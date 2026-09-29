@@ -15,6 +15,14 @@ csv = "1"
 gix = { version = "0.88", default-features = false, features = ["sha1", "revision"] }
 roxmltree = "0.21"
 toml = "1.1"
+# Tree-sitter core and grammars (design §4.4). Versions are also pinned in rb-syntax's
+# EXTRACTOR_VERSION, which a test checks against Cargo.lock.
+tree-sitter = "0.27"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,6 +31,7 @@ rb-model = { path = "crates/rb-model" }
 rb-git = { path = "crates/rb-git" }
 rb-store = { path = "crates/rb-store" }
 rb-indexer = { path = "crates/rb-indexer" }
+rb-syntax = { path = "crates/rb-syntax" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

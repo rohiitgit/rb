@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-09-29 09:40]
+- M1b step 1: new `rb-syntax` crate. It parses TypeScript, TSX, JavaScript, Java, Python and Go with Tree-sitter 0.27 and extracts definitions (with parents) and references (with their enclosing definition). It also derives heuristic symbol keys in SCIP shape.
+  - Java gets an extra query for enums, records and constructors.
+  - TS/TSX run both the JS and TS tag queries.
+  - Go methods attach to their receiver type.
+  - 15 tests cover these, and mutation checks confirm they catch regressions.
+- Files affected: crates/rb-syntax/*, Cargo.toml.
+
 ## [2026-09-29 08:55]
 - Engineer review of M1a:
   - service `role` (service, library, unassigned) replaces the deployable and synthetic flags;
