@@ -19,7 +19,10 @@ use rb_model::{
 use serde_json::Value;
 
 pub use age::{LoadDir, graph_name};
-pub use query::{FoundNode, OwnerShare, Resolved, ServiceCard, ServiceSummary};
+pub use query::{
+    FoundNode, OwnerShare, Resolved, ServiceCard, ServiceSummary, SqlCoverage, TableAccess,
+    TableDeps,
+};
 
 /// Embedded migrations, applied in order and recorded in `public.rb_schema_migrations`.
 const MIGRATIONS: &[(&str, &str)] = &[

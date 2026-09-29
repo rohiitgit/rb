@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use rb_model::{NodeKind, ServiceRole, canonical_dump};
-use rb_store::{LoadDir, Resolved, ServiceCard, SnapshotInfo, Store};
+use rb_store::{LoadDir, Resolved, ServiceCard, SnapshotInfo, Store, TableAccess, TableDeps};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -100,6 +100,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show which migrations and code touch a table (by `schema.table` or bare name).
+    TableDeps {
+        table: String,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
         /// openCypher query, e.g. "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)".
@@ -148,6 +157,13 @@ fn main() -> anyhow::Result<()> {
                         s.snapshots
                     ),
                     None => println!("{}: no live snapshot", s.name),
+                }
+                if let Some(live) = &s.live {
+                    let c = store.sql_coverage(live.id)?;
+                    println!(
+                        "  sql: {} tables; {} query sites; {} migration statements; {} unparsed",
+                        c.tables, c.query_sites, c.migration_statements, c.unparsed
+                    );
                 }
             }
         }
@@ -222,6 +238,29 @@ fn main() -> anyhow::Result<()> {
                         print!("{}", render_card(&card));
                     }
                 }
+            }
+        }
+        Command::TableDeps { table, repo, json } => {
+            let snap = live_snapshot(&mut store, repo)?;
+            let found = match store.resolve_table(snap.id, &table)? {
+                Resolved::One(n) => n,
+                Resolved::None => {
+                    bail!("no table matches {table:?} (try `rb find {table} --kind table`)")
+                }
+                Resolved::Ambiguous(candidates) => {
+                    let list: Vec<String> =
+                        candidates.iter().map(|c| format!("  {}", c.key)).collect();
+                    bail!(
+                        "{table:?} matches several tables; pass schema.table:\n{}",
+                        list.join("\n")
+                    );
+                }
+            };
+            let deps = store.table_deps(snap.id, &found.key)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&deps)?);
+            } else {
+                print!("{}", render_table_deps(&deps));
             }
         }
         Command::Cypher { query, repo, cols } => {
@@ -412,6 +451,55 @@ fn files(n: usize) -> String {
         "1 file".into()
     } else {
         format!("{n} files")
+    }
+}
+
+/// Text rendering of `rb table-deps` (design §9.4, symbol level).
+fn render_table_deps(d: &TableDeps) -> String {
+    let access_line = |a: &TableAccess| {
+        let ops = a.ops.join("+");
+        let assumed = if a.schema_assumed {
+            ", schema assumed"
+        } else {
+            ""
+        };
+        format!(
+            "{}  {ops}  {}:{}  [{}{assumed}]",
+            source_label(a),
+            a.file,
+            a.line,
+            a.certainty
+        )
+    };
+    let mut out = format!("{}  (table {})\n", d.key, d.name);
+    out += "├─ Migrations\n";
+    if d.migrations.is_empty() {
+        out += "│    none (not created by any .sql file in this repo)\n";
+    }
+    for m in &d.migrations {
+        out += &format!("│    {}  ({})\n", access_line(m), m.service_name);
+    }
+    out += "├─ Accessed by\n";
+    if d.accesses.is_empty() {
+        out += "│    no code in this repo\n";
+    }
+    let mut current = None;
+    for a in &d.accesses {
+        if current != Some(&a.service_key) {
+            out += &format!("│    {} ({})\n", a.service_name, a.service_key);
+            current = Some(&a.service_key);
+        }
+        out += &format!("│      {}\n", access_line(a));
+    }
+    out += "└─ Callers up to entry points arrive with call resolution (M3)\n";
+    out
+}
+
+/// A symbol's descriptors (e.g. `UserDao#emailOf()`), which carry its class; a file's name.
+fn source_label(a: &TableAccess) -> &str {
+    match a.source_key.rsplit_once("`/") {
+        Some((_, descriptors)) if a.source_kind == "symbol" => descriptors.trim_end_matches('.'),
+        _ => &a.source_name,
     }
 }
 

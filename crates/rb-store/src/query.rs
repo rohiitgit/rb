@@ -51,6 +51,41 @@ pub struct ServiceCard {
     pub unowned_files: usize,
 }
 
+/// One source's access to a table: a migration file (`MIGRATES`) or code (`QUERIES`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableAccess {
+    /// `file` or `symbol`.
+    pub source_kind: String,
+    pub source_key: String,
+    pub source_name: String,
+    pub ops: Vec<String>,
+    pub certainty: String,
+    pub schema_assumed: bool,
+    pub file: String,
+    /// 1-based line of the first evidence site.
+    pub line: i32,
+    pub service_key: String,
+    pub service_name: String,
+}
+
+/// Which code and migrations touch a table (design §9.4, symbol level until M3 adds callers).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableDeps {
+    pub key: String,
+    pub name: String,
+    pub migrations: Vec<TableAccess>,
+    pub accesses: Vec<TableAccess>,
+}
+
+/// SQL coverage of a snapshot (design §12.4), derived from edges and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct SqlCoverage {
+    pub query_sites: i64,
+    pub migration_statements: i64,
+    pub unparsed: i64,
+    pub tables: i64,
+}
+
 /// Outcome of resolving user input to exactly one node (design §9.1: never pick silently).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {
@@ -98,6 +133,116 @@ impl Store {
             1 => Resolved::One(found.remove(0)),
             _ if found[0].key == text => Resolved::One(found.remove(0)),
             _ => Resolved::Ambiguous(found),
+        })
+    }
+
+    /// Resolves a table by exact key (`schema.table`) or bare name (`table`).
+    pub fn resolve_table(&mut self, snapshot_id: i64, text: &str) -> anyhow::Result<Resolved> {
+        let rows = self.client.query(
+            "SELECT kind, key, name FROM rb.node
+             WHERE snapshot_id = $1 AND kind = 'table' AND (key = $2 OR name = $2)
+             ORDER BY (key = $2) DESC, key COLLATE \"C\"",
+            &[&snapshot_id, &text],
+        )?;
+        let mut found: Vec<FoundNode> = rows.iter().map(found_from_row).collect();
+        Ok(match found.len() {
+            0 => Resolved::None,
+            1 => Resolved::One(found.remove(0)),
+            _ if found[0].key == text => Resolved::One(found.remove(0)),
+            _ => Resolved::Ambiguous(found),
+        })
+    }
+
+    pub fn table_deps(&mut self, snapshot_id: i64, key: &str) -> anyhow::Result<TableDeps> {
+        let Some(table) = self.client.query_opt(
+            "SELECT id, name FROM rb.node WHERE snapshot_id = $1 AND kind = 'table' AND key = $2",
+            &[&snapshot_id, &key],
+        )?
+        else {
+            bail!("no table with key {key:?}");
+        };
+        let table_id: i64 = table.get(0);
+        // Each access with the file it lives in (a symbol's DEFINED_IN file, or the file itself),
+        // that file's service, and the first evidence line.
+        let rows = self.client.query(
+            "SELECT e.kind, s.kind, s.key, s.name, e.attrs, e.certainty, f.key,
+                    (SELECT min(ev.span[1]) FROM rb.edge_evidence ev
+                     WHERE ev.snapshot_id = e.snapshot_id AND ev.src = e.src AND ev.dst = e.dst
+                       AND ev.kind = e.kind AND ev.provenance = e.provenance),
+                    svc.key, svc.name
+             FROM rb.edge e
+             JOIN rb.node s ON s.snapshot_id = e.snapshot_id AND s.id = e.src
+             LEFT JOIN rb.edge d ON d.snapshot_id = e.snapshot_id AND d.src = s.id AND d.kind = 'DEFINED_IN'
+             JOIN rb.node f ON f.snapshot_id = e.snapshot_id
+                           AND f.id = CASE WHEN s.kind = 'file' THEN s.id ELSE d.dst END
+             JOIN rb.edge m ON m.snapshot_id = e.snapshot_id AND m.src = f.id AND m.kind = 'IN_SERVICE'
+             JOIN rb.node svc ON svc.snapshot_id = e.snapshot_id AND svc.id = m.dst
+             WHERE e.snapshot_id = $1 AND e.dst = $2 AND e.kind IN ('MIGRATES', 'QUERIES')",
+            &[&snapshot_id, &table_id],
+        )?;
+        let mut migrations = Vec::new();
+        let mut accesses = Vec::new();
+        for r in &rows {
+            let attrs: Value = r.get(4);
+            let access = TableAccess {
+                source_kind: r.get(1),
+                source_key: r.get(2),
+                source_name: r.get(3),
+                ops: attrs["ops"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|o| o.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                certainty: rb_model::Certainty::from_rank(r.get(5))?
+                    .as_str()
+                    .to_owned(),
+                schema_assumed: attrs["schema_assumed"].as_bool().unwrap_or(false),
+                file: r.get(6),
+                line: r.get::<_, Option<i32>>(7).map_or(0, |l| l + 1),
+                service_key: r.get(8),
+                service_name: r.get(9),
+            };
+            if r.get::<_, String>(0) == "MIGRATES" {
+                migrations.push(access);
+            } else {
+                accesses.push(access);
+            }
+        }
+        // Bytewise order, independent of the database collation.
+        let order = |a: &TableAccess, b: &TableAccess| {
+            (&a.service_key, &a.file, a.line, &a.source_key).cmp(&(
+                &b.service_key,
+                &b.file,
+                b.line,
+                &b.source_key,
+            ))
+        };
+        migrations.sort_by(order);
+        accesses.sort_by(order);
+        Ok(TableDeps {
+            key: key.to_owned(),
+            name: table.get(1),
+            migrations,
+            accesses,
+        })
+    }
+
+    pub fn sql_coverage(&mut self, snapshot_id: i64) -> anyhow::Result<SqlCoverage> {
+        let r = self.client.query_one(
+            "SELECT (SELECT count(*) FROM rb.edge_evidence WHERE snapshot_id = $1 AND kind = 'QUERIES'),
+                    (SELECT count(*) FROM rb.edge_evidence WHERE snapshot_id = $1 AND kind = 'MIGRATES'),
+                    (SELECT count(*) FROM rb.diagnostic WHERE snapshot_id = $1 AND kind = 'unparsed_sql'),
+                    (SELECT count(*) FROM rb.node WHERE snapshot_id = $1 AND kind = 'table')",
+            &[&snapshot_id],
+        )?;
+        Ok(SqlCoverage {
+            query_sites: r.get(0),
+            migration_statements: r.get(1),
+            unparsed: r.get(2),
+            tables: r.get(3),
         })
     }
 

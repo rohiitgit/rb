@@ -1,0 +1,36 @@
+{
+  "key": "billing.invoices",
+  "name": "invoices",
+  "migrations": [
+    {
+      "source_kind": "file",
+      "source_key": "services/billing/migrations/001_invoices.sql",
+      "source_name": "001_invoices.sql",
+      "ops": [
+        "create"
+      ],
+      "certainty": "exact",
+      "schema_assumed": false,
+      "file": "services/billing/migrations/001_invoices.sql",
+      "line": 3,
+      "service_key": "services/billing",
+      "service_name": "github.com/acme/billing"
+    }
+  ],
+  "accesses": [
+    {
+      "source_kind": "symbol",
+      "source_key": "rb-heuristic . . . `services/billing/internal/invoice.go`/MarkPaid().",
+      "source_name": "MarkPaid",
+      "ops": [
+        "update"
+      ],
+      "certainty": "exact",
+      "schema_assumed": false,
+      "file": "services/billing/internal/invoice.go",
+      "line": 16,
+      "service_key": "services/billing",
+      "service_name": "github.com/acme/billing"
+    }
+  ]
+}

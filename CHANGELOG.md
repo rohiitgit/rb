@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-09-29 14:20]
+- M2a step 4: `rb table-deps <table>` (text or `--json`).
+  - It lists migrations and accessing code grouped by service, with ops, certainty, schema assumption and file:line.
+  - A bare name that matches several schemas lists the candidates and exits non-zero.
+  - `rb status` shows SQL coverage (tables, query sites, migration statements, unparsed), derived from the snapshot.
+  - The polyglot fixture gained Java `JdbcTemplate`, Node `pg`, Go `database/sql` and migrations.
+  - New goldens: table-deps (3), status-sql.
+- Files affected: crates/rb-store/src/{lib,query}.rs, crates/rb-cli/src/main.rs, crates/rb-cli/tests/e2e.rs, crates/rb-model/src/lib.rs, fixtures/polyglot-monorepo/*, crates/rb-cli/tests/golden/polyglot-monorepo/*.
+
 ## [2026-09-29 13:40]
 - M2a step 3: the indexer adds `Table` nodes.
   - `MIGRATES` (File → Table, provenance `sql_file`) for every statement in `.sql` files.

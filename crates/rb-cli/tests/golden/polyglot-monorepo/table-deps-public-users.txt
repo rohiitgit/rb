@@ -1,0 +1,8 @@
+public.users  (table users)
+├─ Migrations
+│    V1__users.sql  create  services/auth/src/main/resources/db/migration/V1__users.sql:1  [exact, schema assumed]  (auth-service)
+├─ Accessed by
+│    auth-service (services/auth)
+│      UserDao#emailOf()  read  services/auth/src/main/java/com/acme/auth/UserDao.java:13  [exact, schema assumed]
+│      UserDao#touch()  update  services/auth/src/main/java/com/acme/auth/UserDao.java:17  [exact, schema assumed]
+└─ Callers up to entry points arrive with call resolution (M3)

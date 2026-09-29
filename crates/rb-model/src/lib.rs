@@ -137,6 +137,16 @@ pub enum Certainty {
 }
 
 impl Certainty {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Certainty::Ambiguous => "ambiguous",
+            Certainty::Heuristic => "heuristic",
+            Certainty::Synthetic => "synthetic",
+            Certainty::Dispatch => "dispatch",
+            Certainty::Exact => "exact",
+        }
+    }
+
     /// The value stored in `rb.edge.certainty` and in the AGE projection.
     pub fn rank(self) -> i16 {
         self as i16

@@ -1,0 +1,7 @@
+public.email_log  (table email_log)
+├─ Migrations
+│    none (not created by any .sql file in this repo)
+├─ Accessed by
+│    notification (services/notification)
+│      server.ts  insert  services/notification/src/server.ts:8  [exact, schema assumed]
+└─ Callers up to entry points arrive with call resolution (M3)

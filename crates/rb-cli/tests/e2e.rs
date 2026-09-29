@@ -351,6 +351,36 @@ fn polyglot_monorepo_structure_goldens() {
 
     let err = rb_fails(&url, &["service", "no-such-service", "--repo", &name]);
     assert!(err.contains("no service matches"), "{err}");
+
+    // M2a (contract S13, S14): table dependencies and SQL coverage.
+    golden(
+        fixture,
+        "table-deps-public-users.txt",
+        &rb(&url, &["table-deps", "public.users", "--repo", &name]),
+    );
+    golden(
+        fixture,
+        "table-deps-invoices.json",
+        &rb(&url, &["table-deps", "invoices", "--repo", &name, "--json"]),
+    );
+    golden(
+        fixture,
+        "table-deps-email-log.txt",
+        &rb(&url, &["table-deps", "email_log", "--repo", &name]),
+    );
+    let err = rb_fails(&url, &["table-deps", "users", "--repo", &name]);
+    assert!(
+        err.contains("matches several tables")
+            && err.contains("audit.users")
+            && err.contains("public.users"),
+        "{err}"
+    );
+    let status = rb(&url, &["status", "--repo", &name]);
+    let sql_line = status
+        .lines()
+        .find(|l| l.trim_start().starts_with("sql:"))
+        .unwrap_or_default();
+    golden(fixture, "status-sql.txt", &format!("{sql_line}\n"));
 }
 
 /// Output order is bytewise, independent of the database's locale collation.
