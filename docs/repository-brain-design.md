@@ -365,17 +365,47 @@ These are recorded as diagnostics, not guessed at:
 | `@Query(nativeQuery=true)` | Spring Data pack |
 | ORM entity mappings | `jpa`, `prisma`, `typeorm`, `sqlalchemy`, `django` packs → `MAPS_TO` (entity type → Table) |
 
-### 7.2 Parsing
+### 7.2 Parsing (as built in M2a)
 
-1. **Normalise the template.** Replace each `${…}`, `+ expr +` or f-string hole with a positional parameter `$n`. If a hole sits in identifier position (e.g. a dynamic table name), mark the statement `dynamic_identifier` and do not guess the table.
-2. **Parse with pg_query**, which uses the real PostgreSQL parser. The crate's `select_tables()`/`dml_tables()`/`ddl_tables()` helpers are a useful cross-check, but they don't separate insert, update and delete. So `rb-sql` walks the parse tree itself to collect `(table, schema, op)` per statement:
-   - `op ∈ {read, insert, update, delete, ddl, truncate}`;
-   - CTE names are excluded from table sets;
-   - subquery and `JOIN` tables count as reads;
-   - `INSERT … SELECT` gives a write to the target and reads from the sources.
-3. **Fallback.** On a pg_query failure, try `sqlparser-rs` with the dialect configured in `rb.toml` (MySQL, SQLite, MSSQL, BigQuery…). Results get certainty `heuristic`.
-4. On total failure, record `unparsed_sql` with its location. These records count in the coverage report.
-5. **JPQL/HQL is not SQL.** v1 uses a small JPQL tokenizer that extracts `FROM`/`JOIN` entity names and maps them through `Entity` facts to tables, with certainty `heuristic`.
+1. **Normalise the template** (in `rb-syntax`, cached as `FileFacts.sql`):
+   - each `${…}`, `+ expr +` or f-string hole becomes `$n`;
+   - escapes are decoded (`\n`, `\xHH`, `\uHHHH`, `\u{…}`, octal);
+   - Java text blocks are dedented;
+   - a candidate must start with a whole SQL keyword (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH`, `MERGE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`);
+   - annotations and decorators are skipped, because they are framework metadata.
+2. **Split statements on Postgres' own lexer tokens** (`rb-sql`). Quotes, dollar quotes, `E''` strings and comments are single tokens, so they can never be mistaken for boundaries.
+   - A `;` token ends a statement, except inside `BEGIN ATOMIC … END` bodies, which are tracked by counting `BEGIN ATOMIC`/`CASE`/`END`.
+   - A `psql` meta-command (a `\` token to the end of its line) also ends one, as `\gset` does. `\copy …` is kept as a `COPY` statement.
+   - A range runs from the statement's first token to its last, so it is never empty or inverted, even around whitespace that Rust and Postgres disagree on, such as U+00A0.
+   - One bad statement never hides the rest. Only text the lexer cannot tokenise at all (e.g. an unterminated quote) becomes a single reported statement.
+   - *History:* an earlier version combined `split_with_parser`, `split_with_scanner` and a coverage check. The third evaluator pass showed the lexer split silently drops statements that start with a non-keyword, and that mixing Rust and Postgres whitespace rules could invert a range.
+3. **Parse with pg_query** (the real PG17 parser). If a statement fails, it is retried once with JDBC `?`, named `:param` and DB-API `%s`/`%(name)s` placeholders rewritten to `$n`.
+   - Placeholders are found as lexer *tokens*, so comments, strings, `E''` escapes and the `?|`/`@?` operators are never touched.
+   - `id=?` lexes as one `=?` operator token, so placeholders glued to a comparison are split off.
+   - A `?` glued to a word (`"Delete from cache?"`) is prose, not a placeholder.
+4. **Walk the whole parse tree** (serialised to JSON via the protobuf structs' serde support, so no node type is skipped). M2a showed three problems with the alternatives:
+   - pg_query's `*_tables()` helpers lose CTE scope, give nested DML the top-level operation, and return dotted strings.
+   - Its `nodes()` iterator skips `TABLESAMPLE`, `RETURNING`, `ON CONFLICT`, `MERGE` actions, `PREPARE` and cursors.
+   - Each statement node contributes its own target with its own operation, including DML nested in CTEs:
+     - `read`, `insert`, `update`, `delete`, `merge` for DML;
+     - `create`, `alter`, `drop`, `truncate` for DDL;
+     - `COPY FROM` is `insert` and `COPY TO` is `read`;
+     - `SELECT INTO` is `create`;
+     - `ALTER TABLE … RENAME` is `alter`.
+   - Other relations are reads, but only in query-bearing statements. `FOR UPDATE OF alias` names an alias, not a table. `UNION` arms are walked as statements, so their own `WITH` clauses scope correctly.
+   - `CREATE TABLE … PARTITION OF / INHERITS parent` records `alter` on the parent. `CREATE FOREIGN TABLE` records `create`, and `ALTER TABLE … SET SCHEMA` records `alter`. `GRANT`, `LOCK`, `COMMENT` and FK `REFERENCES` in `CREATE TABLE` record nothing.
+   - CTE names are scoped as in Postgres. A CTE hides a same-named table only in later sibling CTEs and the main query (and its own body when `RECURSIVE`), never in outer queries.
+   - `ALTER TYPE` (a composite type) is not a table.
+   - System catalogs are ignored, including unqualified `pg_*` names, because `pg_catalog` is searched first.
+   - Quoted identifiers keep their dots. Table keys double-quote parts that contain `.` or `"`, so `"a.b".c` and `a."b.c"` never collide.
+5. **Failures:** a statement that does not parse gives `unparsed_sql` for `.sql` files and for sink-call arguments. Elsewhere it is dropped, because it is almost always prose.
+   - There is no dialect fallback yet (`sqlparser-rs` is deferred). MySQL/H2 statements are reported, never guessed.
+   - JPQL is left to M2b: arguments to `createQuery` are not treated as SQL.
+
+Known gaps:
+- `DROP VIEW` and `CREATE TABLE … (LIKE t)` report no table.
+- FK `REFERENCES` dependencies are not recorded.
+- Unqualified names always assume `public` (`rb.toml` `sql.default_schema` is not implemented yet).
 
 ### 7.3 Tables as first-class nodes
 

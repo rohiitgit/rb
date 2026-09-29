@@ -119,3 +119,51 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - locals in anonymous scopes were merged into one symbol;
   - the cache served stale facts twice after extractor changes, now prevented by fingerprinting queries and code.
 - [x] Final commit (see git log)
+
+## M2a SQL core: complete (pending fourth evaluator pass)
+
+- **Decided:** see `tasks/contract-m2a.md` and its two amendment sections.
+  - `pg_query` is the only new dependency.
+  - `rb-sql` splits statements itself and walks the parse tree, instead of using pg_query's table helpers.
+  - SQL candidates are cached extractor output; SQL analysis is recomputed each run.
+  - Unparseable SQL is reported only for `.sql` files and sink calls.
+  - Coverage is derived from the graph, never stored.
+- **Built:**
+  - the `rb-sql` crate;
+  - `rb-syntax` SQL candidates (`strings.rs`);
+  - the `rb-indexer` SQL stage (`sql.rs`);
+  - `Store::resolve_table`, `table_deps` and `sql_coverage`;
+  - `rb table-deps`;
+  - SQL coverage in `rb status`;
+  - SQL added to the polyglot fixture, plus goldens.
+- **Measured (S16):** public repos at pinned commits, release build, after fixes, 2026-09-29.
+
+  | Repo @ commit | Cold | Warm | Tables | Code sites | Migration statements | Unparsed |
+  |---|---|---|---|---|---|---|
+  | spring-projects/spring-petclinic @ 818c4136ea97 | 0.92 s | 0.12 s | 7 | 0 | 128 | 66 |
+  | porsager/postgres @ 411429e7bd7a | 0.20 s | 0.18 s | 6 | 783 | 0 | 108 |
+  | jackc/pgx @ ea996359befe | 0.42 s | 0.39 s | 31 | 359 | 2 | 10 |
+
+  Every warm run parsed 0 files, and cold and warm dumps are byte-identical.
+  - **petclinic:** 7 tables, equal to the distinct `CREATE TABLE` names across all its dialect files. All 66 unparsed statements are MySQL/H2/HSQLDB dialect.
+  - **postgres.js:** all 108 unparsed are dynamic identifiers (`${sql(table)}`) in table position.
+  - **pgx:** `drop_cols`, `foo` and `t` were verified against the source. System catalogs, composite types and prepared-statement names no longer appear as tables.
+- **Found in S16 and fixed:** prefilter prefix match (`insert_t`), unqualified `pg_*` catalogs, `ALTER TYPE`, `COPY TO`, `RENAME`.
+- **Found by the evaluator and fixed:**
+  - retry ranges overran the text (a crash);
+  - CTE shadowing;
+  - nested DML operations;
+  - dotted quoted names;
+  - BOM in migrations;
+  - `\u`/`\x`/octal escapes;
+  - prose becoming tables;
+  - coverage over-counting;
+  - also: whole-file failure on one bad statement, `%s` placeholders, JPQL, case-insensitive table lookup.
+
+### Status
+
+- [x] Steps 1–4 committed: 7ac4f7e, 6d8c02e, 10ee960, 8855bbf
+- [x] First evaluator pass: 8 defects; all fixed test-first (rb-sql rewrite)
+- [x] Second evaluator pass: 9 issues, including the structural `nodes()` gap. The core was rebuilt on pg_query's JSON tree walk, and a new test exposed a hidden lexer-split drop.
+- [x] Third evaluator pass: 6 defects, including a panic. Splitting is now token-only. Mutation checks cover every fix.
+- [x] Commit (checkpoint); a fourth evaluator pass follows, and its findings will be fixed in follow-up commits

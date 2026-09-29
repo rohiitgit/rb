@@ -64,3 +64,12 @@ Research findings:
 - **S5:** retry with placeholders rewritten, because JDBC and SQLAlchemy code would otherwise never parse.
 - **S12:** noise control, because the prefilter admits prose.
 - **Cache fingerprint:** the new candidate-extraction source file must be added to `rb_syntax::extractor_id`'s fingerprint.
+
+## Amendments after the first evaluator pass (2026-09-29)
+
+- **API:** `rb_sql::analyze` returns `Analysis { statements, errors }`, with statements split by `rb-sql` itself. This covers S5 and S6: one bad statement never hides the others, and ranges always refer to the original text.
+- **Tree walk:** tables come from walking the parse tree, not pg_query's `*_tables()` helpers, which fixes CTE shadowing, nested DML operations and dotted quoted names (S1–S3).
+- **S4:** also covers unqualified `pg_*` relations.
+- **S5:** also covers DB-API `%s` and `%(name)s`, and a placeholder must be a standalone token.
+- **S14:** coverage counts distinct sites that touch at least one table. SQL that touches no table leaves no graph trace and is not counted. The label says this.
+- **JPQL:** arguments to `createQuery` are not candidates for SQL edges (JPQL belongs to M2b), and `createNativeQuery` is a sink.

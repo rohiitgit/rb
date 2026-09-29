@@ -130,4 +130,4 @@ Findings from the research step (2026-09-29):
 - [x] 2. rb-syntax: SQL candidates from string literals (template normalisation, callee name, prefilter) (S7, S8).
 - [x] 3. Indexer: Table nodes, MIGRATES from `.sql` files, QUERIES from candidates, diagnostics (S6, S9–S12).
 - [x] 4. `rb table-deps`, SQL coverage in `rb status`, fixture goldens (S13–S15).
-- [ ] 5. Public-repo measurement (S16), evaluator pass, fixes, docs, commit.
+- [x] 5. Public-repo measurement (S16), evaluator pass, fixes, docs, commit.

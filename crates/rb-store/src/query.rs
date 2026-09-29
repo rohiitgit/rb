@@ -77,10 +77,14 @@ pub struct TableDeps {
     pub accesses: Vec<TableAccess>,
 }
 
-/// SQL coverage of a snapshot (design §12.4), derived from edges and diagnostics.
+/// SQL coverage of a snapshot (design §12.4), derived from edges and diagnostics. Sites are
+/// distinct source locations: a literal touching two tables counts once, and SQL touching no
+/// table (e.g. `SET search_path`) leaves no trace in the graph and is not counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct SqlCoverage {
+    /// Distinct code sites whose SQL touches at least one table.
     pub query_sites: i64,
+    /// Distinct migration statements that touch at least one table.
     pub migration_statements: i64,
     pub unparsed: i64,
     pub tables: i64,
@@ -136,14 +140,22 @@ impl Store {
         })
     }
 
-    /// Resolves a table by exact key (`schema.table`) or bare name (`table`).
+    /// Resolves a table by exact key (`schema.table`) or bare name (`table`). Input that matches
+    /// nothing as typed is retried in lowercase, as Postgres folds unquoted names.
     pub fn resolve_table(&mut self, snapshot_id: i64, text: &str) -> anyhow::Result<Resolved> {
-        let rows = self.client.query(
-            "SELECT kind, key, name FROM rb.node
-             WHERE snapshot_id = $1 AND kind = 'table' AND (key = $2 OR name = $2)
-             ORDER BY (key = $2) DESC, key COLLATE \"C\"",
-            &[&snapshot_id, &text],
-        )?;
+        let query = "SELECT kind, key, name FROM rb.node
+                     WHERE snapshot_id = $1 AND kind = 'table' AND (key = $2 OR name = $2)
+                     ORDER BY (key = $2) DESC, key COLLATE \"C\"";
+        let mut rows = self.client.query(query, &[&snapshot_id, &text])?;
+        let lower = text.to_lowercase();
+        if rows.is_empty() && lower != text {
+            rows = self.client.query(query, &[&snapshot_id, &lower])?;
+        }
+        let text = if rows.iter().any(|r| r.get::<_, String>(1) == text) {
+            text
+        } else {
+            lower.as_str()
+        };
         let mut found: Vec<FoundNode> = rows.iter().map(found_from_row).collect();
         Ok(match found.len() {
             0 => Resolved::None,
@@ -232,8 +244,10 @@ impl Store {
 
     pub fn sql_coverage(&mut self, snapshot_id: i64) -> anyhow::Result<SqlCoverage> {
         let r = self.client.query_one(
-            "SELECT (SELECT count(*) FROM rb.edge_evidence WHERE snapshot_id = $1 AND kind = 'QUERIES'),
-                    (SELECT count(*) FROM rb.edge_evidence WHERE snapshot_id = $1 AND kind = 'MIGRATES'),
+            "SELECT (SELECT count(*) FROM (SELECT DISTINCT file_id, span FROM rb.edge_evidence
+                                            WHERE snapshot_id = $1 AND kind = 'QUERIES') q),
+                    (SELECT count(*) FROM (SELECT DISTINCT file_id, span FROM rb.edge_evidence
+                                            WHERE snapshot_id = $1 AND kind = 'MIGRATES') m),
                     (SELECT count(*) FROM rb.diagnostic WHERE snapshot_id = $1 AND kind = 'unparsed_sql'),
                     (SELECT count(*) FROM rb.node WHERE snapshot_id = $1 AND kind = 'table')",
             &[&snapshot_id],

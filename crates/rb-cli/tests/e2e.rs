@@ -375,6 +375,10 @@ fn polyglot_monorepo_structure_goldens() {
             && err.contains("public.users"),
         "{err}"
     );
+    // Unquoted names fold to lowercase, as in Postgres.
+    assert!(
+        rb(&url, &["table-deps", "Email_Log", "--repo", &name]).starts_with("public.email_log")
+    );
     let status = rb(&url, &["status", "--repo", &name]);
     let sql_line = status
         .lines()

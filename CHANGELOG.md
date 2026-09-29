@@ -1,5 +1,42 @@
 # Changelog
 
+## [2026-09-29 17:20]
+- M2a, third evaluator pass (6 defects, including a panic); all fixed test-first, and mutation checks confirm each fix is covered by a test.
+  - **Splitting** is now done on Postgres lexer tokens alone. This removes the parser/scanner/coverage-check combination and the psql blanking pass.
+    - Range start can no longer exceed its end (U+00A0).
+    - Non-keyword statements (`USE`, `GO`, garbage) no longer hide the others.
+    - `\gset` terminates a statement, and `\copy` is kept as `COPY`.
+    - `BEGIN ATOMIC` bodies are tracked by keyword depth.
+  - **Placeholders** glued to comparisons are rewritten (`id=?`, `>=?`, `=%(id)s`).
+  - **Tree walk:** `FOR UPDATE OF alias` is no longer a table. `UNION` arms' `WITH` clauses are scoped. `PARTITION OF`/`INHERITS` parents, `CREATE FOREIGN TABLE` and `ALTER TABLE SET SCHEMA` are handled.
+- Files affected: crates/rb-sql/src/lib.rs, docs/repository-brain-design.md.
+
+## [2026-09-29 16:30]
+- M2a, second evaluator pass (9 issues; all fixed test-first, plus one hidden bug found by a new test): `rb-sql` core rebuilt on Postgres' own tools. My hand-written splitter and character scanner are deleted.
+  - **Splitting:** statements are split by `split_with_parser`, falling back to `split_with_scanner`. This fixes `BEGIN ATOMIC` bodies and `$` in identifiers.
+  - **Coverage check:** if tokens are left uncovered, the whole text is reported. This fixes the lexer silently dropping text with unbalanced parentheses.
+  - **Placeholders and meta-commands:** both are handled as lexer tokens. Comments and `E''` strings are safe, and meta-commands work anywhere on a line.
+  - **Tables:** found by a full JSON walk of the protobuf tree, with proper CTE scoping. Nested scopes and sibling order fixed; `TABLESAMPLE`, `RETURNING`/`ON CONFLICT`/`MERGE` subqueries, `PREPARE`, cursors, `CREATE RULE` and `RENAME CONSTRAINT` now handled.
+  - **Table keys:** parts containing `.` or `"` are quoted.
+  - **Diagnostics:** one `unparsed_sql` per sink call site, with `failed_statements`.
+- Mutation checks confirm each fix is covered by a test.
+- Files affected: crates/rb-sql/{Cargo.toml,src/lib.rs}, crates/rb-indexer/src/sql.rs, docs/repository-brain-design.md, goldens.
+
+## [2026-09-29 15:40]
+- M2a fixes after the evaluator pass and the S16 measurement, each test-first.
+- `rb-sql` rewritten:
+  - **Own statement splitter:** handles quotes, `E''`, `$tag$`, nested comments and `psql` meta-commands.
+  - **Per-statement parse:** one bad statement no longer hides the others, and ranges always refer to the original text. This fixes a crash.
+  - **Parse-tree walk:** handles CTE shadowing, nested DML operations, dotted quoted names, `COPY` direction, `RENAME`, `SELECT INTO`, and `ALTER TYPE` as not a table. Unqualified `pg_*` names are system catalogs.
+  - **Token-bounded placeholders:** covers `?`, `:name`, `%s` and `%(name)s`.
+- `rb-syntax`: `\x`, `\u`, `\u{}`, `\U` and octal escapes are decoded, and keywords must be whole words.
+- Indexer:
+  - a BOM in `.sql` files is handled with raw-byte spans;
+  - each bad statement becomes its own diagnostic;
+  - `createQuery` (JPQL) is skipped and `createNativeQuery` is a sink.
+- Store: distinct-site SQL coverage with an honest label, and case-insensitive table lookup.
+- Files affected: crates/rb-sql/src/lib.rs, crates/rb-syntax/src/strings.rs, crates/rb-indexer/src/sql.rs, crates/rb-store/src/query.rs, crates/rb-cli/src/main.rs, crates/rb-cli/tests/e2e.rs, docs/repository-brain-design.md, tasks/contract-m2a.md, IMPLEMENT.md, README.md.
+
 ## [2026-09-29 14:20]
 - M2a step 4: `rb table-deps <table>` (text or `--json`).
   - It lists migrations and accessing code grouped by service, with ops, certainty, schema assumption and file:line.

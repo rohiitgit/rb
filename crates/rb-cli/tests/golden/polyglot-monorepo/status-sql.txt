@@ -1,1 +1,1 @@
-  sql: 4 tables; 5 query sites; 3 migration statements; 1 unparsed
+  sql: 4 tables; 5 code sites and 3 migration statements touching them; 1 unparsed

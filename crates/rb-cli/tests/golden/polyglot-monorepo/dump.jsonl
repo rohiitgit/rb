@@ -159,4 +159,4 @@
 ["E","service","services/notification","OWNED_BY","owner","@acme/messaging","codeowners",3,{"pattern":"/services/notification/","via":"services/notification/package.json"},[[".github/CODEOWNERS",[6,0,6,56]]]]
 ["D","codeowners_ignored","CODEOWNERS",null,{"used":".github/CODEOWNERS"}]
 ["D","codeowners_invalid_line",".github/CODEOWNERS",[10,0,10,53],{"error":"character ranges (`[...]`) are not supported"}]
-["D","unparsed_sql","services/billing/internal/invoice.go",[21,19,21,41],{"callee":"Exec","error":"Invalid statement: syntax error at or near \"$1\""}]
+["D","unparsed_sql","services/billing/internal/invoice.go",[21,19,21,41],{"callee":"Exec","error":"Invalid statement: syntax error at or near \"$1\"","failed_statements":1}]

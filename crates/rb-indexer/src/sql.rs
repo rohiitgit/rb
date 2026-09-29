@@ -36,7 +36,12 @@ pub(crate) const SQL_SINKS: &[&str] = &[
     "$executerawunsafe",
     "sql",
     "text",
+    "createnativequery",
 ];
+
+/// Callees whose string argument is a query language other than SQL (JPA/Hibernate JPQL). Such
+/// strings are left to the ORM packs (M2b) instead of being misread as SQL tables.
+const NON_SQL_CALLEES: &[&str] = &["createquery"];
 
 /// `.sql` files to read, and oversized ones reported (same cap and skips as source files).
 pub(crate) fn sql_plan(files: &[FileEntry]) -> (Vec<&FileEntry>, Vec<Diagnostic>) {
@@ -60,38 +65,45 @@ pub(crate) fn sql_plan(files: &[FileEntry]) -> (Vec<&FileEntry>, Vec<Diagnostic>
     (plan, diagnostics)
 }
 
-/// Adds `MIGRATES` edges for every statement of a `.sql` file; a parse failure is a diagnostic.
+/// Adds `MIGRATES` edges for every statement of a `.sql` file. Statements that do not parse are
+/// diagnostics; they never hide the ones that do.
 pub(crate) fn add_migrations(
     b: &mut GraphBuilder,
     path: &str,
     text: &str,
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    let statements = match rb_sql::analyze(text) {
-        Ok(statements) => statements,
-        Err(error) => {
-            return Ok(vec![unparsed(path, None, &error, None)]);
-        }
+    // Byte ranges must refer to the raw blob, so a byte order mark is skipped, not removed.
+    let offset = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
     };
+    let analysis = rb_sql::analyze(&text[offset..]);
+    let span = |(start, end): (usize, usize)| span_of(text, (start + offset, end + offset));
     let file = NodeKey::new(NodeKind::File, path);
     let mut access = Accesses::default();
-    for statement in &statements {
+    for statement in &analysis.statements {
         let at = Evidence {
             path: path.to_owned(),
-            span: span_of(text, statement.range),
+            span: span(statement.range),
         };
         for table in &statement.tables {
             access.record(&file, table, Certainty::Exact, &at);
         }
     }
     access.emit(b, EdgeKind::Migrates, Provenance::SqlFile)?;
-    Ok(Vec::new())
+    Ok(analysis
+        .errors
+        .iter()
+        .map(|e| unparsed(path, Some(span(e.range)), &e.error, None))
+        .collect())
 }
 
 /// Adds `QUERIES` edges for a file's SQL candidates, from their enclosing symbol (or the file).
 ///
 /// A candidate passed to a known SQL sink is `exact`; any other candidate that parses is
-/// `heuristic`. A candidate that does not parse gives a diagnostic only when it is a sink
-/// argument; otherwise it is almost always prose ("Update failed") and is dropped.
+/// `heuristic`. Statements that do not parse give a diagnostic only in a sink argument; otherwise
+/// they are almost always prose ("Update failed") and are dropped.
 pub(crate) fn add_queries(
     b: &mut GraphBuilder,
     path: &str,
@@ -102,24 +114,26 @@ pub(crate) fn add_queries(
     let mut access = Accesses::default();
     let mut diagnostics = Vec::new();
     for candidate in &facts.sql {
-        let sink = candidate
-            .callee
+        let callee = candidate.callee.as_deref().map(str::to_ascii_lowercase);
+        if callee
             .as_deref()
-            .is_some_and(|c| SQL_SINKS.contains(&c.to_ascii_lowercase().as_str()));
-        let statements = match rb_sql::analyze(&candidate.text) {
-            Ok(statements) => statements,
-            Err(error) => {
-                if sink {
-                    diagnostics.push(unparsed(
-                        path,
-                        Some(candidate.span),
-                        &error,
-                        candidate.callee.as_deref(),
-                    ));
-                }
-                continue;
-            }
-        };
+            .is_some_and(|c| NON_SQL_CALLEES.contains(&c))
+        {
+            continue;
+        }
+        let sink = callee.as_deref().is_some_and(|c| SQL_SINKS.contains(&c));
+        let analysis = rb_sql::analyze(&candidate.text);
+        // One diagnostic per call site: the first error, and how many statements failed.
+        if let (true, Some(first)) = (sink, analysis.errors.first()) {
+            let mut d = unparsed(
+                path,
+                Some(candidate.span),
+                &first.error,
+                candidate.callee.as_deref(),
+            );
+            d.detail["failed_statements"] = analysis.errors.len().into();
+            diagnostics.push(d);
+        }
         let source = match candidate.enclosing {
             Some(i) => NodeKey::new(NodeKind::Symbol, keys[i].clone()),
             None => file.clone(),
@@ -133,7 +147,7 @@ pub(crate) fn add_queries(
             path: path.to_owned(),
             span: candidate.span,
         };
-        for table in statements.iter().flat_map(|s| &s.tables) {
+        for table in analysis.statements.iter().flat_map(|s| &s.tables) {
             access.record(&source, table, certainty, &at);
         }
     }
@@ -314,6 +328,61 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("syntax error")
+        );
+    }
+
+    #[test]
+    fn byte_order_mark_and_bad_statements_do_not_hide_good_ones() {
+        let sql = "\u{feff}CREATE TABLE widgets (id int);\nCREATE TABLE b (id INT AUTO_INCREMENT);\nCREATE TABLE gadgets (id int);\n";
+        let (g, diagnostics) = graph_with("V1.sql", |b| add_migrations(b, "V1.sql", sql).unwrap());
+        assert_eq!(
+            edges(&g, EdgeKind::Migrates),
+            [
+                r#"V1.sql -> public.gadgets ops=["create"] Exact assumed @2"#,
+                r#"V1.sql -> public.widgets ops=["create"] Exact assumed @0"#,
+            ]
+        );
+        // Evidence spans count raw bytes: the statement starts after the 3-byte BOM.
+        let widgets = g
+            .edges()
+            .iter()
+            .find(|e| e.evidence[0].span[0] == 0)
+            .unwrap();
+        assert_eq!(widgets.evidence[0].span[1], 3);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].span.map(|s| s[0]), Some(1));
+    }
+
+    #[test]
+    fn one_diagnostic_per_unparseable_sink_call() {
+        // Two invalid statements the lexer can still split, and one valid one.
+        let src = "db.query('SELECT FROM WHERE; SELECT * FORM x; SELECT * FROM good')\n";
+        let facts = rb_syntax::extract(Language::JavaScript, src.as_bytes()).unwrap();
+        let mut diagnostics = Vec::new();
+        let (g, _) = graph_with("a.js", |b| {
+            diagnostics = add_queries(b, "a.js", &facts).unwrap();
+            Vec::new()
+        });
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].detail["failed_statements"], 2);
+        // The statement that parses still counts.
+        assert_eq!(
+            edges(&g, EdgeKind::Queries),
+            [r#"a.js -> public.good ops=["read"] Exact assumed @0"#]
+        );
+    }
+
+    #[test]
+    fn jpql_is_not_sql_but_native_queries_are() {
+        let src = "class R {\n  void f() {\n    em.createQuery(\"SELECT c FROM Customer c\");\n    em.createNativeQuery(\"SELECT * FROM customer\");\n  }\n}\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let (g, _) = graph_with("R.java", |b| {
+            crate::syntax::add_symbols(b, "R.java", &facts).unwrap();
+            add_queries(b, "R.java", &facts).unwrap()
+        });
+        assert_eq!(
+            edges(&g, EdgeKind::Queries),
+            [r#"R#f(). -> public.customer ops=["read"] Exact assumed @3"#]
         );
     }
 

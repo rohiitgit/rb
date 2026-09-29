@@ -161,7 +161,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(live) = &s.live {
                     let c = store.sql_coverage(live.id)?;
                     println!(
-                        "  sql: {} tables; {} query sites; {} migration statements; {} unparsed",
+                        "  sql: {} tables; {} code sites and {} migration statements touching them; {} unparsed",
                         c.tables, c.query_sites, c.migration_statements, c.unparsed
                     );
                 }

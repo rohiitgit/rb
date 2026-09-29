@@ -239,21 +239,73 @@ fn java_text_block(body: &str) -> String {
         .join("\n")
 }
 
+/// Decodes backslash escapes common to JS/TS, Java, Python and Go string literals: the usual
+/// single letters, `\xHH`, `\uHHHH`, `\u{H…}`, `\UHHHHHHHH` and octal `\NNN`. Unknown escapes keep
+/// the escaped character; malformed ones keep their text.
 fn unescape(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    let mut i = 0;
+    let hex = |from: usize, len: usize| -> Option<char> {
+        let digits: String = chars.get(from..from + len)?.iter().collect();
+        char::from_u32(u32::from_str_radix(&digits, 16).ok()?)
+    };
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            out.push(chars[i]);
+            i += 1;
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
-            Some('\n') | None => {} // line continuation
-            Some(other) => out.push(other),
+        let Some(&next) = chars.get(i + 1) else {
+            break;
+        };
+        if next == '\n' {
+            i += 2; // line continuation
+            continue;
+        }
+        let (decoded, width) = match next {
+            'n' => (Some('\n'), 2),
+            't' => (Some('\t'), 2),
+            'r' => (Some('\r'), 2),
+            'x' => (hex(i + 2, 2), 4),
+            'u' if chars.get(i + 2) == Some(&'{') => {
+                let close = chars[i + 3..]
+                    .iter()
+                    .position(|c| *c == '}')
+                    .map(|p| i + 3 + p);
+                match close {
+                    Some(close) => (hex(i + 3, close - i - 3), close - i + 1),
+                    None => (None, 0),
+                }
+            }
+            'u' => (hex(i + 2, 4), 6),
+            'U' => (hex(i + 2, 8), 10),
+            '0'..='7' => {
+                let len = chars[i + 1..]
+                    .iter()
+                    .take(3)
+                    .take_while(|c| ('0'..='7').contains(*c))
+                    .count();
+                let digits: String = chars[i + 1..i + 1 + len].iter().collect();
+                (
+                    u32::from_str_radix(&digits, 8)
+                        .ok()
+                        .and_then(char::from_u32),
+                    len + 1,
+                )
+            }
+            other => (Some(other), 2),
+        };
+        match (decoded, width) {
+            (Some(c), w) => {
+                out.push(c);
+                i += w;
+            }
+            _ => {
+                // Malformed escape: keep it verbatim.
+                out.push('\\');
+                i += 1;
+            }
         }
     }
     out
@@ -295,7 +347,11 @@ fn looks_like_sql(text: &str) -> bool {
             break;
         }
     }
-    let word: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
+    // A whole word: `insert_t` (a prepared statement name) is not `INSERT`.
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
     SQL_KEYWORDS.contains(&word.to_ascii_uppercase().as_str())
 }
 
@@ -425,6 +481,35 @@ const greeting = "hello";
                 c("DELETE FROM $1", Some("Exec"), Some("Get")),
             ]
         );
+    }
+
+    #[test]
+    fn unicode_hex_and_octal_escapes_are_decoded() {
+        let js = r#"q("SELECT * FROM \u0075sers"); q("SELECT * FROM \u{6F}rders"); q("SELECT * FROM \x74eams");"#;
+        let texts: Vec<String> = candidates(Language::JavaScript, js)
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "SELECT * FROM users",
+                "SELECT * FROM orders",
+                "SELECT * FROM teams"
+            ]
+        );
+        let go = "package p\nfunc f() { db.Exec(\"UPDATE\\x20t SET a = \\101\") }\n";
+        let texts: Vec<String> = candidates(Language::Go, go)
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(texts, ["UPDATE t SET a = A"]);
+    }
+
+    #[test]
+    fn keywords_must_be_whole_words() {
+        let go = "package p\nfunc f() { conn.Prepare(ctx, \"insert_t\", q); conn.Exec(ctx, \"insert_t\") }\n";
+        assert!(candidates(Language::Go, go).is_empty());
     }
 
     #[test]

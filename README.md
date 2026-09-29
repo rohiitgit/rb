@@ -3,15 +3,16 @@
 A deterministic, LLM-free code-intelligence graph for Git repositories. It is built with Rust, Postgres and Apache AGE.
 The design is in [docs/repository-brain-design.md](docs/repository-brain-design.md).
 
-**Status: milestones M0 (Foundations), M1a (Structure) and M1b (Syntax).** `rb` indexes a commit into a snapshot containing:
+**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax) and M2a (SQL core).** `rb` indexes a commit into a snapshot containing:
 
 - one `File` node per blob, with its blob SHA, size, language and binary/generated flags;
 - one `Service` per detected project (package.json, Maven, Gradle, go.mod / `package main`, Cargo, pyproject, Dockerfile, `rb.toml`), marked deployable or library;
 - `Owner` nodes from CODEOWNERS (GitHub semantics), with `OWNED_BY` edges that cite the deciding CODEOWNERS line;
 - `Symbol` nodes for the definitions Tree-sitter finds in TypeScript/TSX/JavaScript, Java, Python and Go files, with `DEFINED_IN` (pointing at the name) and `CONTAINS` edges. Parse results are cached per blob, so a re-index only parses changed files.
+- `Table` nodes from SQL parsed with the real Postgres parser. `MIGRATES` edges come from `.sql` files, and `QUERIES` edges come from SQL strings in code (exact when passed to a known database call).
 - `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests, syntax errors, oversized files).
 
-Each snapshot is stored relationally and projected into an AGE graph. Call edges, SQL and routes arrive in M2–M4.
+Each snapshot is stored relationally and projected into an AGE graph. ORM mappings, call edges and routes arrive in M2b–M4.
 
 ## Quickstart
 
@@ -24,6 +25,7 @@ target/debug/rb status
 target/debug/rb dump > snapshot.jsonl  # canonical, id-independent dump
 target/debug/rb service                # list services; `rb service <dir|name>` shows a card
 target/debug/rb find login --kind symbol  # search nodes by key or name
+target/debug/rb table-deps users         # migrations and code touching a table
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
 ```
 
@@ -48,7 +50,8 @@ Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e
 |---|---|
 | `crates/rb-model` | node/edge kinds, certainty, `GraphBuilder`, canonical dump |
 | `crates/rb-git` | commit → manifest (gitoxide), CODEOWNERS, glob matcher, boundary detection |
-| `crates/rb-syntax` | Tree-sitter extraction (definitions, references) and heuristic symbol keys |
+| `crates/rb-syntax` | Tree-sitter extraction (definitions, references, SQL candidates) and heuristic symbol keys |
+| `crates/rb-sql` | SQL statements → tables and operations (pg_query parse-tree walk) |
 | `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → snapshot graph + diagnostics |
 | `crates/rb-store` | migrations, snapshot publish/retention, evidence, AGE projection, read-only Cypher, find/service queries |
 | `crates/rb-cli` | the `rb` binary |
