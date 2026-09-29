@@ -203,3 +203,11 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Sixth evaluator pass (interrupted by a session end, then resumed): no contract violations. Quadratic Django walks and a proxy stack overflow were fixed test-first; the tests overflowed before the fix. The Flask match was tightened. Name-resolution limitations are deferred to M3 (Amendment 6). Tests: 174 unit, 8 e2e; O9 unchanged.
 - [x] Seventh evaluator pass: PASS with 2 lower-severity reservations (source-order dependence in `first_along`; `Meta` options merged across abstract parents). Both were fixed with the evaluator's repros as failing-first tests (Amendment 7). These two fixes were not re-reviewed; M3's first evaluator pass re-covers `rb-frameworks`. Tests: 176 unit, 8 e2e; O9 unchanged.
 - [x] Commit
+
+## M3a Tier B resolution: in progress
+
+- **Decided:** see `tasks/contract-m3a.md`. M3 is split: M3a resolves calls, types and implementations heuristically from Tree-sitter facts and ships `rb callers` / `rb impact`; M3b adds SCIP in containers. M3a adds import, package and typed-binding facts to `rb-syntax`. Those facts are also what the M2b limitations deferred to M3 need.
+
+### Status
+
+- [ ] Steps 1–5 (see `tasks/todo.md`)

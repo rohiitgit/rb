@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-09-30 08:30]
+- M3a step 1: `rb-syntax` extracts more facts per file.
+  - **`imports`:** module as written, named imports with local names, module alias, wildcard and static flags. Covers ES imports, Java single-type, wildcard and static imports, Python `import`/`from` with relative levels, and Go specs.
+  - **`package`:** the Java or Go package clause.
+  - **`bindings`:** names with a known type (fields, parameters, typed locals, constructor initialisers, TS parameter properties, `this.x`/`self.x` members, Go struct fields and composite literals). Go and Python built-in types are dropped. Members are scoped to their class.
+  - The new modules are part of the extractor fingerprint, so cached facts are rebuilt.
+- Files affected: crates/rb-syntax/src/{lib,imports,bindings}.rs, tasks/contract-m3a.md.
+
 ## [2026-09-30 07:00]
 - M2b evaluator pass 7 fixes:
   - **`first_along`** re-examines a base after resolving it, so results no longer depend on source order.

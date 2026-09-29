@@ -4,7 +4,9 @@
 //! output can be cached by blob SHA. [`symbol_keys`] derives stable heuristic symbol keys (design
 //! §5.4) from a file's path and facts alone.
 
+mod bindings;
 mod decorations;
+mod imports;
 mod keys;
 mod queries;
 mod strings;
@@ -42,6 +44,8 @@ fn fingerprint_input() -> String {
         include_str!("queries.rs"),
         include_str!("strings.rs"),
         include_str!("decorations.rs"),
+        include_str!("imports.rs"),
+        include_str!("bindings.rs"),
     ]
     .join("\n")
 }
@@ -240,6 +244,56 @@ pub struct FileFacts {
     /// SQL-looking string expressions, in source order.
     #[serde(default)]
     pub sql: Vec<SqlCandidate>,
+    /// Import statements, in source order.
+    #[serde(default)]
+    pub imports: Vec<Import>,
+    /// The Java `package` or Go `package` clause.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Names bound to a declared or constructed type, in source order.
+    #[serde(default)]
+    pub bindings: Vec<Binding>,
+}
+
+/// One import statement (or one spec of a Go import block).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Import {
+    /// The module as written: `./auth` or `lib` (TS/JS); the package `com.acme`, or for a static
+    /// import the class `com.acme.B` (Java); `a.b`, `.` or `..p.q` (Python); `x/y` (Go).
+    pub module: String,
+    /// Names imported from the module, with their local names. TS/JS default imports are named
+    /// `default`.
+    pub names: Vec<ImportedName>,
+    /// Local name bound to the module itself: TS/JS `* as m`, Python `import a.b as c`, Go
+    /// `f "x/y"` (also `_` and `.`).
+    pub alias: Option<String>,
+    /// Java `.*`, Python `from m import *`.
+    pub wildcard: bool,
+    /// Java `import static`.
+    pub is_static: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedName {
+    pub name: String,
+    pub local: String,
+}
+
+/// A name whose type is known from its declaration or its constructor: a field, parameter or
+/// variable. `this.x`/`self.x` members are recorded by their member name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Binding {
+    pub name: String,
+    /// The type as written, without type arguments or pointer/reference markers (`User`,
+    /// `models.User`); never a built-in scalar type.
+    pub type_name: String,
+    /// Index into `FileFacts::definitions` of the scope: the enclosing function for locals and
+    /// parameters, the enclosing class for members; `None` for top-level code.
+    pub scope: Option<usize>,
+    /// A field or member (`this.x`, `self.x`, a TS parameter property, a Go struct field).
+    pub member: bool,
+    pub span: Span,
 }
 
 /// Parses `source` and extracts its definitions and references.
@@ -308,6 +362,32 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         })
         .collect();
 
+    let bindings: Vec<Binding> = bindings::bindings(language, root, source)
+        .into_iter()
+        .map(|b| {
+            let mut scope = enclosing(b.node.start_byte(), &starts, &ends, &lexical_parent)
+                .map(|i| nearest_kept(i, &kept, &lexical_parent));
+            // Members belong to their class, even when assigned in a method.
+            if b.member {
+                while let Some(i) = scope.filter(|&i| {
+                    !matches!(
+                        definitions[i].kind,
+                        DefKind::Class | DefKind::Interface | DefKind::Type
+                    )
+                }) {
+                    scope = definitions[i].parent;
+                }
+            }
+            Binding {
+                name: b.name,
+                type_name: b.type_name,
+                scope,
+                member: b.member,
+                span: span(b.node),
+            }
+        })
+        .collect();
+
     Ok(FileFacts {
         definitions,
         references,
@@ -323,6 +403,9 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                 text: c.text,
             })
             .collect(),
+        imports: imports::imports(language, root, source),
+        package: imports::package(language, root, source),
+        bindings,
     })
 }
 
