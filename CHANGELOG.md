@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026-09-29 12:20]
+- M2a step 1: new `rb-sql` crate. It uses `pg_query` 6.2 (the real PG17 parser) to split SQL into statements and report each table with its operations: read, insert, update, delete, merge, create, alter, drop, truncate.
+  - CTE names are excluded and system schemas are ignored.
+  - Unqualified names resolve to `public` and are flagged `schema_assumed`.
+  - Parse errors are returned, never guessed.
+- Files affected: crates/rb-sql/*, Cargo.toml, tasks/contract-m2a.md.
+
 ## [2026-09-29 11:30]
 - M1b review fixes, each test-first:
   - a Go method whose receiver type is declared in its own body crashed the process (a parent cycle). Methods now attach only to top-level types, and key building is iterative and cycle-safe;

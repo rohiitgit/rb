@@ -121,3 +121,13 @@ Findings from the research step (2026-09-29):
 - [x] 2. Symbol keys + indexer assembly: Symbol / DEFINED_IN / CONTAINS (C2, C5, C6, C7); unit tests.
 - [x] 3. Facts cache: store load/save + CLI orchestration + parse counter (C9–C12).
 - [x] 4. Fixture goldens (C15, C16), real-repo measurement (C18), doc sync, evaluator pass, commit.
+
+---
+
+# M2a SQL core (contract: tasks/contract-m2a.md)
+
+- [x] 1. `rb-sql` crate: statements, tables and operations via pg_query (S1–S5); 7 tests.
+- [ ] 2. rb-syntax: SQL candidates from string literals (template normalisation, callee name, prefilter) (S7, S8).
+- [ ] 3. Indexer: Table nodes, MIGRATES from `.sql` files, QUERIES from candidates, diagnostics (S6, S9–S12).
+- [ ] 4. `rb table-deps`, SQL coverage in `rb status`, fixture goldens (S13–S15).
+- [ ] 5. Public-repo measurement (S16), evaluator pass, fixes, docs, commit.
