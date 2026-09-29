@@ -118,6 +118,7 @@ string_enum! {
         Di => "di",
         HttpStitch => "http_stitch",
         SqlLiteral => "sql_literal",
+        SqlFile => "sql_file",
         Orm => "orm",
         Codeowners => "codeowners",
         Manifest => "manifest",

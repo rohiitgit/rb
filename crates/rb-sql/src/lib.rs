@@ -150,7 +150,7 @@ fn analyze_exact(sql: &str) -> Result<Vec<Statement>, String> {
             };
             let text = &sql[start..end];
             let range = (
-                start + (text.len() - text.trim_start().len()),
+                start + (text.len() - skip_leading_comments(text).len()),
                 start + text.trim_end().len(),
             );
             Ok(Statement {
@@ -159,6 +159,21 @@ fn analyze_exact(sql: &str) -> Result<Vec<Statement>, String> {
             })
         })
         .collect()
+}
+
+/// `text` without leading whitespace and SQL comments.
+fn skip_leading_comments(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, r)| r);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, r)| r);
+        } else {
+            return rest;
+        }
+    }
 }
 
 /// Tables of a single statement, with the operation each one undergoes.
@@ -329,6 +344,17 @@ mod tests {
             summary("SELECT * FROM public.users JOIN users u2 ON true"),
             [vec!["public.users:read"]]
         );
+    }
+
+    #[test]
+    fn statement_ranges_start_at_the_first_token() {
+        let sql = "-- header\n/* block */ SELECT 1 FROM a;\n-- trailing note\nSELECT 2 FROM b";
+        let ranges: Vec<&str> = analyze(sql)
+            .unwrap()
+            .iter()
+            .map(|s| &sql[s.range.0..s.range.1])
+            .collect();
+        assert_eq!(ranges, ["SELECT 1 FROM a", "SELECT 2 FROM b"]);
     }
 
     #[test]

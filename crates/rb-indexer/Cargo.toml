@@ -10,6 +10,7 @@ publish.workspace = true
 anyhow.workspace = true
 rb-git.workspace = true
 rb-model.workspace = true
+rb-sql.workspace = true
 rb-syntax.workspace = true
 serde_json.workspace = true
 

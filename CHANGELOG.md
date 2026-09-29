@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-09-29 13:40]
+- M2a step 3: the indexer adds `Table` nodes.
+  - `MIGRATES` (File → Table, provenance `sql_file`) for every statement in `.sql` files.
+  - `QUERIES` (Symbol or File → Table, provenance `sql_literal`) for SQL candidates. They are aggregated per (source, table), with the union of `ops`, the best certainty, and every site as evidence. Sink calls give `exact`; other candidates give `heuristic`.
+  - `unparsed_sql` is reported only for unparseable `.sql` files and sink arguments.
+  - Statement ranges now start at the first token, skipping leading comments.
+  - New provenance: `sql_file`.
+- Files affected: crates/rb-indexer/src/{lib,sql}.rs, crates/rb-sql/src/lib.rs, crates/rb-model/src/lib.rs, crates/rb-cli/tests/golden/polyglot-monorepo/dump.jsonl.
+
 ## [2026-09-29 13:05]
 - M2a step 2: `rb-syntax` extracts SQL candidates, meaning SQL-looking string expressions. They are cached in `FileFacts.sql` with the normalised text, span, enclosing definition and callee name.
   - Covers TS/JS template holes and tagged templates, Java text blocks (dedented), Python f-strings and implicit concatenation, Go raw strings, and `+` concatenation.

@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+mod sql;
 mod syntax;
 
 pub use syntax::{FactsCache, FactsKey, NoCache};
@@ -78,7 +79,21 @@ pub fn index_commit(
         .collect();
     diagnostics.extend(syntax::syntax_diagnostics(&facts_by_path));
 
-    let graph = assemble(&manifest, codeowners.as_ref(), &boundaries, &facts_by_path)?;
+    let (sql_files, skipped_sql) = sql::sql_plan(&manifest.files);
+    diagnostics.extend(skipped_sql);
+    let sql_texts = sql_files
+        .into_iter()
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<BTreeMap<&str, String>>>()?;
+
+    let (graph, assembly_diagnostics) = assemble(
+        &manifest,
+        codeowners.as_ref(),
+        &boundaries,
+        &facts_by_path,
+        &sql_texts,
+    )?;
+    diagnostics.extend(assembly_diagnostics);
     rb_model::sort_diagnostics(&mut diagnostics);
     Ok(Indexed {
         commit_sha: manifest.commit_sha,
@@ -121,13 +136,15 @@ fn load_codeowners(
     Ok(Some(co))
 }
 
-/// Builds the snapshot graph from the structural facts.
+/// Builds the snapshot graph from the structural, syntax and SQL facts; returns the diagnostics
+/// found while assembling (unparseable SQL).
 pub fn assemble(
     manifest: &Manifest,
     codeowners: Option<&Codeowners>,
     boundaries: &Boundaries,
     facts_by_path: &BTreeMap<&str, &rb_syntax::FileFacts>,
-) -> anyhow::Result<Graph> {
+    sql_texts: &BTreeMap<&str, String>,
+) -> anyhow::Result<(Graph, Vec<Diagnostic>)> {
     let mut b = GraphBuilder::new();
 
     // Services: one per project, plus the root as `unassigned` if files lie outside all projects.
@@ -192,10 +209,15 @@ pub fn assemble(
             }
         }
     }
+    let mut diagnostics = Vec::new();
     for (path, facts) in facts_by_path {
         syntax::add_symbols(&mut b, path, facts)?;
+        diagnostics.extend(sql::add_queries(&mut b, path, facts)?);
     }
-    b.finish()
+    for (path, text) in sql_texts {
+        diagnostics.extend(sql::add_migrations(&mut b, path, text)?);
+    }
+    Ok((b.finish()?, diagnostics))
 }
 
 /// Adds `OWNED_BY` edges from `src` for the CODEOWNERS rule deciding `path`, with the rule's line
@@ -335,7 +357,15 @@ mod tests {
             "* @acme/platform\n/api/src/ @alice docs@acme.io\n",
         );
         let boundaries = Boundaries::new(vec![project("api", "api/package.json")], vec![]);
-        let g = assemble(&manifest, Some(&co), &boundaries, &BTreeMap::new()).unwrap();
+        let g = assemble(
+            &manifest,
+            Some(&co),
+            &boundaries,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
 
         assert_eq!(
             edges_of(&g, EdgeKind::InService),
@@ -389,7 +419,15 @@ mod tests {
         let mut library = project(".", "package.json");
         library.deployable = false;
         let boundaries = Boundaries::new(vec![library], vec![]);
-        let g = assemble(&manifest, None, &boundaries, &BTreeMap::new()).unwrap();
+        let g = assemble(
+            &manifest,
+            None,
+            &boundaries,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
         assert!(
             g.nodes()
                 .iter()
@@ -408,7 +446,15 @@ mod tests {
             skipped: vec![],
         };
         let boundaries = Boundaries::new(vec![project("(root)", "(root)/package.json")], vec![]);
-        let g = assemble(&manifest, None, &boundaries, &BTreeMap::new()).unwrap();
+        let g = assemble(
+            &manifest,
+            None,
+            &boundaries,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
         assert_eq!(
             edges_of(&g, EdgeKind::InService),
             [
