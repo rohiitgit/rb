@@ -1,0 +1,7 @@
+{
+  "name": "auth-api",
+  "version": "1.0.0",
+  "main": "src/app.ts",
+  "scripts": { "start": "ts-node src/app.ts" },
+  "dependencies": { "express": "^4.19.2", "@prisma/client": "^5.18.0", "pg": "^8.12.0" }
+}

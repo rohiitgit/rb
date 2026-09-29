@@ -1,0 +1,25 @@
+[package]
+name = "rb-cli"
+description = "Repository Brain command-line interface (design §11.1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rb"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rb-git.workspace = true
+rb-model.workspace = true
+rb-store.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

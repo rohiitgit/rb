@@ -1,0 +1,25 @@
+# Repository Brain — local Postgres 18 + Apache AGE 1.8.0 (design §8.1).
+# Pinned by digest; `latest` is a different image from any release tag.
+name: repository-brain
+
+services:
+  brain-db:
+    image: apache/age:release_PG18_1.8.0@sha256:47a0b054c3663a3e64a25fc0c5a982f1b58348019274b326a691cdf77f78eb58
+    environment:
+      POSTGRES_USER: rb
+      POSTGRES_PASSWORD: rb
+      POSTGRES_DB: rb
+    ports:
+      - "127.0.0.1:55432:5432"   # 5432/5433 are taken by other local stacks
+    volumes:
+      - brain-db-data:/var/lib/postgresql
+        # AGE 1.8 CSV loaders only read under /tmp/age/ server-side; the indexer writes here (design §8.4).
+      - ./var/age-load:/tmp/age/rb-load
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rb -d rb"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  brain-db-data:

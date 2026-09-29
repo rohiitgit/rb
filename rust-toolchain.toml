@@ -1,0 +1,4 @@
+# Pinned for reproducible builds (design §3.3).
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
