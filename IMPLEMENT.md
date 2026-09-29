@@ -208,6 +208,26 @@ This file traces decisions from conversation to code. The design lives in `docs/
 
 - **Decided:** see `tasks/contract-m3a.md`. M3 is split: M3a resolves calls, types and implementations heuristically from Tree-sitter facts and ships `rb callers` / `rb impact`; M3b adds SCIP in containers. M3a adds import, package and typed-binding facts to `rb-syntax`. Those facts are also what the M2b limitations deferred to M3 need.
 
+- **Built:** step 1 (f272cda) imports, packages and bindings; steps 2–3 (73574a4) module and call resolution with coverage; step 4 (4d481aa) `rb callers` / `rb impact` with fixture goldens.
+- **Measured (R12):** public repos at pinned commits, release build, 2026-09-30.
+
+  | Repo @ commit | Index time | Resolved share (own code) | Resolved / ambiguous / unresolved / external | Hand-checked sample |
+  |---|---|---|---|---|
+  | spring-projects/spring-petclinic @ 818c4136ea97 | 0.89 s | 37.8% | 329 / 27 / 585 / 656 | 20/20 correct |
+  | honojs/hono @ 18331a905e24 | 0.46 s | 14.8% | 6,310 / 56 / 36,556 / 1,750 | 20/20 correct |
+  | gin-gonic/gin @ 1bd0ecf2d3e0 | 0.33 s | 70.3% | 4,860 / 72 / 2,086 / 5,162 | 20/20 correct |
+  | psf/requests @ 611c6162cbc4 | 0.18 s | 30.4% | 511 / 26 / 1,231 / 488 | 20/20 correct |
+
+  - **How the sample was drawn:** 20 `heuristic` edges per repo, in md5 order of their keys, each checked against its source line. All 80 were correct, including inherited targets, class-qualified and static calls, constructor calls and typed parameters.
+  - **Why unresolved is high:** calls on receivers without a declared type stay unresolved by design (invariant 3). The hono gap (untyped callback parameters such as `(c) => c.json()`, and test globals) is a hypothesis, not a measurement.
+- **Found in R12 and fixed:**
+  - Indexing psf/requests overflowed the stack. A binding such as `session = session.Session()` made type resolution recurse through itself. Type resolution now has an in-progress guard and a depth cap of 64, with a cycle test.
+- **Known imprecision (for the evaluator and M3b):**
+  - Parameters of anonymous functions are scoped to the enclosing named function, so they can type a same-named local outside the callback. In gin's `TestContextNext` this happened to give the right answer.
+  - A memoised supertype list can be cut short by the in-progress guard, but only when a supertype name resolves through a cyclic binding.
+
 ### Status
 
-- [ ] Steps 1–5 (see `tasks/todo.md`)
+- [x] Steps 1–4 committed; R12 measured.
+- [ ] Evaluator pass
+- [ ] Commit

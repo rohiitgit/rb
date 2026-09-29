@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026-09-30 13:00]
+- M3a R12 measured on spring-petclinic, hono, gin and requests; 80 of 80 sampled edges correct.
+- Fixed: type resolution recursed without bound through self-referential bindings (`session = session.Session()`), overflowing the stack on psf/requests. `Index::resolve_type` now has an in-progress guard and a depth cap of 64, with a test.
+- Files affected: crates/rb-indexer/src/resolve.rs, IMPLEMENT.md, tasks/lessons.md.
+
 ## [2026-09-30 12:00]
 - M3a step 4: the code questions.
   - **`rb_store::code`** holds pure functions over the snapshot graph.

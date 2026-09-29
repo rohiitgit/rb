@@ -224,7 +224,13 @@ struct Index<'a> {
     imports: BTreeMap<&'a str, Vec<Vec<&'a str>>>,
     /// Resolved direct supertypes of a type (memoised; resolving them never needs members).
     supers: RefCell<BTreeMap<Sym<'a>, Vec<Sym<'a>>>>,
+    /// Type resolutions in progress. Bindings can make them cyclic (`session =
+    /// session.Session()`): a resolution already in progress finds nothing.
+    resolving: RefCell<BTreeSet<(&'a str, Option<usize>, String)>>,
 }
+
+/// Nested type resolutions (through bindings and dotted names) followed at most.
+const MAX_TYPE_DEPTH: usize = 64;
 
 #[derive(Default)]
 struct Scopes<'a> {
@@ -276,6 +282,7 @@ impl<'a> Index<'a> {
             scopes,
             imports,
             supers: RefCell::new(BTreeMap::new()),
+            resolving: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -340,6 +347,24 @@ impl<'a> Index<'a> {
     /// Candidates for a type name used in `path` at `scope` (§5.4 levels; dotted names through
     /// their container).
     fn resolve_type(&self, path: &'a str, scope: Option<usize>, name: &str) -> Vec<Sym<'a>> {
+        let key = (path, scope, name.to_owned());
+        {
+            let mut resolving = self.resolving.borrow_mut();
+            if resolving.len() >= MAX_TYPE_DEPTH || !resolving.insert(key.clone()) {
+                return Vec::new();
+            }
+        }
+        let found = self.resolve_type_unguarded(path, scope, name);
+        self.resolving.borrow_mut().remove(&key);
+        found
+    }
+
+    fn resolve_type_unguarded(
+        &self,
+        path: &'a str,
+        scope: Option<usize>,
+        name: &str,
+    ) -> Vec<Sym<'a>> {
         if let Some((head, last)) = name.rsplit_once('.') {
             let found = match self.container(path, scope, head) {
                 Some(Container::Types(ts)) => ts
@@ -1291,5 +1316,27 @@ func (s *Server) helper() {}
             &[],
         );
         assert_eq!(unresolved(&built), [("app/x.py".into(), 0, 0, 1)]);
+    }
+
+    #[test]
+    fn self_referential_bindings_terminate() {
+        let built = build(
+            &[(
+                "app/s.py",
+                PY,
+                "def f():\n    session = session.Session()\n    session.get()\n    a = b.X()\n    b = a.Y()\n    a.go()\n",
+            )],
+            &[],
+        );
+        assert!(edges(&built, EdgeKind::Calls).is_empty());
+        let ts = build(
+            &[(
+                "src/a.ts",
+                TS,
+                "function f() { const x: x.T = mk(); x.go(); }\nclass C { c: C.D; m() { this.c.go(); } }\n",
+            )],
+            &[],
+        );
+        assert!(edges(&ts, EdgeKind::Calls).is_empty());
     }
 }
