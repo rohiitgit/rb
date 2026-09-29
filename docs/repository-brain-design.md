@@ -289,6 +289,19 @@ Heuristic symbol keys use a synthetic SCIP-shaped scheme: `rb-heuristic . . . `<
 - Repeated type-like declarations (TypeScript declaration merging) share one key: the first declaration's kind wins, and every site becomes `DEFINED_IN` evidence.
 - When SCIP later succeeds for that project, the keys are replaced wholesale.
 
+**As built in M3a** (contract `tasks/contract-m3a.md`):
+- **Facts:** `rb-syntax` caches `imports` (module, named imports with local names, alias, wildcard/static), the Java/Go `package` clause, and typed `bindings`. Bindings cover fields, parameters, typed locals, constructor initialisers, `this`/`self` members, TS parameter properties and Go struct fields and literals. Type references keep their qualifier (`store` in `store.DB`).
+- **Module resolution (`rb-indexer/src/modules.rs`):**
+  - TS/JS: relative specifiers, probing extensions and `index` files; `./x.js` may name `x.ts`. `tsconfig` `paths` is not read yet.
+  - Java: package + class, wildcards, static imports, nested classes.
+  - Python: the module path matched by suffix, with the longest shared directory prefix breaking ties; relative levels; `from pkg import submodule`.
+  - Go: the longest `go.mod` module prefix, then the package directory.
+- **Receivers:** only typed bindings, `this`/`self`/`super`, class names, fully qualified Java names and module aliases give a receiver a type. Inheritance is searched breadth-first, at most 64 levels.
+- **Constructors:** a call to a class resolves to its declared constructor; `new T()` is a class reference, because the grammars tag it that way.
+- **Coverage:** a per-file `unresolved_references` diagnostic counts unresolved calls, unresolved types and references into external packages; Go and Python built-ins are neither resolved nor counted. `rb status` prints the resolved share.
+- **Termination:** type resolution is guarded against cycles through bindings (`session = session.Session()`).
+- **Questions:** `rb callers` and `rb impact` run over the snapshot graph loaded into memory (`rb_store::code`). `path:line` picks the symbol declared at or nearest above that line, because symbols record their name position, not their extent.
+
 ### 5.5 External packages
 
 SCIP symbols from other packages (manager, package name, version) become `Package` nodes, with `REFERENCES`/`CALLS` edges to external `Symbol` stubs. Lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `go.sum`, Maven dependency tree output from the fetch phase, `poetry.lock`/`uv.lock`) give `Service -DEPENDS_ON-> Package` with resolved versions. This answers "who uses library X" and feeds the external section of the Service Card.
@@ -896,7 +909,8 @@ Each milestone is shippable and has an exit criterion that is a test, not a demo
 | **M1a Structure** | CODEOWNERS; service boundaries + `rb.toml`; edge evidence; `rb find`, `rb service` (structure sections) | GitHub-example CODEOWNERS tests; golden Service Cards on `polyglot-monorepo`. **Done 2026-09-29.** |
 | **M1b Syntax** | Tree-sitter defs/refs/scopes for TS/TSX/JS, Java, Python, Go; Symbol/DEFINED_IN/CONTAINS; facts cache (change sets moved to M3) | contract `tasks/contract-m1b.md` C1–C20; warm-cache run parses 0 files and dumps identically to a cold run |
 | **M2 Data access** | `rb-sql`: sinks, template normalisation, pg_query, sqlparser fallback, JPQL tokenizer; ORM packs (JPA, Prisma, TypeORM, SQLAlchemy); `QUERIES/MAPS_TO/MIGRATES` | `rb table-deps` golden at the symbol level (service roll-up via file→service); SQL coverage metrics |
-| **M3 Semantics** | SCIP orchestration (scip-java, scip-typescript first); SCIP⋈TS join; `CALLS/REFERENCES/IMPLEMENTS/CONTAINS`; Tier B heuristic resolver; CSR in rb-server; `rb callers`, `rb impact` | Q1/Q2 goldens on all fixtures, including `no-build`; incremental-equivalence test green |
+| **M3a Tier B** | Import, package and binding facts; module resolution; heuristic `CALLS/REFERENCES/IMPLEMENTS`; resolution coverage; `rb callers`, `rb impact` over the in-memory graph | contract `tasks/contract-m3a.md` R1–R13: Q1/Q2 goldens on all fixtures with must-not-exist cases; ≥ 90% precision on a hand-checked sample of 4 public repos |
+| **M3b SCIP** | SCIP orchestration in pinned containers (scip-java, scip-typescript first); SCIP⋈TS join; key replacement per project; change sets; orphan detection | exact edges on the fixtures that build; incremental-equivalence test green |
 | **M4 Frameworks** | route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card | Q3/Q4 goldens on `polyglot-monorepo`; precision guards (must-not-exist edges) green |
 | **M5 Scale & API** | REST API with guard rails; bulk AGE loading; snapshot retention; `rb diff`; benchmark on 2 large OSS repos | §12.5 targets met or gaps documented with profiles |
 | **M6 Breadth** | scip-python/go/clang/rust-analyzer; Kotlin/C#; OpenAPI/gRPC packs; gateway configs; message topics; architecture-rule checks in Cypher as a CI gate | per-language fixtures; rules engine golden tests |
