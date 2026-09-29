@@ -457,14 +457,19 @@ fn files(n: usize) -> String {
 /// Text rendering of `rb table-deps` (design §9.4, symbol level).
 fn render_table_deps(d: &TableDeps) -> String {
     let access_line = |a: &TableAccess| {
-        let ops = a.ops.join("+");
+        // Mappings carry no operations.
+        let ops = if a.ops.is_empty() {
+            String::new()
+        } else {
+            format!("{}  ", a.ops.join("+"))
+        };
         let assumed = if a.schema_assumed {
             ", schema assumed"
         } else {
             ""
         };
         format!(
-            "{}  {ops}  {}:{}  [{}{assumed}]",
+            "{}  {ops}{}:{}  [{}{assumed}]",
             source_label(a),
             a.file,
             a.line,
@@ -478,6 +483,12 @@ fn render_table_deps(d: &TableDeps) -> String {
     }
     for m in &d.migrations {
         out += &format!("│    {}  ({})\n", access_line(m), m.service_name);
+    }
+    if !d.mappings.is_empty() {
+        out += "├─ Mapped by\n";
+        for m in &d.mappings {
+            out += &format!("│    {}  ({})\n", access_line(m), m.service_name);
+        }
     }
     out += "├─ Accessed by\n";
     if d.accesses.is_empty() {

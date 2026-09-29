@@ -15,7 +15,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser, QueryCursor, StreamingIterator};
 
-pub use keys::symbol_keys;
+pub use keys::{symbol_keys, type_symbol_key};
 
 /// Grammar versions (checked against Cargo.lock by a test). Query text and the extractor's own
 /// source code are fingerprinted automatically by [`extractor_id`], so no manual bump is needed.

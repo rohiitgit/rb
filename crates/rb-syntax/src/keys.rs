@@ -42,6 +42,12 @@ pub fn symbol_keys(path: &str, facts: &FileFacts) -> Vec<String> {
         .collect()
 }
 
+/// The key of a type-like symbol declared outside any grammar we parse (e.g. a Prisma `model`),
+/// in the same shape as [`symbol_keys`] gives a top-level class.
+pub fn type_symbol_key(path: &str, name: &str) -> String {
+    format!("{SCHEME_AND_PACKAGE}{}/{}#", escape(path), escape(name))
+}
+
 /// SCIP descriptors. Callables that share a name within one scope get `(+n)` in source order;
 /// repeated type-like declarations (e.g. TypeScript declaration merging) share one descriptor.
 fn descriptors(defs: &[Definition]) -> Vec<String> {

@@ -194,9 +194,11 @@ const PARSE_BATCH: usize = 512;
 
 /// Per parsed file: `syntax_error` if the tree had errors, `definitions_too_deep` if nesting was
 /// truncated at `rb_syntax::MAX_NESTING`.
-pub(crate) fn syntax_diagnostics(facts_by_path: &BTreeMap<&str, &FileFacts>) -> Vec<Diagnostic> {
+pub(crate) fn syntax_diagnostics(
+    facts_by_path: &BTreeMap<&str, (Language, &FileFacts)>,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for (path, facts) in facts_by_path {
+    for (path, (_, facts)) in facts_by_path {
         if let Some(span) = facts.syntax_error {
             out.push(Diagnostic {
                 kind: "syntax_error".into(),
@@ -445,9 +447,12 @@ mod tests {
         let broken =
             rb_syntax::extract(Language::Python, b"def ok():\n    pass\ndef bad(:\n").unwrap();
         let clean = rb_syntax::extract(Language::Python, b"x = 1\n").unwrap();
-        let by_path: BTreeMap<&str, &FileFacts> = [("bad.py", &broken), ("ok.py", &clean)]
-            .into_iter()
-            .collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = [
+            ("bad.py", (Language::Python, &broken)),
+            ("ok.py", (Language::Python, &clean)),
+        ]
+        .into_iter()
+        .collect();
         let diagnostics = syntax_diagnostics(&by_path);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].kind, "syntax_error");
@@ -457,7 +462,10 @@ mod tests {
         let depth = rb_syntax::MAX_NESTING + 1;
         let src = format!("{}{}", "function a(){".repeat(depth), "}".repeat(depth));
         let truncated = rb_syntax::extract(Language::JavaScript, src.as_bytes()).unwrap();
-        let by_path: BTreeMap<&str, &FileFacts> = [("deep.js", &truncated)].into_iter().collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> =
+            [("deep.js", (Language::JavaScript, &truncated))]
+                .into_iter()
+                .collect();
         let kinds: Vec<String> = syntax_diagnostics(&by_path)
             .into_iter()
             .map(|d| d.kind)

@@ -72,7 +72,7 @@ impl TableUse {
     /// Natural key of the `Table` node (design §8.2): `schema.table`, with a part double-quoted
     /// (SQL style) when it contains `.` or `"`, so `"a.b".c` and `a."b.c"` never collide.
     pub fn key(&self) -> String {
-        format!("{}.{}", quote_part(&self.schema), quote_part(&self.name))
+        table_key(&self.schema, &self.name)
     }
 }
 
@@ -108,6 +108,11 @@ pub fn analyze(sql: &str) -> Analysis {
         }
     }
     analysis
+}
+
+/// The `Table` node key for a schema and table name (see [`TableUse::key`]).
+pub fn table_key(schema: &str, name: &str) -> String {
+    format!("{}.{}", quote_part(schema), quote_part(name))
 }
 
 fn quote_part(part: &str) -> String {

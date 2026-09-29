@@ -472,3 +472,26 @@ fn facts_cache_is_keyed_by_extractor_version() {
     assert!(store.load_facts(&[row("test-v2;go")]).unwrap().is_empty());
     assert!(store.load_facts(&[row("test-v1;java")]).unwrap().is_empty());
 }
+
+/// M2b (contract O8): ORM mappings and accesses in `rb table-deps`, per ORM fixture.
+#[test]
+fn orm_table_deps_goldens() {
+    let Some(url) = db_url() else { return };
+    for (fixture, table) in [("java-spring-jpa", "users"), ("ts-express-prisma", "users")] {
+        let repo = fixture_repo(fixture);
+        let name = format!("t_orm_{}_{}", fixture.replace('-', "_"), std::process::id());
+        let _cleanup = Cleanup {
+            url: &url,
+            repos: vec![name.clone()],
+        };
+        rb(
+            &url,
+            &["index", repo.path().to_str().unwrap(), "--repo", &name],
+        );
+        golden(
+            fixture,
+            "table-deps-users.txt",
+            &rb(&url, &["table-deps", table, "--repo", &name]),
+        );
+    }
+}

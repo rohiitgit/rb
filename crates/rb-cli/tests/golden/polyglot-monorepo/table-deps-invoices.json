@@ -17,6 +17,7 @@
       "service_name": "github.com/acme/billing"
     }
   ],
+  "mappings": [],
   "accesses": [
     {
       "source_kind": "symbol",

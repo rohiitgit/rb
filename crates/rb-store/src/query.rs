@@ -74,6 +74,8 @@ pub struct TableDeps {
     pub key: String,
     pub name: String,
     pub migrations: Vec<TableAccess>,
+    /// ORM classes and models mapped to the table (`MAPS_TO`).
+    pub mappings: Vec<TableAccess>,
     pub accesses: Vec<TableAccess>,
 }
 
@@ -189,10 +191,11 @@ impl Store {
                            AND f.id = CASE WHEN s.kind = 'file' THEN s.id ELSE d.dst END
              JOIN rb.edge m ON m.snapshot_id = e.snapshot_id AND m.src = f.id AND m.kind = 'IN_SERVICE'
              JOIN rb.node svc ON svc.snapshot_id = e.snapshot_id AND svc.id = m.dst
-             WHERE e.snapshot_id = $1 AND e.dst = $2 AND e.kind IN ('MIGRATES', 'QUERIES')",
+             WHERE e.snapshot_id = $1 AND e.dst = $2 AND e.kind IN ('MIGRATES', 'QUERIES', 'MAPS_TO')",
             &[&snapshot_id, &table_id],
         )?;
         let mut migrations = Vec::new();
+        let mut mappings = Vec::new();
         let mut accesses = Vec::new();
         for r in &rows {
             let attrs: Value = r.get(4);
@@ -217,10 +220,10 @@ impl Store {
                 service_key: r.get(8),
                 service_name: r.get(9),
             };
-            if r.get::<_, String>(0) == "MIGRATES" {
-                migrations.push(access);
-            } else {
-                accesses.push(access);
+            match r.get::<_, String>(0).as_str() {
+                "MIGRATES" => migrations.push(access),
+                "MAPS_TO" => mappings.push(access),
+                _ => accesses.push(access),
             }
         }
         // Bytewise order, independent of the database collation.
@@ -233,11 +236,13 @@ impl Store {
             ))
         };
         migrations.sort_by(order);
+        mappings.sort_by(order);
         accesses.sort_by(order);
         Ok(TableDeps {
             key: key.to_owned(),
             name: table.get(1),
             migrations,
+            mappings,
             accesses,
         })
     }

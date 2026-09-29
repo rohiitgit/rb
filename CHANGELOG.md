@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-09-29 20:10]
+- M2b step 3: the indexer emits ORM edges.
+  - **`MAPS_TO`** (class or Prisma model → table, provenance `orm`): exact for explicit names, synthetic when the name comes from a naming rule. JPA names are folded to lowercase, as Hibernate emits them unquoted.
+  - **ORM `QUERIES`:** native `@Query` is exact, conventions are synthetic, and JPQL is heuristic. Entities resolve across files, and duplicate entity names give `ambiguous`.
+  - **Diagnostics:** `orm_unresolved_entity`.
+  - **Prisma models** become symbols defined in `schema.prisma`.
+  - **`assemble`** now takes a `Content` struct (facts, `.sql`, `.prisma`).
+  - **`rb table-deps`** shows "Mapped by".
+  - New goldens for the JPA and Prisma fixtures.
+- Files affected: crates/rb-indexer/src/{lib,orm,sql,syntax}.rs, crates/rb-sql/src/lib.rs, crates/rb-syntax/src/{lib,keys}.rs, crates/rb-store/src/query.rs, crates/rb-cli/{src/main.rs,tests/e2e.rs}, goldens.
+
 ## [2026-09-29 19:20]
 - M2b step 2: new `rb-frameworks` crate. Pure packs over syntax facts cover:
   - JPA `@Entity`/`@Table` (by default the table is the entity name snake-cased, flagged assumed);

@@ -43,13 +43,17 @@ pub(crate) const SQL_SINKS: &[&str] = &[
 /// strings are left to the ORM packs (M2b) instead of being misread as SQL tables.
 const NON_SQL_CALLEES: &[&str] = &["createquery"];
 
-/// `.sql` files to read, and oversized ones reported (same cap and skips as source files).
-pub(crate) fn sql_plan(files: &[FileEntry]) -> (Vec<&FileEntry>, Vec<Diagnostic>) {
+/// Text files of `lang` (e.g. `sql`, `prisma`) to read, and oversized ones reported (same cap and
+/// skips as source files).
+pub(crate) fn text_plan<'f>(
+    files: &'f [FileEntry],
+    lang: &str,
+) -> (Vec<&'f FileEntry>, Vec<Diagnostic>) {
     let mut plan = Vec::new();
     let mut diagnostics = Vec::new();
     for f in files
         .iter()
-        .filter(|f| f.lang == Some("sql") && !f.binary && !f.generated)
+        .filter(|f| f.lang == Some(lang) && !f.binary && !f.generated)
     {
         if f.size > rb_syntax::MAX_PARSE_BYTES {
             diagnostics.push(Diagnostic {
@@ -165,10 +169,16 @@ struct Access {
 }
 
 #[derive(Default)]
-struct Accesses(BTreeMap<(NodeKey, String), Access>);
+pub(crate) struct Accesses(BTreeMap<(NodeKey, String), Access>);
 
 impl Accesses {
-    fn record(&mut self, source: &NodeKey, table: &TableUse, certainty: Certainty, at: &Evidence) {
+    pub(crate) fn record(
+        &mut self,
+        source: &NodeKey,
+        table: &TableUse,
+        certainty: Certainty,
+        at: &Evidence,
+    ) {
         let access = self
             .0
             .entry((source.clone(), table.key()))
@@ -185,7 +195,7 @@ impl Accesses {
         access.evidence.insert(at.clone());
     }
 
-    fn emit(
+    pub(crate) fn emit(
         self,
         b: &mut GraphBuilder,
         kind: EdgeKind,

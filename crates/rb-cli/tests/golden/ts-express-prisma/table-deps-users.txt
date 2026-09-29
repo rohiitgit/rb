@@ -1,0 +1,9 @@
+public.users  (table users)
+├─ Migrations
+│    none (not created by any .sql file in this repo)
+├─ Mapped by
+│    User#  prisma/schema.prisma:6  [exact, schema assumed]  (auth-api)
+├─ Accessed by
+│    auth-api (.)
+│      findUserByEmail()  read  src/db/users.ts:8  [synthetic, schema assumed]
+└─ Callers up to entry points arrive with call resolution (M3)

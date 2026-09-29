@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+mod orm;
 mod sql;
 mod syntax;
 
@@ -67,32 +68,34 @@ pub fn index_commit(
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let (facts, parsed) =
         syntax::load_or_parse(&|blob: &str| repo.blob(blob), &plan, cache, threads)?;
-    let facts_by_path: BTreeMap<&str, &rb_syntax::FileFacts> = plan
+    let facts_by_path: BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)> = plan
         .iter()
         .map(|(f, language)| {
             let key = FactsKey {
                 blob: f.blob_sha.clone(),
                 language: *language,
             };
-            (f.path.as_str(), &facts[&key])
+            (f.path.as_str(), (*language, &facts[&key]))
         })
         .collect();
     diagnostics.extend(syntax::syntax_diagnostics(&facts_by_path));
 
-    let (sql_files, skipped_sql) = sql::sql_plan(&manifest.files);
-    diagnostics.extend(skipped_sql);
-    let sql_texts = sql_files
-        .into_iter()
-        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
-        .collect::<anyhow::Result<BTreeMap<&str, String>>>()?;
+    let mut texts = |lang: &str| -> anyhow::Result<BTreeMap<&str, String>> {
+        let (files, skipped) = sql::text_plan(&manifest.files, lang);
+        diagnostics.extend(skipped);
+        files
+            .into_iter()
+            .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+            .collect()
+    };
+    let content = Content {
+        facts: facts_by_path,
+        sql: texts("sql")?,
+        prisma: texts("prisma")?,
+    };
 
-    let (graph, assembly_diagnostics) = assemble(
-        &manifest,
-        codeowners.as_ref(),
-        &boundaries,
-        &facts_by_path,
-        &sql_texts,
-    )?;
+    let (graph, assembly_diagnostics) =
+        assemble(&manifest, codeowners.as_ref(), &boundaries, &content)?;
     diagnostics.extend(assembly_diagnostics);
     rb_model::sort_diagnostics(&mut diagnostics);
     Ok(Indexed {
@@ -136,14 +139,24 @@ fn load_codeowners(
     Ok(Some(co))
 }
 
-/// Builds the snapshot graph from the structural, syntax and SQL facts; returns the diagnostics
-/// found while assembling (unparseable SQL).
+/// Everything read from a commit besides its structure, by path.
+#[derive(Default)]
+pub struct Content<'a> {
+    /// Parsed source files.
+    pub facts: BTreeMap<&'a str, (rb_syntax::Language, &'a rb_syntax::FileFacts)>,
+    /// `.sql` files.
+    pub sql: BTreeMap<&'a str, String>,
+    /// `.prisma` schema files.
+    pub prisma: BTreeMap<&'a str, String>,
+}
+
+/// Builds the snapshot graph from the structural, syntax, SQL and ORM facts; returns the
+/// diagnostics found while assembling (unparseable SQL, unresolved ORM entities).
 pub fn assemble(
     manifest: &Manifest,
     codeowners: Option<&Codeowners>,
     boundaries: &Boundaries,
-    facts_by_path: &BTreeMap<&str, &rb_syntax::FileFacts>,
-    sql_texts: &BTreeMap<&str, String>,
+    content: &Content<'_>,
 ) -> anyhow::Result<(Graph, Vec<Diagnostic>)> {
     let mut b = GraphBuilder::new();
 
@@ -210,11 +223,22 @@ pub fn assemble(
         }
     }
     let mut diagnostics = Vec::new();
-    for (path, facts) in facts_by_path {
+    // ORM mappings from every file first, so accesses can resolve entities across files.
+    let mut orm_index = orm::OrmIndex::default();
+    for (path, (language, facts)) in &content.facts {
         syntax::add_symbols(&mut b, path, facts)?;
         diagnostics.extend(sql::add_queries(&mut b, path, facts)?);
+        orm::add_mappings(&mut b, path, *language, facts, &mut orm_index)?;
     }
-    for (path, text) in sql_texts {
+    for (path, text) in &content.prisma {
+        orm::add_prisma_models(&mut b, path, text, &mut orm_index)?;
+    }
+    for (path, (language, facts)) in &content.facts {
+        diagnostics.extend(orm::add_accesses(
+            &mut b, path, *language, facts, &orm_index,
+        )?);
+    }
+    for (path, text) in &content.sql {
         diagnostics.extend(sql::add_migrations(&mut b, path, text)?);
     }
     Ok((b.finish()?, diagnostics))
@@ -357,15 +381,9 @@ mod tests {
             "* @acme/platform\n/api/src/ @alice docs@acme.io\n",
         );
         let boundaries = Boundaries::new(vec![project("api", "api/package.json")], vec![]);
-        let g = assemble(
-            &manifest,
-            Some(&co),
-            &boundaries,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap()
-        .0;
+        let g = assemble(&manifest, Some(&co), &boundaries, &Content::default())
+            .unwrap()
+            .0;
 
         assert_eq!(
             edges_of(&g, EdgeKind::InService),
@@ -419,15 +437,9 @@ mod tests {
         let mut library = project(".", "package.json");
         library.deployable = false;
         let boundaries = Boundaries::new(vec![library], vec![]);
-        let g = assemble(
-            &manifest,
-            None,
-            &boundaries,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap()
-        .0;
+        let g = assemble(&manifest, None, &boundaries, &Content::default())
+            .unwrap()
+            .0;
         assert!(
             g.nodes()
                 .iter()
@@ -446,15 +458,9 @@ mod tests {
             skipped: vec![],
         };
         let boundaries = Boundaries::new(vec![project("(root)", "(root)/package.json")], vec![]);
-        let g = assemble(
-            &manifest,
-            None,
-            &boundaries,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap()
-        .0;
+        let g = assemble(&manifest, None, &boundaries, &Content::default())
+            .unwrap()
+            .0;
         assert_eq!(
             edges_of(&g, EdgeKind::InService),
             [

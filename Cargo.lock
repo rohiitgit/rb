@@ -1902,6 +1902,7 @@ name = "rb-indexer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rb-frameworks",
  "rb-git",
  "rb-model",
  "rb-sql",
