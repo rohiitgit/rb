@@ -24,7 +24,7 @@ pub const MAX_PARSE_BYTES: u64 = 1024 * 1024;
 
 pub type Span = rb_model::Span;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Language {
     TypeScript,
     Tsx,
@@ -35,6 +35,17 @@ pub enum Language {
 }
 
 impl Language {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Language::TypeScript => "typescript",
+            Language::Tsx => "tsx",
+            Language::JavaScript => "javascript",
+            Language::Java => "java",
+            Language::Python => "python",
+            Language::Go => "go",
+        }
+    }
+
     /// Maps `FileEntry::lang` (from `rb_git::language_for_path`) to a parser, if one exists.
     pub fn from_lang(lang: &str) -> Option<Self> {
         Some(match lang {
@@ -622,6 +633,9 @@ export function hash(s: string): string {
             ("sql", None),
         ] {
             assert_eq!(Language::from_lang(lang), expected, "{lang}");
+            if let Some(l) = expected {
+                assert_eq!(l.as_str(), lang);
+            }
         }
     }
 

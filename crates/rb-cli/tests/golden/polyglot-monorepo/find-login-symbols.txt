@@ -1,0 +1,4 @@
+symbol	rb-heuristic . . . `apps/web/src/api/auth.ts`/login().	login
+symbol	rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login().	login
+symbol	rb-heuristic . . . `apps/web/src/pages/Login.tsx`/LoginForm().	LoginForm
+symbol	rb-heuristic . . . `apps/web/src/pages/Login.tsx`/LoginForm().onSubmit().	onSubmit

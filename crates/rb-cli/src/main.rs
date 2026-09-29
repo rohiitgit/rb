@@ -282,7 +282,8 @@ fn index(
         commit_sha,
         graph,
         diagnostics,
-    } = rb_indexer::index_commit(&path, &commit_sha)?;
+        ..
+    } = rb_indexer::index_commit(&path, &commit_sha, &mut rb_indexer::NoCache)?;
     let snap = store.publish_snapshot(
         &repo,
         &commit_sha,

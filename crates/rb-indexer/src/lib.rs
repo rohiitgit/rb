@@ -6,6 +6,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+mod syntax;
+
+pub use syntax::{FactsCache, FactsKey, NoCache};
+
 use rb_git::Repo;
 use rb_git::boundaries::{self, Boundaries, Project};
 use rb_git::codeowners::{self, Codeowners};
@@ -16,7 +20,7 @@ use rb_model::{
 use serde_json::{Value, json};
 
 /// Identifies the extraction pipeline; bump whenever indexing output changes for the same input.
-pub const PIPELINE: &str = "m1a-structure-1";
+pub const PIPELINE: &str = "m1b-syntax-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -28,10 +32,16 @@ pub struct Indexed {
     pub graph: Graph,
     /// In canonical order.
     pub diagnostics: Vec<Diagnostic>,
+    /// Blobs parsed in this run (cache misses); 0 on a fully warm cache.
+    pub parsed: usize,
 }
 
-/// Indexes `rev` of the repository at `repo_path`.
-pub fn index_commit(repo_path: &Path, rev: &str) -> anyhow::Result<Indexed> {
+/// Indexes `rev` of the repository at `repo_path`, reusing and filling `cache`.
+pub fn index_commit(
+    repo_path: &Path,
+    rev: &str,
+    cache: &mut dyn FactsCache,
+) -> anyhow::Result<Indexed> {
     let repo = Repo::open(repo_path)?;
     let manifest = repo.manifest(rev)?;
     let read = |f: &FileEntry| repo.blob_text(&f.blob_sha);
@@ -51,12 +61,30 @@ pub fn index_commit(repo_path: &Path, rev: &str) -> anyhow::Result<Indexed> {
     let boundaries = boundaries::detect(&manifest.files, &read)?;
     diagnostics.extend(boundaries.diagnostics.iter().cloned());
 
-    let graph = assemble(&manifest, codeowners.as_ref(), &boundaries)?;
+    let (plan, skipped) = syntax::parse_plan(&manifest.files);
+    diagnostics.extend(skipped);
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let (facts, parsed) =
+        syntax::load_or_parse(&|blob: &str| repo.blob(blob), &plan, cache, threads)?;
+    let facts_by_path: BTreeMap<&str, &rb_syntax::FileFacts> = plan
+        .iter()
+        .map(|(f, language)| {
+            let key = FactsKey {
+                blob: f.blob_sha.clone(),
+                language: *language,
+            };
+            (f.path.as_str(), &facts[&key])
+        })
+        .collect();
+    diagnostics.extend(syntax::syntax_diagnostics(&facts_by_path));
+
+    let graph = assemble(&manifest, codeowners.as_ref(), &boundaries, &facts_by_path)?;
     rb_model::sort_diagnostics(&mut diagnostics);
     Ok(Indexed {
         commit_sha: manifest.commit_sha,
         graph,
         diagnostics,
+        parsed,
     })
 }
 
@@ -98,6 +126,7 @@ pub fn assemble(
     manifest: &Manifest,
     codeowners: Option<&Codeowners>,
     boundaries: &Boundaries,
+    facts_by_path: &BTreeMap<&str, &rb_syntax::FileFacts>,
 ) -> anyhow::Result<Graph> {
     let mut b = GraphBuilder::new();
 
@@ -162,6 +191,9 @@ pub fn assemble(
                 )?;
             }
         }
+    }
+    for (path, facts) in facts_by_path {
+        syntax::add_symbols(&mut b, path, facts)?;
     }
     b.finish()
 }
@@ -303,7 +335,7 @@ mod tests {
             "* @acme/platform\n/api/src/ @alice docs@acme.io\n",
         );
         let boundaries = Boundaries::new(vec![project("api", "api/package.json")], vec![]);
-        let g = assemble(&manifest, Some(&co), &boundaries).unwrap();
+        let g = assemble(&manifest, Some(&co), &boundaries, &BTreeMap::new()).unwrap();
 
         assert_eq!(
             edges_of(&g, EdgeKind::InService),
@@ -357,7 +389,7 @@ mod tests {
         let mut library = project(".", "package.json");
         library.deployable = false;
         let boundaries = Boundaries::new(vec![library], vec![]);
-        let g = assemble(&manifest, None, &boundaries).unwrap();
+        let g = assemble(&manifest, None, &boundaries, &BTreeMap::new()).unwrap();
         assert!(
             g.nodes()
                 .iter()
@@ -376,7 +408,7 @@ mod tests {
             skipped: vec![],
         };
         let boundaries = Boundaries::new(vec![project("(root)", "(root)/package.json")], vec![]);
-        let g = assemble(&manifest, None, &boundaries).unwrap();
+        let g = assemble(&manifest, None, &boundaries, &BTreeMap::new()).unwrap();
         assert_eq!(
             edges_of(&g, EdgeKind::InService),
             [

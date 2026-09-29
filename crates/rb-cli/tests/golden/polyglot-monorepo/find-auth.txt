@@ -1,6 +1,8 @@
 file	apps/web/src/api/auth.ts	auth.ts
 service	services/auth	auth-service
+symbol	rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#	AuthController
+symbol	rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#AuthController().	AuthController
 file	services/auth/src/main/java/com/acme/auth/AuthController.java	AuthController.java
 file	services/auth/pom.xml	pom.xml
+symbol	rb-heuristic . . . `apps/web/src/api/auth.ts`/login().	login
 file	services/auth/src/main/java/com/acme/auth/MfaClient.java	MfaClient.java
-file	services/auth/src/main/resources/db/migration/V1__users.sql	V1__users.sql

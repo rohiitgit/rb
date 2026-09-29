@@ -138,7 +138,7 @@ fn check_fixture(fixture: &str, tag: &str) {
     assert_eq!(rb(&url, &["dump", "--repo", &a]), dump_a, "forced rebuild");
 
     // The stored snapshot is faithful to the in-memory pipeline output.
-    let indexed = rb_indexer::index_commit(repo.path(), "HEAD").unwrap();
+    let indexed = rb_indexer::index_commit(repo.path(), "HEAD", &mut rb_indexer::NoCache).unwrap();
     assert_eq!(
         canonical_dump(&indexed.commit_sha, &indexed.graph, &indexed.diagnostics),
         dump_a,
@@ -336,7 +336,18 @@ fn polyglot_monorepo_structure_goldens() {
         "find-owners.txt",
         &rb(&url, &["find", "acme", "--kind", "owner", "--repo", &name]),
     );
-    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+    golden(
+        fixture,
+        "find-login-symbols.txt",
+        &rb(
+            &url,
+            &["find", "login", "--kind", "symbol", "--repo", &name],
+        ),
+    );
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    // M1b extracts call references but must not emit unresolved CALLS edges (contract C7).
+    assert!(!dump.contains("\"CALLS\""), "M1b must not emit CALLS edges");
+    golden(fixture, "dump.jsonl", &dump);
 
     let err = rb_fails(&url, &["service", "no-such-service", "--repo", &name]);
     assert!(err.contains("no service matches"), "{err}");
