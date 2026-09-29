@@ -148,5 +148,5 @@ Findings from the research step (2026-09-29):
 - [x] 1. rb-syntax: imports, package clause, typed bindings (R1, R2).
 - [x] 2. Indexer: module resolution (R3).
 - [x] 3. Indexer: call, type and implements resolution; coverage (R4–R8).
-- [ ] 4. rb-store and CLI: `rb callers`, `rb impact` (R9, R10); fixtures and goldens (R11).
+- [x] 4. rb-store and CLI: `rb callers`, `rb impact` (R9, R10); fixtures and goldens (R11).
 - [ ] 5. Public repos (R12), evaluator passes, docs, commit.

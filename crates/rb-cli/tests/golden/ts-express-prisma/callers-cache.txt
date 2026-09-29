@@ -1,0 +1,3 @@
+callers of Cache#findUserByEmail().  src/cache.ts:3  [auth-api]
+  (no callers found)
+certainty: -

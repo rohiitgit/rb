@@ -1,0 +1,3 @@
+callers of LegacyAuth#authenticate().  src/main/java/com/acme/auth/LegacyAuth.java:5  [auth-service]
+  (no callers found)
+certainty: -

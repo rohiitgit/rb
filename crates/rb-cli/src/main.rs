@@ -5,6 +5,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
+
+mod code;
 use clap::{Args, Parser, Subcommand};
 use rb_model::{NodeKind, ServiceRole, canonical_dump};
 use rb_store::{LoadDir, Resolved, ServiceCard, SnapshotInfo, Store, TableAccess, TableDeps};
@@ -108,6 +110,37 @@ enum Command {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// Show what calls a function or method (Q1), as a caller tree.
+    Callers {
+        /// A symbol key, `path:line`, a key suffix (`AuthService#login().`), `Class.method` or a
+        /// name.
+        target: String,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Levels of callers to follow (1-25).
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Also count function values passed around (`REFERENCES`).
+        #[arg(long)]
+        include_references: bool,
+        /// Ignore edges below this certainty (ambiguous, heuristic, synthetic, dispatch, exact).
+        #[arg(long, default_value = "ambiguous", value_parser = code::parse_certainty)]
+        min_certainty: rb_model::Certainty,
+        /// Choose among several matching symbols (1-based, as listed).
+        #[arg(long)]
+        pick: Option<usize>,
+    },
+    /// Show what breaks if a symbol or table is removed (Q2).
+    Impact {
+        /// As for `callers`; a table key (`public.users`) also works.
+        target: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long, default_value = "ambiguous", value_parser = code::parse_certainty)]
+        min_certainty: rb_model::Certainty,
+        #[arg(long)]
+        pick: Option<usize>,
     },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
@@ -271,6 +304,45 @@ fn main() -> anyhow::Result<()> {
             } else {
                 print!("{}", render_table_deps(&deps));
             }
+        }
+        Command::Callers {
+            target,
+            repo,
+            depth,
+            include_references,
+            min_certainty,
+            pick,
+        } => {
+            ensure!(
+                (1..=rb_store::code::MAX_CALLER_DEPTH).contains(&depth),
+                "--depth must be between 1 and {}",
+                rb_store::code::MAX_CALLER_DEPTH
+            );
+            let snap = live_snapshot(&mut store, repo)?;
+            let graph = store.load_graph(snap.id)?;
+            let t = code::pick_target(&graph, &target, pick)?;
+            let tree = rb_store::code::callers(
+                &graph,
+                t,
+                rb_store::code::CallerOptions {
+                    depth,
+                    include_references,
+                    min_certainty,
+                },
+            );
+            print!("{}", code::render_callers(&graph, &tree));
+        }
+        Command::Impact {
+            target,
+            repo,
+            min_certainty,
+            pick,
+        } => {
+            let snap = live_snapshot(&mut store, repo)?;
+            let graph = store.load_graph(snap.id)?;
+            let t = code::pick_target(&graph, &target, pick)?;
+            let impact = rb_store::code::impact(&graph, t, min_certainty);
+            print!("{}", code::render_impact(&graph, &impact));
         }
         Command::Cypher { query, repo, cols } => {
             let snap = live_snapshot(&mut store, repo)?;

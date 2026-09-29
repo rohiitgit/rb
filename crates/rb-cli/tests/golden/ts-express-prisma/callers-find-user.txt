@@ -1,0 +1,3 @@
+callers of findUserByEmail().  src/db/users.ts:7  [auth-api]
+  src/routes/auth.ts (top-level code)  [auth-api]  heuristic
+certainty: heuristic 1

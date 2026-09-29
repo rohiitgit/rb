@@ -513,3 +513,91 @@ fn orm_table_deps_goldens() {
         );
     }
 }
+
+/// Contract M3a R9-R11: `rb callers` and `rb impact` goldens on every fixture, including the
+/// must-not-exist cases (a same-named method in an unrelated class).
+#[test]
+fn code_question_goldens() {
+    let Some(url) = db_url() else { return };
+    // (fixture, [(golden file, rb arguments)])
+    type Questions<'a> = &'a [(&'a str, &'a [&'a str])];
+    let cases: &[(&str, Questions)] = &[
+        (
+            "java-spring-jpa",
+            &[
+                (
+                    "callers-authenticate.txt",
+                    &["callers", "DefaultAuthService.authenticate", "--depth", "2"],
+                ),
+                (
+                    "callers-legacy.txt",
+                    &["callers", "LegacyAuth.authenticate"],
+                ),
+                (
+                    "impact-authservice.txt",
+                    &["impact", "AuthService#authenticate()."],
+                ),
+                ("impact-users.txt", &["impact", "public.users"]),
+            ],
+        ),
+        (
+            "ts-express-prisma",
+            &[
+                (
+                    "callers-find-user.txt",
+                    &["callers", "findUserByEmail().", "--depth", "3"],
+                ),
+                ("callers-cache.txt", &["callers", "Cache.findUserByEmail"]),
+                ("impact-create-session.txt", &["impact", "createSession"]),
+            ],
+        ),
+        (
+            "polyglot-monorepo",
+            &[
+                (
+                    "callers-send-code.txt",
+                    &["callers", "MfaClient.sendCode", "--depth", "2"],
+                ),
+                ("impact-login-pick.txt", &["impact", "login", "--pick", "1"]),
+            ],
+        ),
+    ];
+    for (fixture, questions) in cases {
+        let repo = fixture_repo(fixture);
+        let name = format!(
+            "t_code_{}_{}",
+            fixture.replace('-', "_"),
+            std::process::id()
+        );
+        let _cleanup = Cleanup {
+            url: &url,
+            repos: vec![name.clone()],
+        };
+        rb(
+            &url,
+            &["index", repo.path().to_str().unwrap(), "--repo", &name],
+        );
+        for (golden_name, args) in *questions {
+            let mut args: Vec<&str> = args.to_vec();
+            args.extend(["--repo", &name]);
+            golden(fixture, golden_name, &rb(&url, &args));
+        }
+    }
+    // An ambiguous name lists candidates and exits with an error; it never picks one.
+    let repo = fixture_repo("polyglot-monorepo");
+    let name = format!("t_code_pick_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    rb(
+        &url,
+        &["index", repo.path().to_str().unwrap(), "--repo", &name],
+    );
+    let err = rb_fails(&url, &["impact", "login", "--repo", &name]);
+    assert!(err.contains("matches 2 symbols; pass --pick N"), "{err}");
+    assert!(
+        err.contains("1. login()") && err.contains("2. AuthController#login()"),
+        "{err}"
+    );
+}

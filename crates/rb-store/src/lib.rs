@@ -5,6 +5,7 @@
 //! so readers never see a partial graph and a failed load leaves nothing behind but a `failed` row.
 
 mod age;
+pub mod code;
 mod query;
 
 use anyhow::{Context, bail};

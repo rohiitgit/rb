@@ -1,5 +1,17 @@
 # Changelog
 
+## [2026-09-30 12:00]
+- M3a step 4: the code questions.
+  - **`rb_store::code`** holds pure functions over the snapshot graph.
+    - `resolve_target` (§9.1): exact key, `path:line`, key suffix, dotted name, plain name. It returns every candidate in the best tier and never picks silently.
+    - `callers` (Q1): breadth-first, with CHA dispatch through `IMPLEMENTS`; the path certainty is the minimum along the path; depth 1–25; references on request.
+    - `impact` (Q2): the target plus its `CONTAINS` members; tier 1 is requiring edges, tier 2 is inbound reachability with dispatch; roll-ups by service (own vs other) and owner; capped at 200,000 nodes, with `truncated`.
+    - `Describer`: a display name, file:line and service per node.
+  - **CLI:** `rb callers <target> [--depth N] [--include-references] [--min-certainty C] [--pick N]` and `rb impact <target> [--min-certainty C] [--pick N]`.
+  - **Fixtures** gain the must-not-exist cases `LegacyAuth#authenticate` and `Cache#findUserByEmail`.
+  - **e2e:** `code_question_goldens` covers all three fixtures, plus candidate listing for an ambiguous name.
+- Files affected: crates/rb-store/src/{lib,code}.rs, crates/rb-cli/src/{main,code}.rs, crates/rb-cli/tests/{e2e.rs,golden/*}, fixtures/*.
+
 ## [2026-09-30 10:30]
 - M3a steps 2–3: Tier B resolution in the indexer.
   - **`modules.rs`** resolves imports to snapshot files:
