@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-09-29 17:55]
+- M2a, fourth evaluator pass (4 defects, 0 regressions); all fixed test-first and covered by mutation checks.
+  - **Lexer errors** keep the statements before the failure point, taken from the lexer's "at or near" text.
+  - **`pg_dump` `COPY … FROM stdin` data** is blanked, so it's no longer lexed as SQL. This removes the phantom `DROP`/`DELETE` edges and the whole-file errors.
+  - **Placeholders glued to arithmetic** (`bal-?`, `n+?`) are rewritten.
+  - **Multi-action `CREATE RULE (…; …)`** stays one statement.
+- Files affected: crates/rb-sql/src/lib.rs, docs/repository-brain-design.md.
+
 ## [2026-09-29 17:20]
 - M2a, third evaluator pass (6 defects, including a panic); all fixed test-first, and mutation checks confirm each fix is covered by a test.
   - **Splitting** is now done on Postgres lexer tokens alone. This removes the parser/scanner/coverage-check combination and the psql blanking pass.

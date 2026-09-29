@@ -377,7 +377,9 @@ These are recorded as diagnostics, not guessed at:
    - A `;` token ends a statement, except inside `BEGIN ATOMIC … END` bodies, which are tracked by counting `BEGIN ATOMIC`/`CASE`/`END`.
    - A `psql` meta-command (a `\` token to the end of its line) also ends one, as `\gset` does. `\copy …` is kept as a `COPY` statement.
    - A range runs from the statement's first token to its last, so it is never empty or inverted, even around whitespace that Rust and Postgres disagree on, such as U+00A0.
-   - One bad statement never hides the rest. Only text the lexer cannot tokenise at all (e.g. an unterminated quote) becomes a single reported statement.
+   - One bad statement never hides the rest. If the lexer fails (e.g. an unterminated quote), the statements before the failure point are kept. The failure point comes from the lexer's own error, and only the interrupted statement plus the rest of the text is reported.
+   - `pg_dump` data blocks (after `COPY … FROM stdin;`, up to `\.`) are data, not SQL.
+   - `;` inside the parentheses of a multi-action `CREATE RULE` does not split it.
    - *History:* an earlier version combined `split_with_parser`, `split_with_scanner` and a coverage check. The third evaluator pass showed the lexer split silently drops statements that start with a non-keyword, and that mixing Rust and Postgres whitespace rules could invert a range.
 3. **Parse with pg_query** (the real PG17 parser). If a statement fails, it is retried once with JDBC `?`, named `:param` and DB-API `%s`/`%(name)s` placeholders rewritten to `$n`.
    - Placeholders are found as lexer *tokens*, so comments, strings, `E''` escapes and the `?|`/`@?` operators are never touched.
@@ -404,6 +406,7 @@ These are recorded as diagnostics, not guessed at:
 
 Known gaps:
 - `DROP VIEW` and `CREATE TABLE … (LIKE t)` report no table.
+- Tables used inside `$$`-quoted function bodies (SQL or PL/pgSQL) are not analysed. Only `BEGIN ATOMIC` bodies are.
 - FK `REFERENCES` dependencies are not recorded.
 - Unqualified names always assume `public` (`rb.toml` `sql.default_schema` is not implemented yet).
 

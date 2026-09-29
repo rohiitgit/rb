@@ -120,7 +120,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - the cache served stale facts twice after extractor changes, now prevented by fingerprinting queries and code.
 - [x] Final commit (see git log)
 
-## M2a SQL core: complete (pending fourth evaluator pass)
+## M2a SQL core: complete
 
 - **Decided:** see `tasks/contract-m2a.md` and its two amendment sections.
   - `pg_query` is the only new dependency.
@@ -166,4 +166,5 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] First evaluator pass: 8 defects; all fixed test-first (rb-sql rewrite)
 - [x] Second evaluator pass: 9 issues, including the structural `nodes()` gap. The core was rebuilt on pg_query's JSON tree walk, and a new test exposed a hidden lexer-split drop.
 - [x] Third evaluator pass: 6 defects, including a panic. Splitting is now token-only. Mutation checks cover every fix.
-- [x] Commit (checkpoint); a fourth evaluator pass follows, and its findings will be fixed in follow-up commits
+- [x] Commit (checkpoint, bd40ff3)
+- [x] Fourth evaluator pass: 4 defects (lexer-error recovery, `pg_dump` COPY data, glued arithmetic placeholders, multi-action rules) and no regressions. All fixed and committed.

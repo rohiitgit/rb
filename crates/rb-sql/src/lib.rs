@@ -124,21 +124,75 @@ fn token_kind(token: &pg_query::protobuf::ScanToken) -> Option<Token> {
 
 /// Statement ranges from Postgres' own lexer, so quotes, dollar quotes, `E''` strings and
 /// comments are single tokens and can never be mistaken for boundaries:
-/// - a `;` ends a statement, except inside a `BEGIN ATOMIC … END` function body;
+/// - a `;` ends a statement, except inside a `BEGIN ATOMIC … END` function body or inside the
+///   parentheses of a multi-action `CREATE RULE`;
 /// - a `psql` meta-command (a `\\` token, to the end of its line) ends one too, as `\\gset` does;
 ///   `\\copy …` is kept as a `COPY …` statement;
+/// - `pg_dump` data after `COPY … FROM stdin;` (up to its `\\.` line) is data, not SQL;
 /// - a range runs from a statement's first token to its last, so it is never empty or inverted;
-/// - text the lexer cannot tokenise (e.g. an unterminated quote) is one statement, so its error
-///   is reported rather than lost.
+/// - if the lexer fails (e.g. an unterminated quote), the statements before the failure are kept
+///   and the rest is one statement, so its error is reported rather than hiding the whole text.
 fn split(sql: &str) -> Vec<(usize, usize)> {
-    let Ok(scan) = pg_query::scan(sql) else {
-        let (start, end) = (sql.len() - sql.trim_start().len(), sql.trim_end().len());
-        return if start < end {
-            vec![(start, end)]
-        } else {
-            Vec::new()
-        };
+    let lexable = blank_copy_data(sql);
+    let scan_error = match pg_query::scan(&lexable) {
+        Ok(scan) => return split_tokens(&lexable, &scan).0,
+        Err(e) => e.to_string(),
     };
+    let rest = |from: usize| {
+        let start = from + (lexable[from..].len() - lexable[from..].trim_start().len());
+        let end = lexable.trim_end().len();
+        (start < end).then_some((start, end))
+    };
+    let Some(failure) = scan_error_offset(&lexable, &scan_error) else {
+        return rest(0).into_iter().collect();
+    };
+    let prefix = &lexable[..failure];
+    let Ok(scan) = pg_query::scan(prefix) else {
+        return rest(0).into_iter().collect();
+    };
+    let (mut ranges, open) = split_tokens(prefix, &scan);
+    // The statement the failure interrupted, if any, is reported together with the rest.
+    let from = if open {
+        ranges.pop().map_or(failure, |r| r.0)
+    } else {
+        failure
+    };
+    ranges.extend(rest(from));
+    ranges
+}
+
+/// Byte offset where the lexer failed: its message quotes the input from that point to the end
+/// (`… at or near "<rest>"`).
+fn scan_error_offset(sql: &str, message: &str) -> Option<usize> {
+    let (_, quoted) = message.split_once("at or near \"")?;
+    let rest = quoted.strip_suffix('"')?;
+    let offset = sql.len().checked_sub(rest.len())?;
+    (sql.ends_with(rest) && sql.is_char_boundary(offset)).then_some(offset)
+}
+
+/// Blanks `pg_dump` data blocks (the lines after `COPY … FROM stdin;` up to and including `\\.`)
+/// with spaces, keeping byte offsets.
+fn blank_copy_data(sql: &str) -> String {
+    let mut bytes = sql.as_bytes().to_vec();
+    let mut in_data = false;
+    let mut at = 0;
+    for line in sql.split_inclusive('\n') {
+        let text = line.trim_end();
+        if in_data {
+            in_data = text != "\\.";
+            bytes[at..at + text.len()].fill(b' ');
+        } else {
+            let lower = text.trim_start().to_ascii_lowercase();
+            in_data =
+                lower.starts_with("copy ") && lower.contains(" from stdin") && lower.ends_with(';');
+        }
+        at += line.len();
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| sql.to_owned())
+}
+
+/// Splits a lexable text; also returns whether the last statement was left open (no `;`).
+fn split_tokens(sql: &str, scan: &pg_query::protobuf::ScanResult) -> (Vec<(usize, usize)>, bool) {
     let tokens: Vec<(Option<Token>, usize, usize)> = scan
         .tokens
         .iter()
@@ -154,6 +208,7 @@ fn split(sql: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut current: Option<(usize, usize)> = None;
     let mut atomic_depth = 0usize;
+    let mut rule_parens: Option<usize> = None; // Some(depth) while inside CREATE [OR REPLACE] RULE
     let mut i = 0;
     while i < tokens.len() {
         let (kind, start, end) = tokens[i];
@@ -175,13 +230,33 @@ fn split(sql: &str) -> Vec<(usize, usize)> {
                 i += 1 + on_line.len();
                 continue;
             }
-            Some(Token::Ascii59) if atomic_depth == 0 => out.extend(current.take()),
+            Some(Token::Ascii59) if atomic_depth == 0 && rule_parens.is_none_or(|d| d == 0) => {
+                out.extend(current.take());
+                rule_parens = None;
+            }
             _ => {
+                if current.is_none() {
+                    let kinds: Vec<Option<Token>> =
+                        tokens[i..].iter().take(4).map(|t| t.0).collect();
+                    let is_rule = matches!(
+                        kinds.as_slice(),
+                        [Some(Token::Create), Some(Token::Rule), ..]
+                            | [
+                                Some(Token::Create),
+                                Some(Token::Or),
+                                Some(Token::Replace),
+                                Some(Token::Rule)
+                            ]
+                    );
+                    rule_parens = is_rule.then_some(0);
+                }
                 let after_begin = i > 0 && tokens[i - 1].0 == Some(Token::BeginP);
                 match kind {
                     Some(Token::Atomic) if after_begin => atomic_depth += 1,
                     Some(Token::Case) if atomic_depth > 0 => atomic_depth += 1,
                     Some(Token::EndP) if atomic_depth > 0 => atomic_depth -= 1,
+                    Some(Token::Ascii40) => rule_parens = rule_parens.map(|d| d + 1),
+                    Some(Token::Ascii41) => rule_parens = rule_parens.map(|d| d.saturating_sub(1)),
                     _ => {}
                 }
                 current = Some((current.map_or(start, |c| c.0), end));
@@ -189,8 +264,9 @@ fn split(sql: &str) -> Vec<(usize, usize)> {
         }
         i += 1;
     }
+    let open = current.is_some();
     out.extend(current);
-    out
+    (out, open)
 }
 
 /// Tables of one statement; retried once with placeholders rewritten if it does not parse.
@@ -211,11 +287,13 @@ fn tables_of(statement: &str) -> Result<Vec<TableUse>, String> {
     Ok(walker.uses.into_tables())
 }
 
-/// Comparison operators the lexer may glue to a following `?` or `%` (`id=?`, `a>=%s`).
-const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">="];
+/// Operators the lexer may glue to a following `?` or `%` (`id=?`, `a>=%s`, `bal-?`).
+const GLUED_OPERATORS: &[&str] = &[
+    "=", "<>", "!=", "<", ">", "<=", ">=", "+", "-", "*", "/", "||",
+];
 
 /// Rewrites placeholder tokens to `$1`, `$2`, …: a `?` operator, `:name`, `%s` and `%(name)s`
-/// (each part adjacent), also when glued to a comparison (`id=?` lexes as one `=?` token). A `?`
+/// (each part adjacent), also when glued to an operator (`id=?` lexes as one `=?` token). A `?`
 /// glued to a preceding word (`cache?`) is prose; real operators such as `?|` or `@?` stay.
 fn positional(sql: &str) -> String {
     let Ok(scan) = pg_query::scan(sql) else {
@@ -261,7 +339,7 @@ fn positional(sql: &str) -> String {
             (Some(Token::Op), "?") | (Some(Token::Ascii37), "%") | (Some(Token::Ascii58), ":") => {
                 ("", text.chars().next())
             }
-            (Some(Token::Op), t) if t.len() > 1 && COMPARISONS.contains(&&t[..t.len() - 1]) => {
+            (Some(Token::Op), t) if t.len() > 1 && GLUED_OPERATORS.contains(&&t[..t.len() - 1]) => {
                 (&t[..t.len() - 1], t.chars().last())
             }
             _ => ("", None),
@@ -1010,6 +1088,65 @@ mod tests {
         assert_eq!(
             summary("CREATE TABLE p1 PARTITION OF parent FOR VALUES IN (1)"),
             [vec!["public.p1*:create", "public.parent*:alter"]]
+        );
+    }
+
+    #[test]
+    fn a_lexer_error_keeps_the_statements_before_it() {
+        let sql =
+            "CREATE TABLE a (id int);\nINSERT INTO t VALUES ('it\\'s');\nCREATE TABLE b (id int);";
+        let a = analyze(sql);
+        assert_eq!(summary_of(&a), [vec!["public.a*:create"]]);
+        assert_eq!(a.errors.len(), 1);
+        assert!(
+            sql[a.errors[0].range.0..].starts_with("INSERT INTO t"),
+            "{:?}",
+            a.errors[0]
+        );
+        let a = analyze("CREATE TABLE a (id int);\n/* TODO\nCREATE TABLE b (id int);");
+        assert_eq!(
+            (summary_of(&a), a.errors.len()),
+            (vec![vec!["public.a*:create".to_owned()]], 1)
+        );
+    }
+
+    #[test]
+    fn pg_dump_copy_data_is_not_sql() {
+        let dump = "CREATE TABLE public.people (id int, name text);\nCOPY public.people (id, name) FROM stdin;\n1\tO'Brien\n2\tx; DROP TABLE users\n\\.\n\nALTER TABLE public.people ADD PRIMARY KEY (id);\n";
+        let a = analyze(dump);
+        assert!(a.errors.is_empty(), "{:?}", a.errors);
+        assert_eq!(
+            summary_of(&a),
+            [
+                vec!["public.people:create"],
+                vec!["public.people:insert"],
+                vec!["public.people:alter"]
+            ]
+        );
+    }
+
+    #[test]
+    fn placeholders_glued_to_arithmetic() {
+        assert_eq!(
+            summary("UPDATE acct SET bal = bal-?, n = ? WHERE id = ?"),
+            [vec!["public.acct*:update"]]
+        );
+        assert_eq!(
+            summary("UPDATE t SET n = n+? WHERE id = ?"),
+            [vec!["public.t*:update"]]
+        );
+    }
+
+    #[test]
+    fn multi_action_rules_are_one_statement() {
+        assert_eq!(
+            summary(
+                "CREATE RULE r AS ON INSERT TO t DO ALSO (INSERT INTO a VALUES (1); INSERT INTO b VALUES (2)); SELECT 1 FROM z"
+            ),
+            [
+                vec!["public.a*:insert", "public.b*:insert", "public.t*:alter"],
+                vec!["public.z*:read"]
+            ]
         );
     }
 
