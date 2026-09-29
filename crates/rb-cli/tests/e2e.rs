@@ -345,8 +345,20 @@ fn polyglot_monorepo_structure_goldens() {
         ),
     );
     let dump = rb(&url, &["dump", "--repo", &name]);
-    // M1b extracts call references but must not emit unresolved CALLS edges (contract C7).
-    assert!(!dump.contains("\"CALLS\""), "M1b must not emit CALLS edges");
+    // M3a (contract R1, invariants 1-2): resolved code edges are heuristic guesses, never exact.
+    for line in dump.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let kind = row
+            .get(3)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if matches!(kind, "CALLS" | "REFERENCES" | "IMPLEMENTS") {
+            assert!(
+                matches!(row[6].as_str(), Some("heuristic" | "ambiguous")),
+                "{line}"
+            );
+        }
+    }
     golden(fixture, "dump.jsonl", &dump);
 
     let err = rb_fails(&url, &["service", "no-such-service", "--repo", &name]);
@@ -385,6 +397,12 @@ fn polyglot_monorepo_structure_goldens() {
         .find(|l| l.trim_start().starts_with("sql:"))
         .unwrap_or_default();
     golden(fixture, "status-sql.txt", &format!("{sql_line}\n"));
+    // Contract M3a R8: the resolution coverage line.
+    let code_line = status
+        .lines()
+        .find(|l| l.trim_start().starts_with("code:"))
+        .unwrap_or_default();
+    golden(fixture, "status-code.txt", &format!("{code_line}\n"));
 }
 
 /// Output order is bytewise, independent of the database's locale collation.

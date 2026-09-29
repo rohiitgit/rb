@@ -281,11 +281,14 @@ fn gradle(text: &str) -> Detected {
 }
 
 fn go_mod(text: &str) -> Detected {
-    let name = text
-        .lines()
+    Detected::new(2, "go.mod", go_module_path(text), false)
+}
+
+/// The module path declared by a `go.mod` file.
+pub fn go_module_path(text: &str) -> Option<String> {
+    text.lines()
         .find_map(|l| l.trim().strip_prefix("module "))
-        .map(|m| m.trim().trim_matches('"').to_owned());
-    Detected::new(2, "go.mod", name, false)
+        .map(|m| m.trim().trim_matches('"').to_owned())
 }
 
 /// True if the first `package` clause (outside comments) is `package main`.

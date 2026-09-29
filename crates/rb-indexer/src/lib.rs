@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+mod modules;
 mod orm;
+mod resolve;
 mod sql;
 mod syntax;
 
@@ -88,10 +90,22 @@ pub fn index_commit(
             .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
             .collect()
     };
+    let go_modules = manifest
+        .files
+        .iter()
+        .filter(|f| f.path == "go.mod" || f.path.ends_with("/go.mod"))
+        .map(|f| {
+            let dir = f.path.strip_suffix("go.mod").unwrap_or_default();
+            let module = boundaries::go_module_path(&repo.blob_text(&f.blob_sha)?);
+            Ok(module.map(|m| (dir.trim_end_matches('/').to_owned(), m)))
+        })
+        .filter_map(Result::transpose)
+        .collect::<anyhow::Result<_>>()?;
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
         prisma: texts("prisma")?,
+        go_modules,
     };
 
     let (graph, assembly_diagnostics) =
@@ -148,6 +162,8 @@ pub struct Content<'a> {
     pub sql: BTreeMap<&'a str, String>,
     /// `.prisma` schema files.
     pub prisma: BTreeMap<&'a str, String>,
+    /// Directory of each `go.mod` (`""` for the root) → its module path.
+    pub go_modules: BTreeMap<String, String>,
 }
 
 /// Builds the snapshot graph from the structural, syntax, SQL and ORM facts; returns the
@@ -238,6 +254,11 @@ pub fn assemble(
         .iter()
         .map(|(path, text)| (*path, text.as_str()))
         .collect();
+    diagnostics.extend(resolve::add_edges(
+        &mut b,
+        &content.facts,
+        &content.go_modules,
+    )?);
     let (orm_index, orm_diagnostics) = orm::add_mappings(&mut b, &files, &prisma)?;
     diagnostics.extend(orm_diagnostics);
     for (path, (language, facts)) in &content.facts {

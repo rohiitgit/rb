@@ -1,5 +1,22 @@
 # Changelog
 
+## [2026-09-30 10:30]
+- M3a steps 2–3: Tier B resolution in the indexer.
+  - **`modules.rs`** resolves imports to snapshot files:
+    - TS/JS relative specifiers, with extension and `index` probing, and `.js` naming `.ts`;
+    - Java classes, wildcards, static imports and nested classes;
+    - Python modules by suffix, with a shared-prefix tie-break, relative levels and submodules;
+    - Go import paths, through each `go.mod`'s module path (new `Content::go_modules`).
+  - **`resolve.rs`** emits `CALLS`, `REFERENCES` and `IMPLEMENTS` (provenance `heuristic`).
+    - Resolution levels, per §5.4: lexical scope, the same file, imports, the same package.
+    - Receivers: typed receivers, `this`/`self`/`super`, class-qualified and fully qualified calls, and module aliases.
+    - Inheritance is searched breadth-first, capped at 64 levels. Several candidates are `ambiguous` with `candidates`, and an unknown receiver is never linked by name.
+    - `IMPLEMENTS` covers type → supertype and method → overridden method.
+  - **Coverage:** per file, `unresolved_references` counts unresolved calls and types and external references; Go and Python built-ins are skipped. `rb status` prints the resolved share.
+  - **rb-syntax:** type references keep their qualifier (`store` in `store.DB`).
+  - **e2e:** the M1b "no CALLS" guard is replaced by M3a's certainty invariant; the polyglot dump golden gains 3 verified `CALLS` edges; there is a new `status-code.txt` golden.
+- Files affected: crates/rb-indexer/src/{lib,modules,resolve}.rs, crates/rb-git/src/boundaries.rs, crates/rb-syntax/src/lib.rs, crates/rb-store/src/query.rs, crates/rb-cli/{src/main.rs,tests/e2e.rs,tests/golden/polyglot-monorepo/*}, tasks/contract-m3a.md.
+
 ## [2026-09-30 08:30]
 - M3a step 1: `rb-syntax` extracts more facts per file.
   - **`imports`:** module as written, named imports with local names, module alias, wildcard and static flags. Covers ES imports, Java single-type, wildcard and static imports, Python `import`/`from` with relative levels, and Go specs.

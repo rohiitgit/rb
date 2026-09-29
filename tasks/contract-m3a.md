@@ -10,6 +10,10 @@ M3 in the roadmap (§13) is split in two:
 
 M3a needs no external tool. Every M3a edge has provenance `heuristic`; SCIP later replaces it project by project.
 
+**Grammar limits found during implementation:**
+- Java's tags capture only simple type names, so scoped types (`a.b.C x`, `new x.Y()`) produce no type reference. Java supertypes still resolve through `IMPLEMENTS`, which reads the full supertype text.
+- Java method overrides match by name only; parameter counts are not in the facts.
+
 **Out of scope, and why:**
 - RTA and `impl_instantiated` need DI facts (M4); M3a queries use CHA only.
 - The in-memory CSR server (`rb-server`) is M5. M3a runs its BFS in the CLI over edges loaded from the relational tables.
@@ -48,9 +52,9 @@ M3a needs no external tool. Every M3a edge has provenance `heuristic`; SCIP late
 | R3 | Module resolution: TS/JS relative specifiers, probing `.ts .tsx .js .jsx .mjs .cjs` and `/index.*`; Java package + class, wildcard = every file of the package; Python absolute modules (unique suffix match over repo files, `a/b.py` or `a/b/__init__.py`) and relative levels; Go import path = module path from the nearest `go.mod` + subdirectory. Unresolvable imports (external packages) are recorded as external and give no edge. | indexer unit |
 | R4 | Call resolution follows §5.4's levels: enclosing class (including `this.`/`self.`), the same file, imported names (named imports, namespace or module aliases `m.f()`, Java static imports), the same package or directory (Java package, Go package directory). Typed receivers (`x.f()` with `x` bound to type `T`) resolve to `T`'s methods, and to inherited methods through resolved supertypes. `super.f()` resolves to the superclass. Class-qualified calls (`T.f()`) resolve to `T`'s members. | indexer unit, one test per level and per language family |
 | R5 | Invariants 2 and 3: one candidate is `heuristic`; several are `ambiguous` with `candidates`; an unknown receiver is unresolved (never bare-name linked) | indexer unit |
-| R6 | `REFERENCES`: class and type references resolve with the same levels to type definitions. `new T()` / `T()` constructor calls give `CALLS` to `T`'s constructor when one is declared, else `REFERENCES` to `T`. | indexer unit |
+| R6 | `REFERENCES`: class and type references resolve with the same levels to type definitions; a qualified type (`store.DB`) resolves through its qualifier. A *call* that resolves to a class (Python `T()`) gives `CALLS` to its declared constructor, else `REFERENCES` to `T`. `new T()` is tagged as a class reference by the grammars, not a call, so it gives `REFERENCES` to `T` (revised during implementation). | indexer unit |
 | R7 | `IMPLEMENTS`: every resolved supertype gives type → type. A method with the same name (and, for Java, the same parameter count) in a resolved supertype gives method → method. Unresolved supertypes (external) give nothing. | indexer unit |
-| R8 | Coverage: the snapshot records resolved, ambiguous and unresolved calls and references per language. `rb status` shows the resolved share. | e2e |
+| R8 | Coverage: per file, an `unresolved_references` diagnostic counts unresolved calls, unresolved types and references into external packages (imports that resolve to no snapshot file, directly or through a binding's declared type). Go and Python built-ins are neither resolved nor counted. `rb status` shows the share of references to the snapshot's own code that resolved, with resolved and ambiguous sites derived from edge evidence. | e2e |
 | R9 | `rb callers <target> [--depth N] [--include-references] [--min-certainty C]`: resolves input per §9.1 (candidate list on ambiguity, never a silent pick, `--pick N`). Output is a caller tree with file:line, service and certainty. Dispatch callers come through `IMPLEMENTS` (CHA) and are marked `dispatch`. A path's certainty is the minimum along it. Output is deterministic. | e2e goldens on every fixture |
 | R10 | `rb impact <target>`: tier 1 (distance-1 requiring edges: `CALLS`, `REFERENCES`, `IMPLEMENTS`, and `MAPS_TO`/`QUERIES` for tables); tier 2 (inbound reachability over `CALLS ∪ REFERENCES` plus CHA). A class target includes its members through `CONTAINS`. Roll-ups: own service vs other services, and owners with symbol counts. There is a node cap with a `truncated` flag. | e2e goldens on every fixture |
 | R11 | Fixtures gain enough cross-file calls to exercise every level and language, and include the must-not-exist cases (unknown receiver, a same-named method in an unrelated class) | goldens |

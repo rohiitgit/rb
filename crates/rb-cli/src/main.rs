@@ -164,6 +164,15 @@ fn main() -> anyhow::Result<()> {
                         "  sql: {} tables; {} code sites and {} migration statements touching them; {} unparsed",
                         c.tables, c.query_sites, c.migration_statements, c.unparsed
                     );
+                    let r = store.resolution_coverage(live.id)?;
+                    println!(
+                        "  code: {:.1}% of references to own code resolved ({} resolved, {} ambiguous, {} unresolved; {} external)",
+                        r.resolved_share() * 100.0,
+                        r.resolved,
+                        r.ambiguous,
+                        r.unresolved,
+                        r.external
+                    );
                 }
             }
         }

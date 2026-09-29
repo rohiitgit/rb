@@ -212,7 +212,8 @@ pub struct Reference {
     /// Index into `FileFacts::definitions` of the innermost definition containing the reference.
     pub enclosing: Option<usize>,
     /// For a member call, the object it is called on as written (`prisma.user` in
-    /// `prisma.user.findMany()`); `None` for plain calls.
+    /// `prisma.user.findMany()`); for a qualified type, its package or outer type (`store` in Go
+    /// `store.DB`). `None` for plain calls and simple type names.
     #[serde(default)]
     pub qualifier: Option<String>,
 }
@@ -356,9 +357,11 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             span: span(r.name),
             enclosing: enclosing(r.name.start_byte(), &starts, &ends, &lexical_parent)
                 .map(|i| nearest_kept(i, &kept, &lexical_parent)),
-            qualifier: (r.kind == RefKind::Call)
-                .then(|| call_qualifier(r.name, source))
-                .flatten(),
+            qualifier: match r.kind {
+                RefKind::Call => call_qualifier(r.name, source),
+                RefKind::Class | RefKind::Type => type_qualifier(r.name, source),
+                RefKind::Implementation => None,
+            },
         })
         .collect();
 
@@ -597,6 +600,22 @@ fn enclosing(
 
 /// The object a member call is made on: the `object` (JS/TS, Python, Java) or `operand` (Go) of
 /// the node whose name the call reference captured.
+/// The package or outer type of a qualified type reference: `store` in Go `store.DB`, `a.b` in
+/// Java `a.b.C`, `ns` in TS `ns.T`.
+fn type_qualifier(name: Node<'_>, source: &[u8]) -> Option<String> {
+    let parent = name.parent()?;
+    let scope = match parent.kind() {
+        "qualified_type" => parent.child_by_field_name("package"),
+        "nested_type_identifier" => parent.child_by_field_name("module"),
+        "scoped_type_identifier" => parent.named_child(0),
+        "member_expression" => parent.child_by_field_name("object"),
+        "attribute" => parent.child_by_field_name("object"),
+        _ => None,
+    }
+    .filter(|s| s.id() != name.id())?;
+    Some(text(scope, source))
+}
+
 fn call_qualifier(name: Node<'_>, source: &[u8]) -> Option<String> {
     let member = name.parent()?;
     let object = member
@@ -666,6 +685,37 @@ fn span(node: Node<'_>) -> Span {
     let n = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
     let (s, e) = (node.start_position(), node.end_position());
     [n(s.row), n(s.column), n(e.row), n(e.column)]
+}
+
+#[cfg(test)]
+mod type_qualifier_tests {
+    use crate::{Language, RefKind, extract};
+
+    fn qualified(language: Language, src: &str) -> Vec<(String, Option<String>)> {
+        extract(language, src.as_bytes())
+            .unwrap()
+            .references
+            .into_iter()
+            .filter(|r| matches!(r.kind, RefKind::Type | RefKind::Class))
+            .map(|r| (r.name, r.qualifier))
+            .collect()
+    }
+
+    #[test]
+    fn qualified_type_references_keep_their_qualifier() {
+        let go = qualified(
+            Language::Go,
+            "package p\ntype S struct { db store.DB; n Local }\n",
+        );
+        assert!(go.contains(&("DB".into(), Some("store".into()))), "{go:?}");
+        assert!(go.contains(&("Local".into(), None)), "{go:?}");
+        // Java's tags capture simple type names only (`new Y()`), never scoped ones.
+        let java = qualified(
+            Language::Java,
+            "class K { void m() { new Y(); new x.Z(); } }\n",
+        );
+        assert_eq!(java, [("Y".to_owned(), None)]);
+    }
 }
 
 #[cfg(test)]

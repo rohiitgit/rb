@@ -79,6 +79,32 @@ pub struct TableDeps {
     pub accesses: Vec<TableAccess>,
 }
 
+/// How many call and type references were resolved (design §12.4, contract M3a R8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionCoverage {
+    /// Distinct reference sites with exactly one target.
+    pub resolved: i64,
+    /// Distinct reference sites with several candidate targets.
+    pub ambiguous: i64,
+    /// References to the snapshot's own code that found no target.
+    pub unresolved: i64,
+    /// References into packages outside the snapshot.
+    pub external: i64,
+}
+
+impl ResolutionCoverage {
+    /// Share of references to the snapshot's own code that found at least one target.
+    pub fn resolved_share(&self) -> f64 {
+        let found = self.resolved + self.ambiguous;
+        let total = found + self.unresolved;
+        if total == 0 {
+            1.0
+        } else {
+            found as f64 / total as f64
+        }
+    }
+}
+
 /// SQL coverage of a snapshot (design §12.4), derived from edges and diagnostics. Sites are
 /// distinct source locations: a literal touching two tables counts once, and SQL touching no
 /// table (e.g. `SET search_path`) leaves no trace in the graph and is not counted.
@@ -262,6 +288,31 @@ impl Store {
             migration_statements: r.get(1),
             unparsed: r.get(2),
             tables: r.get(3),
+        })
+    }
+
+    pub fn resolution_coverage(&mut self, snapshot_id: i64) -> anyhow::Result<ResolutionCoverage> {
+        let r = self.client.query_one(
+            "WITH sites AS (
+                 SELECT ev.file_id, ev.span, max(e.certainty) AS certainty
+                 FROM rb.edge_evidence ev
+                 JOIN rb.edge e USING (snapshot_id, src, kind, dst, provenance)
+                 WHERE ev.snapshot_id = $1 AND ev.kind IN ('CALLS', 'REFERENCES')
+                   AND ev.provenance = 'heuristic'
+                 GROUP BY ev.file_id, ev.span)
+             SELECT (SELECT count(*) FROM sites WHERE certainty > 1),
+                    (SELECT count(*) FROM sites WHERE certainty = 1),
+                    (SELECT coalesce(sum((detail->>'calls')::bigint + (detail->>'types')::bigint), 0)::bigint
+                     FROM rb.diagnostic WHERE snapshot_id = $1 AND kind = 'unresolved_references'),
+                    (SELECT coalesce(sum((detail->>'external')::bigint), 0)::bigint
+                     FROM rb.diagnostic WHERE snapshot_id = $1 AND kind = 'unresolved_references')",
+            &[&snapshot_id],
+        )?;
+        Ok(ResolutionCoverage {
+            resolved: r.get(0),
+            ambiguous: r.get(1),
+            unresolved: r.get(2),
+            external: r.get(3),
         })
     }
 
