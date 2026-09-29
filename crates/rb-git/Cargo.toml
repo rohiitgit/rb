@@ -10,6 +10,10 @@ publish.workspace = true
 anyhow.workspace = true
 gix.workspace = true
 rb-model.workspace = true
+roxmltree.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

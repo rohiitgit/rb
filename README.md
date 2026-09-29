@@ -3,13 +3,14 @@
 A deterministic, LLM-free code-intelligence graph for Git repositories. It is built with Rust, Postgres and Apache AGE.
 The design is in [docs/repository-brain-design.md](docs/repository-brain-design.md).
 
-**Status: milestone M0 (Foundations).** `rb` indexes a commit into a snapshot containing:
+**Status: milestones M0 (Foundations) and M1a (Structure).** `rb` indexes a commit into a snapshot containing:
 
 - one `File` node per blob, with its blob SHA, size, language and binary/generated flags;
-- a single root `Service`;
-- `IN_SERVICE` edges.
+- one `Service` per detected project (package.json, Maven, Gradle, go.mod / `package main`, Cargo, pyproject, Dockerfile, `rb.toml`), marked deployable or library;
+- `Owner` nodes from CODEOWNERS (GitHub semantics), with `OWNED_BY` edges that cite the deciding CODEOWNERS line;
+- `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests).
 
-Each snapshot is stored relationally and projected into an AGE graph. The code graph itself arrives in M1–M4: CODEOWNERS, service boundaries, symbols, calls, SQL and routes.
+Each snapshot is stored relationally and projected into an AGE graph. Symbols, calls, SQL and routes arrive in M1b–M4.
 
 ## Quickstart
 
@@ -20,6 +21,8 @@ target/debug/rb migrate
 target/debug/rb index /path/to/repo    # --rev <rev>, --repo <name>, --force
 target/debug/rb status
 target/debug/rb dump > snapshot.jsonl  # canonical, id-independent dump
+target/debug/rb service                # list services; `rb service <dir|name>` shows a card
+target/debug/rb find auth --kind file  # search nodes by key or name
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
 ```
 
@@ -38,13 +41,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55432/rb cargo test --workspace
 ```
 
-Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/m0.rs` print a notice and pass without running.
+Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e.rs` print a notice and pass without running.
 
 | Path | Contents |
 |---|---|
 | `crates/rb-model` | node/edge kinds, certainty, `GraphBuilder`, canonical dump |
-| `crates/rb-git` | commit → manifest (gitoxide) |
-| `crates/rb-store` | migrations, snapshot publish/retention, AGE projection, read-only Cypher |
+| `crates/rb-git` | commit → manifest (gitoxide), CODEOWNERS, glob matcher, boundary detection |
+| `crates/rb-indexer` | pipeline: git → structure → snapshot graph + diagnostics |
+| `crates/rb-store` | migrations, snapshot publish/retention, evidence, AGE projection, read-only Cypher, find/service queries |
 | `crates/rb-cli` | the `rb` binary |
 | `migrations/` | SQL schema, embedded into the binary |
 | `fixtures/` | golden fixture repositories |
+| `crates/rb-cli/tests/golden/` | reviewed golden outputs (`RB_BLESS=1` rewrites them; review before committing) |

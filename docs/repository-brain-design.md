@@ -132,6 +132,7 @@ This document started from the "Architecting the Repository Brain" blueprint. Se
 
 - `gix` opens the repository without shelling out. For the target commit, the ingester walks the tree and emits `(path, blob_sha, mode, size)`.
 - It skips `.gitignore`d paths only when they appear in the working tree; the Git tree is authoritative. It also skips submodules, which are recorded as `external` nodes. Blobs over a configurable size (default 1 MiB) and blobs detected as binary or generated are skipped too. A file counts as generated if it matches `linguist-generated` in `.gitattributes`, carries a `@generated` or `Code generated … DO NOT EDIT` header, or sits in a configured path.
+- Paths that are not valid UTF-8 are skipped with a `skipped_non_utf8_path` diagnostic. Keys are UTF-8 text, and a lossy conversion could merge two distinct files.
 - **Change set.** A tree diff between the commit of the previous live snapshot and the target commit gives added, modified, deleted and renamed files. That diff drives cache lookups and project invalidation (§3.4).
 - **Contributors (optional).** For recent history, the ingester counts commits per path over a window, by default 90 days before the target commit's timestamp. It uses committer identity only and runs deterministically for a given commit. The result is reported as `contributors`, never as owners.
 
@@ -140,13 +141,17 @@ This document started from the "Architecting the Repository Brain" blueprint. Se
 - Lookup order follows GitHub: `.github/CODEOWNERS`, then `CODEOWNERS`, then `docs/CODEOWNERS`. The first one found is used.
 - Patterns follow gitignore-style semantics with GitHub's precedence rule: **the last matching pattern wins**. A matching line with no owners explicitly clears ownership.
 - There are exceptions to gitignore: CODEOWNERS does **not** support `!` negation, `[a-z]` character ranges or `\#` escaping.
-- The existing Rust crates are stale (`codeowners` 0.1.3 dates from 2017) or tiny (`codeowners-rs` 0.1.1). The matcher is therefore a small in-house module on top of `globset`.
+- The existing Rust crates are stale (`codeowners` 0.1.3 dates from 2017) or tiny (`codeowners-rs` 0.1.1). The matcher is therefore a small in-house segment matcher (`rb-git/src/glob.rs`). `rb.toml` exclude patterns use the same matcher, so the Brain has one glob dialect.
+- One documented GitHub rule differs from gitignore: a pattern whose last segment is exactly `*` is not recursive. `docs/*` owns `docs/a.md` but not `docs/sub/b.md`. `docs/*/` names directories, so it is recursive below each one.
+- A leading UTF-8 BOM and CRLF line endings are handled. Spans still count raw bytes.
+- Owners are lowercased, because GitHub handles and emails are case-insensitive: `@Alice` and `@alice` are one owner.
+- The CODEOWNERS file used (the first found) is recorded. Other CODEOWNERS files produce a `codeowners_ignored` diagnostic, and invalid lines produce `codeowners_invalid_line`.
 - The output is `File -OWNED_BY-> Owner` for every file. A service's owners are the owners of its boundary root path, plus a share histogram computed over its files (§9.5).
 - The matcher is property-tested against a table of GitHub-documented examples (§12.3).
 
 ### 4.3 Service boundary detection
 
-A **service** is a deployable or buildable unit. A **project** is a SCIP build unit. They often coincide, but not always.
+A **project** is a directory holding a recognised build manifest. **Every project becomes a `Service` node**, with `deployable: bool` separating runnable services from libraries. This lets the Service Card treat a monorepo's shared library like any other unit. A SCIP build unit usually coincides with a project, but not always.
 
 | Signal | Creates |
 |---|---|
@@ -157,9 +162,11 @@ A **service** is a deployable or buildable unit. A **project** is a SCIP build u
 | `pyproject.toml` / `setup.cfg` | project; a service if it has an ASGI/WSGI app or a `__main__` entry |
 | Bazel `BUILD` targets | a project per package, a service per `*_binary` / `*_image` target (v2) |
 | `Dockerfile`, `docker-compose.yml`, k8s `Deployment` manifests | service name hints and cross-links from compose/k8s service names to directories |
-| `rb.toml` in the repo root | **explicit overrides**, which always win |
+| `rb.toml` in the repo root | **explicit overrides**, which always win: `exclude = [patterns]` ignores manifests during detection, and `[[service]] path/name/deployable` adds or overrides a project. A malformed `rb.toml` fails the run, because a silent fallback would hide a user's intent. |
 
-Every file belongs to the innermost project that contains it (`File -IN_SERVICE-> Service` when the project is a service). Files outside any service are assigned to a synthetic `(root)` service.
+Every file belongs to the innermost project that contains it (`File -IN_SERVICE-> Service`). The repo root `.` is the implicit outermost project. If no manifest sits there, the root still becomes a `Service` with `role: unassigned` and name `(unassigned)` whenever some file lies outside every project. Git forbids `.` as a path component, so no real directory can collide with that key. An earlier `(root)` key could collide, and the evaluator found that.
+
+A service's owners (`Service -OWNED_BY-> Owner`, certainty `synthetic`) are the owners of its **anchor file**: its first manifest, or else its first file. `attrs.via` names the anchor file.
 
 ### 4.4 Tree-sitter extraction (`rb-syntax`)
 
@@ -383,7 +390,7 @@ These are recorded as diagnostics, not guessed at:
 |---|---|
 | `Symbol` | SCIP symbol string. Locals are not nodes; they never cross files and are not needed for any of Q1–Q4. |
 | `File` | repo-relative path |
-| `Service` | service name from boundary detection or `rb.toml` |
+| `Service` | the project **directory** (`.` for the repo root, which is `role: unassigned` when no project is detected there). Names can collide, so name lookups return candidates instead of guessing (§9.1). |
 | `Table` | `schema.table` |
 | `Owner` | `@user`, `@org/team`, or email, verbatim from CODEOWNERS |
 | `Endpoint` | `HTTP <METHOD> <normalised path>` (path parameters → `{}`), or `GRPC <pkg.Service>/<Method>` |
@@ -775,7 +782,7 @@ Each fixture is a small but realistic repo, committed with its own Git history, 
 ### 12.3 Property tests
 
 - Route normaliser idempotence: `norm(norm(x)) == norm(x)`.
-- CODEOWNERS: the last-match-wins model agrees with a straightforward reference implementation over generated pattern sets.
+- CODEOWNERS: table tests of every rule in GitHub's documented example file, with the behaviour each rule's comment describes, plus last-match-wins across the whole file. This replaces the planned randomized cross-check, which would only have compared two implementations written by the same author.
 - Reachability: CSR BFS agrees with the SQL `WITH RECURSIVE … UNION` result on random graphs, including cycles.
 
 ### 12.4 Coverage report (per snapshot, stored in `snapshot.coverage`)
@@ -808,7 +815,8 @@ Each milestone is shippable and has an exit criterion that is a test, not a demo
 | Milestone | Contents | Exit criteria |
 |---|---|---|
 | **M0 Foundations** | Rust workspace; Docker Compose with Postgres + AGE (pinned digest); `rb.*` migrations; snapshot lifecycle; `rb index` manifest-only; AGE projection of `File/Service` (Owner moved to M1, because it needs CODEOWNERS); `rb dump` | determinism test green on 2 fixtures; `rb cypher` returns files per service. **Done 2026-09-29.** |
-| **M1 Structure** | `gix` ingest and change sets; CODEOWNERS; service boundaries + `rb.toml`; Tree-sitter defs/refs/scopes for TS, Java, Python, Go; facts cache; `rb find`, `rb service` (owners/files only) | CODEOWNERS property tests; fixture golden Service Cards (structure sections) |
+| **M1a Structure** | CODEOWNERS; service boundaries + `rb.toml`; edge evidence; `rb find`, `rb service` (structure sections) | GitHub-example CODEOWNERS tests; golden Service Cards on `polyglot-monorepo`. **Done 2026-09-29.** |
+| **M1b Syntax** | `gix` change sets; Tree-sitter defs/refs/scopes for TS, Java, Python, Go; facts cache | per-language extraction goldens; warm-cache run = cold-cache run |
 | **M2 Data access** | `rb-sql`: sinks, template normalisation, pg_query, sqlparser fallback, JPQL tokenizer; ORM packs (JPA, Prisma, TypeORM, SQLAlchemy); `QUERIES/MAPS_TO/MIGRATES` | `rb table-deps` golden at the symbol level (service roll-up via file→service); SQL coverage metrics |
 | **M3 Semantics** | SCIP orchestration (scip-java, scip-typescript first); SCIP⋈TS join; `CALLS/REFERENCES/IMPLEMENTS/CONTAINS`; Tier B heuristic resolver; CSR in rb-server; `rb callers`, `rb impact` | Q1/Q2 goldens on all fixtures, including `no-build`; incremental-equivalence test green |
 | **M4 Frameworks** | route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card | Q3/Q4 goldens on `polyglot-monorepo`; precision guards (must-not-exist edges) green |

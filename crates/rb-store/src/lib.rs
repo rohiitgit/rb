@@ -5,21 +5,37 @@
 //! so readers never see a partial graph and a failed load leaves nothing behind but a `failed` row.
 
 mod age;
+mod query;
 
 use anyhow::{Context, bail};
 use postgres::binary_copy::BinaryCopyInWriter;
 use postgres::types::Type;
 use postgres::{Client, NoTls};
-use rb_model::{Certainty, Edge, Graph, Node};
+use std::collections::HashMap;
+
+use rb_model::{
+    Certainty, Diagnostic, Edge, EdgeKind, Evidence, Graph, Node, NodeKind, Provenance,
+};
 use serde_json::Value;
 
 pub use age::{LoadDir, graph_name};
+pub use query::{FoundNode, OwnerShare, Resolved, ServiceCard, ServiceSummary};
 
 /// Embedded migrations, applied in order and recorded in `public.rb_schema_migrations`.
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_init",
-    include_str!("../../../migrations/0001_init.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_init",
+        include_str!("../../../migrations/0001_init.sql"),
+    ),
+    (
+        "0002_evidence_paths",
+        include_str!("../../../migrations/0002_evidence_paths.sql"),
+    ),
+    (
+        "0003_trgm_schema",
+        include_str!("../../../migrations/0003_trgm_schema.sql"),
+    ),
+];
 
 /// Name of the newest embedded migration; recorded in each snapshot's `tool_versions`.
 pub fn schema_version() -> &'static str {
@@ -40,13 +56,6 @@ pub struct SnapshotInfo {
     pub status: String,
     pub tool_versions: Value,
     pub age_graph: Option<String>,
-}
-
-/// A row for `rb.diagnostic` (skipped files, later: unresolved calls, unparsed SQL…).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Diagnostic {
-    pub kind: String,
-    pub detail: Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +85,8 @@ impl Store {
     pub fn migrate(&mut self) -> anyhow::Result<Vec<&'static str>> {
         let mut tx = self.client.transaction()?;
         tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])?;
+        // Objects created by migrations must land in `public`, not in AGE's ag_catalog.
+        tx.batch_execute("SET LOCAL search_path = public")?;
         tx.batch_execute(
             "CREATE TABLE IF NOT EXISTS public.rb_schema_migrations (
                name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
@@ -115,7 +126,7 @@ impl Store {
     pub fn repo_names(&mut self) -> anyhow::Result<Vec<String>> {
         let rows = self
             .client
-            .query("SELECT name FROM rb.repo ORDER BY name", &[])?;
+            .query("SELECT name FROM rb.repo ORDER BY name COLLATE \"C\"", &[])?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
@@ -278,12 +289,66 @@ impl Store {
         }
         w.finish().context("copying edges")?;
 
-        for d in diagnostics {
-            tx.execute(
-                "INSERT INTO rb.diagnostic (snapshot_id, kind, detail) VALUES ($1, $2, $3)",
-                &[&snapshot_id, &d.kind, &d.detail],
-            )?;
+        let file_ids: HashMap<&str, i64> = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::File)
+            .map(|n| (n.key.as_str(), n.id))
+            .collect();
+
+        let sink = tx.copy_in(
+            "COPY rb.edge_evidence (snapshot_id, src, kind, dst, provenance, file_id, span) FROM STDIN (FORMAT binary)",
+        )?;
+        let mut w = BinaryCopyInWriter::new(
+            sink,
+            &[
+                Type::INT8,
+                Type::INT8,
+                Type::TEXT,
+                Type::INT8,
+                Type::TEXT,
+                Type::INT8,
+                Type::INT4_ARRAY,
+            ],
+        );
+        for e in graph.edges() {
+            for ev in &e.evidence {
+                let file_id = file_ids
+                    .get(ev.path.as_str())
+                    .with_context(|| format!("evidence file {:?} is not a node", ev.path))?;
+                w.write(&[
+                    &snapshot_id,
+                    &e.src,
+                    &e.kind.as_str(),
+                    &e.dst,
+                    &e.provenance.as_str(),
+                    file_id,
+                    &ev.span.to_vec(),
+                ])?;
+            }
         }
+        w.finish().context("copying edge evidence")?;
+
+        let sink = tx.copy_in(
+            "COPY rb.diagnostic (snapshot_id, kind, path, file_id, span, detail) FROM STDIN (FORMAT binary)",
+        )?;
+        let mut w = BinaryCopyInWriter::new(
+            sink,
+            &[
+                Type::INT8,
+                Type::TEXT,
+                Type::TEXT,
+                Type::INT8,
+                Type::INT4_ARRAY,
+                Type::JSONB,
+            ],
+        );
+        for d in diagnostics {
+            let file_id = d.path.as_deref().and_then(|p| file_ids.get(p));
+            let span = d.span.map(|s| s.to_vec());
+            w.write(&[&snapshot_id, &d.kind, &d.path, &file_id, &span, &d.detail])?;
+        }
+        w.finish().context("copying diagnostics")?;
 
         age::project(&mut tx, graph, graph_name, load_dir).with_context(|| {
             format!(
@@ -365,10 +430,63 @@ impl Store {
                     provenance: r.get::<_, String>(3).parse()?,
                     certainty: Certainty::from_rank(r.get(4))?,
                     attrs: into_object(r.get(5))?,
+                    evidence: Vec::new(),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut evidence: HashMap<(i64, EdgeKind, i64, Provenance), Vec<Evidence>> = HashMap::new();
+        for r in self.client.query(
+            "SELECT ev.src, ev.kind, ev.dst, ev.provenance, f.key, ev.span
+             FROM rb.edge_evidence ev
+             JOIN rb.node f ON f.snapshot_id = ev.snapshot_id AND f.id = ev.file_id
+             WHERE ev.snapshot_id = $1",
+            &[&snapshot_id],
+        )? {
+            let key = (
+                r.get(0),
+                r.get::<_, String>(1).parse()?,
+                r.get(2),
+                r.get::<_, String>(3).parse()?,
+            );
+            evidence.entry(key).or_default().push(Evidence {
+                path: r.get(4),
+                span: span_from_sql(r.get(5))?,
+            });
+        }
+        let mut edges = edges;
+        for e in &mut edges {
+            if let Some(ev) = evidence.remove(&(e.src, e.kind, e.dst, e.provenance)) {
+                e.evidence = ev;
+            }
+        }
+        anyhow::ensure!(evidence.is_empty(), "evidence rows without a matching edge");
         Graph::from_parts(nodes, edges)
+    }
+
+    /// Reads a snapshot's diagnostics, in canonical order.
+    pub fn load_diagnostics(&mut self, snapshot_id: i64) -> anyhow::Result<Vec<Diagnostic>> {
+        let mut out = self
+            .client
+            .query(
+                "SELECT kind, path, span, detail FROM rb.diagnostic WHERE snapshot_id = $1",
+                &[&snapshot_id],
+            )?
+            .iter()
+            .map(|r| {
+                Ok(Diagnostic {
+                    kind: r.get(0),
+                    path: r.get(1),
+                    span: r
+                        .get::<_, Option<Vec<i32>>>(2)
+                        .map(span_from_sql)
+                        .transpose()?,
+                    detail: r.get(3),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        rb_model::sort_diagnostics(&mut out);
+        Ok(out)
     }
 
     /// Runs a read-only Cypher query against the snapshot's AGE graph. Returns a header row followed
@@ -445,6 +563,11 @@ fn snapshot_from_row(r: &postgres::Row) -> SnapshotInfo {
         tool_versions: r.get(4),
         age_graph: r.get(5),
     }
+}
+
+fn span_from_sql(v: Vec<i32>) -> anyhow::Result<rb_model::Span> {
+    v.try_into()
+        .map_err(|v: Vec<i32>| anyhow::anyhow!("span must have 4 elements, got {}", v.len()))
 }
 
 fn into_object(v: Value) -> anyhow::Result<rb_model::Attrs> {

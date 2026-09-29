@@ -1,0 +1,11 @@
+# Default owners
+*                                        @acme/platform
+/apps/web/                               @acme/frontend
+/packages/                               @acme/frontend @acme/platform
+/services/auth/                          @acme/identity
+/services/auth/src/main/resources/db/    @acme/data
+/services/notification/                  @acme/messaging
+/services/billing/                       billing-team@acme.example
+docs/*                                   @acme/docs  # architecture docs
+/examples/
+[abc].md                                 @acme/nobody

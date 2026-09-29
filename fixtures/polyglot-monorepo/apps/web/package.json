@@ -1,0 +1,1 @@
+{ "name": "@acme/web", "scripts": { "start": "vite", "build": "vite build" }, "dependencies": { "axios": "^1.7.7", "@acme/shared": "*" } }

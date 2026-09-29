@@ -1,0 +1,36 @@
+{
+  "key": ".",
+  "name": "acme",
+  "role": "library",
+  "detected_by": [
+    "package.json"
+  ],
+  "manifests": [
+    "package.json"
+  ],
+  "files": 8,
+  "languages": [
+    [
+      "other",
+      7
+    ],
+    [
+      "javascript",
+      1
+    ]
+  ],
+  "owners": [
+    "@acme/platform"
+  ],
+  "file_owners": [
+    {
+      "owner": "@acme/platform",
+      "files": 5
+    },
+    {
+      "owner": "@acme/docs",
+      "files": 1
+    }
+  ],
+  "unowned_files": 2
+}

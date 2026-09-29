@@ -1,6 +1,11 @@
-//! Git ingestion (design §4.1): turns a commit into a sorted [`Manifest`] of blobs.
+//! Git ingestion (design §4.1): turns a commit into a sorted [`Manifest`] of blobs, and reads blob
+//! contents for later stages. CODEOWNERS (§4.2) and service boundaries (§4.3) live in submodules.
 //!
 //! The Git tree is authoritative; the working tree and `.gitignore` are never consulted.
+
+pub mod boundaries;
+pub mod codeowners;
+pub mod glob;
 
 use std::path::Path;
 
@@ -11,63 +16,118 @@ use rb_model::{FileEntry, Manifest, Skipped};
 /// Bytes inspected for binary / generated detection (Git uses the same 8000-byte window for NUL).
 const SNIFF_BYTES: usize = 8000;
 
-/// Reads the tree of `rev` (e.g. `HEAD`, a branch, a SHA) in the repository at `repo_path`.
-pub fn read_manifest(repo_path: &Path, rev: &str) -> anyhow::Result<Manifest> {
-    let repo = gix::open(repo_path)
-        .with_context(|| format!("opening git repository {}", repo_path.display()))?;
-    let commit = repo
-        .rev_parse_single(rev)
-        .with_context(|| format!("resolving revision {rev:?}"))?
-        .object()?
-        .peel_to_commit()
-        .with_context(|| format!("{rev:?} does not point to a commit"))?;
-    let tree = commit.tree().context("reading commit tree")?;
+/// An open repository.
+pub struct Repo {
+    inner: gix::Repository,
+}
 
-    let mut recorder = gix::traverse::tree::Recorder::default();
-    tree.traverse()
-        .breadthfirst(&mut recorder)
-        .context("traversing commit tree")?;
+impl Repo {
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let inner = gix::open(path)
+            .with_context(|| format!("opening git repository {}", path.display()))?;
+        Ok(Self { inner })
+    }
 
-    let mut files = Vec::new();
-    let mut skipped = Vec::new();
-    for entry in recorder.records {
-        let non_utf8_path = std::str::from_utf8(&entry.filepath).is_err();
-        let path = String::from_utf8_lossy(&entry.filepath).into_owned();
-        match entry.mode.kind() {
-            EntryKind::Tree => {}
-            EntryKind::Commit => skipped.push(Skipped {
-                path,
-                reason: "submodule",
-            }),
-            EntryKind::Link => skipped.push(Skipped {
-                path,
-                reason: "symlink",
-            }),
-            kind @ (EntryKind::Blob | EntryKind::BlobExecutable) => {
-                let blob = repo
-                    .find_blob(entry.oid)
-                    .with_context(|| format!("reading blob {} ({path})", entry.oid))?;
-                let head = &blob.data[..blob.data.len().min(SNIFF_BYTES)];
-                files.push(FileEntry {
-                    lang: language_for_path(&path),
-                    blob_sha: entry.oid.to_string(),
-                    size: blob.data.len() as u64,
-                    executable: kind == EntryKind::BlobExecutable,
-                    binary: head.contains(&0),
-                    generated: has_generated_marker(head),
-                    non_utf8_path,
+    /// Resolves `rev` to a commit SHA without reading the tree.
+    pub fn resolve_commit(&self, rev: &str) -> anyhow::Result<String> {
+        let commit = self
+            .inner
+            .rev_parse_single(rev)
+            .with_context(|| format!("resolving revision {rev:?}"))?
+            .object()?
+            .peel_to_commit()
+            .with_context(|| format!("{rev:?} does not point to a commit"))?;
+        Ok(commit.id.to_string())
+    }
+
+    /// Reads the tree of `rev` (e.g. `HEAD`, a branch, a SHA).
+    pub fn manifest(&self, rev: &str) -> anyhow::Result<Manifest> {
+        let commit = self
+            .inner
+            .rev_parse_single(rev)
+            .with_context(|| format!("resolving revision {rev:?}"))?
+            .object()?
+            .peel_to_commit()
+            .with_context(|| format!("{rev:?} does not point to a commit"))?;
+        let tree = commit.tree().context("reading commit tree")?;
+
+        let mut recorder = gix::traverse::tree::Recorder::default();
+        tree.traverse()
+            .breadthfirst(&mut recorder)
+            .context("traversing commit tree")?;
+
+        let mut files = Vec::new();
+        let mut skipped = Vec::new();
+        for entry in recorder.records {
+            let path = String::from_utf8_lossy(&entry.filepath).into_owned();
+            if entry.mode.kind() == EntryKind::Tree {
+                continue;
+            }
+            // Keys are UTF-8 text (as is Postgres `text`); a lossy key could merge distinct files.
+            if std::str::from_utf8(&entry.filepath).is_err() {
+                skipped.push(Skipped {
                     path,
+                    reason: "non_utf8_path",
                 });
+                continue;
+            }
+            match entry.mode.kind() {
+                EntryKind::Tree => {}
+                EntryKind::Commit => skipped.push(Skipped {
+                    path,
+                    reason: "submodule",
+                }),
+                EntryKind::Link => skipped.push(Skipped {
+                    path,
+                    reason: "symlink",
+                }),
+                kind @ (EntryKind::Blob | EntryKind::BlobExecutable) => {
+                    let blob = self
+                        .inner
+                        .find_blob(entry.oid)
+                        .with_context(|| format!("reading blob {} ({path})", entry.oid))?;
+                    let head = &blob.data[..blob.data.len().min(SNIFF_BYTES)];
+                    files.push(FileEntry {
+                        lang: language_for_path(&path),
+                        blob_sha: entry.oid.to_string(),
+                        size: blob.data.len() as u64,
+                        executable: kind == EntryKind::BlobExecutable,
+                        binary: head.contains(&0),
+                        generated: has_generated_marker(head),
+                        path,
+                    });
+                }
             }
         }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        skipped.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Manifest {
+            commit_sha: commit.id.to_string(),
+            files,
+            skipped,
+        })
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    skipped.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(Manifest {
-        commit_sha: commit.id.to_string(),
-        files,
-        skipped,
-    })
+
+    /// Reads a blob's bytes by its hex SHA.
+    pub fn blob(&self, sha: &str) -> anyhow::Result<Vec<u8>> {
+        let id = gix::ObjectId::from_hex(sha.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid object id {sha:?}: {e}"))?;
+        let mut blob = self
+            .inner
+            .find_blob(id)
+            .with_context(|| format!("reading blob {sha}"))?;
+        Ok(blob.take_data())
+    }
+
+    /// Reads a blob as UTF-8 text, replacing invalid sequences.
+    pub fn blob_text(&self, sha: &str) -> anyhow::Result<String> {
+        Ok(String::from_utf8_lossy(&self.blob(sha)?).into_owned())
+    }
+}
+
+/// Drops a leading UTF-8 byte order mark. Parsers call this; byte spans stay relative to the blob.
+pub fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 /// Language by file name / extension. Only languages the design plans to parse are named;
@@ -166,7 +226,7 @@ mod tests {
         );
         git(dir, &["commit", "-q", "-m", "init"]);
 
-        let m = read_manifest(dir, "HEAD").unwrap();
+        let m = Repo::open(dir).unwrap().manifest("HEAD").unwrap();
         assert_eq!(m.commit_sha, git(dir, &["rev-parse", "HEAD"]));
 
         let paths: Vec<&str> = m.files.iter().map(|f| f.path.as_str()).collect();
@@ -196,6 +256,12 @@ mod tests {
         assert_eq!(get("src/main.rs").lang, Some("rust"));
         assert_eq!(get("src/main.rs").size, 13);
         assert_eq!(get("README").lang, None);
+        let repo = Repo::open(dir).unwrap();
+        assert_eq!(
+            repo.blob(&get("src/main.rs").blob_sha).unwrap(),
+            b"fn main() {}\n"
+        );
+        assert!(repo.blob("not-a-sha").is_err());
 
         let skipped: Vec<(&str, &str)> = m
             .skipped
@@ -209,10 +275,43 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_paths_are_skipped_not_merged() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        write(dir, "ok.txt", b"x\n");
+        git(dir, &["add", "-A"]);
+        let blob = git(dir, &["hash-object", "-w", "ok.txt"]);
+        for name in [&b"a\xff.txt"[..], &b"a\xfe.txt"[..]] {
+            let mut info = format!("100644,{blob},").into_bytes();
+            info.extend_from_slice(name);
+            let out = Command::new("git")
+                .args(["update-index", "--add", "--cacheinfo"])
+                .arg(std::ffi::OsStr::from_bytes(&info))
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        git(dir, &["commit", "-q", "-m", "x"]);
+
+        let m = Repo::open(dir).unwrap().manifest("HEAD").unwrap();
+        let paths: Vec<&str> = m.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["ok.txt"]);
+        let reasons: Vec<&str> = m.skipped.iter().map(|s| s.reason).collect();
+        assert_eq!(reasons, ["non_utf8_path", "non_utf8_path"]);
+    }
+
+    #[test]
     fn unknown_revision_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         git(tmp.path(), &["init", "-q"]);
-        assert!(read_manifest(tmp.path(), "HEAD").is_err());
+        assert!(Repo::open(tmp.path()).unwrap().manifest("HEAD").is_err());
     }
 
     #[test]

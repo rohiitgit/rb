@@ -66,3 +66,58 @@ Scope note: Owner projection needs CODEOWNERS, which is M1. M0 projects File + S
 - Service boundary detection (package.json workspaces, Maven/Gradle modules, go.mod, Cargo, pyproject) + `rb.toml` overrides
 - Tree-sitter defs/refs/scopes for TS, Java, Python, Go; facts cache keyed by blob SHA
 - `rb find`, `rb service` (structure sections)
+
+---
+
+# M1a Structure — CODEOWNERS, boundaries, evidence, `rb find` / `rb service` (started 2026-09-29)
+
+Design decisions made while planning (sync into the doc at the end):
+- Every detected project becomes a `Service` node with `deployable: bool`. Libraries are services too; this matches the Service Card example ("shared-lib").
+- Service key = the project directory (`.` for the repo root). The synthetic `(root)` service holds files outside every project. Names can collide, so `rb service <name>` returns candidates rather than picking one.
+- CODEOWNERS uses an in-house segment matcher (GitHub semantics: `docs/*` is not recursive, and there is no `!`/`[]`). The same matcher handles `rb.toml` exclude globs, so there is one glob engine and no `globset`.
+- Edges carry evidence (file path + span), stored in `rb.edge_evidence` and included in the dump (dump format v2).
+- Assembly moves from rb-model into a new `rb-indexer` crate (git → structure → graph + diagnostics).
+
+- [x] A — model: `NewEdge`, `Evidence`, `Diagnostic` in rb-model; dump v2; store persists and loads evidence. Verify: all existing tests.
+- [x] B — rb-git `Repo` API (manifest + blob reads); `codeowners` module with GitHub-documented table tests.
+- [x] C — `boundaries` module: package.json, pom.xml, gradle, go.mod (+ `package main` dirs), Cargo.toml, pyproject, Dockerfile, `rb.toml` overrides/excludes. Unit tests.
+- [x] D — `rb-indexer` assembly (Service/Owner nodes, IN_SERVICE, OWNED_BY, diagnostics); store queries; `rb find`, `rb service`.
+- [x] E — `polyglot-monorepo` fixture; golden tests for the service list and cards; doc sync. Verify: fmt, clippy, full test run on the DB.
+
+## M1a review (2026-09-29)
+
+- **Checks:** 43 tests pass, 5 of them end to end on the compose DB. Clippy with `-D warnings` and `fmt --check` are clean. No test repos are left in the DB.
+- **Goldens:** 7 files for `polyglot-monorepo`, each reviewed by hand against the rules: services, cards, search, and the full dump with evidence and diagnostics. The test was shown to fail when a golden file is tampered with.
+- **Real repos:**
+  - A private TypeScript repo resolves to one service.
+  - A private Java repo resolves to 4 projects, matching its manifests.
+- **Bugs found and fixed:**
+  - `pg_trgm` was installed into `ag_catalog`, because migrations inherited the AGE search_path. Migration 0003 moves it, and the runner now pins `search_path = public`.
+  - A Go `package main // comment` line was not detected.
+  - Card output said "1 files".
+- **Design decisions,** synced into the doc (§4.2, §4.3, §8.2, §12.3, §13):
+  - every project is a Service with `deployable`;
+  - the Service key is the project directory;
+  - the glob matcher is in-house and shared with `rb.toml`;
+  - CODEOWNERS is tested with GitHub-example table tests instead of the planned property tests.
+- **Not committed yet:** waiting for confirmation.
+
+## Next: M1b Syntax (awaiting confirmation)
+- Tree-sitter grammars (TS/TSX, Java, Python, Go) + `tags.scm` definitions/references + enclosing-scope index
+- Symbol nodes (heuristic keys until SCIP lands in M3), `DEFINED_IN` / `CONTAINS` edges with evidence
+- Facts cache keyed by (blob SHA, extractor version); `gix` change sets; rayon parallel extraction
+
+---
+
+# M1b Syntax (contract: tasks/contract-m1b.md)
+
+Findings from the research step (2026-09-29):
+- **Crates:** `tree-sitter` 0.27.0; grammar crates typescript 0.23.2, javascript 0.25.0, java 0.23.5, python 0.25.0 and go 0.25.0. Each exports `TAGS_QUERY`.
+- **TypeScript:** `tags.scm` has only the TS additions (signatures, interfaces, abstract classes, modules). TS/TSX must run the JS query plus the TS query.
+- **Java:** the stock tags have no enum, record or constructor definitions, so rb adds a small supplementary query.
+- **Go:** method keys need the receiver type (`Circle#Area().`), otherwise two receivers' `Area` in one file collide. The receiver is read from the node in Rust.
+
+- [ ] 1. `rb-syntax` crate: the language registry (C14) and `extract(lang, bytes) -> FileFacts`, with tests first for C1–C4, C8, C13 and C17.
+- [ ] 2. Symbol keys + indexer assembly: Symbol / DEFINED_IN / CONTAINS (C2, C5, C6, C7); unit tests.
+- [ ] 3. Facts cache: store load/save + CLI orchestration + parse counter (C9–C12).
+- [ ] 4. Fixture goldens (C15, C16), real-repo measurement (C18), doc sync, evaluator pass, commit.

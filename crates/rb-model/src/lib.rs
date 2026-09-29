@@ -6,8 +6,11 @@
 mod graph;
 mod manifest;
 
-pub use graph::{Attrs, Edge, Graph, GraphBuilder, Node, canonical_dump};
-pub use manifest::{FileEntry, Manifest, ROOT_SERVICE, Skipped, graph_from_manifest};
+pub use graph::{
+    Attrs, Diagnostic, Edge, Evidence, Graph, GraphBuilder, NewEdge, Node, Span, canonical_dump,
+    sort_diagnostics,
+};
+pub use manifest::{FileEntry, Manifest, Skipped};
 
 use std::fmt;
 use std::str::FromStr;
@@ -94,6 +97,15 @@ string_enum! {
         Consumes => "CONSUMES",
         OwnedBy => "OWNED_BY",
         DependsOn => "DEPENDS_ON",
+    }
+}
+
+string_enum! {
+    /// What a `Service` node represents (stored as `attrs.role`; design §4.3).
+    ServiceRole {
+        Service => "service",
+        Library => "library",
+        Unassigned => "unassigned",
     }
 }
 

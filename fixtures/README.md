@@ -5,7 +5,8 @@ temp dir with a fixed author, committer and date, so its commit SHA is stable ac
 
 | Fixture | M0 checks | Later milestones |
 |---|---|---|
-| `ts-express-prisma` | manifest, determinism, AGE parity | router prefixes, Prisma `@@map`, raw SQL, CODEOWNERS |
+| `ts-express-prisma` | manifest, determinism, AGE parity, CODEOWNERS evidence round trip | router prefixes, Prisma `@@map`, raw SQL, CODEOWNERS |
+| `polyglot-monorepo` | boundaries for every ecosystem, `rb.toml` exclude/override, CODEOWNERS edge cases (ignored duplicate file, invalid line, ownership clearing, inline comment); golden service list, cards, search and dump | web → gateway → auth → notification request path; Feign/axios stitching; Flyway |
 | `java-spring-jpa` | manifest, determinism, AGE parity | `@RequestMapping` composition, interface dispatch, Spring Data, JPA `@Table`, Flyway |
 
 Files are kept intentionally tiny; add an `expected.yaml` per fixture when M1+ extractors land.

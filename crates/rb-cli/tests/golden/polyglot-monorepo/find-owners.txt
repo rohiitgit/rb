@@ -1,0 +1,7 @@
+owner	@acme/data	@acme/data
+owner	@acme/docs	@acme/docs
+owner	@acme/frontend	@acme/frontend
+owner	@acme/identity	@acme/identity
+owner	@acme/platform	@acme/platform
+owner	@acme/messaging	@acme/messaging
+owner	billing-team@acme.example	billing-team@acme.example

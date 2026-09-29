@@ -1,0 +1,8 @@
+edge-gateway  (path: gateway, deployable)
+├─ Detected by: rb.toml
+├─ Files: 1 (other 1)
+├─ Owners: @acme/platform
+├─ File ownership
+│    @acme/platform      1 file  100%
+│    unowned            0 files    0%
+└─ APIs, tables, dependencies and call graph: not indexed yet (M2–M4)

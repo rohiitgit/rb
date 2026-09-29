@@ -1,0 +1,10 @@
+auth-service  (path: services/auth, deployable)
+├─ Detected by: maven
+├─ Manifests: services/auth/pom.xml
+├─ Files: 4 (java 2, other 1, sql 1)
+├─ Owners: @acme/identity
+├─ File ownership
+│    @acme/identity     3 files   75%
+│    @acme/data          1 file   25%
+│    unowned            0 files    0%
+└─ APIs, tables, dependencies and call graph: not indexed yet (M2–M4)

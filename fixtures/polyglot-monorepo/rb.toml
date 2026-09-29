@@ -1,0 +1,7 @@
+# Demo code is not a project boundary.
+exclude = ["examples/**"]
+
+# The gateway is pure nginx config: no build manifest, but it is a deployable service.
+[[service]]
+path = "gateway"
+name = "edge-gateway"

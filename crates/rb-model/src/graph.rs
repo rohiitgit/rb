@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use anyhow::{Context, bail, ensure};
@@ -9,6 +9,26 @@ use crate::{Certainty, EdgeKind, NodeKey, NodeKind, Provenance};
 /// Attribute bag. `serde_json::Map` is a `BTreeMap` (the workspace must never enable serde_json's
 /// `preserve_order` feature), so serialisation is key-sorted and deterministic.
 pub type Attrs = Map<String, Value>;
+
+/// `[start_line, start_col, end_line, end_col]`: 0-based, half-open, columns in UTF-8 bytes
+/// (the SCIP / Tree-sitter convention). Displays add 1 to lines.
+pub type Span = [i32; 4];
+
+/// Source location that justifies an edge (design §6.3). `path` must be a `File` node.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Evidence {
+    pub path: String,
+    pub span: Span,
+}
+
+/// Something the indexer could not model or chose to skip (design §6.5, §12.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagnostic {
+    pub kind: String,
+    pub path: Option<String>,
+    pub span: Option<Span>,
+    pub detail: Value,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
@@ -27,6 +47,50 @@ pub struct Edge {
     pub provenance: Provenance,
     pub certainty: Certainty,
     pub attrs: Attrs,
+    /// Sorted and de-duplicated.
+    pub evidence: Vec<Evidence>,
+}
+
+/// An edge to add to a [`GraphBuilder`], addressed by natural keys.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewEdge {
+    pub src: NodeKey,
+    pub kind: EdgeKind,
+    pub dst: NodeKey,
+    pub provenance: Provenance,
+    pub certainty: Certainty,
+    pub attrs: Attrs,
+    pub evidence: Vec<Evidence>,
+}
+
+impl NewEdge {
+    pub fn new(
+        src: NodeKey,
+        kind: EdgeKind,
+        dst: NodeKey,
+        provenance: Provenance,
+        certainty: Certainty,
+    ) -> Self {
+        Self {
+            src,
+            kind,
+            dst,
+            provenance,
+            certainty,
+            attrs: Attrs::new(),
+            evidence: Vec::new(),
+        }
+    }
+
+    pub fn attrs(mut self, attrs: Attrs) -> Self {
+        self.attrs = attrs;
+        self
+    }
+
+    pub fn evidence(mut self, evidence: Evidence) -> Self {
+        self.evidence.push(evidence);
+        self
+    }
 }
 
 /// An immutable snapshot graph. Nodes are sorted by natural key and numbered `1..=n` in that order;
@@ -46,8 +110,8 @@ impl Graph {
         &self.edges
     }
 
-    /// Rebuilds a graph from stored rows (e.g. read back from Postgres), validating that ids are
-    /// unique, keys are unique and every edge endpoint exists.
+    /// Rebuilds a graph from stored rows (e.g. read back from Postgres), validating that ids and keys
+    /// are unique, every edge endpoint exists and all evidence points at `File` nodes.
     pub fn from_parts(mut nodes: Vec<Node>, mut edges: Vec<Edge>) -> anyhow::Result<Self> {
         nodes.sort_by(|a, b| (a.kind, &a.key).cmp(&(b.kind, &b.key)));
         let mut ids = HashMap::with_capacity(nodes.len());
@@ -63,7 +127,8 @@ impl Graph {
                 );
             }
         }
-        for e in &edges {
+        let files = file_paths(nodes.iter().map(|n| (n.kind, n.key.as_str())));
+        for e in &mut edges {
             ensure!(
                 ids.contains_key(&e.src) && ids.contains_key(&e.dst),
                 "edge {} {}->{} references a missing node",
@@ -71,6 +136,9 @@ impl Graph {
                 e.src,
                 e.dst
             );
+            check_evidence(&files, &e.evidence)?;
+            e.evidence.sort();
+            e.evidence.dedup();
         }
         edges.sort_by(|a, b| {
             (a.src, a.kind, a.dst, a.provenance).cmp(&(b.src, b.kind, b.dst, b.provenance))
@@ -85,12 +153,16 @@ type EdgeId = (NodeKey, EdgeKind, NodeKey, Provenance);
 #[derive(Debug, Default)]
 pub struct GraphBuilder {
     nodes: BTreeMap<NodeKey, (String, Attrs)>,
-    edges: BTreeMap<EdgeId, (Certainty, Attrs)>,
+    edges: BTreeMap<EdgeId, (Certainty, Attrs, BTreeSet<Evidence>)>,
 }
 
 impl GraphBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn has_node(&self, key: &NodeKey) -> bool {
+        self.nodes.contains_key(key)
     }
 
     /// Adds a node. Re-adding an identical node is a no-op; a conflicting one is an error.
@@ -109,53 +181,54 @@ impl GraphBuilder {
         Ok(())
     }
 
-    /// Adds an edge. Re-adding an identical edge is a no-op; a conflicting one is an error.
-    pub fn add_edge(
-        &mut self,
-        src: NodeKey,
-        kind: EdgeKind,
-        dst: NodeKey,
-        provenance: Provenance,
-        certainty: Certainty,
-        attrs: Attrs,
-    ) -> anyhow::Result<()> {
-        let id = (src, kind, dst, provenance);
-        let value = (certainty, attrs);
-        if let Some(existing) = self.edges.get(&id) {
-            ensure!(
-                *existing == value,
-                "conflicting definitions for edge {} {} {} ({})",
-                id.0,
-                id.1,
-                id.2,
-                id.3
-            );
-            return Ok(());
+    /// Adds an edge. Re-adding the same edge merges its evidence; differing certainty or attrs is
+    /// an error.
+    pub fn add_edge(&mut self, edge: NewEdge) -> anyhow::Result<()> {
+        let id = (edge.src, edge.kind, edge.dst, edge.provenance);
+        match self.edges.get_mut(&id) {
+            Some((certainty, attrs, evidence)) => {
+                ensure!(
+                    *certainty == edge.certainty && *attrs == edge.attrs,
+                    "conflicting definitions for edge {} {} {} ({})",
+                    id.0,
+                    id.1,
+                    id.2,
+                    id.3
+                );
+                evidence.extend(edge.evidence);
+            }
+            None => {
+                self.edges.insert(
+                    id,
+                    (
+                        edge.certainty,
+                        edge.attrs,
+                        edge.evidence.into_iter().collect(),
+                    ),
+                );
+            }
         }
-        self.edges.insert(id, value);
         Ok(())
     }
 
-    /// Assigns dense ids in key order and resolves edges. Fails on dangling edge endpoints.
+    /// Assigns dense ids in key order and resolves edges. Fails on dangling edge endpoints and on
+    /// evidence that does not point at a `File` node.
     pub fn finish(self) -> anyhow::Result<Graph> {
+        let files = file_paths(self.nodes.keys().map(|k| (k.kind, k.key.as_str())));
         let mut ids = HashMap::with_capacity(self.nodes.len());
-        let mut nodes = Vec::with_capacity(self.nodes.len());
-        for (i, (key, (name, attrs))) in self.nodes.into_iter().enumerate() {
-            let id = i64::try_from(i + 1).context("node count overflows i64")?;
-            ids.insert(key.clone(), id);
-            nodes.push(Node {
-                id,
-                kind: key.kind,
-                key: key.key,
-                name,
-                attrs,
-            });
+        for (i, key) in self.nodes.keys().enumerate() {
+            ids.insert(
+                key.clone(),
+                i64::try_from(i + 1).context("node count overflows i64")?,
+            );
         }
         let mut edges = Vec::with_capacity(self.edges.len());
-        for ((src, kind, dst, provenance), (certainty, attrs)) in self.edges {
+        for ((src, kind, dst, provenance), (certainty, attrs, evidence)) in self.edges {
             let (Some(&s), Some(&d)) = (ids.get(&src), ids.get(&dst)) else {
                 bail!("edge {src} {kind} {dst} has an endpoint that is not a node");
             };
+            let evidence: Vec<Evidence> = evidence.into_iter().collect();
+            check_evidence(&files, &evidence)?;
             edges.push(Edge {
                 src: s,
                 dst: d,
@@ -163,18 +236,61 @@ impl GraphBuilder {
                 provenance,
                 certainty,
                 attrs,
+                evidence,
             });
         }
+        let nodes = self
+            .nodes
+            .into_iter()
+            .map(|(key, (name, attrs))| Node {
+                id: ids[&key],
+                kind: key.kind,
+                key: key.key,
+                name,
+                attrs,
+            })
+            .collect();
         // BTreeMap order is by key; ids follow key order, so this is already (src, kind, dst, prov) order.
         Ok(Graph { nodes, edges })
     }
 }
 
+fn file_paths<'a>(nodes: impl Iterator<Item = (NodeKind, &'a str)>) -> HashSet<&'a str> {
+    nodes
+        .filter(|(k, _)| *k == NodeKind::File)
+        .map(|(_, key)| key)
+        .collect()
+}
+
+fn check_evidence(files: &HashSet<&str>, evidence: &[Evidence]) -> anyhow::Result<()> {
+    for ev in evidence {
+        ensure!(
+            files.contains(ev.path.as_str()),
+            "evidence references {:?}, which is not a File node",
+            ev.path
+        );
+    }
+    Ok(())
+}
+
+/// Sorts diagnostics into their canonical order (kind, path, span, detail).
+pub fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
+    diagnostics.sort_by(|a, b| {
+        (&a.kind, &a.path, &a.span, a.detail.to_string()).cmp(&(
+            &b.kind,
+            &b.path,
+            &b.span,
+            b.detail.to_string(),
+        ))
+    });
+}
+
 /// Canonical, id-independent text dump of a snapshot (design §3.3, §11.1 `rb dump`).
 ///
-/// One JSON array per line: a header, then nodes sorted by `(kind, key)`, then edges sorted by
-/// `(src key, kind, dst key, provenance)`. Two snapshots of the same inputs must dump byte-identically.
-pub fn canonical_dump(commit_sha: &str, graph: &Graph) -> String {
+/// One JSON array per line: a header, nodes sorted by `(kind, key)`, edges sorted by
+/// `(src key, kind, dst key, provenance)` with their evidence, then diagnostics in canonical order.
+/// Two snapshots of the same inputs must dump byte-identically.
+pub fn canonical_dump(commit_sha: &str, graph: &Graph, diagnostics: &[Diagnostic]) -> String {
     let by_id: HashMap<i64, &Node> = graph.nodes.iter().map(|n| (n.id, n)).collect();
     let mut out = String::new();
     let mut line = |v: Value| {
@@ -182,7 +298,7 @@ pub fn canonical_dump(commit_sha: &str, graph: &Graph) -> String {
         let _ = writeln!(out, "{v}");
     };
 
-    line(json!(["rb-dump", 1, commit_sha]));
+    line(json!(["rb-dump", 2, commit_sha]));
 
     let mut nodes: Vec<&Node> = graph.nodes.iter().collect();
     nodes.sort_by(|a, b| (a.kind, &a.key).cmp(&(b.kind, &b.key)));
@@ -206,6 +322,12 @@ pub fn canonical_dump(commit_sha: &str, graph: &Graph) -> String {
         ))
     });
     for (s, e, d) in edges {
+        let mut evidence: Vec<&Evidence> = e.evidence.iter().collect();
+        evidence.sort();
+        let evidence: Vec<Value> = evidence
+            .iter()
+            .map(|ev| json!([ev.path, ev.span]))
+            .collect();
         line(json!([
             "E",
             s.kind.as_str(),
@@ -215,8 +337,15 @@ pub fn canonical_dump(commit_sha: &str, graph: &Graph) -> String {
             d.key,
             e.provenance.as_str(),
             e.certainty.rank(),
-            e.attrs
+            e.attrs,
+            evidence
         ]));
+    }
+
+    let mut diagnostics = diagnostics.to_vec();
+    sort_diagnostics(&mut diagnostics);
+    for d in diagnostics {
+        line(json!(["D", d.kind, d.path, d.span, d.detail]));
     }
     out
 }
@@ -237,23 +366,32 @@ mod tests {
         NodeKey::new(NodeKind::Service, "(root)")
     }
 
+    fn in_root(p: &str) -> NewEdge {
+        NewEdge::new(
+            file(p),
+            EdgeKind::InService,
+            svc(),
+            Provenance::Manifest,
+            Certainty::Exact,
+        )
+    }
+
     fn build(order: &[&str]) -> Graph {
         let mut b = GraphBuilder::new();
         b.add_node(svc(), "(root)", Attrs::new()).unwrap();
         for p in order {
             b.add_node(file(p), *p, attrs(json!({"z": 1, "a": 2})))
                 .unwrap();
-            b.add_edge(
-                file(p),
-                EdgeKind::InService,
-                svc(),
-                Provenance::Manifest,
-                Certainty::Exact,
-                Attrs::new(),
-            )
-            .unwrap();
+            b.add_edge(in_root(p)).unwrap();
         }
         b.finish().unwrap()
+    }
+
+    fn ev(p: &str, line: i32) -> Evidence {
+        Evidence {
+            path: p.into(),
+            span: [line, 0, line, 5],
+        }
     }
 
     #[test]
@@ -261,7 +399,10 @@ mod tests {
         let a = build(&["b.rs", "a.rs", "c/d.rs"]);
         let b = build(&["c/d.rs", "b.rs", "a.rs"]);
         assert_eq!(a, b);
-        assert_eq!(canonical_dump("abc", &a), canonical_dump("abc", &b));
+        assert_eq!(
+            canonical_dump("abc", &a, &[]),
+            canonical_dump("abc", &b, &[])
+        );
     }
 
     #[test]
@@ -276,16 +417,53 @@ mod tests {
 
     #[test]
     fn dump_is_key_sorted_json_lines() {
-        let dump = canonical_dump("abc", &build(&["a.rs"]));
+        let diag = Diagnostic {
+            kind: "skipped_symlink".into(),
+            path: Some("l".into()),
+            span: None,
+            detail: json!({}),
+        };
+        let dump = canonical_dump("abc", &build(&["a.rs"]), &[diag]);
         let lines: Vec<&str> = dump.lines().collect();
-        assert_eq!(lines[0], r#"["rb-dump",1,"abc"]"#);
-        assert_eq!(lines[1], r#"["N","file","a.rs","a.rs",{"a":2,"z":1}]"#);
-        assert_eq!(lines[2], r#"["N","service","(root)","(root)",{}]"#);
         assert_eq!(
-            lines[3],
-            r#"["E","file","a.rs","IN_SERVICE","service","(root)","manifest",5,{}]"#
+            lines,
+            [
+                r#"["rb-dump",2,"abc"]"#,
+                r#"["N","file","a.rs","a.rs",{"a":2,"z":1}]"#,
+                r#"["N","service","(root)","(root)",{}]"#,
+                r#"["E","file","a.rs","IN_SERVICE","service","(root)","manifest",5,{},[]]"#,
+                r#"["D","skipped_symlink","l",null,{}]"#,
+            ]
         );
-        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn evidence_is_merged_sorted_and_deduplicated() {
+        let mut b = GraphBuilder::new();
+        b.add_node(svc(), "(root)", Attrs::new()).unwrap();
+        b.add_node(file("a.rs"), "a.rs", Attrs::new()).unwrap();
+        b.add_edge(in_root("a.rs").evidence(ev("a.rs", 7))).unwrap();
+        b.add_edge(
+            in_root("a.rs")
+                .evidence(ev("a.rs", 2))
+                .evidence(ev("a.rs", 7)),
+        )
+        .unwrap();
+        let g = b.finish().unwrap();
+        assert_eq!(g.edges()[0].evidence, vec![ev("a.rs", 2), ev("a.rs", 7)]);
+        assert!(
+            canonical_dump("c", &g, &[]).contains(r#"[["a.rs",[2,0,2,5]],["a.rs",[7,0,7,5]]]"#)
+        );
+    }
+
+    #[test]
+    fn evidence_must_point_at_a_file_node() {
+        let mut b = GraphBuilder::new();
+        b.add_node(svc(), "(root)", Attrs::new()).unwrap();
+        b.add_node(file("a.rs"), "a.rs", Attrs::new()).unwrap();
+        b.add_edge(in_root("a.rs").evidence(ev("missing.rs", 1)))
+            .unwrap();
+        assert!(b.finish().is_err());
     }
 
     #[test]
@@ -320,21 +498,19 @@ mod tests {
         b.add_node(file("a"), "a", Attrs::new()).unwrap();
         b.add_node(file("a"), "a", Attrs::new()).unwrap();
         assert!(b.add_node(file("a"), "other", Attrs::new()).is_err());
+
+        b.add_node(svc(), "(root)", Attrs::new()).unwrap();
+        b.add_edge(in_root("a")).unwrap();
+        let mut heuristic = in_root("a");
+        heuristic.certainty = Certainty::Heuristic;
+        assert!(b.add_edge(heuristic).is_err());
     }
 
     #[test]
     fn dangling_edges_fail_finish() {
         let mut b = GraphBuilder::new();
         b.add_node(file("a"), "a", Attrs::new()).unwrap();
-        b.add_edge(
-            file("a"),
-            EdgeKind::InService,
-            svc(),
-            Provenance::Manifest,
-            Certainty::Exact,
-            Attrs::new(),
-        )
-        .unwrap();
+        b.add_edge(in_root("a")).unwrap();
         assert!(b.finish().is_err());
     }
 }

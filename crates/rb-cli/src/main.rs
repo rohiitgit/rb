@@ -1,16 +1,13 @@
-//! `rb` — Repository Brain CLI (design §11.1). M0 commands: migrate, index, status, dump, cypher.
+//! `rb` — Repository Brain CLI (design §11.1).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
 use clap::{Parser, Subcommand};
-use rb_model::{canonical_dump, graph_from_manifest};
-use rb_store::{Diagnostic, LoadDir, SnapshotInfo, Store};
+use rb_model::{NodeKind, ServiceRole, canonical_dump};
+use rb_store::{LoadDir, Resolved, ServiceCard, SnapshotInfo, Store};
 use serde_json::{Value, json};
-
-/// Identifies the extraction pipeline; bump whenever indexing output changes for the same input.
-const PIPELINE: &str = "m0-manifest-1";
 
 #[derive(Parser)]
 #[command(
@@ -74,6 +71,27 @@ enum Command {
         /// Write to a file instead of stdout.
         #[arg(long, short)]
         output: Option<PathBuf>,
+    },
+    /// Search nodes by key or name (exact matches first, then ranked substring matches).
+    Find {
+        text: String,
+        /// Restrict to one node kind (symbol, file, service, table, owner, endpoint, package).
+        #[arg(long)]
+        kind: Option<NodeKind>,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(i64).range(1..=1000))]
+        limit: i64,
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// List services, or show one service's card (by directory or name).
+    Service {
+        /// Service directory (e.g. `services/auth`, `.` for the repo root) or name.
+        service: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
@@ -140,12 +158,68 @@ fn main() -> anyhow::Result<()> {
                 Some(id) => store.snapshot(id)?,
                 None => live_snapshot(&mut store, repo)?,
             };
-            let dump = canonical_dump(&snap.commit_sha, &store.load_graph(snap.id)?);
+            let graph = store.load_graph(snap.id)?;
+            let diagnostics = store.load_diagnostics(snap.id)?;
+            let dump = canonical_dump(&snap.commit_sha, &graph, &diagnostics);
             match output {
                 Some(p) => {
                     std::fs::write(&p, dump).with_context(|| format!("writing {}", p.display()))?
                 }
                 None => std::io::stdout().write_all(dump.as_bytes())?,
+            }
+        }
+        Command::Find {
+            text,
+            kind,
+            limit,
+            repo,
+        } => {
+            let snap = live_snapshot(&mut store, repo)?;
+            for n in store.find(snap.id, &text, kind, limit)? {
+                println!("{}\t{}\t{}", n.kind, n.key, n.name);
+            }
+        }
+        Command::Service {
+            service,
+            repo,
+            json,
+        } => {
+            let snap = live_snapshot(&mut store, repo)?;
+            match service {
+                None => {
+                    let services = store.services(snap.id)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&services)?);
+                    } else {
+                        for s in services {
+                            println!("{}\t{}\t{}\t{}", s.key, s.name, s.role, files(s.files));
+                        }
+                    }
+                }
+                Some(text) => {
+                    let found = match store.resolve_service(snap.id, &text)? {
+                        Resolved::One(n) => n,
+                        Resolved::None => {
+                            bail!("no service matches {text:?} (try `rb service` to list them)")
+                        }
+                        Resolved::Ambiguous(candidates) => {
+                            let list: Vec<String> = candidates
+                                .iter()
+                                .map(|c| format!("  {}  ({})", c.key, c.name))
+                                .collect();
+                            bail!(
+                                "{text:?} matches several services; pass a directory:\n{}",
+                                list.join("\n")
+                            );
+                        }
+                    };
+                    let card = store.service_card(snap.id, &found.key)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&card)?);
+                    } else {
+                        print!("{}", render_card(&card));
+                    }
+                }
             }
         }
         Command::Cypher { query, repo, cols } => {
@@ -187,35 +261,31 @@ fn index(
         load_dir.display()
     );
 
-    let manifest = rb_git::read_manifest(&path, rev)?;
+    let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(rev)?;
     store.migrate()?;
     let tools = tool_versions();
 
     if !force
         && let Some(live) = store.live_snapshot(&repo)?
-        && live.commit_sha == manifest.commit_sha
+        && live.commit_sha == commit_sha
         && live.tool_versions == tools
     {
         println!(
             "{repo}: up to date — live snapshot {} already covers {} (use --force to rebuild)",
             live.id,
-            short(&manifest.commit_sha)
+            short(&commit_sha)
         );
         return Ok(());
     }
 
-    let graph = graph_from_manifest(&manifest)?;
-    let diagnostics: Vec<Diagnostic> = manifest
-        .skipped
-        .iter()
-        .map(|s| Diagnostic {
-            kind: format!("skipped_{}", s.reason),
-            detail: json!({ "path": s.path }),
-        })
-        .collect();
+    let rb_indexer::Indexed {
+        commit_sha,
+        graph,
+        diagnostics,
+    } = rb_indexer::index_commit(&path, &commit_sha)?;
     let snap = store.publish_snapshot(
         &repo,
-        &manifest.commit_sha,
+        &commit_sha,
         &tools,
         &graph,
         &diagnostics,
@@ -236,9 +306,79 @@ fn index(
 fn tool_versions() -> Value {
     json!({
         "rb": env!("CARGO_PKG_VERSION"),
-        "pipeline": PIPELINE,
+        "pipeline": rb_indexer::PIPELINE,
         "schema": rb_store::schema_version(),
     })
+}
+
+/// Text rendering of the Service Card's structure sections (design §9.5).
+fn render_card(c: &ServiceCard) -> String {
+    let kind = match c.role {
+        ServiceRole::Service => "deployable",
+        ServiceRole::Library => "library",
+        ServiceRole::Unassigned => "files outside every detected project",
+    };
+    let mut out = format!("{}  (path: {}, {kind})\n", c.name, c.key);
+    if !c.detected_by.is_empty() {
+        out += &format!("├─ Detected by: {}\n", c.detected_by.join(", "));
+    }
+    if !c.manifests.is_empty() {
+        out += &format!("├─ Manifests: {}\n", c.manifests.join(", "));
+    }
+    let langs: Vec<String> = c
+        .languages
+        .iter()
+        .map(|(l, n)| format!("{l} {n}"))
+        .collect();
+    out += &format!("├─ Files: {} ({})\n", c.files, langs.join(", "));
+    let owners = if c.owners.is_empty() {
+        "none".to_owned()
+    } else {
+        c.owners.join(", ")
+    };
+    out += &format!("├─ Owners: {owners}\n");
+    out += "├─ File ownership\n";
+    let width = c
+        .file_owners
+        .iter()
+        .map(|o| o.owner.len())
+        .max()
+        .unwrap_or(0)
+        .max("unowned".len());
+    for o in &c.file_owners {
+        out += &format!(
+            "│    {:<width$}  {:>10}  {:>3}%\n",
+            o.owner,
+            files(o.files),
+            percent(o.files, c.files)
+        );
+    }
+    out += &format!(
+        "│    {:<width$}  {:>10}  {:>3}%\n",
+        "unowned",
+        files(c.unowned_files),
+        percent(c.unowned_files, c.files)
+    );
+    out += "└─ APIs, tables, dependencies and call graph: not indexed yet (M2–M4)\n";
+    out
+}
+
+/// "1 file", "3 files".
+fn files(n: usize) -> String {
+    if n == 1 {
+        "1 file".into()
+    } else {
+        format!("{n} files")
+    }
+}
+
+/// Integer percentage rounded half up; 0 when `total` is 0.
+fn percent(part: usize, total: usize) -> usize {
+    if total == 0 {
+        0
+    } else {
+        (part * 200 + total) / (total * 2)
+    }
 }
 
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
@@ -289,6 +429,32 @@ fn short(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percentages_round_half_up() {
+        assert_eq!(percent(1, 3), 33);
+        assert_eq!(percent(2, 3), 67);
+        assert_eq!(percent(1, 8), 13);
+        assert_eq!(percent(0, 0), 0);
+    }
+
+    #[test]
+    fn file_counts_pluralise() {
+        assert_eq!(files(0), "0 files");
+        assert_eq!(files(1), "1 file");
+        assert_eq!(files(12), "12 files");
+    }
+
+    #[test]
+    fn find_limit_is_validated_at_parse_time() {
+        for bad in ["0", "-1", "1001"] {
+            assert!(
+                Cli::try_parse_from(["rb", "find", "x", "--limit", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(Cli::try_parse_from(["rb", "find", "x", "--limit", "1000"]).is_ok());
+    }
 
     #[test]
     fn repo_names_are_sanitised() {
