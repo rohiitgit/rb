@@ -90,6 +90,15 @@ fn syntax(language: Language) -> Syntax {
     }
 }
 
+/// The decoded value of a string literal node of `language`, or `None` if `node` is not one.
+/// Interpolations become `$n`, as for SQL candidates.
+pub(crate) fn string_value(language: Language, node: Node<'_>, source: &[u8]) -> Option<String> {
+    let syn = syntax(language);
+    syn.literals
+        .contains(&node.kind())
+        .then(|| literal_text(node, &syn, source, &mut 0))
+}
+
 pub(crate) fn sql_candidates<'t>(
     language: Language,
     root: Node<'t>,

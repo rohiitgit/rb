@@ -4,6 +4,7 @@
 //! output can be cached by blob SHA. [`symbol_keys`] derives stable heuristic symbol keys (design
 //! §5.4) from a file's path and facts alone.
 
+mod decorations;
 mod keys;
 mod queries;
 mod strings;
@@ -40,6 +41,7 @@ fn fingerprint_input() -> String {
         include_str!("lib.rs"),
         include_str!("queries.rs"),
         include_str!("strings.rs"),
+        include_str!("decorations.rs"),
     ]
     .join("\n")
 }
@@ -142,6 +144,45 @@ pub struct Definition {
     pub parent: Option<usize>,
     /// Go method receiver type, when the type is not defined in the same file (else `parent`).
     pub receiver: Option<String>,
+    /// Java annotations, Python/TypeScript decorators, in source order.
+    #[serde(default)]
+    pub decorations: Vec<Decoration>,
+    /// Classes and interfaces this definition extends or implements, in source order.
+    #[serde(default)]
+    pub supertypes: Vec<Supertype>,
+    /// Python class bodies: `NAME = 'string'` assignments (e.g. `__tablename__`), in order.
+    #[serde(default)]
+    pub class_constants: Vec<ClassConstant>,
+}
+
+/// An annotation or decorator on a definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decoration {
+    /// As written, possibly qualified (`Table`, `app.route`, `javax.persistence.Entity`).
+    pub name: String,
+    pub args: Vec<DecorationArg>,
+}
+
+/// One decoration argument. String literals are decoded; anything else is its source text. An
+/// object literal argument (`@Entity({ name: 'x' })`) contributes its pairs as keyed arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DecorationArg {
+    pub key: Option<String>,
+    pub value: String,
+}
+
+/// A named supertype; `name` is as written (possibly qualified), type arguments by simple name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Supertype {
+    pub name: String,
+    pub type_args: Vec<String>,
+}
+
+/// A string constant assigned in a Python class body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassConstant {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +257,9 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             receiver: (language == Language::Go)
                 .then(|| go_receiver(d.node, source))
                 .flatten(),
+            decorations: decorations::decorations(language, d.node, source),
+            supertypes: decorations::supertypes(language, d.node, source),
+            class_constants: decorations::class_constants(language, d.node, source),
         })
         .collect();
     attach_go_methods(&mut definitions);

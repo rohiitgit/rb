@@ -131,3 +131,12 @@ Findings from the research step (2026-09-29):
 - [x] 3. Indexer: Table nodes, MIGRATES from `.sql` files, QUERIES from candidates, diagnostics (S6, S9–S12).
 - [x] 4. `rb table-deps`, SQL coverage in `rb status`, fixture goldens (S13–S15).
 - [x] 5. Public-repo measurement (S16), evaluator pass, fixes, docs, commit.
+
+---
+
+# M2b ORM mappings (contract: tasks/contract-m2b.md)
+
+- [x] 1. rb-syntax: generic decorations, supertypes and Python class constants (O1).
+- [ ] 2. rb-frameworks crate: JPA entities and naming, Spring Data repositories and derived queries, `@Query` (native SQL and JPQL), JPQL resolution, Prisma schema and client calls, TypeORM, SQLAlchemy, Django (O2–O7).
+- [ ] 3. Indexer: MAPS_TO and ORM QUERIES edges, `jpql_unresolved_entity` diagnostics; table-deps "Mapped by" (O8).
+- [ ] 4. Public repos (O9), evaluator passes, docs, commit.

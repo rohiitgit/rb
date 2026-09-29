@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-09-29 18:30]
+- M2b step 1: `rb-syntax` extracts framework-neutral facts per definition:
+  - decorations: Java annotations, and Python/TypeScript decorators (including the siblings before a method and those on an export statement), with decoded literal arguments; TypeORM-style option objects are flattened into keyed arguments;
+  - supertypes, with type arguments;
+  - Python class-body string constants.
+- The new source file is part of the cache fingerprint.
+- Files affected: crates/rb-syntax/src/{lib,decorations,strings,keys}.rs.
+
 ## [2026-09-29 17:55]
 - M2a, fourth evaluator pass (4 defects, 0 regressions); all fixed test-first and covered by mutation checks.
   - **Lexer errors** keep the statements before the failure point, taken from the lexer's "at or near" text.
