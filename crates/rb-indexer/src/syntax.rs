@@ -20,11 +20,7 @@ pub struct FactsKey {
 impl FactsKey {
     /// The cache's `extractor` column: extractor version plus language.
     pub fn extractor(&self) -> String {
-        format!(
-            "{};{}",
-            rb_syntax::EXTRACTOR_VERSION,
-            self.language.as_str()
-        )
+        format!("{};{}", rb_syntax::extractor_id(), self.language.as_str())
     }
 }
 
@@ -196,19 +192,29 @@ pub(crate) fn load_or_parse(
 /// Blobs read and parsed per round; bounds memory on large repositories.
 const PARSE_BATCH: usize = 512;
 
-/// A `syntax_error` diagnostic per parsed file whose tree had errors.
+/// Per parsed file: `syntax_error` if the tree had errors, `definitions_too_deep` if nesting was
+/// truncated at `rb_syntax::MAX_NESTING`.
 pub(crate) fn syntax_diagnostics(facts_by_path: &BTreeMap<&str, &FileFacts>) -> Vec<Diagnostic> {
-    facts_by_path
-        .iter()
-        .filter_map(|(path, facts)| {
-            facts.syntax_error.map(|span| Diagnostic {
+    let mut out = Vec::new();
+    for (path, facts) in facts_by_path {
+        if let Some(span) = facts.syntax_error {
+            out.push(Diagnostic {
                 kind: "syntax_error".into(),
                 path: Some((*path).to_owned()),
                 span: Some(span),
                 detail: json!({}),
-            })
-        })
-        .collect()
+            });
+        }
+        if facts.nesting_truncated {
+            out.push(Diagnostic {
+                kind: "definitions_too_deep".into(),
+                path: Some((*path).to_owned()),
+                span: None,
+                detail: json!({"max_nesting": rb_syntax::MAX_NESTING}),
+            });
+        }
+    }
+    out
 }
 
 fn object(v: serde_json::Value) -> rb_model::Attrs {
@@ -425,7 +431,7 @@ mod tests {
         };
         assert_eq!(
             key.extractor(),
-            format!("{};tsx", rb_syntax::EXTRACTOR_VERSION)
+            format!("{};tsx", rb_syntax::extractor_id())
         );
         let other = FactsKey {
             language: Language::TypeScript,
@@ -447,5 +453,15 @@ mod tests {
         assert_eq!(diagnostics[0].kind, "syntax_error");
         assert_eq!(diagnostics[0].path.as_deref(), Some("bad.py"));
         assert_eq!(diagnostics[0].span.map(|s| s[0]), Some(2));
+
+        let depth = rb_syntax::MAX_NESTING + 1;
+        let src = format!("{}{}", "function a(){".repeat(depth), "}".repeat(depth));
+        let truncated = rb_syntax::extract(Language::JavaScript, src.as_bytes()).unwrap();
+        let by_path: BTreeMap<&str, &FileFacts> = [("deep.js", &truncated)].into_iter().collect();
+        let kinds: Vec<String> = syntax_diagnostics(&by_path)
+            .into_iter()
+            .map(|d| d.kind)
+            .collect();
+        assert_eq!(kinds, ["definitions_too_deep"]);
     }
 }

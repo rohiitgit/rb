@@ -99,7 +99,7 @@ This document started from the "Architecting the Repository Brain" blueprint. Se
 
 | Crate | Responsibility |
 |---|---|
-| `rb-model` | IDs, node and edge kinds, `FileFacts`, `certainty`/`provenance` enums, serde and bincode formats |
+| `rb-model` | IDs, node and edge kinds, `certainty`/`provenance` enums, graph builder, canonical dump |
 | `rb-git` | `gix` wrapper: manifests, tree diffs, blob reads, CODEOWNERS, boundary detection |
 | `rb-syntax` | Tree-sitter grammars, `tags.scm` runner, enclosing-scope index |
 | `rb-frameworks` | Framework packs: data-driven query files plus small Rust handlers (§4.5) |
@@ -133,7 +133,7 @@ This document started from the "Architecting the Repository Brain" blueprint. Se
 - `gix` opens the repository without shelling out. For the target commit, the ingester walks the tree and emits `(path, blob_sha, mode, size)`.
 - It skips `.gitignore`d paths only when they appear in the working tree; the Git tree is authoritative. It also skips submodules, which are recorded as `external` nodes. Blobs over a configurable size (default 1 MiB) and blobs detected as binary or generated are skipped too. A file counts as generated if it matches `linguist-generated` in `.gitattributes`, carries a `@generated` or `Code generated … DO NOT EDIT` header, or sits in a configured path.
 - Paths that are not valid UTF-8 are skipped with a `skipped_non_utf8_path` diagnostic. Keys are UTF-8 text, and a lossy conversion could merge two distinct files.
-- **Change set.** A tree diff between the commit of the previous live snapshot and the target commit gives added, modified, deleted and renamed files. That diff drives cache lookups and project invalidation (§3.4).
+- **Change set.** A tree diff between the commit of the previous live snapshot and the target commit gives added, modified, deleted and renamed files. *M1b finding:* the facts cache is keyed by blob, so unchanged files are never re-parsed without a change set. Change sets are therefore deferred to M3, where they decide which SCIP projects to re-index.
 - **Contributors (optional).** For recent history, the ingester counts commits per path over a window, by default 90 days before the target commit's timestamp. It uses committer identity only and runs deterministically for a given commit. The result is reported as `contributors`, never as owners.
 
 ### 4.2 CODEOWNERS
@@ -177,7 +177,20 @@ For each supported language, the extractor runs one pass per blob and emits:
 3. **Imports**, from a per-language `imports.scm` (written by us). These feed the heuristic resolver (§5.4).
 4. **String literals**, recorded with their parent call expression. Adjacent literal concatenations and template strings are folded into a template, with `${…}` holes marked. SQL (§7) and HTTP stitching (§10) both use them.
 
-v1 languages: TypeScript/JavaScript (incl. TSX), Java, Python and Go. v1.x adds Kotlin, C#, Rust and C/C++. Grammars are compiled in as crates at pinned versions.
+v1 languages: TypeScript/JavaScript (incl. TSX), Java, Python and Go. v1.x adds Kotlin, C#, Rust and C/C++. Grammars are compiled in as crates at pinned versions, and the versions are part of `EXTRACTOR_VERSION` (a test checks them against `Cargo.lock`).
+
+What M1b learned about the stock `tags.scm` queries:
+- **TypeScript:** its `tags.scm` only covers the TypeScript additions (signatures, interfaces, abstract classes, modules), so TS/TSX run the JavaScript query plus the TypeScript one.
+- **Java:** the stock query misses enums, records and constructors. A small supplement adds them. Annotation types (`@interface`) are not captured yet.
+- **Go:** methods attach to their receiver type. The type becomes the parent when it is declared in the same file; otherwise the receiver name is kept on the definition and used in the key.
+- **Python:** functions directly inside a class become `method`.
+- **False positives:** the TSX grammar reports a syntax error for a bare `&` in JSX text, and tree-sitter-typescript 0.23.2 (the newest on crates.io) rejects some TypeScript 5.x syntax such as `export type * from`. The file's other definitions are still extracted, but definitions inside the unparsed region can be lost. Evaluating a newer grammar revision is an open item.
+- **TypeScript:** type aliases, enums and `namespace` blocks are added by a supplement, because neither stock query covers them.
+- **Locals are not symbols (§8.2):** a definition inside an anonymous function (callback, lambda, anonymous class, Go func literal) is local and is dropped. A function value that is itself a captured definition (`const f = () => {}`) is not anonymous.
+- **Nesting cap:** definitions deeper than 64 levels are dropped, with a diagnostic, so key size stays linear. Beyond about 32k levels Tree-sitter itself slows down (about 17 s per file); no timeout is used, because it would make results depend on machine speed.
+- **Cache identity:** the facts-cache key includes a fingerprint of all bundled queries and of the extractor source, so an edit to either invalidates stale facts automatically.
+
+Output: definitions as `(kind, name, name span, node span, parent)` and references as `(kind, name, span, enclosing definition)`, both 0-based with byte columns. References are cached but not turned into edges until resolution (M3).
 
 ### 4.5 Framework packs (`rb-frameworks`)
 
@@ -270,7 +283,11 @@ For a call named `f` in file `F`, candidates are the definitions named `f` in:
 
 The search stops at the first level that yields candidates. If there is **exactly one** candidate, the result is an edge with certainty `heuristic`. If there are **several**, the result is one edge to each, with certainty `ambiguous` and attr `candidates=n`. If there are **none**, the call site is recorded as `unresolved` and counted in coverage. Method calls on receivers of unknown type (`x.save()`) resolve only when the receiver was declared in-file with a type. Otherwise they stay `unresolved` rather than linking by bare name to every `save`.
 
-Heuristic symbol keys use a synthetic SCIP-shaped scheme, e.g. `rb-heuristic . <project> . <path-derived descriptors>`, so every node kind shares one key space. When SCIP later succeeds for that project, the keys are replaced wholesale.
+Heuristic symbol keys use a synthetic SCIP-shaped scheme: `rb-heuristic . . . `<path>`/<descriptors>`. For example, ``rb-heuristic . . . `src/auth.ts`/AuthService#login().``.
+- The package fields are empty and the file path is a backtick-escaped namespace, so a key depends only on its own file. A project-based prefix would change every key whenever a `package.json` moved.
+- Callables that share a name in one scope get SCIP's `(+n)` disambiguator in source order.
+- Repeated type-like declarations (TypeScript declaration merging) share one key: the first declaration's kind wins, and every site becomes `DEFINED_IN` evidence.
+- When SCIP later succeeds for that project, the keys are replaced wholesale.
 
 ### 5.5 External packages
 
@@ -467,7 +484,7 @@ CREATE TABLE rb.edge_evidence (
 CREATE TABLE rb.file_facts_cache (             -- content-addressed; shared across snapshots and repos
   blob_sha   text  NOT NULL,
   extractor  text  NOT NULL,                   -- extractor + pack versions hash
-  facts      bytea NOT NULL,                   -- bincode FileFacts, zstd
+  facts      bytea NOT NULL,                   -- JSON FileFacts (M1b; bincode+zstd only if size demands it)
   PRIMARY KEY (blob_sha, extractor)
 );
 
@@ -816,7 +833,7 @@ Each milestone is shippable and has an exit criterion that is a test, not a demo
 |---|---|---|
 | **M0 Foundations** | Rust workspace; Docker Compose with Postgres + AGE (pinned digest); `rb.*` migrations; snapshot lifecycle; `rb index` manifest-only; AGE projection of `File/Service` (Owner moved to M1, because it needs CODEOWNERS); `rb dump` | determinism test green on 2 fixtures; `rb cypher` returns files per service. **Done 2026-09-29.** |
 | **M1a Structure** | CODEOWNERS; service boundaries + `rb.toml`; edge evidence; `rb find`, `rb service` (structure sections) | GitHub-example CODEOWNERS tests; golden Service Cards on `polyglot-monorepo`. **Done 2026-09-29.** |
-| **M1b Syntax** | `gix` change sets; Tree-sitter defs/refs/scopes for TS, Java, Python, Go; facts cache | per-language extraction goldens; warm-cache run = cold-cache run |
+| **M1b Syntax** | Tree-sitter defs/refs/scopes for TS/TSX/JS, Java, Python, Go; Symbol/DEFINED_IN/CONTAINS; facts cache (change sets moved to M3) | contract `tasks/contract-m1b.md` C1–C20; warm-cache run parses 0 files and dumps identically to a cold run |
 | **M2 Data access** | `rb-sql`: sinks, template normalisation, pg_query, sqlparser fallback, JPQL tokenizer; ORM packs (JPA, Prisma, TypeORM, SQLAlchemy); `QUERIES/MAPS_TO/MIGRATES` | `rb table-deps` golden at the symbol level (service roll-up via file→service); SQL coverage metrics |
 | **M3 Semantics** | SCIP orchestration (scip-java, scip-typescript first); SCIP⋈TS join; `CALLS/REFERENCES/IMPLEMENTS/CONTAINS`; Tier B heuristic resolver; CSR in rb-server; `rb callers`, `rb impact` | Q1/Q2 goldens on all fixtures, including `no-build`; incremental-equivalence test green |
 | **M4 Frameworks** | route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card | Q3/Q4 goldens on `polyglot-monorepo`; precision guards (must-not-exist edges) green |

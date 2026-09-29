@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-09-29 11:30]
+- M1b review fixes, each test-first:
+  - a Go method whose receiver type is declared in its own body crashed the process (a parent cycle). Methods now attach only to top-level types, and key building is iterative and cycle-safe;
+  - a Go method no longer attaches to a same-named type local to another function;
+  - nesting is capped at 64 levels (`definitions_too_deep` diagnostic), so key size stays linear;
+  - TypeScript `namespace`, type aliases and enums are now definitions;
+  - definitions inside anonymous functions (callbacks, lambdas, anonymous classes, Go func literals) are locals, not symbols. Previously unrelated test-local types merged into one symbol.
+- Cache correctness: the facts cache key is now `rb_syntax::extractor_id()`, which combines the grammar versions with a fingerprint of the bundled queries and the extractor source, so stale facts can't be served after an edit.
+- C18 moved to public repos (spring-petclinic, hono, gin, requests). The two private repos previously used for C18 were deleted from the Brain, and their references removed from IMPLEMENT.md and the M1b contract.
+- Files affected: crates/rb-syntax/src/{lib,keys,queries}.rs, crates/rb-indexer/src/syntax.rs, crates/rb-cli/tests/e2e.rs, IMPLEMENT.md, tasks/contract-m1b.md, docs/repository-brain-design.md, README.md.
+
 ## [2026-09-29 10:25]
 - M1b step 3: syntax facts are cached in `rb.file_facts_cache`, keyed by blob plus extractor version and language, through `Store::load_facts`/`save_facts` and a CLI `StoreCache` adapter.
   - `rb index` reports `parsed N source files`.

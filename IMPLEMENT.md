@@ -70,3 +70,52 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Fixes 1–6, written tests first
 - [x] Evaluator review of the full M1a diff: 9 confirmed defects, all fixed with regression tests. Also fixed 3 of its 5 unconfirmed suspicions (owner case, `--limit`, DOCTYPE) and proved one more by test (migration 0003). The last one, `/*` being root-only, was kept on purpose and documented.
 - [x] Commit (see git log)
+
+## M1b Syntax: complete
+
+- **Decided:** see `tasks/contract-m1b.md`.
+  - The extractor goes in a new `rb-syntax` crate.
+  - Keys use the file path, not the project, so a key depends only on its own file.
+  - References are cached but not emitted as edges.
+  - Parallelism uses `std::thread::scope` (no rayon).
+  - The facts cache stores JSON, not bincode.
+  - `gix` change sets are dropped; the blob-keyed cache makes them redundant until M3.
+- **Built:**
+  - `rb-syntax`: queries, extraction, keys;
+  - the `rb-indexer::syntax` stage;
+  - `Store::load_facts`/`save_facts`;
+  - `rb index --no-cache` and the parse count.
+- **Measured (C18):** public repos at pinned commits, release build, 2026-09-29.
+
+  | Repo @ commit | Files parsed | Cold | Warm | Symbols | Diagnostics |
+  |---|---|---|---|---|---|
+  | spring-projects/spring-petclinic @ 818c4136ea97 | 50 | 0.82 s | 0.10 s | 240 | 0 |
+  | honojs/hono @ 18331a905e24 | 441 | 0.33 s | 0.23 s | 1,698 | 8 syntax errors |
+  | gin-gonic/gin @ 1bd0ecf2d3e0 | 98 | 0.19 s | 0.21 s | 1,522 | 0 |
+  | psf/requests @ 611c6162cbc4 | 37 | 0.17 s | 0.16 s | 911 | 2 skipped symlinks |
+
+  Every warm run parsed 0 files, and each repo's cold and warm dumps are byte-identical.
+
+  Sanity checks against `grep`:
+  - **Java:** type declarations 50 = 50.
+  - **Python:** def + class 807 = 807.
+  - **TypeScript:** classes 59 = 59, and type-alias definition sites 915 of 926. The 11 missing are in files where the grammar reports syntax errors.
+  - **Go:** functions + methods 1,315 = 1,345 − 25 (generated `test.pb.go`, skipped by design) − 5 (inside a `/* legacy tests */` block comment, which grep miscounts).
+
+  All C18 repos were deleted from the Brain afterwards.
+- **Known gaps:**
+  - Java `@interface` annotation types are not captured.
+  - tree-sitter-typescript 0.23.2 (the newest on crates.io, from November 2024) rejects some valid TypeScript 5.x, such as `export type * from`. In hono this caused 8 false syntax errors and lost definitions in those files. The TSX grammar also flags a bare `&` in JSX text.
+  - Nesting deeper than about 32k levels takes Tree-sitter about 17 s per file. It is bounded and doesn't crash, but a timeout would make results depend on machine speed, so none is used.
+  - JavaScript computed and private method names are not captured by the upstream query.
+- **Found and fixed during review:** see CHANGELOG 2026-09-29 11:30.
+
+### Status
+
+- [x] Steps 1–3, committed: ce5290a, d97e645, eb70b51
+- [x] Evaluator review of 54cb220..HEAD: 3 confirmed defects (a Go receiver cycle crashing the whole run, the wrong Go receiver parent, quadratic key growth), all fixed test-first.
+- [x] Own C18 findings fixed:
+  - TypeScript type aliases and enums were missing;
+  - locals in anonymous scopes were merged into one symbol;
+  - the cache served stale facts twice after extractor changes, now prevented by fingerprinting queries and code.
+- [x] Final commit (see git log)

@@ -15,9 +15,43 @@ use tree_sitter::{Node, Parser, QueryCursor, StreamingIterator};
 
 pub use keys::symbol_keys;
 
-/// Bump when extraction output can change for the same input. Includes the grammar versions,
-/// which a test checks against Cargo.lock.
-pub const EXTRACTOR_VERSION: &str = "rb-syntax-1;tree-sitter-0.27.0;typescript-0.23.2;javascript-0.25.0;java-0.23.5;python-0.25.0;go-0.25.0";
+/// Grammar versions (checked against Cargo.lock by a test). Query text and the extractor's own
+/// source code are fingerprinted automatically by [`extractor_id`], so no manual bump is needed.
+pub const EXTRACTOR_VERSION: &str = "rb-syntax;tree-sitter-0.27.0;typescript-0.23.2;javascript-0.25.0;java-0.23.5;python-0.25.0;go-0.25.0";
+
+/// The cache identity of this extractor: [`EXTRACTOR_VERSION`] plus a fingerprint of every
+/// bundled query and of the extraction source code. Any edit to either invalidates cached facts,
+/// so a stale cache can never be served (a manual version bump was forgotten twice).
+pub fn extractor_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        format!(
+            "{EXTRACTOR_VERSION};code-{:016x}",
+            fnv1a(fingerprint_input().as_bytes())
+        )
+    })
+}
+
+/// Everything that determines `extract`'s output besides the grammars.
+fn fingerprint_input() -> String {
+    [
+        queries::all_sources().as_str(),
+        include_str!("lib.rs"),
+        include_str!("queries.rs"),
+    ]
+    .join("\n")
+}
+
+/// 64-bit FNV-1a: tiny, stable across platforms and releases, good enough for a fingerprint.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Definitions nested deeper than this are dropped (reported via `nesting_truncated`). Keys embed
+/// their ancestors, so unbounded depth would make key size quadratic in file size.
+pub const MAX_NESTING: usize = 64;
 
 /// Files larger than this are not parsed (design §4.1).
 pub const MAX_PARSE_BYTES: u64 = 1024 * 1024;
@@ -125,6 +159,9 @@ pub struct FileFacts {
     pub references: Vec<Reference>,
     /// Span of the first syntax error, if the file did not parse cleanly.
     pub syntax_error: Option<Span>,
+    /// Definitions deeper than [`MAX_NESTING`] were dropped.
+    #[serde(default)]
+    pub nesting_truncated: bool,
 }
 
 /// Parses `source` and extracts its definitions and references.
@@ -139,18 +176,25 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
 
     let (mut raw_defs, mut raw_refs) = capture(grammar, root, source);
     raw_defs.sort_by_key(|d| (d.node.start_byte(), std::cmp::Reverse(d.node.end_byte())));
+    let raw_defs = drop_locals(raw_defs, grammar.anonymous_scopes);
     raw_refs.sort_by_key(|r| (r.name.start_byte(), r.kind));
 
     let lexical_parent = nesting(&raw_defs);
+    let depth = depths(&lexical_parent);
+    let kept: Vec<Option<usize>> = kept_indices(&depth);
+    let nesting_truncated = kept.iter().any(Option::is_none);
     let mut definitions: Vec<Definition> = raw_defs
         .iter()
         .zip(&lexical_parent)
-        .map(|(d, parent)| Definition {
+        .zip(&kept)
+        .filter(|(_, new)| new.is_some())
+        .map(|((d, parent), _)| Definition {
             kind: d.kind,
             name: text(d.name, source),
             name_span: span(d.name),
             span: span(d.node),
-            parent: *parent,
+            // A kept definition's parent is shallower, so it is kept too.
+            parent: parent.and_then(|p| kept[p]),
             receiver: (language == Language::Go)
                 .then(|| go_receiver(d.node, source))
                 .flatten(),
@@ -174,7 +218,8 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             kind: r.kind,
             name: text(r.name, source),
             span: span(r.name),
-            enclosing: enclosing(r.name.start_byte(), &starts, &ends, &lexical_parent),
+            enclosing: enclosing(r.name.start_byte(), &starts, &ends, &lexical_parent)
+                .map(|i| nearest_kept(i, &kept, &lexical_parent)),
         })
         .collect();
 
@@ -182,7 +227,78 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         definitions,
         references,
         syntax_error: root.has_error().then(|| first_error(root)).flatten(),
+        nesting_truncated,
     })
+}
+
+/// Removes definitions that live inside an anonymous function (callbacks, lambdas, anonymous
+/// classes, func literals) or inside another local: they are locals, not symbols (design §8.2).
+/// A function value that *is* a captured definition (`const f = () => {}`) is not anonymous.
+/// `defs` must be sorted outer-first, so each definition's ancestors are decided before it.
+fn drop_locals<'t>(defs: Vec<RawDef<'t>>, anonymous_scopes: &[&str]) -> Vec<RawDef<'t>> {
+    let mut is_local: HashMap<usize, bool> = HashMap::with_capacity(defs.len());
+    let mut kept = Vec::with_capacity(defs.len());
+    for d in defs {
+        let local = local_by_ancestry(d.node, &is_local, anonymous_scopes);
+        is_local.insert(d.node.id(), local);
+        if !local {
+            kept.push(d);
+        }
+    }
+    kept
+}
+
+fn local_by_ancestry(
+    node: Node<'_>,
+    is_local: &HashMap<usize, bool>,
+    anonymous_scopes: &[&str],
+) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if let Some(&local) = is_local.get(&n.id()) {
+            return local;
+        }
+        let names_a_definition = n.parent().is_some_and(|p| is_local.contains_key(&p.id()));
+        if anonymous_scopes.contains(&n.kind()) && !names_a_definition {
+            return true;
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// Nesting depth of each definition (parents precede children in `parent`'s order).
+fn depths(parent: &[Option<usize>]) -> Vec<usize> {
+    let mut depth = vec![0; parent.len()];
+    for i in 0..parent.len() {
+        depth[i] = parent[i].map_or(0, |p| depth[p] + 1);
+    }
+    depth
+}
+
+/// New index of each definition within `MAX_NESTING`, `None` for dropped ones.
+fn kept_indices(depth: &[usize]) -> Vec<Option<usize>> {
+    let mut next = 0;
+    depth
+        .iter()
+        .map(|&d| {
+            (d < MAX_NESTING).then(|| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
+
+/// The new index of `i`, or of its closest kept ancestor (depth 0 is always kept).
+fn nearest_kept(mut i: usize, kept: &[Option<usize>], parent: &[Option<usize>]) -> usize {
+    loop {
+        match (kept[i], parent[i]) {
+            (Some(new), _) => return new,
+            (None, Some(p)) => i = p,
+            (None, None) => unreachable!("top-level definitions are always kept"),
+        }
+    }
 }
 
 struct RawDef<'t> {
@@ -316,12 +432,14 @@ fn go_receiver(node: Node<'_>, source: &[u8]) -> Option<String> {
     None
 }
 
-/// Go methods become children of their receiver type when it is declared in the same file.
+/// Go methods become children of their receiver type when it is declared at the top level of the
+/// same file. Receivers always name package-level types, so types local to a function (including
+/// the method's own body) never qualify; that also keeps the parent relation acyclic.
 fn attach_go_methods(defs: &mut [Definition]) {
     let types: HashMap<String, usize> = defs
         .iter()
         .enumerate()
-        .filter(|(_, d)| d.kind == DefKind::Type)
+        .filter(|(_, d)| d.kind == DefKind::Type && d.parent.is_none())
         .rev() // so the first declaration wins
         .map(|(i, d)| (d.name.clone(), i))
         .collect();
@@ -549,6 +667,91 @@ export function hash(s: string): string {
 ";
 
     #[test]
+    fn go_methods_only_attach_to_top_level_types() {
+        // The receiver type is declared inside the method itself: must not become its parent.
+        let own_body = "package p\nfunc (t T) M() {\n\ttype T struct{}\n}\n";
+        let facts = extract(Language::Go, own_body.as_bytes()).unwrap();
+        let m = facts.definitions.iter().find(|d| d.name == "M").unwrap();
+        assert_eq!((m.parent, m.receiver.as_deref()), (None, Some("T")));
+
+        // A same-named type local to another function is not the receiver either.
+        let other_fn = "package p\nfunc f() {\n\ttype T struct{}\n}\nfunc (t T) M() {}\n";
+        assert_eq!(
+            outline(Language::Go, other_fn),
+            ["function f@1:5", "type f.T@2:6", "method T.M@4:11"]
+        );
+    }
+
+    #[test]
+    fn nesting_is_capped_so_cost_stays_linear() {
+        let depth = MAX_NESTING + 40;
+        let src = format!("{}{}\n", "function a(){".repeat(depth), "}".repeat(depth));
+        let facts = extract(Language::JavaScript, src.as_bytes()).unwrap();
+        assert_eq!(facts.definitions.len(), MAX_NESTING);
+        assert!(facts.nesting_truncated);
+        assert!(
+            facts
+                .definitions
+                .iter()
+                .all(|d| d.parent.is_none_or(|p| p < facts.definitions.len()))
+        );
+        let shallow = extract(Language::JavaScript, b"function a(){ function b(){} }\n").unwrap();
+        assert!(!shallow.nesting_truncated);
+    }
+
+    #[test]
+    fn typescript_type_aliases_and_enums_are_definitions() {
+        let src = "export type Id = string\nenum Color { Red }\nexport const enum Dir { Up }\n";
+        assert_eq!(
+            outline(Language::TypeScript, src),
+            ["type Id@0:12", "class Color@1:5", "class Dir@2:18"]
+        );
+    }
+
+    #[test]
+    fn definitions_inside_anonymous_functions_are_locals() {
+        // Test-style callbacks: the aliases are locals, not symbols (design §8.2).
+        let ts = "describe('a', () => {\n  type Expected = 1\n  function helper() { go() }\n})\ndescribe('b', () => { type Expected = 2 })\nconst f = () => { type T = 1 }\n";
+        assert_eq!(
+            outline(Language::TypeScript, ts),
+            ["function f@5:6", "type f.T@5:23"]
+        );
+        // A call inside a local definition still counts, attributed to no named definition.
+        assert_eq!(
+            refs(Language::TypeScript, ts, RefKind::Call),
+            ["describe in -", "go in -", "describe in -"]
+        );
+
+        let java = "class A {\n  void m() {\n    Runnable r = new Runnable() { public void run() { go(); } };\n  }\n}\n";
+        assert_eq!(
+            outline(Language::Java, java),
+            ["class A@0:6", "method A.m@1:7"]
+        );
+        assert_eq!(refs(Language::Java, java, RefKind::Call), ["go in m"]);
+
+        let go = "package p\nfunc F() {\n\tg := func() { type L struct{} }\n\ttype K struct{}\n\t_ = g\n}\n";
+        assert_eq!(
+            outline(Language::Go, go),
+            ["function F@1:5", "type F.K@3:6"]
+        );
+    }
+
+    #[test]
+    fn typescript_namespaces_are_modules() {
+        let src =
+            "namespace N { export function a() {} }\nnamespace M { export function a() {} }\n";
+        assert_eq!(
+            outline(Language::TypeScript, src),
+            [
+                "module N@0:10",
+                "function N.a@0:30",
+                "module M@1:10",
+                "function M.a@1:30"
+            ]
+        );
+    }
+
+    #[test]
     fn typescript_uses_javascript_and_typescript_tags() {
         assert_eq!(
             outline(Language::TypeScript, TS),
@@ -637,6 +840,30 @@ export function hash(s: string): string {
                 assert_eq!(l.as_str(), lang);
             }
         }
+    }
+
+    #[test]
+    fn extractor_id_fingerprints_queries_and_code() {
+        let id = extractor_id();
+        assert!(id.starts_with(EXTRACTOR_VERSION), "{id}");
+        let (_, hash) = id.rsplit_once(";code-").expect("code fingerprint present");
+        assert_eq!(hash.len(), 16);
+        assert_eq!(
+            hash,
+            format!("{:016x}", fnv1a(fingerprint_input().as_bytes()))
+        );
+        let input = fingerprint_input();
+        assert!(
+            input.contains("fn drop_locals"),
+            "extractor code is fingerprinted"
+        );
+        assert!(
+            input.contains("JAVA_SUPPLEMENT"),
+            "query supplements are fingerprinted"
+        );
+        // FNV-1a reference value and sensitivity.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_ne!(fnv1a(b"(a) @name"), fnv1a(b"(b) @name"));
     }
 
     /// EXTRACTOR_VERSION must change whenever a grammar version changes.

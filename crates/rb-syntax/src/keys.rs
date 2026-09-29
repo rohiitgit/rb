@@ -5,43 +5,41 @@
 //! descriptor with SCIP's suffixes (`/` module, `#` type, `.` term, `().` callable). A key depends
 //! only on its file's path and contents. SCIP keys replace these per project once M3 lands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{DefKind, Definition, FileFacts};
 
 const SCHEME_AND_PACKAGE: &str = "rb-heuristic . . . ";
 
 /// One key per definition, index-aligned with `facts.definitions`.
+///
+/// Iterative and cycle-safe: facts can come from a cache, so a corrupt parent chain must not
+/// recurse forever. A repeated ancestor simply ends the chain.
 pub fn symbol_keys(path: &str, facts: &FileFacts) -> Vec<String> {
     let defs = &facts.definitions;
     let descriptors = descriptors(defs);
     let root = format!("{SCHEME_AND_PACKAGE}{}/", escape(path));
-    let mut keys: Vec<Option<String>> = vec![None; defs.len()];
-    for i in 0..defs.len() {
-        key_of(i, defs, &descriptors, &root, &mut keys);
-    }
-    keys.into_iter().map(|k| k.unwrap_or_default()).collect()
-}
-
-/// A definition's key is its parent's key (or the file root, plus a Go receiver) + its descriptor.
-fn key_of(
-    i: usize,
-    defs: &[Definition],
-    descriptors: &[String],
-    root: &str,
-    keys: &mut [Option<String>],
-) -> String {
-    if let Some(k) = &keys[i] {
-        return k.clone();
-    }
-    let prefix = match (defs[i].parent, &defs[i].receiver) {
-        (Some(p), _) => key_of(p, defs, descriptors, root, keys),
-        (None, Some(receiver)) => format!("{root}{}#", escape(receiver)),
-        (None, None) => root.to_owned(),
-    };
-    let key = format!("{prefix}{}", descriptors[i]);
-    keys[i] = Some(key.clone());
-    key
+    (0..defs.len())
+        .map(|i| {
+            let mut chain = vec![i];
+            let mut seen = HashSet::from([i]);
+            let mut cur = defs[i].parent;
+            while let Some(p) = cur.filter(|&p| p < defs.len() && seen.insert(p)) {
+                chain.push(p);
+                cur = defs[p].parent;
+            }
+            let top = &defs[chain[chain.len() - 1]];
+            let mut key = root.clone();
+            if let (None, Some(receiver)) = (top.parent, &top.receiver) {
+                key.push_str(&escape(receiver));
+                key.push('#');
+            }
+            for &j in chain.iter().rev() {
+                key.push_str(&descriptors[j]);
+            }
+            key
+        })
+        .collect()
 }
 
 /// SCIP descriptors. Callables that share a name within one scope get `(+n)` in source order;
@@ -151,6 +149,27 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a[1], format!("{PREFIX}`m.py`/f().g()."));
         assert_ne!(a, keys(Language::Python, "n.py", src));
+    }
+
+    #[test]
+    fn parent_cycles_cannot_overflow_the_stack() {
+        use crate::{DefKind, Definition};
+        let def = |name: &str, parent| Definition {
+            kind: DefKind::Function,
+            name: name.into(),
+            name_span: [0, 0, 0, 1],
+            span: [0, 0, 0, 1],
+            parent,
+            receiver: None,
+        };
+        // Corrupt input (e.g. a stale cache row): 0 -> 1 -> 0.
+        let facts = FileFacts {
+            definitions: vec![def("a", Some(1)), def("b", Some(0))],
+            ..FileFacts::default()
+        };
+        let got = symbol_keys("x.js", &facts);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|k| k.starts_with(PREFIX)), "{got:?}");
     }
 
     #[test]

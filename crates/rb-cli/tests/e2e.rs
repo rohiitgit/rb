@@ -422,3 +422,19 @@ fn warm_facts_cache_equals_cold_run() {
         rb(&url, &["dump", "--repo", &warm])
     );
 }
+
+/// Contract C11: facts cached under one extractor version are invisible to another.
+#[test]
+fn facts_cache_is_keyed_by_extractor_version() {
+    let Some(url) = db_url() else { return };
+    let mut store = Store::connect(&url).unwrap();
+    store.migrate().unwrap();
+    let blob = format!("{:0>40x}", std::process::id());
+    let row = |extractor: &str| (blob.clone(), extractor.to_owned());
+    store
+        .save_facts(&[(blob.clone(), "test-v1;go".into(), b"{}".to_vec())])
+        .unwrap();
+    assert_eq!(store.load_facts(&[row("test-v1;go")]).unwrap().len(), 1);
+    assert!(store.load_facts(&[row("test-v2;go")]).unwrap().is_empty());
+    assert!(store.load_facts(&[row("test-v1;java")]).unwrap().is_empty());
+}

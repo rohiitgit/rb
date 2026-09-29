@@ -52,6 +52,17 @@ Dropped from M1b: `gix` change sets. The blob-keyed facts cache already skips un
 | C15 | AGE parity holds with `Symbol` vertices and the new edges | existing e2e parity test |
 | C16 | `rb find login --kind symbol` returns the login symbols from the fixtures | golden |
 | C17 | Symbol keys follow SCIP descriptor shape with an `rb-heuristic` scheme; names with non-identifier characters are backtick-escaped | unit |
-| C18 | Real repos (a private Java repo and a private TypeScript repo) index with no panic, and their symbol counts are sanity-checked by hand against `grep` | recorded measurement: cold time, warm time, symbol count |
+| C18 | Public open-source repos at pinned commits index with no panic, and their symbol counts are sanity-checked by hand against `grep`. The repos: spring-projects/spring-petclinic (Java), honojs/hono (TypeScript), gin-gonic/gin (Go), psf/requests (Python). | recorded measurement: cold time, warm time, symbol count per repo |
 | C19 | No new dependency without a stated reason; only Tree-sitter and grammar crates are added (the cache uses the existing serde_json, no bincode/zstd yet) | review |
 | C20 | `cargo fmt --check`, `clippy -D warnings` and the full test suite pass; the stub scan is clean | verification loop |
+
+## Results (2026-09-29)
+
+All 20 assertions are met:
+- C1–C17, C19 and C20 are covered by tests: 84 workspace tests pass, and the evaluator's verdicts plus the fixes are recorded in `IMPLEMENT.md`.
+- C18 was measured on 4 public repos at pinned commits: no crashes, warm run = cold run, and the `grep` reconciliations are in `IMPLEMENT.md`.
+
+Changes made while fulfilling the contract:
+- **C11:** the cache key includes a fingerprint of the queries and the extractor code, not just a version string. The version string had been forgotten twice.
+- **§8.2 applied:** definitions inside anonymous functions are locals, not symbols.
+- **New cap:** definitions nested deeper than 64 levels are dropped, with a `definitions_too_deep` diagnostic.
