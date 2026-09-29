@@ -1876,6 +1876,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-frameworks"
+version = "0.1.0"
+dependencies = [
+ "rb-sql",
+ "rb-syntax",
+]
+
+[[package]]
 name = "rb-git"
 version = "0.1.0"
 dependencies = [

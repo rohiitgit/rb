@@ -1,5 +1,18 @@
 # Changelog
 
+## [2026-09-29 19:20]
+- M2b step 2: new `rb-frameworks` crate. Pure packs over syntax facts cover:
+  - JPA `@Entity`/`@Table` (by default the table is the entity name snake-cased, flagged assumed);
+  - Spring Data repositories: inherited CRUD, derived queries, native and JPQL `@Query`;
+  - a JPQL parser (association paths skipped, FROM lists with joins);
+  - Prisma schema models and client calls;
+  - TypeORM `@Entity`;
+  - SQLAlchemy `__tablename__`;
+  - Django models (`Meta.db_table` or `<app>_<model>`).
+- The `snake_case` implementation follows TypeORM's `DefaultNamingStrategy` and Hibernate's `PhysicalNamingStrategySnakeCaseImpl`, which Spring Boot uses by default. Both were checked against their sources.
+- `rb-syntax`: call references record their receiver `qualifier`.
+- Files affected: crates/rb-frameworks/*, crates/rb-syntax/src/lib.rs, Cargo.toml.
+
 ## [2026-09-29 18:30]
 - M2b step 1: `rb-syntax` extracts framework-neutral facts per definition:
   - decorations: Java annotations, and Python/TypeScript decorators (including the siblings before a method and those on an export statement), with decoded literal arguments; TypeORM-style option objects are flattened into keyed arguments;

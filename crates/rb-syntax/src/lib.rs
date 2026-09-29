@@ -192,6 +192,10 @@ pub struct Reference {
     pub span: Span,
     /// Index into `FileFacts::definitions` of the innermost definition containing the reference.
     pub enclosing: Option<usize>,
+    /// For a member call, the object it is called on as written (`prisma.user` in
+    /// `prisma.user.findMany()`); `None` for plain calls.
+    #[serde(default)]
+    pub qualifier: Option<String>,
 }
 
 /// A string expression that looks like SQL (design §7.1). The SQL parser decides downstream.
@@ -282,6 +286,9 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             span: span(r.name),
             enclosing: enclosing(r.name.start_byte(), &starts, &ends, &lexical_parent)
                 .map(|i| nearest_kept(i, &kept, &lexical_parent)),
+            qualifier: (r.kind == RefKind::Call)
+                .then(|| call_qualifier(r.name, source))
+                .flatten(),
         })
         .collect();
 
@@ -487,6 +494,17 @@ fn enclosing(
         candidate = parent[i];
     }
     None
+}
+
+/// The object a member call is made on: the `object` (JS/TS, Python, Java) or `operand` (Go) of
+/// the node whose name the call reference captured.
+fn call_qualifier(name: Node<'_>, source: &[u8]) -> Option<String> {
+    let member = name.parent()?;
+    let object = member
+        .child_by_field_name("object")
+        .or_else(|| member.child_by_field_name("operand"))
+        .filter(|o| o.id() != name.id())?;
+    Some(text(object, source))
 }
 
 /// Go: the receiver's type name of a `method_declaration`, e.g. `Circle` for `(c *Circle)`.
@@ -856,6 +874,40 @@ export function hash(s: string): string {
             ["class K@0:6", "method K.m@0:10"]
         );
         assert_eq!(refs(Language::JavaScript, js, RefKind::Class), ["K in m"]);
+    }
+
+    #[test]
+    fn member_calls_record_their_qualifier() {
+        let qualifiers = |language, src: &str| -> Vec<(String, Option<String>)> {
+            extract(language, src.as_bytes())
+                .unwrap()
+                .references
+                .iter()
+                .filter(|r| r.kind == RefKind::Call)
+                .map(|r| (r.name.clone(), r.qualifier.clone()))
+                .collect()
+        };
+        let q =
+            |name: &str, qualifier: Option<&str>| (name.to_owned(), qualifier.map(str::to_owned));
+        assert_eq!(
+            qualifiers(
+                Language::TypeScript,
+                "async function f() { await this.prisma.user.findMany(); go(); }"
+            ),
+            [q("findMany", Some("this.prisma.user")), q("go", None)]
+        );
+        assert_eq!(
+            qualifiers(Language::Python, "def f():\n    db.session.query(User)\n"),
+            [q("query", Some("db.session"))]
+        );
+        assert_eq!(
+            qualifiers(Language::Java, "class A { void f() { repo.findById(1); } }"),
+            [q("findById", Some("repo"))]
+        );
+        assert_eq!(
+            qualifiers(Language::Go, "package p\nfunc f() { db.Query(q) }\n"),
+            [q("Query", Some("db"))]
+        );
     }
 
     #[test]

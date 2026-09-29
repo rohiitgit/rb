@@ -1,0 +1,14 @@
+[package]
+name = "rb-frameworks"
+description = "Repository Brain framework packs: ORM mappings and data access from syntax facts (design §4.5)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rb-sql.workspace = true
+rb-syntax.workspace = true
+
+[lints]
+workspace = true

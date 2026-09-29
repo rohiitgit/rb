@@ -35,6 +35,7 @@ rb-store = { path = "crates/rb-store" }
 rb-indexer = { path = "crates/rb-indexer" }
 rb-syntax = { path = "crates/rb-syntax" }
 rb-sql = { path = "crates/rb-sql" }
+rb-frameworks = { path = "crates/rb-frameworks" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
