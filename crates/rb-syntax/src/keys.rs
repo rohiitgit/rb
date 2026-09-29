@@ -170,6 +170,7 @@ mod tests {
             decorations: Vec::new(),
             supertypes: Vec::new(),
             class_constants: Vec::new(),
+            type_params: Vec::new(),
         };
         // Corrupt input (e.g. a stale cache row): 0 -> 1 -> 0.
         let facts = FileFacts {

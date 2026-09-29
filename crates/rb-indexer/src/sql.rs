@@ -221,7 +221,7 @@ impl Accesses {
     }
 }
 
-fn unparsed(
+pub(crate) fn unparsed(
     path: &str,
     span: Option<rb_model::Span>,
     error: &str,

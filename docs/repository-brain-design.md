@@ -420,6 +420,34 @@ Known gaps:
   - `Symbol(type) -MAPS_TO-> Table`, for ORM entities;
   - `File(migration) -MIGRATES{op}-> Table`.
 
+### 7.4 ORM mappings (as built in M2b)
+
+`rb-syntax` records framework-neutral facts: decorations with arguments, supertypes with type arguments, type parameters, class constants, and call qualifiers. Every argument and constant carries a `literal` flag (a static string; concatenations of literals are flattened). `rb-frameworks` turns these facts into mappings and accesses with pure functions. The indexer then resolves them across the whole snapshot.
+
+| ORM | Table name | Notes |
+|---|---|---|
+| JPA | `@Table(name, schema)`, else the entity name (`@Entity(name)` or the class name) | Written as Hibernate's `PhysicalNamingStrategySnakeCaseImpl` writes it. That is Spring Boot 4's default (Boot 3.x's `CamelCaseToUnderscoresNamingStrategy` also lowercases quoted names), and it applies to explicit names and schemas too. Quoted names (`"x"`, `` `x` ``) are kept exactly. Otherwise `.` becomes `_`, an underscore is inserted before an interior capital that has a lowercase letter or digit on both sides, and the name is lowercased. Inserted underscores are flagged `name_assumed`. |
+| JPA inheritance | a subclass entity shares its root entity's table | This is SINGLE_TABLE, the default; Hibernate ignores `@Table` on such a subclass (HHH000139). With `@Inheritance(JOINED \| TABLE_PER_CLASS)` on the root, each class has its own table. The walk follows `extends` (never `implements`) through every Java class, including `@MappedSuperclass`. A superclass resolves by simple name: the only class with that name, else the only one in the same directory. The edge is `synthetic` and carries `inherits`. |
+| TypeORM | `@Entity('x')` / `@Entity({name, schema})`, else `snakeCase(class)` | Names are quoted, so case is kept. |
+| SQLAlchemy | `__tablename__`; for Flask-SQLAlchemy `db.Model`, `camel_to_snake_case(class)` | Flask's rule differs from TypeORM's (`My_Table` becomes `my__table`). `__abstract__ = True` and `__tablename__ = None` (single-table inheritance) get no table. A Flask class reaching `db.Model` through abstract bases only gets its own table; a subclass of a concrete model shares its parent's. |
+| Django | `Meta.db_table`, else `<app_label>_<model>` | A model extends `models.Model` (bare `Model` is not recognised until there are import facts), or a model of the same file. `app_label` and `db_table` follow Django's Meta inheritance: a class without its own `Meta` inherits the whole `Meta` of its first abstract parent, and `class Meta(Base.Meta)` extends it. Otherwise the app label is the directory above the last `models` package, or the file's directory. A `db_table` of `'"auth"."users"'` means `auth.users`. `abstract` models get no table. A `proxy` uses its parent's table; if the parent is not in the file, the result is `orm_unresolved_proxy_parent`. Multi-table-inheritance children get their own table. |
+| Prisma | `@@map("x")` / `@@map(name: "x")`, `@@schema`, else the model name | An accessor resolves to the schemas whose directory shares the most leading path segments with the file. Several distinct tables make the result `ambiguous`. |
+
+Accesses:
+- **Spring Data:** a repository gets inherited CRUD access; declared methods get derived-query access, native `@Query` (exact, via `rb-sql`) or JPQL (heuristic).
+  - Type arguments are resolved as *class* names; JPQL names are *entity* names.
+  - Generic base repositories are resolved per name, memoised, with a cycle guard: a name binds the index of its entity type parameter only if every declaration of it agrees (a built-in base counts as a declaration). Otherwise it is dropped. `org.springframework.data.…` supertypes always mean the built-in base.
+- **JPQL:** entities come only from clause-level FROM and JOIN, at the top level or in a subquery. Function arguments, `IN(…)` and `TREAT(…)` are never entities. Comments and SpEL are skipped. Concatenated queries are read from their flattened text, where a word holding a `$n` hole is never an entity. A native query's `$n`-glued table names are never tables, and its other tables become `heuristic` when the text is not static.
+- **Prisma client calls:** these count only when the receiver segment before the model accessor contains `prisma` or is `db`, `tx`, `client`, `trx` or `database`.
+
+Diagnostics:
+- `orm_dynamic_table_name`: the name is not a static string, so no table is invented;
+- `orm_unresolved_proxy_parent`;
+- `orm_unresolved_entity`;
+- `unparsed_sql` with callee `Query`: native SQL that `rb-sql` cannot parse.
+
+Declarations that share a symbol key are aggregated per (symbol, table) rather than conflicting. This happens, for example, with a class defined in both branches of an `if`.
+
 ---
 
 ## 8. Storage: PostgreSQL + Apache AGE

@@ -224,15 +224,22 @@ pub fn assemble(
     }
     let mut diagnostics = Vec::new();
     // ORM mappings from every file first, so accesses can resolve entities across files.
-    let mut orm_index = orm::OrmIndex::default();
-    for (path, (language, facts)) in &content.facts {
+    for (path, (_, facts)) in &content.facts {
         syntax::add_symbols(&mut b, path, facts)?;
         diagnostics.extend(sql::add_queries(&mut b, path, facts)?);
-        orm::add_mappings(&mut b, path, *language, facts, &mut orm_index)?;
     }
-    for (path, text) in &content.prisma {
-        orm::add_prisma_models(&mut b, path, text, &mut orm_index)?;
-    }
+    let files: Vec<(&str, rb_syntax::Language, &rb_syntax::FileFacts)> = content
+        .facts
+        .iter()
+        .map(|(path, (language, facts))| (*path, *language, *facts))
+        .collect();
+    let prisma: Vec<(&str, &str)> = content
+        .prisma
+        .iter()
+        .map(|(path, text)| (*path, text.as_str()))
+        .collect();
+    let (orm_index, orm_diagnostics) = orm::add_mappings(&mut b, &files, &prisma)?;
+    diagnostics.extend(orm_diagnostics);
     for (path, (language, facts)) in &content.facts {
         diagnostics.extend(orm::add_accesses(
             &mut b, path, *language, facts, &orm_index,

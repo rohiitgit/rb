@@ -139,4 +139,6 @@ Findings from the research step (2026-09-29):
 - [x] 1. rb-syntax: generic decorations, supertypes and Python class constants (O1).
 - [x] 2. rb-frameworks crate: JPA entities and naming, Spring Data repositories and derived queries, `@Query` (native SQL and JPQL), JPQL resolution, Prisma schema and client calls, TypeORM, SQLAlchemy, Django (O2–O7).
 - [x] 3. Indexer: MAPS_TO and ORM QUERIES edges, `jpql_unresolved_entity` diagnostics; table-deps "Mapped by" (O8).
-- [ ] 4. Public repos (O9), evaluator passes, docs, commit.
+- [x] 4a. Public repos (O9) measured; re-measured after fixes (Django 55, reconciled).
+- [x] 4b. Evaluator pass 1: 13 defects fixed test-first (contract Amendment 1); design §7.4.
+- [x] 4c. Evaluator passes 2–7 (Amendments 2–7), commit.

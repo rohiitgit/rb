@@ -1,5 +1,84 @@
 # Changelog
 
+## [2026-09-30 07:00]
+- M2b evaluator pass 7 fixes:
+  - **`first_along`** re-examines a base after resolving it, so results no longer depend on source order.
+  - **Django `Meta`:** a class without its own `Meta` inherits only its first abstract parent's `Meta`.
+  - **Tests:** shadowed-order proxies and `Meta` chains, merged-Meta across parents, and a reversed 20,000-deep proxy chain.
+- Files affected: crates/rb-frameworks/src/lib.rs, tasks/contract-m2b.md, docs §7.4.
+
+## [2026-09-30 06:00]
+- M2b evaluator pass 6 fixes:
+  - **`first_along`:** a new iterative, memoised resolver. `PyClasses` now resolves every class's Django table (`resolve_django_tables`) and inherited `Meta` values (`inherited_meta`) with it, once per file. It replaces the recursive `django_table` and the per-class `Meta` walks, so there is no recursion depth and cost is linear.
+  - **Flask:** detection requires `db.Model` or a name ending in `.db.Model`.
+  - **Contract:** Amendment 6 records E2, E3, enums/records and nested Python bases as limitations for M3.
+- Files affected: crates/rb-frameworks/src/lib.rs, tasks/contract-m2b.md.
+
+## [2026-09-30 04:30]
+- M2b evaluator pass 5 fixes:
+  - **`BaseResolver`** tracks which names on the current path a result was computed without, and caches only complete results, so bindings no longer depend on interface names. There is a step budget of 100,000.
+  - **Python mapping** is rebuilt around `PyClasses`: per-file base and `Meta` indexes, Django and Flask membership by reverse BFS, and an iterative `Meta` inheritance walk. `reaches`, `local_bases`, `django_is_model`, `own_meta` and `inherited_meta_from` are removed.
+  - **`mappings`** only considers class definitions.
+- Files affected: crates/rb-frameworks/src/lib.rs, tasks/contract-m2b.md.
+
+## [2026-09-30 03:00]
+- M2b evaluator pass 4 fixes:
+  - **Repository bases:** `repository_bases` was a round-based fixpoint that could loop forever on same-named interface cycles. It is now a memoised per-name resolver (`BaseResolver`) with a cycle guard and a depth cap of 512. Every declaration of a name must agree, and `org.springframework.data.…` supertypes bind the built-ins directly.
+  - **Hole filter:** only non-literal native SQL has `$n` names filtered.
+  - **Python walks:** they use visited sets (`reaches`, `inherited_meta_from`, `django_table` with `seen`). `MAX_MODEL_DEPTH` is removed.
+  - **Flask:** models under `__abstract__` bases.
+  - **Tests:** a cycle, a Spring-name clash, a wide Python hierarchy (40 classes), a 3000-level repository chain, Flask abstract bases, and `$` in static SQL.
+- Files affected: crates/rb-frameworks/src/lib.rs, crates/rb-indexer/src/orm.rs, docs §7.4, tasks/contract-m2b.md.
+
+## [2026-09-30 01:10]
+- M2b evaluator pass 3 fixes (3 contract violations, and the lower-severity defects that were cheap to fix):
+  - **rb-syntax:** `Supertype::implements`.
+  - **rb-frameworks:**
+    - `Target::Sql { text, literal }`.
+    - Repository-base bindings are re-derived every round, so late clashes conflict. The redundant removal loop, which a mutation check showed was dead code, is removed.
+    - Flask `__abstract__`; SQLAlchemy `__tablename__ = None`.
+    - Django: schema-quoted `db_table`, `Meta(Base.Meta)` and whole-Meta inheritance, nested `models` app labels.
+    - JPQL holes, SpEL and `UPDATE VERSIONED`.
+    - Prisma attributes sharing a line.
+  - **Indexer:** inheritance follows only `extends`. Dynamic native SQL never names hole tables, and its static tables are heuristic.
+  - **Contract:** the O5 diagnostic name is corrected; Amendment 3 lists the fixes and the accepted known gaps.
+- Files affected: crates/rb-syntax/src/{lib,decorations}.rs, crates/rb-frameworks/src/lib.rs, crates/rb-indexer/src/orm.rs, docs §7.4, tasks/contract-m2b.md.
+
+## [2026-09-29 23:40]
+- M2b evaluator pass 2 fixes (11 new code defects; the 13 earlier ones verified fixed), test-first:
+  - **rb-syntax:** Python class constants keep non-string values, marked non-literal. String values unwrap parentheses.
+  - **rb-frameworks:**
+    - `Mapping::table` is `Result<TableName, Unmapped>`, with reasons `DynamicName` and `UnknownProxyParent`. The `superclass` field is removed.
+    - Spring Data targets are `Target::EntityClass`.
+    - JPQL uses flattened non-literal text and skips comments.
+    - Conflicting generic repository bases are dropped.
+    - A snake-cased JPA schema is flagged assumed.
+    - Django: only `models.Model`; `app_label` inherited from abstract bases; `Meta.proxy` marks a model.
+    - New `flask_snake_case`. `prisma_root` is removed.
+  - **Indexer:**
+    - JPA inheritance walks all Java classes (through `@MappedSuperclass`) and prefers a same-directory superclass.
+    - A class-name index for repositories.
+    - Prisma resolves by the longest shared directory prefix.
+    - New diagnostic `orm_unresolved_proxy_parent`.
+- Files affected: crates/rb-syntax/src/{lib,strings,decorations}.rs, crates/rb-frameworks/src/lib.rs, crates/rb-indexer/src/orm.rs, docs §7.4, tasks/contract-m2b.md.
+
+## [2026-09-29 22:30]
+- M2b evaluator fixes (13 defects), test-first:
+  - **rb-syntax:** decoration arguments and class constants carry `literal`; concatenated literals are flattened; `true`/`false` class constants are kept; definitions record `type_params`.
+  - **rb-frameworks:**
+    - JPA naming follows Hibernate's `PhysicalNamingStrategySnakeCaseImpl` (`hibernate_physical_name`) for explicit names too, with quoted names kept. This corrects the earlier claim that `snake_case` matched Hibernate: it matches TypeORM and Flask-SQLAlchemy only.
+    - Dynamic names give no table.
+    - Django: abstract, proxy, `app_label`, same-file subclasses and multi-table inheritance. `db.Model` is Flask-SQLAlchemy.
+    - JPQL counts only clause-level FROM/JOIN.
+    - Generic base repositories (`repository_bases`).
+    - The Prisma receiver must look like a client.
+    - `@@map(name:)`; `prisma_root`.
+  - **Indexer:**
+    - `add_mappings` resolves the whole snapshot at once: JPA SINGLE_TABLE subclasses map to the root's table, and Prisma accessors resolve to the nearest schema (or `ambiguous`).
+    - `MAPS_TO` edges are aggregated per (symbol, table), so a class declared twice no longer fails the index.
+    - New diagnostics: `orm_dynamic_table_name`, and `unparsed_sql` (callee `Query`) for native queries.
+- Files affected: crates/rb-syntax/src/{lib,keys,strings,decorations}.rs, crates/rb-frameworks/src/lib.rs, crates/rb-indexer/src/{lib,orm,sql}.rs, docs/repository-brain-design.md §7.4, tasks/contract-m2b.md.
+
 ## [2026-09-29 20:10]
 - M2b step 3: the indexer emits ORM edges.
   - **`MAPS_TO`** (class or Prisma model → table, provenance `orm`): exact for explicit names, synthetic when the name comes from a naming rule. JPA names are folded to lowercase, as Hibernate emits them unquoted.

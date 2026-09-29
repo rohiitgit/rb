@@ -90,13 +90,25 @@ fn syntax(language: Language) -> Syntax {
     }
 }
 
-/// The decoded value of a string literal node of `language`, or `None` if `node` is not one.
-/// Interpolations become `$n`, as for SQL candidates.
-pub(crate) fn string_value(language: Language, node: Node<'_>, source: &[u8]) -> Option<String> {
+/// The decoded value of a string expression (a literal, template, or `+` concatenation with at
+/// least one literal) of `language`, and whether it is fully static (no interpolations or
+/// non-literal operands, which become `$n`). `None` if `node` is not a string expression.
+pub(crate) fn string_expression(
+    language: Language,
+    node: Node<'_>,
+    source: &[u8],
+) -> Option<(String, bool)> {
     let syn = syntax(language);
-    syn.literals
-        .contains(&node.kind())
-        .then(|| literal_text(node, &syn, source, &mut 0))
+    let mut node = node;
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        node = node.named_child(0)?;
+    }
+    if !is_string_expr(node, &syn) {
+        return None;
+    }
+    let mut holes = 0;
+    let text = flatten(node, &syn, source, &mut holes);
+    Some((text, holes == 0))
 }
 
 pub(crate) fn sql_candidates<'t>(

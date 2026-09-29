@@ -168,3 +168,38 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Third evaluator pass: 6 defects, including a panic. Splitting is now token-only. Mutation checks cover every fix.
 - [x] Commit (checkpoint, bd40ff3)
 - [x] Fourth evaluator pass: 4 defects (lexer-error recovery, `pg_dump` COPY data, glued arithmetic placeholders, multi-action rules) and no regressions. All fixed and committed.
+
+## M2b ORM mappings: complete
+
+- **Decided:** see `tasks/contract-m2b.md`.
+  - `rb-syntax` extracts framework-neutral decorations, supertypes, class constants and call qualifiers.
+  - A new `rb-frameworks` crate holds the packs.
+  - Naming rules are checked against TypeORM and Hibernate/Spring Boot sources.
+  - JPA names follow Hibernate's physical naming: snake_case plus lowercase, with quoted names kept exactly. The other ORMs keep case. The frameworks crate computes physical names; the indexer does not fold case.
+  - Certainty by kind: stated exact, convention synthetic, JPQL heuristic, duplicates ambiguous.
+- **Built:** `decorations.rs`, `rb-frameworks`, indexer `orm.rs` (`MAPS_TO` and ORM `QUERIES`), `Content` input struct, and "Mapped by" in `table-deps`, plus goldens for the JPA and Prisma fixtures.
+- **Measured (O9):** public repos at pinned commits, release build, 2026-09-29.
+
+  | Repo @ commit | Time | Mappings | ORM query edges | Unresolved entities |
+  |---|---|---|---|---|
+  | spring-projects/spring-petclinic @ 818c4136ea97 | 1.07 s | 6 JPA (= 6 `@Entity`) | 8 | 0 |
+  | prisma/prisma-examples @ caa902a819be | 1.02 s | 143 Prisma (= 143 `model` blocks), 2 TypeORM | 341 | 0 |
+  | django/djangoproject.com @ 901dd6b014c5 | 0.34 s | 48 Django (= 48 `models.Model` classes) | 0 | 0 |
+
+  Re-measured after the evaluator fixes (same commits): petclinic 6 JPA with 8 ORM query edges; prisma-examples 143 Prisma + 2 TypeORM with 341; djangoproject.com **55** Django. Every run had 0 ambiguous edges and 0 ORM diagnostics. The Django count reconciles exactly: 48 direct `models.Model` classes, minus 3 abstract bases (`Metric`, `ReleaseChecklist`, `FundraisingModel`), plus 10 concrete subclasses of those bases.
+
+  - **petclinic:** all 6 entities map exactly to the same `Table` nodes that its 4 dialect schema files create, so the ORM and SQL views join.
+  - **prisma-examples:** the TypeORM mappings come from its real TypeORM example.
+  - **djangoproject.com:** usage (querysets) is out of M2b's scope, so 0 ORM query edges is expected.
+
+### Status
+
+- [x] Steps 1–3 committed: c2ce362, 2982c96, 4dd764e
+- [x] First evaluator pass: 13 confirmed defects (the report's summary line said 11, but its list has 13). All were fixed test-first in three layers: syntax facts (`literal`, `type_params`, flattened concatenation), framework rules, then indexer resolution (JPA inheritance, generic repositories, Prisma roots, `MAPS_TO` aggregation). See contract Amendment 1.
+- [x] Second evaluator pass: the 13 earlier fixes verified; 11 new code defects, plus a stale O9 record that was already updated. All fixed test-first, with mutation checks on the syntax fixes (contract Amendment 2). The O9 numbers did not change.
+- [x] Third evaluator pass: the 11 pass-2 fixes verified; 3 contract violations (base-repository clashes across rounds, `$n` hole tables from dynamic native SQL, `implements` taken for `extends`) plus lower-severity defects. Fixed with tests; D1–D3 were mutation-checked. Accepted gaps are listed in contract Amendment 3. The O9 numbers did not change. Tests: 165 unit, 8 e2e.
+- [x] Fourth evaluator pass: D1–D3 verified; a non-terminating repository-base fixpoint (my termination argument was wrong), a project interface overriding a Spring base, the hole filter hitting literal SQL, exponential Python walks, Flask abstract bases. All fixed with tests, and the fixpoint was replaced by a memoised resolver (Amendment 4). Tests: 170 unit, 8 e2e; O9 unchanged.
+- [x] Fifth evaluator pass: pass-4 fixes verified; 2 lower-severity defects (name-dependent base resolution around cycles; cubic Python walks, which contradicted my "linear" claim). Both fixed test-first, and the tests failed before the fix (Amendment 5). Tests: 172 unit, 8 e2e; O9 unchanged.
+- [x] Sixth evaluator pass (interrupted by a session end, then resumed): no contract violations. Quadratic Django walks and a proxy stack overflow were fixed test-first; the tests overflowed before the fix. The Flask match was tightened. Name-resolution limitations are deferred to M3 (Amendment 6). Tests: 174 unit, 8 e2e; O9 unchanged.
+- [x] Seventh evaluator pass: PASS with 2 lower-severity reservations (source-order dependence in `first_along`; `Meta` options merged across abstract parents). Both were fixed with the evaluator's repros as failing-first tests (Amendment 7). These two fixes were not re-reviewed; M3's first evaluator pass re-covers `rb-frameworks`. Tests: 176 unit, 8 e2e; O9 unchanged.
+- [x] Commit

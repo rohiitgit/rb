@@ -78,33 +78,43 @@ fn decoration(language: Language, node: Node<'_>, source: &[u8]) -> Decoration {
         let mut c = arguments.walk();
         for arg in arguments.named_children(&mut c) {
             match arg.kind() {
-                "element_value_pair" | "keyword_argument" => args.push(DecorationArg {
-                    key: field_text(arg, &["key", "name"], source),
-                    value: arg
+                "element_value_pair" | "keyword_argument" => {
+                    let (value, literal) = arg
                         .child_by_field_name("value")
                         .map(|v| value_text(language, v, source))
-                        .unwrap_or_default(),
-                }),
+                        .unwrap_or_default();
+                    args.push(DecorationArg {
+                        key: field_text(arg, &["key", "name"], source),
+                        value,
+                        literal,
+                    });
+                }
                 // TypeORM-style options objects: their pairs become keyed arguments.
                 "object" => {
                     let mut pc = arg.walk();
                     for pair in arg.named_children(&mut pc).filter(|p| p.kind() == "pair") {
+                        let (value, literal) = pair
+                            .child_by_field_name("value")
+                            .map(|v| value_text(language, v, source))
+                            .unwrap_or_default();
                         args.push(DecorationArg {
                             key: pair
                                 .child_by_field_name("key")
-                                .map(|k| value_text(language, k, source)),
-                            value: pair
-                                .child_by_field_name("value")
-                                .map(|v| value_text(language, v, source))
-                                .unwrap_or_default(),
+                                .map(|k| value_text(language, k, source).0),
+                            value,
+                            literal,
                         });
                     }
                 }
                 "comment" => {}
-                _ => args.push(DecorationArg {
-                    key: None,
-                    value: value_text(language, arg, source),
-                }),
+                _ => {
+                    let (value, literal) = value_text(language, arg, source);
+                    args.push(DecorationArg {
+                        key: None,
+                        value,
+                        literal,
+                    });
+                }
             }
         }
     }
@@ -127,11 +137,11 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
             }
             for list in def.children(&mut cursor) {
                 if matches!(list.kind(), "super_interfaces" | "extends_interfaces") {
-                    out.extend(
-                        type_list_items(list)
-                            .into_iter()
-                            .map(|t| supertype(t, source)),
-                    );
+                    let implements = list.kind() == "super_interfaces";
+                    out.extend(type_list_items(list).into_iter().map(|t| Supertype {
+                        implements,
+                        ..supertype(t, source)
+                    }));
                 }
             }
         }
@@ -163,14 +173,16 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
                                         .child_by_field_name("type_arguments")
                                         .map(|a| named_texts(a, source))
                                         .unwrap_or_default(),
+                                    implements: false,
                                 });
                             }
                         }
                         "implements_clause" => {
                             let mut cc = clause.walk();
-                            out.extend(
-                                clause.named_children(&mut cc).map(|t| supertype(t, source)),
-                            );
+                            out.extend(clause.named_children(&mut cc).map(|t| Supertype {
+                                implements: true,
+                                ..supertype(t, source)
+                            }));
                         }
                         _ => {}
                     }
@@ -202,9 +214,17 @@ pub(crate) fn class_constants(
                 .child_by_field_name("left")
                 .filter(|l| l.kind() == "identifier")?;
             let right = a.child_by_field_name("right")?;
+            let (value, literal) = match right.kind() {
+                "true" => ("True".to_owned(), true),
+                "false" => ("False".to_owned(), true),
+                // Any other value is kept, so a dynamic table name is seen as one.
+                _ => crate::strings::string_expression(language, right, source)
+                    .unwrap_or_else(|| (text(right, source), false)),
+            };
             Some(ClassConstant {
                 name: text(left, source),
-                value: crate::strings::string_value(language, right, source)?,
+                value,
+                literal,
             })
         })
         .collect()
@@ -223,11 +243,16 @@ fn supertype(node: Node<'_>, source: &[u8]) -> Supertype {
             .find(|n| n.kind() == "type_arguments")
             .map(|a| named_texts(a, source))
             .unwrap_or_default();
-        return Supertype { name, type_args };
+        return Supertype {
+            name,
+            type_args,
+            implements: false,
+        };
     }
     Supertype {
         name: text(node, source),
         type_args: Vec::new(),
+        implements: false,
     }
 }
 
@@ -252,8 +277,33 @@ fn named_texts(node: Node<'_>, source: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn value_text(language: Language, node: Node<'_>, source: &[u8]) -> String {
-    crate::strings::string_value(language, node, source).unwrap_or_else(|| text(node, source))
+/// A value's decoded text and whether it is a static string (see `DecorationArg::literal`).
+fn value_text(language: Language, node: Node<'_>, source: &[u8]) -> (String, bool) {
+    crate::strings::string_expression(language, node, source)
+        .unwrap_or_else(|| (text(node, source), false))
+}
+
+/// Declared type parameter names of a Java or TypeScript class/interface.
+pub(crate) fn type_params(language: Language, def: Node<'_>, source: &[u8]) -> Vec<String> {
+    if !matches!(
+        language,
+        Language::Java | Language::TypeScript | Language::Tsx
+    ) {
+        return Vec::new();
+    }
+    let Some(params) = def.child_by_field_name("type_parameters") else {
+        return Vec::new();
+    };
+    let mut c = params.walk();
+    params
+        .named_children(&mut c)
+        .filter(|p| p.kind() == "type_parameter")
+        .filter_map(|p| {
+            p.child_by_field_name("name")
+                .or_else(|| p.named_child(0))
+                .map(|n| text(n, source))
+        })
+        .collect()
 }
 
 fn field_text(node: Node<'_>, fields: &[&str], source: &[u8]) -> Option<String> {
@@ -392,6 +442,111 @@ class User(Base, models.Model, metaclass=M):
             ]
         );
         assert_eq!(constants("Meta"), [("db_table".to_owned(), "u".to_owned())]);
+    }
+
+    #[test]
+    fn literal_flags_concatenation_booleans_and_type_parameters() {
+        let java = r#"@Table(name = Tables.ACCOUNTS) class A {}
+interface R { @Query(value = "SELECT * " + "FROM people", nativeQuery = true) void q(); }
+interface BaseRepo<T, ID> extends JpaRepository<T, ID> {}
+"#;
+        let f = extract(Language::Java, java.as_bytes()).unwrap();
+        let table = &f.definitions[0].decorations[0].args[0];
+        assert_eq!(
+            (table.value.as_str(), table.literal),
+            ("Tables.ACCOUNTS", false)
+        );
+        let query = &f.definitions[2].decorations[0].args[0];
+        assert_eq!(
+            (query.value.as_str(), query.literal),
+            ("SELECT * FROM people", true)
+        );
+        let base = f.definitions.iter().find(|d| d.name == "BaseRepo").unwrap();
+        assert_eq!(base.type_params, ["T", "ID"]);
+
+        let ts = "@Entity(TABLE) class A {}\n@Entity(`orders_${s}`) class B {}\nclass C<K, V> {}\n";
+        let f = extract(Language::TypeScript, ts.as_bytes()).unwrap();
+        let args: Vec<(&str, bool)> = f
+            .definitions
+            .iter()
+            .flat_map(|d| &d.decorations)
+            .map(|d| (d.args[0].value.as_str(), d.args[0].literal))
+            .collect();
+        assert_eq!(args, [("TABLE", false), ("orders_$1", false)]);
+        assert_eq!(f.definitions[2].type_params, ["K", "V"]);
+
+        let py = "class M(models.Model):\n    __tablename__ = f\"{P}_users\"\n    class Meta:\n        abstract = True\n        proxy = False\n";
+        let f = extract(Language::Python, py.as_bytes()).unwrap();
+        let constants: Vec<(String, String, bool)> = f
+            .definitions
+            .iter()
+            .flat_map(|d| &d.class_constants)
+            .map(|c| (c.name.clone(), c.value.clone(), c.literal))
+            .collect();
+        assert_eq!(
+            constants,
+            [
+                ("__tablename__".into(), "$1_users".into(), false),
+                ("abstract".into(), "True".into(), true),
+                ("proxy".into(), "False".into(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn implemented_interfaces_are_marked() {
+        let java = "class A extends B implements C, D {}\nclass E implements F {}\ninterface G extends H {}\n";
+        let f = extract(Language::Java, java.as_bytes()).unwrap();
+        let marks = |i: usize| -> Vec<(String, bool)> {
+            f.definitions[i]
+                .supertypes
+                .iter()
+                .map(|s| (s.name.clone(), s.implements))
+                .collect()
+        };
+        assert_eq!(
+            marks(0),
+            [("B".into(), false), ("C".into(), true), ("D".into(), true)]
+        );
+        assert_eq!(marks(1), [("F".into(), true)]);
+        assert_eq!(marks(2), [("H".into(), false)]);
+        let ts = "class A extends B implements C {}\n";
+        let f = extract(Language::TypeScript, ts.as_bytes()).unwrap();
+        let got: Vec<bool> = f.definitions[0]
+            .supertypes
+            .iter()
+            .map(|s| s.implements)
+            .collect();
+        assert_eq!(got, [false, true]);
+    }
+
+    #[test]
+    fn non_string_constants_are_kept_as_non_literal_and_parentheses_unwrap() {
+        let py = "class M(Base):
+    __tablename__ = LOG_TABLE
+    a = \"{}_x\".format(p)
+    b = \"%s_x\" % P
+    c = (\"paren\")
+";
+        let f = extract(Language::Python, py.as_bytes()).unwrap();
+        let constants: Vec<(String, String, bool)> = f.definitions[0]
+            .class_constants
+            .iter()
+            .map(|c| (c.name.clone(), c.value.clone(), c.literal))
+            .collect();
+        assert_eq!(
+            constants,
+            [
+                ("__tablename__".into(), "LOG_TABLE".into(), false),
+                ("a".into(), "\"{}_x\".format(p)".into(), false),
+                ("b".into(), "\"%s_x\" % P".into(), false),
+                ("c".into(), "paren".into(), true),
+            ]
+        );
+        let java = "@Table(name = (\"paren_t\")) class A {}\n";
+        let f = extract(Language::Java, java.as_bytes()).unwrap();
+        let arg = &f.definitions[0].decorations[0].args[0];
+        assert_eq!((arg.value.as_str(), arg.literal), ("paren_t", true));
     }
 
     const TS: &str = "@Entity('users') export class User extends Base<Id> implements Named {

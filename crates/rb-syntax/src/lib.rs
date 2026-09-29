@@ -153,6 +153,9 @@ pub struct Definition {
     /// Python class bodies: `NAME = 'string'` assignments (e.g. `__tablename__`), in order.
     #[serde(default)]
     pub class_constants: Vec<ClassConstant>,
+    /// Declared type parameters (`BaseRepo<T, ID>` → `T`, `ID`), for Java and TypeScript.
+    #[serde(default)]
+    pub type_params: Vec<String>,
 }
 
 /// An annotation or decorator on a definition.
@@ -163,12 +166,16 @@ pub struct Decoration {
     pub args: Vec<DecorationArg>,
 }
 
-/// One decoration argument. String literals are decoded; anything else is its source text. An
-/// object literal argument (`@Entity({ name: 'x' })`) contributes its pairs as keyed arguments.
+/// One decoration argument. String literals (and `+` concatenations of them) are decoded, with
+/// interpolations as `$n`; anything else is its source text. An object literal argument
+/// (`@Entity({ name: 'x' })`) contributes its pairs as keyed arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DecorationArg {
     pub key: Option<String>,
     pub value: String,
+    /// `value` is a fixed string known statically (no identifiers, calls or interpolations).
+    #[serde(default)]
+    pub literal: bool,
 }
 
 /// A named supertype; `name` is as written (possibly qualified), type arguments by simple name.
@@ -176,13 +183,21 @@ pub struct DecorationArg {
 pub struct Supertype {
     pub name: String,
     pub type_args: Vec<String>,
+    /// An interface the class implements (Java `implements`, TypeScript `implements`), as
+    /// opposed to the class it extends.
+    #[serde(default)]
+    pub implements: bool,
 }
 
-/// A string constant assigned in a Python class body.
+/// A name assigned in a Python class body. Strings are decoded and booleans kept as
+/// `True`/`False`; any other value is its source text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassConstant {
     pub name: String,
     pub value: String,
+    /// `value` is a static string or boolean (not an f-string, a name or a call).
+    #[serde(default)]
+    pub literal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +279,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             decorations: decorations::decorations(language, d.node, source),
             supertypes: decorations::supertypes(language, d.node, source),
             class_constants: decorations::class_constants(language, d.node, source),
+            type_params: decorations::type_params(language, d.node, source),
         })
         .collect();
     attach_go_methods(&mut definitions);
