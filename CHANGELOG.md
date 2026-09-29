@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-09-29 13:05]
+- M2a step 2: `rb-syntax` extracts SQL candidates, meaning SQL-looking string expressions. They are cached in `FileFacts.sql` with the normalised text, span, enclosing definition and callee name.
+  - Covers TS/JS template holes and tagged templates, Java text blocks (dedented), Python f-strings and implicit concatenation, Go raw strings, and `+` concatenation.
+  - Escapes are decoded.
+  - Annotations and decorators are skipped.
+  - `rb-sql` retries JDBC `?` and named `:param` placeholders as `$n`.
+- Files affected: crates/rb-syntax/src/{lib,strings}.rs, crates/rb-sql/src/lib.rs, tasks/contract-m2a.md.
+
 ## [2026-09-29 12:20]
 - M2a step 1: new `rb-sql` crate. It uses `pg_query` 6.2 (the real PG17 parser) to split SQL into statements and report each table with its operations: read, insert, update, delete, merge, create, alter, drop, truncate.
   - CTE names are excluded and system schemas are ignored.

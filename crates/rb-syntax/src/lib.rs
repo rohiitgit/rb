@@ -6,6 +6,7 @@
 
 mod keys;
 mod queries;
+mod strings;
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,6 +39,7 @@ fn fingerprint_input() -> String {
         queries::all_sources().as_str(),
         include_str!("lib.rs"),
         include_str!("queries.rs"),
+        include_str!("strings.rs"),
     ]
     .join("\n")
 }
@@ -151,6 +153,19 @@ pub struct Reference {
     pub enclosing: Option<usize>,
 }
 
+/// A string expression that looks like SQL (design §7.1). The SQL parser decides downstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqlCandidate {
+    /// Normalised text: escapes decoded, interpolations and non-literal operands as `$n`.
+    pub text: String,
+    /// Span of the whole string expression.
+    pub span: Span,
+    /// Index into `FileFacts::definitions` of the innermost definition containing it.
+    pub enclosing: Option<usize>,
+    /// Name of the function it is a direct argument of (or that tags it, for templates).
+    pub callee: Option<String>,
+}
+
 /// Everything extracted from one blob. Definitions are sorted by position (a Go method's parent
 /// may be a type declared later in the file).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -162,6 +177,9 @@ pub struct FileFacts {
     /// Definitions deeper than [`MAX_NESTING`] were dropped.
     #[serde(default)]
     pub nesting_truncated: bool,
+    /// SQL-looking string expressions, in source order.
+    #[serde(default)]
+    pub sql: Vec<SqlCandidate>,
 }
 
 /// Parses `source` and extracts its definitions and references.
@@ -228,6 +246,16 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         references,
         syntax_error: root.has_error().then(|| first_error(root)).flatten(),
         nesting_truncated,
+        sql: strings::sql_candidates(language, root, source)
+            .into_iter()
+            .map(|c| SqlCandidate {
+                span: span(c.node),
+                enclosing: enclosing(c.node.start_byte(), &starts, &ends, &lexical_parent)
+                    .map(|i| nearest_kept(i, &kept, &lexical_parent)),
+                callee: c.callee,
+                text: c.text,
+            })
+            .collect(),
     })
 }
 

@@ -69,7 +69,73 @@ pub struct Statement {
 }
 
 /// Splits `sql` into statements and reports the tables each one touches.
+///
+/// JDBC `?` and named `:param` placeholders are not PostgreSQL syntax; if the text does not parse,
+/// it is retried once with them rewritten to `$n`, and the retry is used only if it parses.
 pub fn analyze(sql: &str) -> Result<Vec<Statement>, String> {
+    match analyze_exact(sql) {
+        Ok(statements) => Ok(statements),
+        Err(first) => {
+            let rewritten = positional(sql);
+            if rewritten == sql {
+                return Err(first);
+            }
+            analyze_exact(&rewritten).map_err(|_| first)
+        }
+    }
+}
+
+/// Rewrites `?` and `:name` placeholders outside quoted text to `$1`, `$2`, … Casts (`::`) and
+/// quoted strings or identifiers are left alone. Byte length may change, so statement ranges of a
+/// retried parse refer to the rewritten text; callers only use them for evidence within a literal.
+fn positional(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1).copied();
+        let is_named = c == ':'
+            && prev != Some(':')
+            && next.is_some_and(|x| x.is_ascii_alphabetic() || x == '_');
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '?' => {
+                n += 1;
+                out.push_str(&format!("${n}"));
+            }
+            ':' if is_named => {
+                n += 1;
+                out.push_str(&format!("${n}"));
+                while chars
+                    .get(i + 1)
+                    .is_some_and(|x| x.is_ascii_alphanumeric() || *x == '_')
+                {
+                    i += 1;
+                }
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn analyze_exact(sql: &str) -> Result<Vec<Statement>, String> {
     let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
     parsed
         .protobuf
@@ -283,6 +349,29 @@ mod tests {
         assert!(analyze("SELEC oops").is_err());
         assert_eq!(analyze("").unwrap(), []);
         assert_eq!(analyze("-- only a comment\n").unwrap(), []);
+    }
+
+    #[test]
+    fn jdbc_and_named_placeholders_are_retried_as_positional() {
+        assert_eq!(
+            summary("SELECT name FROM users WHERE id = ? AND org = ?"),
+            [vec!["public.users*:read"]]
+        );
+        assert_eq!(
+            summary("UPDATE t SET a = :a, b = :b_2 WHERE id = :id AND x::int = 1"),
+            [vec!["public.t*:update"]]
+        );
+        // Quoted text and casts are untouched; jsonb `?` already parses as-is.
+        assert_eq!(
+            super::positional("SELECT '?', \"a:b\", c::text FROM t WHERE d = ?"),
+            "SELECT '?', \"a:b\", c::text FROM t WHERE d = $1"
+        );
+        assert_eq!(
+            summary("SELECT * FROM t WHERE data ? 'k'"),
+            [vec!["public.t*:read"]]
+        );
+        // A placeholder in table position still cannot parse.
+        assert!(analyze("SELECT * FROM ?").is_err());
     }
 
     #[test]

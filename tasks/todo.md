@@ -127,7 +127,7 @@ Findings from the research step (2026-09-29):
 # M2a SQL core (contract: tasks/contract-m2a.md)
 
 - [x] 1. `rb-sql` crate: statements, tables and operations via pg_query (S1–S5); 7 tests.
-- [ ] 2. rb-syntax: SQL candidates from string literals (template normalisation, callee name, prefilter) (S7, S8).
+- [x] 2. rb-syntax: SQL candidates from string literals (template normalisation, callee name, prefilter) (S7, S8).
 - [ ] 3. Indexer: Table nodes, MIGRATES from `.sql` files, QUERIES from candidates, diagnostics (S6, S9–S12).
 - [ ] 4. `rb table-deps`, SQL coverage in `rb status`, fixture goldens (S13–S15).
 - [ ] 5. Public-repo measurement (S16), evaluator pass, fixes, docs, commit.
