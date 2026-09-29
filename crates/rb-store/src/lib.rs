@@ -396,6 +396,41 @@ impl Store {
         Ok(())
     }
 
+    /// Cached syntax facts for `(blob, extractor)` rows; missing rows are simply absent.
+    pub fn load_facts(
+        &mut self,
+        rows: &[(String, String)],
+    ) -> anyhow::Result<HashMap<(String, String), Vec<u8>>> {
+        let (blobs, extractors): (Vec<&str>, Vec<&str>) =
+            rows.iter().map(|(b, e)| (b.as_str(), e.as_str())).unzip();
+        Ok(self
+            .client
+            .query(
+                "SELECT c.blob_sha, c.extractor, c.facts
+                 FROM rb.file_facts_cache c
+                 JOIN unnest($1::text[], $2::text[]) AS k(blob_sha, extractor)
+                   USING (blob_sha, extractor)",
+                &[&blobs, &extractors],
+            )?
+            .iter()
+            .map(|r| ((r.get(0), r.get(1)), r.get(2)))
+            .collect())
+    }
+
+    /// Stores syntax facts. Rows are content-addressed, so an existing row is already correct.
+    pub fn save_facts(&mut self, rows: &[(String, String, Vec<u8>)]) -> anyhow::Result<()> {
+        let blobs: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        let extractors: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        let facts: Vec<&[u8]> = rows.iter().map(|r| r.2.as_slice()).collect();
+        self.client.execute(
+            "INSERT INTO rb.file_facts_cache (blob_sha, extractor, facts)
+             SELECT * FROM unnest($1::text[], $2::text[], $3::bytea[])
+             ON CONFLICT (blob_sha, extractor) DO NOTHING",
+            &[&blobs, &extractors, &facts],
+        )?;
+        Ok(())
+    }
+
     /// Reads a snapshot back into a [`Graph`] (used by `rb dump` and the determinism tests).
     pub fn load_graph(&mut self, snapshot_id: i64) -> anyhow::Result<Graph> {
         let nodes = self

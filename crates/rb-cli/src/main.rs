@@ -1,10 +1,11 @@
 //! `rb` — Repository Brain CLI (design §11.1).
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use rb_model::{NodeKind, ServiceRole, canonical_dump};
 use rb_store::{LoadDir, Resolved, ServiceCard, SnapshotInfo, Store};
 use serde_json::{Value, json};
@@ -38,24 +39,30 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Args)]
+struct IndexArgs {
+    /// Path to the repository (its root, containing .git).
+    path: PathBuf,
+    /// Repository name in the Brain ([a-z0-9_], max 40). Defaults to the directory name.
+    #[arg(long)]
+    repo: Option<String>,
+    /// Revision to index.
+    #[arg(long, default_value = "HEAD")]
+    rev: String,
+    /// Rebuild even if the live snapshot already covers this commit with the same tools.
+    #[arg(long)]
+    force: bool,
+    /// Parse every file instead of reusing cached syntax facts (the cache is not updated either).
+    #[arg(long)]
+    no_cache: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Apply pending schema migrations.
     Migrate,
     /// Index a commit of a git repository into a new live snapshot.
-    Index {
-        /// Path to the repository (its root, containing .git).
-        path: PathBuf,
-        /// Repository name in the Brain ([a-z0-9_], max 40). Defaults to the directory name.
-        #[arg(long)]
-        repo: Option<String>,
-        /// Revision to index.
-        #[arg(long, default_value = "HEAD")]
-        rev: String,
-        /// Rebuild even if the live snapshot already covers this commit with the same tools.
-        #[arg(long)]
-        force: bool,
-    },
+    Index(IndexArgs),
     /// Show the live snapshot and counts per repository.
     Status {
         #[arg(long)]
@@ -117,12 +124,7 @@ fn main() -> anyhow::Result<()> {
                 println!("applied: {}", applied.join(", "));
             }
         }
-        Command::Index {
-            path,
-            repo,
-            rev,
-            force,
-        } => index(&mut store, &cli.age_load_dir, &path, repo, &rev, force)?,
+        Command::Index(args) => index(&mut store, &cli.age_load_dir, args)?,
         Command::Status { repo } => {
             let repos = match repo {
                 Some(r) => vec![r],
@@ -232,14 +234,14 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn index(
-    store: &mut Store,
-    load_dir: &Path,
-    path: &Path,
-    repo: Option<String>,
-    rev: &str,
-    force: bool,
-) -> anyhow::Result<()> {
+fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<()> {
+    let IndexArgs {
+        path,
+        repo,
+        rev,
+        force,
+        no_cache,
+    } = args;
     let path = path
         .canonicalize()
         .with_context(|| format!("repository path {}", path.display()))?;
@@ -261,7 +263,7 @@ fn index(
         load_dir.display()
     );
 
-    let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(rev)?;
+    let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(&rev)?;
     store.migrate()?;
     let tools = tool_versions();
 
@@ -282,8 +284,12 @@ fn index(
         commit_sha,
         graph,
         diagnostics,
-        ..
-    } = rb_indexer::index_commit(&path, &commit_sha, &mut rb_indexer::NoCache)?;
+        parsed,
+    } = if no_cache {
+        rb_indexer::index_commit(&path, &commit_sha, &mut rb_indexer::NoCache)?
+    } else {
+        rb_indexer::index_commit(&path, &commit_sha, &mut StoreCache(store))?
+    };
     let snap = store.publish_snapshot(
         &repo,
         &commit_sha,
@@ -293,7 +299,7 @@ fn index(
         &LoadDir::new(load_dir),
     )?;
     println!(
-        "{repo}: snapshot {} live @ {} — {} nodes, {} edges, {} diagnostics; AGE graph {}",
+        "{repo}: snapshot {} live @ {} — {} nodes, {} edges, {} diagnostics; AGE graph {}; parsed {parsed} source files",
         snap.id,
         short(&snap.commit_sha),
         graph.nodes().len(),
@@ -302,6 +308,42 @@ fn index(
         snap.age_graph.as_deref().unwrap_or("-")
     );
     Ok(())
+}
+
+/// Syntax facts cached in Postgres, keyed by (blob, extractor version + language).
+struct StoreCache<'a>(&'a mut Store);
+
+impl rb_indexer::FactsCache for StoreCache<'_> {
+    fn load(
+        &mut self,
+        keys: &[rb_indexer::FactsKey],
+    ) -> anyhow::Result<HashMap<rb_indexer::FactsKey, rb_syntax::FileFacts>> {
+        let by_row: HashMap<(String, String), &rb_indexer::FactsKey> = keys
+            .iter()
+            .map(|k| ((k.blob.clone(), k.extractor()), k))
+            .collect();
+        let rows: Vec<(String, String)> = by_row.keys().cloned().collect();
+        self.0
+            .load_facts(&rows)?
+            .into_iter()
+            .map(|(row, bytes)| {
+                let facts = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("decoding cached facts for blob {}", row.0))?;
+                Ok((by_row[&row].clone(), facts))
+            })
+            .collect()
+    }
+
+    fn save(
+        &mut self,
+        facts: &[(rb_indexer::FactsKey, rb_syntax::FileFacts)],
+    ) -> anyhow::Result<()> {
+        let rows = facts
+            .iter()
+            .map(|(k, f)| Ok((k.blob.clone(), k.extractor(), serde_json::to_vec(f)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.0.save_facts(&rows)
+    }
 }
 
 fn tool_versions() -> Value {

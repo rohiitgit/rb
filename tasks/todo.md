@@ -119,5 +119,5 @@ Findings from the research step (2026-09-29):
 
 - [x] 1. `rb-syntax` crate: the language registry (C14) and `extract(lang, bytes) -> FileFacts`, with tests first for C1–C4, C8, C13 and C17.
 - [x] 2. Symbol keys + indexer assembly: Symbol / DEFINED_IN / CONTAINS (C2, C5, C6, C7); unit tests.
-- [ ] 3. Facts cache: store load/save + CLI orchestration + parse counter (C9–C12).
+- [x] 3. Facts cache: store load/save + CLI orchestration + parse counter (C9–C12).
 - [ ] 4. Fixture goldens (C15, C16), real-repo measurement (C18), doc sync, evaluator pass, commit.

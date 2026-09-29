@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-09-29 10:25]
+- M1b step 3: syntax facts are cached in `rb.file_facts_cache`, keyed by blob plus extractor version and language, through `Store::load_facts`/`save_facts` and a CLI `StoreCache` adapter.
+  - `rb index` reports `parsed N source files`.
+  - New `rb index --no-cache` bypasses the cache.
+  - The index subcommand's arguments are now an `IndexArgs` struct.
+  - New e2e test: a warm cache parses 0 files and dumps byte-identically to a cold run.
+- Files affected: crates/rb-store/src/lib.rs, crates/rb-cli/src/main.rs, crates/rb-cli/Cargo.toml, crates/rb-cli/tests/e2e.rs.
+
 ## [2026-09-29 10:05]
 - M1b step 2: the indexer turns definitions into `Symbol` nodes with `DEFINED_IN` (evidence: the name span) and `CONTAINS` edges.
   - Files are chosen for parsing by language, binary/generated flags and a 1 MiB cap (over the cap gives an `extraction_skipped` diagnostic).

@@ -390,3 +390,35 @@ fn listing_order_is_bytewise() {
         ]
     );
 }
+
+/// Number from the `parsed N source files` part of `rb index` output.
+fn parsed_count(index_output: &str) -> usize {
+    let (_, rest) = index_output
+        .split_once("parsed ")
+        .unwrap_or_else(|| panic!("no parse count in {index_output:?}"));
+    rest.split_whitespace().next().unwrap().parse().unwrap()
+}
+
+/// Contract C10/C12: a warm facts cache parses nothing and yields the same snapshot as a cold run.
+#[test]
+fn warm_facts_cache_equals_cold_run() {
+    let Some(url) = db_url() else { return };
+    let repo = fixture_repo("polyglot-monorepo");
+    let path = repo.path().to_str().unwrap();
+    let pid = std::process::id();
+    let (cold, warm) = (format!("t_cold_{pid}"), format!("t_warm_{pid}"));
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![cold.clone(), warm.clone()],
+    };
+
+    let cold_run = rb(&url, &["index", path, "--repo", &cold, "--no-cache"]);
+    assert!(parsed_count(&cold_run) >= 8, "{cold_run}");
+    rb(&url, &["index", path, "--repo", &warm]); // fills the cache (may already be warm)
+    let warm_run = rb(&url, &["index", path, "--repo", &warm, "--force"]);
+    assert_eq!(parsed_count(&warm_run), 0, "{warm_run}");
+    assert_eq!(
+        rb(&url, &["dump", "--repo", &cold]),
+        rb(&url, &["dump", "--repo", &warm])
+    );
+}

@@ -1630,6 +1630,7 @@ dependencies = [
  "rb-indexer",
  "rb-model",
  "rb-store",
+ "rb-syntax",
  "serde_json",
  "tempfile",
 ]
