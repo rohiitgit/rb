@@ -121,6 +121,28 @@ fn scope_kinds(language: Language) -> &'static [&'static str] {
     }
 }
 
+/// The function (or program) a JavaScript `var` is hoisted to.
+fn hoisting_scope<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            "program"
+                | "function_declaration"
+                | "function_expression"
+                | "function"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
 fn scope_of<'t>(language: Language, node: Node<'t>) -> Node<'t> {
     let kinds = scope_kinds(language);
     let mut cur = node;
@@ -390,11 +412,27 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
             }
         }
         "variable_declarator" => {
+            let value = node.child_by_field_name("value");
+            // `const f = () => …` defines a function (the tags query captures it): it is a
+            // definition, not a variable.
+            if value.is_some_and(|v| {
+                matches!(
+                    v.kind(),
+                    "arrow_function"
+                        | "function_expression"
+                        | "function"
+                        | "generator_function"
+                        | "class"
+                        | "class_expression"
+                )
+            }) {
+                return;
+            }
             let ty = node
                 .child_by_field_name("type")
                 .and_then(|t| type_name(t, source))
                 .or_else(|| {
-                    node.child_by_field_name("value")
+                    value
                         .filter(|v| v.kind() == "new_expression")
                         .and_then(|v| type_name(v, source))
                 });
@@ -403,8 +441,17 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
                 pattern_names(name, &mut names);
                 // Only a plain name takes the declared or constructed type.
                 let ty = ty.filter(|_| name.kind() == "identifier");
+                // `var` is hoisted: in effect from the start of the enclosing function.
+                let hoisted = node
+                    .parent()
+                    .filter(|p| p.kind() == "variable_declaration")
+                    .and_then(|_| hoisting_scope(node));
                 for n in names {
                     push(out, Some(n), ty.clone(), false, node, node, source);
+                    if let (Some(h), Some(b)) = (hoisted, out.last_mut()) {
+                        b.from = h.child(0).unwrap_or(h);
+                        b.scope = Some(h);
+                    }
                 }
             }
         }
@@ -734,6 +781,13 @@ mod tests {
                 "top: Top in -"
             ]
         );
+        // Function-valued declarations are definitions, not variables; `var` is hoisted.
+        let src =
+            "const helper = () => 1;\nlet g = function () {};\nfunction f() { h(); var h = 2; }\n";
+        let got = extents(Language::JavaScript, src);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "h");
+        assert!(got[0].1 < after(src, "h()"), "{got:?}");
         assert_eq!(
             bound(
                 Language::JavaScript,

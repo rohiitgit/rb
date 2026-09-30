@@ -102,3 +102,12 @@ M3a needs no external tool. Every M3a edge has provenance `heuristic`; SCIP late
 - **Go `case` clauses** (expression, type, default and select cases) are scopes.
 - **Bare calls through variables:** `cb()` where `cb` is a parameter or local is never linked by name to a function; it counts as unresolved. A typed variable is not followed to a `__call__` or functional interface.
 - **Accepted:** a closure reading a name declared after the closure's text; JavaScript `var` hoisting out of a block; Java `instanceof` flow scoping; a walrus inside a comprehension. Each gives an unresolved reference, never a wrong edge.
+
+## Amendment 4: evaluator pass 4 (a regression from Amendment 3 and three smaller defects; all fixed test-first)
+
+- **Function-valued declarations are definitions, not variables.** `const f = () => …`, `let g = function () {}` and class expressions are captured as definitions by the tags query, so they are no longer recorded as bindings. Amendment 3's bare-call rule had suppressed every same-file call to them (329 edges in hono; the changelog had wrongly credited the drop to `next()` calls).
+- **Java methods are never shadowed by variables** (JLS §6.4.2): the bare-call rule does not apply to Java.
+- **JavaScript `var` is hoisted:** it is in effect from the start of the enclosing function, so a call before the declaration is unresolved rather than linked to an outer function.
+- **`staticmethod`, `classmethod` and `property`** are Python built-ins.
+- **Accepted:** a Python method default argument referencing a class attribute (`def n(self, y=r.m2())`) resolves `r` in the method's scope, so a same-named module variable wins; defaults are evaluated in class scope, and this needs the parameter list's extent, which the facts do not record. A wrong edge is possible only when a class attribute shadows a module name and is used in a default.
+- **Accepted:** `wrapped = deco(wrapped); wrapped()` is an unresolved call, since `wrapped` is a variable at the call.

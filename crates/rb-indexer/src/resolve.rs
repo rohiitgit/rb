@@ -209,6 +209,9 @@ const PYTHON_BUILTINS: &[&str] = &[
     "TypeError",
     "KeyError",
     "RuntimeError",
+    "staticmethod",
+    "classmethod",
+    "property",
     "NotImplementedError",
 ];
 
@@ -936,10 +939,12 @@ impl<'a> Index<'a> {
         at: Option<rb_model::Span>,
     ) -> Vec<(EdgeKind, Sym<'a>)> {
         // A bare call through a variable (`cb()`) is never linked by name to a function.
-        let through_variable = at.is_some_and(|at| {
-            self.binding(path, scope, name, Some(at))
-                .is_some_and(|b| !b.member)
-        });
+        // Java keeps methods and variables in separate namespaces (JLS §6.4.2).
+        let through_variable = self.language(path) != Language::Java
+            && at.is_some_and(|at| {
+                self.binding(path, scope, name, Some(at))
+                    .is_some_and(|b| !b.member)
+            });
         let found = match qualifier {
             None if through_variable => Vec::new(),
             None => self.levels(path, scope, name, is_callable, true),
@@ -2080,5 +2085,65 @@ func (s *Server) helper() {}
                 "sw:f(). -> sw:Resp#M1(). [heuristic]"
             ]
         );
+    }
+
+    #[test]
+    fn function_valued_constants_java_locals_and_hoisted_vars() {
+        // D1: a function held in a `const` is a definition; calls to it resolve.
+        let js = build(
+            &[(
+                "src/h.js",
+                Language::JavaScript,
+                "const helper = () => 1;\nlet other = function () {};\nexport function run() { helper(); other(); }\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&js, EdgeKind::Calls),
+            [
+                "h:run(). -> h:helper(). [heuristic]",
+                "h:run(). -> h:other(). [heuristic]"
+            ]
+        );
+        // D2: Java methods are never shadowed by same-named variables.
+        let java = build(
+            &[(
+                "p/Svc.java",
+                J,
+                "package p;\nclass Svc { int count() { return 0; } int size() { return 0; } void a() { int count = 0; count = count(); } void b(int size) { size(); } }\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&java, EdgeKind::Calls),
+            [
+                "Svc:Svc#a(). -> Svc:Svc#count(). [heuristic]",
+                "Svc:Svc#b(). -> Svc:Svc#size(). [heuristic]"
+            ]
+        );
+        // D3: a hoisted `var` hides the module function even before its declaration.
+        let hoist = build(
+            &[(
+                "src/v.js",
+                Language::JavaScript,
+                "function g() {}\nfunction f() { g(); var g = 2; }\n",
+            )],
+            &[],
+        );
+        assert!(
+            edges(&hoist, EdgeKind::Calls).is_empty(),
+            "{:?}",
+            edges(&hoist, EdgeKind::Calls)
+        );
+        // D5: decorator built-ins are not unresolved calls.
+        let py = build(
+            &[(
+                "a/d.py",
+                PY,
+                "class K:\n    def h():\n        pass\n    h = staticmethod(h)\n",
+            )],
+            &[],
+        );
+        assert!(unresolved(&py).is_empty(), "{:?}", unresolved(&py));
     }
 }

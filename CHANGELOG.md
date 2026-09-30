@@ -1,8 +1,13 @@
 # Changelog
 
+## [2026-09-30 23:30]
+- M3a evaluator pass 4 fixes (contract Amendment 4): function-valued declarations (`const f = () => …`) are definitions, not variable bindings; the bare-call rule skips Java (separate method and variable namespaces); JavaScript `var` is hoisted to the enclosing function; `staticmethod`, `classmethod` and `property` are built-ins.
+- Re-measured with a classified edge diff against 5ed2b3b: hono 14.8% (6,310 resolved), regaining exactly the 329 `CALLS` edges the bare-call rule had suppressed; 2 edges lost, not classified. petclinic 39.2%, gin 63.4%, requests 30.4% unchanged.
+- Files affected: crates/rb-syntax/src/bindings.rs, crates/rb-indexer/src/resolve.rs, tasks/contract-m3a.md, tasks/lessons.md.
+
 ## [2026-09-30 21:30]
 - M3a evaluator pass 3 fixes (contract Amendment 3): `except` bodies are not scopes (only the `as` name is clause-scoped); class-body names are skipped rather than ending the lookup (`Locals::at_where`); signature parameters end with their signature (new scope kinds for TS and Go); Go `case` clauses are scopes; bare calls through variables are unresolved.
-- Re-measured: hono 13.5% (was 14.8%: bare calls through variables such as `next()` are now unresolved rather than linked to a same-named function); petclinic 39.2%, gin 63.4%, requests 30.4% unchanged.
+- Re-measured: hono 13.5% (was 14.8%); petclinic 39.2%, gin 63.4%, requests 30.4% unchanged. **Correction (pass 4):** the hono drop was a regression, not the `next()` explanation first written here: the bare-call rule also suppressed calls to functions held in `const f = () => …` declarations (329 edges). Fixed in the next entry.
 - Files affected: crates/rb-syntax/src/bindings.rs, crates/rb-indexer/src/resolve.rs, tasks/contract-m3a.md.
 
 ## [2026-09-30 19:00]

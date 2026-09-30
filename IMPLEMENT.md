@@ -232,5 +232,6 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Evaluator pass 1: 12 defects (three performance blowups; receivers linked through same-named types; untyped names not shadowing; impact missing dispatch callers; Java lookup order; rebinding; Go test packages; status split; Python stdlib matching; self-calls). All fixed test-first (contract Amendment 1). The independent 80-edge sample was also 80/80.
 - [x] Evaluator pass 2: 5 defects, two of them regressions of pass-1 fixes (position-based rebinding ignored block scope; a declaration referenced itself). Fixed by giving every declaration a visibility extent (contract Amendment 2). Resolved share after the fixes: petclinic 39.2%, hono 14.8%, gin 63.4%, requests 30.4%.
 - [x] Evaluator pass 3: all pass-2 fixes verified (88/88 precision); 5 defects in the extent rules and bare-call resolution, all fixed test-first (contract Amendment 3). Resolved share after the fixes: petclinic 39.2%, hono 13.5%, gin 63.4%, requests 30.4%.
-- [ ] Evaluator pass 4
+- [x] Evaluator pass 4: C1–C5 verified; one regression (function-valued `const`s treated as variables, which caused the hono drop I had misattributed) plus Java namespaces, `var` hoisting and missing Python built-ins. All fixed test-first (contract Amendment 4). hono is back at 14.8% (the 329 suppressed edges regained, verified by an edge diff); the other repos are unchanged.
+- [ ] Evaluator pass 5
 - [ ] Commit
