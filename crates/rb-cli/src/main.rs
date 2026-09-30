@@ -1,6 +1,8 @@
 //! `rb` — Repository Brain CLI (design §11.1).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -55,8 +57,16 @@ struct IndexArgs {
     #[arg(long)]
     force: bool,
     /// Parse every file instead of reusing cached syntax facts (the cache is not updated either).
+    /// SCIP indexes stay cached: an index is a pure function of its project's inputs.
     #[arg(long)]
     no_cache: bool,
+    /// Run no SCIP indexer: every project is resolved heuristically and its job is `skipped`.
+    #[arg(long)]
+    no_scip: bool,
+    /// Directory for indexer exports and package caches; the container runtime must be able to
+    /// bind-mount it (under the home directory on colima).
+    #[arg(long, env = "RB_SCIP_WORK_DIR", default_value = "var/scip")]
+    scip_work_dir: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -199,13 +209,19 @@ fn main() -> anyhow::Result<()> {
                     );
                     let r = store.resolution_coverage(live.id)?;
                     println!(
-                        "  code: {:.1}% of references to own code resolved ({} resolved, {} ambiguous, {} unresolved; {} external)",
+                        "  code: {:.1}% of references to own code resolved ({} resolved, {} ambiguous, {} unresolved; {} external); {} exact calls (scip)",
                         r.resolved_share() * 100.0,
                         r.resolved,
                         r.ambiguous,
                         r.unresolved,
-                        r.external
+                        r.external,
+                        r.exact_calls
                     );
+                    for d in store.load_diagnostics(live.id)? {
+                        if d.kind == "scip_status" {
+                            println!("  {}", scip_status_line(&d));
+                        }
+                    }
                 }
             }
         }
@@ -361,6 +377,8 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         rev,
         force,
         no_cache,
+        no_scip,
+        scip_work_dir,
     } = args;
     let path = path
         .canonicalize()
@@ -385,7 +403,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
 
     let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(&rev)?;
     store.migrate()?;
-    let tools = tool_versions();
+    let tools = tool_versions(!no_scip);
 
     if !force
         && let Some(live) = store.live_snapshot(&repo)?
@@ -400,15 +418,36 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         return Ok(());
     }
 
+    let scip = rb_indexer::ScipOptions {
+        enabled: !no_scip,
+        cache_dir: scip_work_dir.join("cache"),
+        work_dir: scip_work_dir,
+        budget: rb_scip::Budget::default(),
+    };
+    // Both caches live in the store; the indexer borrows each through its own trait.
+    let cell = RefCell::new(&mut *store);
     let rb_indexer::Indexed {
         commit_sha,
         graph,
         diagnostics,
         parsed,
+        scip: jobs,
     } = if no_cache {
-        rb_indexer::index_commit(&path, &commit_sha, &mut rb_indexer::NoCache)?
+        rb_indexer::index_commit(
+            &path,
+            &commit_sha,
+            &mut rb_indexer::NoCache,
+            &scip,
+            &mut StoreCache(&cell),
+        )?
     } else {
-        rb_indexer::index_commit(&path, &commit_sha, &mut StoreCache(store))?
+        rb_indexer::index_commit(
+            &path,
+            &commit_sha,
+            &mut StoreCache(&cell),
+            &scip,
+            &mut StoreCache(&cell),
+        )?
     };
     let snap = store.publish_snapshot(
         &repo,
@@ -427,13 +466,106 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         diagnostics.len(),
         snap.age_graph.as_deref().unwrap_or("-")
     );
+    for j in &jobs {
+        let mut line = format!(
+            "  scip: {} {} {}",
+            root_label(&j.root),
+            j.indexer,
+            j.status.as_str()
+        );
+        if j.cached {
+            line.push_str(" (cached)");
+        }
+        if j.elapsed_ms > 0 {
+            let _ = write!(line, " {:.1}s", j.elapsed_ms as f64 / 1000.0);
+        }
+        if let Some(reason) = j.status.reason() {
+            let _ = write!(line, ": {reason}");
+        }
+        println!("{line}");
+    }
     Ok(())
 }
 
-/// Syntax facts cached in Postgres, keyed by (blob, extractor version + language).
-struct StoreCache<'a>(&'a mut Store);
+/// `.` for the repository root, as in the `scip_status` diagnostic.
+fn root_label(root: &str) -> &str {
+    if root.is_empty() { "." } else { root }
+}
 
-impl rb_indexer::FactsCache for StoreCache<'_> {
+/// The `rb status` line for one `scip_status` diagnostic (contract M3b S9).
+fn scip_status_line(d: &rb_model::Diagnostic) -> String {
+    let field = |k: &str| d.detail[k].as_str().unwrap_or("?").to_owned();
+    let mut line = format!(
+        "scip: {} {} {}",
+        d.path.as_deref().unwrap_or("?"),
+        field("indexer"),
+        field("status")
+    );
+    if let Some(ms) = d.detail["elapsed_ms"].as_u64().filter(|&ms| ms > 0) {
+        let _ = write!(line, " {:.1}s", ms as f64 / 1000.0);
+    }
+    if let Some(reason) = d.detail["reason"].as_str() {
+        let _ = write!(line, ": {reason}");
+    }
+    if let Some(c) = d.detail.get("coverage") {
+        let n = |k: &str| c[k].as_u64().unwrap_or(0);
+        let _ = write!(
+            line,
+            ", definitions matched {}/{}, references matched {}, external {}, local {}, unanchored {}, unmatched {}",
+            n("definitions_matched"),
+            n("definitions_total"),
+            n("references_matched"),
+            n("references_external"),
+            n("references_local"),
+            n("references_unanchored"),
+            n("references_unmatched")
+        );
+    }
+    line
+}
+
+/// Syntax facts and SCIP indexes cached in Postgres: facts by (blob, extractor version +
+/// language), indexes by (project input hash, image digest).
+struct StoreCache<'a, 'b>(&'a RefCell<&'b mut Store>);
+
+impl rb_indexer::ScipCache for StoreCache<'_, '_> {
+    fn get(
+        &mut self,
+        input_hash: &str,
+        image: &str,
+    ) -> anyhow::Result<Option<rb_indexer::ScipCacheEntry>> {
+        Ok(self
+            .0
+            .borrow_mut()
+            .scip_index_get(input_hash, image)?
+            .map(|e| rb_indexer::ScipCacheEntry {
+                status: e.status,
+                index: e.index,
+                stderr_tail: e.stderr_tail,
+                elapsed_ms: u64::try_from(e.elapsed_ms).unwrap_or(0),
+            }))
+    }
+
+    fn put(
+        &mut self,
+        input_hash: &str,
+        image: &str,
+        entry: &rb_indexer::ScipCacheEntry,
+    ) -> anyhow::Result<()> {
+        self.0.borrow_mut().scip_index_put(
+            input_hash,
+            image,
+            &rb_store::CachedScipIndex {
+                status: entry.status.clone(),
+                index: entry.index.clone(),
+                stderr_tail: entry.stderr_tail.clone(),
+                elapsed_ms: i32::try_from(entry.elapsed_ms).unwrap_or(i32::MAX),
+            },
+        )
+    }
+}
+
+impl rb_indexer::FactsCache for StoreCache<'_, '_> {
     fn load(
         &mut self,
         keys: &[rb_indexer::FactsKey],
@@ -444,6 +576,7 @@ impl rb_indexer::FactsCache for StoreCache<'_> {
             .collect();
         let rows: Vec<(String, String)> = by_row.keys().cloned().collect();
         self.0
+            .borrow_mut()
             .load_facts(&rows)?
             .into_iter()
             .map(|(row, bytes)| {
@@ -462,15 +595,17 @@ impl rb_indexer::FactsCache for StoreCache<'_> {
             .iter()
             .map(|(k, f)| Ok((k.blob.clone(), k.extractor(), serde_json::to_vec(f)?)))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        self.0.save_facts(&rows)
+        self.0.borrow_mut().save_facts(&rows)
     }
 }
 
-fn tool_versions() -> Value {
+/// What a snapshot was built with; `scip` because a run without indexers is a different graph.
+fn tool_versions(scip: bool) -> Value {
     json!({
         "rb": env!("CARGO_PKG_VERSION"),
         "pipeline": rb_indexer::PIPELINE,
         "schema": rb_store::schema_version(),
+        "scip": scip,
     })
 }
 

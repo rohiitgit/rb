@@ -2,7 +2,9 @@
 //!
 //! Requires the compose database: `docker compose up -d --wait`, then
 //! `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55432/rb cargo test`.
-//! Without `RB_TEST_DATABASE_URL` these tests print a notice and pass vacuously.
+//! Without `RB_TEST_DATABASE_URL` these tests print a notice and pass vacuously. Every index run
+//! passes `--no-scip` so goldens stay heuristic and Docker-free, except `scip_ts_express_prisma`,
+//! which runs the real scip-typescript container and skips itself when Docker is unavailable.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -114,6 +116,7 @@ fn rb(url: &str, args: &[&str]) -> String {
         .args(args)
         .env("RB_DATABASE_URL", url)
         .env("RB_AGE_LOAD_DIR", workspace_root().join("var/age-load"))
+        .env("RB_SCIP_WORK_DIR", workspace_root().join("var/scip"))
         .output()
         .unwrap();
     assert!(
@@ -152,18 +155,25 @@ fn check_fixture(fixture: &str, tag: &str) {
     };
 
     // Determinism: the same commit indexed into two repos, and rebuilt, dumps byte-identically.
-    rb(&url, &["index", path, "--repo", &a]);
-    rb(&url, &["index", path, "--repo", &b]);
+    rb(&url, &["index", path, "--repo", &a, "--no-scip"]);
+    rb(&url, &["index", path, "--repo", &b, "--no-scip"]);
     let dump_a = rb(&url, &["dump", "--repo", &a]);
     let dump_b = rb(&url, &["dump", "--repo", &b]);
     assert_eq!(dump_a, dump_b, "same commit, different repos");
 
-    assert!(rb(&url, &["index", path, "--repo", &a]).contains("up to date"));
-    rb(&url, &["index", path, "--repo", &a, "--force"]);
+    assert!(rb(&url, &["index", path, "--repo", &a, "--no-scip"]).contains("up to date"));
+    rb(&url, &["index", path, "--repo", &a, "--no-scip", "--force"]);
     assert_eq!(rb(&url, &["dump", "--repo", &a]), dump_a, "forced rebuild");
 
     // The stored snapshot is faithful to the in-memory pipeline output.
-    let indexed = rb_indexer::index_commit(repo.path(), "HEAD", &mut rb_indexer::NoCache).unwrap();
+    let indexed = rb_indexer::index_commit(
+        repo.path(),
+        "HEAD",
+        &mut rb_indexer::NoCache,
+        &rb_indexer::ScipOptions::disabled(),
+        &mut rb_indexer::NoScipCache,
+    )
+    .unwrap();
     assert_eq!(
         canonical_dump(&indexed.commit_sha, &indexed.graph, &indexed.diagnostics),
         dump_a,
@@ -327,7 +337,13 @@ fn polyglot_monorepo_structure_goldens() {
     };
     rb(
         &url,
-        &["index", repo.path().to_str().unwrap(), "--repo", &name],
+        &[
+            "index",
+            repo.path().to_str().unwrap(),
+            "--repo",
+            &name,
+            "--no-scip",
+        ],
     );
 
     golden(
@@ -447,7 +463,13 @@ fn listing_order_is_bytewise() {
     };
     rb(
         &url,
-        &["index", repo.path().to_str().unwrap(), "--repo", &name],
+        &[
+            "index",
+            repo.path().to_str().unwrap(),
+            "--repo",
+            &name,
+            "--no-scip",
+        ],
     );
     let keys: Vec<String> = rb(&url, &["service", "--repo", &name])
         .lines()
@@ -489,10 +511,16 @@ fn warm_facts_cache_equals_cold_run() {
         repos: vec![cold.clone(), warm.clone()],
     };
 
-    let cold_run = rb(&url, &["index", path, "--repo", &cold, "--no-cache"]);
+    let cold_run = rb(
+        &url,
+        &["index", path, "--repo", &cold, "--no-cache", "--no-scip"],
+    );
     assert!(parsed_count(&cold_run) >= 8, "{cold_run}");
-    rb(&url, &["index", path, "--repo", &warm]); // fills the cache (may already be warm)
-    let warm_run = rb(&url, &["index", path, "--repo", &warm, "--force"]);
+    rb(&url, &["index", path, "--repo", &warm, "--no-scip"]); // fills the cache (may already be warm)
+    let warm_run = rb(
+        &url,
+        &["index", path, "--repo", &warm, "--no-scip", "--force"],
+    );
     assert_eq!(parsed_count(&warm_run), 0, "{warm_run}");
     assert_eq!(
         rb(&url, &["dump", "--repo", &cold]),
@@ -529,7 +557,13 @@ fn orm_table_deps_goldens() {
         };
         rb(
             &url,
-            &["index", repo.path().to_str().unwrap(), "--repo", &name],
+            &[
+                "index",
+                repo.path().to_str().unwrap(),
+                "--repo",
+                &name,
+                "--no-scip",
+            ],
         );
         golden(
             fixture,
@@ -605,7 +639,13 @@ fn code_question_goldens() {
         };
         rb(
             &url,
-            &["index", repo.path().to_str().unwrap(), "--repo", &name],
+            &[
+                "index",
+                repo.path().to_str().unwrap(),
+                "--repo",
+                &name,
+                "--no-scip",
+            ],
         );
         for (golden_name, args) in *questions {
             let mut args: Vec<&str> = args.to_vec();
@@ -622,7 +662,13 @@ fn code_question_goldens() {
     };
     rb(
         &url,
-        &["index", repo.path().to_str().unwrap(), "--repo", &name],
+        &[
+            "index",
+            repo.path().to_str().unwrap(),
+            "--repo",
+            &name,
+            "--no-scip",
+        ],
     );
     let err = rb_fails(&url, &["impact", "login", "--repo", &name]);
     assert!(err.contains("matches 2 symbols; pass --pick N"), "{err}");
@@ -630,4 +676,119 @@ fn code_question_goldens() {
         err.contains("1. login()") && err.contains("2. AuthController#login()"),
         "{err}"
     );
+}
+
+/// Contract M3b S3, S4, S6, S7, S9, S12: the TypeScript fixture indexed with scip-typescript in
+/// its container. Needs Docker (and the network for the fetch phase); skipped otherwise.
+#[test]
+fn scip_ts_express_prisma() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = rb_scip::docker_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "ts-express-prisma";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scip_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    // The index cache lives in the database and outlives test runs, so the first run may
+    // already be served from it; the second run must be.
+    let first = rb(&url, &["index", path, "--repo", &name]);
+    assert!(first.contains("scip: . scip-typescript ok"), "{first}");
+
+    // S6, S7: exact edges between SCIP keys, and no heuristic code edge in the project.
+    golden(
+        fixture,
+        "scip-callers-find-user.txt",
+        &rb(
+            &url,
+            &[
+                "callers",
+                "findUserByEmail().",
+                "--depth",
+                "3",
+                "--repo",
+                &name,
+            ],
+        ),
+    );
+    golden(
+        fixture,
+        "scip-impact-create-session.txt",
+        &rb(&url, &["impact", "createSession", "--repo", &name]),
+    );
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let mut exact_calls = 0;
+    for line in dump.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let kind = row
+            .get(3)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if matches!(kind, "CALLS" | "REFERENCES" | "IMPLEMENTS") {
+            assert_eq!(row[6].as_str(), Some("scip"), "{line}");
+            assert_eq!(
+                row[7].as_i64(),
+                Some(rb_model::Certainty::Exact.rank().into()),
+                "{line}"
+            );
+            exact_calls += usize::from(kind == "CALLS");
+        }
+    }
+    assert!(exact_calls >= 2, "{dump}");
+    // S6: the SCIP key itself and the `path:line` form name the same symbol as the suffix; the
+    // bare name still lists both `findUserByEmail` methods rather than picking one.
+    let key = "scip-typescript npm auth-api 1.0.0 src/db/`users.ts`/findUserByEmail().";
+    let by_key = rb(&url, &["callers", key, "--repo", &name]);
+    assert_eq!(
+        by_key,
+        rb(&url, &["callers", "findUserByEmail().", "--repo", &name])
+    );
+    assert_eq!(
+        by_key,
+        rb(&url, &["callers", "src/db/users.ts:8", "--repo", &name])
+    );
+    let err = rb_fails(&url, &["callers", "findUserByEmail", "--repo", &name]);
+    assert!(err.contains("matches 2 symbols"), "{err}");
+    assert!(
+        rb(
+            &url,
+            &[
+                "find",
+                "findUserByEmail",
+                "--kind",
+                "symbol",
+                "--repo",
+                &name
+            ]
+        )
+        .contains(key)
+    );
+
+    // S9: coverage per project and the exact share.
+    let status = rb(&url, &["status", "--repo", &name]);
+    let lines: Vec<&str> = status
+        .lines()
+        .filter(|l| {
+            let l = l.trim_start();
+            l.starts_with("code:") || l.starts_with("scip:")
+        })
+        .collect();
+    golden(
+        fixture,
+        "scip-status.txt",
+        &format!("{}\n", lines.join("\n")),
+    );
+
+    // S4, S12: unchanged inputs are served from the cache, and the dump is byte-identical.
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(
+        second.contains("scip: . scip-typescript ok (cached"),
+        "{second}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
 }

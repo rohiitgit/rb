@@ -94,6 +94,23 @@ pub fn docker_args(run: &ContainerRun) -> Vec<String> {
 /// Runs containers with the `docker` CLI.
 pub struct DockerRunner;
 
+/// Whether `docker version` succeeds (the CLI is installed and a daemon answers); the error is
+/// the user-facing reason when it does not.
+pub fn docker_available() -> Result<(), String> {
+    let out = Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "docker is not available: {}",
+            tail(&String::from_utf8_lossy(&o.stderr), 1)
+        )),
+        Err(e) => Err(format!("docker is not available: {e}")),
+    }
+}
+
 impl Runner for DockerRunner {
     fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
         let started = std::time::Instant::now();

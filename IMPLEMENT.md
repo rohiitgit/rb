@@ -246,10 +246,12 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Built:** step 1, `rb-scip::decode` (typed and deprecated ranges, column conversion with the document text or the repo blob, duplicate-document merge, symbol information). Two new dependencies with stated reasons: `scip`, `protobuf`.
 
 - **Incident (2026-10-01):** pulling the official scip-java 0.13.1 image (6.75 GB uncompressed) filled the host disk; `cargo clean` (16.4 GiB, `target/` had reached 12 GB) and removing the image recovered it. The published image is not usable here: the Java path needs a slim image from a pinned JDK base plus the pinned scip-java release (research in progress). scip-typescript's slim image proceeds.
-- **Built (step 2, partial):** job detection (`rb_scip::jobs`), the container runner (`rb_scip::runner`, `docker run` with digest, platform, `--network none`, budgets), the cache key (`project_input_hash`, SHA-256; new dependency `sha2`), and the `rb.scip_index` cache table (migration 0004) with store methods.
+- **Built (step 2):** job detection (`rb_scip::jobs`), the container runner (`rb_scip::runner`, `docker run` with digest, platform, `--network none`, budgets), the cache key (`project_input_hash`, SHA-256; new dependency `sha2`), the `rb.scip_index` cache table (migration 0004) with store methods, and `rb_scip::run_job` (export, fetch with the network, index without it). Verified empirically on the TypeScript fixture: offline indexing after a fetch step works; bind mounts must sit under a colima-shared path, so work directories live under `var/scip/`.
+- **Built (step 3a–3b):** the SCIP⋈Tree-sitter join (`rb_indexer::scip::join`: keys by definition-name range, `CALLS`/`REFERENCES`/`IMPLEMENTS` from matched references and `is_implementation`, coverage incl. `references_unanchored`); orchestration in `rb_indexer::projects` (`ScipOptions`, `ScipCache` mirroring `FactsCache`, cache hit → no container, `unsupported` never cached, `--no-scip` or no Docker → every job `skipped`); `assemble` builds one symbol-keys map (heuristic, overridden by SCIP symbols) that every stage takes, adds exact edges, excludes SCIP-ok files from Tier B and emits one `scip_status` diagnostic per job (no `cached` flag, so warm re-indexes dump identically). CLI: `--no-scip`, `--scip-work-dir`, per-job `scip:` lines in `rb index` and `rb status`, `exact calls (scip)` in the `code:` line. e2e `scip_ts_express_prisma` runs the real container (skips without Docker) and proves S3, S4, S6, S7, S9 and S12 on the TypeScript fixture.
+- **Open:** `Package`/`DEPENDS_ON` (S8), the Java path (S10's `java-spring-jpa` and the mixed `polyglot-monorepo` golden need a usable scip-java image), the public-repo measurement (S11), and the `no-build` fixture.
 
 ### Status
 
-- [x] Steps 0–1
-- [ ] Step 2: orchestration and the empirical offline check (in progress)
-- [ ] Steps 3–4 (see `tasks/todo.md`)
+- [x] Steps 0–2
+- [x] Step 3a–3b: join, orchestration, key replacement, exact edges, coverage, CLI
+- [ ] Step 3c (S8 packages) and step 4 (see `tasks/todo.md`)

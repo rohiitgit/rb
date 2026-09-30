@@ -14,18 +14,26 @@ use rb_syntax::{FileFacts, RefKind};
 pub(crate) struct Joined {
     /// Per file, per definition index: the SCIP symbol that replaces its heuristic key.
     pub keys: BTreeMap<String, BTreeMap<usize, String>>,
-    /// `(source key, kind, target symbol, evidence)`; sources are already SCIP keys when the
-    /// enclosing definition matched, else its heuristic key.
+    /// Exact edges; every target is a symbol whose definition matched, so the graph has its node.
     pub edges: Vec<ScipEdge>,
     pub coverage: Coverage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScipEdge {
-    pub src: String,
+    pub src: Source,
     pub kind: EdgeKind,
     pub dst: String,
+    /// The reference site; for `Source::File` also the file that is the source.
     pub at: Evidence,
+}
+
+/// Where a reference sits: inside a definition (its key, SCIP when the definition matched, else
+/// heuristic) or in top-level code, where the `File` node is the source.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Source {
+    Symbol(String),
+    File,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,9 +54,20 @@ pub(crate) struct Coverage {
     pub references_external: usize,
     /// Matched an occurrence that is a document-local symbol (never a node).
     pub references_local: usize,
-    /// No occurrence at that range: SCIP has nothing to say, Tier B keeps its guess.
+    /// Matched an occurrence of a symbol the index defines, but at a range Tree-sitter does not
+    /// treat as a definition (a field, a constant), so the graph has no node for it.
+    pub references_unanchored: usize,
+    /// No occurrence at that range: SCIP has nothing to say, and nothing is guessed.
     pub references_unmatched: usize,
 }
+
+/// A document with facts: repo path, the document, its facts and its occurrences by span.
+type Doc<'a> = (
+    String,
+    &'a rb_scip::Document,
+    &'a FileFacts,
+    BTreeMap<Span, Vec<&'a rb_scip::Occurrence>>,
+);
 
 /// Joins `index` (paths relative to `root`) with the facts of the repository's files, keyed by
 /// repo path, whose heuristic keys are `keys[path]`.
@@ -74,19 +93,27 @@ pub(crate) fn join(
         .map(|o| o.symbol.as_str())
         .collect();
     let mut out = Joined::default();
-    let mut implements: Vec<(String, String, String, Span)> = Vec::new();
-    for doc in &index.documents {
-        let path = repo_path(&doc.path);
-        let Some(facts) = files.get(path.as_str()) else {
-            continue;
-        };
-        let heuristic = &keys[path.as_str()];
-        let by_span: BTreeMap<Span, Vec<&rb_scip::Occurrence>> =
-            doc.occurrences.iter().fold(BTreeMap::new(), |mut m, o| {
-                m.entry(o.span).or_default().push(o);
-                m
-            });
-        // Definitions: the name's range is a definition occurrence of a global symbol.
+    // The documents with facts, each with its occurrences by span.
+    let docs: Vec<Doc<'_>> = index
+        .documents
+        .iter()
+        .filter_map(|doc| {
+            let path = repo_path(&doc.path);
+            let facts = *files.get(path.as_str())?;
+            let by_span = doc.occurrences.iter().fold(
+                BTreeMap::<Span, Vec<&rb_scip::Occurrence>>::new(),
+                |mut m, o| {
+                    m.entry(o.span).or_default().push(o);
+                    m
+                },
+            );
+            Some((path, doc, facts, by_span))
+        })
+        .collect();
+    // Definitions first, over every document: the name's range is a definition occurrence of a
+    // global symbol. The matched symbols are the only targets an edge may have, since only they
+    // get `Symbol` nodes.
+    for (path, _, facts, by_span) in &docs {
         let mut replaced: BTreeMap<usize, String> = BTreeMap::new();
         for (i, d) in facts.definitions.iter().enumerate() {
             out.coverage.definitions_total += 1;
@@ -99,11 +126,27 @@ pub(crate) fn join(
                 replaced.insert(i, o.symbol.clone());
             }
         }
-        let key_of = |i: usize| {
-            replaced
-                .get(&i)
-                .cloned()
-                .unwrap_or_else(|| heuristic[i].clone())
+        if !replaced.is_empty() {
+            out.keys.insert(path.clone(), replaced);
+        }
+    }
+    let nodes: BTreeSet<&str> = out
+        .keys
+        .values()
+        .flat_map(|r| r.values().map(String::as_str))
+        .collect();
+    let mut implements: Vec<ScipEdge> = Vec::new();
+    for (path, doc, facts, by_span) in &docs {
+        let heuristic = &keys[path.as_str()];
+        let replaced = out.keys.get(path);
+        let source = |enclosing: Option<usize>| match enclosing {
+            Some(i) => Source::Symbol(
+                replaced
+                    .and_then(|r| r.get(&i))
+                    .cloned()
+                    .unwrap_or_else(|| heuristic[i].clone()),
+            ),
+            None => Source::File,
         };
         // References: the name's range is a non-definition occurrence.
         for r in &facts.references {
@@ -119,23 +162,24 @@ pub(crate) fn join(
                 out.coverage.references_unmatched += 1;
                 continue;
             };
-            if o.symbol.starts_with("local ") {
+            let symbol = o.symbol.as_str();
+            if symbol.starts_with("local ") {
                 out.coverage.references_local += 1;
                 continue;
             }
-            if !defined.contains(o.symbol.as_str()) {
+            if !defined.contains(symbol) {
                 out.coverage.references_external += 1;
                 continue;
             }
+            if !nodes.contains(symbol) {
+                out.coverage.references_unanchored += 1;
+                continue;
+            }
             out.coverage.references_matched += 1;
-            let src = match r.enclosing {
-                Some(i) => key_of(i),
-                None => format!("file:{path}"),
-            };
             out.edges.push(ScipEdge {
-                src,
+                src: source(r.enclosing),
                 kind,
-                dst: o.symbol.clone(),
+                dst: symbol.to_owned(),
                 at: Evidence {
                     path: path.clone(),
                     span: r.span,
@@ -143,35 +187,31 @@ pub(crate) fn join(
             });
         }
         // Implementations come from symbol information, anchored at the type's name.
+        let Some(replaced) = replaced else {
+            continue;
+        };
         for s in &doc.symbols {
             let Some((i, _)) = replaced.iter().find(|(_, sym)| **sym == s.symbol) else {
                 continue;
             };
             for rel in s.relationships.iter().filter(|r| r.is_implementation) {
-                if defined.contains(rel.symbol.as_str()) {
-                    implements.push((
-                        s.symbol.clone(),
-                        rel.symbol.clone(),
-                        path.clone(),
-                        facts.definitions[*i].name_span,
-                    ));
+                if nodes.contains(rel.symbol.as_str()) {
+                    implements.push(ScipEdge {
+                        src: Source::Symbol(s.symbol.clone()),
+                        kind: EdgeKind::Implements,
+                        dst: rel.symbol.clone(),
+                        at: Evidence {
+                            path: path.clone(),
+                            span: facts.definitions[*i].name_span,
+                        },
+                    });
                 }
             }
         }
-        if !replaced.is_empty() {
-            out.keys.insert(path.clone(), replaced);
-        }
     }
-    for (src, dst, path, span) in implements {
-        out.edges.push(ScipEdge {
-            src,
-            kind: EdgeKind::Implements,
-            dst,
-            at: Evidence { path, span },
-        });
-    }
+    out.edges.extend(implements);
     out.edges.sort_by(|a, b| {
-        (&a.src, a.kind as u8, &a.dst, a.at.span).cmp(&(&b.src, b.kind as u8, &b.dst, b.at.span))
+        (&a.src, a.kind as u8, &a.dst, &a.at).cmp(&(&b.src, b.kind as u8, &b.dst, &b.at))
     });
     out.edges.dedup();
     out
@@ -268,13 +308,8 @@ mod tests {
                 ),
             ]
         );
-        let edges: Vec<String> = joined
-            .edges
-            .iter()
-            .map(|e| format!("{} {:?} {}", e.src, e.kind, e.dst))
-            .collect();
         assert_eq!(
-            edges,
+            edge_lines(&joined),
             [
                 "scip-java maven . . p/Dog# References scip-java maven . . p/Animal#",
                 "scip-java maven . . p/Dog#sound(). Calls scip-java maven . . p/Dog#helper().",
@@ -289,9 +324,75 @@ mod tests {
                 references_matched: 2,
                 references_external: 1,
                 references_local: 1,
+                references_unanchored: 0,
                 references_unmatched: 0,
             }
         );
+    }
+
+    fn edge_lines(joined: &Joined) -> Vec<String> {
+        joined
+            .edges
+            .iter()
+            .map(|e| {
+                let src = match &e.src {
+                    Source::Symbol(k) => k.clone(),
+                    Source::File => format!("file {}", e.at.path),
+                };
+                format!("{src} {:?} {}", e.kind, e.dst)
+            })
+            .collect()
+    }
+
+    /// Top-level code has the file as its source; a symbol the index defines at a range
+    /// Tree-sitter does not (a constant) is no target, and counts as unanchored.
+    #[test]
+    fn top_level_calls_come_from_the_file_and_unanchored_symbols_get_no_edge() {
+        let src = "export function f() {}\nexport const k = 1;\nf();\nk();\n";
+        let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let path = "src/a.ts";
+        let sym = |d: &str| format!("scip-typescript npm p 1.0.0 src/`a.ts`/{d}");
+        let at = |token: &str| -> Span {
+            let line = src.lines().position(|l| l.contains(token)).unwrap();
+            let col = src.lines().nth(line).unwrap().find(token).unwrap();
+            let (line, col) = (line as i32, col as i32);
+            [line, col, line, col + 1]
+        };
+        let occ = |span: Span, symbol: String, roles: i32| Occurrence {
+            span,
+            symbol,
+            roles,
+            enclosing: None,
+        };
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "src/a.ts".into(),
+                occurrences: vec![
+                    occ(at("f() {}"), sym("f()."), 1),
+                    occ(at("k = 1"), sym("k."), 1),
+                    occ(at("f();"), sym("f()."), 0),
+                    occ(at("k();"), sym("k."), 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files: BTreeMap<&str, &FileFacts> = BTreeMap::from([(path, &facts)]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined = join(&index, "", &files, &keys);
+        assert_eq!(
+            joined.keys[path],
+            BTreeMap::from([(0, sym("f()."))]),
+            "only the function is a Tree-sitter definition"
+        );
+        assert_eq!(
+            edge_lines(&joined),
+            [format!("file src/a.ts Calls {}", sym("f()."))]
+        );
+        assert_eq!(joined.coverage.references_matched, 1);
+        assert_eq!(joined.coverage.references_unanchored, 1);
+        assert_eq!(joined.coverage.references_unmatched, 0);
     }
 
     #[test]
@@ -377,7 +478,7 @@ mod sample {
             }
         }
         for e in joined.edges.iter().take(20) {
-            println!("  edge {} {:?} {}", e.src, e.kind, e.dst);
+            println!("  edge {:?} {:?} {}", e.src, e.kind, e.dst);
         }
         for d in &index.documents {
             for o in d.occurrences.iter().take(6) {

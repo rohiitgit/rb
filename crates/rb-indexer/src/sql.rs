@@ -103,7 +103,8 @@ pub(crate) fn add_migrations(
         .collect())
 }
 
-/// Adds `QUERIES` edges for a file's SQL candidates, from their enclosing symbol (or the file).
+/// Adds `QUERIES` edges for a file's SQL candidates, from their enclosing symbol (or the file);
+/// `keys` is parallel to `facts.definitions`.
 ///
 /// A candidate passed to a known SQL sink is `exact`; any other candidate that parses is
 /// `heuristic`. Statements that do not parse give a diagnostic only in a sink argument; otherwise
@@ -112,8 +113,8 @@ pub(crate) fn add_queries(
     b: &mut GraphBuilder,
     path: &str,
     facts: &FileFacts,
+    keys: &[String],
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    let keys = rb_syntax::symbol_keys(path, facts);
     let file = NodeKey::new(NodeKind::File, path);
     let mut access = Accesses::default();
     let mut diagnostics = Vec::new();
@@ -265,6 +266,10 @@ mod tests {
 
     use super::*;
 
+    fn keys(path: &str, facts: &FileFacts) -> Vec<String> {
+        rb_syntax::symbol_keys(path, facts)
+    }
+
     fn graph_with(
         path: &str,
         build: impl FnOnce(&mut GraphBuilder) -> Vec<Diagnostic>,
@@ -370,7 +375,7 @@ mod tests {
         let facts = rb_syntax::extract(Language::JavaScript, src.as_bytes()).unwrap();
         let mut diagnostics = Vec::new();
         let (g, _) = graph_with("a.js", |b| {
-            diagnostics = add_queries(b, "a.js", &facts).unwrap();
+            diagnostics = add_queries(b, "a.js", &facts, &keys("a.js", &facts)).unwrap();
             Vec::new()
         });
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
@@ -387,8 +392,9 @@ mod tests {
         let src = "class R {\n  void f() {\n    em.createQuery(\"SELECT c FROM Customer c\");\n    em.createNativeQuery(\"SELECT * FROM customer\");\n  }\n}\n";
         let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
         let (g, _) = graph_with("R.java", |b| {
-            crate::syntax::add_symbols(b, "R.java", &facts).unwrap();
-            add_queries(b, "R.java", &facts).unwrap()
+            let keys = keys("R.java", &facts);
+            crate::syntax::add_symbols(b, "R.java", &facts, &keys).unwrap();
+            add_queries(b, "R.java", &facts, &keys).unwrap()
         });
         assert_eq!(
             edges(&g, EdgeKind::Queries),
@@ -410,8 +416,9 @@ const REPORT = 'SELECT * FROM public.orders';
         let facts = rb_syntax::extract(Language::TypeScript, TS.as_bytes()).unwrap();
         let mut diagnostics = Vec::new();
         let (g, _) = graph_with("src/load.ts", |b| {
-            crate::syntax::add_symbols(b, "src/load.ts", &facts).unwrap();
-            diagnostics = add_queries(b, "src/load.ts", &facts).unwrap();
+            let keys = keys("src/load.ts", &facts);
+            crate::syntax::add_symbols(b, "src/load.ts", &facts, &keys).unwrap();
+            diagnostics = add_queries(b, "src/load.ts", &facts, &keys).unwrap();
             Vec::new()
         });
         assert_eq!(
@@ -435,8 +442,9 @@ const REPORT = 'SELECT * FROM public.orders';
         let src = "db.execute('DELETE FROM sessions')\n";
         let facts = rb_syntax::extract(Language::Python, src.as_bytes()).unwrap();
         let (g, _) = graph_with("jobs/cleanup.py", |b| {
-            crate::syntax::add_symbols(b, "jobs/cleanup.py", &facts).unwrap();
-            add_queries(b, "jobs/cleanup.py", &facts).unwrap()
+            let keys = keys("jobs/cleanup.py", &facts);
+            crate::syntax::add_symbols(b, "jobs/cleanup.py", &facts, &keys).unwrap();
+            add_queries(b, "jobs/cleanup.py", &facts, &keys).unwrap()
         });
         assert_eq!(
             edges(&g, EdgeKind::Queries),

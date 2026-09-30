@@ -156,6 +156,9 @@ Findings from the research step (2026-09-29):
 
 - [x] 0. Research: indexer images/digests/invocations, `scip` crate API, fixture buildability; contract facts recorded.
 - [x] 1. rb-scip: decode `index.scip`, position-encoding conversion (S1).
-- [ ] 2. rb-scip: project detection, container jobs, fetch/index phases, cache (S2–S4).
+- [x] 2. rb-scip: project detection, container jobs, fetch/index phases, cache (S2–S4).
 - [ ] 3. Indexer: the SCIP⋈Tree-sitter join, key replacement, exact edges, packages, coverage (S5–S9).
+  - [x] 3a. Join: `Source` enum for file-level edges, targets limited to symbols the graph has, coverage.
+  - [x] 3b. `index_commit` runs jobs (`ScipOptions`, `ScipCache`, Docker check), decodes, assembles with a precomputed keys map, excludes SCIP-ok files from Tier B, emits `scip_status`; CLI flags `--no-scip`, `--scip-work-dir`; `rb status` lines; `exact_calls`; e2e `scip_ts_express_prisma` with goldens; docs.
+  - [ ] 3c. Packages / `DEPENDS_ON` from external symbols and lockfiles (S8).
 - [ ] 4. Fixtures (`no-build`), goldens, public repos (S10–S12), evaluator passes, docs, commit.

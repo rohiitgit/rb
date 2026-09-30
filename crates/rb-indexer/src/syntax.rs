@@ -103,6 +103,7 @@ pub(crate) fn parse_parallel(
 }
 
 /// Adds the file's symbols: `Symbol` nodes, `DEFINED_IN` (evidence: name span) and `CONTAINS`.
+/// `keys` is parallel to `facts.definitions` (heuristic keys, or SCIP keys where the join matched).
 ///
 /// Declarations that share a key (e.g. TypeScript declaration merging) are one symbol: the first
 /// declaration's kind wins and every site becomes `DEFINED_IN` evidence.
@@ -110,11 +111,12 @@ pub(crate) fn add_symbols(
     b: &mut GraphBuilder,
     path: &str,
     facts: &FileFacts,
+    keys: &[String],
 ) -> anyhow::Result<()> {
     let file = NodeKey::new(NodeKind::File, path);
-    let keys: Vec<NodeKey> = rb_syntax::symbol_keys(path, facts)
-        .into_iter()
-        .map(|k| NodeKey::new(NodeKind::Symbol, k))
+    let keys: Vec<NodeKey> = keys
+        .iter()
+        .map(|k| NodeKey::new(NodeKind::Symbol, k.clone()))
         .collect();
     for (def, key) in facts.definitions.iter().zip(&keys) {
         if !b.has_node(key) {
@@ -300,7 +302,13 @@ mod tests {
             rb_model::Attrs::new(),
         )
         .unwrap();
-        add_symbols(&mut b, "a.py", &facts).unwrap();
+        add_symbols(
+            &mut b,
+            "a.py",
+            &facts,
+            &rb_syntax::symbol_keys("a.py", &facts),
+        )
+        .unwrap();
         let g = b.finish().unwrap();
 
         let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
@@ -358,7 +366,13 @@ mod tests {
             rb_model::Attrs::new(),
         )
         .unwrap();
-        add_symbols(&mut b, "x.ts", &facts).unwrap();
+        add_symbols(
+            &mut b,
+            "x.ts",
+            &facts,
+            &rb_syntax::symbol_keys("x.ts", &facts),
+        )
+        .unwrap();
         let g = b.finish().unwrap();
         let symbols: Vec<&rb_model::Node> = g
             .nodes()

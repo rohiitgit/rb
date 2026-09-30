@@ -9,7 +9,10 @@ pub mod jobs;
 pub use jobs::{Indexer, Job, jobs};
 pub mod runner;
 
-pub use runner::{ContainerRun, DockerRunner, Network, Outcome, Runner};
+pub use runner::{ContainerRun, DockerRunner, Network, Outcome, Runner, docker_available};
 pub mod hash;
 
 pub use hash::project_input_hash;
+pub mod orchestrate;
+
+pub use orchestrate::{Budget, RunStatus, ScipRun, image_for, run_job};

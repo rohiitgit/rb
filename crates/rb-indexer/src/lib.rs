@@ -3,16 +3,18 @@
 //! Everything here is a pure function of the commit's tree, so the same commit always yields the
 //! same graph and diagnostics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 mod modules;
 mod orm;
+mod projects;
 mod resolve;
 mod scip;
 mod sql;
 mod syntax;
 
+pub use projects::{NoScipCache, ScipCache, ScipCacheEntry, ScipOptions, ScipProject};
 pub use syntax::{FactsCache, FactsKey, NoCache};
 
 use rb_git::Repo;
@@ -39,13 +41,19 @@ pub struct Indexed {
     pub diagnostics: Vec<Diagnostic>,
     /// Blobs parsed in this run (cache misses); 0 on a fully warm cache.
     pub parsed: usize,
+    /// The SCIP jobs of the commit, in job order, with their decoded indexes dropped.
+    pub scip: Vec<ScipProject>,
 }
 
-/// Indexes `rev` of the repository at `repo_path`, reusing and filling `cache`.
+/// Indexes `rev` of the repository at `repo_path`, reusing and filling `cache` and, for SCIP
+/// indexes, `scip_cache`. Jobs run only when `scip.enabled` and Docker answers; otherwise every
+/// job is recorded as `skipped` and the whole graph is heuristic.
 pub fn index_commit(
     repo_path: &Path,
     rev: &str,
     cache: &mut dyn FactsCache,
+    scip: &ScipOptions,
+    scip_cache: &mut dyn ScipCache,
 ) -> anyhow::Result<Indexed> {
     let repo = Repo::open(repo_path)?;
     let manifest = repo.manifest(rev)?;
@@ -102,22 +110,47 @@ pub fn index_commit(
         })
         .filter_map(Result::transpose)
         .collect::<anyhow::Result<_>>()?;
+    let docker = rb_scip::DockerRunner;
+    let mode = if !scip.enabled {
+        projects::Mode::Skip("SCIP disabled (--no-scip)".into())
+    } else {
+        match rb_scip::docker_available() {
+            Ok(()) => projects::Mode::Run(&docker),
+            Err(reason) => projects::Mode::Skip(reason),
+        }
+    };
+    if let projects::Mode::Run(_) = mode {
+        std::fs::create_dir_all(&scip.work_dir)?;
+    }
+    let scip_projects = projects::run_projects(
+        &manifest.files,
+        &|blob: &str| repo.blob(blob),
+        &mode,
+        scip,
+        scip_cache,
+    )?;
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
         prisma: texts("prisma")?,
         go_modules,
+        scip: scip_projects,
     };
 
     let (graph, assembly_diagnostics) =
         assemble(&manifest, codeowners.as_ref(), &boundaries, &content)?;
     diagnostics.extend(assembly_diagnostics);
     rb_model::sort_diagnostics(&mut diagnostics);
+    let mut scip = content.scip;
+    for p in &mut scip {
+        p.index = None;
+    }
     Ok(Indexed {
         commit_sha: manifest.commit_sha,
         graph,
         diagnostics,
         parsed,
+        scip,
     })
 }
 
@@ -165,6 +198,8 @@ pub struct Content<'a> {
     pub prisma: BTreeMap<&'a str, String>,
     /// Directory of each `go.mod` (`""` for the root) → its module path.
     pub go_modules: BTreeMap<String, String>,
+    /// The commit's SCIP jobs and their outcomes.
+    pub scip: Vec<ScipProject>,
 }
 
 /// Builds the snapshot graph from the structural, syntax, SQL and ORM facts; returns the
@@ -240,10 +275,70 @@ pub fn assemble(
         }
     }
     let mut diagnostics = Vec::new();
+    // Symbol keys: heuristic per file, replaced by SCIP symbols where a project's index matched
+    // (design §5.3). Every later stage names symbols through this one map.
+    let mut keys: BTreeMap<&str, Vec<String>> = content
+        .facts
+        .iter()
+        .map(|(path, (_, facts))| (*path, rb_syntax::symbol_keys(path, facts)))
+        .collect();
+    // A file belongs to the deepest build root containing it; it is exact when that root's
+    // index is ok, and heuristic otherwise (contract M3b invariant 1).
+    let owner_of =
+        |path: &str| projects::owner_root(path, content.scip.iter().map(|p| p.root.as_str()));
+    let mut scip_edges = Vec::new();
+    let mut exact_files: BTreeSet<&str> = BTreeSet::new();
+    for project in &content.scip {
+        let files: BTreeMap<&str, &rb_syntax::FileFacts> = content
+            .facts
+            .iter()
+            .filter(|(path, _)| owner_of(path) == Some(project.root.as_str()))
+            .map(|(path, (_, facts))| (*path, *facts))
+            .collect();
+        let coverage = match (&project.status, &project.index) {
+            (rb_scip::RunStatus::Ok, Some(index)) => {
+                let joined = scip::join(index, &project.root, &files, &keys);
+                for (path, replaced) in joined.keys {
+                    let file_keys = keys
+                        .get_mut(path.as_str())
+                        .expect("the join only returns files it was given");
+                    for (i, key) in replaced {
+                        file_keys[i] = key;
+                    }
+                }
+                scip_edges.extend(joined.edges);
+                exact_files.extend(files.keys());
+                Some(joined.coverage)
+            }
+            _ => None,
+        };
+        diagnostics.push(scip_status(project, coverage.as_ref()));
+    }
     // ORM mappings from every file first, so accesses can resolve entities across files.
     for (path, (_, facts)) in &content.facts {
-        syntax::add_symbols(&mut b, path, facts)?;
-        diagnostics.extend(sql::add_queries(&mut b, path, facts)?);
+        syntax::add_symbols(&mut b, path, facts, &keys[path])?;
+        diagnostics.extend(sql::add_queries(&mut b, path, facts, &keys[path])?);
+    }
+    for e in scip_edges {
+        let src = match e.src {
+            scip::Source::Symbol(key) => NodeKey::new(NodeKind::Symbol, key),
+            scip::Source::File => NodeKey::new(NodeKind::File, e.at.path.clone()),
+        };
+        let kind = match e.kind {
+            scip::EdgeKind::Calls => EdgeKind::Calls,
+            scip::EdgeKind::References => EdgeKind::References,
+            scip::EdgeKind::Implements => EdgeKind::Implements,
+        };
+        b.add_edge(
+            NewEdge::new(
+                src,
+                kind,
+                NodeKey::new(NodeKind::Symbol, e.dst),
+                Provenance::Scip,
+                Certainty::Exact,
+            )
+            .evidence(e.at),
+        )?;
     }
     let files: Vec<(&str, rb_syntax::Language, &rb_syntax::FileFacts)> = content
         .facts
@@ -259,18 +354,65 @@ pub fn assemble(
         &mut b,
         &content.facts,
         &content.go_modules,
+        &keys,
+        &exact_files,
     )?);
-    let (orm_index, orm_diagnostics) = orm::add_mappings(&mut b, &files, &prisma)?;
+    let (orm_index, orm_diagnostics) = orm::add_mappings(&mut b, &files, &prisma, &keys)?;
     diagnostics.extend(orm_diagnostics);
     for (path, (language, facts)) in &content.facts {
         diagnostics.extend(orm::add_accesses(
-            &mut b, path, *language, facts, &orm_index,
+            &mut b,
+            path,
+            *language,
+            facts,
+            &keys[path],
+            &orm_index,
         )?);
     }
     for (path, text) in &content.sql {
         diagnostics.extend(sql::add_migrations(&mut b, path, text)?);
     }
     Ok((b.finish()?, diagnostics))
+}
+
+/// One `scip_status` diagnostic per job (contract M3b S9). Its detail is a function of the
+/// commit and the cache, never of this run: whether the index was served from the cache is
+/// reported by `rb index`, not recorded here, so a warm re-index dumps byte-identically.
+fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic {
+    let mut detail = json!({
+        "indexer": p.indexer,
+        "status": p.status.as_str(),
+        "elapsed_ms": p.elapsed_ms,
+        "unpinned": p.unpinned,
+    });
+    match p.status.reason() {
+        Some(reason) => detail["reason"] = reason.into(),
+        None => detail["image"] = p.image.into(),
+    }
+    if let Some(c) = coverage {
+        detail["coverage"] = json!({
+            "definitions_matched": c.definitions_matched,
+            "definitions_total": c.definitions_total,
+            "references_matched": c.references_matched,
+            "references_external": c.references_external,
+            "references_local": c.references_local,
+            "references_unanchored": c.references_unanchored,
+            "references_unmatched": c.references_unmatched,
+        });
+    }
+    if p.status != rb_scip::RunStatus::Ok && !p.stderr_tail.is_empty() {
+        detail["stderr_tail"] = p.stderr_tail.as_str().into();
+    }
+    Diagnostic {
+        kind: "scip_status".into(),
+        path: Some(if p.root.is_empty() {
+            boundaries::ROOT_DIR.to_owned()
+        } else {
+            p.root.clone()
+        }),
+        span: None,
+        detail,
+    }
 }
 
 /// Adds `OWNED_BY` edges from `src` for the CODEOWNERS rule deciding `path`, with the rule's line

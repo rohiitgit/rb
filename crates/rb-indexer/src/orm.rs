@@ -42,11 +42,12 @@ struct Found<'a> {
 
 /// Adds `MAPS_TO` for every mapped class and Prisma model of the snapshot, and returns the index
 /// that accesses resolve against. Needs all files at once: JPA inheritance and Spring Data base
-/// repositories cross files.
+/// repositories cross files. `keys` holds each file's symbol keys, parallel to its definitions.
 pub(crate) fn add_mappings(
     b: &mut GraphBuilder,
     files: &[(&str, Language, &FileFacts)],
     prisma: &[(&str, &str)],
+    keys: &BTreeMap<&str, Vec<String>>,
 ) -> anyhow::Result<(OrmIndex, Vec<Diagnostic>)> {
     let mut index = OrmIndex {
         repository_bases: rb_frameworks::repository_bases(
@@ -59,7 +60,7 @@ pub(crate) fn add_mappings(
     };
     let mut found = Vec::new();
     for &(path, language, facts) in files {
-        let keys = rb_syntax::symbol_keys(path, facts);
+        let keys = &keys[path];
         for mapping in rb_frameworks::mappings(path, language, facts) {
             let def = &facts.definitions[mapping.class];
             found.push(Found {
@@ -356,15 +357,16 @@ fn orm_name(orm: Orm) -> &'static str {
     }
 }
 
-/// Adds `QUERIES` (provenance `orm`) for the ORM accesses of one file.
+/// Adds `QUERIES` (provenance `orm`) for the ORM accesses of one file; `keys` is parallel to
+/// `facts.definitions`.
 pub(crate) fn add_accesses(
     b: &mut GraphBuilder,
     path: &str,
     language: Language,
     facts: &FileFacts,
+    keys: &[String],
     index: &OrmIndex,
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    let keys = rb_syntax::symbol_keys(path, facts);
     let mut accesses = Accesses::default();
     let mut diagnostics = Vec::new();
     for access in rb_frameworks::accesses(language, facts, &index.repository_bases) {
@@ -527,14 +529,20 @@ mod tests {
             b.add_node(NodeKey::new(NodeKind::File, p), p, Attrs::new())
                 .unwrap();
         }
+        let keys: BTreeMap<&str, Vec<String>> = facts
+            .iter()
+            .map(|(p, _, f)| (p.as_str(), rb_syntax::symbol_keys(p, f)))
+            .collect();
         for (path, _, f) in &facts {
-            crate::syntax::add_symbols(&mut b, path, f).unwrap();
+            crate::syntax::add_symbols(&mut b, path, f, &keys[path.as_str()]).unwrap();
         }
         let files: Vec<(&str, Language, &FileFacts)> =
             facts.iter().map(|(p, l, f)| (p.as_str(), *l, f)).collect();
-        let (index, mut diagnostics) = add_mappings(&mut b, &files, prisma).unwrap();
+        let (index, mut diagnostics) = add_mappings(&mut b, &files, prisma, &keys).unwrap();
         for (path, language, f) in &facts {
-            diagnostics.extend(add_accesses(&mut b, path, *language, f, &index).unwrap());
+            diagnostics.extend(
+                add_accesses(&mut b, path, *language, f, &keys[path.as_str()], &index).unwrap(),
+            );
         }
         (b.finish().unwrap(), diagnostics)
     }

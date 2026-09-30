@@ -20,16 +20,23 @@ type Sym<'a> = (&'a str, usize);
 const MAX_INHERITANCE_DEPTH: usize = 64;
 
 /// Adds the resolved edges for every file; returns one `unresolved_references` diagnostic per file
-/// that has unresolved call or type references.
+/// that has unresolved call or type references. `keys` holds each file's symbol keys, parallel to
+/// its definitions. Files in `excluded` (those an exact SCIP index covers) get no edges and no
+/// diagnostic, but their definitions still resolve references from other files.
 pub(crate) fn add_edges(
     b: &mut GraphBuilder,
     files: &BTreeMap<&str, (Language, &FileFacts)>,
     go_modules: &BTreeMap<String, String>,
+    keys: &BTreeMap<&str, Vec<String>>,
+    excluded: &BTreeSet<&str>,
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    let index = Index::new(files, go_modules);
+    let index = Index::new(files, go_modules, keys);
     let mut edges = Edges::default();
     let mut diagnostics = Vec::new();
     for (&path, (language, facts)) in files {
+        if excluded.contains(path) {
+            continue;
+        }
         let keys = &index.keys[path];
         let source = |enclosing: Option<usize>| match enclosing {
             Some(i) => NodeKey::new(NodeKind::Symbol, keys[i].clone()),
@@ -232,7 +239,7 @@ enum Container<'a> {
 struct Index<'a> {
     files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
     modules: Modules<'a>,
-    keys: BTreeMap<&'a str, Vec<String>>,
+    keys: &'a BTreeMap<&'a str, Vec<String>>,
     /// Per file: definitions by name, directly inside each definition and at top level.
     scopes: BTreeMap<&'a str, Scopes<'a>>,
     /// Per file: the files each import refers to, parallel to `FileFacts::imports`.
@@ -347,9 +354,9 @@ impl<'a> Index<'a> {
     fn new(
         files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
         go_modules: &'a BTreeMap<String, String>,
+        keys: &'a BTreeMap<&'a str, Vec<String>>,
     ) -> Self {
         let modules = Modules::new(files, go_modules);
-        let mut keys = BTreeMap::new();
         let mut scopes = BTreeMap::new();
         let mut imports = BTreeMap::new();
         let mut raw_locals: BTreeMap<&str, BTreeMap<&str, Vec<&Binding>>> = BTreeMap::new();
@@ -391,7 +398,6 @@ impl<'a> Index<'a> {
                     table.entry(d.name.as_str()).or_default().push((path, i));
                 }
             }
-            keys.insert(path, rb_syntax::symbol_keys(path, facts));
             let mut sc = Scopes::default();
             for (i, d) in facts.definitions.iter().enumerate() {
                 let table = match d.parent {
@@ -1148,13 +1154,17 @@ mod tests {
             .iter()
             .map(|(d, m)| ((*d).to_owned(), (*m).to_owned()))
             .collect();
+        let keys: BTreeMap<&str, Vec<String>> = by_path
+            .iter()
+            .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+            .collect();
         let mut b = GraphBuilder::new();
         for (path, (_, f)) in &by_path {
             b.add_node(NodeKey::new(NodeKind::File, *path), *path, Attrs::new())
                 .unwrap();
-            crate::syntax::add_symbols(&mut b, path, f).unwrap();
+            crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
         }
-        let diagnostics = add_edges(&mut b, &by_path, &go).unwrap();
+        let diagnostics = add_edges(&mut b, &by_path, &go, &keys, &BTreeSet::new()).unwrap();
         Built {
             graph: b.finish().unwrap(),
             diagnostics,
@@ -1984,9 +1994,10 @@ func (s *Server) helper() {}
             Attrs::new(),
         )
         .unwrap();
-        crate::syntax::add_symbols(&mut b, "app/many.py", &facts).unwrap();
+        let keys = BTreeMap::from([("app/many.py", rb_syntax::symbol_keys("app/many.py", &facts))]);
+        crate::syntax::add_symbols(&mut b, "app/many.py", &facts, &keys["app/many.py"]).unwrap();
         let started = std::time::Instant::now();
-        add_edges(&mut b, &by_path, &BTreeMap::new()).unwrap();
+        add_edges(&mut b, &by_path, &BTreeMap::new(), &keys, &BTreeSet::new()).unwrap();
         assert!(
             started.elapsed().as_millis() < 1500,
             "{:?}",
