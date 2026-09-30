@@ -36,6 +36,11 @@ rb-indexer = { path = "crates/rb-indexer" }
 rb-syntax = { path = "crates/rb-syntax" }
 rb-sql = { path = "crates/rb-sql" }
 rb-frameworks = { path = "crates/rb-frameworks" }
+rb-scip = { path = "crates/rb-scip" }
+# SCIP index decoding (design §5.1). `scip` pins `protobuf = "=3.7.2"`; the same pin is needed
+# here to name the `protobuf::Message` trait.
+scip = "0.10"
+protobuf = "=3.7.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

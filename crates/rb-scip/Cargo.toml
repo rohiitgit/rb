@@ -1,0 +1,19 @@
+[package]
+name = "rb-scip"
+description = "Repository Brain SCIP support: decoding indexes and running indexers in containers (design §5.2, §5.3)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# The official SCIP bindings (design §5.1); `protobuf` must match the bindings' exact pin to
+# name the `Message` trait they implement.
+protobuf.workspace = true
+rb-model.workspace = true
+scip.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

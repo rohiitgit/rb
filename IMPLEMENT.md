@@ -237,3 +237,13 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Evaluator pass 6: PASS. All Amendment 5 repros hold, 96/96 sampled edges correct, invariants 1–6 hold, no database FATALs across three serial e2e runs. Its two low-severity notes on `defines` were fixed afterwards with unit tests (Amendment 6).
 - [x] e2e flake: AGE 1.8 on PG 18 kills backends under concurrent graph DDL; tests serialized, risk recorded in design §14.
 - [x] Commit
+
+## M3b SCIP orchestration: planning
+
+- **Decided so far:** see `tasks/contract-m3b.md` (draft). Indexers run in pinned containers with the network disabled during indexing; an index is cached by `(project_input_hash, indexer_digest)`; a project is fully SCIP or fully heuristic. scip-java and scip-typescript first.
+- **Environment checked 2026-10-01:** Docker 29.5.2 on colima (arm64); `--network none` verified to block egress; about 4.8 GiB free on the host disk, so image sizes matter.
+- **Open:** image digests and invocations, the `scip` crate API, whether the fixtures build inside the indexers (research in progress).
+
+### Status
+
+- [ ] Steps 0–4 (see `tasks/todo.md`)
