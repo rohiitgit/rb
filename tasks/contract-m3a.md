@@ -60,3 +60,24 @@ M3a needs no external tool. Every M3a edge has provenance `heuristic`; SCIP late
 | R11 | Fixtures gain enough cross-file calls to exercise every level and language, and include the must-not-exist cases (unknown receiver, a same-named method in an unrelated class) | goldens |
 | R12 | Public repos at pinned commits (the M1b set: spring-petclinic, hono, gin, requests): no panics; resolution rate per language recorded; **precision** measured by hand-checking 20 random `heuristic` edges per repo against the source, target ≥ 90% correct; time recorded | recorded measurement |
 | R13 | fmt, clippy, tests and the stub scan are clean; a separate evaluator pass finds no open defects; no new dependency without a stated reason | verification loop |
+
+## Amendment 1: evaluator pass 1 (12 defects, all fixed test-first)
+
+- **Invariant 6:**
+  - Containers are deduplicated at every step, so repeated bindings or declarations no longer multiply along a field chain; it was exponential.
+  - Bindings are looked up through per-file indexes instead of a scan.
+  - The same-package level is a precomputed per-package index, not a scan of the package.
+  - Timing tests: a 24-segment chain with duplicates, a 4,000-line binding chain, and 1,500 files in one package.
+- **Invariant 3:**
+  - `rb-syntax` records untyped declarations as bindings with an empty type: untyped parameters (Python, JS), untyped locals, and Go short declarations of calls.
+  - A variable's receiver is its declared type or nothing, never a same-named type or module.
+  - An untyped inner binding hides a typed outer one.
+  - A class body's own names are not locals of its methods; a Python class attribute is a field, reachable through `self`.
+- **Rebinding:** among several bindings of a name in one scope, the nearest one declared before the reference wins.
+- **Java levels:** single-type imports, then the same package, then wildcard imports (JLS §6.4.1).
+- **Go:** `_test.go` files are never part of an imported package; the same-package level matches both directory and package clause.
+- **Python:** an absolute import matches a module only when the directory above it is not a package (`import json` inside `pkg/` is the standard library, not `pkg/json.py`). Ties between valid candidates stay ambiguous; the old "unique suffix match" wording was wrong.
+- **Recursion:** recursive calls are `CALLS` edges to self.
+- **`rb impact`:** callers of a method the target overrides (CHA dispatch) are affected at distance 1.
+- **`rb status`:** a reference site is ambiguous when it has several targets, not when its edge's certainty is `ambiguous`.
+- **Known and accepted:** an edge's certainty is the best of its sites, so an edge whose sites are sometimes ambiguous shows `heuristic`.

@@ -45,8 +45,12 @@ fn push<'t>(
     node: Node<'t>,
     source: &[u8],
 ) {
-    let type_name = type_name.filter(|t| !BUILTIN_TYPES.contains(&t.as_str()));
-    if let (Some(name), Some(type_name)) = (name, type_name) {
+    // A declaration without a known type is kept (empty `type_name`): it still shadows outer
+    // bindings and marks the name as a variable rather than a type.
+    let type_name = type_name
+        .filter(|t| !BUILTIN_TYPES.contains(&t.as_str()))
+        .unwrap_or_default();
+    if let Some(name) = name {
         out.push(RawBinding {
             name: text(name, source),
             type_name,
@@ -161,6 +165,22 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
 
 fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
     match node.kind() {
+        // JavaScript parameters (TypeScript wraps them in `required_parameter`).
+        "formal_parameters" => {
+            let mut c = node.walk();
+            for p in node.named_children(&mut c) {
+                let name = match p.kind() {
+                    "identifier" => Some(p),
+                    "assignment_pattern" => p
+                        .child_by_field_name("left")
+                        .filter(|l| l.kind() == "identifier"),
+                    _ => None,
+                };
+                if name.is_some() {
+                    push(out, name, None, false, p, source);
+                }
+            }
+        }
         "public_field_definition" | "field_definition" => {
             let ty = node
                 .child_by_field_name("type")
@@ -231,16 +251,29 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
 
 fn python<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
     match node.kind() {
-        "typed_parameter" | "typed_default_parameter" => {
-            let ty = node
-                .child_by_field_name("type")
-                .and_then(|t| type_name(t, source));
-            let name = node.child_by_field_name("name").or_else(|| {
-                let mut c = node.walk();
-                node.named_children(&mut c)
-                    .find(|n| n.kind() == "identifier")
-            });
-            push(out, name, ty, false, node, source);
+        "parameters" | "lambda_parameters" => {
+            let mut c = node.walk();
+            for p in node.named_children(&mut c) {
+                let ty = p
+                    .child_by_field_name("type")
+                    .and_then(|t| type_name(t, source));
+                let name = match p.kind() {
+                    "identifier" => Some(p),
+                    "default_parameter" | "typed_default_parameter" => {
+                        p.child_by_field_name("name")
+                    }
+                    "typed_parameter" => {
+                        let mut pc = p.walk();
+                        p.named_children(&mut pc).find(|n| n.kind() == "identifier")
+                    }
+                    _ => None,
+                };
+                // `self`/`cls` are handled as the enclosing class.
+                let name = name.filter(|n| !matches!(text(*n, source).as_str(), "self" | "cls"));
+                if name.is_some() {
+                    push(out, name, ty, false, p, source);
+                }
+            }
         }
         "assignment" => {
             let Some(left) = node.child_by_field_name("left") else {
@@ -345,7 +378,12 @@ mod tests {
                     .scope
                     .map_or("-".to_owned(), |i| facts.definitions[i].name.clone());
                 let star = if b.member { "*" } else { "" };
-                format!("{star}{}: {} in {scope}", b.name, b.type_name)
+                let ty = if b.type_name.is_empty() {
+                    "?"
+                } else {
+                    &b.type_name
+                };
+                format!("{star}{}: {ty} in {scope}", b.name)
             })
             .collect()
     }
@@ -358,9 +396,12 @@ mod tests {
             [
                 "*repo: Repo in K",
                 "*users: List in K",
+                "*n: ? in K",
                 "u: User in f",
+                "i: ? in f",
                 "s: Store in f",
                 "t: Thing in f",
+                "v: ? in f",
                 "c: a.b.C in f"
             ]
         );
@@ -373,20 +414,24 @@ mod tests {
             bound(Language::TypeScript, src),
             [
                 "*repo: UserRepo in K",
+                "*n: ? in K",
                 "*svc: Svc in K",
+                // TypeScript's tags define no `constructor` symbol: its parameters sit in the class.
+                "x: ? in K",
                 "*cache: Cache in K",
                 "u: User in f",
                 "s: Store in f",
                 "n: Thing in f",
+                "m: ? in f",
                 "top: Top in -"
             ]
         );
         assert_eq!(
             bound(
                 Language::JavaScript,
-                "function f() { const t = new Thing(); }\n"
+                "function f(a, b = 1) { const t = new Thing(); }\n"
             ),
-            ["t: Thing in f"]
+            ["a: ? in f", "b: ? in f", "t: Thing in f"]
         );
     }
 
@@ -397,9 +442,12 @@ mod tests {
             bound(Language::Python, src),
             [
                 "u: User in f",
+                "v: ? in f",
+                "w: ? in f",
                 "*repo: Repo in K",
                 "s: Store in f",
-                "t: Thing in f"
+                "t: Thing in f",
+                "n: ? in f"
             ]
         );
     }
@@ -411,11 +459,15 @@ mod tests {
             bound(Language::Go, src),
             [
                 "*repo: Repo in Server",
+                "*n: ? in Server",
                 "s: Server in Run",
                 "r: Req in Run",
+                "a: ? in Run",
+                "b: ? in Run",
                 "st: Store in Run",
                 "t: Thing in Run",
-                "p: Thing in Run"
+                "p: Thing in Run",
+                "q: ? in Run"
             ]
         );
     }

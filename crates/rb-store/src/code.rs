@@ -413,6 +413,27 @@ pub fn impact(graph: &Graph, target: i64, min_certainty: Certainty) -> Impact {
     let mut frontier: Vec<(i64, Certainty)> =
         breaks.iter().map(|x| (x.node, x.certainty)).collect();
     let mut affects = Vec::new();
+    // Callers of a method a removed node overrides may dispatch into it (CHA): they keep
+    // compiling but their behaviour changes, so they are affected at distance 1.
+    for &r in &removed {
+        for (m, via) in v.overridden(r, min_certainty) {
+            for &kind in &[EdgeKind::Calls, EdgeKind::References] {
+                for e in v.inbound(m, kind, min_certainty) {
+                    if in_removed.contains(&e.src) || reached.contains_key(&e.src) {
+                        continue;
+                    }
+                    let c = via.min(Certainty::Dispatch).min(e.certainty);
+                    reached.insert(e.src, (c, 1));
+                    affects.push(Impacted {
+                        node: e.src,
+                        certainty: c,
+                        distance: 1,
+                    });
+                    frontier.push((e.src, c));
+                }
+            }
+        }
+    }
     let mut distance = 1;
     while !frontier.is_empty() && !truncated {
         distance += 1;
@@ -798,6 +819,34 @@ mod tests {
         let removed: Vec<String> = ctl.removed.iter().map(|&n| desc(&g, n)).collect();
         assert_eq!(removed, ["Ctl#", "Ctl#handle()."]);
         assert_eq!(names(&ctl.breaks), ["1 page(). [heuristic]"]);
+    }
+
+    #[test]
+    fn impact_on_an_implementation_includes_its_dispatch_callers() {
+        let g = fixture();
+        let i = impact(&g, id(&g, "SvcImpl#run()."), Certainty::Ambiguous);
+        let names: Vec<String> = i
+            .breaks
+            .iter()
+            .chain(&i.affects)
+            .map(|x| {
+                format!(
+                    "{} {} [{}]",
+                    x.distance,
+                    desc(&g, x.node),
+                    x.certainty.as_str()
+                )
+            })
+            .collect();
+        // `Ctl#handle()` calls the interface method and may dispatch here; `page()` calls it.
+        assert_eq!(
+            names,
+            [
+                "1 Job#tick(). [ambiguous]",
+                "1 Ctl#handle(). [heuristic]",
+                "2 page(). [heuristic]"
+            ]
+        );
     }
 
     #[test]

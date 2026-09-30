@@ -538,6 +538,11 @@ fn code_question_goldens() {
                     &["impact", "AuthService#authenticate()."],
                 ),
                 ("impact-users.txt", &["impact", "public.users"]),
+                // An implementation: its dispatch callers are affected (CHA).
+                (
+                    "impact-default-authenticate.txt",
+                    &["impact", "DefaultAuthService.authenticate"],
+                ),
             ],
         ),
         (

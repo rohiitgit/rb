@@ -43,7 +43,13 @@ pub(crate) fn add_edges(
             };
             let (found, is_call) = match r.kind {
                 RefKind::Call => (
-                    index.call(path, r.enclosing, &r.name, r.qualifier.as_deref()),
+                    index.call(
+                        path,
+                        r.enclosing,
+                        &r.name,
+                        r.qualifier.as_deref(),
+                        Some(r.span),
+                    ),
                     true,
                 ),
                 RefKind::Class | RefKind::Type => {
@@ -70,7 +76,7 @@ pub(crate) fn add_edges(
                     .map_or(r.name.as_str(), |q| q.split('.').next().unwrap_or(q));
                 if r.qualifier.is_none() && is_builtin(*language, &r.name) {
                     // Built-ins are not resolution failures.
-                } else if index.is_external(path, r.enclosing, head) {
+                } else if index.is_external(path, r.enclosing, head, Some(r.span)) {
                     external += 1;
                 } else if is_call {
                     calls += 1;
@@ -227,6 +233,28 @@ struct Index<'a> {
     /// Type resolutions in progress. Bindings can make them cyclic (`session =
     /// session.Session()`): a resolution already in progress finds nothing.
     resolving: RefCell<BTreeSet<(&'a str, Option<usize>, String)>>,
+    /// Per file: non-member bindings by name, in source order.
+    locals: BTreeMap<&'a str, BTreeMap<&'a str, Vec<&'a Binding>>>,
+    /// Per file: member bindings by (owning type, name), in source order.
+    fields: BTreeMap<&'a str, BTreeMap<(usize, &'a str), Vec<&'a Binding>>>,
+    /// Top-level definitions by name per Java package and per Go (directory, package), so the
+    /// same-package level costs a lookup rather than a scan of the package.
+    packages: BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<Sym<'a>>>>,
+}
+
+/// The package a file's same-package level searches: `("", package)` for Java, `(dir, package)`
+/// for Go (a directory may also hold an external `_test` package).
+fn package_key<'a>(
+    path: &'a str,
+    language: Language,
+    facts: &'a FileFacts,
+) -> Option<(&'a str, &'a str)> {
+    let package = facts.package.as_deref().unwrap_or_default();
+    match language {
+        Language::Java => Some(("", package)),
+        Language::Go => Some((dir(path), package)),
+        _ => None,
+    }
 }
 
 /// Nested type resolutions (through bindings and dotted names) followed at most.
@@ -236,6 +264,13 @@ const MAX_TYPE_DEPTH: usize = 64;
 struct Scopes<'a> {
     top: BTreeMap<&'a str, Vec<usize>>,
     of: BTreeMap<usize, BTreeMap<&'a str, Vec<usize>>>,
+}
+
+/// Sorted, without repeats.
+fn dedup<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 fn is_type(kind: DefKind) -> bool {
@@ -255,7 +290,40 @@ impl<'a> Index<'a> {
         let mut keys = BTreeMap::new();
         let mut scopes = BTreeMap::new();
         let mut imports = BTreeMap::new();
-        for (&path, (_, facts)) in files {
+        let mut locals: BTreeMap<&str, BTreeMap<&str, Vec<&Binding>>> = BTreeMap::new();
+        let mut fields: BTreeMap<&str, BTreeMap<(usize, &str), Vec<&Binding>>> = BTreeMap::new();
+        let mut packages: BTreeMap<(&str, &str), BTreeMap<&str, Vec<Sym>>> = BTreeMap::new();
+        for (&path, (language, facts)) in files {
+            let (l, f) = (
+                locals.entry(path).or_default(),
+                fields.entry(path).or_default(),
+            );
+            for b in &facts.bindings {
+                match (b.member, b.scope) {
+                    (true, Some(t)) => f.entry((t, b.name.as_str())).or_default().push(b),
+                    (true, None) => {}
+                    (false, scope) => {
+                        l.entry(b.name.as_str()).or_default().push(b);
+                        // A Python class-body assignment is a class attribute: `self.x` reads it.
+                        if let Some(t) = scope.filter(|&t| {
+                            *language == Language::Python && is_type(facts.definitions[t].kind)
+                        }) {
+                            f.entry((t, b.name.as_str())).or_default().push(b);
+                        }
+                    }
+                }
+            }
+            if let Some(key) = package_key(path, *language, facts) {
+                let table = packages.entry(key).or_default();
+                for (i, d) in facts
+                    .definitions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.parent.is_none())
+                {
+                    table.entry(d.name.as_str()).or_default().push((path, i));
+                }
+            }
             keys.insert(path, rb_syntax::symbol_keys(path, facts));
             let mut sc = Scopes::default();
             for (i, d) in facts.definitions.iter().enumerate() {
@@ -283,6 +351,9 @@ impl<'a> Index<'a> {
             imports,
             supers: RefCell::new(BTreeMap::new()),
             resolving: RefCell::new(BTreeSet::new()),
+            locals,
+            fields,
+            packages,
         }
     }
 
@@ -354,7 +425,7 @@ impl<'a> Index<'a> {
                 return Vec::new();
             }
         }
-        let found = self.resolve_type_unguarded(path, scope, name);
+        let found = dedup(self.resolve_type_unguarded(path, scope, name));
         self.resolving.borrow_mut().remove(&key);
         found
     }
@@ -366,7 +437,7 @@ impl<'a> Index<'a> {
         name: &str,
     ) -> Vec<Sym<'a>> {
         if let Some((head, last)) = name.rsplit_once('.') {
-            let found = match self.container(path, scope, head) {
+            let found = match self.container(path, scope, head, None) {
                 Some(Container::Types(ts)) => ts
                     .into_iter()
                     .flat_map(|t| self.named(t.0, Some(t.1), last, is_type))
@@ -430,15 +501,31 @@ impl<'a> Index<'a> {
         if !found.is_empty() {
             return found;
         }
-        let found = self.imported(path, name, want);
+        // Java (JLS §6.4.1): single-type imports shadow the package, which shadows on-demand
+        // (wildcard) imports. Elsewhere imports come before the package.
+        let found = self.imported(path, name, want, false);
         if !found.is_empty() {
             return found;
+        }
+        if self.language(path) == Language::Java {
+            let found = self.same_package(path, name, want);
+            if !found.is_empty() {
+                return found;
+            }
+            return self.imported(path, name, want, true);
         }
         self.same_package(path, name, want)
     }
 
-    /// Definitions `name` refers to through the file's imports.
-    fn imported(&self, path: &'a str, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
+    /// Definitions `name` refers to through the file's imports: single-name imports, or with
+    /// `on_demand` only Java wildcard (package or static) imports.
+    fn imported(
+        &self,
+        path: &'a str,
+        name: &str,
+        want: fn(DefKind) -> bool,
+        on_demand: bool,
+    ) -> Vec<Sym<'a>> {
         let language = self.language(path);
         let mut out = Vec::new();
         for (import, targets) in self.facts(path).imports.iter().zip(&self.imports[path]) {
@@ -448,6 +535,12 @@ impl<'a> Index<'a> {
                     .flat_map(|&f| self.named(f, None, n, want))
                     .collect()
             };
+            if language == Language::Java && import.wildcard != on_demand {
+                continue;
+            }
+            if language != Language::Java && on_demand {
+                continue;
+            }
             match language {
                 Language::Java if import.is_static => {
                     let class = import.module.rsplit('.').next().unwrap_or_default();
@@ -477,17 +570,14 @@ impl<'a> Index<'a> {
     }
 
     fn same_package(&self, path: &'a str, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
-        let files = match self.language(path) {
-            Language::Java => self
-                .modules
-                .package_files(self.facts(path).package.as_deref().unwrap_or_default()),
-            Language::Go => self.modules.go_dir(dir(path)),
-            _ => Vec::new(),
-        };
-        files
+        let (language, facts) = self.files[path];
+        package_key(path, language, facts)
+            .and_then(|key| self.packages.get(&key))
+            .and_then(|table| table.get(name))
             .into_iter()
-            .filter(|&f| f != path)
-            .flat_map(|f| self.named(f, None, name, want))
+            .flatten()
+            .copied()
+            .filter(|&(f, i)| f != path && want(self.def((f, i)).kind))
             .collect()
     }
 
@@ -532,37 +622,63 @@ impl<'a> Index<'a> {
         found
     }
 
-    /// A binding named `name` visible at `scope`: the innermost local, else (Java) a field of an
-    /// enclosing class.
-    fn binding(&self, path: &'a str, scope: Option<usize>, name: &str) -> Option<&'a Binding> {
-        let facts = self.facts(path);
+    /// The binding `name` refers to at `scope`: the innermost local (a class body's own names are
+    /// not locals of its methods), and among several in that scope the nearest one declared before
+    /// `at`; else (Java) a field of an enclosing class. An untyped binding still counts: it hides
+    /// outer ones and marks the name as a variable.
+    fn binding(
+        &self,
+        path: &'a str,
+        scope: Option<usize>,
+        name: &str,
+        at: Option<rb_model::Span>,
+    ) -> Option<&'a Binding> {
+        let defs = &self.facts(path).definitions;
         let chain = self.ancestors(path, scope);
-        let local = facts
-            .bindings
-            .iter()
-            .filter(|b| !b.member && b.name == name)
-            .filter_map(|b| match b.scope {
-                None => Some((usize::MAX, b)),
-                Some(s) => chain.iter().position(|&a| a == s).map(|depth| (depth, b)),
-            })
-            .min_by_key(|(depth, _)| *depth)
-            .map(|(_, b)| b);
-        if local.is_some() || self.language(path) != Language::Java {
-            return local;
+        let visible = |b: &&Binding| match b.scope {
+            None => Some(usize::MAX),
+            Some(s) => chain.iter().position(|&a| a == s).filter(|&depth| {
+                // A class body is a scope only for code directly in it.
+                depth == 0 || !is_type(defs[s].kind)
+            }),
+        };
+        let candidates = self.locals[path].get(name).into_iter().flatten();
+        let innermost = candidates.clone().filter_map(visible).min();
+        if let Some(depth) = innermost {
+            let same: Vec<&'a Binding> = candidates
+                .filter(|b| visible(b) == Some(depth))
+                .copied()
+                .collect();
+            let before = at.and_then(|at| {
+                same.iter()
+                    .rev()
+                    .find(|b| (b.span[0], b.span[1]) <= (at[0], at[1]))
+                    .copied()
+            });
+            return before.or_else(|| same.first().copied());
+        }
+        if self.language(path) != Language::Java {
+            return None;
         }
         chain.iter().find_map(|&a| {
-            facts
-                .bindings
-                .iter()
-                .find(|b| b.member && b.scope == Some(a) && b.name == name)
+            self.fields[path]
+                .get(&(a, name))
+                .and_then(|bs| bs.first().copied())
         })
     }
 
     /// Whether the unresolved name `head` (a bare name, or the first segment of a qualifier)
     /// comes from an external package: an import that resolves to no file of the snapshot, directly
     /// or as the declared type of a binding.
-    fn is_external(&self, path: &'a str, scope: Option<usize>, head: &str) -> bool {
-        let head = match self.binding(path, scope, head) {
+    fn is_external(
+        &self,
+        path: &'a str,
+        scope: Option<usize>,
+        head: &str,
+        at: Option<rb_model::Span>,
+    ) -> bool {
+        let head = match self.binding(path, scope, head, at) {
+            Some(b) if b.type_name.is_empty() => return false,
             Some(b) => b.type_name.split('.').next().unwrap_or(&b.type_name),
             None => head,
         };
@@ -587,9 +703,15 @@ impl<'a> Index<'a> {
     }
 
     /// What the dotted qualifier `q` of a member call stands for, or `None` when unknown.
-    fn container(&self, path: &'a str, scope: Option<usize>, q: &str) -> Option<Container<'a>> {
+    fn container(
+        &self,
+        path: &'a str,
+        scope: Option<usize>,
+        q: &str,
+        at: Option<rb_model::Span>,
+    ) -> Option<Container<'a>> {
         let segments: Vec<&str> = q.split('.').collect();
-        let (mut target, consumed) = self.first_segment(path, scope, &segments)?;
+        let (mut target, consumed) = self.first_segment(path, scope, &segments, at)?;
         for seg in &segments[consumed..] {
             target = self.step(target, seg)?;
         }
@@ -601,6 +723,7 @@ impl<'a> Index<'a> {
         path: &'a str,
         scope: Option<usize>,
         segments: &[&str],
+        at: Option<rb_model::Span>,
     ) -> Option<(Container<'a>, usize)> {
         let language = self.language(path);
         let s0 = segments[0];
@@ -614,11 +737,13 @@ impl<'a> Index<'a> {
             }
             _ => {}
         }
-        if let Some(b) = self.binding(path, scope, s0) {
-            let types = self.resolve_type(path, b.scope, &b.type_name);
-            if !types.is_empty() {
-                return Some((Container::Types(types), 1));
+        // A variable: its declared type, or nothing. Never a same-named type or module.
+        if let Some(b) = self.binding(path, scope, s0, at) {
+            if b.type_name.is_empty() {
+                return None;
             }
+            let types = self.resolve_type(path, b.scope, &b.type_name);
+            return (!types.is_empty()).then_some((Container::Types(types), 1));
         }
         let imports = self.facts(path).imports.iter().zip(&self.imports[path]);
         for (import, targets) in imports {
@@ -685,11 +810,11 @@ impl<'a> Index<'a> {
             Container::Types(ts) => ts
                 .into_iter()
                 .flat_map(|t| {
-                    let fields = self
-                        .facts(t.0)
-                        .bindings
-                        .iter()
-                        .filter(|b| b.member && b.scope == Some(t.1) && b.name == seg)
+                    let fields = self.fields[t.0]
+                        .get(&(t.1, seg))
+                        .into_iter()
+                        .flatten()
+                        .filter(|b| !b.type_name.is_empty())
                         .flat_map(|b| self.resolve_type(t.0, Some(t.1), &b.type_name));
                     fields
                         .chain(self.named(t.0, Some(t.1), seg, is_type))
@@ -701,6 +826,8 @@ impl<'a> Index<'a> {
                 .flat_map(|f| self.named(f, None, seg, is_type))
                 .collect(),
         };
+        // Deduplicated, so repeated bindings or declarations never multiply along a chain.
+        let found = dedup(found);
         (!found.is_empty()).then_some(Container::Types(found))
     }
 
@@ -711,10 +838,11 @@ impl<'a> Index<'a> {
         scope: Option<usize>,
         name: &str,
         qualifier: Option<&str>,
+        at: Option<rb_model::Span>,
     ) -> Vec<(EdgeKind, Sym<'a>)> {
         let found = match qualifier {
             None => self.levels(path, scope, name, is_callable, true),
-            Some(q) => match self.container(path, scope, q) {
+            Some(q) => match self.container(path, scope, q, at) {
                 Some(Container::Types(ts)) => ts
                     .into_iter()
                     .flat_map(|t| self.members(t, name, is_callable))
@@ -828,9 +956,6 @@ impl Edges {
         };
         for (kind, key) in targets {
             let dst = NodeKey::new(NodeKind::Symbol, key.to_owned());
-            if dst == src {
-                continue;
-            }
             let e = self
                 .0
                 .entry((src.clone(), kind, dst))
@@ -1338,5 +1463,200 @@ func (s *Server) helper() {}
             &[],
         );
         assert!(edges(&ts, EdgeKind::Calls).is_empty());
+    }
+
+    #[test]
+    fn variables_never_resolve_through_a_same_named_type() {
+        let go = build(
+            &[(
+                "main.go",
+                GO,
+                "package main\nimport \"net/http\"\ntype client struct{}\nfunc (c *client) Do(x int) {}\ntype handler struct{}\nfunc (h handler) ServeHTTP() {}\nfunc run() {\n    client := &http.Client{}\n    client.Do(nil)\n    handler := mux.Handler(nil)\n    handler.ServeHTTP()\n}\n",
+            )],
+            &[],
+        );
+        assert!(
+            edges(&go, EdgeKind::Calls)
+                .iter()
+                .all(|e| !e.starts_with("main:run().")),
+            "{:?}",
+            edges(&go, EdgeKind::Calls)
+        );
+        let js = build(
+            &[(
+                "src/app.js",
+                Language::JavaScript,
+                "class Hono { get() {} }\nconst app = new Hono();\napp.get();\nfunction register(app) { app.get(); }\n",
+            )],
+            &[],
+        );
+        // The untyped parameter hides the typed module-level `app`.
+        assert_eq!(
+            edges(&js, EdgeKind::Calls),
+            ["src/app.js -> app:Hono#get(). [heuristic]"]
+        );
+        let py = build(
+            &[(
+                "app/m.py",
+                PY,
+                "class Repo:\n    def save(self):\n        pass\n\nclass Svc:\n    repo = Repo()\n    def run(self):\n        repo.save()\n        self.repo.save()\n",
+            )],
+            &[],
+        );
+        // A class-body name is an attribute, not a local of its methods.
+        assert_eq!(
+            edges(&py, EdgeKind::Calls),
+            ["m:Svc#run(). -> m:Repo#save(). [heuristic]"]
+        );
+        assert_eq!(unresolved(&py), [("app/m.py".into(), 1, 0, 0)]);
+    }
+
+    #[test]
+    fn java_same_package_beats_wildcard_imports() {
+        let built = build(
+            &[
+                (
+                    "p/Widget.java",
+                    J,
+                    "package p;\npublic class Widget { public void spin() {} }\n",
+                ),
+                (
+                    "q/Widget.java",
+                    J,
+                    "package q;\npublic class Widget { public void spin() {} }\n",
+                ),
+                (
+                    "q/User.java",
+                    J,
+                    "package q;\nimport p.*;\nclass User { void run(Widget w) { w.spin(); } }\n",
+                ),
+            ],
+            &[],
+        );
+        let calls = edges(&built, EdgeKind::Calls);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(built.graph.edges().iter().any(|e| {
+            let dst = &built
+                .graph
+                .nodes()
+                .iter()
+                .find(|n| n.id == e.dst)
+                .unwrap()
+                .key;
+            e.kind == EdgeKind::Calls && dst.contains("`q/Widget.java`")
+        }));
+    }
+
+    #[test]
+    fn rebinding_follows_the_nearest_preceding_assignment() {
+        let built = build(
+            &[(
+                "app/r.py",
+                PY,
+                "class A:\n    def go(self):\n        pass\n\nclass B:\n    def go(self):\n        pass\n\ndef f():\n    x = A()\n    x.go()\n    x = B()\n    x.go()\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "r:f(). -> r:A#__init__(). [heuristic]",
+                "r:f(). -> r:A#go(). [heuristic]",
+                "r:f(). -> r:B#go(). [heuristic]",
+            ]
+            .iter()
+            .filter(|e| !e.contains("__init__"))
+            .map(|e| (*e).to_owned())
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn go_test_packages_are_not_part_of_the_imported_package() {
+        for test_file in ["util/util_ext_test.go", "util/0_test.go"] {
+            let built = build(
+                &[
+                    ("util/util.go", GO, "package util\nfunc Helper() {}\n"),
+                    (test_file, GO, "package util_test\nfunc Helper() {}\n"),
+                    (
+                        "cmd/main.go",
+                        GO,
+                        "package main\nimport \"example.com/m/util\"\nfunc main() { util.Helper() }\n",
+                    ),
+                ],
+                &[("", "example.com/m")],
+            );
+            assert_eq!(
+                edges(&built, EdgeKind::Calls),
+                ["main:main(). -> util:Helper(). [heuristic]"],
+                "{test_file}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_calls_are_edges() {
+        let built = build(
+            &[(
+                "src/a.ts",
+                TS,
+                "function fact(n: number): number { return fact(n - 1); }\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            ["a:fact(). -> a:fact(). [heuristic]"]
+        );
+    }
+
+    #[test]
+    fn field_chains_binding_chains_and_big_packages_stay_fast() {
+        // Duplicate member bindings and duplicate classes must not multiply per segment.
+        let chain = vec!["f"; 24].join(".");
+        let src = format!(
+            "class X:\n    def a(self):\n        self.f = X()\n    def b(self):\n        self.f = X()\n    def m(self):\n        pass\n\nclass X:\n    def c(self):\n        self.f = X()\n\ndef run(x: X):\n    x.{chain}.m()\n"
+        );
+        let started = std::time::Instant::now();
+        build(&[("app/x.py", PY, &src)], &[]);
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "field chain {:?}",
+            started.elapsed()
+        );
+
+        // A long chain of bindings in one function.
+        let mut src = String::from("def run(x0):\n");
+        for i in 1..4000 {
+            src.push_str(&format!("    x{i} = x{}.m()\n    x{i}.go()\n", i - 1));
+        }
+        let started = std::time::Instant::now();
+        build(&[("app/y.py", PY, &src)], &[]);
+        assert!(
+            started.elapsed().as_secs() < 3,
+            "binding chain {:?}",
+            started.elapsed()
+        );
+
+        // Many files in one Java package, each with unresolved calls.
+        let files: Vec<(String, String)> = (0..1500)
+            .map(|i| {
+                (
+                    format!("p/C{i}.java"),
+                    format!("package p;\nclass C{i} {{ void m() {{ a(); b(); c(); new Missing(); d(); e(); }} }}\n"),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, Language, &str)> = files
+            .iter()
+            .map(|(p, s)| (p.as_str(), J, s.as_str()))
+            .collect();
+        let started = std::time::Instant::now();
+        build(&refs, &[]);
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "package scan {:?}",
+            started.elapsed()
+        );
     }
 }

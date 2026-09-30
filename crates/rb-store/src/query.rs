@@ -294,14 +294,15 @@ impl Store {
     pub fn resolution_coverage(&mut self, snapshot_id: i64) -> anyhow::Result<ResolutionCoverage> {
         let r = self.client.query_one(
             "WITH sites AS (
-                 SELECT ev.file_id, ev.span, max(e.certainty) AS certainty
+                 -- A site is ambiguous when it has several targets. An edge's own certainty
+                 -- is its best site's, so it cannot classify a site.
+                 SELECT ev.file_id, ev.span, count(DISTINCT (ev.kind, ev.dst)) AS targets
                  FROM rb.edge_evidence ev
-                 JOIN rb.edge e USING (snapshot_id, src, kind, dst, provenance)
                  WHERE ev.snapshot_id = $1 AND ev.kind IN ('CALLS', 'REFERENCES')
                    AND ev.provenance = 'heuristic'
                  GROUP BY ev.file_id, ev.span)
-             SELECT (SELECT count(*) FROM sites WHERE certainty > 1),
-                    (SELECT count(*) FROM sites WHERE certainty = 1),
+             SELECT (SELECT count(*) FROM sites WHERE targets = 1),
+                    (SELECT count(*) FROM sites WHERE targets > 1),
                     (SELECT coalesce(sum((detail->>'calls')::bigint + (detail->>'types')::bigint), 0)::bigint
                      FROM rb.diagnostic WHERE snapshot_id = $1 AND kind = 'unresolved_references'),
                     (SELECT coalesce(sum((detail->>'external')::bigint), 0)::bigint

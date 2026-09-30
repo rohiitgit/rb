@@ -229,5 +229,6 @@ This file traces decisions from conversation to code. The design lives in `docs/
 ### Status
 
 - [x] Steps 1–4 committed; R12 measured.
-- [ ] Evaluator pass
+- [x] Evaluator pass 1: 12 defects (three performance blowups; receivers linked through same-named types; untyped names not shadowing; impact missing dispatch callers; Java lookup order; rebinding; Go test packages; status split; Python stdlib matching; self-calls). All fixed test-first (contract Amendment 1). The independent 80-edge sample was also 80/80.
+- [ ] Evaluator pass 2
 - [ ] Commit

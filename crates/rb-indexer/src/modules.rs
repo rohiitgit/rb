@@ -47,7 +47,10 @@ impl<'a> Modules<'a> {
                             .push(path);
                     }
                 }
-                Language::Go => go_dirs.entry(dir(path)).or_default().push(path),
+                // Test files are never part of an imported package.
+                Language::Go if !path.ends_with("_test.go") => {
+                    go_dirs.entry(dir(path)).or_default().push(path);
+                }
                 _ => {}
             }
         }
@@ -206,6 +209,27 @@ impl<'a> Modules<'a> {
         let Some(candidates) = self.python_modules.get(dotted) else {
             return Vec::new();
         };
+        // Python 3 imports are absolute: `import json` inside the package `pkg` means the
+        // top-level `json`, not `pkg/json.py`. A match counts only when the directory above the
+        // matched segments is not itself a package (no `__init__.py`), i.e. a source root.
+        let depth = dotted.split('.').count();
+        let candidates: Vec<&'a str> = candidates
+            .iter()
+            .copied()
+            .filter(|c| {
+                let mut segments: Vec<&str> = c.trim_end_matches(".py").split('/').collect();
+                if segments.last() == Some(&"__init__") {
+                    segments.pop();
+                }
+                let root = segments[..segments.len().saturating_sub(depth)].join("/");
+                let init = if root.is_empty() {
+                    "__init__.py".to_owned()
+                } else {
+                    format!("{root}/__init__.py")
+                };
+                !self.files.contains_key(init.as_str())
+            })
+            .collect();
         let best = candidates
             .iter()
             .map(|c| shared_segments(dir(c), dir(from)))
@@ -216,11 +240,6 @@ impl<'a> Modules<'a> {
             .copied()
             .filter(|c| shared_segments(dir(c), dir(from)) == best)
             .collect()
-    }
-
-    /// The Go files of a directory.
-    pub(crate) fn go_dir(&self, dir: &str) -> Vec<&'a str> {
-        self.go_dirs.get(dir).cloned().unwrap_or_default()
     }
 
     /// The package directory of a Go import path, under the `go.mod` with the longest matching
@@ -448,5 +467,22 @@ mod tests {
                 vec![],
             ]
         );
+    }
+
+    #[test]
+    fn python_absolute_imports_do_not_match_modules_inside_packages() {
+        let py = Language::Python;
+        let got = resolved(
+            &[
+                ("pkg/app.py", py, "import json\nimport tools\n"),
+                ("pkg/json.py", py, ""),
+                ("pkg/__init__.py", py, ""),
+                // `scripts/` is not a package: its modules are importable top-level names.
+                ("scripts/tools.py", py, ""),
+            ],
+            &[],
+            "pkg/app.py",
+        );
+        assert_eq!(got, [vec![], vec!["scripts/tools.py"]]);
     }
 }

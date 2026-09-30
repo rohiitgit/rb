@@ -1,5 +1,18 @@
 # Changelog
 
+## [2026-09-30 16:00]
+- M3a evaluator pass 1 fixes (12 defects; contract Amendment 1):
+  - **Linear resolution:** containers are deduplicated; bindings and same-package lookups are indexed.
+  - **Untyped declarations** are recorded, hide outer bindings, and never fall back to same-named types.
+  - **Rebinding** uses the nearest preceding declaration.
+  - **Class scope:** a class body is not a scope for its methods; Python class attributes are fields.
+  - **Order and packages:** Java lookup order follows JLS §6.4.1; Go `_test` files are excluded from imported packages; Python absolute imports only match source-root modules.
+  - **Self-calls** are kept.
+  - **`rb impact`** includes dispatch callers.
+  - **`rb status`** classifies sites by target count.
+- Re-measured: petclinic 37.8%, hono 14.8%, requests 30.4% unchanged. gin fell from 70.3% to 64.7%: untyped `c, _ := CreateTestContext(…)` no longer borrows the type of a later anonymous handler's `c *Context` parameter.
+- Files affected: crates/rb-syntax/src/bindings.rs, crates/rb-indexer/src/{resolve,modules}.rs, crates/rb-store/src/{code,query}.rs, crates/rb-cli/tests/{e2e.rs,golden/java-spring-jpa/impact-default-authenticate.txt}, tasks/contract-m3a.md.
+
 ## [2026-09-30 13:00]
 - M3a R12 measured on spring-petclinic, hono, gin and requests; 80 of 80 sampled edges correct.
 - Fixed: type resolution recursed without bound through self-referential bindings (`session = session.Session()`), overflowing the stack on psf/requests. `Index::resolve_type` now has an in-progress guard and a depth cap of 64, with a test.
