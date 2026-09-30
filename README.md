@@ -36,6 +36,8 @@ Run `rb` from the project root. AGE's CSV loaders only read files under the serv
 | `RB_DATABASE_URL` | `postgresql://rb:rb@127.0.0.1:55432/rb` |
 | `RB_AGE_LOAD_DIR` | `var/age-load` |
 
+If 55432 is taken, start the database on another port with `RB_DB_PORT=55433 docker compose up -d --wait` and point `RB_DATABASE_URL` at it.
+
 ## Development
 
 ```sh

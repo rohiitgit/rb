@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026-09-30 22:00]
+- The database's host port is now `${RB_DB_PORT:-55432}` in `compose.yaml`, so the stack can start when 55432 is held by something else. No code change.
+- Environment moved to Docker Desktop. Rebuilt `rb-scip-java:0.13.1` and re-pulled the pinned scip-typescript image there. All 13 e2e tests pass with real containers against a fresh database, including the two `scip-status.txt` goldens that were edited by hand in 74e0b20 (compared, not blessed).
+- Files affected: compose.yaml, README.md, IMPLEMENT.md.
+
 ## [2026-09-30 21:42] (wall clock, like the entry below it; the older M3b entries carry 2026-10-01 stamps)
 - M3b evaluator pass 2 fixes (contract amendments 21–24), each test-first.
   - **`IMPLEMENTS` through a hierarchy (E1):** the join accepted an `is_implementation` relationship only when the source's type holder directly declared the target's type, so `Svc extends AbstractSvc implements Mid` (`Mid extends Base`) lost `Svc#m() IMPLEMENTS Base#m()` and `Bottom extends Middle extends Top` lost `Bottom#run() IMPLEMENTS Top#run()`. Now the target's type definition is found exactly by symbol (`rb_scip::type_symbol_of`; `last_type_name` is removed) and the holder must reach it through declared supertypes (`scip::reaches_supertype`: simple names over the project's type definitions, visited set, depth cap 64). The reverse direction is still rejected at every level. No fixture edge changes: the fixtures' indexes carry only direct in-project relationships.

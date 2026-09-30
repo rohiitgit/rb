@@ -10,7 +10,8 @@ services:
       POSTGRES_PASSWORD: rb
       POSTGRES_DB: rb
     ports:
-      - "127.0.0.1:55432:5432"   # 5432/5433 are taken by other local stacks
+      # 5432/5433 are taken by other local stacks; RB_DB_PORT moves it when 55432 is busy too.
+      - "127.0.0.1:${RB_DB_PORT:-55432}:5432"
     volumes:
       - brain-db-data:/var/lib/postgresql
         # AGE 1.8 CSV loaders only read under /tmp/age/ server-side; the indexer writes here (design §8.4).
