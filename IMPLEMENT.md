@@ -204,7 +204,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Seventh evaluator pass: PASS with 2 lower-severity reservations (source-order dependence in `first_along`; `Meta` options merged across abstract parents). Both were fixed with the evaluator's repros as failing-first tests (Amendment 7). These two fixes were not re-reviewed; M3's first evaluator pass re-covers `rb-frameworks`. Tests: 176 unit, 8 e2e; O9 unchanged.
 - [x] Commit
 
-## M3a Tier B resolution: in progress
+## M3a Tier B resolution: complete
 
 - **Decided:** see `tasks/contract-m3a.md`. M3 is split: M3a resolves calls, types and implementations heuristically from Tree-sitter facts and ships `rb callers` / `rb impact`; M3b adds SCIP in containers. M3a adds import, package and typed-binding facts to `rb-syntax`. Those facts are also what the M2b limitations deferred to M3 need.
 
@@ -234,5 +234,6 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Evaluator pass 3: all pass-2 fixes verified (88/88 precision); 5 defects in the extent rules and bare-call resolution, all fixed test-first (contract Amendment 3). Resolved share after the fixes: petclinic 39.2%, hono 13.5%, gin 63.4%, requests 30.4%.
 - [x] Evaluator pass 4: C1–C5 verified; one regression (function-valued `const`s treated as variables, which caused the hono drop I had misattributed) plus Java namespaces, `var` hoisting and missing Python built-ins. All fixed test-first (contract Amendment 4). hono is back at 14.8% (the 329 suppressed edges regained, verified by an edge diff); the other repos are unchanged.
 - [x] Evaluator pass 5: D1–D5 verified; one regression (function-valued constants inside callbacks fell through to same-named imports) plus generator/class expressions and two `var` hoisting gaps. Fixed test-first by moving the "is a definition" decision into the resolver (contract Amendment 5). Edge diff: hono lost exactly the one wrong edge; the other repos are identical.
-- [ ] Evaluator pass 6
-- [ ] Commit
+- [x] Evaluator pass 6: PASS. All Amendment 5 repros hold, 96/96 sampled edges correct, invariants 1–6 hold, no database FATALs across three serial e2e runs. Its two low-severity notes on `defines` were fixed afterwards with unit tests (Amendment 6).
+- [x] e2e flake: AGE 1.8 on PG 18 kills backends under concurrent graph DDL; tests serialized, risk recorded in design §14.
+- [x] Commit

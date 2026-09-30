@@ -118,3 +118,9 @@ M3a needs no external tool. Every M3a edge has provenance `heuristic`; SCIP late
 - **`var` hoisting** starts at the start of the enclosing function or file (not after its first statement), and applies to `for (var x of …)` loop variables.
 - **Accepted (unresolved, never wrong):** `let k; k = () => …; k()`; a reassigned function-valued `let`; Go `f := func(){}` and Python `f = lambda` followed by `f()`; an anonymous `const K = class {}` never yields a type; a block-level `function` declaration shadows a module function for calls outside the block.
 - **Accepted (precision):** Java overload fan-out is `ambiguous`; call-site arity is not yet used to narrow it.
+
+## Amendment 6: evaluator pass 6 (PASS; two low-severity imprecisions fixed afterwards, covered by unit tests)
+
+- A bare call through a function-valued variable resolves to **the definition the variable itself is**: the kept symbol declared by the same name token. It no longer re-runs the name lookup, so each site goes to the `h` in effect there rather than to every nested `h` (which had made them `ambiguous`), and a same-named property inside the value (`const run = { run: () => … }`) is not taken for the variable.
+
+**M3a is closed.** Every R1–R13 assertion and every invariant 1–6 holds. Accepted limitations are listed in the amendments and carried into M3b (SCIP), which replaces heuristic edges with exact ones project by project.

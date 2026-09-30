@@ -594,19 +594,21 @@ impl<'a> Index<'a> {
         self.same_package(path, name, want)
     }
 
-    /// Whether binding `b` of `name` is also a definition: a kept symbol whose name lies inside
-    /// the declaration (`const f = () => …`). Definitions inside callbacks are not kept, so a
-    /// function held in such a variable stays a plain variable.
-    fn defines(&self, path: &'a str, name: &str, b: &Binding) -> bool {
+    /// The definition that binding `b` of `name` also is: the kept symbol declared by the same
+    /// name token (`const f = () => …` starts with `f`). Definitions inside callbacks are not
+    /// kept, so a function held in such a variable stays a plain variable; a same-named property
+    /// inside the value (`const run = { run: () => … }`) is not the variable.
+    fn defines(&self, path: &'a str, name: &str, b: &Binding) -> Option<Sym<'a>> {
         let defs = &self.facts(path).definitions;
-        let within = |s: rb_model::Span| {
-            (s[0], s[1]) >= (b.span[0], b.span[1]) && (s[2], s[3]) <= (b.span[2], b.span[3])
-        };
         self.defs_by_name[path]
             .get(name)
             .into_iter()
             .flatten()
-            .any(|&i| within(defs[i].name_span))
+            .find(|&&i| {
+                let s = defs[i].name_span;
+                (s[0], s[1]) == (b.span[0], b.span[1]) && is_callable(defs[i].kind)
+            })
+            .map(|&i| (path, i))
     }
 
     /// Types along a dotted path inside file `f` (`Util.Nested`): a top-level type followed by
@@ -961,19 +963,17 @@ impl<'a> Index<'a> {
         qualifier: Option<&str>,
         at: Option<rb_model::Span>,
     ) -> Vec<(EdgeKind, Sym<'a>)> {
-        // A bare call through a variable (`cb()`) is never linked by name to a function.
-        // A bare call through a variable (`cb()`) is never linked by name to a function, unless
-        // the variable is itself a kept definition (`const f = () => …` at a symbol level).
+        // A bare call through a variable (`cb()`) is never linked by name to a function: it
+        // resolves to the definition the variable itself is (`const f = () => …`), or to nothing.
         // Java keeps methods and variables in separate namespaces (JLS §6.4.2).
-        let through_variable = self.language(path) != Language::Java
-            && at.is_some_and(|at| {
-                self.binding(path, scope, name, Some(at))
-                    .is_some_and(|b| !b.member && !self.defines(path, name, b))
-            });
-        let found = match qualifier {
-            None if through_variable => Vec::new(),
-            None => self.levels(path, scope, name, is_callable, true),
-            Some(q) => match self.container(path, scope, q, at) {
+        let variable = (self.language(path) != Language::Java)
+            .then(|| at.and_then(|at| self.binding(path, scope, name, Some(at))))
+            .flatten()
+            .filter(|b| !b.member);
+        let found = match (qualifier, variable) {
+            (None, Some(b)) => self.defines(path, name, b).into_iter().collect(),
+            (None, None) => self.levels(path, scope, name, is_callable, true),
+            (Some(q), _) => match self.container(path, scope, q, at) {
                 Some(Container::Types(ts)) => ts
                     .into_iter()
                     .flat_map(|t| self.members(t, name, is_callable))
@@ -2242,5 +2242,39 @@ func (s *Server) helper() {}
             "{:?}",
             edges(&js, EdgeKind::Calls)
         );
+    }
+
+    #[test]
+    fn a_function_valued_variable_resolves_to_its_own_definition() {
+        // An object property named like the variable is not the variable.
+        let js = build(
+            &[(
+                "src/o.js",
+                Language::JavaScript,
+                "const run = { run: () => 1 };\nfunction callsRun() { run(); }\n",
+            )],
+            &[],
+        );
+        assert!(
+            edges(&js, EdgeKind::Calls).is_empty(),
+            "{:?}",
+            edges(&js, EdgeKind::Calls)
+        );
+        // Each call site goes to the `h` in effect there, not to every `h` in the function.
+        let js = build(
+            &[(
+                "src/n.js",
+                Language::JavaScript,
+                "function g() { const h = () => 1; if (c) { const h = () => 2; return h(); } return h(); }\n",
+            )],
+            &[],
+        );
+        let calls = edges(&js, EdgeKind::Calls);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls.iter().all(|e| e.ends_with("[heuristic]")),
+            "{calls:?}"
+        );
+        assert_ne!(calls[0], calls[1]);
     }
 }

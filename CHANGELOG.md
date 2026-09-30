@@ -1,5 +1,9 @@
 # Changelog
 
+## [2026-10-01 03:00]
+- M3a closed after evaluator pass 6 (PASS). Its two low-severity notes fixed: a bare call through a function-valued variable resolves to the definition the variable itself is (`Index::defines` returns the symbol declared by the same name token), so nested same-named functions no longer make sites ambiguous and an object property named like the variable is not taken for it. Edge sets on the four public repos are unchanged.
+- Files affected: crates/rb-indexer/src/resolve.rs, tasks/contract-m3a.md, IMPLEMENT.md, tasks/todo.md, docs §13.
+
 ## [2026-10-01 02:30]
 - e2e tests are serialized through a lock in `db_url()`: run in parallel, the `rb` processes they spawn create and drop AGE graphs concurrently, and AGE 1.8 on Postgres 18 then intermittently kills a backend (`FATAL: failed to re-find shared lock object`, 11 times in a day; three serial runs and a direct read-only write attempt never reproduced it). Recorded as a risk in design §14.
 - Files affected: crates/rb-cli/tests/e2e.rs, docs/repository-brain-design.md.
