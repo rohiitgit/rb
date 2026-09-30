@@ -7,3 +7,9 @@ pub use decode::{Document, Occurrence, Relationship, ScipIndex, SymbolInfo, deco
 pub mod jobs;
 
 pub use jobs::{Indexer, Job, jobs};
+pub mod runner;
+
+pub use runner::{ContainerRun, DockerRunner, Network, Outcome, Runner};
+pub mod hash;
+
+pub use hash::project_input_hash;

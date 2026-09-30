@@ -41,6 +41,8 @@ rb-scip = { path = "crates/rb-scip" }
 # here to name the `protobuf::Message` trait.
 scip = "0.10"
 protobuf = "=3.7.2"
+# Content-addressed cache keys for SCIP indexes (design §5.2) must be collision-resistant.
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

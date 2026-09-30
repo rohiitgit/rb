@@ -25,6 +25,17 @@ pub use query::{
     TableDeps,
 };
 
+/// A recorded SCIP indexer run (design §5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedScipIndex {
+    /// `ok`, `failed` or `timeout`.
+    pub status: String,
+    /// `index.scip` bytes when `ok`.
+    pub index: Option<Vec<u8>>,
+    pub stderr_tail: String,
+    pub elapsed_ms: i32,
+}
+
 /// Embedded migrations, applied in order and recorded in `public.rb_schema_migrations`.
 const MIGRATIONS: &[(&str, &str)] = &[
     (
@@ -38,6 +49,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0003_trgm_schema",
         include_str!("../../../migrations/0003_trgm_schema.sql"),
+    ),
+    (
+        "0004_scip_index",
+        include_str!("../../../migrations/0004_scip_index.sql"),
     ),
 ];
 
@@ -135,6 +150,51 @@ impl Store {
     }
 
     /// Deletes a repository, all its snapshots and their AGE graphs. Returns false if it did not exist.
+    /// A cached SCIP index for `(input_hash, indexer_digest)`, if one was recorded.
+    pub fn scip_index_get(
+        &mut self,
+        input_hash: &str,
+        indexer_digest: &str,
+    ) -> anyhow::Result<Option<CachedScipIndex>> {
+        let row = self.client.query_opt(
+            "SELECT status, index, stderr_tail, elapsed_ms FROM rb.scip_index
+             WHERE input_hash = $1 AND indexer_digest = $2",
+            &[&input_hash, &indexer_digest],
+        )?;
+        Ok(row.map(|r| CachedScipIndex {
+            status: r.get(0),
+            index: r.get(1),
+            stderr_tail: r.get(2),
+            elapsed_ms: r.get(3),
+        }))
+    }
+
+    /// Records an index run; a later run with the same key replaces it (a retry after a fix).
+    pub fn scip_index_put(
+        &mut self,
+        input_hash: &str,
+        indexer_digest: &str,
+        entry: &CachedScipIndex,
+    ) -> anyhow::Result<()> {
+        self.client.execute(
+            "INSERT INTO rb.scip_index (input_hash, indexer_digest, status, index, stderr_tail, elapsed_ms)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (input_hash, indexer_digest) DO UPDATE
+             SET status = EXCLUDED.status, index = EXCLUDED.index,
+                 stderr_tail = EXCLUDED.stderr_tail, elapsed_ms = EXCLUDED.elapsed_ms,
+                 created_at = now()",
+            &[
+                &input_hash,
+                &indexer_digest,
+                &entry.status,
+                &entry.index,
+                &entry.stderr_tail,
+                &entry.elapsed_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_repo(&mut self, name: &str) -> anyhow::Result<bool> {
         let mut tx = self.client.transaction()?;
         let graphs = tx.query(

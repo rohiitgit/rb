@@ -245,7 +245,11 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Research done (2026-10-01, primary sources, recorded in the contract):** `scip` 0.10.0 with `protobuf` pinned to 3.7.2; scip-java 0.13.1 (`ghcr.io/scip-code/scip-java`, arm64 and amd64 digests recorded) runs the whole Maven/Gradle build; scip-typescript 0.4.0 (`sourcegraph/scip-typescript`, **amd64 only**, so it runs under emulation here, which was verified to work). Both indexers mean UTF-16 columns and leave the encoding unset; scip-java emits typed ranges, scip-typescript the deprecated ones. Offline indexing after a fetch step is undocumented for both and is verified empirically in step 2.
 - **Built:** step 1, `rb-scip::decode` (typed and deprecated ranges, column conversion with the document text or the repo blob, duplicate-document merge, symbol information). Two new dependencies with stated reasons: `scip`, `protobuf`.
 
+- **Incident (2026-10-01):** pulling the official scip-java 0.13.1 image (6.75 GB uncompressed) filled the host disk; `cargo clean` (16.4 GiB, `target/` had reached 12 GB) and removing the image recovered it. The published image is not usable here: the Java path needs a slim image from a pinned JDK base plus the pinned scip-java release (research in progress). scip-typescript's slim image proceeds.
+- **Built (step 2, partial):** job detection (`rb_scip::jobs`), the container runner (`rb_scip::runner`, `docker run` with digest, platform, `--network none`, budgets), the cache key (`project_input_hash`, SHA-256; new dependency `sha2`), and the `rb.scip_index` cache table (migration 0004) with store methods.
+
 ### Status
 
 - [x] Steps 0–1
-- [ ] Steps 2–4 (see `tasks/todo.md`)
+- [ ] Step 2: orchestration and the empirical offline check (in progress)
+- [ ] Steps 3–4 (see `tasks/todo.md`)
