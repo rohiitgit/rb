@@ -770,24 +770,251 @@ fn scip_ts_express_prisma() {
     );
 
     // S9: coverage per project and the exact share.
-    let status = rb(&url, &["status", "--repo", &name]);
-    let lines: Vec<&str> = status
-        .lines()
-        .filter(|l| {
-            let l = l.trim_start();
-            l.starts_with("code:") || l.starts_with("scip:")
-        })
-        .collect();
-    golden(
-        fixture,
-        "scip-status.txt",
-        &format!("{}\n", lines.join("\n")),
-    );
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
 
     // S4, S12: unchanged inputs are served from the cache, and the dump is byte-identical.
     let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
     assert!(
         second.contains("scip: . scip-typescript ok (cached"),
+        "{second}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+}
+
+/// The `code:` and `scip:` lines of `rb status`, with each job's run time masked: it is the
+/// container's (or the cached run's), not a function of the commit.
+fn scip_status_lines(url: &str, name: &str) -> String {
+    let status = rb(url, &["status", "--repo", name]);
+    let masked: Vec<String> = status
+        .lines()
+        .filter(|l| {
+            let l = l.trim_start();
+            l.starts_with("code:") || l.starts_with("scip:")
+        })
+        .map(|l| {
+            l.split(' ')
+                .map(|token| {
+                    let t = token.trim_end_matches(',');
+                    match t.strip_suffix('s') {
+                        Some(n) if n.parse::<f64>().is_ok() => token.replace(t, "<elapsed>"),
+                        _ => token.to_owned(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    format!("{}\n", masked.join("\n"))
+}
+
+/// Docker answering and the local scip-java image built (docker/scip-java/README.md); the
+/// reason to skip otherwise. The image is never built implicitly.
+fn scip_java_available() -> Result<(), String> {
+    use rb_scip::Runner as _;
+    rb_scip::docker_available()?;
+    let image = rb_scip::jobs::SCIP_JAVA_IMAGE;
+    rb_scip::DockerRunner
+        .image_id(image)
+        .map(|_| ())
+        .ok_or_else(|| format!("{image} is not built; see docker/scip-java/README.md"))
+}
+
+/// Contract M3b S7 for one SCIP-ok project: every `CALLS`, `REFERENCES` and `IMPLEMENTS` edge
+/// of `dump` whose source or target key starts with `key_prefix` (the project's SCIP package,
+/// `""` for every edge) is `scip`/`exact`, and no such edge names one of the project's files
+/// through a heuristic key (`` `<root>/ ``). Returns the number of exact `CALLS`.
+fn assert_exact_code_edges(dump: &str, key_prefix: &str, root: &str) -> usize {
+    let mut exact_calls = 0;
+    let heuristic_in_root = format!("rb-heuristic . . . `{root}");
+    for line in dump.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let kind = row
+            .get(3)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !matches!(kind, "CALLS" | "REFERENCES" | "IMPLEMENTS") {
+            continue;
+        }
+        let keys = [2, 5].map(|i| row[i].as_str().unwrap_or_default());
+        assert!(
+            !keys.iter().any(|k| k.starts_with(&heuristic_in_root)),
+            "heuristic code edge in a SCIP-ok project: {line}"
+        );
+        if keys.iter().any(|k| k.starts_with(key_prefix)) {
+            assert_eq!(row[6].as_str(), Some("scip"), "{line}");
+            assert_eq!(
+                row[7].as_i64(),
+                Some(rb_model::Certainty::Exact.rank().into()),
+                "{line}"
+            );
+            exact_calls += usize::from(kind == "CALLS");
+        }
+    }
+    exact_calls
+}
+
+/// Contract M3b S3–S7, S10, S12 for scip-java: the Java fixture indexed with Maven in the slim
+/// local image. Needs Docker, the image and (on a cold Maven cache) the network; skipped with a
+/// notice otherwise.
+#[test]
+fn scip_java_spring_jpa() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "java-spring-jpa";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipj_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name]);
+    eprintln!(
+        "scip_java_spring_jpa: first index {:.1?}",
+        started.elapsed()
+    );
+    assert!(first.contains("scip: . scip-java ok"), "{first}");
+
+    // S6: the §9.1 forms name SCIP symbols; the interface call resolves through `IMPLEMENTS`.
+    golden(
+        fixture,
+        "scip-callers-authenticate.txt",
+        &rb(
+            &url,
+            &[
+                "callers",
+                "DefaultAuthService.authenticate",
+                "--depth",
+                "2",
+                "--repo",
+                &name,
+            ],
+        ),
+    );
+    golden(
+        fixture,
+        "scip-impact-authservice.txt",
+        &rb(
+            &url,
+            &["impact", "AuthService#authenticate().", "--repo", &name],
+        ),
+    );
+    // Amendment 7: `login` sits under `@PostMapping("/login")`, where scip-java anchors its
+    // definition; the by-name fallback still gives it its SCIP key.
+    let login_key =
+        "scip-java maven maven/com.acme/auth-service 1.4.0 com/acme/auth/AuthController#login().";
+    assert!(
+        rb(
+            &url,
+            &["find", "login", "--kind", "symbol", "--repo", &name]
+        )
+        .contains(login_key)
+    );
+    assert_eq!(
+        rb(&url, &["callers", login_key, "--repo", &name]),
+        rb(&url, &["callers", "AuthController.login", "--repo", &name])
+    );
+
+    // S7: no heuristic code edge remains anywhere in the project.
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    assert!(assert_exact_code_edges(&dump, "", "") >= 2, "{dump}");
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+
+    // S4, S12: unchanged inputs are served from the cache, and the dump is byte-identical.
+    let started = std::time::Instant::now();
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!(
+        "scip_java_spring_jpa: cached index {:.1?}",
+        started.elapsed()
+    );
+    assert!(second.contains("scip: . scip-java ok (cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+}
+
+/// Contract M3b S10 and invariant 4: a monorepo mixing a Maven project that indexes, one that
+/// fails to build on purpose (`services/broken`), and TypeScript packages. `rb index` succeeds,
+/// the failed project keeps its stderr tail and stays heuristic, the others are exact.
+#[test]
+fn scip_polyglot_monorepo() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "polyglot-monorepo";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipp_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name]);
+    eprintln!(
+        "scip_polyglot_monorepo: first index {:.1?}",
+        started.elapsed()
+    );
+    assert!(
+        first.contains("scip: services/auth scip-java ok"),
+        "{first}"
+    );
+    assert!(
+        first.contains("scip: services/broken scip-java failed"),
+        "{first}"
+    );
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+
+    // The failed project's diagnostic carries Maven's error, and its files stay heuristic; the
+    // ok project's edges are exact.
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let broken = dump
+        .lines()
+        .find(|l| l.starts_with("[\"D\",\"scip_status\",\"services/broken\""))
+        .unwrap_or_else(|| panic!("no scip_status for services/broken in {dump}"));
+    // Maven's wording differs once the miss is cached in the shared `.m2` ("was not found …
+    // during a previous attempt"); the resolution summary is the same either way.
+    assert!(
+        broken.contains("\"status\":\"failed\"")
+            && broken
+                .contains("The following artifacts could not be resolved: com.acme:nope:jar:0.0.0"),
+        "{broken}"
+    );
+    assert!(
+        dump.contains(
+            "rb-heuristic . . . `services/broken/src/main/java/com/acme/broken/Broken.java`/Broken#"
+        ),
+        "{dump}"
+    );
+    let auth_package = "scip-java maven maven/com.acme/auth-service 1.4.0 ";
+    assert!(
+        assert_exact_code_edges(&dump, auth_package, "services/auth/") >= 1,
+        "{dump}"
+    );
+    golden(
+        fixture,
+        "scip-callers-send-code.txt",
+        &rb(
+            &url,
+            &[
+                "callers",
+                "MfaClient.sendCode",
+                "--depth",
+                "2",
+                "--repo",
+                &name,
+            ],
+        ),
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(
+        second.contains("scip: services/auth scip-java ok (cached")
+            && second.contains("scip: services/broken scip-java failed (cached"),
         "{second}"
     );
     assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);

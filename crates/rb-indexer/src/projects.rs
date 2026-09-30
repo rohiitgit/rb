@@ -68,8 +68,9 @@ pub struct ScipProject {
     /// Repo-relative build root (`""` for the repository root).
     pub root: String,
     pub indexer: &'static str,
-    /// The image the job runs in, pinned by digest.
-    pub image: &'static str,
+    /// The image the job runs in and its index is cached under: a registry digest reference, or
+    /// the image ID of the locally built scip-java image (`rb_scip::resolve_image`).
+    pub image: String,
     pub status: RunStatus,
     /// The decoded index when `status` is `Ok`; dropped once the graph is assembled.
     pub index: Option<ScipIndex>,
@@ -104,11 +105,10 @@ pub(crate) fn run_projects(
         .collect();
     let mut out = Vec::new();
     for job in rb_scip::jobs(&paths) {
-        let image = rb_scip::image_for(&job);
         let mut project = ScipProject {
             root: job.root.clone(),
             indexer: job.indexer.as_str(),
-            image,
+            image: rb_scip::image_for(&job).to_owned(),
             status: RunStatus::Skipped(String::new()),
             index: None,
             elapsed_ms: 0,
@@ -124,13 +124,22 @@ pub(crate) fn run_projects(
             }
             Mode::Run(runner) => *runner,
         };
+        // The image is resolved before the cache lookup: it is the key's second half.
+        match rb_scip::resolve_image(&job, runner) {
+            Ok(image) => project.image = image,
+            Err(reason) => {
+                project.status = RunStatus::Unsupported(reason);
+                out.push(project);
+                continue;
+            }
+        }
         let under_root: Vec<(&str, &str)> = blobs
             .iter()
             .filter(|(path, _)| in_root(path, &job.root))
             .map(|(p, b)| (*p, *b))
             .collect();
         let input_hash = rb_scip::project_input_hash(&job.root, under_root.iter().copied());
-        let entry = match cache.get(&input_hash, image)? {
+        let entry = match cache.get(&input_hash, &project.image)? {
             Some(entry) => {
                 project.cached = true;
                 entry
@@ -142,6 +151,7 @@ pub(crate) fn run_projects(
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 let run = rb_scip::run_job(
                     &job,
+                    &project.image,
                     &exported,
                     &options.work_dir.join(&input_hash[..16]),
                     &options.cache_dir,
@@ -159,7 +169,7 @@ pub(crate) fn run_projects(
                     stderr_tail: run.stderr_tail,
                     elapsed_ms: u64::try_from(run.elapsed.as_millis()).unwrap_or(u64::MAX),
                 };
-                cache.put(&input_hash, image, &entry)?;
+                cache.put(&input_hash, &project.image, &entry)?;
                 entry
             }
         };
@@ -219,16 +229,20 @@ mod tests {
 
     use super::*;
 
+    const JAVA_ID: &str = "sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2";
+
     struct Fake {
         runs: RefCell<usize>,
         index: Vec<u8>,
         fail: bool,
+        /// The scip-java image is present locally.
+        java_image: bool,
     }
 
     impl Runner for Fake {
         fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
             *self.runs.borrow_mut() += 1;
-            if run.args.first().map(String::as_str) == Some("index") && !self.fail {
+            if run.network == rb_scip::Network::None && !self.fail {
                 std::fs::write(run.workdir.join("index.scip"), &self.index)?;
             }
             Ok(Outcome {
@@ -241,6 +255,10 @@ mod tests {
                 },
                 elapsed: std::time::Duration::from_millis(7),
             })
+        }
+
+        fn image_id(&self, image: &str) -> Option<String> {
+            (self.java_image && image == rb_scip::jobs::SCIP_JAVA_IMAGE).then(|| JAVA_ID.to_owned())
         }
     }
 
@@ -322,6 +340,7 @@ mod tests {
             runs: RefCell::new(0),
             index: index_bytes(),
             fail: false,
+            java_image: true,
         };
         let mut cache = MemCache::default();
         let opts = options(tmp.path());
@@ -378,6 +397,7 @@ mod tests {
             runs: RefCell::new(0),
             index: Vec::new(),
             fail: true,
+            java_image: false,
         };
         let mut cache = MemCache::default();
         let opts = options(tmp.path());
@@ -403,8 +423,14 @@ mod tests {
         assert_eq!(*fake.runs.borrow(), 0);
 
         let ran = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        // The scip-java image is not built locally: unsupported, with the reason pointing at
+        // the image's README.
         assert_eq!(ran[0].status.as_str(), "unsupported");
-        assert!(ran[0].status.reason().unwrap().contains("scip-java"));
+        let reason = ran[0].status.reason().unwrap();
+        assert!(
+            reason.contains("rb-scip-java:0.13.1") && reason.contains("docker/scip-java/README.md"),
+            "{reason}"
+        );
         // The TypeScript job's fetch failed: recorded, cached as such, and served from the cache
         // next time without another attempt.
         assert_eq!(ran[1].status, RunStatus::Failed);
@@ -415,6 +441,38 @@ mod tests {
         let again = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
         assert!(again[1].cached && again[1].status == RunStatus::Failed);
         assert_eq!(*fake.runs.borrow(), 1);
+    }
+
+    /// A Maven job with the local image present runs (two fetch runs and the index) and is
+    /// cached under the image ID, which is what the project reports as its image.
+    #[test]
+    fn maven_jobs_are_keyed_by_the_local_image_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![entry("svc/pom.xml", "1"), entry("svc/src/A.java", "2")];
+        let read = |_: &str| Ok(b"class A {}\n".to_vec());
+        let fake = Fake {
+            runs: RefCell::new(0),
+            index: index_bytes(),
+            fail: false,
+            java_image: true,
+        };
+        let mut cache = MemCache::default();
+        let opts = options(tmp.path());
+        let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        assert_eq!(cold.len(), 1);
+        assert_eq!(
+            (cold[0].indexer, cold[0].status.as_str()),
+            ("scip-java", "ok")
+        );
+        assert_eq!(cold[0].image, JAVA_ID);
+        assert_eq!(*fake.runs.borrow(), 3, "go-offline, verify, index");
+        let keys: Vec<&(String, String)> = cache.rows.keys().collect();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].1, JAVA_ID, "the cache key's image part is the ID");
+        let warm = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        assert!(warm[0].cached);
+        assert_eq!(*fake.runs.borrow(), 3, "no container ran");
+        assert_eq!(warm[0].image, JAVA_ID);
     }
 
     #[test]

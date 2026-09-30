@@ -387,11 +387,12 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
     });
     match p.status.reason() {
         Some(reason) => detail["reason"] = reason.into(),
-        None => detail["image"] = p.image.into(),
+        None => detail["image"] = p.image.as_str().into(),
     }
     if let Some(c) = coverage {
         detail["coverage"] = json!({
             "definitions_matched": c.definitions_matched,
+            "definitions_matched_by_name": c.definitions_matched_by_name,
             "definitions_total": c.definitions_total,
             "references_matched": c.references_matched,
             "references_external": c.references_external,

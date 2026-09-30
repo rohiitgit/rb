@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_TYPESCRIPT_IMAGE};
+use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_JAVA_IMAGE, SCIP_TYPESCRIPT_IMAGE};
 use crate::runner::{ContainerRun, Network, Outcome, Runner};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,18 +79,36 @@ impl Default for Budget {
     }
 }
 
-/// The image reference a job uses, pinned by digest: the cache key's second half.
+/// The image reference a job uses: scip-typescript's registry digest, scip-java's local tag.
 pub fn image_for(job: &Job) -> &'static str {
     match job.indexer {
         Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
-        Indexer::ScipJava => "unsupported",
+        Indexer::ScipJava => SCIP_JAVA_IMAGE,
     }
 }
 
-/// Runs `job` over `files` (`(root-relative path, bytes)`) in `work_dir` (recreated, removed
-/// afterwards) with `cache_dir` holding package-manager caches shared across jobs.
+/// The image `job` runs in and its index is cached under: the digest reference itself for a
+/// pinned image, the image ID for the locally built scip-java one. `Err` is the user-facing
+/// reason the job is `unsupported`: the local image is absent, and nothing builds it implicitly.
+pub fn resolve_image(job: &Job, runner: &dyn Runner) -> Result<String, String> {
+    let image = image_for(job);
+    match job.indexer {
+        Indexer::ScipTypescript => Ok(image.to_owned()),
+        Indexer::ScipJava => runner.image_id(image).ok_or_else(|| {
+            format!(
+                "scip-java: image {image} is not available locally; build it as \
+                 docker/scip-java/README.md describes"
+            )
+        }),
+    }
+}
+
+/// Runs `job` in `image` (from [`resolve_image`]) over `files` (`(root-relative path, bytes)`)
+/// in `work_dir` (recreated, removed afterwards) with `cache_dir` holding package-manager
+/// caches shared across jobs.
 pub fn run_job(
     job: &Job,
+    image: &str,
     files: &[(String, Vec<u8>)],
     work_dir: &Path,
     cache_dir: &Path,
@@ -98,23 +116,27 @@ pub fn run_job(
     runner: &dyn Runner,
 ) -> anyhow::Result<ScipRun> {
     let started = std::time::Instant::now();
-    let unsupported = |reason: &str| ScipRun {
-        status: RunStatus::Unsupported(reason.to_owned()),
-        index: None,
-        stderr_tail: String::new(),
-        elapsed: Duration::ZERO,
-    };
-    if job.indexer == Indexer::ScipJava {
-        // The published scip-java image is 6.75 GB (contract M3b facts); a slim image is pending.
-        return Ok(unsupported("scip-java: no usable indexer image yet"));
+    if let Fetch::Gradle { .. } = job.fetch {
+        // Only the Maven path is verified (contract M3b amendment 8); Gradle is M6.
+        return Ok(ScipRun {
+            status: RunStatus::Unsupported("scip-java Gradle builds are not verified yet".into()),
+            index: None,
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+        });
     }
     export(files, work_dir)?;
     std::fs::create_dir_all(cache_dir)?;
     let result = (|| -> anyhow::Result<ScipRun> {
-        let (fetch, index) = typescript_runs(job, work_dir, cache_dir, budget)?;
-        let outcome = runner.run(&fetch)?;
-        if !outcome.ok() {
-            return Ok(finished(&outcome, None, started));
+        let (fetches, index) = match job.indexer {
+            Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
+            Indexer::ScipJava => java_runs(image, work_dir, cache_dir, budget)?,
+        };
+        for fetch in &fetches {
+            let outcome = runner.run(fetch)?;
+            if !outcome.ok() {
+                return Ok(finished(&outcome, None, started));
+            }
         }
         let outcome = runner.run(&index)?;
         let index_bytes = if outcome.ok() {
@@ -153,15 +175,16 @@ fn finished(outcome: &Outcome, index: Option<Vec<u8>>, started: std::time::Insta
 /// the index; the image exists for linux/amd64 only).
 fn typescript_runs(
     job: &Job,
+    image: &str,
     work_dir: &Path,
     cache_dir: &Path,
     budget: &Budget,
-) -> anyhow::Result<(ContainerRun, ContainerRun)> {
+) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
     let workdir = crate::runner::absolute(work_dir)?;
     let npm_cache = crate::runner::absolute(cache_dir)?.join("npm");
     std::fs::create_dir_all(&npm_cache)?;
     let base = ContainerRun {
-        image: SCIP_TYPESCRIPT_IMAGE.into(),
+        image: image.into(),
         platform: Some("linux/amd64".into()),
         workdir,
         mount_at: "/src".into(),
@@ -221,14 +244,84 @@ fn typescript_runs(
         args: index_args,
         ..base
     };
-    Ok((fetch, index))
+    Ok((vec![fetch], index))
+}
+
+/// The fetch and index invocations for a scip-java Maven job (docker/scip-java/README.md,
+/// verified on the Java fixture). The fetch phase resolves plugins and dependencies into the
+/// Maven cache shared across jobs (`go-offline`) and then does one online build, so that the
+/// index phase can run the same build with `--offline` under `--network none`. Arguments after
+/// `--` replace scip-java's default Maven arguments, so they are repeated plus `--offline`.
+/// Maven logs to stdout by default; `MAVEN_OPTS` moves its logger to stderr so a failed build's
+/// `[ERROR]` lines reach the stderr tail. scip-java prefers a repository's own `./mvnw` when it
+/// is executable, which would download Maven; exported files are never executable, so the
+/// image's `mvn` is always the one used.
+fn java_runs(
+    image: &str,
+    work_dir: &Path,
+    cache_dir: &Path,
+    budget: &Budget,
+) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
+    let workdir = crate::runner::absolute(work_dir)?;
+    let m2 = crate::runner::absolute(cache_dir)?.join("m2");
+    std::fs::create_dir_all(&m2)?;
+    let base = ContainerRun {
+        image: image.into(),
+        platform: None,
+        workdir,
+        mount_at: "/sources".into(),
+        caches: vec![(m2, "/root/.m2".into())],
+        env: vec![(
+            "MAVEN_OPTS".into(),
+            "-Dorg.slf4j.simpleLogger.logFile=System.err".into(),
+        )],
+        network: Network::Registries,
+        cpus: budget.cpus,
+        memory: budget.memory.clone(),
+        timeout: budget.fetch_timeout,
+        entrypoint: None,
+        args: Vec::new(),
+    };
+    let mvn = |goals: &[&str]| ContainerRun {
+        args: ["mvn", "-B", "-q"]
+            .iter()
+            .chain(goals)
+            .map(|s| (*s).to_owned())
+            .collect(),
+        ..base.clone()
+    };
+    let fetches = vec![
+        mvn(&["org.apache.maven.plugins:maven-dependency-plugin:3.11.0:go-offline"]),
+        mvn(&["clean", "verify", "-DskipTests"]),
+    ];
+    let index = ContainerRun {
+        network: Network::None,
+        timeout: budget.index_timeout,
+        args: [
+            "scip-java",
+            "index",
+            "--build-tool",
+            "Maven",
+            "--",
+            "--batch-mode",
+            "--offline",
+            "clean",
+            "verify",
+            "-DskipTests",
+        ]
+        .map(String::from)
+        .to_vec(),
+        ..base
+    };
+    Ok((fetches, index))
 }
 
 fn once(s: &str) -> std::iter::Once<&str> {
     std::iter::once(s)
 }
 
-/// Writes `files` under `dir`, which is recreated empty first. Paths never escape `dir`.
+/// Writes `files` under `dir`, which is recreated empty first. Paths never escape `dir`. Files
+/// are written with default permissions, never executable.
 fn export(files: &[(String, Vec<u8>)], dir: &Path) -> anyhow::Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
@@ -254,17 +347,32 @@ mod tests {
 
     use super::*;
 
-    /// Records runs; the index phase writes a fake `index.scip` unless told to fail.
+    const JAVA_ID: &str = "sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2";
+
+    /// Records runs; the index phase (the one without network) writes a fake `index.scip`
+    /// unless told to fail. Knows the scip-java image when `java_image` is set.
     struct Fake {
         runs: RefCell<Vec<ContainerRun>>,
         fail_fetch: bool,
         fail_index: bool,
+        java_image: bool,
+    }
+
+    impl Fake {
+        fn new(fail_fetch: bool, fail_index: bool) -> Fake {
+            Fake {
+                runs: RefCell::new(Vec::new()),
+                fail_fetch,
+                fail_index,
+                java_image: true,
+            }
+        }
     }
 
     impl Runner for Fake {
         fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
             self.runs.borrow_mut().push(run.clone());
-            let is_index = run.args.first().map(String::as_str) == Some("index");
+            let is_index = run.network == Network::None;
             let fail = if is_index {
                 self.fail_index
             } else {
@@ -280,6 +388,10 @@ mod tests {
                 elapsed: Duration::from_millis(1),
             })
         }
+
+        fn image_id(&self, image: &str) -> Option<String> {
+            (self.java_image && image == SCIP_JAVA_IMAGE).then(|| JAVA_ID.to_owned())
+        }
     }
 
     fn ts_job(lockfile: NodeLock) -> Job {
@@ -289,6 +401,16 @@ mod tests {
             fetch: Fetch::Npm { lockfile },
             projects: vec![".".into(), "sub".into()],
             unpinned: lockfile == NodeLock::None,
+        }
+    }
+
+    fn java_job(fetch: Fetch) -> Job {
+        Job {
+            root: "svc".into(),
+            indexer: Indexer::ScipJava,
+            fetch,
+            projects: Vec::new(),
+            unpinned: false,
         }
     }
 
@@ -304,13 +426,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let work = tmp.path().join("work");
         let cache = tmp.path().join("cache");
-        let fake = Fake {
-            runs: RefCell::new(Vec::new()),
-            fail_fetch: false,
-            fail_index: false,
-        };
+        let fake = Fake::new(false, false);
+        let job = ts_job(NodeLock::PackageLock);
+        let image = resolve_image(&job, &fake).unwrap();
+        assert_eq!(
+            image, SCIP_TYPESCRIPT_IMAGE,
+            "a pinned image is its own key"
+        );
         let run = run_job(
-            &ts_job(NodeLock::PackageLock),
+            &job,
+            &image,
             &files(),
             &work,
             &cache,
@@ -352,13 +477,10 @@ mod tests {
     #[test]
     fn a_failed_fetch_stops_before_indexing_and_a_failed_index_has_no_bytes() {
         let tmp = tempfile::tempdir().unwrap();
-        let fake = Fake {
-            runs: RefCell::new(Vec::new()),
-            fail_fetch: true,
-            fail_index: false,
-        };
+        let fake = Fake::new(true, false);
         let run = run_job(
             &ts_job(NodeLock::None),
+            SCIP_TYPESCRIPT_IMAGE,
             &files(),
             &tmp.path().join("w"),
             &tmp.path().join("c"),
@@ -374,13 +496,10 @@ mod tests {
             "install",
             "no lockfile: npm install"
         );
-        let fake = Fake {
-            runs: RefCell::new(Vec::new()),
-            fail_fetch: false,
-            fail_index: true,
-        };
+        let fake = Fake::new(false, true);
         let run = run_job(
             &ts_job(NodeLock::Yarn),
+            SCIP_TYPESCRIPT_IMAGE,
             &files(),
             &tmp.path().join("w"),
             &tmp.path().join("c"),
@@ -393,23 +512,87 @@ mod tests {
         assert_eq!(fake.runs.borrow()[0].entrypoint.as_deref(), Some("yarn"));
     }
 
+    /// A Maven job: two online Maven runs into the shared `.m2`, then scip-java offline in the
+    /// same image, all under `/sources`; the image ID resolved at run time is what runs.
     #[test]
-    fn java_jobs_are_unsupported_for_now_and_exports_refuse_unsafe_paths() {
+    fn maven_jobs_fetch_online_then_index_offline_in_the_local_image() {
         let tmp = tempfile::tempdir().unwrap();
-        let fake = Fake {
-            runs: RefCell::new(Vec::new()),
-            fail_fetch: false,
-            fail_index: false,
+        let work = tmp.path().join("work");
+        let cache = tmp.path().join("cache");
+        let fake = Fake::new(false, false);
+        let job = java_job(Fetch::Maven { wrapper: false });
+        let image = resolve_image(&job, &fake).unwrap();
+        assert_eq!(image, JAVA_ID);
+        let budget = Budget {
+            cpus: 3.0,
+            memory: "6g".into(),
+            fetch_timeout: Duration::from_secs(10),
+            index_timeout: Duration::from_secs(20),
         };
-        let job = Job {
-            root: "svc".into(),
-            indexer: Indexer::ScipJava,
-            fetch: Fetch::Maven { wrapper: false },
-            projects: Vec::new(),
-            unpinned: false,
-        };
+        let run = run_job(&job, &image, &files(), &work, &cache, &budget, &fake).unwrap();
+        assert_eq!(run.status, RunStatus::Ok);
+        assert_eq!(run.index.as_deref(), Some(&b"fake-index"[..]));
+        assert!(!work.exists());
+        let runs = fake.runs.borrow();
+        assert_eq!(runs.len(), 3);
+        for r in runs.iter() {
+            assert_eq!(r.image, JAVA_ID);
+            assert_eq!(r.platform, None, "scip-java runs natively");
+            assert_eq!(r.mount_at, "/sources");
+            assert_eq!(r.caches[0].1, "/root/.m2");
+            assert!(r.caches[0].0.ends_with("cache/m2"));
+            assert_eq!(r.entrypoint, None);
+            assert_eq!(r.env[0].0, "MAVEN_OPTS");
+            assert!(r.env[0].1.contains("logFile=System.err"));
+            assert_eq!((r.cpus, r.memory.as_str()), (3.0, "6g"));
+        }
+        assert_eq!(runs[0].network, Network::Registries);
+        assert_eq!(
+            runs[0].args,
+            [
+                "mvn",
+                "-B",
+                "-q",
+                "org.apache.maven.plugins:maven-dependency-plugin:3.11.0:go-offline"
+            ]
+        );
+        assert_eq!(runs[0].timeout, Duration::from_secs(10));
+        assert_eq!(runs[1].network, Network::Registries);
+        assert_eq!(
+            runs[1].args,
+            ["mvn", "-B", "-q", "clean", "verify", "-DskipTests"]
+        );
+        assert_eq!(runs[2].network, Network::None);
+        assert_eq!(runs[2].timeout, Duration::from_secs(20));
+        assert_eq!(
+            runs[2].args,
+            [
+                "scip-java",
+                "index",
+                "--build-tool",
+                "Maven",
+                "--",
+                "--batch-mode",
+                "--offline",
+                "clean",
+                "verify",
+                "-DskipTests"
+            ]
+        );
+        assert!(
+            cache.join("m2").is_dir(),
+            "the Maven cache directory is created"
+        );
+    }
+
+    /// A build failure in the second fetch run stops before the index; nothing runs offline.
+    #[test]
+    fn a_failed_maven_build_stops_before_indexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(true, false);
         let run = run_job(
-            &job,
+            &java_job(Fetch::Maven { wrapper: true }),
+            JAVA_ID,
             &files(),
             &tmp.path().join("w"),
             &tmp.path().join("c"),
@@ -417,8 +600,52 @@ mod tests {
             &fake,
         )
         .unwrap();
-        assert!(matches!(run.status, RunStatus::Unsupported(_)));
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.stderr_tail, "boom");
+        assert_eq!(
+            fake.runs.borrow().len(),
+            1,
+            "go-offline failed: nothing else runs"
+        );
+    }
+
+    #[test]
+    fn gradle_jobs_and_a_missing_java_image_are_unsupported_and_exports_refuse_unsafe_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(false, false);
+        let run = run_job(
+            &java_job(Fetch::Gradle { wrapper: true }),
+            JAVA_ID,
+            &files(),
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(
+            run.status,
+            RunStatus::Unsupported("scip-java Gradle builds are not verified yet".into())
+        );
         assert!(fake.runs.borrow().is_empty());
+        assert!(!tmp.path().join("w").exists(), "nothing is exported");
+
+        let no_image = Fake {
+            java_image: false,
+            ..Fake::new(false, false)
+        };
+        let reason =
+            resolve_image(&java_job(Fetch::Maven { wrapper: false }), &no_image).unwrap_err();
+        assert!(
+            reason.contains("rb-scip-java:0.13.1") && reason.contains("docker/scip-java/README.md"),
+            "{reason}"
+        );
+        assert_eq!(
+            resolve_image(&ts_job(NodeLock::None), &no_image).as_deref(),
+            Ok(SCIP_TYPESCRIPT_IMAGE),
+            "a pinned image needs no lookup"
+        );
+
         let bad = vec![("../escape".to_owned(), b"x".to_vec())];
         assert!(export(&bad, &tmp.path().join("e")).is_err());
     }

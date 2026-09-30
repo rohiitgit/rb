@@ -53,6 +53,11 @@ impl Outcome {
 
 pub trait Runner {
     fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome>;
+
+    /// The content-addressed ID (`sha256:…`) of a locally present image, `None` when the runtime
+    /// does not have it. A digest-pinned reference needs no lookup; a locally built image (the
+    /// scip-java one) has no registry digest, so its ID is what identifies it in the cache key.
+    fn image_id(&self, image: &str) -> Option<String>;
 }
 
 /// The `docker run` arguments for `run`: no credentials, no host toolchains, the network
@@ -150,6 +155,16 @@ impl Runner for DockerRunner {
             stderr_tail: tail(&stderr, 40),
             elapsed: started.elapsed(),
         })
+    }
+
+    fn image_id(&self, image: &str) -> Option<String> {
+        let out = Command::new("docker")
+            .args(["image", "inspect", "--format", "{{.Id}}", image])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (out.status.success() && id.starts_with("sha256:")).then_some(id)
     }
 }
 

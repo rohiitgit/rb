@@ -1,5 +1,5 @@
-//! SCIP support (design §5.1–§5.3): decoding `index.scip` files into ranges the rest of the graph
-//! understands, and (later) running indexers in containers.
+//! SCIP support (design §5.1–§5.3): detecting indexer jobs, running them in containers, and
+//! decoding `index.scip` files into ranges the rest of the graph understands.
 
 pub mod decode;
 
@@ -15,4 +15,7 @@ pub mod hash;
 pub use hash::project_input_hash;
 pub mod orchestrate;
 
-pub use orchestrate::{Budget, RunStatus, ScipRun, image_for, run_job};
+pub use orchestrate::{Budget, RunStatus, ScipRun, image_for, resolve_image, run_job};
+pub mod symbol;
+
+pub use symbol::last_descriptor_name;

@@ -45,8 +45,13 @@ pub(crate) enum EdgeKind {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Coverage {
-    /// Tree-sitter definitions matched to a SCIP definition occurrence.
+    /// Tree-sitter definitions matched to a SCIP definition occurrence (at their name, or
+    /// through the by-name fallback below).
     pub definitions_matched: usize,
+    /// The subset matched by [`definition_before_name`]: scip-java anchors a member's definition
+    /// occurrence at the first text match of its name, which lands inside an annotation above
+    /// the member when that text contains the name (contract M3b amendment 7).
+    pub definitions_matched_by_name: usize,
     pub definitions_total: usize,
     /// Tree-sitter references matched to an occurrence of a symbol defined in the index.
     pub references_matched: usize,
@@ -117,12 +122,16 @@ pub(crate) fn join(
         let mut replaced: BTreeMap<usize, String> = BTreeMap::new();
         for (i, d) in facts.definitions.iter().enumerate() {
             out.coverage.definitions_total += 1;
-            let hit = by_span.get(&d.name_span).and_then(|os| {
-                os.iter()
-                    .find(|o| o.is_definition() && !o.symbol.starts_with("local "))
-            });
+            let at_name = by_span
+                .get(&d.name_span)
+                .and_then(|os| os.iter().find(|o| is_global_definition(o)));
+            let (hit, by_name) = match at_name {
+                Some(o) => (Some(*o), false),
+                None => (definition_before_name(d, by_span), true),
+            };
             if let Some(o) = hit {
                 out.coverage.definitions_matched += 1;
+                out.coverage.definitions_matched_by_name += usize::from(by_name);
                 replaced.insert(i, o.symbol.clone());
             }
         }
@@ -215,6 +224,32 @@ pub(crate) fn join(
     });
     out.edges.dedup();
     out
+}
+
+fn is_global_definition(o: &rb_scip::Occurrence) -> bool {
+    o.is_definition() && !o.symbol.starts_with("local ")
+}
+
+/// The fallback for a definition with no definition occurrence at its name (contract M3b
+/// amendment 7): scip-java anchors a member's definition occurrence at the first text match of
+/// the member's name from the top of the member, so `@PostMapping("/login") … String login(…)`
+/// gets its occurrence inside the annotation's string. Accepted is a definition occurrence of
+/// a global symbol whose last descriptor is the definition's name and whose span lies inside
+/// the definition, before its name (its modifiers and annotations); nothing outside those
+/// bounds is considered, so the join still invents no range (invariant 6).
+fn definition_before_name<'a>(
+    d: &rb_syntax::Definition,
+    by_span: &BTreeMap<Span, Vec<&'a rb_scip::Occurrence>>,
+) -> Option<&'a rb_scip::Occurrence> {
+    let start: Span = [d.span[0], d.span[1], i32::MIN, i32::MIN];
+    by_span
+        .range(start..d.name_span)
+        .filter(|(span, _)| (span[2], span[3]) <= (d.name_span[0], d.name_span[1]))
+        .flat_map(|(_, os)| os.iter().copied())
+        .find(|o| {
+            is_global_definition(o)
+                && rb_scip::last_descriptor_name(&o.symbol).as_deref() == Some(d.name.as_str())
+        })
 }
 
 #[cfg(test)]
@@ -320,6 +355,7 @@ mod tests {
             joined.coverage,
             Coverage {
                 definitions_matched: 5,
+                definitions_matched_by_name: 0,
                 definitions_total: 5,
                 references_matched: 2,
                 references_external: 1,
@@ -328,6 +364,118 @@ mod tests {
                 references_unmatched: 0,
             }
         );
+    }
+
+    /// scip-java's annotation-anchored definitions (contract M3b amendment 7): the occurrence
+    /// inside `@Mapping("/login")` matches the `login` method below it, and is counted as a
+    /// by-name match; a same-named occurrence outside the method, or one for another name
+    /// inside its annotations, matches nothing.
+    #[test]
+    fn a_definition_occurrence_inside_the_annotations_matches_by_name() {
+        let src = "package p;\nclass C {\n  @Mapping(\"/login\")\n  public String login() { return \"\"; }\n  @Mapping(\"/logout\")\n  public String logout() { return \"\"; }\n}\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let path = "svc/src/C.java";
+        let login = facts
+            .definitions
+            .iter()
+            .find(|d| d.name == "login")
+            .unwrap();
+        assert!(
+            login.span[0] < login.name_span[0],
+            "the method's span starts at its annotation: {:?} vs {:?}",
+            login.span,
+            login.name_span
+        );
+        let sym = |d: &str| format!("scip-java maven maven/p/svc 1.0 p/C#{d}");
+        let at = |line: usize, token: &str| -> Span {
+            let col = src.lines().nth(line).unwrap().find(token).unwrap() as i32;
+            let line = line as i32;
+            [line, col, line, col + token.len() as i32]
+        };
+        let def = |span: Span, symbol: String| Occurrence {
+            span,
+            symbol,
+            roles: 1,
+            enclosing: None,
+        };
+        let class_name = facts.definitions.iter().find(|d| d.name == "C").unwrap();
+        let in_login_annotation = at(2, "login");
+        let in_logout_annotation = at(4, "logout");
+        let index = |occurrences: Vec<Occurrence>| ScipIndex {
+            documents: vec![Document {
+                path: "src/C.java".into(),
+                occurrences,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files: BTreeMap<&str, &FileFacts> = BTreeMap::from([(path, &facts)]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+
+        // The occurrences as scip-java emits them: `login` anchored in its annotation, `logout`
+        // as well (its annotation's text contains it too); a same-named occurrence at the top
+        // of the file lies outside both methods.
+        let joined = join(
+            &index(vec![
+                def([0, 8, 0, 9], sym("login().")),
+                def(class_name.name_span, sym("")),
+                def(in_login_annotation, sym("login().")),
+                def(in_logout_annotation, sym("logout().")),
+            ]),
+            "svc",
+            &files,
+            &keys,
+        );
+        let replaced: Vec<(&str, &str)> = joined.keys[path]
+            .iter()
+            .map(|(i, s)| (facts.definitions[*i].name.as_str(), s.as_str()))
+            .collect();
+        assert_eq!(
+            replaced,
+            [
+                ("C", "scip-java maven maven/p/svc 1.0 p/C#"),
+                ("login", "scip-java maven maven/p/svc 1.0 p/C#login()."),
+                ("logout", "scip-java maven maven/p/svc 1.0 p/C#logout()."),
+            ]
+        );
+        assert_eq!(
+            (
+                joined.coverage.definitions_matched,
+                joined.coverage.definitions_matched_by_name,
+                joined.coverage.definitions_total
+            ),
+            (3, 2, 3)
+        );
+
+        // Swapped names: the occurrence inside `login`'s annotation names `logout` and vice
+        // versa, so neither matches; the class still does, at its name.
+        let joined = join(
+            &index(vec![
+                def(class_name.name_span, sym("")),
+                def(in_login_annotation, sym("logout().")),
+                def(in_logout_annotation, sym("login().")),
+            ]),
+            "svc",
+            &files,
+            &keys,
+        );
+        assert_eq!(joined.keys[path].len(), 1);
+        assert_eq!(
+            (
+                joined.coverage.definitions_matched,
+                joined.coverage.definitions_matched_by_name
+            ),
+            (1, 0)
+        );
+        // A local symbol inside the annotations is never a match.
+        let joined = join(
+            &index(vec![def(in_login_annotation, "local 1".into())]),
+            "svc",
+            &files,
+            &keys,
+        );
+        assert!(joined.keys.is_empty());
     }
 
     fn edge_lines(joined: &Joined) -> Vec<String> {

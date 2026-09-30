@@ -1,2 +1,2 @@
   code: 100.0% of references to own code resolved (0 resolved, 0 ambiguous, 0 unresolved; 0 external); 2 exact calls (scip)
-  scip: . scip-typescript ok 4.1s, definitions matched 4/4, references matched 2, external 1, local 3, unanchored 0, unmatched 10
+  scip: . scip-typescript ok <elapsed>, definitions matched 4/4 (0 by name), references matched 2, external 1, local 3, unanchored 0, unmatched 10

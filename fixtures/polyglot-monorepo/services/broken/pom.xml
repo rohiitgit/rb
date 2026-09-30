@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Fails to build on purpose (contract M3b S10): the dependency does not exist, so the
+     scip-java fetch phase fails and this project stays heuristic while the others index. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.acme</groupId>
+  <artifactId>broken</artifactId>
+  <version>0.0.1</version>
+  <dependencies>
+    <dependency><groupId>com.acme</groupId><artifactId>nope</artifactId><version>0.0.0</version></dependency>
+  </dependencies>
+</project>

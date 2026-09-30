@@ -43,8 +43,10 @@ Environment set in the image:
 docker build -t rb-scip-java:0.13.1 docker/scip-java
 ```
 
-A locally built image has no registry digest; the index cache key uses the image ID or tag
-until the image is pushed somewhere.
+A locally built image has no registry digest; `rb index` resolves the image ID with
+`docker image inspect --format '{{.Id}}' rb-scip-java:0.13.1`, runs the containers by that ID and
+uses it as the index cache key. When the image is absent, Maven jobs are reported as
+`unsupported` and nothing builds the image implicitly.
 
 ## Use
 
@@ -64,6 +66,10 @@ docker run --rm --network bridge -v "$SRC:/sources" -v "$M2:/root/.m2" rb-scip-j
 docker run --rm --network none -v "$SRC:/sources" -v "$M2:/root/.m2" rb-scip-java:0.13.1 \
   scip-java index --build-tool Maven -- --batch-mode --offline clean verify -DskipTests
 ```
+
+`rb index` runs exactly these three steps (`rb_scip::orchestrate::java_runs`) with `$M2` at
+`var/scip/cache/m2`, and sets `MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err`: Maven logs
+to stdout by default, and only stderr is kept as the tail reported for a failed build.
 
 The result is `/sources/index.scip` (project root `file:///sources/`, document paths relative to
 it, e.g. `src/main/java/com/acme/auth/AuthController.java`). scip-java runs Maven as

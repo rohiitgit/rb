@@ -3,9 +3,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The scip-java image (design §5.2, contract M3b facts): 0.13.1, pinned by digest.
-pub const SCIP_JAVA_IMAGE_ARM64: &str = "ghcr.io/scip-code/scip-java@sha256:0f459823b911bbd08730340f7e4524dec041e8eed778efb761a640bc64a6e932";
-pub const SCIP_JAVA_IMAGE_AMD64: &str = "ghcr.io/scip-code/scip-java@sha256:3ad7af456aa02cf5e303e900b280711f3656d5d86a217dd5044a8b8a5e64de8c";
+/// The scip-java image: the slim one built locally from `docker/scip-java` (the published
+/// `ghcr.io/scip-code/scip-java:0.13.1` is 6.75 GB). A local image has no registry digest, so
+/// the cache key uses its image ID, resolved at run time by [`crate::Runner::image_id`]; when the
+/// image is absent the job is `unsupported` and nothing builds it implicitly.
+pub const SCIP_JAVA_IMAGE: &str = "rb-scip-java:0.13.1";
 /// scip-typescript 0.4.0 is published for linux/amd64 only; on arm64 hosts it runs emulated.
 pub const SCIP_TYPESCRIPT_IMAGE: &str = "sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845";
 
