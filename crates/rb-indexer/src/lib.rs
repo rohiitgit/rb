@@ -288,6 +288,9 @@ pub fn assemble(
         |path: &str| projects::owner_root(path, content.scip.iter().map(|p| p.root.as_str()));
     let mut scip_edges = Vec::new();
     let mut exact_files: BTreeSet<&str> = BTreeSet::new();
+    // `Service -DEPENDS_ON-> Package` (design §5.5): per service and package, the first site of
+    // the service's files that names the package is the one evidence.
+    let mut packages: BTreeMap<(NodeKey, String), (rb_scip::Package, Evidence)> = BTreeMap::new();
     for project in &content.scip {
         let files: BTreeMap<&str, &rb_syntax::FileFacts> = content
             .facts
@@ -308,11 +311,46 @@ pub fn assemble(
                 }
                 scip_edges.extend(joined.edges);
                 exact_files.extend(files.keys());
+                for u in joined.packages {
+                    let service = boundaries
+                        .project_for(&u.at.path)
+                        .map_or_else(|| unassigned.clone(), |p| service_key(&p.dir));
+                    packages
+                        .entry((service, u.package.key()))
+                        .and_modify(|(_, at)| {
+                            if u.at < *at {
+                                *at = u.at.clone();
+                            }
+                        })
+                        .or_insert((u.package, u.at));
+                }
                 Some(joined.coverage)
             }
             _ => None,
         };
         diagnostics.push(scip_status(project, coverage.as_ref()));
+    }
+    for ((service, key), (package, at)) in packages {
+        let node = NodeKey::new(NodeKind::Package, key);
+        b.add_node(
+            node.clone(),
+            &package.name,
+            object(json!({
+                "manager": package.manager,
+                "name": package.name,
+                "version": package.version,
+            })),
+        )?;
+        b.add_edge(
+            NewEdge::new(
+                service,
+                EdgeKind::DependsOn,
+                node,
+                Provenance::Scip,
+                Certainty::Exact,
+            )
+            .evidence(at),
+        )?;
     }
     // ORM mappings from every file first, so accesses can resolve entities across files.
     for (path, (_, facts)) in &content.facts {
@@ -399,6 +437,7 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "references_local": c.references_local,
             "references_unanchored": c.references_unanchored,
             "references_unmatched": c.references_unmatched,
+            "files_without_document": c.files_without_document,
         });
     }
     if p.status != rb_scip::RunStatus::Ok && !p.stderr_tail.is_empty() {
@@ -620,6 +659,113 @@ mod tests {
         let root = g.nodes().iter().find(|n| n.key == ".").unwrap();
         assert_eq!(root.attrs["role"], "library");
         assert!(edges_of(&g, EdgeKind::OwnedBy).is_empty());
+    }
+
+    /// Design §5.5: a SCIP-ok project's external symbols give `Package` nodes and one
+    /// `DEPENDS_ON` edge per service and package, from the service of the referencing file,
+    /// with the first site as its only evidence.
+    #[test]
+    fn external_symbols_give_one_depends_on_edge_per_service_and_package() {
+        let src = "import { Client } from 'lib';\nexport const c: Client = 1;\n";
+        let facts = rb_syntax::extract(rb_syntax::Language::TypeScript, src.as_bytes()).unwrap();
+        let paths = ["svc/src/a.ts", "svc/src/b.ts", "other/src/c.ts"];
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: ["svc/package.json", "other/package.json"]
+                .into_iter()
+                .chain(paths)
+                .map(entry)
+                .collect(),
+            skipped: vec![],
+        };
+        let boundaries = Boundaries::new(
+            vec![
+                project("other", "other/package.json"),
+                project("svc", "svc/package.json"),
+            ],
+            vec![],
+        );
+        let lib = "scip-typescript npm lib 2.0.0 `index.d.ts`/Client#";
+        let index = rb_scip::ScipIndex {
+            documents: paths
+                .iter()
+                .map(|path| rb_scip::Document {
+                    path: (*path).to_owned(),
+                    occurrences: vec![
+                        rb_scip::Occurrence {
+                            span: [0, 9, 0, 15],
+                            symbol: lib.into(),
+                            roles: 2,
+                            enclosing: None,
+                        },
+                        rb_scip::Occurrence {
+                            span: [1, 16, 1, 22],
+                            symbol: lib.into(),
+                            roles: 0,
+                            enclosing: None,
+                        },
+                    ],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let content = Content {
+            facts: paths
+                .iter()
+                .map(|p| (*p, (rb_syntax::Language::TypeScript, &facts)))
+                .collect(),
+            scip: vec![ScipProject {
+                root: String::new(),
+                indexer: "scip-typescript",
+                image: "img".into(),
+                status: rb_scip::RunStatus::Ok,
+                index: Some(index),
+                elapsed_ms: 0,
+                cached: false,
+                stderr_tail: String::new(),
+                unpinned: false,
+            }],
+            ..Content::default()
+        };
+        let g = assemble(&manifest, None, &boundaries, &content).unwrap().0;
+        let package = g
+            .nodes()
+            .iter()
+            .find(|n| n.kind == NodeKind::Package)
+            .unwrap();
+        assert_eq!(package.key, "npm/lib@2.0.0");
+        assert_eq!(package.name, "lib");
+        assert_eq!(package.attrs["version"], "2.0.0");
+        assert_eq!(
+            edges_of(&g, EdgeKind::DependsOn),
+            [
+                ("other".into(), "npm/lib@2.0.0".into()),
+                ("svc".into(), "npm/lib@2.0.0".into()),
+            ]
+        );
+        let evidence: Vec<Vec<(String, rb_model::Span)>> = g
+            .edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DependsOn)
+            .map(|e| {
+                assert_eq!(
+                    (e.provenance, e.certainty),
+                    (Provenance::Scip, Certainty::Exact)
+                );
+                e.evidence
+                    .iter()
+                    .map(|ev| (ev.path.clone(), ev.span))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            evidence,
+            [
+                vec![("other/src/c.ts".into(), [0, 9, 0, 15])],
+                vec![("svc/src/a.ts".into(), [0, 9, 0, 15])],
+            ]
+        );
     }
 
     #[test]

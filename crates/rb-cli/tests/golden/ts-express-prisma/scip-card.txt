@@ -1,0 +1,13 @@
+auth-api  (path: ., deployable)
+├─ Detected by: package.json
+├─ Manifests: package.json
+├─ Files: 9 (other 4, typescript 4, prisma 1)
+├─ Owners: @acme/platform
+├─ File ownership
+│    @acme/auth-team     4 files   44%
+│    @acme/platform      4 files   44%
+│    @acme/data           1 file   11%
+│    unowned             0 files    0%
+├─ Packages (1)
+│    npm/@prisma/client@5.22.0
+└─ APIs, tables and call graph: not indexed yet (M2–M4)

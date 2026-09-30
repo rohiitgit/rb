@@ -7,4 +7,5 @@ auth-service  (path: services/auth, deployable)
 │    @acme/identity     4 files   67%
 │    @acme/data         2 files   33%
 │    unowned            0 files    0%
-└─ APIs, tables, dependencies and call graph: not indexed yet (M2–M4)
+├─ Packages: none
+└─ APIs, tables and call graph: not indexed yet (M2–M4)

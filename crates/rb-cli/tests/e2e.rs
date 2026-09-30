@@ -771,6 +771,16 @@ fn scip_ts_express_prisma() {
 
     // S9: coverage per project and the exact share.
     golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    // S8: the packages the service's exact references name, from the index's symbols.
+    golden(
+        fixture,
+        "scip-card.txt",
+        &rb(&url, &["service", ".", "--repo", &name]),
+    );
+    assert!(
+        dump.contains("\"package\",\"npm/@prisma/client@5.22.0\""),
+        "{dump}"
+    );
 
     // S4, S12: unchanged inputs are served from the cache, and the dump is byte-identical.
     let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
@@ -923,6 +933,12 @@ fn scip_java_spring_jpa() {
     let dump = rb(&url, &["dump", "--repo", &name]);
     assert!(assert_exact_code_edges(&dump, "", "") >= 2, "{dump}");
     golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    // S8: Maven artifacts and the JDK, with the versions scip-java resolved.
+    golden(
+        fixture,
+        "scip-card.txt",
+        &rb(&url, &["service", ".", "--repo", &name]),
+    );
 
     // S4, S12: unchanged inputs are served from the cache, and the dump is byte-identical.
     let started = std::time::Instant::now();
@@ -995,6 +1011,14 @@ fn scip_polyglot_monorepo() {
         assert_exact_code_edges(&dump, auth_package, "services/auth/") >= 1,
         "{dump}"
     );
+    // S8: the ok Maven service lists its packages; the failed one has none.
+    golden(
+        fixture,
+        "scip-card-auth.txt",
+        &rb(&url, &["service", "services/auth", "--repo", &name]),
+    );
+    let broken_card = rb(&url, &["service", "services/broken", "--repo", &name]);
+    assert!(broken_card.contains("Packages: none"), "{broken_card}");
     golden(
         fixture,
         "scip-callers-send-code.txt",

@@ -16,7 +16,17 @@ pub(crate) struct Joined {
     pub keys: BTreeMap<String, BTreeMap<usize, String>>,
     /// Exact edges; every target is a symbol whose definition matched, so the graph has its node.
     pub edges: Vec<ScipEdge>,
+    /// External packages (design §5.5): per file and package, the first occurrence of a symbol
+    /// of that package; sorted by file, then site.
+    pub packages: Vec<PackageUse>,
     pub coverage: Coverage,
+}
+
+/// A file's first use of a symbol from a package the index does not define.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PackageUse {
+    pub at: Evidence,
+    pub package: rb_scip::Package,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +74,10 @@ pub(crate) struct Coverage {
     pub references_unanchored: usize,
     /// No occurrence at that range: SCIP has nothing to say, and nothing is guessed.
     pub references_unmatched: usize,
+    /// Files the project owns that the indexer emitted no document for (a `tsconfig.json`
+    /// that excludes `test/**`): they get neither exact nor heuristic edges (contract M3b
+    /// invariant 1), and none of their references is counted above.
+    pub files_without_document: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -97,6 +111,11 @@ pub(crate) fn join(
         .filter(|o| o.is_definition() && !o.symbol.starts_with("local "))
         .map(|o| o.symbol.as_str())
         .collect();
+    // The packages the index itself belongs to: a symbol of one of them that the index does not
+    // define (scip-typescript's `node_modules/.prisma/…` under the project's own package name)
+    // is not a dependency.
+    let own_packages: BTreeSet<rb_scip::Package> =
+        defined.iter().filter_map(|s| rb_scip::package(s)).collect();
     let mut out = Joined::default();
     // The documents with facts, each with its occurrences by span.
     let docs: Vec<Doc<'_>> = index
@@ -115,6 +134,11 @@ pub(crate) fn join(
             Some((path, doc, facts, by_span))
         })
         .collect();
+    let documented: BTreeSet<&str> = docs.iter().map(|(path, ..)| path.as_str()).collect();
+    out.coverage.files_without_document = files
+        .keys()
+        .filter(|path| !documented.contains(*path))
+        .count();
     // Definitions first, over every document: the name's range is a definition occurrence of a
     // global symbol. The matched symbols are the only targets an edge may have, since only they
     // get `Symbol` nodes.
@@ -195,6 +219,31 @@ pub(crate) fn join(
                 },
             });
         }
+        // Packages: every occurrence of a global symbol the index does not define, whether or
+        // not Tree-sitter captured it (imports and annotations are not references); the first
+        // site per package is the evidence.
+        let mut first: BTreeMap<rb_scip::Package, Span> = BTreeMap::new();
+        for (span, os) in by_span {
+            for o in os {
+                if o.symbol.starts_with("local ") || defined.contains(o.symbol.as_str()) {
+                    continue;
+                }
+                let Some(package) = rb_scip::package(&o.symbol) else {
+                    continue;
+                };
+                if !own_packages.contains(&package) {
+                    first.entry(package).or_insert(*span);
+                }
+            }
+        }
+        out.packages
+            .extend(first.into_iter().map(|(package, span)| PackageUse {
+                at: Evidence {
+                    path: path.clone(),
+                    span,
+                },
+                package,
+            }));
         // Implementations come from symbol information, anchored at the type's name.
         let Some(replaced) = replaced else {
             continue;
@@ -223,6 +272,7 @@ pub(crate) fn join(
         (&a.src, a.kind as u8, &a.dst, &a.at).cmp(&(&b.src, b.kind as u8, &b.dst, &b.at))
     });
     out.edges.dedup();
+    out.packages.sort();
     out
 }
 
@@ -284,7 +334,7 @@ mod tests {
         for r in &facts.references {
             let symbol = match r.name.as_str() {
                 "helper" => sym("Dog#helper()."),
-                "ext" => "scip-java maven org.ext:lib 1.0 e/Ext#ext().".to_owned(),
+                "ext" => "scip-java maven maven/org.ext/lib 1.0 e/Ext#ext().".to_owned(),
                 "local" => "local 3".to_owned(),
                 "Animal" => sym("Animal#"),
                 _ => continue,
@@ -362,7 +412,90 @@ mod tests {
                 references_local: 1,
                 references_unanchored: 0,
                 references_unmatched: 0,
+                files_without_document: 0,
             }
+        );
+        // The external call names a package (design §5.5), at its site.
+        let ext = facts.references.iter().find(|r| r.name == "ext").unwrap();
+        assert_eq!(
+            joined.packages,
+            [PackageUse {
+                at: Evidence {
+                    path: path.into(),
+                    span: ext.span,
+                },
+                package: rb_scip::package("scip-java maven maven/org.ext/lib 1.0 e/Ext#ext().")
+                    .unwrap(),
+            }]
+        );
+    }
+
+    /// Packages come from every occurrence of an undefined global symbol, captured by
+    /// Tree-sitter or not (an import, an annotation): one use per file and package, at the first
+    /// site. Symbols of the index's own package, namespace-only symbols and locals name none.
+    #[test]
+    fn packages_are_the_first_use_per_file_of_each_undefined_global_symbols_package() {
+        let src =
+            "import { Client } from 'lib';\nexport function f(): Client { return other(); }\n";
+        let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let path = "src/a.ts";
+        let at = |token: &str| -> Span {
+            let line = src.lines().position(|l| l.contains(token)).unwrap();
+            let col = src.lines().nth(line).unwrap().find(token).unwrap();
+            let (line, col) = (line as i32, col as i32);
+            [line, col, line, col + token.len() as i32]
+        };
+        let occ = |span: Span, symbol: &str, roles: i32| Occurrence {
+            span,
+            symbol: symbol.into(),
+            roles,
+            enclosing: None,
+        };
+        let f = facts.definitions.iter().find(|d| d.name == "f").unwrap();
+        let lib = "scip-typescript npm lib 2.0.0 `index.d.ts`/";
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences: vec![
+                    // The import binding (no Tree-sitter reference) is the first site.
+                    occ(at("Client }"), &format!("{lib}Client#"), 2),
+                    occ(at("'lib'"), lib, 0),
+                    occ(
+                        f.name_span,
+                        "scip-typescript npm p 1.0.0 src/`a.ts`/f().",
+                        1,
+                    ),
+                    occ(at("Client {"), &format!("{lib}Client#"), 0),
+                    // The project's own package, undefined here: not a dependency.
+                    occ(
+                        at("other"),
+                        "scip-typescript npm p 1.0.0 node_modules/`x.d.ts`/other().",
+                        0,
+                    ),
+                    occ(at("return"), "scip-java maven . . org/springframework/", 0),
+                    occ(at("import"), "local 1", 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files: BTreeMap<&str, &FileFacts> = BTreeMap::from([(path, &facts)]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined = join(&index, "", &files, &keys);
+        assert_eq!(
+            joined.packages,
+            [PackageUse {
+                at: Evidence {
+                    path: path.into(),
+                    span: at("Client }"),
+                },
+                package: rb_scip::Package {
+                    manager: "npm".into(),
+                    name: "lib".into(),
+                    version: "2.0.0".into(),
+                },
+            }]
         );
     }
 
@@ -555,6 +688,15 @@ mod tests {
         idx.documents[0].path = "src/Other.java".into();
         let joined = join(&idx, "svc", &files, &keys);
         assert!(joined.keys.is_empty() && joined.edges.is_empty());
+        // The file we do have facts for has no document: counted, and nothing else is.
+        assert_eq!(joined.coverage.files_without_document, 1);
+        assert_eq!(joined.coverage.definitions_total, 0);
+        assert_eq!(
+            join(&index(&facts), "svc", &files, &keys)
+                .coverage
+                .files_without_document,
+            0
+        );
         let mut shifted = index(&facts);
         for o in &mut shifted.documents[0].occurrences {
             o.span[1] += 1;

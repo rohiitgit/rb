@@ -521,6 +521,14 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
             n("references_unanchored"),
             n("references_unmatched")
         );
+        // Files the indexer left out (excluded by its tsconfig): no edges of any kind.
+        if n("files_without_document") > 0 {
+            let _ = write!(
+                line,
+                ", {} files without a document",
+                n("files_without_document")
+            );
+        }
     }
     line
 }
@@ -658,7 +666,16 @@ fn render_card(c: &ServiceCard) -> String {
         files(c.unowned_files),
         percent(c.unowned_files, c.files)
     );
-    out += "└─ APIs, tables, dependencies and call graph: not indexed yet (M2–M4)\n";
+    // Packages named by the service's exact (SCIP) references; heuristic projects have none.
+    if c.packages.is_empty() {
+        out += "├─ Packages: none\n";
+    } else {
+        out += &format!("├─ Packages ({})\n", c.packages.len());
+        for p in &c.packages {
+            out += &format!("│    {p}\n");
+        }
+    }
+    out += "└─ APIs, tables and call graph: not indexed yet (M2–M4)\n";
     out
 }
 

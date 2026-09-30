@@ -18,4 +18,4 @@ pub mod orchestrate;
 pub use orchestrate::{Budget, RunStatus, ScipRun, image_for, resolve_image, run_job};
 pub mod symbol;
 
-pub use symbol::last_descriptor_name;
+pub use symbol::{Package, last_descriptor_name, package};

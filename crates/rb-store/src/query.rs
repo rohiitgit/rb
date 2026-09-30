@@ -49,6 +49,8 @@ pub struct ServiceCard {
     /// Per-owner file counts, sorted by count desc then owner. A file can have several owners.
     pub file_owners: Vec<OwnerShare>,
     pub unowned_files: usize,
+    /// Keys of the packages the service depends on (`DEPENDS_ON`, design §5.5), sorted.
+    pub packages: Vec<String>,
 }
 
 /// One source's access to a table: a migration file (`MIGRATES`) or code (`QUERIES`).
@@ -411,18 +413,23 @@ impl Store {
             .collect();
         file_owners.sort_by(|a, b| b.files.cmp(&a.files).then_with(|| a.owner.cmp(&b.owner)));
 
-        let owners = self
-            .client
-            .query(
-                "SELECT o.key FROM rb.edge e
-                 JOIN rb.node o ON o.snapshot_id = e.snapshot_id AND o.id = e.dst
-                 WHERE e.snapshot_id = $1 AND e.src = $2 AND e.kind = 'OWNED_BY'
-                 ORDER BY o.key COLLATE \"C\"",
-                &[&snapshot_id, &id],
-            )?
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
+        // Targets of the service's edges of one kind, by key.
+        let mut targets = |kind: &str| -> anyhow::Result<Vec<String>> {
+            Ok(self
+                .client
+                .query(
+                    "SELECT o.key FROM rb.edge e
+                     JOIN rb.node o ON o.snapshot_id = e.snapshot_id AND o.id = e.dst
+                     WHERE e.snapshot_id = $1 AND e.src = $2 AND e.kind = $3
+                     ORDER BY o.key COLLATE \"C\"",
+                    &[&snapshot_id, &id, &kind],
+                )?
+                .iter()
+                .map(|r| r.get(0))
+                .collect())
+        };
+        let owners = targets("OWNED_BY")?;
+        let packages = targets("DEPENDS_ON")?;
 
         Ok(ServiceCard {
             key: key.to_owned(),
@@ -435,6 +442,7 @@ impl Store {
             owners,
             file_owners,
             unowned_files,
+            packages,
         })
     }
 }

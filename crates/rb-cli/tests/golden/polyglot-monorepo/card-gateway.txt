@@ -5,4 +5,5 @@ edge-gateway  (path: gateway, deployable)
 ├─ File ownership
 │    @acme/platform      1 file  100%
 │    unowned            0 files    0%
-└─ APIs, tables, dependencies and call graph: not indexed yet (M2–M4)
+├─ Packages: none
+└─ APIs, tables and call graph: not indexed yet (M2–M4)
