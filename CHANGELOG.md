@@ -1,5 +1,9 @@
 # Changelog
 
+## [2026-10-01 02:30]
+- e2e tests are serialized through a lock in `db_url()`: run in parallel, the `rb` processes they spawn create and drop AGE graphs concurrently, and AGE 1.8 on Postgres 18 then intermittently kills a backend (`FATAL: failed to re-find shared lock object`, 11 times in a day; three serial runs and a direct read-only write attempt never reproduced it). Recorded as a risk in design §14.
+- Files affected: crates/rb-cli/tests/e2e.rs, docs/repository-brain-design.md.
+
 ## [2026-10-01 01:00]
 - M3a evaluator pass 5 fixes (contract Amendment 5): every declarator is a variable binding again, and the resolver decides whether a bare call goes through a variable or a kept definition (`Index::defines`), so function-valued constants inside callbacks no longer fall through to same-named imports; `var` hoisting starts at the start of the function or file and covers `for (var …)` loop variables.
 - Classified edge diff against e21d631: hono lost exactly the one wrong edge (`jsx/hooks/index.ts` → `dom/render.ts/update()`), 6,309 resolved, 14.8%; gin, requests and petclinic identical.

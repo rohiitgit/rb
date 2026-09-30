@@ -16,12 +16,37 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn db_url() -> Option<String> {
-    let url = std::env::var("RB_TEST_DATABASE_URL").ok();
-    if url.is_none() {
-        eprintln!("skipping: set RB_TEST_DATABASE_URL to run database tests");
+/// The database URL, plus a lock that serializes the tests of this binary: they spawn `rb`
+/// processes that create and drop AGE graphs concurrently, and AGE 1.8 on Postgres 18 then
+/// intermittently kills a backend with `FATAL: failed to re-find shared lock object` (seen 11
+/// times in one day of parallel runs, never serially). The tests themselves are independent.
+struct Db {
+    url: String,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for Db {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.url
     }
-    url
+}
+
+impl AsRef<std::ffi::OsStr> for Db {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.url.as_ref()
+    }
+}
+
+fn db_url() -> Option<Db> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let url = std::env::var("RB_TEST_DATABASE_URL").ok();
+    let Some(url) = url else {
+        eprintln!("skipping: set RB_TEST_DATABASE_URL to run database tests");
+        return None;
+    };
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Some(Db { url, _guard: guard })
 }
 
 /// Materialises `fixtures/<name>` as a git repository with a fixed identity and date.
