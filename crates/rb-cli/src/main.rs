@@ -540,12 +540,13 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         let n = |k: &str| c[k].as_u64().unwrap_or(0);
         let _ = write!(
             line,
-            ", definitions matched {}/{} ({} by name), references matched {}, external {}, local {}, unanchored {}, unmatched {}",
+            ", definitions matched {}/{} ({} by name), references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}",
             n("definitions_matched"),
             n("definitions_total"),
             n("definitions_matched_by_name"),
             n("references_matched"),
             n("references_external"),
+            n("references_undocumented"),
             n("references_local"),
             n("references_unanchored"),
             n("references_unmatched")

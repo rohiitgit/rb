@@ -183,4 +183,17 @@ Findings from the research step (2026-09-29):
       - [x] D6 `unpinned` in the `scip:` lines; polyglot status golden re-blessed.
       - [x] Docs: contract (invariant 1, S5/S7, verified facts, S11 wording, amendments 15–20), IMPLEMENT.md, CHANGELOG.md, lessons.
       - [x] Verify: fmt, clippy, unit tests (awk-summed), e2e with containers, stub scan, no `t_*` repos, no work dirs.
-    - [ ] Evaluator pass 2, commit.
+    - [ ] Evaluator pass 2 (test-first, one amendment each, 21–24):
+      - [x] E1 `IMPLEMENTS` through a hierarchy: `rb_scip::type_symbol_of` (replaces `last_type_name`); the join walks A's holder's declared supertypes (by simple name, visited set, depth cap 64) to B's type definition found exactly by symbol and compared by (document, index). Unit: abstract class + interface chain, two-class chain, the reverse still rejected, a same-named interface in another package, a generic supertype.
+      - [x] E2 one run instance per `run_job`: work dir `<work_dir>/<hash16>-<pid>-<nanos>`, containers `rb-scip-<hash16>-<pid>-<nanos>-<phase>`; cache key unchanged. Unit: two runs of the same job share no directory and no name; each name is its instance's.
+      - [x] E3 `references_undocumented`: an undefined symbol of the project's own package counts there, not as external; status line and diagnostic; the three status goldens changed, each moved reference identified in the cached index.
+      - [x] E4 `resolve_target` accepts a key suffix after a space as well as after `/`. Unit in `rb_store::code`.
+      - [x] Docs: contract (S5, amendments 21–24), IMPLEMENT.md, CHANGELOG.md, lessons.
+      - [x] Verify without containers: fmt, clippy, unit tests (awk-summed), e2e against the database with Docker hidden, stub scan, no `t_*` repos, no work dirs, `df -h /`.
+      - [ ] Verify with containers, once a runtime with both images exists: `scip_ts_express_prisma` without `RB_BLESS` (it passed once under `RB_BLESS=1`, before the runtime was lost), `scip_java_spring_jpa` and `scip_polyglot_monorepo` (both skipped: no scip-java image; their status goldens were edited by hand), and two concurrent `rb index --no-cache --force` of one fixture (E2).
+    - [ ] Commit.
+
+## Review (evaluator pass 2)
+- The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
+- Found while hand-checking E3: the Java fixture's two "external" references that moved are a record's compiler-generated accessors, so `references_undocumented` covers generated members as well as files without a document.
+- Environment, not code: the container runtime (colima) disappeared during verification and Docker Desktop was started by someone else, so no SCIP e2e was re-run; an IDE build directory (`fixtures/java-spring-jpa/target/`) appeared in the Java fixture and breaks `orm_table_deps_goldens` while it is there, because `fixture_repo` copies untracked files.

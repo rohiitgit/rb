@@ -80,8 +80,9 @@ impl ScipMode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScipOptions {
     pub mode: ScipMode,
-    /// Holds one export directory per job (`<input_hash[..16]>`), removed after the run. Must be a
-    /// path the container runtime can bind-mount.
+    /// Holds one export directory per job run (`<input_hash[..16]>-<pid>-<nanos>`, so runs of
+    /// the same commit at once share nothing; contract M3b amendment 22), removed after the
+    /// run. Must be a path the container runtime can bind-mount.
     pub work_dir: PathBuf,
     /// Package-manager caches shared across jobs.
     pub cache_dir: PathBuf,

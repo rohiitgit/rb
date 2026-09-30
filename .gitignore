@@ -1,3 +1,5 @@
 /target
 /var
 /archive
+.DS_Store
+/fixtures/**/target/

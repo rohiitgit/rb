@@ -205,8 +205,9 @@ impl<'g> Describer<'g> {
     }
 }
 
-/// The nodes `input` may mean, best tier only: an exact key, `path:line`, a key suffix, a dotted
-/// name (`AuthService.login`) or a plain name. Several means the caller must choose (§9.1).
+/// The nodes `input` may mean, best tier only: an exact key, `path:line`, a key suffix (after a
+/// `/`, or the whole descriptor part of a SCIP key), a dotted name (`AuthService.login`) or a
+/// plain name. Several means the caller must choose (§9.1).
 /// `path:line` picks the symbol declared at or nearest above that line in that file: symbols
 /// record where their name is, not their full extent.
 pub fn resolve_target(graph: &Graph, input: &str) -> Vec<i64> {
@@ -242,9 +243,14 @@ pub fn resolve_target(graph: &Graph, input: &str) -> Vec<i64> {
             return sorted(at_line);
         }
     }
+    // A suffix starts after a `/`, or after the space that starts a SCIP key's descriptors
+    // (`com/acme/auth/AuthService#authenticate().` names the whole descriptor part).
+    let (slash, space) = (format!("/{input}"), format!(" {input}"));
     let suffix: Vec<&Node> = nodes
         .clone()
-        .filter(|n| n.kind == NodeKind::Symbol && n.key.ends_with(&format!("/{input}")))
+        .filter(|n| {
+            n.kind == NodeKind::Symbol && (n.key.ends_with(&slash) || n.key.ends_with(&space))
+        })
         .collect();
     if !suffix.is_empty() {
         return sorted(suffix);
@@ -516,6 +522,9 @@ mod tests {
 
     use super::*;
 
+    const SCIP_KEY: &str =
+        "scip-java maven maven/com.acme/svc 1.0 com/acme/auth/AuthService#authenticate().";
+
     /// A small codebase:
     /// - `api/Ctl.java`: `Ctl#handle()` calls `Svc#run()` (interface method, heuristic);
     ///   `Ctl#other()` passes `Util#fmt()` as a value (REFERENCES).
@@ -524,6 +533,7 @@ mod tests {
     /// - `web/Page.ts`: `page()` calls `Ctl#handle()`.
     ///
     /// Services: api (Ctl), core (Svc, Job), web (Page). Owners: @api on api, @core on core.
+    /// `core/Svc.java` also holds one symbol with a SCIP key, [`SCIP_KEY`], with no edges.
     fn fixture() -> Graph {
         let mut b = GraphBuilder::new();
         let file = |p: &str| NodeKey::new(NodeKind::File, p);
@@ -599,6 +609,20 @@ mod tests {
             )
             .unwrap();
         }
+        // One SCIP-keyed symbol (a key whose descriptor starts after a space, not a `/`).
+        b.add_node(sym(SCIP_KEY), "authenticate", Attrs::new())
+            .unwrap();
+        b.add_edge(
+            NewEdge::new(
+                sym(SCIP_KEY),
+                EdgeKind::DefinedIn,
+                file("core/Svc.java"),
+                Provenance::Scip,
+                Certainty::Exact,
+            )
+            .evidence(at("core/Svc.java", 9)),
+        )
+        .unwrap();
         let k = |p: &str, d: &str| sym(&format!("rb-heuristic . . . `{p}`/{d}"));
         let edge = |b: &mut GraphBuilder, s: NodeKey, kind, d: NodeKey, c, p: &str, line| {
             b.add_edge(NewEdge::new(s, kind, d, Provenance::Heuristic, c).evidence(at(p, line)))
@@ -734,6 +758,16 @@ mod tests {
         // `path:line` (1-based): the symbol declared at or nearest above that line.
         assert_eq!(one("core/Svc.java:6"), ["SvcImpl#run()."]);
         assert!(one("nothing").is_empty());
+        // A SCIP key's descriptor starts after a space (contract M3b amendment 24), so the whole
+        // descriptor is a suffix as much as its tail after a `/`; the dotted form works too.
+        assert_eq!(one(SCIP_KEY), [SCIP_KEY]);
+        assert_eq!(one("com/acme/auth/AuthService#authenticate()."), [SCIP_KEY]);
+        assert_eq!(one("auth/AuthService#authenticate()."), [SCIP_KEY]);
+        assert_eq!(one("AuthService#authenticate()."), [SCIP_KEY]);
+        assert_eq!(one("AuthService.authenticate"), [SCIP_KEY]);
+        assert_eq!(one("core/Svc.java:10"), [SCIP_KEY]);
+        // Part of a descriptor is not a suffix.
+        assert!(one("acme/auth/AuthService#authenticate()").is_empty());
     }
 
     #[test]

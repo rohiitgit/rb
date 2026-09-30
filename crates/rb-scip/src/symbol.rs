@@ -11,21 +11,23 @@ pub fn last_descriptor_name(symbol: &str) -> Option<String> {
     parsed.descriptors.last().map(|d| d.name.clone())
 }
 
-/// The name of a global symbol's last type descriptor: the type itself for `… p/Dog#`, the
-/// enclosing type for a member such as `… p/Dog#sound().` or `… src/\`a.ts\`/Cache#get().`.
-/// `None` for local symbols, strings the grammar rejects and symbols without a type descriptor
-/// (a top-level function).
-pub fn last_type_name(symbol: &str) -> Option<String> {
+/// The symbol of a global symbol's last type: the symbol cut after its last type descriptor
+/// (`… p/Dog#` for `… p/Dog#sound().`, itself for `… p/Dog#`), byte for byte a prefix of the
+/// original, so it can be looked up among the index's definitions. `None` for local symbols,
+/// strings the grammar rejects, symbols without a type descriptor, and a symbol the `scip`
+/// crate would format differently from how the indexer wrote it (then no prefix is exact).
+pub fn type_symbol_of(symbol: &str) -> Option<String> {
     if scip::symbol::is_local_symbol(symbol) {
         return None;
     }
-    let parsed = scip::symbol::parse_symbol(symbol).ok()?;
-    parsed
+    let mut parsed = scip::symbol::parse_symbol(symbol).ok()?;
+    let last_type = parsed
         .descriptors
         .iter()
-        .rev()
-        .find(|d| d.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Type))
-        .map(|d| d.name.clone())
+        .rposition(|d| d.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Type))?;
+    parsed.descriptors.truncate(last_type + 1);
+    let cut = scip::symbol::format_symbol(parsed);
+    symbol.starts_with(&cut).then_some(cut)
 }
 
 /// The package a global symbol belongs to (design §5.5): the grammar's `<manager> <package-name>
@@ -108,34 +110,39 @@ mod tests {
         assert_eq!(last_descriptor_name(""), None);
     }
 
-    /// The last type descriptor names a member's enclosing type, or the type itself; a top-level
-    /// function, a namespace and a local have none.
+    /// The type symbol is the symbol cut after its last type descriptor (a member's enclosing
+    /// type, or the type itself), byte for byte a prefix of the original, so it can be looked up
+    /// among the index's definitions; a top-level function, a namespace and a local have none.
     #[test]
-    fn the_last_type_name_is_the_enclosing_type_of_a_member() {
+    fn the_type_symbol_is_the_symbol_cut_after_its_last_type_descriptor() {
         let java = "scip-java maven maven/com.acme/auth-service 1.4.0 com/acme/auth/";
         assert_eq!(
-            last_type_name(&format!("{java}DefaultAuthService#authenticate().")).as_deref(),
-            Some("DefaultAuthService")
+            type_symbol_of(&format!("{java}DefaultAuthService#authenticate().")).as_deref(),
+            Some(format!("{java}DefaultAuthService#").as_str())
         );
         assert_eq!(
-            last_type_name(&format!("{java}AuthService#")).as_deref(),
-            Some("AuthService")
+            type_symbol_of(&format!("{java}AuthService#")).as_deref(),
+            Some(format!("{java}AuthService#").as_str())
         );
         assert_eq!(
-            last_type_name(&format!("{java}Outer#Inner#run(+1).")).as_deref(),
-            Some("Inner")
+            type_symbol_of(&format!("{java}Outer#Inner#run(+1).")).as_deref(),
+            Some(format!("{java}Outer#Inner#").as_str())
         );
         assert_eq!(
-            last_type_name("scip-typescript npm p 1.0.0 src/`cache.ts`/Cache#get().").as_deref(),
-            Some("Cache")
+            type_symbol_of("scip-java maven . . p/Dog#sound().").as_deref(),
+            Some("scip-java maven . . p/Dog#")
         );
         assert_eq!(
-            last_type_name("scip-typescript npm p 1.0.0 src/`a.ts`/f()."),
+            type_symbol_of("scip-typescript npm p 1.0.0 src/`cache.ts`/Cache#get().").as_deref(),
+            Some("scip-typescript npm p 1.0.0 src/`cache.ts`/Cache#")
+        );
+        assert_eq!(
+            type_symbol_of("scip-typescript npm p 1.0.0 src/`a.ts`/f()."),
             None
         );
-        assert_eq!(last_type_name(java), None);
-        assert_eq!(last_type_name("local 3"), None);
-        assert_eq!(last_type_name("not a symbol"), None);
+        assert_eq!(type_symbol_of(java), None);
+        assert_eq!(type_symbol_of("local 3"), None);
+        assert_eq!(type_symbol_of("not a symbol"), None);
     }
 
     #[test]

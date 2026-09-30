@@ -1,2 +1,2 @@
   code: 100.0% of references to own code resolved (1 resolved, 0 ambiguous, 0 unresolved; 0 external); 2 exact calls (scip)
-  scip: . scip-java ok <elapsed>, definitions matched 15/15 (1 by name), references matched 2, external 4, local 0, unanchored 0, unmatched 0
+  scip: . scip-java ok <elapsed>, definitions matched 15/15 (1 by name), references matched 2, external 2, undocumented 2, local 0, unanchored 0, unmatched 0

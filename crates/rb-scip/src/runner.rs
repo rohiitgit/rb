@@ -17,8 +17,9 @@ pub enum Network {
 /// One container invocation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContainerRun {
-    /// The container's name (`rb-scip-<input_hash16>-<fetch|index>`), so a run that exceeds
-    /// its budget can be killed by name (contract M3b amendment 18); `None` leaves it to Docker.
+    /// The container's name (`rb-scip-<input_hash16>-<pid>-<nanos>-<fetch|index>`, unique to
+    /// one run of the job), so a run that exceeds its budget can be killed by name (contract
+    /// M3b amendments 18 and 22); `None` leaves it to Docker.
     pub name: Option<String>,
     /// Image reference pinned by digest.
     pub image: String,

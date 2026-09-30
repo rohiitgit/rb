@@ -444,6 +444,7 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "definitions_total": c.definitions_total,
             "references_matched": c.references_matched,
             "references_external": c.references_external,
+            "references_undocumented": c.references_undocumented,
             "references_local": c.references_local,
             "references_unanchored": c.references_unanchored,
             "references_unmatched": c.references_unmatched,

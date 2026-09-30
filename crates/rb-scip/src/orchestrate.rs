@@ -104,10 +104,12 @@ pub fn resolve_image(job: &Job, runner: &dyn Runner) -> Result<String, String> {
 }
 
 /// Runs `job` in `image` (from [`resolve_image`]) over `files` (`(root-relative path, bytes)`)
-/// in `work_dir` (recreated, removed afterwards) with `cache_dir` holding package-manager
-/// caches shared across jobs. The containers are named `rb-scip-<work dir name>-<phase>` (the
-/// caller names the work directory after the job's input hash), so a run over its budget can
-/// be killed by name (contract M3b amendment 18).
+/// with `cache_dir` holding package-manager caches shared across jobs. `work_dir` names the
+/// job (the caller names it after the job's input hash); this run's export lives next to it in
+/// a directory of its own, `<work_dir>-<pid>-<nanos>` (created, removed afterwards), and its
+/// containers are named `rb-scip-<that name>-<phase>`, so two runs of the same job at once
+/// share nothing (contract M3b amendment 22) and a run over its budget can be killed by name
+/// (amendment 18).
 pub fn run_job(
     job: &Job,
     image: &str,
@@ -127,15 +129,21 @@ pub fn run_job(
             elapsed: Duration::ZERO,
         });
     }
-    export(files, work_dir)?;
-    std::fs::create_dir_all(cache_dir)?;
-    let name = format!(
-        "rb-scip-{}",
+    let instance = format!(
+        "{}-{}-{}",
         work_dir
             .file_name()
             .map(|n| n.to_string_lossy())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
     );
+    let work_dir = &work_dir.with_file_name(&instance);
+    export(files, work_dir)?;
+    std::fs::create_dir_all(cache_dir)?;
+    let name = format!("rb-scip-{instance}");
     let result = (|| -> anyhow::Result<ScipRun> {
         let (mut fetches, mut index) = match job.indexer {
             Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
@@ -460,11 +468,20 @@ mod tests {
         .unwrap();
         assert_eq!(run.status, RunStatus::Ok);
         assert_eq!(run.index.as_deref(), Some(&b"fake-index"[..]));
-        assert!(!work.exists(), "work directory is removed");
         let runs = fake.runs.borrow();
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].name.as_deref(), Some("rb-scip-work-fetch"));
-        assert_eq!(runs[1].name.as_deref(), Some("rb-scip-work-index"));
+        // The export lived in `work-<pid>-<nanos>` next to `work`, and is gone.
+        let exported = runs[0].workdir.file_name().unwrap().to_string_lossy();
+        assert!(exported.starts_with("work-"), "{exported}");
+        assert!(!work.exists() && !runs[0].workdir.exists());
+        assert_eq!(
+            runs[0].name.as_deref(),
+            Some(format!("rb-scip-{exported}-fetch").as_str())
+        );
+        assert_eq!(
+            runs[1].name.as_deref(),
+            Some(format!("rb-scip-{exported}-index").as_str())
+        );
         assert_eq!(runs[0].network, Network::Registries);
         assert_eq!(
             runs[0].entrypoint.as_deref(),
@@ -552,15 +569,16 @@ mod tests {
         assert!(!work.exists());
         let runs = fake.runs.borrow();
         assert_eq!(runs.len(), 3);
-        let names: Vec<Option<&str>> = runs.iter().map(|r| r.name.as_deref()).collect();
+        let names: Vec<&str> = runs.iter().map(|r| r.name.as_deref().unwrap()).collect();
         assert_eq!(
-            names,
-            [
-                Some("rb-scip-work-fetch"),
-                Some("rb-scip-work-fetch"),
-                Some("rb-scip-work-index")
-            ],
+            names[0], names[1],
             "sequential fetch runs reuse the name; `--rm` removes each before the next"
+        );
+        assert!(names[0].starts_with("rb-scip-work-") && names[0].ends_with("-fetch"));
+        assert_eq!(
+            names[2],
+            names[0].replace("-fetch", "-index"),
+            "the index phase runs under the same instance"
         );
         for r in runs.iter() {
             assert_eq!(r.image, JAVA_ID);
@@ -609,6 +627,79 @@ mod tests {
         assert!(
             cache.join("m2").is_dir(),
             "the Maven cache directory is created"
+        );
+    }
+
+    /// Contract M3b amendment 22: two runs of the same job (the same input hash, so the same
+    /// `work_dir` argument) export into distinct directories and name their containers
+    /// distinctly, so concurrent runs of one commit neither clobber each other's export nor
+    /// collide on `--name`; the name the runner kills on a budget overrun is the instance's.
+    #[test]
+    fn each_run_of_a_job_has_its_own_work_directory_and_container_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("0123456789abcdef");
+        let cache = tmp.path().join("cache");
+        let fake = Fake::new(false, false);
+        let job = ts_job(NodeLock::PackageLock);
+        for _ in 0..2 {
+            let run = run_job(
+                &job,
+                SCIP_TYPESCRIPT_IMAGE,
+                &files(),
+                &work,
+                &cache,
+                &Budget::default(),
+                &fake,
+            )
+            .unwrap();
+            assert_eq!(run.status, RunStatus::Ok);
+        }
+        let runs = fake.runs.borrow();
+        assert_eq!(runs.len(), 4, "fetch and index, twice");
+        let instances: Vec<String> = runs
+            .iter()
+            .map(|r| {
+                r.workdir
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(instances[0], instances[1], "one instance per run_job");
+        assert_eq!(instances[2], instances[3]);
+        assert_ne!(instances[0], instances[2], "a new instance per run_job");
+        let pid = std::process::id().to_string();
+        for (r, instance) in runs.iter().zip(&instances) {
+            let rest = instance
+                .strip_prefix("0123456789abcdef-")
+                .unwrap_or_else(|| panic!("{instance}"));
+            let (p, nanos) = rest.split_once('-').unwrap_or_else(|| panic!("{instance}"));
+            assert_eq!(p, pid, "{instance}");
+            assert!(
+                !nanos.is_empty() && nanos.chars().all(|c| c.is_ascii_digit()),
+                "{instance}"
+            );
+            let phase = if r.network == Network::None {
+                "index"
+            } else {
+                "fetch"
+            };
+            assert_eq!(
+                r.name.as_deref(),
+                Some(format!("rb-scip-{instance}-{phase}").as_str())
+            );
+        }
+        let left: Vec<String> = tmp
+            .path()
+            .read_dir()
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "cache")
+            .collect();
+        assert!(
+            left.is_empty(),
+            "instance directories left behind: {left:?}"
         );
     }
 
