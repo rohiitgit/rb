@@ -3,8 +3,9 @@
 //! Requires the compose database: `docker compose up -d --wait`, then
 //! `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55432/rb cargo test`.
 //! Without `RB_TEST_DATABASE_URL` these tests print a notice and pass vacuously. Every index run
-//! passes `--no-scip` so goldens stay heuristic and Docker-free, except `scip_ts_express_prisma`,
-//! which runs the real scip-typescript container and skips itself when Docker is unavailable.
+//! passes `--no-scip` so goldens stay heuristic and Docker-free, except the `scip_*` tests,
+//! which run the real indexer containers and skip themselves when Docker (or the local
+//! scip-java image) is unavailable.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -112,13 +113,20 @@ fn copy_dir(from: &Path, to: &Path) {
 }
 
 fn rb(url: &str, args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_rb"))
-        .args(args)
+    rb_with_path(url, args, None)
+}
+
+/// `rb` with the child's `PATH` replaced (`Some("/usr/bin:/bin")` hides Docker from it).
+fn rb_with_path(url: &str, args: &[&str], path: Option<&str>) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rb"));
+    cmd.args(args)
         .env("RB_DATABASE_URL", url)
         .env("RB_AGE_LOAD_DIR", workspace_root().join("var/age-load"))
-        .env("RB_SCIP_WORK_DIR", workspace_root().join("var/scip"))
-        .output()
-        .unwrap();
+        .env("RB_SCIP_WORK_DIR", workspace_root().join("var/scip"));
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
         "rb {args:?} failed:\n{}",
@@ -789,6 +797,75 @@ fn scip_ts_express_prisma() {
         "{second}"
     );
     assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    // Amendment 20: `--no-cache` bypasses the index cache's reads, so the container runs again;
+    // its outcome replaces the row and gives the same graph. Only the `scip_status` diagnostic's
+    // `elapsed_ms` moves, since it is the (new) container run's time (amendment 2).
+    let third = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        third.contains("scip: . scip-typescript ok ") && !third.contains("(cached"),
+        "{third}"
+    );
+    assert_eq!(
+        mask_elapsed_ms(&rb(&url, &["dump", "--repo", &name])),
+        mask_elapsed_ms(&dump)
+    );
+}
+
+/// `dump` with every `"elapsed_ms":<n>` replaced by `"elapsed_ms":<elapsed>`.
+fn mask_elapsed_ms(dump: &str) -> String {
+    let key = "\"elapsed_ms\":";
+    let mut out = String::with_capacity(dump.len());
+    let mut rest = dump;
+    while let Some(at) = rest.find(key) {
+        let after = at + key.len();
+        out.push_str(&rest[..after]);
+        out.push_str("<elapsed>");
+        rest = rest[after..].trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Contract M3b amendment 17: whether SCIP ran is part of the snapshot's tool configuration.
+/// A snapshot indexed while Docker was hidden from `rb` (`PATH=/usr/bin:/bin`) is not "up to
+/// date" for a `--no-scip` run, nor for a run with Docker; each configuration is up to date
+/// only with itself.
+#[test]
+fn scip_availability_is_part_of_the_tool_configuration() {
+    let Some(url) = db_url() else { return };
+    // No SCIP job in this repository: only the configuration differs between the runs.
+    let repo = repo_from(&[("tool.py", "def f():\n    pass\n"), ("README.md", "x\n")]);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipmode_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let hidden = Some("/usr/bin:/bin");
+    let first = rb_with_path(&url, &["index", path, "--repo", &name], hidden);
+    assert!(first.contains("snapshot"), "{first}");
+    let again = rb_with_path(&url, &["index", path, "--repo", &name], hidden);
+    assert!(again.contains("up to date"), "{again}");
+
+    let off = rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    assert!(!off.contains("up to date"), "unavailable ≠ off: {off}");
+    let off_again = rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    assert!(off_again.contains("up to date"), "{off_again}");
+
+    if rb_scip::docker_available().is_ok() {
+        let on = rb(&url, &["index", path, "--repo", &name]);
+        assert!(!on.contains("up to date"), "off ≠ on: {on}");
+        let unavailable = rb_with_path(&url, &["index", path, "--repo", &name], hidden);
+        assert!(
+            !unavailable.contains("up to date"),
+            "on ≠ unavailable: {unavailable}"
+        );
+    } else {
+        eprintln!("skipping the on/unavailable half: docker is not available");
+    }
 }
 
 /// The `code:` and `scip:` lines of `rb status`, with each job's run time masked: it is the
@@ -823,7 +900,7 @@ fn scip_java_available() -> Result<(), String> {
     use rb_scip::Runner as _;
     rb_scip::docker_available()?;
     let image = rb_scip::jobs::SCIP_JAVA_IMAGE;
-    rb_scip::DockerRunner
+    rb_scip::DockerRunner::default()
         .image_id(image)
         .map(|_| ())
         .ok_or_else(|| format!("{image} is not built; see docker/scip-java/README.md"))
@@ -831,11 +908,12 @@ fn scip_java_available() -> Result<(), String> {
 
 /// Contract M3b S7 for one SCIP-ok project: every `CALLS`, `REFERENCES` and `IMPLEMENTS` edge
 /// of `dump` whose source or target key starts with `key_prefix` (the project's SCIP package,
-/// `""` for every edge) is `scip`/`exact`, and no such edge names one of the project's files
-/// through a heuristic key (`` `<root>/ ``). Returns the number of exact `CALLS`.
-fn assert_exact_code_edges(dump: &str, key_prefix: &str, root: &str) -> usize {
+/// `""` for every edge) is `scip`/`exact`, and no such edge names a file under `documented`
+/// (a directory the index has documents for) through a heuristic key (`` `<documented> ``).
+/// Returns the number of exact `CALLS`.
+fn assert_exact_code_edges(dump: &str, key_prefix: &str, documented: &str) -> usize {
     let mut exact_calls = 0;
-    let heuristic_in_root = format!("rb-heuristic . . . `{root}");
+    let heuristic_in_root = format!("rb-heuristic . . . `{documented}");
     for line in dump.lines() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
         let kind = row
@@ -929,9 +1007,37 @@ fn scip_java_spring_jpa() {
         rb(&url, &["callers", "AuthController.login", "--repo", &name])
     );
 
-    // S7: no heuristic code edge remains anywhere in the project.
+    // Amendment 16: `IMPLEMENTS` runs from the implementation to the interface only, so the
+    // interface method is not listed as an implementer of the class's.
+    golden(
+        fixture,
+        "scip-impact-default-authenticate.txt",
+        &rb(
+            &url,
+            &["impact", "DefaultAuthService.authenticate", "--repo", &name],
+        ),
+    );
+
+    // S7: no heuristic code edge remains in the documented files (the Java sources), and every
+    // edge of the project's package is exact.
     let dump = rb(&url, &["dump", "--repo", &name]);
-    assert!(assert_exact_code_edges(&dump, "", "") >= 2, "{dump}");
+    let package = "scip-java maven maven/com.acme/auth-service 1.4.0 ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "src/") >= 2,
+        "{dump}"
+    );
+    // Amendment 15: ownership is by document. `scripts/tool.py` lies under the Maven root but
+    // scip-java has no document for it, so it keeps its heuristic `main → helper` call and is
+    // not counted as a file without a document (see the status golden).
+    let python_call = dump.lines().any(|line| {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        row[0] == "E"
+            && row[2] == "rb-heuristic . . . `scripts/tool.py`/main()."
+            && row[3] == "CALLS"
+            && row[5] == "rb-heuristic . . . `scripts/tool.py`/helper()."
+            && row[6] == "heuristic"
+    });
+    assert!(python_call, "no heuristic main → helper call in {dump}");
     golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
     // S8: Maven artifacts and the JDK, with the versions scip-java resolved.
     golden(

@@ -11,6 +11,23 @@ pub fn last_descriptor_name(symbol: &str) -> Option<String> {
     parsed.descriptors.last().map(|d| d.name.clone())
 }
 
+/// The name of a global symbol's last type descriptor: the type itself for `… p/Dog#`, the
+/// enclosing type for a member such as `… p/Dog#sound().` or `… src/\`a.ts\`/Cache#get().`.
+/// `None` for local symbols, strings the grammar rejects and symbols without a type descriptor
+/// (a top-level function).
+pub fn last_type_name(symbol: &str) -> Option<String> {
+    if scip::symbol::is_local_symbol(symbol) {
+        return None;
+    }
+    let parsed = scip::symbol::parse_symbol(symbol).ok()?;
+    parsed
+        .descriptors
+        .iter()
+        .rev()
+        .find(|d| d.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Type))
+        .map(|d| d.name.clone())
+}
+
 /// The package a global symbol belongs to (design §5.5): the grammar's `<manager> <package-name>
 /// <version>` fields.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,6 +106,36 @@ mod tests {
         assert_eq!(last_descriptor_name("local 3"), None);
         assert_eq!(last_descriptor_name("not a symbol"), None);
         assert_eq!(last_descriptor_name(""), None);
+    }
+
+    /// The last type descriptor names a member's enclosing type, or the type itself; a top-level
+    /// function, a namespace and a local have none.
+    #[test]
+    fn the_last_type_name_is_the_enclosing_type_of_a_member() {
+        let java = "scip-java maven maven/com.acme/auth-service 1.4.0 com/acme/auth/";
+        assert_eq!(
+            last_type_name(&format!("{java}DefaultAuthService#authenticate().")).as_deref(),
+            Some("DefaultAuthService")
+        );
+        assert_eq!(
+            last_type_name(&format!("{java}AuthService#")).as_deref(),
+            Some("AuthService")
+        );
+        assert_eq!(
+            last_type_name(&format!("{java}Outer#Inner#run(+1).")).as_deref(),
+            Some("Inner")
+        );
+        assert_eq!(
+            last_type_name("scip-typescript npm p 1.0.0 src/`cache.ts`/Cache#get().").as_deref(),
+            Some("Cache")
+        );
+        assert_eq!(
+            last_type_name("scip-typescript npm p 1.0.0 src/`a.ts`/f()."),
+            None
+        );
+        assert_eq!(last_type_name(java), None);
+        assert_eq!(last_type_name("local 3"), None);
+        assert_eq!(last_type_name("not a symbol"), None);
     }
 
     #[test]

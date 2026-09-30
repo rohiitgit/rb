@@ -7,11 +7,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rb_model::{Evidence, Span};
 use rb_scip::ScipIndex;
-use rb_syntax::{FileFacts, RefKind};
+use rb_syntax::{FileFacts, Language, RefKind};
+
+/// The languages an indexer covers: a file of one of them that its index has no document for
+/// is a gap (`Coverage::files_without_document`); a file of any other language under the same
+/// root was never the indexer's to cover.
+pub(crate) fn indexed_languages(indexer: &str) -> &'static [Language] {
+    match indexer {
+        "scip-java" => &[Language::Java],
+        "scip-typescript" => &[Language::TypeScript, Language::Tsx, Language::JavaScript],
+        _ => &[],
+    }
+}
 
 /// What one project's index contributes.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Joined {
+    /// The files (repo paths) the index has a document for: the ones whose code edges are the
+    /// exact ones below and nothing else (contract M3b invariant 1, amendment 15).
+    pub documented: BTreeSet<String>,
     /// Per file, per definition index: the SCIP symbol that replaces its heuristic key.
     pub keys: BTreeMap<String, BTreeMap<usize, String>>,
     /// Exact edges; every target is a symbol whose definition matched, so the graph has its node.
@@ -74,9 +88,9 @@ pub(crate) struct Coverage {
     pub references_unanchored: usize,
     /// No occurrence at that range: SCIP has nothing to say, and nothing is guessed.
     pub references_unmatched: usize,
-    /// Files the project owns that the indexer emitted no document for (a `tsconfig.json`
-    /// that excludes `test/**`): they get neither exact nor heuristic edges (contract M3b
-    /// invariant 1), and none of their references is counted above.
+    /// Files of the indexer's languages the project owns that the indexer emitted no document
+    /// for (a `tsconfig.json` that excludes `test/**`): they fall back to Tier B (contract M3b
+    /// amendment 15), and none of their references is counted above.
     pub files_without_document: usize,
 }
 
@@ -88,13 +102,15 @@ type Doc<'a> = (
     BTreeMap<Span, Vec<&'a rb_scip::Occurrence>>,
 );
 
-/// Joins `index` (paths relative to `root`) with the facts of the repository's files, keyed by
-/// repo path, whose heuristic keys are `keys[path]`.
+/// Joins `index` (paths relative to `root`) with the facts of the files the project owns, keyed
+/// by repo path, whose heuristic keys are `keys[path]`; `languages` are the ones the indexer
+/// covers ([`indexed_languages`]).
 pub(crate) fn join(
     index: &ScipIndex,
     root: &str,
-    files: &BTreeMap<&str, &FileFacts>,
+    files: &BTreeMap<&str, (Language, &FileFacts)>,
     keys: &BTreeMap<&str, Vec<String>>,
+    languages: &[Language],
 ) -> Joined {
     let repo_path = |doc: &str| {
         if root.is_empty() {
@@ -123,7 +139,7 @@ pub(crate) fn join(
         .iter()
         .filter_map(|doc| {
             let path = repo_path(&doc.path);
-            let facts = *files.get(path.as_str())?;
+            let (_, facts) = *files.get(path.as_str())?;
             let by_span = doc.occurrences.iter().fold(
                 BTreeMap::<Span, Vec<&rb_scip::Occurrence>>::new(),
                 |mut m, o| {
@@ -134,10 +150,12 @@ pub(crate) fn join(
             Some((path, doc, facts, by_span))
         })
         .collect();
-    let documented: BTreeSet<&str> = docs.iter().map(|(path, ..)| path.as_str()).collect();
+    out.documented = docs.iter().map(|(path, ..)| path.clone()).collect();
     out.coverage.files_without_document = files
-        .keys()
-        .filter(|path| !documented.contains(*path))
+        .iter()
+        .filter(|(path, (language, _))| {
+            languages.contains(language) && !out.documented.contains(**path)
+        })
         .count();
     // Definitions first, over every document: the name's range is a definition occurrence of a
     // global symbol. The matched symbols are the only targets an edge may have, since only they
@@ -244,7 +262,9 @@ pub(crate) fn join(
                 },
                 package,
             }));
-        // Implementations come from symbol information, anchored at the type's name.
+        // Implementations come from symbol information, anchored at the definition's name, in
+        // the one direction the syntax supports (contract M3b amendment 16): scip-java 0.13.1
+        // emits `is_implementation` on both sides of an override inside the workspace.
         let Some(replaced) = replaced else {
             continue;
         };
@@ -252,8 +272,11 @@ pub(crate) fn join(
             let Some((i, _)) = replaced.iter().find(|(_, sym)| **sym == s.symbol) else {
                 continue;
             };
+            let holder = type_holder(facts, *i);
             for rel in s.relationships.iter().filter(|r| r.is_implementation) {
-                if nodes.contains(rel.symbol.as_str()) {
+                let supported = rb_scip::last_type_name(&rel.symbol)
+                    .is_some_and(|target| declares_supertype(holder, &target));
+                if supported && nodes.contains(rel.symbol.as_str()) {
                     implements.push(ScipEdge {
                         src: Source::Symbol(s.symbol.clone()),
                         kind: EdgeKind::Implements,
@@ -278,6 +301,28 @@ pub(crate) fn join(
 
 fn is_global_definition(o: &rb_scip::Occurrence) -> bool {
     o.is_definition() && !o.symbol.starts_with("local ")
+}
+
+/// The definition whose supertypes decide an `IMPLEMENTS` direction: the definition itself when
+/// it is a type, else (a method, a constant) the nearest enclosing type.
+fn type_holder(facts: &FileFacts, i: usize) -> &rb_syntax::Definition {
+    let mut d = &facts.definitions[i];
+    while matches!(
+        d.kind,
+        rb_syntax::DefKind::Function | rb_syntax::DefKind::Method | rb_syntax::DefKind::Constant
+    ) && let Some(parent) = d.parent
+    {
+        d = &facts.definitions[parent];
+    }
+    d
+}
+
+/// `d` extends or implements a type whose simple name is `name` (`a.b.Foo` and `Foo<T>` both
+/// name `Foo`).
+fn declares_supertype(d: &rb_syntax::Definition, name: &str) -> bool {
+    d.supertypes
+        .iter()
+        .any(|s| s.name.rsplit('.').next() == Some(name))
 }
 
 /// The fallback for a definition with no definition occurrence at its name (contract M3b
@@ -311,7 +356,9 @@ mod tests {
 
     const JAVA: &str = "package p;\nclass Animal { void sound() {} }\nclass Dog extends Animal {\n  void sound() { helper(); ext(); local(); }\n  void helper() {}\n}\n";
 
-    /// Definition occurrences at every Tree-sitter definition name, plus references.
+    /// Definition occurrences at every Tree-sitter definition name, plus references. The
+    /// `is_implementation` relationships are symmetric, as scip-java 0.13.1 emits them for an
+    /// override inside the workspace (both the method and the type level).
     fn index(facts: &FileFacts) -> ScipIndex {
         let sym = |name: &str| format!("scip-java maven . . p/{name}");
         let mut occurrences = Vec::new();
@@ -350,15 +397,22 @@ mod tests {
             documents: vec![Document {
                 path: "src/Dog.java".into(),
                 occurrences,
-                symbols: vec![SymbolInfo {
-                    symbol: sym("Dog#sound()."),
+                symbols: [
+                    ("Dog#sound().", "Animal#sound()."),
+                    ("Animal#sound().", "Dog#sound()."),
+                    ("Dog#", "Animal#"),
+                    ("Animal#", "Dog#"),
+                ]
+                .map(|(from, to)| SymbolInfo {
+                    symbol: sym(from),
                     relationships: vec![Relationship {
-                        symbol: sym("Animal#sound()."),
+                        symbol: sym(to),
                         is_implementation: true,
                         ..Default::default()
                     }],
                     ..Default::default()
-                }],
+                })
+                .to_vec(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -370,9 +424,10 @@ mod tests {
         let facts = rb_syntax::extract(Language::Java, JAVA.as_bytes()).unwrap();
         let path = "svc/src/Dog.java";
         let heuristic = rb_syntax::symbol_keys(path, &facts);
-        let files: BTreeMap<&str, &FileFacts> = BTreeMap::from([(path, &facts)]);
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([(path, heuristic)]);
-        let joined = join(&index(&facts), "svc", &files, &keys);
+        let joined = join(&index(&facts), "svc", &files, &keys, &[Language::Java]);
+        assert_eq!(joined.documented, BTreeSet::from([path.to_owned()]));
         let replaced: Vec<(String, String)> = joined.keys[path]
             .iter()
             .map(|(i, s)| (facts.definitions[*i].name.clone(), s.clone()))
@@ -393,10 +448,13 @@ mod tests {
                 ),
             ]
         );
+        // Only the direction the syntax supports (`Dog extends Animal`) gives `IMPLEMENTS`; the
+        // relationships the index carries the other way round (contract M3b amendment 16) do not.
         assert_eq!(
             edge_lines(&joined),
             [
                 "scip-java maven . . p/Dog# References scip-java maven . . p/Animal#",
+                "scip-java maven . . p/Dog# Implements scip-java maven . . p/Animal#",
                 "scip-java maven . . p/Dog#sound(). Calls scip-java maven . . p/Dog#helper().",
                 "scip-java maven . . p/Dog#sound(). Implements scip-java maven . . p/Animal#sound().",
             ]
@@ -479,10 +537,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let files: BTreeMap<&str, &FileFacts> = BTreeMap::from([(path, &facts)]);
+        let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys);
+        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
         assert_eq!(
             joined.packages,
             [PackageUse {
@@ -542,9 +600,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let files: BTreeMap<&str, &FileFacts> = BTreeMap::from([(path, &facts)]);
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let java = &[Language::Java];
 
         // The occurrences as scip-java emits them: `login` anchored in its annotation, `logout`
         // as well (its annotation's text contains it too); a same-named occurrence at the top
@@ -559,6 +618,7 @@ mod tests {
             "svc",
             &files,
             &keys,
+            java,
         );
         let replaced: Vec<(&str, &str)> = joined.keys[path]
             .iter()
@@ -592,6 +652,7 @@ mod tests {
             "svc",
             &files,
             &keys,
+            java,
         );
         assert_eq!(joined.keys[path].len(), 1);
         assert_eq!(
@@ -607,6 +668,7 @@ mod tests {
             "svc",
             &files,
             &keys,
+            java,
         );
         assert!(joined.keys.is_empty());
     }
@@ -658,10 +720,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let files: BTreeMap<&str, &FileFacts> = BTreeMap::from([(path, &facts)]);
+        let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys);
+        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
         assert_eq!(
             joined.keys[path],
             BTreeMap::from([(0, sym("f()."))]),
@@ -681,18 +743,30 @@ mod tests {
         let facts = rb_syntax::extract(Language::Java, JAVA.as_bytes()).unwrap();
         let path = "svc/src/Dog.java";
         let heuristic = rb_syntax::symbol_keys(path, &facts);
-        let files: BTreeMap<&str, &FileFacts> = BTreeMap::from([(path, &facts)]);
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([(path, heuristic.clone())]);
+        let java = &[Language::Java];
         // A document for a file we have no facts for, and an index with offset ranges.
         let mut idx = index(&facts);
         idx.documents[0].path = "src/Other.java".into();
-        let joined = join(&idx, "svc", &files, &keys);
+        let joined = join(&idx, "svc", &files, &keys, java);
         assert!(joined.keys.is_empty() && joined.edges.is_empty());
-        // The file we do have facts for has no document: counted, and nothing else is.
+        assert!(
+            joined.documented.is_empty(),
+            "no document for a file with facts"
+        );
+        // The file we do have facts for has no document: counted, and nothing else is. A file
+        // of a language the indexer does not cover is not a gap (contract M3b amendment 15).
         assert_eq!(joined.coverage.files_without_document, 1);
         assert_eq!(joined.coverage.definitions_total, 0);
         assert_eq!(
-            join(&index(&facts), "svc", &files, &keys)
+            join(&idx, "svc", &files, &keys, &[Language::Python])
+                .coverage
+                .files_without_document,
+            0
+        );
+        assert_eq!(
+            join(&index(&facts), "svc", &files, &keys, java)
                 .coverage
                 .files_without_document,
             0
@@ -701,7 +775,7 @@ mod tests {
         for o in &mut shifted.documents[0].occurrences {
             o.span[1] += 1;
         }
-        let joined = join(&shifted, "svc", &files, &keys);
+        let joined = join(&shifted, "svc", &files, &keys, java);
         assert!(joined.keys.is_empty());
         assert_eq!(joined.coverage.definitions_matched, 0);
         assert_eq!(joined.coverage.references_unmatched, 4);
@@ -729,19 +803,22 @@ mod sample {
             index.project_root,
             index.documents.len()
         );
-        let mut facts_by_path: BTreeMap<String, FileFacts> = BTreeMap::new();
+        let mut facts_by_path: BTreeMap<String, (Language, FileFacts)> = BTreeMap::new();
         for d in &index.documents {
             let language = match d.path.rsplit('.').next() {
-                Some("ts") => rb_syntax::Language::TypeScript,
-                Some("tsx") => rb_syntax::Language::Tsx,
-                Some("js") => rb_syntax::Language::JavaScript,
-                Some("java") => rb_syntax::Language::Java,
+                Some("ts") => Language::TypeScript,
+                Some("tsx") => Language::Tsx,
+                Some("js") => Language::JavaScript,
+                Some("java") => Language::Java,
                 _ => continue,
             };
             let Ok(src) = std::fs::read(format!("{dir}/{}", d.path)) else {
                 continue;
             };
-            facts_by_path.insert(d.path.clone(), rb_syntax::extract(language, &src).unwrap());
+            facts_by_path.insert(
+                d.path.clone(),
+                (language, rb_syntax::extract(language, &src).unwrap()),
+            );
             println!(
                 "  {} occurrences={} symbols={} encoding_assumed={} unconverted={}",
                 d.path,
@@ -751,19 +828,22 @@ mod sample {
                 d.unconverted
             );
         }
-        let files: BTreeMap<&str, &FileFacts> =
-            facts_by_path.iter().map(|(p, f)| (p.as_str(), f)).collect();
+        let files: BTreeMap<&str, (Language, &FileFacts)> = facts_by_path
+            .iter()
+            .map(|(p, (l, f))| (p.as_str(), (*l, f)))
+            .collect();
         let keys: BTreeMap<&str, Vec<String>> = facts_by_path
             .iter()
-            .map(|(p, f)| (p.as_str(), rb_syntax::symbol_keys(p, f)))
+            .map(|(p, (_, f))| (p.as_str(), rb_syntax::symbol_keys(p, f)))
             .collect();
-        let joined = join(&index, "", &files, &keys);
+        let languages: Vec<Language> = files.values().map(|(l, _)| *l).collect();
+        let joined = join(&index, "", &files, &keys, &languages);
         println!("coverage={:?}", joined.coverage);
         for (path, replaced) in &joined.keys {
             for (i, s) in replaced {
                 println!(
                     "  key {path} {} -> {s}",
-                    files[path.as_str()].definitions[*i].name
+                    files[path.as_str()].1.definitions[*i].name
                 );
             }
         }

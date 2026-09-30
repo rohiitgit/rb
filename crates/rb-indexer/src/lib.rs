@@ -14,7 +14,9 @@ mod scip;
 mod sql;
 mod syntax;
 
-pub use projects::{NoScipCache, ScipCache, ScipCacheEntry, ScipOptions, ScipProject};
+pub use projects::{
+    NoScipCache, ScipCache, ScipCacheEntry, ScipMode, ScipOptions, ScipProject, WriteOnlyScipCache,
+};
 pub use syntax::{FactsCache, FactsKey, NoCache};
 
 use rb_git::Repo;
@@ -46,8 +48,9 @@ pub struct Indexed {
 }
 
 /// Indexes `rev` of the repository at `repo_path`, reusing and filling `cache` and, for SCIP
-/// indexes, `scip_cache`. Jobs run only when `scip.enabled` and Docker answers; otherwise every
-/// job is recorded as `skipped` and the whole graph is heuristic.
+/// indexes, `scip_cache`. Jobs run only when `scip.mode` is `On` (the caller has checked that
+/// Docker answers); otherwise every job is recorded as `skipped` and the whole graph is
+/// heuristic.
 pub fn index_commit(
     repo_path: &Path,
     rev: &str,
@@ -110,14 +113,11 @@ pub fn index_commit(
         })
         .filter_map(Result::transpose)
         .collect::<anyhow::Result<_>>()?;
-    let docker = rb_scip::DockerRunner;
-    let mode = if !scip.enabled {
-        projects::Mode::Skip("SCIP disabled (--no-scip)".into())
-    } else {
-        match rb_scip::docker_available() {
-            Ok(()) => projects::Mode::Run(&docker),
-            Err(reason) => projects::Mode::Skip(reason),
-        }
+    let docker = rb_scip::DockerRunner::default();
+    let mode = match &scip.mode {
+        ScipMode::Off => projects::Mode::Skip("SCIP disabled (--no-scip)".into()),
+        ScipMode::Unavailable(reason) => projects::Mode::Skip(reason.clone()),
+        ScipMode::On => projects::Mode::Run(&docker),
     };
     if let projects::Mode::Run(_) = mode {
         std::fs::create_dir_all(&scip.work_dir)?;
@@ -283,7 +283,8 @@ pub fn assemble(
         .map(|(path, (_, facts))| (*path, rb_syntax::symbol_keys(path, facts)))
         .collect();
     // A file belongs to the deepest build root containing it; it is exact when that root's
-    // index is ok, and heuristic otherwise (contract M3b invariant 1).
+    // index is ok and has a document for it, and heuristic otherwise (contract M3b invariant 1,
+    // amendment 15).
     let owner_of =
         |path: &str| projects::owner_root(path, content.scip.iter().map(|p| p.root.as_str()));
     let mut scip_edges = Vec::new();
@@ -292,42 +293,51 @@ pub fn assemble(
     // the service's files that names the package is the one evidence.
     let mut packages: BTreeMap<(NodeKey, String), (rb_scip::Package, Evidence)> = BTreeMap::new();
     for project in &content.scip {
-        let files: BTreeMap<&str, &rb_syntax::FileFacts> = content
+        let files: BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)> = content
             .facts
             .iter()
             .filter(|(path, _)| owner_of(path) == Some(project.root.as_str()))
-            .map(|(path, (_, facts))| (*path, *facts))
+            .map(|(path, (language, facts))| (*path, (*language, *facts)))
             .collect();
-        let coverage = match (&project.status, &project.index) {
-            (rb_scip::RunStatus::Ok, Some(index)) => {
-                let joined = scip::join(index, &project.root, &files, &keys);
-                for (path, replaced) in joined.keys {
-                    let file_keys = keys
-                        .get_mut(path.as_str())
-                        .expect("the join only returns files it was given");
-                    for (i, key) in replaced {
-                        file_keys[i] = key;
+        let coverage =
+            match (&project.status, &project.index) {
+                (rb_scip::RunStatus::Ok, Some(index)) => {
+                    let joined = scip::join(
+                        index,
+                        &project.root,
+                        &files,
+                        &keys,
+                        scip::indexed_languages(project.indexer),
+                    );
+                    for (path, replaced) in joined.keys {
+                        let file_keys = keys
+                            .get_mut(path.as_str())
+                            .expect("the join only returns files it was given");
+                        for (i, key) in replaced {
+                            file_keys[i] = key;
+                        }
                     }
+                    scip_edges.extend(joined.edges);
+                    exact_files.extend(joined.documented.iter().filter_map(|path| {
+                        files.get_key_value(path.as_str()).map(|(path, _)| *path)
+                    }));
+                    for u in joined.packages {
+                        let service = boundaries
+                            .project_for(&u.at.path)
+                            .map_or_else(|| unassigned.clone(), |p| service_key(&p.dir));
+                        packages
+                            .entry((service, u.package.key()))
+                            .and_modify(|(_, at)| {
+                                if u.at < *at {
+                                    *at = u.at.clone();
+                                }
+                            })
+                            .or_insert((u.package, u.at));
+                    }
+                    Some(joined.coverage)
                 }
-                scip_edges.extend(joined.edges);
-                exact_files.extend(files.keys());
-                for u in joined.packages {
-                    let service = boundaries
-                        .project_for(&u.at.path)
-                        .map_or_else(|| unassigned.clone(), |p| service_key(&p.dir));
-                    packages
-                        .entry((service, u.package.key()))
-                        .and_modify(|(_, at)| {
-                            if u.at < *at {
-                                *at = u.at.clone();
-                            }
-                        })
-                        .or_insert((u.package, u.at));
-                }
-                Some(joined.coverage)
-            }
-            _ => None,
-        };
+                _ => None,
+            };
         diagnostics.push(scip_status(project, coverage.as_ref()));
     }
     for ((service, key), (package, at)) in packages {
@@ -766,6 +776,187 @@ mod tests {
                 vec![("svc/src/a.ts".into(), [0, 9, 0, 15])],
             ]
         );
+    }
+
+    /// A definition occurrence at every definition name and a reference occurrence at every
+    /// call, for one file, as an ok index would carry them.
+    fn document_for(
+        path: &str,
+        facts: &rb_syntax::FileFacts,
+        sym: &dyn Fn(&str) -> String,
+    ) -> rb_scip::Document {
+        let mut occurrences: Vec<rb_scip::Occurrence> = facts
+            .definitions
+            .iter()
+            .map(|d| rb_scip::Occurrence {
+                span: d.name_span,
+                symbol: sym(&d.name),
+                roles: 1,
+                enclosing: None,
+            })
+            .collect();
+        occurrences.extend(facts.references.iter().map(|r| rb_scip::Occurrence {
+            span: r.span,
+            symbol: sym(&r.name),
+            roles: 0,
+            enclosing: None,
+        }));
+        rb_scip::Document {
+            path: path.into(),
+            occurrences,
+            ..Default::default()
+        }
+    }
+
+    fn ok_project(
+        root: &str,
+        indexer: &'static str,
+        documents: Vec<rb_scip::Document>,
+    ) -> ScipProject {
+        ScipProject {
+            root: root.into(),
+            indexer,
+            image: "img".into(),
+            status: rb_scip::RunStatus::Ok,
+            index: Some(rb_scip::ScipIndex {
+                documents,
+                ..Default::default()
+            }),
+            elapsed_ms: 0,
+            cached: false,
+            stderr_tail: String::new(),
+            unpinned: false,
+        }
+    }
+
+    /// `(src key, dst key, provenance)` of every `CALLS` edge.
+    fn calls(g: &Graph) -> Vec<(String, String, Provenance)> {
+        let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+        g.edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| (key(e.src), key(e.dst), e.provenance))
+            .collect()
+    }
+
+    fn files_without_document(diagnostics: &[Diagnostic]) -> u64 {
+        let d = diagnostics
+            .iter()
+            .find(|d| d.kind == "scip_status")
+            .expect("one scip_status diagnostic");
+        d.detail["coverage"]["files_without_document"]
+            .as_u64()
+            .expect("coverage of an ok project")
+    }
+
+    /// Contract M3b amendment 15: ownership is by document. A Python file under a SCIP-ok Maven
+    /// root has no document, so it keeps its Tier B edges and is not a "file without a
+    /// document" (scip-java never indexes Python).
+    #[test]
+    fn a_file_of_another_language_under_a_scip_ok_root_keeps_tier_b() {
+        let java = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package p;\nclass A { void a() {} }\n",
+        )
+        .unwrap();
+        let python = rb_syntax::extract(
+            rb_syntax::Language::Python,
+            b"def helper():\n    pass\n\ndef main():\n    helper()\n",
+        )
+        .unwrap();
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: ["pom.xml", "src/A.java", "scripts/tool.py"]
+                .map(entry)
+                .to_vec(),
+            skipped: vec![],
+        };
+        let boundaries = Boundaries::new(vec![project(".", "pom.xml")], vec![]);
+        let sym = |name: &str| format!("scip-java maven . . p/{name}");
+        let content = Content {
+            facts: BTreeMap::from([
+                ("src/A.java", (rb_syntax::Language::Java, &java)),
+                ("scripts/tool.py", (rb_syntax::Language::Python, &python)),
+            ]),
+            scip: vec![ok_project(
+                "",
+                "scip-java",
+                vec![document_for("src/A.java", &java, &sym)],
+            )],
+            ..Content::default()
+        };
+        let (g, diagnostics) = assemble(&manifest, None, &boundaries, &content).unwrap();
+        let py_keys = rb_syntax::symbol_keys("scripts/tool.py", &python);
+        let main = py_keys[python
+            .definitions
+            .iter()
+            .position(|d| d.name == "main")
+            .unwrap()]
+        .clone();
+        let helper = py_keys[python
+            .definitions
+            .iter()
+            .position(|d| d.name == "helper")
+            .unwrap()]
+        .clone();
+        assert_eq!(calls(&g), [(main, helper, Provenance::Heuristic)]);
+        assert_eq!(files_without_document(&diagnostics), 0);
+    }
+
+    /// Contract M3b amendment 15: a TypeScript file the index has no document for (excluded by
+    /// the tsconfig) keeps Tier B, while the documented file gets only exact edges; the missing
+    /// document is counted, since scip-typescript should have covered the file.
+    #[test]
+    fn a_file_without_a_document_keeps_tier_b_next_to_a_documented_one() {
+        let src = rb_syntax::extract(
+            rb_syntax::Language::TypeScript,
+            b"export function f() {}\nexport function g() { f(); }\n",
+        )
+        .unwrap();
+        let spec = rb_syntax::extract(
+            rb_syntax::Language::TypeScript,
+            b"function h() {}\nfunction t() { h(); }\n",
+        )
+        .unwrap();
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: [
+                "package.json",
+                "tsconfig.json",
+                "src/a.ts",
+                "test/a.spec.ts",
+            ]
+            .map(entry)
+            .to_vec(),
+            skipped: vec![],
+        };
+        let boundaries = Boundaries::new(vec![project(".", "package.json")], vec![]);
+        let sym = |name: &str| format!("scip-typescript npm p 1.0.0 src/`a.ts`/{name}().");
+        let content = Content {
+            facts: BTreeMap::from([
+                ("src/a.ts", (rb_syntax::Language::TypeScript, &src)),
+                ("test/a.spec.ts", (rb_syntax::Language::TypeScript, &spec)),
+            ]),
+            scip: vec![ok_project(
+                "",
+                "scip-typescript",
+                vec![document_for("src/a.ts", &src, &sym)],
+            )],
+            ..Content::default()
+        };
+        let (g, diagnostics) = assemble(&manifest, None, &boundaries, &content).unwrap();
+        let spec_keys = rb_syntax::symbol_keys("test/a.spec.ts", &spec);
+        let t = spec_keys[spec.definitions.iter().position(|d| d.name == "t").unwrap()].clone();
+        let h = spec_keys[spec.definitions.iter().position(|d| d.name == "h").unwrap()].clone();
+        // In the graph's canonical order (heuristic keys sort before SCIP ones).
+        assert_eq!(
+            calls(&g),
+            [
+                (t, h, Provenance::Heuristic),
+                (sym("g"), sym("f"), Provenance::Scip),
+            ]
+        );
+        assert_eq!(files_without_document(&diagnostics), 1);
     }
 
     #[test]

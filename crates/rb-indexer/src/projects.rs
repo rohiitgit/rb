@@ -37,11 +37,49 @@ impl ScipCache for NoScipCache {
     }
 }
 
+/// A cache that is never read, only written (`rb index --no-cache`, contract M3b amendment
+/// 20): every job runs again and its outcome replaces the row, so a cached `failed` or
+/// `timeout` can be retried.
+pub struct WriteOnlyScipCache<'a>(pub &'a mut dyn ScipCache);
+
+impl ScipCache for WriteOnlyScipCache<'_> {
+    fn get(&mut self, _: &str, _: &str) -> anyhow::Result<Option<ScipCacheEntry>> {
+        Ok(None)
+    }
+
+    fn put(&mut self, input_hash: &str, image: &str, entry: &ScipCacheEntry) -> anyhow::Result<()> {
+        self.0.put(input_hash, image, entry)
+    }
+}
+
+/// Whether SCIP jobs run, decided by the caller (contract M3b amendment 17). It is part of a
+/// snapshot's tool configuration: a graph indexed without Docker is heuristic, so a later run
+/// with Docker must not take it for "up to date".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScipMode {
+    /// `--no-scip`: every job is `skipped`.
+    Off,
+    /// Docker does not answer (the reason is user-facing): every job is `skipped`.
+    Unavailable(String),
+    /// Jobs run in containers.
+    On,
+}
+
+impl ScipMode {
+    /// The value recorded in `tool_versions.scip`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScipMode::Off => "off",
+            ScipMode::Unavailable(_) => "unavailable",
+            ScipMode::On => "on",
+        }
+    }
+}
+
 /// How SCIP jobs run for one `index_commit`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScipOptions {
-    /// `false` records every job as `skipped` without touching Docker.
-    pub enabled: bool,
+    pub mode: ScipMode,
     /// Holds one export directory per job (`<input_hash[..16]>`), removed after the run. Must be a
     /// path the container runtime can bind-mount.
     pub work_dir: PathBuf,
@@ -54,7 +92,7 @@ impl ScipOptions {
     /// No jobs run; every project stays heuristic.
     pub fn disabled() -> Self {
         ScipOptions {
-            enabled: false,
+            mode: ScipMode::Off,
             work_dir: PathBuf::new(),
             cache_dir: PathBuf::new(),
             budget: Budget::default(),
@@ -315,7 +353,7 @@ mod tests {
 
     fn options(tmp: &std::path::Path) -> ScipOptions {
         ScipOptions {
-            enabled: true,
+            mode: ScipMode::On,
             work_dir: tmp.join("work"),
             cache_dir: tmp.join("cache"),
             budget: Budget::default(),
@@ -441,6 +479,29 @@ mod tests {
         let again = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
         assert!(again[1].cached && again[1].status == RunStatus::Failed);
         assert_eq!(*fake.runs.borrow(), 1);
+
+        // `--no-cache` (contract M3b amendment 20): the cached failure is not read, the job
+        // runs again, and its new outcome replaces the row.
+        let retry = Fake {
+            runs: RefCell::new(0),
+            index: index_bytes(),
+            fail: false,
+            java_image: false,
+        };
+        let retried = run_projects(
+            &files,
+            &read,
+            &Mode::Run(&retry),
+            &opts,
+            &mut WriteOnlyScipCache(&mut cache),
+        )
+        .unwrap();
+        assert!(!retried[1].cached && retried[1].status == RunStatus::Ok);
+        assert_eq!(*retry.runs.borrow(), 2, "fetch and index ran again");
+        assert_eq!(cache.puts, 2, "the outcome is written");
+        let served = run_projects(&files, &read, &Mode::Run(&retry), &opts, &mut cache).unwrap();
+        assert!(served[1].cached && served[1].status == RunStatus::Ok);
+        assert_eq!(*retry.runs.borrow(), 2);
     }
 
     /// A Maven job with the local image present runs (two fetch runs and the index) and is

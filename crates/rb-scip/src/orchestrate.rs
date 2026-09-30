@@ -105,7 +105,9 @@ pub fn resolve_image(job: &Job, runner: &dyn Runner) -> Result<String, String> {
 
 /// Runs `job` in `image` (from [`resolve_image`]) over `files` (`(root-relative path, bytes)`)
 /// in `work_dir` (recreated, removed afterwards) with `cache_dir` holding package-manager
-/// caches shared across jobs.
+/// caches shared across jobs. The containers are named `rb-scip-<work dir name>-<phase>` (the
+/// caller names the work directory after the job's input hash), so a run over its budget can
+/// be killed by name (contract M3b amendment 18).
 pub fn run_job(
     job: &Job,
     image: &str,
@@ -127,11 +129,22 @@ pub fn run_job(
     }
     export(files, work_dir)?;
     std::fs::create_dir_all(cache_dir)?;
+    let name = format!(
+        "rb-scip-{}",
+        work_dir
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    );
     let result = (|| -> anyhow::Result<ScipRun> {
-        let (fetches, index) = match job.indexer {
+        let (mut fetches, mut index) = match job.indexer {
             Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
             Indexer::ScipJava => java_runs(image, work_dir, cache_dir, budget)?,
         };
+        for fetch in &mut fetches {
+            fetch.name = Some(format!("{name}-fetch"));
+        }
+        index.name = Some(format!("{name}-index"));
         for fetch in &fetches {
             let outcome = runner.run(fetch)?;
             if !outcome.ok() {
@@ -184,6 +197,7 @@ fn typescript_runs(
     let npm_cache = crate::runner::absolute(cache_dir)?.join("npm");
     std::fs::create_dir_all(&npm_cache)?;
     let base = ContainerRun {
+        name: None,
         image: image.into(),
         platform: Some("linux/amd64".into()),
         workdir,
@@ -266,6 +280,7 @@ fn java_runs(
     let m2 = crate::runner::absolute(cache_dir)?.join("m2");
     std::fs::create_dir_all(&m2)?;
     let base = ContainerRun {
+        name: None,
         image: image.into(),
         platform: None,
         workdir,
@@ -448,6 +463,8 @@ mod tests {
         assert!(!work.exists(), "work directory is removed");
         let runs = fake.runs.borrow();
         assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].name.as_deref(), Some("rb-scip-work-fetch"));
+        assert_eq!(runs[1].name.as_deref(), Some("rb-scip-work-index"));
         assert_eq!(runs[0].network, Network::Registries);
         assert_eq!(
             runs[0].entrypoint.as_deref(),
@@ -535,6 +552,16 @@ mod tests {
         assert!(!work.exists());
         let runs = fake.runs.borrow();
         assert_eq!(runs.len(), 3);
+        let names: Vec<Option<&str>> = runs.iter().map(|r| r.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            [
+                Some("rb-scip-work-fetch"),
+                Some("rb-scip-work-fetch"),
+                Some("rb-scip-work-index")
+            ],
+            "sequential fetch runs reuse the name; `--rm` removes each before the next"
+        );
         for r in runs.iter() {
             assert_eq!(r.image, JAVA_ID);
             assert_eq!(r.platform, None, "scip-java runs natively");

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 
@@ -56,8 +57,9 @@ struct IndexArgs {
     /// Rebuild even if the live snapshot already covers this commit with the same tools.
     #[arg(long)]
     force: bool,
-    /// Parse every file instead of reusing cached syntax facts (the cache is not updated either).
-    /// SCIP indexes stay cached: an index is a pure function of its project's inputs.
+    /// Parse every file instead of reusing cached syntax facts (that cache is not updated
+    /// either), and run every SCIP job again instead of serving it from the index cache (its
+    /// outcome is stored, so a cached `failed` or `timeout` can be retried).
     #[arg(long)]
     no_cache: bool,
     /// Run no SCIP indexer: every project is resolved heuristically and its job is `skipped`.
@@ -67,6 +69,10 @@ struct IndexArgs {
     /// bind-mount it (under the home directory on colima).
     #[arg(long, env = "RB_SCIP_WORK_DIR", default_value = "var/scip")]
     scip_work_dir: PathBuf,
+    /// Seconds a SCIP job's index phase may take (its fetch phase gets the same budget); a run
+    /// over it is killed and recorded as `timeout`. Default: 600 for the fetch, 900 for the index.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    scip_timeout_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -379,6 +385,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         no_cache,
         no_scip,
         scip_work_dir,
+        scip_timeout_secs,
     } = args;
     let path = path
         .canonicalize()
@@ -403,7 +410,17 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
 
     let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(&rev)?;
     store.migrate()?;
-    let tools = tool_versions(!no_scip);
+    // Decided here, before the "up to date" check: a snapshot indexed without Docker is
+    // heuristic and must be rebuilt once Docker answers (contract M3b amendment 17).
+    let scip_mode = if no_scip {
+        rb_indexer::ScipMode::Off
+    } else {
+        match rb_scip::docker_available() {
+            Ok(()) => rb_indexer::ScipMode::On,
+            Err(reason) => rb_indexer::ScipMode::Unavailable(reason),
+        }
+    };
+    let tools = tool_versions(&scip_mode);
 
     if !force
         && let Some(live) = store.live_snapshot(&repo)?
@@ -418,11 +435,16 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         return Ok(());
     }
 
+    let mut budget = rb_scip::Budget::default();
+    if let Some(secs) = scip_timeout_secs {
+        budget.fetch_timeout = Duration::from_secs(secs);
+        budget.index_timeout = Duration::from_secs(secs);
+    }
     let scip = rb_indexer::ScipOptions {
-        enabled: !no_scip,
+        mode: scip_mode,
         cache_dir: scip_work_dir.join("cache"),
         work_dir: scip_work_dir,
-        budget: rb_scip::Budget::default(),
+        budget,
     };
     // Both caches live in the store; the indexer borrows each through its own trait.
     let cell = RefCell::new(&mut *store);
@@ -438,7 +460,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
             &commit_sha,
             &mut rb_indexer::NoCache,
             &scip,
-            &mut StoreCache(&cell),
+            &mut rb_indexer::WriteOnlyScipCache(&mut StoreCache(&cell)),
         )?
     } else {
         rb_indexer::index_commit(
@@ -476,6 +498,9 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         if j.cached {
             line.push_str(" (cached)");
         }
+        if j.unpinned {
+            line.push_str(" unpinned");
+        }
         if j.elapsed_ms > 0 {
             let _ = write!(line, " {:.1}s", j.elapsed_ms as f64 / 1000.0);
         }
@@ -501,6 +526,10 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         field("indexer"),
         field("status")
     );
+    // No lockfile: the fetch resolved versions at run time, so the index is not reproducible.
+    if d.detail["unpinned"].as_bool() == Some(true) {
+        line.push_str(" unpinned");
+    }
     if let Some(ms) = d.detail["elapsed_ms"].as_u64().filter(|&ms| ms > 0) {
         let _ = write!(line, " {:.1}s", ms as f64 / 1000.0);
     }
@@ -608,13 +637,14 @@ impl rb_indexer::FactsCache for StoreCache<'_, '_> {
     }
 }
 
-/// What a snapshot was built with; `scip` because a run without indexers is a different graph.
-fn tool_versions(scip: bool) -> Value {
+/// What a snapshot was built with; `scip` (`on`, `off`, `unavailable`) because a run without
+/// indexers is a different graph, whether they were turned off or Docker was missing.
+fn tool_versions(scip: &rb_indexer::ScipMode) -> Value {
     json!({
         "rb": env!("CARGO_PKG_VERSION"),
         "pipeline": rb_indexer::PIPELINE,
         "schema": rb_store::schema_version(),
-        "scip": scip,
+        "scip": scip.as_str(),
     })
 }
 

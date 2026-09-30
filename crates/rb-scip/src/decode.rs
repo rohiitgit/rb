@@ -2,7 +2,7 @@
 //! col]` spans like Tree-sitter's; SCIP's columns are code units in the document's position
 //! encoding, which scip-java and scip-typescript leave unset while meaning UTF-16.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use protobuf::Message as _;
@@ -41,7 +41,9 @@ pub struct Document {
     pub unconverted: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered by span, then symbol, roles and enclosing range: the order of a document's
+/// occurrences after decoding.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Occurrence {
     pub span: Span,
     pub symbol: String,
@@ -60,7 +62,8 @@ impl Occurrence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Ordered by symbol first: the order of a document's symbols after decoding.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct SymbolInfo {
     pub symbol: String,
     /// `SymbolInformation.Kind` by name (`Class`, `Method`, …); empty when unspecified.
@@ -69,7 +72,7 @@ pub struct SymbolInfo {
     pub relationships: Vec<Relationship>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct Relationship {
     pub symbol: String,
     pub is_implementation: bool,
@@ -86,7 +89,14 @@ pub fn decode(
 ) -> anyhow::Result<ScipIndex> {
     let index = scip::types::Index::parse_from_bytes(bytes).context("parsing index.scip")?;
     let metadata = index.metadata.as_ref();
-    let mut documents: BTreeMap<String, Document> = BTreeMap::new();
+    // Duplicate documents for one path (scip-typescript #330) merge into ordered sets, which
+    // drop repeats and give the decoded order without a per-item scan.
+    struct Merged {
+        document: Document,
+        occurrences: BTreeSet<Occurrence>,
+        symbols: BTreeSet<SymbolInfo>,
+    }
+    let mut documents: BTreeMap<String, Merged> = BTreeMap::new();
     for doc in &index.documents {
         let path = normalise(&doc.relative_path);
         let encoding = doc.position_encoding.enum_value_or_default();
@@ -138,37 +148,35 @@ pub fn decode(
                 enclosing,
             });
         }
-        let entry = documents.entry(path.clone()).or_insert_with(|| Document {
-            path,
-            language: doc.language.clone(),
-            encoding_assumed: assumed,
-            ..Document::default()
+        let entry = documents.entry(path.clone()).or_insert_with(|| Merged {
+            document: Document {
+                path,
+                language: doc.language.clone(),
+                encoding_assumed: assumed,
+                ..Document::default()
+            },
+            occurrences: BTreeSet::new(),
+            symbols: BTreeSet::new(),
         });
-        // Duplicate documents for one path (scip-typescript #330) merge, without repeats.
-        for o in occurrences {
-            if !entry.occurrences.contains(&o) {
-                entry.occurrences.push(o);
-            }
-        }
-        for s in doc.symbols.iter().map(symbol_info) {
-            if !entry.symbols.contains(&s) {
-                entry.symbols.push(s);
-            }
-        }
-        entry.unconverted += unconverted;
+        entry.occurrences.extend(occurrences);
+        entry.symbols.extend(doc.symbols.iter().map(symbol_info));
+        entry.document.unconverted += unconverted;
     }
-    for d in documents.values_mut() {
-        d.occurrences
-            .sort_by(|a, b| (a.span, &a.symbol, a.roles).cmp(&(b.span, &b.symbol, b.roles)));
-        d.symbols.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-    }
+    let documents = documents
+        .into_values()
+        .map(|m| Document {
+            occurrences: m.occurrences.into_iter().collect(),
+            symbols: m.symbols.into_iter().collect(),
+            ..m.document
+        })
+        .collect();
     Ok(ScipIndex {
         project_root: metadata.map(|m| m.project_root.clone()).unwrap_or_default(),
         tool: metadata
             .and_then(|m| m.tool_info.as_ref())
             .map(|t| format!("{} {}", t.name, t.version))
             .unwrap_or_default(),
-        documents: documents.into_values().collect(),
+        documents,
         external_symbols: index.external_symbols.iter().map(symbol_info).collect(),
     })
 }
@@ -443,6 +451,48 @@ mod tests {
             got.external_symbols[0].symbol,
             "scip-java maven jdk 17 java/lang/Object#"
         );
+    }
+
+    /// Merging duplicate documents must not compare every occurrence with every other one:
+    /// 40k occurrences over two copies of one document decode in well under a second, and the
+    /// result keeps one copy of each, in span order.
+    #[test]
+    fn decoding_forty_thousand_occurrences_is_fast() {
+        let occurrences: Vec<ScipOccurrence> = (0..20_000)
+            .map(|i| {
+                let mut o = occ(&format!("scip-java maven . . p/S{i}#"), ROLE_DEFINITION);
+                o.range = vec![i, 0, 4];
+                o
+            })
+            .collect();
+        let doc = ScipDocument {
+            relative_path: "a.java".into(),
+            occurrences,
+            symbols: (0..2_000)
+                .map(|i| SymbolInformation {
+                    symbol: format!("scip-java maven . . p/S{i}#"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc.clone(), doc],
+            ..Default::default()
+        };
+        let bytes = encode(&index);
+        let started = std::time::Instant::now();
+        let got = decode(&bytes, &|_| None).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "decoding took {elapsed:?}"
+        );
+        let d = &got.documents[0];
+        assert_eq!(d.occurrences.len(), 20_000);
+        assert_eq!(d.symbols.len(), 2_000);
+        assert!(d.occurrences.windows(2).all(|w| w[0].span < w[1].span));
+        assert!(d.symbols.windows(2).all(|w| w[0].symbol < w[1].symbol));
     }
 
     #[test]

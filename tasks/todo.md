@@ -174,3 +174,13 @@ Findings from the research step (2026-09-29):
   - [x] m3b repos deleted from the database, work dirs removed, caches kept; disk figures in the contract.
   - [x] Docs: contract (S8, S11, amendments 11–14, measurement section), IMPLEMENT.md, CHANGELOG.md, design §5.5/§13, lessons.
   - [ ] Evaluator passes, commit.
+    - [x] Pass 1 fixes (test-first, one amendment each, 15–20):
+      - [x] D1 ownership by document: `Joined.documented` → `exact_files`; `files_without_document` counts the indexer's languages only; unit (Python under Maven, excluded TS) + e2e (`scripts/tool.py` in the Java fixture; re-bless `scip-card.txt`, `scip-status.txt`).
+      - [x] D2 `IMPLEMENTS` direction: only when A's type (or its method's enclosing type) declares a supertype named like B's last type descriptor; unit on a symmetric index; e2e golden `scip-impact-default-authenticate.txt`.
+      - [x] D3 `tool_versions.scip` = `off` / `unavailable` / `on` (`ScipMode` decided by the caller); e2e with Docker hidden from the child's PATH.
+      - [x] D4 `--name rb-scip-<hash16>-<phase>`, `docker kill` on timeout, `--scip-timeout-secs`; D7 `--no-cache` bypasses SCIP cache reads (`WriteOnlyScipCache`); unit (names, kill through a fake `docker` script) + e2e (`--no-cache --force` runs the container).
+      - [x] D5 decode dedup through `BTreeSet`; timing test 40k occurrences < 1 s.
+      - [x] D6 `unpinned` in the `scip:` lines; polyglot status golden re-blessed.
+      - [x] Docs: contract (invariant 1, S5/S7, verified facts, S11 wording, amendments 15–20), IMPLEMENT.md, CHANGELOG.md, lessons.
+      - [x] Verify: fmt, clippy, unit tests (awk-summed), e2e with containers, stub scan, no `t_*` repos, no work dirs.
+    - [ ] Evaluator pass 2, commit.
