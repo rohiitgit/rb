@@ -15,6 +15,8 @@ pub(crate) struct RawBinding<'t> {
     /// The binding is in effect from the end of `from` to the end of `to`.
     pub from: Node<'t>,
     pub to: Node<'t>,
+    /// An explicit scope, for names whose scope is not the nearest scope kind (`except … as e`).
+    pub scope: Option<Node<'t>>,
 }
 
 /// Every binding in the file, in source order.
@@ -39,7 +41,7 @@ pub(crate) fn bindings<'t>(
         stack.extend(children.into_iter().rev());
     }
     for b in &mut out {
-        b.to = scope_of(language, b.from);
+        b.to = b.scope.unwrap_or_else(|| scope_of(language, b.from));
     }
     out
 }
@@ -57,7 +59,6 @@ fn scope_kinds(language: Language) -> &'static [&'static str] {
             "set_comprehension",
             "dictionary_comprehension",
             "generator_expression",
-            "except_clause",
         ],
         Language::Go => &[
             "source_file",
@@ -70,6 +71,14 @@ fn scope_kinds(language: Language) -> &'static [&'static str] {
             "expression_switch_statement",
             "type_switch_statement",
             "select_statement",
+            "expression_case",
+            "type_case",
+            "default_case",
+            "communication_case",
+            // Parameter names of function types and interface methods end with their signature.
+            "function_type",
+            "interface_type",
+            "method_elem",
         ],
         Language::TypeScript | Language::Tsx | Language::JavaScript => &[
             "program",
@@ -84,6 +93,16 @@ fn scope_kinds(language: Language) -> &'static [&'static str] {
             "for_statement",
             "for_in_statement",
             "catch_clause",
+            // Parameter names of type-level signatures end with the signature.
+            "function_type",
+            "constructor_type",
+            "function_signature",
+            "method_signature",
+            "abstract_method_signature",
+            "call_signature",
+            "construct_signature",
+            "interface_body",
+            "object_type",
         ],
         Language::Java => &[
             "program",
@@ -137,6 +156,7 @@ fn push<'t>(
             node,
             from,
             to: node,
+            scope: None,
         });
     }
 }
@@ -520,13 +540,17 @@ fn python<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 }
             }
         }
-        // `with … as x`, `except E as x`
+        // `with … as x` (function-scoped), `except E as x` (deleted after the clause).
         "as_pattern" => {
             if let Some(target) = node.child_by_field_name("alias") {
+                let except = node.parent().filter(|p| p.kind() == "except_clause");
                 let mut names = Vec::new();
                 pattern_names(target, &mut names);
                 for n in names {
                     push(out, Some(n), None, false, node, node, source);
+                    if let (Some(e), Some(b)) = (except, out.last_mut()) {
+                        b.scope = Some(e);
+                    }
                 }
             }
         }
@@ -859,6 +883,89 @@ mod tests {
                 "r [3:16-3:28]",
                 "r2 [4:18-5:3]"
             ]
+        );
+    }
+
+    /// `(row, column)` just after the first occurrence of `needle`.
+    fn after(src: &str, needle: &str) -> (i32, i32) {
+        let end = src.find(needle).expect(needle) + needle.len();
+        let before = &src[..end];
+        let row = before.matches('\n').count();
+        let col = end - before.rfind('\n').map_or(0, |i| i + 1);
+        (row as i32, col as i32)
+    }
+
+    /// `(name, start, end)` of a non-member binding's extent.
+    type Extent = (String, (i32, i32), (i32, i32));
+
+    fn extents(language: Language, src: &str) -> Vec<Extent> {
+        extract(language, src.as_bytes())
+            .unwrap()
+            .bindings
+            .into_iter()
+            .filter(|b| !b.member)
+            .map(|b| {
+                let v = b.visible;
+                (b.name, (v[0], v[1]), (v[2], v[3]))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_except_name_ends_with_its_clause() {
+        let src = "def f(r):\n    try:\n        pass\n    except Exception as e:\n        r = Resp()\n    r.m1()\n";
+        let got = extents(Language::Python, src);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(
+            got[1],
+            ("e".into(), after(src, "as e"), after(src, "r = Resp()"))
+        );
+        // The assignment inside the clause is an ordinary function-scoped name.
+        assert_eq!(
+            got[2],
+            ("r".into(), after(src, "Resp()"), after(src, "r.m1()"))
+        );
+    }
+
+    #[test]
+    fn signature_parameters_end_with_their_signature() {
+        let src = "const r: Req = mk();\ninterface H { do(r: Resp): void }\nfunction over(r: Resp): void;\nfunction over(r: any) {}\ntype Fn2 = (w: Resp) => void;\n";
+        let got = extents(Language::TypeScript, src);
+        let rows: Vec<(String, i32, i32)> =
+            got.iter().map(|(n, s, e)| (n.clone(), s.0, e.0)).collect();
+        // Every signature parameter starts and ends on its own line; the constant spans the file.
+        assert_eq!(
+            rows,
+            [
+                ("r".into(), 0, 5),
+                ("r".into(), 1, 1),
+                ("r".into(), 2, 2),
+                ("r".into(), 3, 3),
+                ("w".into(), 4, 4)
+            ]
+        );
+
+        let go = "package p\nvar cb func(c *Ctx)\ntype H interface { Do(s *Ctx) }\nfunc f(x int) {\n\tswitch x {\n\tcase 1:\n\t\tr := Resp{}\n\t\tr.M1()\n\tcase 2:\n\t\tr.M2()\n\t}\n}\n";
+        let got = extents(Language::Go, go);
+        let rows: Vec<(String, i32, i32)> =
+            got.iter().map(|(n, s, e)| (n.clone(), s.0, e.0)).collect();
+        // `cb` spans the file; `c` and `s` end on their own line; `r` ends with its case clause,
+        // after `r.M1()` and before `r.M2()`.
+        assert_eq!(
+            &rows[..4],
+            [
+                ("cb".into(), 1, 12),
+                ("c".into(), 1, 1),
+                ("s".into(), 2, 2),
+                ("x".into(), 3, 11)
+            ]
+        );
+        let (name, start, end) = &rows[4];
+        assert_eq!(name, "r");
+        assert_eq!(*start, after(go, "r := Resp{}").0);
+        assert!(
+            *end >= after(go, "r.M1()").0 && *end < after(go, "r.M2()").0,
+            "{rows:?}"
         );
     }
 }

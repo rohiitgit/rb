@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026-09-30 21:30]
+- M3a evaluator pass 3 fixes (contract Amendment 3): `except` bodies are not scopes (only the `as` name is clause-scoped); class-body names are skipped rather than ending the lookup (`Locals::at_where`); signature parameters end with their signature (new scope kinds for TS and Go); Go `case` clauses are scopes; bare calls through variables are unresolved.
+- Re-measured: hono 13.5% (was 14.8%: bare calls through variables such as `next()` are now unresolved rather than linked to a same-named function); petclinic 39.2%, gin 63.4%, requests 30.4% unchanged.
+- Files affected: crates/rb-syntax/src/bindings.rs, crates/rb-indexer/src/resolve.rs, tasks/contract-m3a.md.
+
 ## [2026-09-30 19:00]
 - M3a evaluator pass 2 fixes (contract Amendment 2):
   - **rb-syntax:** `Binding::visible`, the extent over which a declaration is in effect, computed from per-language scope kinds; all declaration forms recorded (loops, `with`/`except`/`catch`, comprehensions, destructuring, walrus, lambda parameters, Go multi-assignment and type switches, Java enhanced-for, resources and `instanceof` patterns).

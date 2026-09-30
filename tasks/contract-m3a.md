@@ -93,3 +93,12 @@ M3a needs no external tool. Every M3a edge has provenance `heuristic`; SCIP late
 - **Python source roots:** an absolute import matches a module whose source root (the directory above the matched segments) is the importer's own root, or one of the conventional roots `""` and `src`. A `tests/logging.py` beside `tests/test_x.py` is therefore a candidate for that test's `import logging`; without an environment, the standard library cannot be told apart, and this is accepted. An `__init__.py` at the repository root no longer disables absolute imports.
 - **Java nested classes** resolve through imports (`import a.Util.Nested`, `import static a.Util.Nested.n`, `import a.Util.*`).
 - **`rb callers`** lists a recursive target as its own direct caller, once.
+
+## Amendment 3: evaluator pass 3 (5 defects in the extent rules and bare calls; all fixed test-first)
+
+- **Python `except` bodies** are not scopes. Only the `except … as e` name ends with its clause; an assignment inside the clause is function-scoped like any other.
+- **Class-body names** are skipped, not final: when the innermost declaration in effect is a class body's own name and the reference is inside a method, the lookup continues with the enclosing declaration.
+- **Signature parameters** (TypeScript function types, interface and overload signatures, call and construct signatures; Go function types and interface methods) end with their signature, never the enclosing block.
+- **Go `case` clauses** (expression, type, default and select cases) are scopes.
+- **Bare calls through variables:** `cb()` where `cb` is a parameter or local is never linked by name to a function; it counts as unresolved. A typed variable is not followed to a `__call__` or functional interface.
+- **Accepted:** a closure reading a name declared after the closure's text; JavaScript `var` hoisting out of a block; Java `instanceof` flow scoping; a walrus inside a comprehension. Each gives an unresolved reference, never a wrong edge.

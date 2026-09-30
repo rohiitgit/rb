@@ -276,8 +276,13 @@ impl<'a> Locals<'a> {
         Locals { bindings, parent }
     }
 
-    /// The innermost declaration in effect at `at`.
-    fn at(&self, at: rb_model::Span) -> Option<&'a Binding> {
+    /// The innermost declaration in effect at `at` that `accept`s; a rejected one is skipped
+    /// in favour of the declaration enclosing it.
+    fn at_where(
+        &self,
+        at: rb_model::Span,
+        accept: impl Fn(&Binding) -> bool,
+    ) -> Option<&'a Binding> {
         let pos = (at[0], at[1]);
         let i = self
             .bindings
@@ -285,7 +290,7 @@ impl<'a> Locals<'a> {
         let mut cur = i.checked_sub(1);
         while let Some(k) = cur {
             let b = self.bindings[k];
-            if (b.visible[2], b.visible[3]) >= pos {
+            if (b.visible[2], b.visible[3]) >= pos && accept(b) {
                 return Some(b);
             }
             cur = self.parent[k];
@@ -726,13 +731,18 @@ impl<'a> Index<'a> {
         at: Option<rb_model::Span>,
     ) -> Option<&'a Binding> {
         let defs = &self.facts(path).definitions;
-        if let Some(at) = at
-            && let Some(b) = self.locals[path].get(name).and_then(|l| l.at(at))
-            && !b
-                .scope
-                .is_some_and(|t| is_type(defs[t].kind) && scope != Some(t))
-        {
-            return Some(b);
+        if let Some(at) = at {
+            // A class body's own names are not locals of its methods; look past them.
+            let accept = |b: &Binding| {
+                !b.scope
+                    .is_some_and(|t| is_type(defs[t].kind) && scope != Some(t))
+            };
+            if let Some(b) = self.locals[path]
+                .get(name)
+                .and_then(|l| l.at_where(at, accept))
+            {
+                return Some(b);
+            }
         }
         if self.language(path) != Language::Java {
             return None;
@@ -925,7 +935,13 @@ impl<'a> Index<'a> {
         qualifier: Option<&str>,
         at: Option<rb_model::Span>,
     ) -> Vec<(EdgeKind, Sym<'a>)> {
+        // A bare call through a variable (`cb()`) is never linked by name to a function.
+        let through_variable = at.is_some_and(|at| {
+            self.binding(path, scope, name, Some(at))
+                .is_some_and(|b| !b.member)
+        });
         let found = match qualifier {
+            None if through_variable => Vec::new(),
             None => self.levels(path, scope, name, is_callable, true),
             Some(q) => match self.container(path, scope, q, at) {
                 Some(Container::Types(ts)) => ts
@@ -1954,6 +1970,115 @@ func (s *Server) helper() {}
                 .filter(|e| e.kind == EdgeKind::Calls)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn except_bodies_class_bodies_and_signatures_do_not_capture_names() {
+        // C1: an assignment inside `except` is function-scoped.
+        let py = build(
+            &[(
+                "a/e.py",
+                PY,
+                "class Req:\n    def m1(self):\n        pass\nclass Resp:\n    def m1(self):\n        pass\ndef f(r: Req):\n    try:\n        pass\n    except Exception:\n        r = Resp()\n    r.m1()\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&py, EdgeKind::Calls),
+            ["e:f(). -> e:Resp#m1(). [heuristic]"]
+        );
+        // C2: a class-body name is skipped in favour of the enclosing declaration.
+        let py = build(
+            &[(
+                "a/k.py",
+                PY,
+                "class Req:\n    def m2(self):\n        pass\nclass Resp:\n    def m2(self):\n        pass\nr = Req()\nclass K:\n    r = Resp()\n    def m(self):\n        r.m2()\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&py, EdgeKind::Calls),
+            ["k:K#m(). -> k:Req#m2(). [heuristic]"]
+        );
+        // C3: interface, overload and function-type parameters end with their signature.
+        let ts = build(
+            &[(
+                "src/s.ts",
+                TS,
+                "class Req { m1() {} m4() {} }\nclass Resp { m1() {} m4() {} }\nconst r: Req = mk();\ninterface H { do(r: Resp): void }\nfunction over(r: Resp): void;\nfunction over(r: any) {}\nconst w: Req = mk();\ntype Fn2 = (w: Resp) => void;\nfunction g() { r.m1(); w.m4(); }\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&ts, EdgeKind::Calls),
+            [
+                "s:g(). -> s:Req#m1(). [heuristic]",
+                "s:g(). -> s:Req#m4(). [heuristic]"
+            ]
+        );
+        let go = build(
+            &[
+                ("cfg/cfg.go", GO, "package cfg\nfunc Load() {}\n"),
+                (
+                    "p/t.go",
+                    GO,
+                    "package p\nimport c \"example.com/m/cfg\"\ntype Ctx struct{}\nfunc (x *Ctx) Load() {}\nvar cb func(c *Ctx)\ntype H interface { Do(c *Ctx) }\nfunc f() { c.Load() }\n",
+                ),
+            ],
+            &[("", "example.com/m")],
+        );
+        assert_eq!(
+            edges(&go, EdgeKind::Calls),
+            ["t:f(). -> cfg:Load(). [heuristic]"]
+        );
+    }
+
+    #[test]
+    fn bare_calls_through_variables_are_unresolved() {
+        for (path, language, src) in [
+            (
+                "a/fn.py",
+                PY,
+                "def fn():\n    pass\ndef apply(fn):\n    return fn()\ndef g():\n    h = 1\n    h()\n",
+            ),
+            (
+                "src/fn.ts",
+                TS,
+                "function fn() {}\nfunction apply(fn: () => void) { fn(); }\n",
+            ),
+            (
+                "p/fn.go",
+                GO,
+                "package p\nfunc fn() {}\nfunc apply(fn func()) { fn() }\n",
+            ),
+        ] {
+            let built = build(&[(path, language, src)], &[]);
+            assert!(
+                edges(&built, EdgeKind::Calls).is_empty(),
+                "{path}: {:?}",
+                edges(&built, EdgeKind::Calls)
+            );
+            assert_eq!(unresolved(&built).len(), 1, "{path}");
+        }
+    }
+
+    #[test]
+    fn go_case_clauses_are_scopes() {
+        let built = build(
+            &[(
+                "p/sw.go",
+                GO,
+                "package p\ntype Req struct{}\nfunc (r Req) M1() {}\nfunc (r Req) M2() {}\ntype Resp struct{}\nfunc (r Resp) M1() {}\nfunc (r Resp) M2() {}\nfunc f(r Req, x int) {\n\tswitch x {\n\tcase 1:\n\t\tr := Resp{}\n\t\tr.M1()\n\tcase 2:\n\t\tr.M2()\n\t}\n}\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "sw:f(). -> sw:Req#M2(). [heuristic]",
+                "sw:f(). -> sw:Resp#M1(). [heuristic]"
+            ]
         );
     }
 }
