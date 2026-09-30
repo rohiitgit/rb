@@ -295,6 +295,11 @@ pub struct Binding {
     /// A field or member (`this.x`, `self.x`, a TS parameter property, a Go struct field).
     pub member: bool,
     pub span: Span,
+    /// Where the declaration is in effect: from the end of the declaration to the end of its
+    /// scope (a block, function or loop; the whole function in Python). A reference to the name
+    /// outside this extent means another declaration.
+    #[serde(default)]
+    pub visible: Span,
 }
 
 /// Parses `source` and extracts its definitions and references.
@@ -381,12 +386,19 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                     scope = definitions[i].parent;
                 }
             }
+            let (from, to) = (b.from.end_position(), b.to.end_position());
             Binding {
                 name: b.name,
                 type_name: b.type_name,
                 scope,
                 member: b.member,
                 span: span(b.node),
+                visible: [
+                    point(from.row),
+                    point(from.column),
+                    point(to.row),
+                    point(to.column),
+                ],
             }
         })
         .collect();
@@ -682,9 +694,12 @@ fn text(node: Node<'_>, source: &[u8]) -> String {
 }
 
 fn span(node: Node<'_>) -> Span {
-    let n = |v: usize| i32::try_from(v).unwrap_or(i32::MAX);
     let (s, e) = (node.start_position(), node.end_position());
-    [n(s.row), n(s.column), n(e.row), n(e.column)]
+    [point(s.row), point(s.column), point(e.row), point(e.column)]
+}
+
+fn point(v: usize) -> i32 {
+    i32::try_from(v).unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]

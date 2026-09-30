@@ -223,12 +223,13 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Found in R12 and fixed:**
   - Indexing psf/requests overflowed the stack. A binding such as `session = session.Session()` made type resolution recurse through itself. Type resolution now has an in-progress guard and a depth cap of 64, with a cycle test.
 - **Known imprecision (for the evaluator and M3b):**
-  - Parameters of anonymous functions are scoped to the enclosing named function, so they can type a same-named local outside the callback. In gin's `TestContextNext` this happened to give the right answer.
-  - A memoised supertype list can be cut short by the in-progress guard, but only when a supertype name resolves through a cyclic binding.
+  - A memoised supertype list can be cut short by the in-progress guard, but only when a supertype name resolves through a cyclic binding. The evaluator found no reachable case.
+  - The earlier anonymous-parameter leak is gone since Amendment 2: declarations carry extents.
 
 ### Status
 
 - [x] Steps 1–4 committed; R12 measured.
 - [x] Evaluator pass 1: 12 defects (three performance blowups; receivers linked through same-named types; untyped names not shadowing; impact missing dispatch callers; Java lookup order; rebinding; Go test packages; status split; Python stdlib matching; self-calls). All fixed test-first (contract Amendment 1). The independent 80-edge sample was also 80/80.
-- [ ] Evaluator pass 2
+- [x] Evaluator pass 2: 5 defects, two of them regressions of pass-1 fixes (position-based rebinding ignored block scope; a declaration referenced itself). Fixed by giving every declaration a visibility extent (contract Amendment 2). Resolved share after the fixes: petclinic 39.2%, hono 14.8%, gin 63.4%, requests 30.4%.
+- [ ] Evaluator pass 3
 - [ ] Commit

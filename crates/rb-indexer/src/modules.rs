@@ -210,9 +210,11 @@ impl<'a> Modules<'a> {
             return Vec::new();
         };
         // Python 3 imports are absolute: `import json` inside the package `pkg` means the
-        // top-level `json`, not `pkg/json.py`. A match counts only when the directory above the
-        // matched segments is not itself a package (no `__init__.py`), i.e. a source root.
+        // top-level `json`, not `pkg/json.py`. A candidate counts when its source root (the
+        // directory above the matched segments) is the importing file's own root, or one of
+        // the conventional roots `""` and `src`.
         let depth = dotted.split('.').count();
+        let own_root = self.python_root(dir(from));
         let candidates: Vec<&'a str> = candidates
             .iter()
             .copied()
@@ -222,12 +224,7 @@ impl<'a> Modules<'a> {
                     segments.pop();
                 }
                 let root = segments[..segments.len().saturating_sub(depth)].join("/");
-                let init = if root.is_empty() {
-                    "__init__.py".to_owned()
-                } else {
-                    format!("{root}/__init__.py")
-                };
-                !self.files.contains_key(init.as_str())
+                root == own_root || root.is_empty() || root == "src"
             })
             .collect();
         let best = candidates
@@ -240,6 +237,22 @@ impl<'a> Modules<'a> {
             .copied()
             .filter(|c| shared_segments(dir(c), dir(from)) == best)
             .collect()
+    }
+
+    /// The source root of a Python directory: the nearest ancestor (or itself) that is not a
+    /// package, i.e. has no `__init__.py`; `""` when packages reach the repository root.
+    fn python_root(&self, mut dir: &str) -> String {
+        loop {
+            let init = if dir.is_empty() {
+                "__init__.py".to_owned()
+            } else {
+                format!("{dir}/__init__.py")
+            };
+            if dir.is_empty() || !self.files.contains_key(init.as_str()) {
+                return dir.to_owned();
+            }
+            dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+        }
     }
 
     /// The package directory of a Go import path, under the `go.mod` with the longest matching
@@ -436,7 +449,8 @@ mod tests {
                 vec!["app/core/db.py"],
                 vec!["app/api/forms.py"],
                 vec![],
-                // Two `util` modules: the one sharing the longest directory prefix wins.
+                // `app/` has no `__init__.py`, so it is the importer's source root and its
+                // `util.py` is the top-level `util`; `tools/util.py` belongs to another root.
                 vec!["app/util.py"],
             ]
         );
@@ -477,12 +491,68 @@ mod tests {
                 ("pkg/app.py", py, "import json\nimport tools\n"),
                 ("pkg/json.py", py, ""),
                 ("pkg/__init__.py", py, ""),
-                // `scripts/` is not a package: its modules are importable top-level names.
                 ("scripts/tools.py", py, ""),
             ],
             &[],
             "pkg/app.py",
         );
-        assert_eq!(got, [vec![], vec!["scripts/tools.py"]]);
+        // `scripts/` is a different source root from the importer's.
+        assert_eq!(got, [Vec::<String>::new(), Vec::new()]);
+    }
+
+    #[test]
+    fn python_source_roots_include_src_layouts_and_a_root_package() {
+        let py = Language::Python;
+        // src layout: tests import the package through its `src` root.
+        let got = resolved(
+            &[
+                ("src/pkg/__init__.py", py, ""),
+                ("src/pkg/mod.py", py, "def f(): pass\n"),
+                ("src/pkg/other.py", py, "import pkg.mod\n"),
+                ("tests/test_mod.py", py, "import pkg.mod\nimport logging\n"),
+                ("tests/logging.py", py, ""),
+            ],
+            &[],
+            "tests/test_mod.py",
+        );
+        // A sibling `tests/logging.py` shares the importer's root, so it is a candidate; the
+        // standard library cannot be told apart without an environment.
+        assert_eq!(got, [vec!["src/pkg/mod.py"], vec!["tests/logging.py"]]);
+        assert_eq!(
+            resolved(
+                &[
+                    ("src/pkg/__init__.py", py, ""),
+                    ("src/pkg/mod.py", py, ""),
+                    ("src/pkg/other.py", py, "import pkg.mod\n"),
+                ],
+                &[],
+                "src/pkg/other.py",
+            ),
+            [vec!["src/pkg/mod.py"]]
+        );
+        // An `__init__.py` at the repository root still lets absolute imports resolve.
+        let got = resolved(
+            &[
+                ("__init__.py", py, ""),
+                ("pkg/__init__.py", py, ""),
+                ("pkg/core.py", py, ""),
+                (
+                    "pkg/app.py",
+                    py,
+                    "import pkg.core\nfrom pkg import core\nimport json\n",
+                ),
+                ("pkg/json.py", py, ""),
+            ],
+            &[],
+            "pkg/app.py",
+        );
+        assert_eq!(
+            got,
+            [
+                vec!["pkg/core.py"],
+                vec!["pkg/__init__.py", "pkg/core.py"],
+                vec![]
+            ]
+        );
     }
 }

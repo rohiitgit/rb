@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-09-30 19:00]
+- M3a evaluator pass 2 fixes (contract Amendment 2):
+  - **rb-syntax:** `Binding::visible`, the extent over which a declaration is in effect, computed from per-language scope kinds; all declaration forms recorded (loops, `with`/`except`/`catch`, comprehensions, destructuring, walrus, lambda parameters, Go multi-assignment and type switches, Java enhanced-for, resources and `instanceof` patterns).
+  - **Resolver:** lookups by extent through a nested-interval tree (`Locals`), replacing position order; a definition's own name is not a self-reference; Java nested classes through imports.
+  - **Modules:** Python source-root rule (importer's root, `""` or `src`).
+  - **rb callers:** recursive targets list themselves once.
+- Re-measured: petclinic 39.2% (was 37.8%), hono 14.8%, gin 63.4% (was 64.7%; its 207 self-references from type declarations are gone, 3 genuine ones remain), requests 30.4%.
+- Files affected: crates/rb-syntax/src/{bindings,lib}.rs, crates/rb-indexer/src/{resolve,modules}.rs, crates/rb-store/src/code.rs, tasks/contract-m3a.md.
+
 ## [2026-09-30 16:00]
 - M3a evaluator pass 1 fixes (12 defects; contract Amendment 1):
   - **Linear resolution:** containers are deduplicated; bindings and same-package lookups are indexed.

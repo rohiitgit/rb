@@ -53,6 +53,12 @@ pub(crate) fn add_edges(
                     true,
                 ),
                 RefKind::Class | RefKind::Type => {
+                    // The name in `type Conn struct{}` is the declaration, not a reference.
+                    if r.enclosing
+                        .is_some_and(|i| facts.definitions[i].name_span == r.span)
+                    {
+                        continue;
+                    }
                     let name = match &r.qualifier {
                         Some(q) => format!("{q}.{}", r.name),
                         None => r.name.clone(),
@@ -233,13 +239,59 @@ struct Index<'a> {
     /// Type resolutions in progress. Bindings can make them cyclic (`session =
     /// session.Session()`): a resolution already in progress finds nothing.
     resolving: RefCell<BTreeSet<(&'a str, Option<usize>, String)>>,
-    /// Per file: non-member bindings by name, in source order.
-    locals: BTreeMap<&'a str, BTreeMap<&'a str, Vec<&'a Binding>>>,
+    /// Per file: non-member bindings by name, ordered by where they come into effect.
+    locals: BTreeMap<&'a str, BTreeMap<&'a str, Locals<'a>>>,
     /// Per file: member bindings by (owning type, name), in source order.
     fields: BTreeMap<&'a str, BTreeMap<(usize, &'a str), Vec<&'a Binding>>>,
     /// Top-level definitions by name per Java package and per Go (directory, package), so the
     /// same-package level costs a lookup rather than a scan of the package.
     packages: BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<Sym<'a>>>>,
+}
+
+/// The declarations of one name in one file, sorted by the start of their extent. Extents are
+/// nested or disjoint (scopes are), so `parent` links each declaration to the nearest enclosing
+/// one, and a lookup walks that chain instead of scanning every declaration.
+#[derive(Default)]
+struct Locals<'a> {
+    bindings: Vec<&'a Binding>,
+    parent: Vec<Option<usize>>,
+}
+
+impl<'a> Locals<'a> {
+    fn new(mut bindings: Vec<&'a Binding>) -> Self {
+        bindings.sort_by_key(|b| (b.visible[0], b.visible[1], b.span[0], b.span[1]));
+        let mut parent = Vec::with_capacity(bindings.len());
+        let mut open: Vec<usize> = Vec::new();
+        for (i, b) in bindings.iter().enumerate() {
+            let start = (b.visible[0], b.visible[1]);
+            while open
+                .last()
+                .is_some_and(|&o| (bindings[o].visible[2], bindings[o].visible[3]) < start)
+            {
+                open.pop();
+            }
+            parent.push(open.last().copied());
+            open.push(i);
+        }
+        Locals { bindings, parent }
+    }
+
+    /// The innermost declaration in effect at `at`.
+    fn at(&self, at: rb_model::Span) -> Option<&'a Binding> {
+        let pos = (at[0], at[1]);
+        let i = self
+            .bindings
+            .partition_point(|b| (b.visible[0], b.visible[1]) <= pos);
+        let mut cur = i.checked_sub(1);
+        while let Some(k) = cur {
+            let b = self.bindings[k];
+            if (b.visible[2], b.visible[3]) >= pos {
+                return Some(b);
+            }
+            cur = self.parent[k];
+        }
+        None
+    }
 }
 
 /// The package a file's same-package level searches: `("", package)` for Java, `(dir, package)`
@@ -290,12 +342,12 @@ impl<'a> Index<'a> {
         let mut keys = BTreeMap::new();
         let mut scopes = BTreeMap::new();
         let mut imports = BTreeMap::new();
-        let mut locals: BTreeMap<&str, BTreeMap<&str, Vec<&Binding>>> = BTreeMap::new();
+        let mut raw_locals: BTreeMap<&str, BTreeMap<&str, Vec<&Binding>>> = BTreeMap::new();
         let mut fields: BTreeMap<&str, BTreeMap<(usize, &str), Vec<&Binding>>> = BTreeMap::new();
         let mut packages: BTreeMap<(&str, &str), BTreeMap<&str, Vec<Sym>>> = BTreeMap::new();
         for (&path, (language, facts)) in files {
             let (l, f) = (
-                locals.entry(path).or_default(),
+                raw_locals.entry(path).or_default(),
                 fields.entry(path).or_default(),
             );
             for b in &facts.bindings {
@@ -351,7 +403,16 @@ impl<'a> Index<'a> {
             imports,
             supers: RefCell::new(BTreeMap::new()),
             resolving: RefCell::new(BTreeSet::new()),
-            locals,
+            locals: raw_locals
+                .into_iter()
+                .map(|(path, by_name)| {
+                    let by_name = by_name
+                        .into_iter()
+                        .map(|(name, bs)| (name, Locals::new(bs)))
+                        .collect();
+                    (path, by_name)
+                })
+                .collect(),
             fields,
             packages,
         }
@@ -517,6 +578,27 @@ impl<'a> Index<'a> {
         self.same_package(path, name, want)
     }
 
+    /// Types along a dotted path inside file `f` (`Util.Nested`): a top-level type followed by
+    /// types nested in it, trying each suffix of the path.
+    fn java_type_path(&self, f: &'a str, segments: &[&str]) -> Vec<Sym<'a>> {
+        for start in 0..segments.len() {
+            let mut types = self.named(f, None, segments[start], is_type);
+            for seg in &segments[start + 1..] {
+                if types.is_empty() {
+                    break;
+                }
+                types = types
+                    .into_iter()
+                    .flat_map(|t| self.named(t.0, Some(t.1), seg, is_type))
+                    .collect();
+            }
+            if !types.is_empty() {
+                return types;
+            }
+        }
+        Vec::new()
+    }
+
     /// Definitions `name` refers to through the file's imports: single-name imports, or with
     /// `on_demand` only Java wildcard (package or static) imports.
     fn imported(
@@ -529,10 +611,21 @@ impl<'a> Index<'a> {
         let language = self.language(path);
         let mut out = Vec::new();
         for (import, targets) in self.facts(path).imports.iter().zip(&self.imports[path]) {
+            // A top-level definition of the target files; for Java also a member of the class the
+            // import names (`import a.Util.Nested`, `import a.Util.*`).
+            let module: Vec<&str> = import.module.split('.').collect();
             let top = |n: &str| -> Vec<Sym<'a>> {
-                targets
+                let found: Vec<Sym<'a>> = targets
                     .iter()
                     .flat_map(|&f| self.named(f, None, n, want))
+                    .collect();
+                if !found.is_empty() || language != Language::Java {
+                    return found;
+                }
+                targets
+                    .iter()
+                    .flat_map(|&f| self.java_type_path(f, &module))
+                    .flat_map(|c| self.named(c.0, Some(c.1), n, want))
                     .collect()
             };
             if language == Language::Java && import.wildcard != on_demand {
@@ -543,11 +636,10 @@ impl<'a> Index<'a> {
             }
             match language {
                 Language::Java if import.is_static => {
-                    let class = import.module.rsplit('.').next().unwrap_or_default();
                     let named = import.wildcard || import.names.iter().any(|n| n.local == name);
                     if named {
                         for &f in targets {
-                            for c in self.named(f, None, class, is_type) {
+                            for c in self.java_type_path(f, &module) {
                                 out.extend(self.named(c.0, Some(c.1), name, want));
                             }
                         }
@@ -622,10 +714,10 @@ impl<'a> Index<'a> {
         found
     }
 
-    /// The binding `name` refers to at `scope`: the innermost local (a class body's own names are
-    /// not locals of its methods), and among several in that scope the nearest one declared before
-    /// `at`; else (Java) a field of an enclosing class. An untyped binding still counts: it hides
-    /// outer ones and marks the name as a variable.
+    /// The declaration `name` refers to at position `at` in `path`: the innermost local whose
+    /// extent contains `at` (a class body's own names are not locals of its methods); else (Java)
+    /// a field of an enclosing class. An untyped declaration still counts: it hides outer ones and
+    /// marks the name as a variable. Without a position, only fields are considered.
     fn binding(
         &self,
         path: &'a str,
@@ -634,33 +726,18 @@ impl<'a> Index<'a> {
         at: Option<rb_model::Span>,
     ) -> Option<&'a Binding> {
         let defs = &self.facts(path).definitions;
-        let chain = self.ancestors(path, scope);
-        let visible = |b: &&Binding| match b.scope {
-            None => Some(usize::MAX),
-            Some(s) => chain.iter().position(|&a| a == s).filter(|&depth| {
-                // A class body is a scope only for code directly in it.
-                depth == 0 || !is_type(defs[s].kind)
-            }),
-        };
-        let candidates = self.locals[path].get(name).into_iter().flatten();
-        let innermost = candidates.clone().filter_map(visible).min();
-        if let Some(depth) = innermost {
-            let same: Vec<&'a Binding> = candidates
-                .filter(|b| visible(b) == Some(depth))
-                .copied()
-                .collect();
-            let before = at.and_then(|at| {
-                same.iter()
-                    .rev()
-                    .find(|b| (b.span[0], b.span[1]) <= (at[0], at[1]))
-                    .copied()
-            });
-            return before.or_else(|| same.first().copied());
+        if let Some(at) = at
+            && let Some(b) = self.locals[path].get(name).and_then(|l| l.at(at))
+            && !b
+                .scope
+                .is_some_and(|t| is_type(defs[t].kind) && scope != Some(t))
+        {
+            return Some(b);
         }
         if self.language(path) != Language::Java {
             return None;
         }
-        chain.iter().find_map(|&a| {
+        self.ancestors(path, scope).into_iter().find_map(|a| {
             self.fields[path]
                 .get(&(a, name))
                 .and_then(|bs| bs.first().copied())
@@ -772,10 +849,18 @@ impl<'a> Index<'a> {
                 return Some((Container::Module(targets.clone()), 1));
             }
             for n in import.names.iter().filter(|n| n.local == s0) {
-                let types: Vec<Sym<'a>> = targets
+                let mut types: Vec<Sym<'a>> = targets
                     .iter()
                     .flat_map(|&f| self.named(f, None, &n.name, is_type))
                     .collect();
+                if types.is_empty() && language == Language::Java {
+                    let module: Vec<&str> = import.module.split('.').collect();
+                    types = targets
+                        .iter()
+                        .flat_map(|&f| self.java_type_path(f, &module))
+                        .flat_map(|c| self.named(c.0, Some(c.1), &n.name, is_type))
+                        .collect();
+                }
                 if !types.is_empty() {
                     return Some((Container::Types(types), 1));
                 }
@@ -1657,6 +1742,218 @@ func (s *Server) helper() {}
             started.elapsed().as_secs() < 5,
             "package scan {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn every_declaration_form_makes_a_variable() {
+        // Each variable shares its name with a type, package or field; none may resolve to it.
+        let py = build(
+            &[
+                (
+                    "pkg/models.py",
+                    PY,
+                    "class user:\n    def save(self):\n        pass\nclass conn:\n    def close(self):\n        pass\nclass item:\n    def run(self):\n        pass\nclass err:\n    def log(self):\n        pass\n",
+                ),
+                (
+                    "pkg/app.py",
+                    PY,
+                    "from pkg.models import user, conn, item, err\ndef f(users, items):\n    for user in users:\n        user.save()\n    with open() as conn:\n        conn.close()\n    x = [item.run() for item in items]\n    try:\n        pass\n    except Exception as err:\n        err.log()\n    a, conn = 1, 2\n    conn.close()\n    if (user := get()):\n        user.save()\n",
+                ),
+            ],
+            &[],
+        );
+        assert!(
+            edges(&py, EdgeKind::Calls).is_empty(),
+            "{:?}",
+            edges(&py, EdgeKind::Calls)
+        );
+
+        let go = build(
+            &[
+                ("user/user.go", GO, "package user\nfunc Save() {}\n"),
+                (
+                    "main.go",
+                    GO,
+                    "package main\nimport \"example.com/m/user\"\ntype client struct{}\nfunc (c *client) Do() {}\nfunc run(users []int, x any) {\n    for _, user := range users { user.Save() }\n    a, client := f()\n    client.Do()\n    switch client := x.(type) { case int: client.Do() }\n}\n",
+                ),
+            ],
+            &[("", "example.com/m")],
+        );
+        assert!(
+            edges(&go, EdgeKind::Calls).is_empty(),
+            "{:?}",
+            edges(&go, EdgeKind::Calls)
+        );
+
+        let ts = build(
+            &[
+                (
+                    "src/lib.ts",
+                    TS,
+                    "export class item { go() {} }\nexport class client { run() {} }\nexport class err { log() {} }\n",
+                ),
+                (
+                    "src/app.ts",
+                    TS,
+                    "import { item, client, err } from './lib';\nfunction f(items: any[], o: any) {\n  for (const item of items) item.go();\n  const { client } = o;\n  client.run();\n  items.map(item => item.go());\n  try {} catch (err) { err.log(); }\n}\n",
+                ),
+            ],
+            &[],
+        );
+        assert!(
+            edges(&ts, EdgeKind::Calls).is_empty(),
+            "{:?}",
+            edges(&ts, EdgeKind::Calls)
+        );
+
+        let java = build(
+            &[(
+                "p/K.java",
+                J,
+                "package p;\nclass Other { void save() {} void close() {} }\nclass Repo { void save() {} void close() {} }\nclass K {\n  private Other repo;\n  void m(java.util.List<Repo> xs) {\n    for (Repo repo : xs) { repo.save(); }\n    xs.forEach(repo -> repo.save());\n    try (Repo repo = new Repo()) { repo.close(); } catch (RuntimeException repo) { repo.save(); }\n    if (xs instanceof Repo repo) { repo.save(); }\n    repo.save();\n  }\n}\n",
+            )],
+            &[],
+        );
+        let calls = edges(&java, EdgeKind::Calls);
+        // The field `repo` (type Other) is reached only by the last call.
+        assert_eq!(
+            calls.iter().filter(|e| e.contains("Other#save")).count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|e| e.contains("Repo#save")).count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|e| e.contains("Repo#close")).count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|e| e.contains("Other#close")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn declarations_are_block_scoped_and_start_after_their_initialiser() {
+        let go = build(
+            &[(
+                "p/h.go",
+                GO,
+                "package p\ntype Ctx struct{}\nfunc (c *Ctx) Copy() *Ctx { return c }\nfunc (c *Ctx) Next() {}\nfunc Handle(c *Ctx) {\n    go func() { c := c.Copy(); c.Next() }()\n    c.Next()\n}\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&go, EdgeKind::Calls),
+            [
+                "h:Handle(). -> h:Ctx#Copy(). [heuristic]",
+                "h:Handle(). -> h:Ctx#Next(). [heuristic]"
+            ]
+        );
+        let ts = build(
+            &[(
+                "src/f.ts",
+                TS,
+                "class Repo { save() {} }\nfunction f(repo: Repo) {\n  if (x) { const repo = 1 }\n  repo.save();\n  [1].forEach(() => { let repo = 2 });\n  repo.save();\n}\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&ts, EdgeKind::Calls),
+            ["f:f(). -> f:Repo#save(). [heuristic]"]
+        );
+        let py = build(
+            &[(
+                "app/c.py",
+                PY,
+                "class Client:\n    def session(self):\n        pass\n\ndef f():\n    client = Client()\n    client = client.session()\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&py, EdgeKind::Calls),
+            ["c:f(). -> c:Client#session(). [heuristic]"]
+        );
+    }
+
+    #[test]
+    fn a_declaration_does_not_reference_itself() {
+        let built = build(
+            &[(
+                "p/t.go",
+                GO,
+                "package p\ntype Conn struct { next *Conn }\ntype Plain struct{}\n",
+            )],
+            &[],
+        );
+        // Only the genuine recursive field type references `Conn`.
+        assert_eq!(
+            edges(&built, EdgeKind::References),
+            ["t:Conn# -> t:Conn# [heuristic]"]
+        );
+    }
+
+    #[test]
+    fn java_nested_class_imports_resolve() {
+        let built = build(
+            &[
+                (
+                    "x/Util.java",
+                    J,
+                    "package x;\npublic class Util { public static class Nested { public static void n() {} } }\n",
+                ),
+                (
+                    "y/Use.java",
+                    J,
+                    "package y;\nimport x.Util.Nested;\nimport static x.Util.Nested.n;\nclass Use { void m() { Nested.n(); n(); } }\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            ["Use:Use#m(). -> Util:Util#Nested#n(). [heuristic]"]
+        );
+    }
+
+    #[test]
+    fn many_declarations_of_one_name_stay_fast() {
+        let mut src = String::from("class A:\n    def f(self):\n        pass\n\ndef run():\n");
+        for _ in 0..40_000 {
+            src.push_str("    x = A()\n    x.f()\n");
+        }
+        // Parsing is not under test: time the resolution alone.
+        let facts = rb_syntax::extract(PY, src.as_bytes()).unwrap();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> =
+            BTreeMap::from([("app/many.py", (PY, &facts))]);
+        let mut b = GraphBuilder::new();
+        b.add_node(
+            NodeKey::new(NodeKind::File, "app/many.py"),
+            "app/many.py",
+            Attrs::new(),
+        )
+        .unwrap();
+        crate::syntax::add_symbols(&mut b, "app/many.py", &facts).unwrap();
+        let started = std::time::Instant::now();
+        add_edges(&mut b, &by_path, &BTreeMap::new()).unwrap();
+        assert!(
+            started.elapsed().as_millis() < 1500,
+            "{:?}",
+            started.elapsed()
+        );
+        let g = b.finish().unwrap();
+        // Every `x.f()` site resolves to the one method, so the edges aggregate into one.
+        assert_eq!(
+            g.edges()
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .count(),
+            1
         );
     }
 }

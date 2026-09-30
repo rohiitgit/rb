@@ -312,6 +312,14 @@ pub fn callers(graph: &Graph, target: i64, opts: CallerOptions) -> CallerTree {
             for (src, step, dispatch, reference) in
                 v.callers_of(n, opts.include_references, opts.min_certainty)
             {
+                // A recursive target is its own direct caller (listed once, without children).
+                if src == target && n == target {
+                    children
+                        .entry(n)
+                        .or_default()
+                        .push((src, c.min(step), dispatch, reference));
+                    continue;
+                }
                 if seen.insert(src) {
                     let c = c.min(step);
                     children
@@ -337,7 +345,11 @@ pub fn callers(graph: &Graph, target: i64, opts: CallerOptions) -> CallerTree {
                 certainty,
                 dispatch,
                 reference,
-                callers: build(node, children),
+                callers: if node == n {
+                    Vec::new()
+                } else {
+                    build(node, children)
+                },
             })
             .collect()
     }
@@ -846,6 +858,37 @@ mod tests {
                 "1 Ctl#handle(). [heuristic]",
                 "2 page(). [heuristic]"
             ]
+        );
+    }
+
+    #[test]
+    fn a_recursive_target_lists_itself_once() {
+        let mut b = GraphBuilder::new();
+        let f = NodeKey::new(NodeKind::File, "r.ts");
+        b.add_node(f.clone(), "r.ts", Attrs::new()).unwrap();
+        let s = |n: &str| {
+            NodeKey::new(
+                NodeKind::Symbol,
+                format!("rb-heuristic . . . `r.ts`/{n}()."),
+            )
+        };
+        b.add_node(s("fact"), "fact", Attrs::new()).unwrap();
+        b.add_node(s("main"), "main", Attrs::new()).unwrap();
+        for (x, y) in [("fact", "fact"), ("main", "fact")] {
+            b.add_edge(NewEdge::new(
+                s(x),
+                EdgeKind::Calls,
+                s(y),
+                Provenance::Heuristic,
+                Certainty::Heuristic,
+            ))
+            .unwrap();
+        }
+        let g = b.finish().unwrap();
+        let tree = callers(&g, id(&g, "fact()."), opts(3));
+        assert_eq!(
+            flat(&g, &tree),
+            ["1 fact(). [heuristic]", "1 main(). [heuristic]"]
         );
     }
 

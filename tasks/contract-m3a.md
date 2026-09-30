@@ -81,3 +81,15 @@ M3a needs no external tool. Every M3a edge has provenance `heuristic`; SCIP late
 - **`rb impact`:** callers of a method the target overrides (CHA dispatch) are affected at distance 1.
 - **`rb status`:** a reference site is ambiguous when it has several targets, not when its edge's certainty is `ambiguous`.
 - **Known and accepted:** an edge's certainty is the best of its sites, so an edge whose sites are sometimes ambiguous shows `heuristic`.
+
+## Amendment 2: evaluator pass 2 (5 defects, 2 of them regressions from Amendment 1; all fixed test-first)
+
+- **Declarations carry an extent** (`Binding::visible`): from the end of the declaration to the end of its scope. Scopes are blocks, functions, loops, catch clauses and lambdas; in Python, the function (comprehensions and `except … as` names have their own). A comprehension variable is in effect from the comprehension's opening bracket, because the body precedes the `for`.
+  - Every declaration form is recorded: loop variables, `with`/`except`/`catch` names, comprehension variables, destructuring and tuple targets, walrus names, lambda and arrow parameters, Go multiple assignment and type-switch aliases, Java enhanced-for, resource and `instanceof` pattern locals.
+  - A reference resolves to the innermost declaration whose extent contains it. This replaces "nearest preceding declaration in the function", which ignored block scope and a statement's own right-hand side (`c := c.Copy()` hid the parameter it read).
+  - Extents are nested or disjoint, so declarations of a name form a tree; a lookup is a binary search plus a walk up that tree, linear overall. Forty thousand declarations of one name are timed.
+  - This also removes the "anonymous-function parameter" imprecision recorded in IMPLEMENT.md: a lambda's parameters end with the lambda.
+- **A definition's own name is not a reference to itself** (`type Conn struct{}`); a recursive field type still is.
+- **Python source roots:** an absolute import matches a module whose source root (the directory above the matched segments) is the importer's own root, or one of the conventional roots `""` and `src`. A `tests/logging.py` beside `tests/test_x.py` is therefore a candidate for that test's `import logging`; without an environment, the standard library cannot be told apart, and this is accepted. An `__init__.py` at the repository root no longer disables absolute imports.
+- **Java nested classes** resolve through imports (`import a.Util.Nested`, `import static a.Util.Nested.n`, `import a.Util.*`).
+- **`rb callers`** lists a recursive target as its own direct caller, once.
