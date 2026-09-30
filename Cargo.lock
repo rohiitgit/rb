@@ -1973,6 +1973,7 @@ dependencies = [
  "rb-frameworks",
  "rb-git",
  "rb-model",
+ "rb-scip",
  "rb-sql",
  "rb-syntax",
  "serde_json",

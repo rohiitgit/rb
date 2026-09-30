@@ -9,6 +9,7 @@ use std::path::Path;
 mod modules;
 mod orm;
 mod resolve;
+mod scip;
 mod sql;
 mod syntax;
 
