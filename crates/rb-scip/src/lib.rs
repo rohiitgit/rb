@@ -4,3 +4,6 @@
 pub mod decode;
 
 pub use decode::{Document, Occurrence, Relationship, ScipIndex, SymbolInfo, decode};
+pub mod jobs;
+
+pub use jobs::{Indexer, Job, jobs};

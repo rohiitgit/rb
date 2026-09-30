@@ -242,8 +242,10 @@ This file traces decisions from conversation to code. The design lives in `docs/
 
 - **Decided so far:** see `tasks/contract-m3b.md` (draft). Indexers run in pinned containers with the network disabled during indexing; an index is cached by `(project_input_hash, indexer_digest)`; a project is fully SCIP or fully heuristic. scip-java and scip-typescript first.
 - **Environment checked 2026-10-01:** Docker 29.5.2 on colima (arm64); `--network none` verified to block egress; about 4.8 GiB free on the host disk, so image sizes matter.
-- **Open:** image digests and invocations, the `scip` crate API, whether the fixtures build inside the indexers (research in progress).
+- **Research done (2026-10-01, primary sources, recorded in the contract):** `scip` 0.10.0 with `protobuf` pinned to 3.7.2; scip-java 0.13.1 (`ghcr.io/scip-code/scip-java`, arm64 and amd64 digests recorded) runs the whole Maven/Gradle build; scip-typescript 0.4.0 (`sourcegraph/scip-typescript`, **amd64 only**, so it runs under emulation here, which was verified to work). Both indexers mean UTF-16 columns and leave the encoding unset; scip-java emits typed ranges, scip-typescript the deprecated ones. Offline indexing after a fetch step is undocumented for both and is verified empirically in step 2.
+- **Built:** step 1, `rb-scip::decode` (typed and deprecated ranges, column conversion with the document text or the repo blob, duplicate-document merge, symbol information). Two new dependencies with stated reasons: `scip`, `protobuf`.
 
 ### Status
 
-- [ ] Steps 0–4 (see `tasks/todo.md`)
+- [x] Steps 0–1
+- [ ] Steps 2–4 (see `tasks/todo.md`)

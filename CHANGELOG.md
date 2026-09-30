@@ -1,5 +1,9 @@
 # Changelog
 
+## [2026-10-01 05:00]
+- M3b step 1: new crate `rb-scip` with `decode`, turning an `index.scip` into documents of occurrences with byte-column spans and symbol information. New dependencies `scip` 0.10 and `protobuf` =3.7.2 (the bindings' own pin). Contract `tasks/contract-m3b.md` drafted with verified indexer and crate facts.
+- Files affected: crates/rb-scip/*, Cargo.toml, tasks/contract-m3b.md, tasks/todo.md, IMPLEMENT.md.
+
 ## [2026-10-01 03:00]
 - M3a closed after evaluator pass 6 (PASS). Its two low-severity notes fixed: a bare call through a function-valued variable resolves to the definition the variable itself is (`Index::defines` returns the symbol declared by the same name token), so nested same-named functions no longer make sites ambiguous and an object property named like the variable is not taken for it. Edge sets on the four public repos are unchanged.
 - Files affected: crates/rb-indexer/src/resolve.rs, tasks/contract-m3a.md, IMPLEMENT.md, tasks/todo.md, docs §13.

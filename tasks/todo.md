@@ -154,8 +154,8 @@ Findings from the research step (2026-09-29):
 
 # M3b SCIP orchestration and exact edges (contract: tasks/contract-m3b.md)
 
-- [ ] 0. Research: indexer images/digests/invocations, `scip` crate API, fixture buildability; finish the contract.
-- [ ] 1. rb-scip: decode `index.scip`, position-encoding conversion (S1).
+- [x] 0. Research: indexer images/digests/invocations, `scip` crate API, fixture buildability; contract facts recorded.
+- [x] 1. rb-scip: decode `index.scip`, position-encoding conversion (S1).
 - [ ] 2. rb-scip: project detection, container jobs, fetch/index phases, cache (S2–S4).
 - [ ] 3. Indexer: the SCIP⋈Tree-sitter join, key replacement, exact edges, packages, coverage (S5–S9).
 - [ ] 4. Fixtures (`no-build`), goldens, public repos (S10–S12), evaluator passes, docs, commit.
