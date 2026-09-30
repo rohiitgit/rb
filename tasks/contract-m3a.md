@@ -111,3 +111,10 @@ M3a needs no external tool. Every M3a edge has provenance `heuristic`; SCIP late
 - **`staticmethod`, `classmethod` and `property`** are Python built-ins.
 - **Accepted:** a Python method default argument referencing a class attribute (`def n(self, y=r.m2())`) resolves `r` in the method's scope, so a same-named module variable wins; defaults are evaluated in class scope, and this needs the parameter list's extent, which the facts do not record. A wrong edge is possible only when a class attribute shadows a module name and is used in a default.
 - **Accepted:** `wrapped = deco(wrapped); wrapped()` is an unresolved call, since `wrapped` is a variable at the call.
+
+## Amendment 5: evaluator pass 5 (a regression from Amendment 4 and three hoisting gaps; all fixed test-first)
+
+- **Whether a function-valued declaration is a definition is decided by the resolver, not the extractor.** Every declarator is recorded as a variable again. A bare call through a variable is suppressed unless that variable is also a *kept* definition, meaning a symbol whose name lies inside the declaration. `const f = () => …` at module or named-function level resolves; the same inside a callback (where locals are not symbols) stays a variable and is unresolved, never linked to an import or module function of the same name. Generator and class expressions, which the tags query does not capture, behave the same way.
+- **`var` hoisting** starts at the start of the enclosing function or file (not after its first statement), and applies to `for (var x of …)` loop variables.
+- **Accepted (unresolved, never wrong):** `let k; k = () => …; k()`; a reassigned function-valued `let`; Go `f := func(){}` and Python `f = lambda` followed by `f()`; an anonymous `const K = class {}` never yields a type; a block-level `function` declaration shadows a module function for calls outside the block.
+- **Accepted (precision):** Java overload fan-out is `ambiguous`; call-site arity is not yet used to narrow it.

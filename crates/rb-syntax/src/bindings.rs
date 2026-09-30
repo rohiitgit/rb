@@ -17,6 +17,8 @@ pub(crate) struct RawBinding<'t> {
     pub to: Node<'t>,
     /// An explicit scope, for names whose scope is not the nearest scope kind (`except … as e`).
     pub scope: Option<Node<'t>>,
+    /// The extent starts at the start of `from` rather than its end (hoisted `var`).
+    pub from_start: bool,
 }
 
 /// Every binding in the file, in source order.
@@ -179,6 +181,7 @@ fn push<'t>(
             from,
             to: node,
             scope: None,
+            from_start: false,
         });
     }
 }
@@ -413,21 +416,6 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
         }
         "variable_declarator" => {
             let value = node.child_by_field_name("value");
-            // `const f = () => …` defines a function (the tags query captures it): it is a
-            // definition, not a variable.
-            if value.is_some_and(|v| {
-                matches!(
-                    v.kind(),
-                    "arrow_function"
-                        | "function_expression"
-                        | "function"
-                        | "generator_function"
-                        | "class"
-                        | "class_expression"
-                )
-            }) {
-                return;
-            }
             let ty = node
                 .child_by_field_name("type")
                 .and_then(|t| type_name(t, source))
@@ -449,7 +437,8 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
                 for n in names {
                     push(out, Some(n), ty.clone(), false, node, node, source);
                     if let (Some(h), Some(b)) = (hoisted, out.last_mut()) {
-                        b.from = h.child(0).unwrap_or(h);
+                        b.from = h;
+                        b.from_start = true;
                         b.scope = Some(h);
                     }
                 }
@@ -457,10 +446,19 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
         }
         "for_in_statement" => {
             if let Some(left) = node.child_by_field_name("left") {
+                let hoisted = node
+                    .child_by_field_name("kind")
+                    .filter(|k| text(*k, source) == "var")
+                    .and_then(|_| hoisting_scope(node));
                 let mut names = Vec::new();
                 pattern_names(left, &mut names);
                 for n in names {
                     push(out, Some(n), None, false, node, left, source);
+                    if let (Some(h), Some(b)) = (hoisted, out.last_mut()) {
+                        b.from = h;
+                        b.from_start = true;
+                        b.scope = Some(h);
+                    }
                 }
             }
         }
@@ -781,19 +779,18 @@ mod tests {
                 "top: Top in -"
             ]
         );
-        // Function-valued declarations are definitions, not variables; `var` is hoisted.
-        let src =
-            "const helper = () => 1;\nlet g = function () {};\nfunction f() { h(); var h = 2; }\n";
+        // `var` is hoisted to the start of its function, or of the file.
+        let src = "function first() { pv() }\nfunction f() { h(); var h = 2; }\nvar pv = 1;\nfor (var g of xs) {}\n";
         let got = extents(Language::JavaScript, src);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].0, "h");
-        assert!(got[0].1 < after(src, "h()"), "{got:?}");
+        let starts: Vec<(String, (i32, i32))> =
+            got.iter().map(|(n, s, _)| (n.clone(), *s)).collect();
         assert_eq!(
-            bound(
-                Language::JavaScript,
-                "function f(a, b = 1) { const t = new Thing(); }\n"
-            ),
-            ["a: ? in f", "b: ? in f", "t: Thing in f"]
+            starts,
+            [
+                ("h".into(), (1, 0)),
+                ("pv".into(), (0, 0)),
+                ("g".into(), (0, 0))
+            ]
         );
     }
 

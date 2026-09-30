@@ -386,7 +386,12 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                     scope = definitions[i].parent;
                 }
             }
-            let (from, to) = (b.from.end_position(), b.to.end_position());
+            let from = if b.from_start {
+                b.from.start_position()
+            } else {
+                b.from.end_position()
+            };
+            let to = b.to.end_position();
             Binding {
                 name: b.name,
                 type_name: b.type_name,

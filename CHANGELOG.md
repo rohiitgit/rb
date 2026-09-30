@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026-10-01 01:00]
+- M3a evaluator pass 5 fixes (contract Amendment 5): every declarator is a variable binding again, and the resolver decides whether a bare call goes through a variable or a kept definition (`Index::defines`), so function-valued constants inside callbacks no longer fall through to same-named imports; `var` hoisting starts at the start of the function or file and covers `for (var …)` loop variables.
+- Classified edge diff against e21d631: hono lost exactly the one wrong edge (`jsx/hooks/index.ts` → `dom/render.ts/update()`), 6,309 resolved, 14.8%; gin, requests and petclinic identical.
+- Files affected: crates/rb-syntax/src/{bindings,lib}.rs, crates/rb-indexer/src/resolve.rs, tasks/contract-m3a.md.
+
 ## [2026-09-30 23:30]
 - M3a evaluator pass 4 fixes (contract Amendment 4): function-valued declarations (`const f = () => …`) are definitions, not variable bindings; the bare-call rule skips Java (separate method and variable namespaces); JavaScript `var` is hoisted to the enclosing function; `staticmethod`, `classmethod` and `property` are built-ins.
 - Re-measured with a classified edge diff against 5ed2b3b: hono 14.8% (6,310 resolved), regaining exactly the 329 `CALLS` edges the bare-call rule had suppressed; 2 edges lost, not classified. petclinic 39.2%, gin 63.4%, requests 30.4% unchanged.

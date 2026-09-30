@@ -244,6 +244,8 @@ struct Index<'a> {
     resolving: RefCell<BTreeSet<(&'a str, Option<usize>, String)>>,
     /// Per file: non-member bindings by name, ordered by where they come into effect.
     locals: BTreeMap<&'a str, BTreeMap<&'a str, Locals<'a>>>,
+    /// Per file: definitions by name, at every nesting level.
+    defs_by_name: BTreeMap<&'a str, BTreeMap<&'a str, Vec<usize>>>,
     /// Per file: member bindings by (owning type, name), in source order.
     fields: BTreeMap<&'a str, BTreeMap<(usize, &'a str), Vec<&'a Binding>>>,
     /// Top-level definitions by name per Java package and per Go (directory, package), so the
@@ -351,6 +353,7 @@ impl<'a> Index<'a> {
         let mut scopes = BTreeMap::new();
         let mut imports = BTreeMap::new();
         let mut raw_locals: BTreeMap<&str, BTreeMap<&str, Vec<&Binding>>> = BTreeMap::new();
+        let mut defs_by_name: BTreeMap<&str, BTreeMap<&str, Vec<usize>>> = BTreeMap::new();
         let mut fields: BTreeMap<&str, BTreeMap<(usize, &str), Vec<&Binding>>> = BTreeMap::new();
         let mut packages: BTreeMap<(&str, &str), BTreeMap<&str, Vec<Sym>>> = BTreeMap::new();
         for (&path, (language, facts)) in files {
@@ -358,6 +361,10 @@ impl<'a> Index<'a> {
                 raw_locals.entry(path).or_default(),
                 fields.entry(path).or_default(),
             );
+            let by_name = defs_by_name.entry(path).or_default();
+            for (i, d) in facts.definitions.iter().enumerate() {
+                by_name.entry(d.name.as_str()).or_default().push(i);
+            }
             for b in &facts.bindings {
                 match (b.member, b.scope) {
                     (true, Some(t)) => f.entry((t, b.name.as_str())).or_default().push(b),
@@ -411,6 +418,7 @@ impl<'a> Index<'a> {
             imports,
             supers: RefCell::new(BTreeMap::new()),
             resolving: RefCell::new(BTreeSet::new()),
+            defs_by_name,
             locals: raw_locals
                 .into_iter()
                 .map(|(path, by_name)| {
@@ -584,6 +592,21 @@ impl<'a> Index<'a> {
             return self.imported(path, name, want, true);
         }
         self.same_package(path, name, want)
+    }
+
+    /// Whether binding `b` of `name` is also a definition: a kept symbol whose name lies inside
+    /// the declaration (`const f = () => …`). Definitions inside callbacks are not kept, so a
+    /// function held in such a variable stays a plain variable.
+    fn defines(&self, path: &'a str, name: &str, b: &Binding) -> bool {
+        let defs = &self.facts(path).definitions;
+        let within = |s: rb_model::Span| {
+            (s[0], s[1]) >= (b.span[0], b.span[1]) && (s[2], s[3]) <= (b.span[2], b.span[3])
+        };
+        self.defs_by_name[path]
+            .get(name)
+            .into_iter()
+            .flatten()
+            .any(|&i| within(defs[i].name_span))
     }
 
     /// Types along a dotted path inside file `f` (`Util.Nested`): a top-level type followed by
@@ -939,11 +962,13 @@ impl<'a> Index<'a> {
         at: Option<rb_model::Span>,
     ) -> Vec<(EdgeKind, Sym<'a>)> {
         // A bare call through a variable (`cb()`) is never linked by name to a function.
+        // A bare call through a variable (`cb()`) is never linked by name to a function, unless
+        // the variable is itself a kept definition (`const f = () => …` at a symbol level).
         // Java keeps methods and variables in separate namespaces (JLS §6.4.2).
         let through_variable = self.language(path) != Language::Java
             && at.is_some_and(|at| {
                 self.binding(path, scope, name, Some(at))
-                    .is_some_and(|b| !b.member)
+                    .is_some_and(|b| !b.member && !self.defines(path, name, b))
             });
         let found = match qualifier {
             None if through_variable => Vec::new(),
@@ -2145,5 +2170,77 @@ func (s *Server) helper() {}
             &[],
         );
         assert!(unresolved(&py).is_empty(), "{:?}", unresolved(&py));
+    }
+
+    #[test]
+    fn functions_in_callbacks_and_unrecognised_forms_stay_variables() {
+        // E1: a function-valued const inside a callback is not a symbol; calling it never falls
+        // through to an import or a module function of the same name.
+        let js = build(
+            &[
+                (
+                    "src/lib.js",
+                    Language::JavaScript,
+                    "export function fmt() {}\nexport function fmtLocal() {}\n",
+                ),
+                (
+                    "src/cb.js",
+                    Language::JavaScript,
+                    "import { fmt } from './lib.js';\nfunction build(items) { return items.map(x => { const fmt = () => x; return fmt(); }); }\ndescribe('x', () => { const fmt = () => 1; fmt(); });\nfunction fmtLocal() {}\nitems.forEach(function () { const fmtLocal = () => 1; fmtLocal(); });\n",
+                ),
+            ],
+            &[],
+        );
+        assert!(
+            edges(&js, EdgeKind::Calls).is_empty(),
+            "{:?}",
+            edges(&js, EdgeKind::Calls)
+        );
+        // E3: generator and class expressions are not captured as definitions; calls through
+        // them are unresolved, never linked to same-named module symbols.
+        let js = build(
+            &[(
+                "src/gc.js",
+                Language::JavaScript,
+                "function gen() {}\nclass K { static build() {} }\nfunction useGen() { const gen = function* () {}; gen(); }\nfunction useClass() { const K = class { static build() {} }; K.build(); }\n",
+            )],
+            &[],
+        );
+        assert!(
+            edges(&js, EdgeKind::Calls).is_empty(),
+            "{:?}",
+            edges(&js, EdgeKind::Calls)
+        );
+        // Module-level function-valued constants are definitions and still resolve.
+        let js = build(
+            &[(
+                "src/ok.js",
+                Language::JavaScript,
+                "const helper = () => 1;\nfunction run() { helper(); }\n",
+            )],
+            &[],
+        );
+        assert_eq!(
+            edges(&js, EdgeKind::Calls),
+            ["ok:run(). -> ok:helper(). [heuristic]"]
+        );
+    }
+
+    #[test]
+    fn var_hoisting_covers_loops_and_the_whole_file() {
+        let js = build(
+            &[(
+                "src/v.js",
+                Language::JavaScript,
+                "function g() {}\nfunction pv() {}\nfunction first() { pv(); }\nfunction second() { pv(); }\nfunction s3() { for (var g of xs) {} g(); }\nvar pv = makePv();\n",
+            )],
+            &[],
+        );
+        // `pv` is hoisted over the whole file and `g` over `s3`: no call resolves.
+        assert!(
+            edges(&js, EdgeKind::Calls).is_empty(),
+            "{:?}",
+            edges(&js, EdgeKind::Calls)
+        );
     }
 }
