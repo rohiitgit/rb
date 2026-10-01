@@ -14,6 +14,9 @@ pub struct ScipCacheEntry {
     /// `ok` or `failed` (contract M3b amendments 30 and 31); a row with any other value, written
     /// by an older binary, is a miss.
     pub status: String,
+    /// The phase a `failed` run stopped in (`fetch` or `index`; contract M3b amendment 56); a
+    /// `failed` row without one, written by an older binary, is a miss.
+    pub phase: Option<String>,
     /// `index.scip` bytes when `ok`.
     pub index: Option<Vec<u8>>,
     pub stderr_tail: String,
@@ -196,9 +199,12 @@ pub(crate) fn run_projects(
         let input_hash = rb_scip::project_input_hash(&job.root, under_root.iter().copied());
         // A row whose status no current run would write (a `timeout` from an older binary) is
         // a miss (contract M3b amendment 31).
-        let cached = cache
-            .get(&input_hash, &project.image)?
-            .and_then(|entry| Some((RunStatus::from_cached(&entry.status)?, entry)));
+        let cached = cache.get(&input_hash, &project.image)?.and_then(|entry| {
+            Some((
+                RunStatus::from_cached(&entry.status, entry.phase.as_deref())?,
+                entry,
+            ))
+        });
         let (status, entry) = match cached {
             Some(hit) => {
                 project.cached = true;
@@ -220,6 +226,7 @@ pub(crate) fn run_projects(
                 )?;
                 let entry = ScipCacheEntry {
                     status: run.status.as_str().to_owned(),
+                    phase: run.status.phase().map(|p| p.as_str().to_owned()),
                     index: run.index,
                     stderr_tail: run.stderr_tail,
                     elapsed_ms: u64::try_from(run.elapsed.as_millis()).unwrap_or(u64::MAX),
@@ -243,7 +250,7 @@ pub(crate) fn run_projects(
             match rb_scip::decode(bytes, &source_of) {
                 Ok(index) => project.index = Some(index),
                 Err(e) => {
-                    project.status = RunStatus::Failed;
+                    project.status = RunStatus::Failed(rb_scip::Phase::Index);
                     project.stderr_tail = format!("decoding index.scip: {e:#}");
                 }
             }
@@ -500,14 +507,27 @@ mod tests {
         );
         // The TypeScript job's fetch failed: recorded, cached as such, and served from the cache
         // next time without another attempt.
-        assert_eq!(ran[1].status, RunStatus::Failed);
+        // The row records the phase (contract M3b amendment 56).
+        assert_eq!(ran[1].status, RunStatus::Failed(rb_scip::Phase::Fetch));
         assert!(ran[1].index.is_none());
         assert_eq!(ran[1].stderr_tail, "boom");
         assert_eq!(cache.puts, 1, "unsupported jobs are not cached");
         assert_eq!(*fake.runs.borrow(), 1);
+        let row = cache.rows.values().next().unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.phase.as_deref()),
+            ("failed", Some("fetch"))
+        );
         let again = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
-        assert!(again[1].cached && again[1].status == RunStatus::Failed);
+        assert!(again[1].cached && again[1].status == RunStatus::Failed(rb_scip::Phase::Fetch));
         assert_eq!(*fake.runs.borrow(), 1);
+        // A `failed` row without a phase (an older binary's) is a miss: the job runs again.
+        for row in cache.rows.values_mut() {
+            row.phase = None;
+        }
+        let rerun = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        assert!(!rerun[1].cached && rerun[1].status == RunStatus::Failed(rb_scip::Phase::Fetch));
+        assert_eq!(*fake.runs.borrow(), 2);
 
         // `--no-cache` (contract M3b amendment 20): the cached failure is not read, the job
         // runs again, and its new outcome replaces the row.
@@ -522,7 +542,7 @@ mod tests {
         .unwrap();
         assert!(!retried[1].cached && retried[1].status == RunStatus::Ok);
         assert_eq!(*retry.runs.borrow(), 2, "fetch and index ran again");
-        assert_eq!(cache.puts, 2, "the outcome is written");
+        assert_eq!(cache.puts, 3, "the outcome is written");
         let served = run_projects(&files, &read, &Mode::Run(&retry), &opts, &mut cache).unwrap();
         assert!(served[1].cached && served[1].status == RunStatus::Ok);
         assert_eq!(*retry.runs.borrow(), 2);

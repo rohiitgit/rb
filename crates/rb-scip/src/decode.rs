@@ -59,6 +59,9 @@ pub struct SymbolInfo {
     pub symbol: String,
     /// `SymbolInformation.Kind` by name (`Class`, `Method`, …); empty when unspecified.
     pub kind: String,
+    /// The symbol's name as written; read for local symbols, whose string carries no name
+    /// (contract M3b amendment 54).
+    pub display_name: String,
     pub relationships: Vec<Relationship>,
 }
 
@@ -79,6 +82,9 @@ pub fn decode(
 ) -> anyhow::Result<ScipIndex> {
     let index = scip::types::Index::parse_from_bytes(bytes).context("parsing index.scip")?;
     let metadata = index.metadata.as_ref();
+    let scip_java = metadata
+        .and_then(|m| m.tool_info.as_ref())
+        .is_some_and(|t| t.name == "scip-java");
     // Duplicate documents for one path (scip-typescript #330) merge into ordered sets, which
     // drop repeats and give the decoded order without a per-item scan.
     struct Merged {
@@ -94,7 +100,13 @@ pub fn decode(
             PositionEncoding::UTF8CodeUnitOffsetFromLineStart => Units::Bytes,
             PositionEncoding::UTF32CodeUnitOffsetFromLineStart => Units::Chars,
             PositionEncoding::UTF16CodeUnitOffsetFromLineStart
-            | PositionEncoding::UnspecifiedPositionEncoding => Units::Utf16,
+            | PositionEncoding::UnspecifiedPositionEncoding => {
+                if scip_java {
+                    Units::Javac
+                } else {
+                    Units::Utf16
+                }
+            }
         };
         let text: Option<Vec<u8>> = if doc.text.is_empty() {
             source_of(&path)
@@ -174,22 +186,39 @@ enum Units {
     Bytes,
     Utf16,
     Chars,
+    /// scip-java's columns (contract M3b amendment 53): javac's `LineMap` advances a tab to the
+    /// next multiple of 8 and any other character by its UTF-16 length, and scip-java then
+    /// subtracts 7 for each tab that starts the line. On a line without a tab this is `Utf16`.
+    Javac,
 }
 
 /// The byte offset of code unit `col` within `line`. A column past the end clamps to the line's
-/// length; a column inside a multi-unit character clamps to the next character's start.
+/// length; a column inside a multi-unit character clamps to the next character's start, and a
+/// javac column inside a tab's expansion maps to the tab.
 fn byte_column(line: &[u8], col: i32, units: Units) -> i32 {
-    let Ok(target) = usize::try_from(col) else {
+    let Ok(mut target) = usize::try_from(col) else {
         return 0;
     };
+    if units == Units::Javac {
+        // Undo scip-java's correction of leading tabs (7 per tab) to get javac's column.
+        let leading = line.iter().take_while(|&&b| b == b'\t').count();
+        target = target.saturating_add(7 * leading);
+    }
     let text = String::from_utf8_lossy(line);
     let mut seen = 0usize;
     for (byte, ch) in text.char_indices() {
         if seen >= target {
             return i32::try_from(byte).unwrap_or(i32::MAX);
         }
+        if units == Units::Javac && ch == '\t' {
+            seen = (seen / 8 + 1) * 8;
+            if seen > target {
+                return i32::try_from(byte).unwrap_or(i32::MAX);
+            }
+            continue;
+        }
         seen += match units {
-            Units::Utf16 => ch.len_utf16(),
+            Units::Utf16 | Units::Javac => ch.len_utf16(),
             Units::Chars => 1,
             Units::Bytes => ch.len_utf8(),
         };
@@ -242,6 +271,7 @@ fn symbol_info(s: &scip::types::SymbolInformation) -> SymbolInfo {
         .unwrap_or_default();
     SymbolInfo {
         symbol: s.symbol.clone(),
+        display_name: s.display_name.clone(),
         kind: if kind == "UnspecifiedKind" {
             String::new()
         } else {
@@ -429,6 +459,7 @@ mod tests {
         let got = decode(&encode(&index), &|_| None).unwrap();
         let s = &got.documents[0].symbols[0];
         assert_eq!(s.kind, "Class");
+        assert_eq!(s.display_name, "Dog");
         assert_eq!(s.relationships[0].symbol, "scip-java maven . . p/Animal#");
         assert!(s.relationships[0].is_implementation && !s.relationships[0].is_reference);
     }
@@ -473,6 +504,216 @@ mod tests {
         assert_eq!(d.symbols.len(), 2_000);
         assert!(d.occurrences.windows(2).all(|w| w[0].span < w[1].span));
         assert!(d.symbols.windows(2).all(|w| w[0].symbol < w[1].symbol));
+    }
+
+    /// Contract M3b amendment 53: scip-java reports javac's columns, which advance a tab to
+    /// the next multiple of 8 and subtract 7 per tab that starts the line. The lines and raw
+    /// columns are the ones measured with `rb-scip-java:0.13.1` (leading, interior, double and
+    /// mixed tabs, a tab inside a string literal, non-ASCII characters before a tab); each
+    /// occurrence must land on its token's bytes. A scip-typescript index with the same columns
+    /// is read as UTF-16 only.
+    #[test]
+    fn javac_columns_expand_tabs_to_multiples_of_eight() {
+        // (line text, token, its nth occurrence on the line, raw start, raw end); a token
+        // `g(s` stands for the name before its `(`.
+        let measured: &[(&str, &str, usize, i32, i32)] = &[
+            (
+                "public interface Wide extends\t\tBox<Doer>,\tYyyyyyyy {",
+                "Box",
+                0,
+                40,
+                43,
+            ),
+            (
+                "public interface Wide extends\t\tBox<Doer>,\tYyyyyyyy {",
+                "Doer",
+                0,
+                44,
+                48,
+            ),
+            (
+                "public interface Wide extends\t\tBox<Doer>,\tYyyyyyyy {",
+                "Yyyyyyyy",
+                0,
+                56,
+                64,
+            ),
+            (
+                "public class Tabby implements\tNamed,\tSized {",
+                "Named",
+                0,
+                32,
+                37,
+            ),
+            (
+                "public class Tabby implements\tNamed,\tSized {",
+                "Sized",
+                0,
+                40,
+                45,
+            ),
+            (
+                "\tpublic String name() { return \"t\"; }\tpublic int size() { return 1; }",
+                "size",
+                0,
+                52,
+                56,
+            ),
+            ("\tint a;\t\tint b = 1;", "b", 0, 21, 22),
+            (
+                "\t\t\tvoid m1() { h(); }\tvoid m2() { m1();\t\tk(); }",
+                "m1",
+                0,
+                8,
+                10,
+            ),
+            (
+                "\t\t\tvoid m1() { h(); }\tvoid m2() { m1();\t\tk(); }",
+                "m2",
+                0,
+                32,
+                34,
+            ),
+            (
+                "\t\t\tvoid m1() { h(); }\tvoid m2() { m1();\t\tk(); }",
+                "m1",
+                1,
+                39,
+                41,
+            ),
+            (
+                "\t\t\tvoid m1() { h(); }\tvoid m2() { m1();\t\tk(); }",
+                "k",
+                0,
+                59,
+                60,
+            ),
+            ("    \t@Override public void why() {}", "Override", 0, 9, 17),
+            ("    \t@Override public void why() {}", "why", 0, 30, 33),
+            ("  \tvoid g(int x, int y) {}", "g", 0, 13, 14),
+            (
+                "\t@Override\tpublic String toString() { return \"a\tb\" + h(); }",
+                "h",
+                0,
+                62,
+                63,
+            ),
+            (
+                "\tvoid f() {\tg(1,\t2);\tString s = \"x\ty\";\tg(s.length(),  3); }",
+                "g(s",
+                0,
+                57,
+                58,
+            ),
+            (
+                "\tvoid f() {\tg(1,\t2);\tString s = \"x\ty\";\tg(s.length(),  3); }",
+                "length",
+                0,
+                61,
+                67,
+            ),
+            (
+                "\tvoid u() { String s = \"\u{e9}\t\u{1f600}\"; g(s.length(),\t1); }",
+                "g(s",
+                0,
+                38,
+                39,
+            ),
+            (
+                "\tvoid u() { String s = \"\u{e9}\t\u{1f600}\"; g(s.length(),\t1); }",
+                "length",
+                0,
+                42,
+                48,
+            ),
+        ];
+        let index_of = |tool: &str| {
+            let text: String = measured.iter().map(|m| format!("{}\n", m.0)).collect();
+            let occurrences = measured
+                .iter()
+                .enumerate()
+                .map(|(line, &(_, _, _, start, end))| {
+                    let mut o = occ(&format!("scip-java maven . . p/T#m{line}()."), 0);
+                    o.typed_range =
+                        Some(occurrence::Typed_range::SingleLineRange(SingleLineRange {
+                            line: line as i32,
+                            start_character: start,
+                            end_character: end,
+                            ..Default::default()
+                        }));
+                    o
+                })
+                .collect();
+            Index {
+                metadata: Some(Metadata {
+                    tool_info: Some(ToolInfo {
+                        name: tool.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                })
+                .into(),
+                documents: vec![ScipDocument {
+                    relative_path: "T.java".into(),
+                    text,
+                    occurrences,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        };
+        let expected: Vec<Span> = measured
+            .iter()
+            .enumerate()
+            .map(|(line, &(text, token, nth, ..))| {
+                let col = text.match_indices(token).nth(nth).unwrap().0 as i32;
+                let len = token.find('(').unwrap_or(token.len()) as i32;
+                [line as i32, col, line as i32, col + len]
+            })
+            .collect();
+        let spans = |tool: &str| -> Vec<Span> {
+            let got = decode(&encode(&index_of(tool)), &|_| None).unwrap();
+            let mut spans: Vec<Span> = got.documents[0]
+                .occurrences
+                .iter()
+                .map(|o| o.span)
+                .collect();
+            spans.sort();
+            spans
+        };
+        assert_eq!(spans("scip-java"), expected);
+        // The same columns from another indexer are UTF-16 units: no tab expansion.
+        let utf16 = spans("scip-typescript");
+        assert_ne!(utf16[0], expected[0]);
+        assert_eq!(
+            utf16[0],
+            [0, 40, 0, 43],
+            "Box's raw columns, read as code units"
+        );
+    }
+
+    #[test]
+    fn javac_columns_inside_a_tab_map_to_the_tab() {
+        // `a\tb`: the tab spans javac columns 1..8, `b` starts at 8.
+        let line = "a\tb".as_bytes();
+        assert_eq!(byte_column(line, 0, Units::Javac), 0);
+        assert_eq!(byte_column(line, 1, Units::Javac), 1);
+        assert_eq!(
+            byte_column(line, 5, Units::Javac),
+            1,
+            "inside the tab's expansion"
+        );
+        assert_eq!(byte_column(line, 8, Units::Javac), 2);
+        assert_eq!(byte_column(line, 9, Units::Javac), 3);
+        assert_eq!(
+            byte_column(line, 99, Units::Javac),
+            3,
+            "past the end clamps"
+        );
+        // A leading tab is corrected by scip-java (7 subtracted): `\tb` reports `b` at 1.
+        assert_eq!(byte_column("\tb".as_bytes(), 1, Units::Javac), 1);
+        assert_eq!(byte_column("\t\tb".as_bytes(), 2, Units::Javac), 2);
     }
 
     #[test]

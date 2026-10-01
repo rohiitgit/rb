@@ -209,6 +209,15 @@ Findings from the research step (2026-09-29):
       - [x] G9 README "Container runtime" note, `--scip-work-dir` under the home directory; design §5.2.
       - [x] G10 `relationships_dropped` in coverage and on the `scip:` line (`dropped_relationships_are_counted`); goldens re-blessed by container runs, the Java fixture's 8 identified.
       - [x] Verify: fmt, clippy, unit tests (awk-summed), e2e twice with containers, stub scan, public repos (petclinic 13 `IMPLEMENTS` read in the source, class-validator), cleanup, commit.
+    - [x] Evaluator pass 5 (test-first, one amendment each, 53–58; `tasks/eval-m3b-pass5.md`):
+      - [x] Amendments 53–58 written first (S7 restated in the body and in 54; amendment 2 note).
+      - [x] H2 comments skipped in heritage clauses (rb-syntax; `comments_in_heritage_clauses_are_not_supertypes`).
+      - [x] H1 measured with the real scip-java on `var/fix-pass5/tabs` (68/68 occurrences explained by "tabs to multiples of 8, minus 7 per leading tab"); decoder `Units::Javac` (`javac_columns_expand_tabs_to_multiples_of_eight`, `javac_columns_inside_a_tab_map_to_the_tab`); join guard (`a_supertype_occurrence_must_name_the_written_type`).
+      - [x] H3 local definitions bound per document (`definitions_local`), local → global forward, `relationships_dropped_in_project`; four join units, mutation-checked; e2e sweep restated.
+      - [x] H4 `RunStatus::Failed(Phase)`, detail `phase`, `failed (fetch phase)`, migration 0005 `rb.scip_index.phase`; units in rb-scip, rb-indexer, rb-cli; polyglot e2e.
+      - [x] H5/H6 docs (amendment 57, design §5.3/§13, amendment 2, singular "1 SCIP job").
+      - [x] Verify: fmt, clippy, 294 unit tests, e2e twice with containers (no `skipping:`), stub scan; goldens re-blessed (3 status files) and read; public repos fresh == cached: petclinic 240/240, 256, 13; class-validator 417/424 + 6 local, 398, 2 (diff classified); jsoup 4,874 + 117 local, 14,013, 688, 0 in project; samples 20/20 and 10/10.
+      - [x] Records: contract measurement, CHANGELOG, IMPLEMENT.md, lessons; cleanup of `var/fix-pass5/` and `fx5_*`; commit.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
@@ -223,3 +232,7 @@ Findings from the research step (2026-09-29):
 ## Review (evaluator pass 4)
 - All ten findings fixed test-first (amendments 43–52). A declared supertype's span is now its name only and resolves to the last type occurrence inside it, so a nested type argument (`Marker<Marker.Disc>`) or a type-use annotation (`@Tag Shape`) no longer picks the wrong type; a snapshot whose SCIP jobs did not all finish is rebuilt by the next plain run; the fetch recipe is part of the index cache key.
 - Found while verifying: a session slip — `git checkout -- <file>` to undo a temporary trace discarded the file's uncommitted work; it was restored from the diff recorded in the session transcript and verified by the file's test suite and the unchanged diff stat (lesson recorded).
+
+## Review (evaluator pass 5)
+- All six findings fixed test-first (amendments 53–58). The tab rule was measured before it was coded: every scip-java occurrence on the scratch project's tab lines is javac's tab-expanded column minus 7 per leading tab, so the decoder converts it and the join's name guard is a second line of defence. Local definitions are bound per document and keep heuristic keys; jsoup's join gaps dropped to 0 in project.
+- Found while measuring: the local binding applies to scip-typescript too (class-validator +6 correct edges), and scip-typescript emits a reference, not a definition, at a named class expression, so one class-validator definition stays unanchored; S7 names that case. jsoup's 52 relationships from anonymous classes' methods stay dropped, because Tree-sitter has no definition for them (design §8.2); they are not counted as in-project gaps.

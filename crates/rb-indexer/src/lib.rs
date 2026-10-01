@@ -441,14 +441,17 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
         Some(reason) => detail["reason"] = reason.into(),
         None => detail["image"] = p.image.as_str().into(),
     }
-    if let rb_scip::RunStatus::Timeout { phase, budget_secs } = &p.status {
+    if let Some(phase) = p.status.phase() {
         detail["phase"] = phase.as_str().into();
+    }
+    if let rb_scip::RunStatus::Timeout { budget_secs, .. } = &p.status {
         detail["budget_secs"] = (*budget_secs).into();
     }
     if let Some(c) = coverage {
         detail["coverage"] = json!({
             "definitions_matched": c.definitions_matched,
             "definitions_matched_by_name": c.definitions_matched_by_name,
+            "definitions_local": c.definitions_local,
             "definitions_total": c.definitions_total,
             "references_matched": c.references_matched,
             "references_external": c.references_external,
@@ -460,11 +463,12 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "supertypes_unresolved": c.supertypes_unresolved,
             "occurrences_unconverted": c.occurrences_unconverted,
             "relationships_dropped": c.relationships_dropped,
+            "relationships_dropped_in_project": c.relationships_dropped_in_project,
         });
     }
     if matches!(
         p.status,
-        rb_scip::RunStatus::Failed | rb_scip::RunStatus::Timeout { .. }
+        rb_scip::RunStatus::Failed(_) | rb_scip::RunStatus::Timeout { .. }
     ) && !p.stderr_tail.is_empty()
     {
         detail["stderr_tail"] = p.stderr_tail.as_str().into();
@@ -1016,7 +1020,7 @@ mod tests {
         let nested_sym =
             |name: &str| format!("scip-typescript npm p 1.0.0 pkg/src/`a.ts`/{name}().");
         let mut failed = ok_project("pkg", "scip-typescript", vec![]);
-        failed.status = rb_scip::RunStatus::Failed;
+        failed.status = rb_scip::RunStatus::Failed(rb_scip::Phase::Fetch);
         failed.index = None;
         let content = Content {
             facts: BTreeMap::from([
@@ -1084,10 +1088,13 @@ mod tests {
         assert!(d.detail.get("stderr_tail").is_none(), "{}", d.detail);
         assert!(!d.detail.to_string().contains("/Users"), "{}", d.detail);
 
-        project.status = rb_scip::RunStatus::Failed;
+        project.status = rb_scip::RunStatus::Failed(rb_scip::Phase::Fetch);
         project.stderr_tail = "[ERROR] boom".into();
         let d = scip_status(&project, None);
         assert_eq!(d.detail["stderr_tail"], "[ERROR] boom");
+        // The phase that failed is recorded, as for a timeout (contract M3b amendment 56).
+        assert_eq!(d.detail["phase"], "fetch");
+        assert!(d.detail.get("budget_secs").is_none(), "{}", d.detail);
     }
 
     #[test]

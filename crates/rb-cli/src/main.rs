@@ -439,7 +439,8 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
                 return Ok(());
             }
             Some(Rebuild::UnfinishedJobs(n)) => {
-                println!("{repo}: rebuilding: {n} SCIP jobs did not finish last time");
+                let jobs = if n == 1 { "job" } else { "jobs" };
+                println!("{repo}: rebuilding: {n} SCIP {jobs} did not finish last time");
             }
             Some(Rebuild::Commit | Rebuild::Tools) => {}
         }
@@ -517,16 +518,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         if j.elapsed_ms > 0 {
             let _ = write!(line, " {:.1}s", j.elapsed_ms as f64 / 1000.0);
         }
-        match &j.status {
-            rb_scip::RunStatus::Timeout { phase, budget_secs } => {
-                line.push_str(&timeout_detail(phase.as_str(), *budget_secs));
-            }
-            other => {
-                if let Some(reason) = other.reason() {
-                    let _ = write!(line, ": {reason}");
-                }
-            }
-        }
+        line.push_str(&status_detail(&j.status));
         println!("{line}");
         // The docker client's whole text, for the terminal only: the stored reason is its
         // redacted first line (contract M3b amendment 49).
@@ -576,9 +568,27 @@ fn rebuild_reason(
     Ok(None)
 }
 
-/// ` (fetch phase, 600 s budget)` after a `timeout` status (contract M3b amendment 31).
-fn timeout_detail(phase: &str, budget_secs: u64) -> String {
-    format!(" ({phase} phase, {budget_secs} s budget)")
+/// ` (fetch phase, 600 s budget)` after a `timeout` status (contract M3b amendment 31),
+/// ` (fetch phase)` after a `failed` one (amendment 56).
+fn phase_detail(phase: &str, budget_secs: Option<u64>) -> String {
+    match budget_secs {
+        Some(budget) => format!(" ({phase} phase, {budget} s budget)"),
+        None => format!(" ({phase} phase)"),
+    }
+}
+
+/// What `rb index` prints after a job's status: the phase of a timeout or failure, else the
+/// reason a job did not run, else nothing.
+fn status_detail(status: &rb_scip::RunStatus) -> String {
+    match status {
+        rb_scip::RunStatus::Timeout { phase, budget_secs } => {
+            phase_detail(phase.as_str(), Some(*budget_secs))
+        }
+        rb_scip::RunStatus::Failed(phase) => phase_detail(phase.as_str(), None),
+        other => other
+            .reason()
+            .map_or_else(String::new, |reason| format!(": {reason}")),
+    }
 }
 
 /// The `rb status` resolution line (contract M3a R8, M3b S9 and amendment 41). With no
@@ -621,10 +631,11 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         line.push_str(" unpinned");
     }
     // A timeout's stored `reason` is rendered from its phase and budget, so the detail is
-    // printed once, as `rb index` prints it (contract M3b amendment 50).
-    match (d.detail["phase"].as_str(), d.detail["budget_secs"].as_u64()) {
-        (Some(phase), Some(budget)) => line.push_str(&timeout_detail(phase, budget)),
-        _ => {
+    // printed once, as `rb index` prints it (contract M3b amendment 50); a failure prints its
+    // phase (amendment 56).
+    match d.detail["phase"].as_str() {
+        Some(phase) => line.push_str(&phase_detail(phase, d.detail["budget_secs"].as_u64())),
+        None => {
             if let Some(reason) = d.detail["reason"].as_str() {
                 let _ = write!(line, ": {reason}");
             }
@@ -634,7 +645,7 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         let n = |k: &str| c[k].as_u64().unwrap_or(0);
         let _ = write!(
             line,
-            ", definitions matched {}/{} ({} by name), references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}, relationships dropped {}",
+            ", definitions matched {}/{} ({} by name), references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}, relationships dropped {} ({} in project)",
             n("definitions_matched"),
             n("definitions_total"),
             n("definitions_matched_by_name"),
@@ -645,7 +656,8 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
             n("references_unanchored"),
             n("references_unmatched"),
             n("occurrences_unconverted"),
-            n("relationships_dropped")
+            n("relationships_dropped"),
+            n("relationships_dropped_in_project")
         );
         // Files the indexer left out (excluded by its tsconfig): no edges of any kind.
         if n("files_without_document") > 0 {
@@ -663,6 +675,11 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
                 ", {} supertypes unresolved",
                 n("supertypes_unresolved")
             );
+        }
+        // Definitions scip-java keys as document-local symbols: they keep heuristic keys
+        // (contract M3b amendment 54).
+        if n("definitions_local") > 0 {
+            let _ = write!(line, ", {} local definitions", n("definitions_local"));
         }
     }
     line
@@ -684,6 +701,7 @@ impl rb_indexer::ScipCache for StoreCache<'_, '_> {
             .scip_index_get(input_hash, image)?
             .map(|e| rb_indexer::ScipCacheEntry {
                 status: e.status,
+                phase: e.phase,
                 index: e.index,
                 stderr_tail: e.stderr_tail,
                 elapsed_ms: u64::try_from(e.elapsed_ms).unwrap_or(0),
@@ -701,6 +719,7 @@ impl rb_indexer::ScipCache for StoreCache<'_, '_> {
             image,
             &rb_store::CachedScipIndex {
                 status: entry.status.clone(),
+                phase: entry.phase.clone(),
                 index: entry.index.clone(),
                 stderr_tail: entry.stderr_tail.clone(),
                 elapsed_ms: i32::try_from(entry.elapsed_ms).unwrap_or(i32::MAX),
@@ -1034,7 +1053,10 @@ mod tests {
             &rb_scip::Images::unresolved(),
         );
         assert!(unavailable.get("scip_java").is_none());
-        assert_eq!(timeout_detail("fetch", 600), " (fetch phase, 600 s budget)");
+        assert_eq!(
+            phase_detail("fetch", Some(600)),
+            " (fetch phase, 600 s budget)"
+        );
     }
 
     /// Contract M3b amendment 44: the live snapshot covers a run only with the same commit, the
@@ -1120,10 +1142,59 @@ mod tests {
             "coverage": {"definitions_matched": 2, "definitions_total": 3, "relationships_dropped": 4},
         }));
         assert!(
-            scip_status_line(&ok).ends_with(", unconverted 0, relationships dropped 4"),
+            scip_status_line(&ok)
+                .ends_with(", unconverted 0, relationships dropped 4 (0 in project)"),
             "{}",
             scip_status_line(&ok)
         );
+        // Local definitions (contract M3b amendment 54) are printed when there are any.
+        let local = diagnostic(json!({
+            "indexer": "scip-java", "status": "ok", "unpinned": false, "image": "sha256:1",
+            "coverage": {"definitions_matched": 2, "definitions_local": 1, "definitions_total": 3,
+                         "relationships_dropped": 4, "relationships_dropped_in_project": 1},
+        }));
+        assert!(
+            scip_status_line(&local)
+                .ends_with(", relationships dropped 4 (1 in project), 1 local definitions"),
+            "{}",
+            scip_status_line(&local)
+        );
+    }
+
+    /// Contract M3b amendment 56: a failed job names its phase on both lines.
+    #[test]
+    fn scip_status_line_prints_the_failed_phase() {
+        let failed = rb_model::Diagnostic {
+            kind: "scip_status".into(),
+            path: Some("services/broken".into()),
+            span: None,
+            detail: json!({
+                "indexer": "scip-java", "status": "failed", "unpinned": false,
+                "image": "sha256:1", "phase": "fetch", "stderr_tail": "[ERROR] boom",
+            }),
+        };
+        assert_eq!(
+            scip_status_line(&failed),
+            "scip: services/broken scip-java failed (fetch phase)"
+        );
+        assert_eq!(
+            status_detail(&rb_scip::RunStatus::Failed(rb_scip::Phase::Index)),
+            " (index phase)"
+        );
+        assert_eq!(
+            status_detail(&rb_scip::RunStatus::Timeout {
+                phase: rb_scip::Phase::Fetch,
+                budget_secs: 600
+            }),
+            " (fetch phase, 600 s budget)"
+        );
+        assert_eq!(
+            status_detail(&rb_scip::RunStatus::Skipped(
+                "docker is not available".into()
+            )),
+            ": docker is not available"
+        );
+        assert_eq!(status_detail(&rb_scip::RunStatus::Ok), "");
     }
 
     #[test]

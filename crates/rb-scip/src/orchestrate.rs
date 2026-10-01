@@ -16,8 +16,10 @@ pub const RECIPE: &str = "m3b-2";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Ok,
-    /// The fetch or index phase failed; `stderr_tail` says why.
-    Failed,
+    /// The fetch or index phase failed (contract M3b amendment 56: which one is recorded, as
+    /// for a timeout; an index that was not produced or could not be decoded is the index
+    /// phase's); `stderr_tail` says why.
+    Failed(Phase),
     /// A phase ran over its budget (contract M3b amendment 31). Not cached: the budget is not
     /// part of the cache key.
     Timeout {
@@ -50,6 +52,15 @@ impl Phase {
             Phase::Index => "index",
         }
     }
+
+    /// The phase [`Phase::as_str`] names; `None` for any other text.
+    pub fn parse(text: &str) -> Option<Phase> {
+        match text {
+            "fetch" => Some(Phase::Fetch),
+            "index" => Some(Phase::Index),
+            _ => None,
+        }
+    }
 }
 
 impl RunStatus {
@@ -57,7 +68,7 @@ impl RunStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             RunStatus::Ok => "ok",
-            RunStatus::Failed => "failed",
+            RunStatus::Failed(_) => "failed",
             RunStatus::Timeout { .. } => "timeout",
             RunStatus::Unsupported(_) => "unsupported",
             RunStatus::Skipped(_) => "skipped",
@@ -69,15 +80,24 @@ impl RunStatus {
     /// own build (`ok` or `failed`). A timeout depends on the budget, and an unsupported or
     /// environment outcome on the host, so they are decided again on the next run.
     pub fn is_cacheable(&self) -> bool {
-        matches!(self, RunStatus::Ok | RunStatus::Failed)
+        matches!(self, RunStatus::Ok | RunStatus::Failed(_))
     }
 
-    /// The status a cache row recorded: `ok` or `failed`. `None` for any other value (a
-    /// `timeout` written by an older binary), which the caller treats as a miss.
-    pub fn from_cached(status: &str) -> Option<RunStatus> {
+    /// The phase a `failed` or `timeout` job stopped in.
+    pub fn phase(&self) -> Option<Phase> {
+        match self {
+            RunStatus::Failed(phase) | RunStatus::Timeout { phase, .. } => Some(*phase),
+            _ => None,
+        }
+    }
+
+    /// The status a cache row recorded: `ok`, or `failed` with its phase. `None` for any other
+    /// value (a `timeout`, or a `failed` without a phase, written by an older binary), which
+    /// the caller treats as a miss.
+    pub fn from_cached(status: &str, phase: Option<&str>) -> Option<RunStatus> {
         match status {
             "ok" => Some(RunStatus::Ok),
-            "failed" => Some(RunStatus::Failed),
+            "failed" => phase.and_then(Phase::parse).map(RunStatus::Failed),
             _ => None,
         }
     }
@@ -92,7 +112,7 @@ impl RunStatus {
                 "{} phase over its {budget_secs} s budget",
                 phase.as_str()
             )),
-            RunStatus::Ok | RunStatus::Failed => None,
+            RunStatus::Ok | RunStatus::Failed(_) => None,
         }
     }
 }
@@ -336,7 +356,7 @@ fn finished(
     let status = if outcome.ok() && index.is_some() {
         RunStatus::Ok
     } else {
-        RunStatus::Failed
+        RunStatus::Failed(phase)
     };
     let mut stderr_tail = outcome.stderr_tail.clone();
     if outcome.ok() && index.is_none() {
@@ -712,6 +732,36 @@ mod tests {
         );
     }
 
+    /// Contract M3b amendment 56: a `failed` job names the phase that failed, and the phase
+    /// round-trips through the cache row; a `failed` row without a phase (an older binary's)
+    /// is a miss, like any status this binary does not write.
+    #[test]
+    fn a_failed_job_records_its_phase() {
+        for phase in [Phase::Fetch, Phase::Index] {
+            let status = RunStatus::Failed(phase);
+            assert_eq!(status.as_str(), "failed");
+            assert_eq!(status.phase(), Some(phase));
+            assert!(status.is_cacheable());
+            assert_eq!(
+                RunStatus::from_cached("failed", Some(phase.as_str())),
+                Some(status)
+            );
+        }
+        assert_eq!(RunStatus::from_cached("failed", None), None);
+        assert_eq!(RunStatus::from_cached("failed", Some("build")), None);
+        assert_eq!(RunStatus::from_cached("ok", None), Some(RunStatus::Ok));
+        assert_eq!(RunStatus::from_cached("timeout", Some("fetch")), None);
+        assert_eq!(RunStatus::Ok.phase(), None);
+        assert_eq!(
+            RunStatus::Timeout {
+                phase: Phase::Index,
+                budget_secs: 1
+            }
+            .phase(),
+            Some(Phase::Index)
+        );
+    }
+
     #[test]
     fn a_failed_fetch_stops_before_indexing_and_a_failed_index_has_no_bytes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -726,7 +776,7 @@ mod tests {
             &fake,
         )
         .unwrap();
-        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.status, RunStatus::Failed(Phase::Fetch));
         assert_eq!(run.stderr_tail, "boom");
         assert_eq!(fake.runs.borrow().len(), 1);
         assert_eq!(
@@ -745,7 +795,7 @@ mod tests {
             &fake,
         )
         .unwrap();
-        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.status, RunStatus::Failed(Phase::Index));
         assert!(run.index.is_none());
         assert_eq!(fake.runs.borrow()[0].entrypoint.as_deref(), Some("yarn"));
     }
@@ -922,7 +972,7 @@ mod tests {
             &fake,
         )
         .unwrap();
-        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.status, RunStatus::Failed(Phase::Fetch));
         assert_eq!(run.stderr_tail, "boom");
         assert_eq!(
             fake.runs.borrow().len(),
@@ -1176,7 +1226,7 @@ mod tests {
         // A build that fails with any other code is the project's (cached by the caller).
         assert_eq!(
             run_with(Ok(outcome(Some(1), false, "[ERROR] boom"))),
-            RunStatus::Failed
+            RunStatus::Failed(Phase::Fetch)
         );
         assert_eq!(
             RunStatus::Timeout {

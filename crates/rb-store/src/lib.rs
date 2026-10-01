@@ -30,6 +30,9 @@ pub use query::{
 pub struct CachedScipIndex {
     /// `ok`, `failed` or `timeout`.
     pub status: String,
+    /// `fetch` or `index` for a `failed` run (contract M3b amendment 56); `None` otherwise and
+    /// on rows written before the column existed.
+    pub phase: Option<String>,
     /// `index.scip` bytes when `ok`.
     pub index: Option<Vec<u8>>,
     pub stderr_tail: String,
@@ -53,6 +56,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0004_scip_index",
         include_str!("../../../migrations/0004_scip_index.sql"),
+    ),
+    (
+        "0005_scip_index_phase",
+        include_str!("../../../migrations/0005_scip_index_phase.sql"),
     ),
 ];
 
@@ -157,7 +164,7 @@ impl Store {
         indexer_digest: &str,
     ) -> anyhow::Result<Option<CachedScipIndex>> {
         let row = self.client.query_opt(
-            "SELECT status, index, stderr_tail, elapsed_ms FROM rb.scip_index
+            "SELECT status, index, stderr_tail, elapsed_ms, phase FROM rb.scip_index
              WHERE input_hash = $1 AND indexer_digest = $2",
             &[&input_hash, &indexer_digest],
         )?;
@@ -166,6 +173,7 @@ impl Store {
             index: r.get(1),
             stderr_tail: r.get(2),
             elapsed_ms: r.get(3),
+            phase: r.get(4),
         }))
     }
 
@@ -177,12 +185,12 @@ impl Store {
         entry: &CachedScipIndex,
     ) -> anyhow::Result<()> {
         self.client.execute(
-            "INSERT INTO rb.scip_index (input_hash, indexer_digest, status, index, stderr_tail, elapsed_ms)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO rb.scip_index (input_hash, indexer_digest, status, index, stderr_tail, elapsed_ms, phase)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (input_hash, indexer_digest) DO UPDATE
              SET status = EXCLUDED.status, index = EXCLUDED.index,
                  stderr_tail = EXCLUDED.stderr_tail, elapsed_ms = EXCLUDED.elapsed_ms,
-                 created_at = now()",
+                 phase = EXCLUDED.phase, created_at = now()",
             &[
                 &input_hash,
                 &indexer_digest,
@@ -190,6 +198,7 @@ impl Store {
                 &entry.index,
                 &entry.stderr_tail,
                 &entry.elapsed_ms,
+                &entry.phase,
             ],
         )?;
         Ok(())

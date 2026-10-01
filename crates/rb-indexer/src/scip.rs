@@ -76,6 +76,11 @@ pub(crate) struct Coverage {
     /// occurrence at the first text match of its name, which lands inside an annotation above
     /// the member when that text contains the name (contract M3b amendment 7).
     pub definitions_matched_by_name: usize,
+    /// Definitions whose definition occurrence is a document-local symbol (scip-java's enum
+    /// constant bodies, scip-typescript's nested functions and classes; contract M3b amendment
+    /// 54): they keep their heuristic keys, and occurrences and relationships naming the local
+    /// symbol in the same document resolve to them. Not part of `definitions_matched`.
+    pub definitions_local: usize,
     pub definitions_total: usize,
     /// Tree-sitter references matched to an occurrence of a symbol defined in the index.
     pub references_matched: usize,
@@ -110,6 +115,12 @@ pub(crate) struct Coverage {
     /// external type; contract M3b amendment 52). Relationships the direction rule rejects
     /// (the reverse side of an override) are not dropped: their forward twin is the edge.
     pub relationships_dropped: usize,
+    /// The subset of `relationships_dropped` whose source and target are both defined in this
+    /// project: each has a definition occurrence in the index's documents (a local one in the
+    /// relationship's own document) on the name line of a same-named Tree-sitter definition
+    /// (contract M3b amendment 54). Non-zero means the join failed to anchor a definition both
+    /// sides know, not that the link leaves the project.
+    pub relationships_dropped_in_project: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -176,30 +187,116 @@ pub(crate) fn join(
             languages.contains(language) && !out.documented.contains(**path)
         })
         .count();
+    // Each document's local symbols by name (`SymbolInformation.display_name`): a local
+    // symbol's string carries none.
+    let local_names: Vec<BTreeMap<&str, &str>> = docs
+        .iter()
+        .map(|(_, doc, ..)| {
+            doc.symbols
+                .iter()
+                .filter(|s| s.symbol.starts_with("local "))
+                .map(|s| (s.symbol.as_str(), s.display_name.as_str()))
+                .collect()
+        })
+        .collect();
     // Definitions first, over every document: the name's range is a definition occurrence of a
     // global symbol. The matched symbols are the only targets an edge may have, since only they
-    // get `Symbol` nodes.
-    for (path, _, facts, by_span) in &docs {
+    // get `Symbol` nodes. A definition occurrence of a local symbol at the name binds that
+    // symbol, within its document, to the definition, which keeps its heuristic key (contract
+    // M3b amendment 54). Exact anchors at the name come before the by-name fallback.
+    let mut locals: Vec<BTreeMap<&str, usize>> = vec![BTreeMap::new(); docs.len()];
+    for (di, (path, _, facts, by_span)) in docs.iter().enumerate() {
         let mut replaced: BTreeMap<usize, String> = BTreeMap::new();
         for (i, d) in facts.definitions.iter().enumerate() {
             out.coverage.definitions_total += 1;
-            let at_name = by_span
-                .get(&d.name_span)
-                .and_then(|os| os.iter().find(|o| is_global_definition(o)));
-            let (hit, by_name) = match at_name {
-                Some(o) => (Some(*o), false),
-                None => (definition_before_name(d, by_span), true),
+            let at_name = |accept: fn(&rb_scip::Occurrence) -> bool| {
+                by_span
+                    .get(&d.name_span)
+                    .and_then(|os| os.iter().copied().find(|o| accept(o)))
             };
-            if let Some(o) = hit {
+            let global_named = |o: &rb_scip::Occurrence| {
+                is_global_definition(o)
+                    && rb_scip::last_descriptor_name(&o.symbol).as_deref() == Some(d.name.as_str())
+            };
+            let local_named = |o: &rb_scip::Occurrence| {
+                is_local_definition(o)
+                    && local_names[di].get(o.symbol.as_str()) == Some(&d.name.as_str())
+            };
+            let global_at_name = at_name(is_global_definition);
+            let local_at_name = global_at_name
+                .is_none()
+                .then(|| at_name(is_local_definition))
+                .flatten();
+            let global_by_name = (global_at_name.is_none() && local_at_name.is_none())
+                .then(|| definition_before_name(d, by_span, &global_named))
+                .flatten();
+            if let Some(o) = global_at_name.or(global_by_name) {
                 out.coverage.definitions_matched += 1;
-                out.coverage.definitions_matched_by_name += usize::from(by_name);
+                out.coverage.definitions_matched_by_name += usize::from(global_by_name.is_some());
                 replaced.insert(i, o.symbol.clone());
+                continue;
+            }
+            let local = local_at_name.or_else(|| definition_before_name(d, by_span, &local_named));
+            if let Some(o) = local {
+                out.coverage.definitions_local += 1;
+                locals[di].entry(o.symbol.as_str()).or_insert(i);
             }
         }
         if !replaced.is_empty() {
             out.keys.insert(path.clone(), replaced);
         }
     }
+    // Where each symbol is defined, for telling a dropped relationship inside the project from
+    // one that leaves it: per document, the Tree-sitter definitions' `(name line, name)`; the
+    // global definition occurrences' `(document, line)`; each document's local ones' lines.
+    let name_lines: Vec<BTreeSet<(i32, &str)>> = docs
+        .iter()
+        .map(|(_, _, facts, _)| {
+            facts
+                .definitions
+                .iter()
+                .map(|d| (d.name_span[0], d.name.as_str()))
+                .collect()
+        })
+        .collect();
+    let mut global_sites: BTreeMap<&str, Vec<(usize, i32)>> = BTreeMap::new();
+    let mut local_sites: Vec<BTreeMap<&str, Vec<i32>>> = vec![BTreeMap::new(); docs.len()];
+    for (di, (_, doc, ..)) in docs.iter().enumerate() {
+        for o in doc.occurrences.iter().filter(|o| o.is_definition()) {
+            if o.symbol.starts_with("local ") {
+                local_sites[di]
+                    .entry(o.symbol.as_str())
+                    .or_default()
+                    .push(o.span[0]);
+            } else {
+                global_sites
+                    .entry(o.symbol.as_str())
+                    .or_default()
+                    .push((di, o.span[0]));
+            }
+        }
+    }
+    // Whether `symbol`, named in document `di`, is defined in the project (see
+    // `Coverage::relationships_dropped_in_project`).
+    let in_project = |symbol: &str, di: usize| -> bool {
+        if symbol.starts_with("local ") {
+            let Some(name) = local_names[di].get(symbol) else {
+                return false;
+            };
+            local_sites[di]
+                .get(symbol)
+                .is_some_and(|lines| lines.iter().any(|&l| name_lines[di].contains(&(l, *name))))
+        } else {
+            let Some(name) = rb_scip::last_descriptor_name(symbol) else {
+                return false;
+            };
+            global_sites.get(symbol).is_some_and(|sites| {
+                sites
+                    .iter()
+                    .any(|&(dj, l)| name_lines[dj].contains(&(l, name.as_str())))
+            })
+        }
+    };
     let nodes: BTreeSet<&str> = out
         .keys
         .values()
@@ -258,7 +355,23 @@ pub(crate) fn join(
             };
             let symbol = o.symbol.as_str();
             if symbol.starts_with("local ") {
-                out.coverage.references_local += 1;
+                // A local symbol bound to a definition of this document (amendment 54) is an
+                // exact target with that definition's heuristic key.
+                match locals[di].get(symbol) {
+                    Some(&i) => {
+                        out.coverage.references_matched += 1;
+                        out.edges.push(ScipEdge {
+                            src: source(r.enclosing),
+                            kind,
+                            dst: heuristic[i].clone(),
+                            at: Evidence {
+                                path: path.clone(),
+                                span: r.span,
+                            },
+                        });
+                    }
+                    None => out.coverage.references_local += 1,
+                }
                 continue;
             }
             if !defined.contains(symbol) {
@@ -316,39 +429,72 @@ pub(crate) fn join(
         // workspace, and relates an override to the method it implements however many levels
         // up, so the source's type holder must reach the target's type through its declared
         // supertypes.
-        let Some(replaced) = replaced else {
-            continue;
-        };
         // Several declarations can share one symbol (TypeScript overload signatures): the
-        // first one is the definition the edge is anchored at.
+        // first one is the definition the edge is anchored at. A local symbol bound in this
+        // document stands for its definition, under that definition's heuristic key.
         let mut definition_of: BTreeMap<&str, usize> = BTreeMap::new();
-        for (i, symbol) in replaced {
+        for (i, symbol) in replaced.into_iter().flatten() {
             definition_of.entry(symbol.as_str()).or_insert(*i);
         }
+        let key_of = |symbol: &str| -> Option<(usize, String)> {
+            match locals[di].get(symbol) {
+                Some(&i) => Some((i, heuristic[i].clone())),
+                None => definition_of.get(symbol).map(|&i| (i, symbol.to_owned())),
+            }
+        };
         for s in &doc.symbols {
             let implementations = s.relationships.iter().filter(|r| r.is_implementation);
+            let mut dropped = |rel: &rb_scip::Relationship| {
+                out.coverage.relationships_dropped += 1;
+                out.coverage.relationships_dropped_in_project +=
+                    usize::from(in_project(&s.symbol, di) && in_project(&rel.symbol, di));
+            };
             // A source without a matched definition (a local class expression, a field) has no
             // node to start an edge from: its relationships are dropped and counted.
-            let Some(&i) = definition_of.get(s.symbol.as_str()) else {
-                out.coverage.relationships_dropped += implementations.count();
+            let Some((i, source_key)) = key_of(&s.symbol) else {
+                implementations.for_each(&mut dropped);
                 continue;
             };
+            let source_local = s.symbol.starts_with("local ");
             let holder = (di, type_holder(facts, i));
             for rel in implementations {
-                if !nodes.contains(rel.symbol.as_str()) {
-                    out.coverage.relationships_dropped += 1;
+                let target_local = rel.symbol.starts_with("local ");
+                let target = if target_local {
+                    locals[di]
+                        .get(rel.symbol.as_str())
+                        .map(|&j| heuristic[j].clone())
+                } else {
+                    nodes
+                        .contains(rel.symbol.as_str())
+                        .then(|| rel.symbol.clone())
+                };
+                let Some(target) = target else {
+                    dropped(rel);
                     continue;
-                }
-                let targets = rb_scip::type_symbol_of(&rel.symbol)
-                    .and_then(|type_symbol| types_by_symbol.get(type_symbol.as_str()));
-                let supported = targets.is_some_and(|targets| {
-                    reaches_supertype(&supertypes, &types_by_symbol, holder, targets)
-                });
+                };
+                // A local type is never a supertype of a global one (an enum constant body, an
+                // anonymous or a local class cannot be named outside its scope), so `local →
+                // global` is the forward side and `global → local` its reverse twin; between two
+                // locals the syntax cannot be consulted (no type symbol), so the link is dropped
+                // (amendment 54). Between globals the source's declared supertypes decide.
+                let supported = match (source_local, target_local) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    (true, true) => {
+                        dropped(rel);
+                        continue;
+                    }
+                    (false, false) => rb_scip::type_symbol_of(&rel.symbol)
+                        .and_then(|type_symbol| types_by_symbol.get(type_symbol.as_str()))
+                        .is_some_and(|targets| {
+                            reaches_supertype(&supertypes, &types_by_symbol, holder, targets)
+                        }),
+                };
                 if supported {
                     implements.push(ScipEdge {
-                        src: Source::Symbol(s.symbol.clone()),
+                        src: Source::Symbol(source_key.clone()),
                         kind: EdgeKind::Implements,
-                        dst: rel.symbol.clone(),
+                        dst: target,
                         at: Evidence {
                             path: path.clone(),
                             span: facts.definitions[i].name_span,
@@ -369,6 +515,10 @@ pub(crate) fn join(
 
 fn is_global_definition(o: &rb_scip::Occurrence) -> bool {
     o.is_definition() && !o.symbol.starts_with("local ")
+}
+
+fn is_local_definition(o: &rb_scip::Occurrence) -> bool {
+    o.is_definition() && o.symbol.starts_with("local ")
 }
 
 /// The definition whose supertypes decide an `IMPLEMENTS` direction: the definition itself when
@@ -400,9 +550,12 @@ fn is_type(d: &rb_syntax::Definition) -> bool {
 /// passed over as not a type, an outer type's occurrence gives way to the nested type after it
 /// (`Outer#` then `Outer#Inner#` for `Outer.Inner`; scip-typescript's `NS#`, `NS/` then
 /// `NS/Inner#` for a namespace-merged class), and type arguments (`Marker.Disc` in
-/// `Marker<Marker.Disc>`) and type-use annotations lie outside the span. `None` when the span
-/// holds no type occurrence: the indexer did not say which type is meant, and nothing is
-/// guessed.
+/// `Marker<Marker.Disc>`) and type-use annotations lie outside the span. The chosen symbol
+/// must name the written type: its last descriptor is the supertype's simple name (`Inner` for
+/// `a.b.Outer.Inner`; contract M3b amendment 53), so an occurrence that an indexer's column
+/// error moved into the span (scip-java's tab expansion put `Doer#` inside `Yyyyyyyy`) is not
+/// taken for it. `None` when the span holds no such type occurrence: the indexer did not say
+/// which type is meant, and nothing is guessed.
 fn declared_supertypes(
     d: &rb_syntax::Definition,
     by_span: &BTreeMap<Span, Vec<&rb_scip::Occurrence>>,
@@ -412,12 +565,16 @@ fn declared_supertypes(
         .map(|s| {
             let start: Span = [s.span[0], s.span[1], i32::MIN, i32::MIN];
             let end: Span = [s.span[2], s.span[3], i32::MAX, i32::MAX];
+            let simple_name = s.name.rsplit('.').next().unwrap_or(&s.name);
             by_span
                 .range(start..=end)
                 .filter(|(span, _)| (span[2], span[3]) <= (s.span[2], s.span[3]))
                 .flat_map(|(_, os)| os.iter().copied())
                 .rfind(|o| {
                     !o.is_definition() && !o.symbol.starts_with("local ") && o.symbol.ends_with('#')
+                })
+                .filter(|o| {
+                    rb_scip::last_descriptor_name(&o.symbol).as_deref() == Some(simple_name)
                 })
                 .map(|o| o.symbol.clone())
         })
@@ -469,23 +626,22 @@ fn reaches_supertype(
 /// The fallback for a definition with no definition occurrence at its name (contract M3b
 /// amendment 7): scip-java anchors a member's definition occurrence at the first text match of
 /// the member's name from the top of the member, so `@PostMapping("/login") … String login(…)`
-/// gets its occurrence inside the annotation's string. Accepted is a definition occurrence of
-/// a global symbol whose last descriptor is the definition's name and whose span lies inside
-/// the definition, before its name (its modifiers and annotations); nothing outside those
-/// bounds is considered, so the join still invents no range (invariant 6).
+/// gets its occurrence inside the annotation's string. Accepted is a definition occurrence that
+/// `names_d` accepts as naming the definition (a global symbol whose last descriptor is its
+/// name; a local symbol whose display name is; amendment 54) and whose span lies inside the
+/// definition, before its name (its modifiers and annotations); nothing outside those bounds is
+/// considered, so the join still invents no range (invariant 6).
 fn definition_before_name<'a>(
     d: &rb_syntax::Definition,
     by_span: &BTreeMap<Span, Vec<&'a rb_scip::Occurrence>>,
+    names_d: &dyn Fn(&rb_scip::Occurrence) -> bool,
 ) -> Option<&'a rb_scip::Occurrence> {
     let start: Span = [d.span[0], d.span[1], i32::MIN, i32::MIN];
     by_span
         .range(start..d.name_span)
         .filter(|(span, _)| (span[2], span[3]) <= (d.name_span[0], d.name_span[1]))
         .flat_map(|(_, os)| os.iter().copied())
-        .find(|o| {
-            is_global_definition(o)
-                && rb_scip::last_descriptor_name(&o.symbol).as_deref() == Some(d.name.as_str())
-        })
+        .find(|o| names_d(o))
 }
 
 #[cfg(test)]
@@ -605,6 +761,7 @@ mod tests {
             Coverage {
                 definitions_matched: 5,
                 definitions_matched_by_name: 0,
+                definitions_local: 0,
                 definitions_total: 5,
                 references_matched: 2,
                 references_external: 1,
@@ -616,6 +773,7 @@ mod tests {
                 supertypes_unresolved: 0,
                 occurrences_unconverted: 0,
                 relationships_dropped: 0,
+                relationships_dropped_in_project: 0,
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -893,6 +1051,31 @@ mod tests {
         relationships: &[(&str, &str)],
         extra: &[(&str, Span, &str)],
     ) -> Joined {
+        let (facts, index) = hierarchy_index(language, files, relationships, extra);
+        join_facts(language, &facts, &index)
+    }
+
+    /// The join of `index` with `facts` (repo paths at the root), each file's heuristic keys
+    /// from its facts.
+    fn join_facts(language: Language, facts: &[(String, FileFacts)], index: &ScipIndex) -> Joined {
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
+            .iter()
+            .map(|(p, f)| (p.as_str(), (language, f)))
+            .collect();
+        let keys: BTreeMap<&str, Vec<String>> = facts
+            .iter()
+            .map(|(p, f)| (p.as_str(), rb_syntax::symbol_keys(p, f)))
+            .collect();
+        join(index, "", &by_path, &keys, &[language])
+    }
+
+    /// The facts and the synthetic index of [`hierarchy_joined`], before the join.
+    fn hierarchy_index(
+        language: Language,
+        files: &[(&str, &str)],
+        relationships: &[(&str, &str)],
+        extra: &[(&str, Span, &str)],
+    ) -> (Vec<(String, FileFacts)>, ScipIndex) {
         let prefix = symbol_prefix(language);
         let facts: Vec<(String, FileFacts)> = files
             .iter()
@@ -1022,15 +1205,7 @@ mod tests {
             documents,
             ..Default::default()
         };
-        let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
-            .iter()
-            .map(|(p, f)| (p.as_str(), (language, f)))
-            .collect();
-        let keys: BTreeMap<&str, Vec<String>> = facts
-            .iter()
-            .map(|(p, f)| (p.as_str(), rb_syntax::symbol_keys(p, f)))
-            .collect();
-        join(&index, "", &by_path, &keys, &[language])
+        (facts, index)
     }
 
     /// `line`'s `token` (its `nth` occurrence on the line, 0-based) as a span.
@@ -1113,6 +1288,93 @@ mod tests {
             ]
         );
         assert_eq!(joined.coverage.supertypes_unresolved, 0);
+    }
+
+    /// Contract M3b amendment 53 (the evaluator's H1): `Wide extends<TAB><TAB>Box<Doer>,<TAB>
+    /// Yyyyyyyy` as a decoder without javac's tab expansion read scip-java's occurrences:
+    /// `Box#` [40..43], `Doer#` [44..48] and `Yyyyyyyy#` clamped to [52..52] (measured), against
+    /// Tree-sitter's name spans `Box` [31..34] and `Yyyyyyyy` [42..50]. The last type
+    /// occurrence inside `Yyyyyyyy`'s span is `Doer#`, which does not name the written type, so
+    /// both supertypes are unresolved and scip-java's reverse link `Wide#act() → Doer#act()`
+    /// gives no edge. With the columns converted (the occurrences at the names), every forward
+    /// edge is there.
+    #[test]
+    fn a_supertype_occurrence_must_name_the_written_type() {
+        let wide = "package h;\npublic interface Wide extends\t\tBox<Doer>,\tYyyyyyyy {\n\tvoid act();\n}\n";
+        let files = [
+            ("h/Box.java", "package h;\npublic interface Box<T> {}\n"),
+            (
+                "h/Yyyyyyyy.java",
+                "package h;\npublic interface Yyyyyyyy { void why(); }\n",
+            ),
+            ("h/Wide.java", wide),
+            (
+                "h/Doer.java",
+                "package h;\npublic class Doer implements Wide {\n\t@Override public void act() {}\n    \t@Override public void why() {}\n}\n",
+            ),
+        ];
+        let both = |a: &'static str, b: &'static str| [(a, b), (b, a)];
+        let rels: Vec<(&str, &str)> = [
+            both("h/Doer#", "h/Wide#"),
+            both("h/Doer#act().", "h/Wide#act()."),
+            both("h/Doer#why().", "h/Yyyyyyyy#why()."),
+            both("h/Wide#", "h/Box#"),
+            both("h/Wide#", "h/Yyyyyyyy#"),
+            both("h/Doer#", "h/Box#"),
+            both("h/Doer#", "h/Yyyyyyyy#"),
+        ]
+        .concat();
+        let (facts, mut index) = hierarchy_index(Language::Java, &files, &rels, &[]);
+        let converted = join_facts(Language::Java, &facts, &index);
+        assert_eq!(
+            implements_lines(Language::Java, &converted),
+            [
+                "h/Doer# Implements h/Box#",
+                "h/Doer# Implements h/Wide#",
+                "h/Doer# Implements h/Yyyyyyyy#",
+                "h/Doer#act(). Implements h/Wide#act().",
+                "h/Doer#why(). Implements h/Yyyyyyyy#why().",
+                "h/Wide# Implements h/Box#",
+                "h/Wide# Implements h/Yyyyyyyy#",
+            ]
+        );
+        assert_eq!(converted.coverage.supertypes_unresolved, 0);
+
+        // The heritage occurrences at scip-java's raw columns.
+        let doc = index
+            .documents
+            .iter_mut()
+            .find(|d| d.path == "h/Wide.java")
+            .unwrap();
+        doc.occurrences.retain(|o| o.is_definition());
+        let prefix = symbol_prefix(Language::Java);
+        for (span, name) in [
+            ([1, 40, 1, 43], "Box"),
+            ([1, 44, 1, 48], "Doer"),
+            ([1, 52, 1, 52], "Yyyyyyyy"),
+        ] {
+            doc.occurrences.push(Occurrence {
+                span,
+                symbol: format!("{prefix}h/{name}#"),
+                roles: 0,
+                enclosing: None,
+            });
+        }
+        doc.occurrences.sort();
+        let shifted = join_facts(Language::Java, &facts, &index);
+        let lines = implements_lines(Language::Java, &shifted);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("h/Wide#")),
+            "no edge from Wide through the shifted occurrences: {lines:?}"
+        );
+        assert_eq!(
+            lines,
+            [
+                "h/Doer# Implements h/Wide#",
+                "h/Doer#act(). Implements h/Wide#act().",
+            ]
+        );
+        assert_eq!(shifted.coverage.supertypes_unresolved, 2);
     }
 
     /// Contract M3b amendment 45 (the evaluator's G3): `implements @Tag Shape` has the
@@ -1231,6 +1493,248 @@ mod tests {
         assert_eq!(
             joined.coverage.relationships_dropped, 2,
             "the local class expression's and the external target's"
+        );
+    }
+
+    /// A definition occurrence (`roles` 1) or a reference (0) at `span`.
+    fn occ_at(span: Span, symbol: &str, roles: i32) -> Occurrence {
+        Occurrence {
+            span,
+            symbol: symbol.into(),
+            roles,
+            enclosing: None,
+        }
+    }
+
+    fn implementation(from: &str, to: &str) -> SymbolInfo {
+        SymbolInfo {
+            symbol: from.into(),
+            relationships: vec![Relationship {
+                symbol: to.into(),
+                is_implementation: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Contract M3b amendment 54 (the evaluator's H3): scip-java keys the method of an enum
+    /// constant's body as `local 3`. Its definition occurrence at the method's name binds the
+    /// local symbol to that definition, which keeps its heuristic key and is counted; the
+    /// relationship `local 3 → Base#process()` gives `IMPLEMENTS` from it, the call inside it
+    /// stays exact, and a reverse link `Base#process() → local 3` (not seen from scip-java
+    /// 0.13.1, which lists none on jsoup) is rejected.
+    #[test]
+    fn an_enum_constant_body_method_implements_through_its_local_symbol() {
+        let src = "package p;\npublic enum Base {\n  A { boolean process() { return helper(); } };\n  abstract boolean process();\n  boolean helper() { return true; }\n}\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let path = "p/Base.java";
+        let sym = |d: &str| format!("scip-java maven . . p/Base#{d}");
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences: vec![
+                    occ_at(at_nth(src, 1, "Base", 0), &sym(""), 1),
+                    occ_at(at_nth(src, 2, "A", 0), &sym("A."), 1),
+                    occ_at(at_nth(src, 2, "process", 0), "local 3", 1),
+                    occ_at(at_nth(src, 2, "helper", 0), &sym("helper()."), 0),
+                    occ_at(at_nth(src, 3, "process", 0), &sym("process()."), 1),
+                    occ_at(at_nth(src, 4, "helper", 0), &sym("helper()."), 1),
+                ],
+                symbols: vec![
+                    SymbolInfo {
+                        display_name: "process".into(),
+                        ..implementation("local 3", &sym("process()."))
+                    },
+                    implementation(&sym("process()."), "local 3"),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let heuristic = rb_syntax::symbol_keys(path, &facts);
+        let body = facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "process" && d.name_span[0] == 2)
+            .expect("the constant body's method is a Tree-sitter definition");
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([(path, heuristic.clone())]);
+        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        assert!(
+            !joined.keys[path].contains_key(&body),
+            "the local definition keeps its heuristic key"
+        );
+        assert_eq!(
+            edge_lines(&joined),
+            [
+                format!("{} Calls {}", heuristic[body], sym("helper().")),
+                format!("{} Implements {}", heuristic[body], sym("process().")),
+            ]
+        );
+        assert_eq!(joined.coverage.definitions_local, 1);
+        assert_eq!(
+            joined.coverage.definitions_matched + joined.coverage.definitions_local,
+            joined.coverage.definitions_total
+        );
+        assert_eq!(joined.coverage.relationships_dropped, 0);
+    }
+
+    /// Contract M3b amendment 54: a local class's method (`local 7`) is called from the
+    /// enclosing global method; the call is an exact edge to the local definition's
+    /// heuristic key, counted as matched.
+    #[test]
+    fn a_call_to_a_local_definition_is_exact() {
+        let src = "package p;\nclass C {\n  void run() {\n    class Local { void go() {} }\n    new Local().go();\n  }\n}\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let path = "p/C.java";
+        let sym = |d: &str| format!("scip-java maven . . p/C#{d}");
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences: vec![
+                    occ_at(at_nth(src, 1, "C", 0), &sym(""), 1),
+                    occ_at(at_nth(src, 2, "run", 0), &sym("run()."), 1),
+                    occ_at(at_nth(src, 3, "Local", 0), "local 6", 1),
+                    occ_at(at_nth(src, 3, "go", 0), "local 7", 1),
+                    occ_at(at_nth(src, 4, "Local", 0), "local 6", 0),
+                    occ_at(at_nth(src, 4, "go", 0), "local 7", 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let heuristic = rb_syntax::symbol_keys(path, &facts);
+        let go = facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "go")
+            .expect("the local class's method is a Tree-sitter definition");
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([(path, heuristic.clone())]);
+        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        assert!(
+            edge_lines(&joined).contains(&format!("{} Calls {}", sym("run()."), heuristic[go])),
+            "{:?}",
+            edge_lines(&joined)
+        );
+        assert_eq!(joined.coverage.definitions_local, 2, "Local and go");
+        assert_eq!(joined.coverage.references_local, 0);
+    }
+
+    /// Contract M3b amendment 54: local symbols are unique per document only. `local 3` is
+    /// bound in `a/A.java`; the same string in `b/B.java` names nothing there, so its call
+    /// gives no edge and counts as a local reference.
+    #[test]
+    fn a_local_symbol_never_crosses_documents() {
+        let a = "package a;\nenum A {\n  X { void go() {} };\n  void go() {}\n}\n";
+        let b = "package b;\nclass B {\n  void run() { go(); }\n}\n";
+        let fa = rb_syntax::extract(Language::Java, a.as_bytes()).unwrap();
+        let fb = rb_syntax::extract(Language::Java, b.as_bytes()).unwrap();
+        let index = ScipIndex {
+            documents: vec![
+                Document {
+                    path: "a/A.java".into(),
+                    occurrences: vec![
+                        occ_at(at_nth(a, 1, "A", 0), "scip-java maven . . a/A#", 1),
+                        occ_at(at_nth(a, 2, "go", 0), "local 3", 1),
+                        occ_at(at_nth(a, 3, "go", 0), "scip-java maven . . a/A#go().", 1),
+                    ],
+                    ..Default::default()
+                },
+                Document {
+                    path: "b/B.java".into(),
+                    occurrences: vec![
+                        occ_at(at_nth(b, 1, "B", 0), "scip-java maven . . b/B#", 1),
+                        occ_at(at_nth(b, 2, "run", 0), "scip-java maven . . b/B#run().", 1),
+                        occ_at(at_nth(b, 2, "go", 0), "local 3", 0),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let files = BTreeMap::from([
+            ("a/A.java", (Language::Java, &fa)),
+            ("b/B.java", (Language::Java, &fb)),
+        ]);
+        let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([
+            ("a/A.java", rb_syntax::symbol_keys("a/A.java", &fa)),
+            ("b/B.java", rb_syntax::symbol_keys("b/B.java", &fb)),
+        ]);
+        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        assert!(joined.edges.is_empty(), "{:?}", edge_lines(&joined));
+        assert_eq!(joined.coverage.definitions_local, 1);
+        assert_eq!(joined.coverage.references_local, 1);
+        assert_eq!(joined.coverage.references_matched, 0);
+    }
+
+    /// Contract M3b amendment 54: a dropped relationship whose two ends are both defined in the
+    /// project (a definition occurrence on the name line of a same-named Tree-sitter
+    /// definition) is a join gap and counted in project; one into a dependency, or from a
+    /// local the syntax does not define (an anonymous class's method), is not.
+    #[test]
+    fn relationships_dropped_in_project_are_counted() {
+        let src =
+            "package p;\ninterface A { void m(); }\nclass B implements A { public void m() {} }\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let path = "p/A.java";
+        let sym = |d: &str| format!("scip-java maven . . p/{d}");
+        let a_m = at_nth(src, 1, "m", 0);
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences: vec![
+                    occ_at(at_nth(src, 1, "A", 0), &sym("A#"), 1),
+                    // `A#m()`'s definition occurrence two columns off its name: unmatched.
+                    occ_at([a_m[0], a_m[1] + 2, a_m[2], a_m[3] + 2], &sym("A#m()."), 1),
+                    occ_at(at_nth(src, 2, "B", 0), &sym("B#"), 1),
+                    occ_at(at_nth(src, 2, "A", 0), &sym("A#"), 0),
+                    occ_at(at_nth(src, 2, "m", 0), &sym("B#m()."), 1),
+                    // An anonymous class's method, which Tree-sitter treats as a local.
+                    occ_at(at_nth(src, 0, "p", 0), "local 5", 1),
+                ],
+                symbols: vec![
+                    SymbolInfo {
+                        relationships: vec![
+                            Relationship {
+                                symbol: sym("A#m()."),
+                                is_implementation: true,
+                                ..Default::default()
+                            },
+                            Relationship {
+                                symbol: "scip-java maven jdk 21 java/lang/Runnable#run().".into(),
+                                is_implementation: true,
+                                ..Default::default()
+                            },
+                        ],
+                        ..implementation(&sym("B#m()."), "")
+                    },
+                    implementation(&sym("B#"), &sym("A#")),
+                    SymbolInfo {
+                        display_name: "m".into(),
+                        ..implementation("local 5", &sym("A#"))
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        assert_eq!(
+            edge_lines(&joined)
+                .into_iter()
+                .filter(|l| l.contains(" Implements "))
+                .collect::<Vec<_>>(),
+            [format!("{} Implements {}", sym("B#"), sym("A#"))]
+        );
+        assert_eq!(joined.coverage.relationships_dropped, 3);
+        assert_eq!(
+            joined.coverage.relationships_dropped_in_project, 1,
+            "B#m() → A#m()"
         );
     }
 
@@ -1502,6 +2006,7 @@ mod tests {
             Coverage {
                 definitions_matched: 1,
                 definitions_matched_by_name: 0,
+                definitions_local: 0,
                 definitions_total: 1,
                 references_matched: 0,
                 references_external: 1,
@@ -1513,6 +2018,7 @@ mod tests {
                 supertypes_unresolved: 0,
                 occurrences_unconverted: 0,
                 relationships_dropped: 0,
+                relationships_dropped_in_project: 0,
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();

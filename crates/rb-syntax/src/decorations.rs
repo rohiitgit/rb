@@ -129,10 +129,10 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
     let mut cursor = def.walk();
     match language {
         Language::Java => {
-            if let Some(t) = def
-                .child_by_field_name("superclass")
-                .and_then(|s| s.named_child(0))
-            {
+            if let Some(t) = def.child_by_field_name("superclass").and_then(|s| {
+                let mut c = s.walk();
+                s.named_children(&mut c).find(|n| !is_comment(*n))
+            }) {
                 out.push(supertype(t, source));
             }
             for list in def.children(&mut cursor) {
@@ -151,7 +151,7 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
                 out.extend(
                     bases
                         .named_children(&mut c)
-                        .filter(|b| b.kind() != "keyword_argument")
+                        .filter(|b| b.kind() != "keyword_argument" && !is_comment(*b))
                         .map(|b| supertype(b, source)),
                 );
             }
@@ -189,10 +189,15 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
                                 }
                                 "implements_clause" => {
                                     let mut cc = clause.walk();
-                                    out.extend(clause.named_children(&mut cc).map(|t| Supertype {
-                                        implements: true,
-                                        ..supertype(t, source)
-                                    }));
+                                    out.extend(
+                                        clause
+                                            .named_children(&mut cc)
+                                            .filter(|t| !is_comment(*t))
+                                            .map(|t| Supertype {
+                                                implements: true,
+                                                ..supertype(t, source)
+                                            }),
+                                    );
                                 }
                                 _ => {}
                             }
@@ -201,7 +206,12 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
                     // `interface X extends A, B<T>`.
                     "extends_type_clause" => {
                         let mut cc = child.walk();
-                        out.extend(child.named_children(&mut cc).map(|t| supertype(t, source)));
+                        out.extend(
+                            child
+                                .named_children(&mut cc)
+                                .filter(|t| !is_comment(*t))
+                                .map(|t| supertype(t, source)),
+                        );
                     }
                     _ => {}
                 }
@@ -302,7 +312,14 @@ fn type_list_items(node: Node<'_>) -> Vec<Node<'_>> {
                 vec![n]
             }
         })
+        .filter(|n| !is_comment(*n))
         .collect()
+}
+
+/// Tree-sitter's comment nodes are named extras that may sit anywhere in a heritage clause
+/// (contract M3b amendment 55); they are never a supertype.
+fn is_comment(node: Node<'_>) -> bool {
+    matches!(node.kind(), "comment" | "line_comment" | "block_comment")
 }
 
 fn named_texts(node: Node<'_>, source: &[u8]) -> Vec<String> {
@@ -702,6 +719,53 @@ export @Entity({ name: 'orders', schema: 'shop' }) class Order {}
                 ("B".into(), "NS.Base".into(), vec![], at(ts, 1, "NS.Base")),
             ],
             "`C extends mixin(Abs)` and `D extends (Abs)` declare no supertype"
+        );
+    }
+
+    /// Contract M3b amendment 55: comments are named extras in Tree-sitter, so a comment inside
+    /// a heritage clause must not become a supertype (`extends /* c */ Base` lost every edge of
+    /// the class) or an extra list item; names and spans are the types' only.
+    #[test]
+    fn comments_in_heritage_clauses_are_not_supertypes() {
+        let names_and_spans = |language: Language, src: &str| -> Vec<(String, crate::Span)> {
+            extract(language, src.as_bytes())
+                .unwrap()
+                .definitions
+                .iter()
+                .flat_map(|d| d.supertypes.iter().map(|s| (s.name.clone(), s.span)))
+                .collect()
+        };
+        let java = "package p;\nclass Split extends /* c */ Base implements\n // c\n I, /* d */ J {}\ninterface K extends /* e */ I, // f\n J {}\nenum Color implements Runnable, /* note */ Cloneable { RED; public void run() {} }\n";
+        assert_eq!(
+            names_and_spans(Language::Java, java),
+            [
+                ("Base".into(), at(java, 1, "Base")),
+                ("I".into(), at(java, 3, "I")),
+                ("J".into(), at(java, 3, "J")),
+                ("I".into(), at(java, 4, "I")),
+                ("J".into(), at(java, 5, "J")),
+                ("Runnable".into(), at(java, 6, "Runnable")),
+                ("Cloneable".into(), at(java, 6, "Cloneable")),
+            ]
+        );
+        let python = "class A(  # c\n    Base,  # d\n    Mixin):\n    pass\n";
+        assert_eq!(
+            names_and_spans(Language::Python, python),
+            [
+                ("Base".into(), at(python, 1, "Base")),
+                ("Mixin".into(), at(python, 2, "Mixin")),
+            ]
+        );
+        let ts = "class A extends /* c */ Base implements I /* d */, // e\n J {}\ninterface K extends /* f */ I, J {}\n";
+        assert_eq!(
+            names_and_spans(Language::TypeScript, ts),
+            [
+                ("Base".into(), at(ts, 0, "Base")),
+                ("I".into(), at(ts, 0, "I")),
+                ("J".into(), at(ts, 1, "J")),
+                ("I".into(), at(ts, 2, "I")),
+                ("J".into(), at(ts, 2, "J")),
+            ]
         );
     }
 }

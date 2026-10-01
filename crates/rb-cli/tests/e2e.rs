@@ -1013,7 +1013,7 @@ fn scip_image_identity_is_part_of_the_tool_configuration() {
     // snapshot is rebuilt (cheaply: facts and index caches are warm), not "up to date".
     let again = rb_with_path(&url, &["index", path, "--repo", &name], Some(&shimmed));
     assert!(
-        again.contains("rebuilding: 1 SCIP jobs did not finish last time")
+        again.contains("rebuilding: 1 SCIP job did not finish last time")
             && again.contains("scip: . scip-java unsupported"),
         "{again}"
     );
@@ -1081,7 +1081,7 @@ fn scip_unfinished_jobs_are_not_up_to_date() {
     );
     let rebuilt = rb(&url, &["index", path, "--repo", &name]);
     assert!(
-        rebuilt.contains("rebuilding: 1 SCIP jobs did not finish last time")
+        rebuilt.contains("rebuilding: 1 SCIP job did not finish last time")
             && rebuilt.contains("scip: . scip-java ok"),
         "{rebuilt}"
     );
@@ -1109,7 +1109,7 @@ fn scip_unfinished_jobs_are_not_up_to_date() {
     );
     let rebuilt = rb(&url, &["index", path, "--repo", &name]);
     assert!(
-        rebuilt.contains("rebuilding: 1 SCIP jobs did not finish last time")
+        rebuilt.contains("rebuilding: 1 SCIP job did not finish last time")
             && rebuilt.contains("scip: . scip-java ok (cached"),
         "{rebuilt}"
     );
@@ -1127,16 +1127,32 @@ fn scip_java_available() -> Result<(), String> {
         .ok_or_else(|| format!("{image} is not built; see docker/scip-java/README.md"))
 }
 
-/// Contract M3b S7 for one SCIP-ok project: every `CALLS`, `REFERENCES` and `IMPLEMENTS` edge
-/// of `dump` whose source or target key starts with `key_prefix` (the project's SCIP package,
-/// `""` for every edge) is `scip`/`exact`, and no such edge names a file under `documented`
-/// (a directory the index has documents for) through a heuristic key (`` `<documented> ``).
-/// Returns the number of exact `CALLS`.
-fn assert_exact_code_edges(dump: &str, key_prefix: &str, documented: &str) -> usize {
+/// Contract M3b S7 (as restated by amendment 54) for the SCIP-ok project at `root`: every
+/// `CALLS`, `REFERENCES` and `IMPLEMENTS` edge of `dump` whose source or target key starts with
+/// `key_prefix` (the project's SCIP package, `""` for every edge) or names a file under
+/// `documented` (a directory the index has documents for) through a heuristic key
+/// (`` `<documented> ``) is `scip`/`exact`, and the heuristic `Symbol` keys naming a file under
+/// `documented` number exactly the project's `definitions_local` (the definitions scip-java
+/// keys as document-local symbols). Returns the number of exact `CALLS`.
+fn assert_exact_code_edges(dump: &str, key_prefix: &str, documented: &str, root: &str) -> usize {
     let mut exact_calls = 0;
     let heuristic_in_root = format!("rb-heuristic . . . `{documented}");
+    let mut heuristic_symbols = 0;
+    let mut definitions_local = None;
     for line in dump.lines() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        if row[0] == "N" && row[1] == "symbol" {
+            heuristic_symbols += usize::from(
+                row[2]
+                    .as_str()
+                    .is_some_and(|k| k.starts_with(&heuristic_in_root)),
+            );
+            continue;
+        }
+        if row[0] == "D" && row[1] == "scip_status" && row[2] == root {
+            definitions_local = row[4]["coverage"]["definitions_local"].as_u64();
+            continue;
+        }
         let kind = row
             .get(3)
             .and_then(serde_json::Value::as_str)
@@ -1145,10 +1161,13 @@ fn assert_exact_code_edges(dump: &str, key_prefix: &str, documented: &str) -> us
             continue;
         }
         let keys = [2, 5].map(|i| row[i].as_str().unwrap_or_default());
-        assert!(
-            !keys.iter().any(|k| k.starts_with(&heuristic_in_root)),
-            "heuristic code edge in a SCIP-ok project: {line}"
-        );
+        if keys.iter().any(|k| k.starts_with(&heuristic_in_root)) {
+            assert_eq!(
+                row[6].as_str(),
+                Some("scip"),
+                "heuristic code edge in a SCIP-ok project: {line}"
+            );
+        }
         if keys.iter().any(|k| k.starts_with(key_prefix)) {
             assert_eq!(row[6].as_str(), Some("scip"), "{line}");
             assert_eq!(
@@ -1159,6 +1178,12 @@ fn assert_exact_code_edges(dump: &str, key_prefix: &str, documented: &str) -> us
             exact_calls += usize::from(kind == "CALLS");
         }
     }
+    let definitions_local =
+        definitions_local.unwrap_or_else(|| panic!("no ok scip_status coverage for {root:?}"));
+    assert_eq!(
+        heuristic_symbols as u64, definitions_local,
+        "heuristic keys in documented files other than local definitions"
+    );
     exact_calls
 }
 
@@ -1244,7 +1269,7 @@ fn scip_java_spring_jpa() {
     let dump = rb(&url, &["dump", "--repo", &name]);
     let package = "scip-java maven maven/com.acme/auth-service 1.4.0 ";
     assert!(
-        assert_exact_code_edges(&dump, package, "src/") >= 2,
+        assert_exact_code_edges(&dump, package, "src/", ".") >= 2,
         "{dump}"
     );
     // Amendment 15: ownership is by document. `scripts/tool.py` lies under the Maven root but
@@ -1337,11 +1362,20 @@ fn scip_polyglot_monorepo() {
         .unwrap_or_else(|| panic!("no scip_status for services/broken in {dump}"));
     // Maven's wording differs once the miss is cached in the shared `.m2` ("was not found …
     // during a previous attempt"); the resolution summary is the same either way.
+    // Dependency resolution fails before scip-java runs: the fetch phase (amendment 56).
     assert!(
         broken.contains("\"status\":\"failed\"")
+            && broken.contains("\"phase\":\"fetch\"")
             && broken
                 .contains("The following artifacts could not be resolved: com.acme:nope:jar:0.0.0"),
         "{broken}"
+    );
+    assert!(
+        first.lines().any(
+            |l| l.starts_with("  scip: services/broken scip-java failed")
+                && l.ends_with(" (fetch phase)")
+        ),
+        "{first}"
     );
     assert!(
         dump.contains(
@@ -1351,7 +1385,7 @@ fn scip_polyglot_monorepo() {
     );
     let auth_package = "scip-java maven maven/com.acme/auth-service 1.4.0 ";
     assert!(
-        assert_exact_code_edges(&dump, auth_package, "services/auth/") >= 1,
+        assert_exact_code_edges(&dump, auth_package, "services/auth/", "services/auth") >= 1,
         "{dump}"
     );
     // S8: the ok Maven service lists its packages; the failed one has none.
