@@ -161,7 +161,8 @@ impl<'g> View<'g> {
 /// How a node is shown to a user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfo {
-    /// A symbol's descriptor (`AuthService#login().`), a file's path, or another node's key.
+    /// A symbol's descriptors (`AuthService#login().`, `com/acme/auth/AuthService#login().`), a
+    /// file's path, or another node's key.
     pub display: String,
     /// Declaring file (empty when unknown).
     pub path: String,
@@ -183,10 +184,7 @@ impl<'g> Describer<'g> {
         let v = &self.0;
         let node = v.node(id);
         let display = match node.kind {
-            NodeKind::Symbol => node
-                .key
-                .rsplit_once("`/")
-                .map_or(node.key.clone(), |(_, d)| d.to_owned()),
+            NodeKind::Symbol => symbol_display(&node.key).to_owned(),
             _ => node.key.clone(),
         };
         let (path, line) = v.location(id);
@@ -203,6 +201,16 @@ impl<'g> Describer<'g> {
             service,
         }
     }
+}
+
+/// A symbol key's descriptor part, as shown to a user: after the last backtick-slash (heuristic
+/// and scip-typescript keys carry the file in a descriptor, `` src/`users.ts`/Cache#get(). ``),
+/// else after the last space (a scip-java key's `scheme manager package version` head), else
+/// the whole key (contract M3b amendment 39).
+fn symbol_display(key: &str) -> &str {
+    key.rsplit_once("`/")
+        .or_else(|| key.rsplit_once(' '))
+        .map_or(key, |(_, d)| d)
 }
 
 /// The nodes `input` may mean, best tier only: an exact key, `path:line`, a key suffix (after a
@@ -260,9 +268,10 @@ pub fn resolve_target(graph: &Graph, input: &str) -> Vec<i64> {
             .clone()
             .filter(|n| n.name == name && n.kind == NodeKind::Symbol)
             .filter(|n| {
-                let desc = n.key.rsplit_once("`/").map_or(n.key.as_str(), |(_, d)| d);
-                let parts: Vec<&str> = desc
-                    .split(['#', '.', '(', ')', '/'])
+                // The descriptors, split at every separator, the space before a scip-java key's
+                // descriptors included (`… 1.4.0 com/acme/…`; contract M3b amendment 39).
+                let parts: Vec<&str> = symbol_display(&n.key)
+                    .split(['#', '.', '(', ')', '/', ' '])
                     .filter(|p| !p.is_empty())
                     .collect();
                 let wanted: Vec<&str> = scope.split('.').collect();
@@ -710,6 +719,22 @@ mod tests {
             .map_or(key.clone(), |(_, d)| d.to_owned())
     }
 
+    /// Contract M3b amendment 39: a scip-java key, whose descriptors follow a space rather than
+    /// a backtick-slash, displays as its descriptors like every other key; a key with neither
+    /// shows whole.
+    #[test]
+    fn scip_java_keys_display_as_their_descriptor() {
+        let g = fixture();
+        let d = Describer::new(&g);
+        let info = d.describe(id(&g, "acme/auth/AuthService#authenticate()."));
+        assert_eq!(info.display, "com/acme/auth/AuthService#authenticate().");
+        assert_eq!(
+            d.describe(id(&g, "SvcImpl#run().")).display,
+            "SvcImpl#run()."
+        );
+        assert_eq!(symbol_display("plain"), "plain");
+    }
+
     /// `depth desc [certainty] (dispatch) (ref)` in tree order.
     fn flat(g: &Graph, t: &CallerTree) -> Vec<String> {
         fn walk(g: &Graph, cs: &[Caller], depth: usize, out: &mut Vec<String>) {
@@ -765,6 +790,9 @@ mod tests {
         assert_eq!(one("auth/AuthService#authenticate()."), [SCIP_KEY]);
         assert_eq!(one("AuthService#authenticate()."), [SCIP_KEY]);
         assert_eq!(one("AuthService.authenticate"), [SCIP_KEY]);
+        // The fully qualified dotted form crosses the space before the descriptors.
+        assert_eq!(one("com.acme.auth.AuthService.authenticate"), [SCIP_KEY]);
+        assert_eq!(one("acme.auth.AuthService.authenticate"), [SCIP_KEY]);
         assert_eq!(one("core/Svc.java:10"), [SCIP_KEY]);
         // Part of a descriptor is not a suffix.
         assert!(one("acme/auth/AuthService#authenticate()").is_empty());

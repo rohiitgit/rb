@@ -232,8 +232,8 @@ Global symbol strings follow the grammar `<scheme> ' ' <manager> ' ' <package-na
 
 | Language | Indexer | Needs a working build? |
 |---|---|---|
-| Java / Kotlin (Scala per the SCIP README) | scip-java v0.13.x (`ghcr.io/scip-code/scip-java`; the Docker Hub `sourcegraph/scip-java` image stopped at 0.12.3) | Yes: runs the Maven/Gradle compile. Bazel needs manual configuration. |
-| TypeScript / JavaScript | scip-typescript v0.4.x (`sourcegraph/scip-typescript`) | Needs `tsconfig`/`jsconfig` and an installed `node_modules` (`npm`/`yarn install` in the fetch phase) |
+| Java / Kotlin (Scala per the SCIP README) | scip-java 0.13.1 in the locally built slim image `rb-scip-java:0.13.1` (`docker/scip-java`; the published `ghcr.io/scip-code/scip-java` image is 6.75 GB and the Docker Hub `sourcegraph/scip-java` image stopped at 0.12.3). Built: Maven; Gradle is M6. | Yes: runs the Maven/Gradle compile. Bazel needs manual configuration. |
+| TypeScript / JavaScript | scip-typescript 0.4.0 (`sourcegraph/scip-typescript`, pinned by digest, amd64 only) | Needs `tsconfig`/`jsconfig` and an installed `node_modules` (`npm ci --ignore-scripts` in the fetch phase) |
 | Python | scip-python v0.6.x (`sourcegraph/scip-python`) | Needs the pip environment (or `--environment`) for third-party resolution |
 | Go | scip-go v0.2.x (moved to `scip-code`; the Docker Hub image is stale, so build our own image) | Needs a module download (`go mod download`) |
 | C / C++ | scip-clang v0.4.x (`sourcegraph/scip-clang`) | Needs `compile_commands.json` |
@@ -246,11 +246,11 @@ Operational rules:
   1. **Hermeticity**, which serves determinism.
   2. **Security.** Building an arbitrary repo runs arbitrary code: Gradle scripts, npm `postinstall`, `setup.py`.
 - Each job has two phases:
-  1. A **fetch** phase with network access, allowed only to package registries, which populates a dependency cache volume.
-  2. An **index** phase with the network disabled.
+  1. A **fetch** phase with network access, which populates a dependency cache (`var/scip/cache`) shared across jobs. **As built in M3b** (contract amendment 27): it runs on Docker's default bridge network, unrestricted; a registry allow-list (an egress-filtered network or a proxy) is M5 work and an open risk in §14. It runs the project's own build (Maven `go-offline` then `clean verify -DskipTests`) or package install (`npm ci`/`yarn`/`pnpm install`, always with `--ignore-scripts`, since type indexing needs no lifecycle scripts). The export never writes the repository's `mvnw`/`gradlew` at the build root, so the image's tools are always the ones that run.
+  2. An **index** phase with the network disabled (`--network none`).
   No credentials are ever mounted. This also keeps the host's toolchains (e.g. a host npm) out of the loop entirely.
-- If a project fails to build, the run records `scip_status=failed` for it, keeps its stderr tail, and drops that project to Tier B heuristic resolution (§5.4). One failing project never fails the run.
-- The output, `index.scip`, is stored content-addressed under `(project_input_hash, indexer_digest)`. `project_input_hash` hashes the project's file blob SHAs plus its lockfiles.
+- If a project fails to build, the run records `scip_status=failed` for it, keeps its stderr tail, and drops that project to Tier B heuristic resolution (§5.4). One failing project never fails the run. A container-runtime failure (`docker run` exits 125–127) is `environment` and a budget overrun `timeout`, neither cached; a missing image is `unsupported`.
+- The output, `index.scip`, is stored content-addressed under `(project_input_hash, indexer_digest)`. `project_input_hash` hashes the project's file blob SHAs plus its lockfiles; for the locally built scip-java image the digest is the image ID. The image identities are also part of the snapshot's `tool_versions`, so a snapshot indexed without an image is rebuilt once it exists. The container's run time is printed by `rb index` and never stored in the graph (§3.3).
 
 ### 5.3 Joining SCIP with Tree-sitter
 
@@ -267,8 +267,8 @@ Each fact source supplies something the other lacks:
 
 - A matched `@reference.call` becomes a `CALLS` edge from the enclosing definition's SCIP symbol to the occurrence's symbol, with provenance `scip` and certainty `exact`.
 - Any other non-definition occurrence becomes a `REFERENCES` edge (type use, function passed as a value, import), with the same source. Keeping `REFERENCES` is what makes Q2 catch higher-order use such as `arr.map(validate)`, which is not a call.
-- A definition occurrence becomes a `Symbol` node, with a `DEFINED_IN` edge to the File and the range stored.
-- `SymbolInformation.relationships` with `is_implementation` become `IMPLEMENTS` edges, from the impl type or method to the interface or overridden method.
+- A definition occurrence whose range is a Tree-sitter definition's name (or, for scip-java's annotation-anchored members, lies inside the definition before its name) gives that definition its SCIP key. Definition occurrences with no Tree-sitter definition (fields, constants) do **not** become `Symbol` nodes (contract M3b amendment 4: a node per field for no question asked); references to them are counted as `unanchored`.
+- `SymbolInformation.relationships` with `is_implementation` become `IMPLEMENTS` edges, from the impl type or method to the interface or overridden method. The flag carries no direction (scip-java sets it on both sides of an override), so the edge is emitted only when the source's type declares the target's type as a supertype, directly or through supertypes of supertypes, each declared supertype resolved to a symbol through the index's own occurrence inside the heritage clause (amendments 16, 21, 26).
 
 Framework facts attach to SCIP symbols through the same range join. For example, the handler method name in a `Route` fact joins to that method's definition occurrence.
 
@@ -912,7 +912,7 @@ Each milestone is shippable and has an exit criterion that is a test, not a demo
 | **M1b Syntax** | Tree-sitter defs/refs/scopes for TS/TSX/JS, Java, Python, Go; Symbol/DEFINED_IN/CONTAINS; facts cache (change sets moved to M3) | contract `tasks/contract-m1b.md` C1–C20; warm-cache run parses 0 files and dumps identically to a cold run |
 | **M2 Data access** | `rb-sql`: sinks, template normalisation, pg_query, sqlparser fallback, JPQL tokenizer; ORM packs (JPA, Prisma, TypeORM, SQLAlchemy); `QUERIES/MAPS_TO/MIGRATES` | `rb table-deps` golden at the symbol level (service roll-up via file→service); SQL coverage metrics |
 | **M3a Tier B** | Import, package and binding facts; module resolution; heuristic `CALLS/REFERENCES/IMPLEMENTS`; resolution coverage; `rb callers`, `rb impact` over the in-memory graph | contract `tasks/contract-m3a.md` R1–R13: Q1/Q2 goldens on all fixtures with must-not-exist cases; ≥ 90% precision on a hand-checked sample of 4 public repos. **Done 2026-10-01** after six evaluator passes; resolved share of own-code references: gin 63%, petclinic 39%, requests 30%, hono 15%; sampled precision 96/96. |
-| **M3b SCIP** | SCIP orchestration in pinned containers (scip-java, scip-typescript first); SCIP⋈TS join; key replacement per project; `Package`/`DEPENDS_ON` from external symbols (change sets and orphan detection deferred: contract scope) | exact edges on the fixtures that build; cached and fresh indexes dump identically. **Built 2026-10-01** (contract `tasks/contract-m3b.md` S1–S12): Maven and npm projects; petclinic 256 exact `CALLS` (20/20 sampled correct), class-validator 394 (20/20); Gradle, workspace installs and tsconfig-excluded files are M6. Evaluator passes pending. |
+| **M3b SCIP** | SCIP orchestration in pinned containers (scip-java, scip-typescript first); SCIP⋈TS join; key replacement per project; `Package`/`DEPENDS_ON` from external symbols (change sets and orphan detection deferred: contract scope) | exact edges on the fixtures that build; cached and fresh indexes dump identically. **Built 2026-10-01** (contract `tasks/contract-m3b.md` S1–S13, amendments 1–42 after three evaluator passes): Maven and npm projects; petclinic 256 exact `CALLS` (20/20 sampled correct), class-validator 394 (20/20); Gradle, workspace installs, tsconfig-excluded files and a registry allow-list for the fetch phase are M5/M6. |
 | **M4 Frameworks** | route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card | Q3/Q4 goldens on `polyglot-monorepo`; precision guards (must-not-exist edges) green |
 | **M5 Scale & API** | REST API with guard rails; bulk AGE loading; snapshot retention; `rb diff`; benchmark on 2 large OSS repos | §12.5 targets met or gaps documented with profiles |
 | **M6 Breadth** | scip-python/go/clang/rust-analyzer; Kotlin/C#; OpenAPI/gRPC packs; gateway configs; message topics; architecture-rule checks in Cypher as a CI gate | per-language fixtures; rules engine golden tests |
@@ -925,6 +925,7 @@ Each milestone is shippable and has an exit criterion that is a test, not a demo
 |---|---|---|
 | SCIP indexers need a **working build**; many repos don't build hermetically | projects fall back to heuristic resolution | Tier B resolver; per-project isolation; coverage report makes it visible; `rb.toml` lets users supply build commands and env |
 | Building untrusted repos executes their code | security | containers with no network in the index phase, no credentials, resource limits, disposable volumes; for hostile inputs, a gVisor/Firecracker runtime (v2) |
+| **Fetch-phase egress (open, M3b):** the fetch phase runs the project's build (`mvn verify`, all its plugins) and package installs (without lifecycle scripts) on Docker's default bridge network, which reaches any host, and writes the shared `.m2`/`.npm` caches every later job reads | a hostile repository can exfiltrate data or poison the shared caches during its fetch | contract M3b amendment 27 states this honestly; M5 adds an egress allow-list (a user-defined network with a registry proxy) and per-repository caches; until then index only repositories you would build on the host |
 | Reflection, codegen, event buses and dynamic imports | false negatives in Q1/Q2/Q4 | blind-spot diagnostics; packs for common codegen (Lombok via scip-java annotation processing, protobuf/OpenAPI stubs); topic packs in M6 |
 | CHA over-approximation in large OO codebases | noisy impact reports | RTA filter by default for Q1/Q4; certainty labels; per-query precision flag |
 | URL stitching with env-driven base URLs | wrong or missing cross-service edges | host → compose/k8s service matching; literal defaults; OpenAPI/Feign/gRPC exact matching; `ambiguous` rather than guessing |

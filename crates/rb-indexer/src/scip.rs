@@ -97,6 +97,14 @@ pub(crate) struct Coverage {
     /// for (a `tsconfig.json` that excludes `test/**`): they fall back to Tier B (contract M3b
     /// amendment 15), and none of their references is counted above.
     pub files_without_document: usize,
+    /// Declared supertypes of the documented type definitions with no type occurrence inside
+    /// their clause item (contract M3b amendment 26): the `IMPLEMENTS` walk stops there, and a
+    /// lost true edge is preferred to a false exact one.
+    pub supertypes_unresolved: usize,
+    /// Occurrences of the documented files whose columns stayed in code units because the
+    /// decoder had no line text to convert them with (contract M3b amendment 33); non-zero
+    /// means the spans above may be off on non-ASCII lines.
+    pub occurrences_unconverted: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -192,27 +200,28 @@ pub(crate) fn join(
         .values()
         .flat_map(|r| r.values().map(String::as_str))
         .collect();
-    // The project's type definitions, `(document, index)`, for the `IMPLEMENTS` direction rule
-    // below: by SCIP symbol (the matched ones; a walk's exact endpoint) and by simple name (all
-    // of them; what a declared supertype resolves to).
+    // The project's type definitions, `(document, index)`, by SCIP symbol (the matched ones:
+    // a walk's exact endpoint, and what a declared supertype resolves to), and each one's
+    // declared supertypes resolved through the index's own occurrences (contract M3b
+    // amendment 26).
     let mut types_by_symbol: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
-    let mut types_by_name: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
-    for (di, (path, _, facts, _)) in docs.iter().enumerate() {
+    let mut supertypes: BTreeMap<(usize, usize), Vec<String>> = BTreeMap::new();
+    for (di, (path, doc, facts, by_span)) in docs.iter().enumerate() {
+        out.coverage.occurrences_unconverted += doc.unconverted;
         let replaced = out.keys.get(path);
         for (i, d) in facts.definitions.iter().enumerate() {
             if !is_type(d) {
                 continue;
             }
-            types_by_name
-                .entry(d.name.as_str())
-                .or_default()
-                .push((di, i));
             if let Some(symbol) = replaced.and_then(|r| r.get(&i)) {
                 types_by_symbol
                     .entry(symbol.as_str())
                     .or_default()
                     .push((di, i));
             }
+            let declared = declared_supertypes(d, by_span);
+            out.coverage.supertypes_unresolved += declared.iter().filter(|s| s.is_none()).count();
+            supertypes.insert((di, i), declared.into_iter().flatten().collect());
         }
     }
     let mut implements: Vec<ScipEdge> = Vec::new();
@@ -297,18 +306,25 @@ pub(crate) fn join(
                 package,
             }));
         // Implementations come from symbol information, anchored at the definition's name, in
-        // the one direction the syntax supports (contract M3b amendments 16 and 21): scip-java
-        // 0.13.1 emits `is_implementation` on both sides of an override inside the workspace,
-        // and relates an override to the method it implements however many levels up, so the
-        // source's type holder must reach the target's type through its declared supertypes.
+        // the one direction the syntax supports (contract M3b amendments 16, 21 and 26):
+        // scip-java 0.13.1 emits `is_implementation` on both sides of an override inside the
+        // workspace, and relates an override to the method it implements however many levels
+        // up, so the source's type holder must reach the target's type through its declared
+        // supertypes.
         let Some(replaced) = replaced else {
             continue;
         };
+        // Several declarations can share one symbol (TypeScript overload signatures): the
+        // first one is the definition the edge is anchored at.
+        let mut definition_of: BTreeMap<&str, usize> = BTreeMap::new();
+        for (i, symbol) in replaced {
+            definition_of.entry(symbol.as_str()).or_insert(*i);
+        }
         for s in &doc.symbols {
-            let Some((i, _)) = replaced.iter().find(|(_, sym)| **sym == s.symbol) else {
+            let Some(&i) = definition_of.get(s.symbol.as_str()) else {
                 continue;
             };
-            let holder = (di, type_holder(facts, *i));
+            let holder = (di, type_holder(facts, i));
             for rel in s.relationships.iter().filter(|r| r.is_implementation) {
                 if !nodes.contains(rel.symbol.as_str()) {
                     continue;
@@ -316,7 +332,7 @@ pub(crate) fn join(
                 let targets = rb_scip::type_symbol_of(&rel.symbol)
                     .and_then(|type_symbol| types_by_symbol.get(type_symbol.as_str()));
                 let supported = targets.is_some_and(|targets| {
-                    reaches_supertype(&docs, &types_by_name, holder, targets)
+                    reaches_supertype(&supertypes, &types_by_symbol, holder, targets)
                 });
                 if supported {
                     implements.push(ScipEdge {
@@ -325,7 +341,7 @@ pub(crate) fn join(
                         dst: rel.symbol.clone(),
                         at: Evidence {
                             path: path.clone(),
-                            span: facts.definitions[*i].name_span,
+                            span: facts.definitions[i].name_span,
                         },
                     });
                 }
@@ -367,18 +383,54 @@ fn is_type(d: &rb_syntax::Definition) -> bool {
     )
 }
 
-/// Whether `from` (a definition, `(document, index)` into `docs`) declares one of `targets` as
-/// a supertype, directly or through the supertypes of its supertypes (contract M3b amendment
-/// 21). A declared name resolves by its simple form (`a.b.Foo` and `Foo<T>` both name `Foo`) to
-/// every type definition of the project with that name, and the walk accepts only when it
-/// reaches one of `targets` itself: a type that has no definition in the project (an external
-/// supertype) satisfies nothing, however it is named. Which of two same-named project types a
-/// declaration means is not resolved here; the index's relationship is exact, so the walk only
-/// decides its direction. A visited set and a depth cap bound the walk, since same-named types
-/// can make the declared graph cyclic.
+/// The SCIP symbol each declared supertype of `d` names, resolved through the index's own
+/// occurrences (contract M3b amendment 26): inside the clause item's span, the earliest-starting
+/// reference occurrence whose symbol is a type (its descriptor ends with `#`), replaced by a
+/// later one in the same span whose symbol extends it (`Outer#` then `Outer#Listener#` for
+/// `Outer.Listener`). A namespace occurrence at a qualifier (`a/` in `a.Circle`) and the type
+/// arguments of a generic supertype (`List#`, `String#` in `Repo<List<String>>`) are passed
+/// over. `None` when the span holds no type occurrence: the indexer did not say which type is
+/// meant, and nothing is guessed.
+fn declared_supertypes(
+    d: &rb_syntax::Definition,
+    by_span: &BTreeMap<Span, Vec<&rb_scip::Occurrence>>,
+) -> Vec<Option<String>> {
+    d.supertypes
+        .iter()
+        .map(|s| {
+            let start: Span = [s.span[0], s.span[1], i32::MIN, i32::MIN];
+            let end: Span = [s.span[2], s.span[3], i32::MAX, i32::MAX];
+            let mut resolved: Option<&str> = None;
+            for o in by_span
+                .range(start..=end)
+                .filter(|(span, _)| (span[2], span[3]) <= (s.span[2], s.span[3]))
+                .flat_map(|(_, os)| os.iter().copied())
+            {
+                if o.is_definition() || o.symbol.starts_with("local ") || !o.symbol.ends_with('#') {
+                    continue;
+                }
+                match resolved {
+                    None => resolved = Some(&o.symbol),
+                    Some(outer) if o.symbol.starts_with(outer) => resolved = Some(&o.symbol),
+                    Some(_) => {}
+                }
+            }
+            resolved.map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Whether `from` (a type definition, `(document, index)`) declares one of `targets` as a
+/// supertype, directly or through the supertypes of its supertypes (contract M3b amendments 21
+/// and 26). `supertypes` holds each type definition's declared supertypes as the SCIP symbols
+/// the index's occurrences resolved them to ([`declared_supertypes`]); a symbol leads on only
+/// when it is one of the project's matched type definitions (`types_by_symbol`), so an
+/// external or unresolved supertype ends that path. The walk accepts only when it reaches one
+/// of `targets` itself; the index's relationship is exact, so the walk only decides its
+/// direction. A visited set and a depth cap bound it.
 fn reaches_supertype(
-    docs: &[Doc<'_>],
-    types_by_name: &BTreeMap<&str, Vec<(usize, usize)>>,
+    supertypes: &BTreeMap<(usize, usize), Vec<String>>,
+    types_by_symbol: &BTreeMap<&str, Vec<(usize, usize)>>,
     from: (usize, usize),
     targets: &[(usize, usize)],
 ) -> bool {
@@ -387,10 +439,12 @@ fn reaches_supertype(
     let mut frontier = vec![from];
     for _ in 0..MAX_DEPTH {
         let mut next = Vec::new();
-        for (di, i) in frontier {
-            for s in &docs[di].2.definitions[i].supertypes {
-                let name = s.name.rsplit('.').next().unwrap_or(&s.name);
-                for &t in types_by_name.get(name).map_or(&[][..], Vec::as_slice) {
+        for at in frontier {
+            for symbol in supertypes.get(&at).map_or(&[][..], Vec::as_slice) {
+                for &t in types_by_symbol
+                    .get(symbol.as_str())
+                    .map_or(&[][..], Vec::as_slice)
+                {
                     if targets.contains(&t) {
                         return true;
                     }
@@ -555,6 +609,8 @@ mod tests {
                 references_unanchored: 0,
                 references_unmatched: 0,
                 files_without_document: 0,
+                supertypes_unresolved: 0,
+                occurrences_unconverted: 0,
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -757,71 +813,154 @@ mod tests {
         assert!(joined.keys.is_empty());
     }
 
-    /// A synthetic scip-java index over several Java files: every class or interface gets
-    /// `<package>/<Name>#` and every method `<package>/<Type>#<name>().`, each with a definition
-    /// occurrence at its name; `relationships` are `is_implementation` links between those
-    /// symbols, listed in the document that defines the source (scip-java's own layout; the
-    /// tests list both directions where it would). Returns the `Implements` edges, without
-    /// the symbol prefix.
+    /// A synthetic index over several files of one language: every class or interface gets a
+    /// type symbol (`<package>/<Name>#` for Java, `src/\`<file>\`/<Name>#` for TypeScript) and
+    /// every method `<Type>#<name>().`, each with a definition occurrence at its name; each
+    /// declared supertype gets the reference occurrences the real indexers emit inside its
+    /// clause item (contract M3b amendment 26): the type symbol at the type's name, preceded by
+    /// a namespace occurrence at each qualifier (`a/` at `a` in `a.Circle`). A supertype name
+    /// resolves as the compiler would: qualified names by their package, simple names in the
+    /// file's own package, then through its imports, then to the one type of that name.
+    /// `relationships` are `is_implementation` links between those symbols, listed in the
+    /// document that defines the source (scip-java's own layout; the tests list both directions
+    /// where it would). Returns the `Implements` edges, without the symbol prefix.
     fn hierarchy(files: &[(&str, &str)], relationships: &[(&str, &str)]) -> Vec<String> {
-        let prefix = "scip-java maven . . ";
+        hierarchy_in(Language::Java, files, relationships)
+    }
+
+    fn hierarchy_in(
+        language: Language,
+        files: &[(&str, &str)],
+        relationships: &[(&str, &str)],
+    ) -> Vec<String> {
+        let prefix = match language {
+            Language::Java => "scip-java maven . . ",
+            _ => "scip-typescript npm t1 1.0.0 ",
+        };
         let facts: Vec<(String, FileFacts)> = files
             .iter()
             .map(|(path, src)| {
                 (
                     (*path).to_owned(),
-                    rb_syntax::extract(Language::Java, src.as_bytes()).unwrap(),
+                    rb_syntax::extract(language, src.as_bytes()).unwrap(),
                 )
             })
             .collect();
-        let symbol_of = |f: &FileFacts, d: &rb_syntax::Definition| -> Option<String> {
-            let package = f.package.as_deref().unwrap_or("p").replace('.', "/");
-            let suffix = match d.kind {
+        // The symbol of a type by (package, simple name): a Java package is the file's clause,
+        // a TypeScript "package" is the file.
+        let scope_of = |path: &str, f: &FileFacts| -> String {
+            match language {
+                Language::Java => f.package.as_deref().unwrap_or("p").replace('.', "/"),
+                _ => format!("src/`{path}`"),
+            }
+        };
+        let type_symbol = |scope: &str, name: &str| format!("{prefix}{scope}/{name}#");
+        let symbol_of = |path: &str, f: &FileFacts, d: &rb_syntax::Definition| -> Option<String> {
+            let scope = scope_of(path, f);
+            match d.kind {
                 rb_syntax::DefKind::Class | rb_syntax::DefKind::Interface => {
-                    format!("{package}/{}#", d.name)
+                    Some(type_symbol(&scope, &d.name))
                 }
                 rb_syntax::DefKind::Method => {
                     let parent = &f.definitions[d.parent?];
-                    format!("{package}/{}#{}().", parent.name, d.name)
+                    Some(format!("{prefix}{scope}/{}#{}().", parent.name, d.name))
                 }
-                _ => return None,
-            };
-            Some(format!("{prefix}{suffix}"))
+                _ => None,
+            }
+        };
+        let types: Vec<(String, String)> = facts
+            .iter()
+            .flat_map(|(path, f)| {
+                f.definitions
+                    .iter()
+                    .filter(|d| is_type(d))
+                    .map(move |d| (scope_of(path, f), d.name.clone()))
+            })
+            .collect();
+        let resolve = |f: &FileFacts, path: &str, name: &str| -> Option<String> {
+            if let Some((package, simple)) = name.rsplit_once('.') {
+                return Some(type_symbol(&package.replace('.', "/"), simple));
+            }
+            let own = scope_of(path, f);
+            if types.iter().any(|(s, n)| *s == own && n == name) {
+                return Some(type_symbol(&own, name));
+            }
+            for import in &f.imports {
+                let module = import.module.replace('.', "/");
+                if let Some(package) = module.strip_suffix(&format!("/{name}")) {
+                    return Some(type_symbol(package, name));
+                }
+                if import.names.iter().any(|n| n.local == name) {
+                    return Some(type_symbol(&module, name));
+                }
+            }
+            let mut found = types.iter().filter(|(_, n)| n == name);
+            let (scope, _) = found.next()?;
+            assert!(found.next().is_none(), "{name} is ambiguous in the test");
+            Some(type_symbol(scope, name))
         };
         let documents = facts
             .iter()
-            .map(|(path, f)| Document {
-                path: path.clone(),
-                occurrences: f
+            .map(|(path, f)| {
+                let mut occurrences: Vec<Occurrence> = f
                     .definitions
                     .iter()
                     .filter_map(|d| {
                         Some(Occurrence {
                             span: d.name_span,
-                            symbol: symbol_of(f, d)?,
+                            symbol: symbol_of(path, f, d)?,
                             roles: 1,
                             enclosing: None,
                         })
                     })
-                    .collect(),
-                symbols: relationships
-                    .iter()
-                    .filter(|(from, _)| {
-                        f.definitions
-                            .iter()
-                            .any(|d| symbol_of(f, d).as_deref() == Some(&format!("{prefix}{from}")))
-                    })
-                    .map(|(from, to)| SymbolInfo {
-                        symbol: format!("{prefix}{from}"),
-                        relationships: vec![Relationship {
-                            symbol: format!("{prefix}{to}"),
-                            is_implementation: true,
+                    .collect();
+                for d in &f.definitions {
+                    for s in &d.supertypes {
+                        let Some(symbol) = resolve(f, path, &s.name) else {
+                            continue;
+                        };
+                        // `a.b.Circle`: `a/` at `a`, `a/b/` at `b`, the type at `Circle`.
+                        let [line, mut col, ..] = s.span;
+                        let parts: Vec<&str> = s.name.split('.').collect();
+                        for (k, part) in parts.iter().enumerate() {
+                            let len = part.len() as i32;
+                            let sym = if k + 1 == parts.len() {
+                                symbol.clone()
+                            } else {
+                                format!("{prefix}{}/", parts[..=k].join("/"))
+                            };
+                            occurrences.push(Occurrence {
+                                span: [line, col, line, col + len],
+                                symbol: sym,
+                                roles: 0,
+                                enclosing: None,
+                            });
+                            col += len + 1;
+                        }
+                    }
+                }
+                Document {
+                    path: path.clone(),
+                    occurrences,
+                    symbols: relationships
+                        .iter()
+                        .filter(|(from, _)| {
+                            f.definitions.iter().any(|d| {
+                                symbol_of(path, f, d).as_deref() == Some(&format!("{prefix}{from}"))
+                            })
+                        })
+                        .map(|(from, to)| SymbolInfo {
+                            symbol: format!("{prefix}{from}"),
+                            relationships: vec![Relationship {
+                                symbol: format!("{prefix}{to}"),
+                                is_implementation: true,
+                                ..Default::default()
+                            }],
                             ..Default::default()
-                        }],
-                        ..Default::default()
-                    })
-                    .collect(),
-                ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }
             })
             .collect();
         let index = ScipIndex {
@@ -830,18 +969,101 @@ mod tests {
         };
         let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
             .iter()
-            .map(|(p, f)| (p.as_str(), (Language::Java, f)))
+            .map(|(p, f)| (p.as_str(), (language, f)))
             .collect();
         let keys: BTreeMap<&str, Vec<String>> = facts
             .iter()
             .map(|(p, f)| (p.as_str(), rb_syntax::symbol_keys(p, f)))
             .collect();
-        let joined = join(&index, "", &by_path, &keys, &[Language::Java]);
+        let joined = join(&index, "", &by_path, &keys, &[language]);
         edge_lines(&joined)
             .into_iter()
             .filter(|l| l.contains(" Implements "))
             .map(|l| l.replace(prefix, ""))
             .collect()
+    }
+
+    /// Contract M3b amendment 26 (the evaluator's J1): two project types named `Common`. With
+    /// declared supertypes resolved by simple name, `a.Shape extends Common` reached `b.Common`,
+    /// whose `extends a.Circle` reached `Circle`, and scip-java's reverse override link
+    /// `Shape#area() → Circle#area()` became an exact edge. Resolved through the occurrences
+    /// in the heritage clauses, `Shape`'s `Common` is `a.Common`, which leads nowhere, so only
+    /// the forward edges remain.
+    #[test]
+    fn a_same_named_type_does_not_make_the_reverse_link_an_edge() {
+        let files = [
+            ("a/Common.java", "package a;\npublic interface Common {}\n"),
+            (
+                "a/Shape.java",
+                "package a;\npublic interface Shape extends Common { double area(); }\n",
+            ),
+            (
+                "a/Circle.java",
+                "package a;\npublic class Circle implements Shape { public double area() { return 1; } }\n",
+            ),
+            (
+                "b/Common.java",
+                "package b;\npublic class Common extends a.Circle {}\n",
+            ),
+        ];
+        let both = |a: &'static str, b: &'static str| [(a, b), (b, a)];
+        let rels: Vec<(&str, &str)> = [
+            both("a/Circle#area().", "a/Shape#area()."),
+            both("a/Circle#", "a/Shape#"),
+            both("a/Circle#", "a/Common#"),
+            both("a/Shape#", "a/Common#"),
+            both("b/Common#", "a/Circle#"),
+            both("b/Common#", "a/Shape#"),
+            both("b/Common#", "a/Common#"),
+        ]
+        .concat();
+        assert_eq!(
+            hierarchy(&files, &rels),
+            [
+                "a/Circle# Implements a/Common#",
+                "a/Circle# Implements a/Shape#",
+                "a/Circle#area(). Implements a/Shape#area().",
+                "a/Shape# Implements a/Common#",
+                "b/Common# Implements a/Circle#",
+                "b/Common# Implements a/Common#",
+                "b/Common# Implements a/Shape#",
+            ]
+        );
+    }
+
+    /// Contract M3b amendment 28 (the evaluator's T1): a TypeScript `interface Mid extends
+    /// Base` declares a supertype, so `class Svc implements Mid` and `class Sub extends Svc`
+    /// both implement `Base#m()` through the interface chain; scip-typescript lists every
+    /// level on the implementation's side only.
+    #[test]
+    fn typescript_implements_runs_through_an_interface_chain() {
+        let src = "export interface Base { m(): void }\nexport interface Mid extends Base { extra(): void }\nexport class Svc implements Mid { m() {} extra() {} }\nexport class Sub extends Svc { m() {} }\nexport function use(b: Base) { b.m(); }\n";
+        let rels = [
+            ("src/`base.ts`/Sub#", "src/`base.ts`/Svc#"),
+            ("src/`base.ts`/Sub#", "src/`base.ts`/Mid#"),
+            ("src/`base.ts`/Sub#", "src/`base.ts`/Base#"),
+            ("src/`base.ts`/Sub#m().", "src/`base.ts`/Svc#m()."),
+            ("src/`base.ts`/Sub#m().", "src/`base.ts`/Base#m()."),
+            ("src/`base.ts`/Svc#", "src/`base.ts`/Mid#"),
+            ("src/`base.ts`/Svc#", "src/`base.ts`/Base#"),
+            ("src/`base.ts`/Svc#extra().", "src/`base.ts`/Mid#extra()."),
+            ("src/`base.ts`/Svc#m().", "src/`base.ts`/Base#m()."),
+        ];
+        let edges = hierarchy_in(Language::TypeScript, &[("base.ts", src)], &rels);
+        assert_eq!(
+            edges,
+            [
+                "src/`base.ts`/Sub# Implements src/`base.ts`/Base#",
+                "src/`base.ts`/Sub# Implements src/`base.ts`/Mid#",
+                "src/`base.ts`/Sub# Implements src/`base.ts`/Svc#",
+                "src/`base.ts`/Sub#m(). Implements src/`base.ts`/Base#m().",
+                "src/`base.ts`/Sub#m(). Implements src/`base.ts`/Svc#m().",
+                "src/`base.ts`/Svc# Implements src/`base.ts`/Base#",
+                "src/`base.ts`/Svc# Implements src/`base.ts`/Mid#",
+                "src/`base.ts`/Svc#extra(). Implements src/`base.ts`/Mid#extra().",
+                "src/`base.ts`/Svc#m(). Implements src/`base.ts`/Base#m().",
+            ]
+        );
     }
 
     /// Contract M3b amendment 21: `IMPLEMENTS` is accepted through the hierarchy the syntax
@@ -1037,6 +1259,8 @@ mod tests {
                 references_unanchored: 0,
                 references_unmatched: 0,
                 files_without_document: 0,
+                supertypes_unresolved: 0,
+                occurrences_unconverted: 0,
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();
@@ -1083,6 +1307,72 @@ mod tests {
             ("p/C0#", "p/C65#"),
         ];
         assert_eq!(hierarchy(&files, &rels), ["p/C0# Implements p/C64#"]);
+    }
+
+    /// Contract M3b amendment 26: a declared supertype resolves to the type occurrence inside
+    /// its clause item as the indexers emit them: the raw type before its arguments
+    /// (`Repo<User>` → `Repo#`, not `User#`), the type after its qualifier's namespace
+    /// occurrence (`a.Circle` → `a/Circle#`, not `a/`), the nested type over its outer one
+    /// (`Outer.Inner` → `Outer#Inner#`), and nothing when the span holds no type occurrence,
+    /// which the coverage counts.
+    #[test]
+    fn declared_supertypes_resolve_generic_qualified_and_nested_names() {
+        let src =
+            "package p;\nclass Impl extends a.Circle implements Repo<User>, Outer.Inner, Gone {}\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let path = "src/Impl.java";
+        let at = |token: &str| -> Span {
+            let col = src.lines().nth(1).unwrap().find(token).unwrap() as i32;
+            [1, col, 1, col + token.len() as i32]
+        };
+        let sym = |d: &str| format!("scip-java maven . . {d}");
+        let occ = |span: Span, symbol: String, roles: i32| Occurrence {
+            span,
+            symbol,
+            roles,
+            enclosing: None,
+        };
+        let impl_def = facts.definitions.iter().find(|d| d.name == "Impl").unwrap();
+        let occurrences = vec![
+            occ(impl_def.name_span, sym("p/Impl#"), 1),
+            occ(at("a."), sym("a/"), 0),
+            occ(at("Circle"), sym("a/Circle#"), 0),
+            occ(at("Repo"), sym("p/Repo#"), 0),
+            occ(at("User"), sym("p/User#"), 0),
+            occ(at("Outer"), sym("p/Outer#"), 0),
+            occ(at("Inner"), sym("p/Outer#Inner#"), 0),
+            // `Gone` has an occurrence, but of a local symbol: not a type the index names.
+            occ(at("Gone"), "local 1".into(), 0),
+        ];
+        let by_span =
+            occurrences
+                .iter()
+                .fold(BTreeMap::<Span, Vec<&Occurrence>>::new(), |mut m, o| {
+                    m.entry(o.span).or_default().push(o);
+                    m
+                });
+        assert_eq!(
+            declared_supertypes(impl_def, &by_span),
+            [
+                Some(sym("a/Circle#")),
+                Some(sym("p/Repo#")),
+                Some(sym("p/Outer#Inner#")),
+                None,
+            ]
+        );
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        assert_eq!(joined.coverage.supertypes_unresolved, 1);
     }
 
     fn edge_lines(joined: &Joined) -> Vec<String> {
@@ -1191,84 +1481,5 @@ mod tests {
         assert!(joined.keys.is_empty());
         assert_eq!(joined.coverage.definitions_matched, 0);
         assert_eq!(joined.coverage.references_unmatched, 4);
-    }
-}
-
-/// Debugging aid, not an assertion: with `RB_SCIP_SAMPLE_DIR=<dir>` holding an `index.scip` and
-/// the sources it was built from, prints the join's coverage and a sample of keys and edges.
-#[cfg(test)]
-mod sample {
-    use std::collections::BTreeMap;
-
-    use super::*;
-
-    #[test]
-    fn print_real_index_join() {
-        let Ok(dir) = std::env::var("RB_SCIP_SAMPLE_DIR") else {
-            return;
-        };
-        let bytes = std::fs::read(format!("{dir}/index.scip")).unwrap();
-        let index = rb_scip::decode(&bytes, &|p| std::fs::read(format!("{dir}/{p}")).ok()).unwrap();
-        println!(
-            "tool={} root={} documents={}",
-            index.tool,
-            index.project_root,
-            index.documents.len()
-        );
-        let mut facts_by_path: BTreeMap<String, (Language, FileFacts)> = BTreeMap::new();
-        for d in &index.documents {
-            let language = match d.path.rsplit('.').next() {
-                Some("ts") => Language::TypeScript,
-                Some("tsx") => Language::Tsx,
-                Some("js") => Language::JavaScript,
-                Some("java") => Language::Java,
-                _ => continue,
-            };
-            let Ok(src) = std::fs::read(format!("{dir}/{}", d.path)) else {
-                continue;
-            };
-            facts_by_path.insert(
-                d.path.clone(),
-                (language, rb_syntax::extract(language, &src).unwrap()),
-            );
-            println!(
-                "  {} occurrences={} symbols={} encoding_assumed={} unconverted={}",
-                d.path,
-                d.occurrences.len(),
-                d.symbols.len(),
-                d.encoding_assumed,
-                d.unconverted
-            );
-        }
-        let files: BTreeMap<&str, (Language, &FileFacts)> = facts_by_path
-            .iter()
-            .map(|(p, (l, f))| (p.as_str(), (*l, f)))
-            .collect();
-        let keys: BTreeMap<&str, Vec<String>> = facts_by_path
-            .iter()
-            .map(|(p, (_, f))| (p.as_str(), rb_syntax::symbol_keys(p, f)))
-            .collect();
-        let languages: Vec<Language> = files.values().map(|(l, _)| *l).collect();
-        let joined = join(&index, "", &files, &keys, &languages);
-        println!("coverage={:?}", joined.coverage);
-        for (path, replaced) in &joined.keys {
-            for (i, s) in replaced {
-                println!(
-                    "  key {path} {} -> {s}",
-                    files[path.as_str()].1.definitions[*i].name
-                );
-            }
-        }
-        for e in joined.edges.iter().take(20) {
-            println!("  edge {:?} {:?} {}", e.src, e.kind, e.dst);
-        }
-        for d in &index.documents {
-            for o in d.occurrences.iter().take(6) {
-                println!(
-                    "  occ {} {:?} roles={} {}",
-                    d.path, o.span, o.roles, o.symbol
-                );
-            }
-        }
     }
 }

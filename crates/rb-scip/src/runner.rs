@@ -8,7 +8,8 @@ use std::time::Duration;
 /// What a container may reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
-    /// The fetch phase: package registries (the host network; registry allow-listing is M5).
+    /// The fetch phase: Docker's default bridge network, unrestricted (registry allow-listing
+    /// is M5; contract M3b amendment 27).
     Registries,
     /// The index phase: nothing.
     None,

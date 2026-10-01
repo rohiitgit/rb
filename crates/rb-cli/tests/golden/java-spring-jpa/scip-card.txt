@@ -11,4 +11,4 @@ auth-service  (path: ., deployable)
 │    maven/org.springframework.data/spring-data-jpa@3.3.4
 │    maven/org.springframework/spring-context@6.1.13
 │    maven/org.springframework/spring-web@6.1.13
-└─ APIs, tables and call graph: not indexed yet (M2–M4)
+└─ Endpoints and request paths: not indexed yet (M4)

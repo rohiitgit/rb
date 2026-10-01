@@ -26,13 +26,14 @@ impl Indexer {
     }
 }
 
-/// How dependencies are fetched before indexing.
+/// How dependencies are fetched before indexing. A repository's own wrapper (`mvnw`,
+/// `gradlew`) is never used: the image's tools are (contract M3b amendment 25).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Fetch {
-    /// `mvn dependency:go-offline` (or through the wrapper when present).
-    Maven { wrapper: bool },
-    /// A Gradle dependency resolution through the wrapper when present.
-    Gradle { wrapper: bool },
+    /// `mvn dependency:go-offline` and an online build with the image's Maven.
+    Maven,
+    /// A Gradle dependency resolution (not verified yet: such jobs are `unsupported`).
+    Gradle,
     /// `npm ci`, `yarn install --frozen-lockfile` or `pnpm install --frozen-lockfile`.
     Npm { lockfile: NodeLock },
 }
@@ -98,42 +99,26 @@ pub fn jobs(files: &[&str]) -> Vec<Job> {
     .iter()
     .flat_map(|n| dirs_with(n))
     .collect();
-    let mut java_roots: Vec<(String, Fetch)> = Vec::new();
-    for r in &maven {
-        java_roots.push((
-            r.clone(),
-            Fetch::Maven {
-                wrapper: has(&join(r, "mvnw")),
-            },
-        ));
-    }
-    for r in &gradle {
-        if !maven.contains(r) {
-            java_roots.push((
-                r.clone(),
-                Fetch::Gradle {
-                    wrapper: has(&join(r, "gradlew")),
-                },
-            ));
-        }
-    }
+    let mut java_roots: Vec<(String, Fetch)> = maven
+        .iter()
+        .map(|r| (r.clone(), Fetch::Maven))
+        .chain(
+            gradle
+                .iter()
+                .filter(|r| !maven.contains(r))
+                .map(|r| (r.clone(), Fetch::Gradle)),
+        )
+        .collect();
     java_roots.sort();
     java_roots.dedup();
     // A Maven module under a Maven reactor, or a Gradle subproject under a Gradle root, is part of
     // its ancestor's build; a Gradle build under a Maven root is its own.
-    let same_tool = |a: &Fetch, b: &Fetch| {
-        matches!(
-            (a, b),
-            (Fetch::Maven { .. }, Fetch::Maven { .. })
-                | (Fetch::Gradle { .. }, Fetch::Gradle { .. })
-        )
-    };
     let outermost: Vec<(String, Fetch)> = java_roots
         .iter()
         .filter(|(r, f)| {
             !java_roots
                 .iter()
-                .any(|(o, g)| o != r && is_under(r, o) && same_tool(f, g))
+                .any(|(o, g)| o != r && is_under(r, o) && f == g)
         })
         .cloned()
         .collect();
@@ -223,8 +208,8 @@ mod tests {
             .into_iter()
             .map(|j| {
                 let fetch = match j.fetch {
-                    Fetch::Maven { wrapper } => format!("maven(wrapper={wrapper})"),
-                    Fetch::Gradle { wrapper } => format!("gradle(wrapper={wrapper})"),
+                    Fetch::Maven => "maven".to_owned(),
+                    Fetch::Gradle => "gradle".to_owned(),
                     Fetch::Npm { lockfile } => format!("npm({lockfile:?})"),
                 };
                 let mut s = format!("{} {} {fetch}", j.indexer.as_str(), j.root);
@@ -255,9 +240,9 @@ mod tests {
         assert_eq!(
             summary(&files),
             [
-                "scip-java  maven(wrapper=true)",
-                "scip-java legacy gradle(wrapper=false)",
-                "scip-java tools gradle(wrapper=true)",
+                "scip-java  maven",
+                "scip-java legacy gradle",
+                "scip-java tools gradle",
             ]
         );
     }
@@ -311,7 +296,7 @@ mod tests {
             summary(&files),
             [
                 "scip-typescript apps/web npm(None) [.] unpinned",
-                "scip-java services/auth maven(wrapper=false)",
+                "scip-java services/auth maven",
             ]
         );
         assert!(jobs(&["README.md"]).is_empty());

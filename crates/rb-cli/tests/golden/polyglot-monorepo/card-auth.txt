@@ -8,4 +8,4 @@ auth-service  (path: services/auth, deployable)
 │    @acme/data         2 files   33%
 │    unowned            0 files    0%
 ├─ Packages: none
-└─ APIs, tables and call graph: not indexed yet (M2–M4)
+└─ Endpoints and request paths: not indexed yet (M4)

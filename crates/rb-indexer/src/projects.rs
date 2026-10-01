@@ -6,12 +6,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use rb_model::FileEntry;
-use rb_scip::{Budget, RunStatus, Runner, ScipIndex};
+use rb_scip::{Budget, Images, RunStatus, Runner, ScipIndex};
 
 /// A recorded indexer run, content-addressed by `(project_input_hash, image)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScipCacheEntry {
-    /// `ok`, `failed` or `timeout`.
+    /// `ok` or `failed` (contract M3b amendments 30 and 31); a row with any other value, written
+    /// by an older binary, is a miss.
     pub status: String,
     /// `index.scip` bytes when `ok`.
     pub index: Option<Vec<u8>>,
@@ -38,8 +39,8 @@ impl ScipCache for NoScipCache {
 }
 
 /// A cache that is never read, only written (`rb index --no-cache`, contract M3b amendment
-/// 20): every job runs again and its outcome replaces the row, so a cached `failed` or
-/// `timeout` can be retried.
+/// 20): every job runs again and its outcome replaces the row, so a cached `failed` can be
+/// retried.
 pub struct WriteOnlyScipCache<'a>(pub &'a mut dyn ScipCache);
 
 impl ScipCache for WriteOnlyScipCache<'_> {
@@ -80,6 +81,9 @@ impl ScipMode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScipOptions {
     pub mode: ScipMode,
+    /// The indexer images on this host, resolved once by the caller before its up-to-date check
+    /// (contract M3b amendment 29): what each job runs in and caches under.
+    pub images: Images,
     /// Holds one export directory per job run (`<input_hash[..16]>-<pid>-<nanos>`, so runs of
     /// the same commit at once share nothing; contract M3b amendment 22), removed after the
     /// run. Must be a path the container runtime can bind-mount.
@@ -94,6 +98,7 @@ impl ScipOptions {
     pub fn disabled() -> Self {
         ScipOptions {
             mode: ScipMode::Off,
+            images: Images::unresolved(),
             work_dir: PathBuf::new(),
             cache_dir: PathBuf::new(),
             budget: Budget::default(),
@@ -108,7 +113,7 @@ pub struct ScipProject {
     pub root: String,
     pub indexer: &'static str,
     /// The image the job runs in and its index is cached under: a registry digest reference, or
-    /// the image ID of the locally built scip-java image (`rb_scip::resolve_image`).
+    /// the image ID of the locally built scip-java image (`rb_scip::Images::for_job`).
     pub image: String,
     pub status: RunStatus,
     /// The decoded index when `status` is `Ok`; dropped once the graph is assembled.
@@ -163,8 +168,8 @@ pub(crate) fn run_projects(
             }
             Mode::Run(runner) => *runner,
         };
-        // The image is resolved before the cache lookup: it is the key's second half.
-        match rb_scip::resolve_image(&job, runner) {
+        // The image was resolved before the cache lookup: it is the key's second half.
+        match options.images.for_job(&job) {
             Ok(image) => project.image = image,
             Err(reason) => {
                 project.status = RunStatus::Unsupported(reason);
@@ -178,10 +183,15 @@ pub(crate) fn run_projects(
             .map(|(p, b)| (*p, *b))
             .collect();
         let input_hash = rb_scip::project_input_hash(&job.root, under_root.iter().copied());
-        let entry = match cache.get(&input_hash, &project.image)? {
-            Some(entry) => {
+        // A row whose status no current run would write (a `timeout` from an older binary) is
+        // a miss (contract M3b amendment 31).
+        let cached = cache
+            .get(&input_hash, &project.image)?
+            .and_then(|entry| Some((RunStatus::from_cached(&entry.status)?, entry)));
+        let (status, entry) = match cached {
+            Some(hit) => {
                 project.cached = true;
-                entry
+                hit
             }
             None => {
                 let exported = under_root
@@ -197,22 +207,21 @@ pub(crate) fn run_projects(
                     &options.budget,
                     runner,
                 )?;
-                if let RunStatus::Unsupported(_) = run.status {
-                    project.status = run.status;
-                    out.push(project);
-                    continue;
-                }
                 let entry = ScipCacheEntry {
                     status: run.status.as_str().to_owned(),
                     index: run.index,
                     stderr_tail: run.stderr_tail,
                     elapsed_ms: u64::try_from(run.elapsed.as_millis()).unwrap_or(u64::MAX),
                 };
-                cache.put(&input_hash, &project.image, &entry)?;
-                entry
+                // Only the project's own outcome is cached; a missing image, a runtime failure
+                // or a budget overrun is decided again next time (amendments 3, 30 and 31).
+                if run.status.is_cacheable() {
+                    cache.put(&input_hash, &project.image, &entry)?;
+                }
+                (run.status, entry)
             }
         };
-        project.status = RunStatus::from_cached(&entry.status);
+        project.status = status;
         project.elapsed_ms = entry.elapsed_ms;
         project.stderr_tail = entry.stderr_tail;
         if let (RunStatus::Ok, Some(bytes)) = (&project.status, &entry.index) {
@@ -276,11 +285,28 @@ mod tests {
         fail: bool,
         /// The scip-java image is present locally.
         java_image: bool,
+        /// Replaces every run's outcome when set (a runtime failure, a timeout).
+        outcome: Option<Outcome>,
+    }
+
+    impl Fake {
+        fn new(index: Vec<u8>, fail: bool, java_image: bool) -> Fake {
+            Fake {
+                runs: RefCell::new(0),
+                index,
+                fail,
+                java_image,
+                outcome: None,
+            }
+        }
     }
 
     impl Runner for Fake {
         fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
             *self.runs.borrow_mut() += 1;
+            if let Some(outcome) = &self.outcome {
+                return Ok(outcome.clone());
+            }
             if run.network == rb_scip::Network::None && !self.fail {
                 std::fs::write(run.workdir.join("index.scip"), &self.index)?;
             }
@@ -352,9 +378,10 @@ mod tests {
         field(2, &document)
     }
 
-    fn options(tmp: &std::path::Path) -> ScipOptions {
+    fn options(tmp: &std::path::Path, runner: &dyn Runner) -> ScipOptions {
         ScipOptions {
             mode: ScipMode::On,
+            images: Images::resolve(runner),
             work_dir: tmp.join("work"),
             cache_dir: tmp.join("cache"),
             budget: Budget::default(),
@@ -375,14 +402,9 @@ mod tests {
             .map(|f| (f.blob_sha.clone(), b"export function f() {}\n".to_vec()))
             .collect();
         let read = |blob: &str| Ok(sources[blob].clone());
-        let fake = Fake {
-            runs: RefCell::new(0),
-            index: index_bytes(),
-            fail: false,
-            java_image: true,
-        };
+        let fake = Fake::new(index_bytes(), false, true);
         let mut cache = MemCache::default();
-        let opts = options(tmp.path());
+        let opts = options(tmp.path(), &fake);
         let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
         assert_eq!(cold.len(), 1);
         let p = &cold[0];
@@ -432,14 +454,9 @@ mod tests {
             entry("web/tsconfig.json", "4"),
         ];
         let read = |_: &str| Ok(Vec::new());
-        let fake = Fake {
-            runs: RefCell::new(0),
-            index: Vec::new(),
-            fail: true,
-            java_image: false,
-        };
+        let fake = Fake::new(Vec::new(), true, false);
         let mut cache = MemCache::default();
-        let opts = options(tmp.path());
+        let opts = options(tmp.path(), &fake);
         let skipped = run_projects(
             &files,
             &read,
@@ -448,15 +465,15 @@ mod tests {
             &mut cache,
         )
         .unwrap();
-        let statuses: Vec<(&str, &str, Option<&str>)> = skipped
+        let statuses: Vec<(&str, &str, Option<String>)> = skipped
             .iter()
             .map(|p| (p.root.as_str(), p.status.as_str(), p.status.reason()))
             .collect();
         assert_eq!(
             statuses,
             [
-                ("svc", "skipped", Some("--no-scip")),
-                ("web", "skipped", Some("--no-scip")),
+                ("svc", "skipped", Some("--no-scip".to_owned())),
+                ("web", "skipped", Some("--no-scip".to_owned())),
             ]
         );
         assert_eq!(*fake.runs.borrow(), 0);
@@ -483,12 +500,7 @@ mod tests {
 
         // `--no-cache` (contract M3b amendment 20): the cached failure is not read, the job
         // runs again, and its new outcome replaces the row.
-        let retry = Fake {
-            runs: RefCell::new(0),
-            index: index_bytes(),
-            fail: false,
-            java_image: false,
-        };
+        let retry = Fake::new(index_bytes(), false, false);
         let retried = run_projects(
             &files,
             &read,
@@ -512,14 +524,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let files = vec![entry("svc/pom.xml", "1"), entry("svc/src/A.java", "2")];
         let read = |_: &str| Ok(b"class A {}\n".to_vec());
-        let fake = Fake {
-            runs: RefCell::new(0),
-            index: index_bytes(),
-            fail: false,
-            java_image: true,
-        };
+        let fake = Fake::new(index_bytes(), false, true);
         let mut cache = MemCache::default();
-        let opts = options(tmp.path());
+        let opts = options(tmp.path(), &fake);
         let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
         assert_eq!(cold.len(), 1);
         assert_eq!(
@@ -535,6 +542,86 @@ mod tests {
         assert!(warm[0].cached);
         assert_eq!(*fake.runs.borrow(), 3, "no container ran");
         assert_eq!(warm[0].image, JAVA_ID);
+    }
+
+    /// Contract M3b amendments 30 and 31: a `docker run` the client or daemon refused (exit 125)
+    /// is an `environment` outcome and a phase over its budget a `timeout` naming the phase and
+    /// the budget; neither is written to the cache, so the next run tries again. A cached row
+    /// with a status no current run writes (`timeout`, from an older binary) is a miss.
+    #[test]
+    fn runtime_failures_and_timeouts_are_reported_but_not_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            entry("package.json", "1"),
+            entry("tsconfig.json", "2"),
+            entry("src/a.ts", "3"),
+        ];
+        let read = |_: &str| Ok(b"export function f() {}\n".to_vec());
+        let outcome = |exit_code: Option<i32>, timed_out: bool, stderr: &str| Outcome {
+            exit_code,
+            timed_out,
+            stderr_tail: stderr.into(),
+            elapsed: std::time::Duration::from_millis(3),
+        };
+        let mut cache = MemCache::default();
+
+        let refused = Fake {
+            outcome: Some(outcome(Some(125), false, "shim: docker run refused")),
+            ..Fake::new(index_bytes(), false, false)
+        };
+        let opts = options(tmp.path(), &refused);
+        let ran = run_projects(&files, &read, &Mode::Run(&refused), &opts, &mut cache).unwrap();
+        assert_eq!(
+            ran[0].status,
+            RunStatus::Environment("shim: docker run refused".into())
+        );
+        assert_eq!(ran[0].status.as_str(), "environment");
+        assert!(!ran[0].cached && ran[0].index.is_none());
+        assert_eq!(cache.puts, 0, "an environment outcome is not cached");
+
+        let slow = Fake {
+            outcome: Some(outcome(None, true, "")),
+            ..Fake::new(index_bytes(), false, false)
+        };
+        let budget = Budget {
+            fetch_timeout: std::time::Duration::from_secs(1),
+            ..Budget::default()
+        };
+        let opts = ScipOptions {
+            budget,
+            ..options(tmp.path(), &slow)
+        };
+        let ran = run_projects(&files, &read, &Mode::Run(&slow), &opts, &mut cache).unwrap();
+        assert_eq!(
+            ran[0].status,
+            RunStatus::Timeout {
+                phase: rb_scip::Phase::Fetch,
+                budget_secs: 1
+            }
+        );
+        assert_eq!(
+            ran[0].status.reason().as_deref(),
+            Some("fetch phase over its 1 s budget")
+        );
+        assert_eq!(cache.puts, 0, "a timeout is not cached");
+        assert_eq!(*slow.runs.borrow(), 1);
+
+        // The next run tries again and, succeeding, is cached.
+        let fine = Fake::new(index_bytes(), false, false);
+        let opts = options(tmp.path(), &fine);
+        let ran = run_projects(&files, &read, &Mode::Run(&fine), &opts, &mut cache).unwrap();
+        assert_eq!(ran[0].status, RunStatus::Ok);
+        assert_eq!(*fine.runs.borrow(), 2, "fetch and index ran");
+        assert_eq!(cache.puts, 1);
+
+        // A `timeout` row an older binary wrote is a miss: the job runs again.
+        for entry in cache.rows.values_mut() {
+            entry.status = "timeout".into();
+        }
+        let ran = run_projects(&files, &read, &Mode::Run(&fine), &opts, &mut cache).unwrap();
+        assert!(!ran[0].cached && ran[0].status == RunStatus::Ok);
+        assert_eq!(*fine.runs.borrow(), 4, "the stale row was not served");
+        assert_eq!(cache.puts, 2, "the row is replaced");
     }
 
     #[test]

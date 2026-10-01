@@ -59,14 +59,15 @@ struct IndexArgs {
     force: bool,
     /// Parse every file instead of reusing cached syntax facts (that cache is not updated
     /// either), and run every SCIP job again instead of serving it from the index cache (its
-    /// outcome is stored, so a cached `failed` or `timeout` can be retried).
+    /// outcome is stored, so a cached `failed` can be retried).
     #[arg(long)]
     no_cache: bool,
     /// Run no SCIP indexer: every project is resolved heuristically and its job is `skipped`.
     #[arg(long)]
     no_scip: bool,
     /// Directory for indexer exports and package caches; the container runtime must be able to
-    /// bind-mount it (under the home directory on colima).
+    /// bind-mount it (a path the runtime shares with its VM, such as one under the home
+    /// directory).
     #[arg(long, env = "RB_SCIP_WORK_DIR", default_value = "var/scip")]
     scip_work_dir: PathBuf,
     /// Seconds a SCIP job's index phase may take (its fetch phase gets the same budget); a run
@@ -213,16 +214,7 @@ fn main() -> anyhow::Result<()> {
                         "  sql: {} tables; {} code sites and {} migration statements touching them; {} unparsed",
                         c.tables, c.query_sites, c.migration_statements, c.unparsed
                     );
-                    let r = store.resolution_coverage(live.id)?;
-                    println!(
-                        "  code: {:.1}% of references to own code resolved ({} resolved, {} ambiguous, {} unresolved; {} external); {} exact calls (scip)",
-                        r.resolved_share() * 100.0,
-                        r.resolved,
-                        r.ambiguous,
-                        r.unresolved,
-                        r.external,
-                        r.exact_calls
-                    );
+                    println!("  {}", code_line(&store.resolution_coverage(live.id)?));
                     for d in store.load_diagnostics(live.id)? {
                         if d.kind == "scip_status" {
                             println!("  {}", scip_status_line(&d));
@@ -410,8 +402,10 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
 
     let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(&rev)?;
     store.migrate()?;
-    // Decided here, before the "up to date" check: a snapshot indexed without Docker is
-    // heuristic and must be rebuilt once Docker answers (contract M3b amendment 17).
+    // Decided here, before the "up to date" check: a snapshot indexed without Docker, or
+    // without an indexer image, is heuristic and must be rebuilt once they answer (contract M3b
+    // amendments 17 and 29). The images are looked up once; the jobs run in and cache under
+    // the same ones.
     let scip_mode = if no_scip {
         rb_indexer::ScipMode::Off
     } else {
@@ -420,7 +414,11 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
             Err(reason) => rb_indexer::ScipMode::Unavailable(reason),
         }
     };
-    let tools = tool_versions(&scip_mode);
+    let images = match scip_mode {
+        rb_indexer::ScipMode::On => rb_scip::Images::resolve(&rb_scip::DockerRunner::default()),
+        _ => rb_scip::Images::unresolved(),
+    };
+    let tools = tool_versions(&scip_mode, &images);
 
     if !force
         && let Some(live) = store.live_snapshot(&repo)?
@@ -442,6 +440,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
     }
     let scip = rb_indexer::ScipOptions {
         mode: scip_mode,
+        images,
         cache_dir: scip_work_dir.join("cache"),
         work_dir: scip_work_dir,
         budget,
@@ -501,15 +500,50 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         if j.unpinned {
             line.push_str(" unpinned");
         }
+        // The container run's time (the cached run's when served from the cache) is printed
+        // here only; it never enters the graph (contract M3b amendment 32).
         if j.elapsed_ms > 0 {
             let _ = write!(line, " {:.1}s", j.elapsed_ms as f64 / 1000.0);
         }
-        if let Some(reason) = j.status.reason() {
-            let _ = write!(line, ": {reason}");
+        match &j.status {
+            rb_scip::RunStatus::Timeout { phase, budget_secs } => {
+                line.push_str(&timeout_detail(phase.as_str(), *budget_secs));
+            }
+            other => {
+                if let Some(reason) = other.reason() {
+                    let _ = write!(line, ": {reason}");
+                }
+            }
         }
         println!("{line}");
     }
     Ok(())
+}
+
+/// ` (fetch phase, 600 s budget)` after a `timeout` status (contract M3b amendment 31).
+fn timeout_detail(phase: &str, budget_secs: u64) -> String {
+    format!(" ({phase} phase, {budget_secs} s budget)")
+}
+
+/// The `rb status` resolution line (contract M3a R8, M3b S9 and amendment 41). With no
+/// heuristic site at all (an all-SCIP repository) there is no share to print.
+fn code_line(r: &rb_store::ResolutionCoverage) -> String {
+    if r.resolved + r.ambiguous + r.unresolved == 0 {
+        format!(
+            "code: no heuristic references to own code ({} external); {} exact calls (scip)",
+            r.external, r.exact_calls
+        )
+    } else {
+        format!(
+            "code: {:.1}% of references to own code resolved ({} resolved, {} ambiguous, {} unresolved; {} external); {} exact calls (scip)",
+            r.resolved_share() * 100.0,
+            r.resolved,
+            r.ambiguous,
+            r.unresolved,
+            r.external,
+            r.exact_calls
+        )
+    }
 }
 
 /// `.` for the repository root, as in the `scip_status` diagnostic.
@@ -530,8 +564,10 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
     if d.detail["unpinned"].as_bool() == Some(true) {
         line.push_str(" unpinned");
     }
-    if let Some(ms) = d.detail["elapsed_ms"].as_u64().filter(|&ms| ms > 0) {
-        let _ = write!(line, " {:.1}s", ms as f64 / 1000.0);
+    if let (Some(phase), Some(budget)) =
+        (d.detail["phase"].as_str(), d.detail["budget_secs"].as_u64())
+    {
+        line.push_str(&timeout_detail(phase, budget));
     }
     if let Some(reason) = d.detail["reason"].as_str() {
         let _ = write!(line, ": {reason}");
@@ -540,7 +576,7 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         let n = |k: &str| c[k].as_u64().unwrap_or(0);
         let _ = write!(
             line,
-            ", definitions matched {}/{} ({} by name), references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}",
+            ", definitions matched {}/{} ({} by name), references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}",
             n("definitions_matched"),
             n("definitions_total"),
             n("definitions_matched_by_name"),
@@ -549,7 +585,8 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
             n("references_undocumented"),
             n("references_local"),
             n("references_unanchored"),
-            n("references_unmatched")
+            n("references_unmatched"),
+            n("occurrences_unconverted")
         );
         // Files the indexer left out (excluded by its tsconfig): no edges of any kind.
         if n("files_without_document") > 0 {
@@ -557,6 +594,15 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
                 line,
                 ", {} files without a document",
                 n("files_without_document")
+            );
+        }
+        // Declared supertypes the index has no type occurrence for: the `IMPLEMENTS` walk
+        // stops at them.
+        if n("supertypes_unresolved") > 0 {
+            let _ = write!(
+                line,
+                ", {} supertypes unresolved",
+                n("supertypes_unresolved")
             );
         }
     }
@@ -639,14 +685,23 @@ impl rb_indexer::FactsCache for StoreCache<'_, '_> {
 }
 
 /// What a snapshot was built with; `scip` (`on`, `off`, `unavailable`) because a run without
-/// indexers is a different graph, whether they were turned off or Docker was missing.
-fn tool_versions(scip: &rb_indexer::ScipMode) -> Value {
-    json!({
+/// indexers is a different graph, whether they were turned off or Docker was missing, and with
+/// `on` the identity of each indexer image (its ID, or `absent`; contract M3b amendment 29),
+/// since a graph indexed without an image is heuristic and a rebuilt image may index differently.
+fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value {
+    let mut tools = json!({
         "rb": env!("CARGO_PKG_VERSION"),
         "pipeline": rb_indexer::PIPELINE,
         "schema": rb_store::schema_version(),
         "scip": scip.as_str(),
-    })
+    });
+    if *scip == rb_indexer::ScipMode::On {
+        tools["scip_java"] = images.identity(rb_scip::jobs::Indexer::ScipJava).into();
+        tools["scip_typescript"] = images
+            .identity(rb_scip::jobs::Indexer::ScipTypescript)
+            .into();
+    }
+    tools
 }
 
 /// Text rendering of the Service Card's structure sections (design §9.5).
@@ -706,7 +761,7 @@ fn render_card(c: &ServiceCard) -> String {
             out += &format!("│    {p}\n");
         }
     }
-    out += "└─ APIs, tables and call graph: not indexed yet (M2–M4)\n";
+    out += "└─ Endpoints and request paths: not indexed yet (M4)\n";
     out
 }
 
@@ -861,6 +916,58 @@ mod tests {
             );
         }
         assert!(Cli::try_parse_from(["rb", "find", "x", "--limit", "1000"]).is_ok());
+    }
+
+    /// Contract M3b amendment 41: an all-SCIP repository has no heuristic site, so the line
+    /// says so instead of rendering 0/0 as 100%.
+    #[test]
+    fn code_line_without_heuristic_sites() {
+        let none = rb_store::ResolutionCoverage {
+            resolved: 0,
+            ambiguous: 0,
+            unresolved: 0,
+            external: 1220,
+            exact_calls: 256,
+        };
+        assert_eq!(
+            code_line(&none),
+            "code: no heuristic references to own code (1220 external); 256 exact calls (scip)"
+        );
+        let some = rb_store::ResolutionCoverage {
+            resolved: 3,
+            ambiguous: 1,
+            unresolved: 1,
+            external: 2,
+            exact_calls: 0,
+        };
+        assert_eq!(
+            code_line(&some),
+            "code: 80.0% of references to own code resolved (3 resolved, 1 ambiguous, 1 unresolved; 2 external); 0 exact calls (scip)"
+        );
+    }
+
+    /// Contract M3b amendments 29 and 31: the image identities are recorded only when SCIP is
+    /// on; a timeout prints its phase and budget.
+    #[test]
+    fn tool_versions_record_image_identities_when_scip_is_on() {
+        let images = rb_scip::Images {
+            java: Err("absent".into()),
+            typescript: Some("sha256:abc".into()),
+        };
+        let on = tool_versions(&rb_indexer::ScipMode::On, &images);
+        assert_eq!(on["scip"], "on");
+        assert_eq!(on["scip_java"], "absent");
+        assert_eq!(on["scip_typescript"], "sha256:abc");
+        assert_eq!(on["pipeline"], rb_indexer::PIPELINE);
+        let off = tool_versions(&rb_indexer::ScipMode::Off, &rb_scip::Images::unresolved());
+        assert_eq!(off["scip"], "off");
+        assert!(off.get("scip_java").is_none() && off.get("scip_typescript").is_none());
+        let unavailable = tool_versions(
+            &rb_indexer::ScipMode::Unavailable("no docker".into()),
+            &rb_scip::Images::unresolved(),
+        );
+        assert!(unavailable.get("scip_java").is_none());
+        assert_eq!(timeout_detail("fetch", 600), " (fetch phase, 600 s budget)");
     }
 
     #[test]

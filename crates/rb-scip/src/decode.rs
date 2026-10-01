@@ -10,11 +10,9 @@ use rb_model::Span;
 use scip::types::{PositionEncoding, occurrence};
 use serde::{Deserialize, Serialize};
 
-/// `SymbolRole` bits (scip.proto).
+/// The `SymbolRole` bit the join reads (scip.proto); the others (import, write, read) are kept
+/// in `Occurrence::roles` but have no reader.
 pub const ROLE_DEFINITION: i32 = 1;
-pub const ROLE_IMPORT: i32 = 2;
-pub const ROLE_WRITE: i32 = 4;
-pub const ROLE_READ: i32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ScipIndex {
@@ -23,8 +21,6 @@ pub struct ScipIndex {
     pub tool: String,
     /// One entry per distinct relative path, sorted.
     pub documents: Vec<Document>,
-    /// Symbols defined outside the index (never definitions here).
-    pub external_symbols: Vec<SymbolInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -34,10 +30,8 @@ pub struct Document {
     pub language: String,
     pub occurrences: Vec<Occurrence>,
     pub symbols: Vec<SymbolInfo>,
-    /// Columns were converted from UTF-16 code units because the index said nothing else. Wrong
-    /// only if the indexer meant something else, which the two supported ones do not.
-    pub encoding_assumed: bool,
     /// Occurrences whose columns could not be converted (no source text): kept as code units.
+    /// Both supported indexers leave the encoding unset and mean UTF-16, which is assumed then.
     pub unconverted: usize,
 }
 
@@ -57,9 +51,6 @@ impl Occurrence {
     pub fn is_definition(&self) -> bool {
         self.roles & ROLE_DEFINITION != 0
     }
-    pub fn is_import(&self) -> bool {
-        self.roles & ROLE_IMPORT != 0
-    }
 }
 
 /// Ordered by symbol first: the order of a document's symbols after decoding.
@@ -68,17 +59,16 @@ pub struct SymbolInfo {
     pub symbol: String,
     /// `SymbolInformation.Kind` by name (`Class`, `Method`, …); empty when unspecified.
     pub kind: String,
-    pub display_name: String,
     pub relationships: Vec<Relationship>,
 }
 
+/// The two relationship flags the join and its diagnostics read; `is_type_definition` and
+/// `is_definition` have no reader and are not decoded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct Relationship {
     pub symbol: String,
     pub is_implementation: bool,
     pub is_reference: bool,
-    pub is_type_definition: bool,
-    pub is_definition: bool,
 }
 
 /// Decodes `bytes`. `source_of(path)` supplies a document's text (for converting columns to
@@ -100,11 +90,11 @@ pub fn decode(
     for doc in &index.documents {
         let path = normalise(&doc.relative_path);
         let encoding = doc.position_encoding.enum_value_or_default();
-        let (units_per, assumed) = match encoding {
-            PositionEncoding::UTF8CodeUnitOffsetFromLineStart => (Units::Bytes, false),
-            PositionEncoding::UTF16CodeUnitOffsetFromLineStart => (Units::Utf16, false),
-            PositionEncoding::UTF32CodeUnitOffsetFromLineStart => (Units::Chars, false),
-            PositionEncoding::UnspecifiedPositionEncoding => (Units::Utf16, true),
+        let units_per = match encoding {
+            PositionEncoding::UTF8CodeUnitOffsetFromLineStart => Units::Bytes,
+            PositionEncoding::UTF32CodeUnitOffsetFromLineStart => Units::Chars,
+            PositionEncoding::UTF16CodeUnitOffsetFromLineStart
+            | PositionEncoding::UnspecifiedPositionEncoding => Units::Utf16,
         };
         let text: Option<Vec<u8>> = if doc.text.is_empty() {
             source_of(&path)
@@ -152,7 +142,6 @@ pub fn decode(
             document: Document {
                 path,
                 language: doc.language.clone(),
-                encoding_assumed: assumed,
                 ..Document::default()
             },
             occurrences: BTreeSet::new(),
@@ -177,7 +166,6 @@ pub fn decode(
             .map(|t| format!("{} {}", t.name, t.version))
             .unwrap_or_default(),
         documents,
-        external_symbols: index.external_symbols.iter().map(symbol_info).collect(),
     })
 }
 
@@ -259,7 +247,6 @@ fn symbol_info(s: &scip::types::SymbolInformation) -> SymbolInfo {
         } else {
             kind
         },
-        display_name: s.display_name.clone(),
         relationships: s
             .relationships
             .iter()
@@ -267,8 +254,6 @@ fn symbol_info(s: &scip::types::SymbolInformation) -> SymbolInfo {
                 symbol: r.symbol.clone(),
                 is_implementation: r.is_implementation,
                 is_reference: r.is_reference,
-                is_type_definition: r.is_type_definition,
-                is_definition: r.is_definition,
             })
             .collect(),
     }
@@ -325,7 +310,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let mut raw3 = occ("local 1", ROLE_READ);
+        let mut raw3 = occ("local 1", 8);
         raw3.range = vec![1, 0, 2];
         let mut raw4 = occ("scip-typescript npm p 1.0.0 `a.ts`/f().", 0);
         raw4.range = vec![0, 3, 1, 1];
@@ -359,7 +344,6 @@ mod tests {
         assert_eq!(got.documents.len(), 1);
         let d = &got.documents[0];
         assert_eq!(d.path, "src/a.ts");
-        assert!(d.encoding_assumed);
         assert_eq!(d.unconverted, 0);
         let spans: Vec<(String, Span, Option<Span>)> = d
             .occurrences
@@ -435,6 +419,7 @@ mod tests {
                 symbols: vec![si.clone()],
                 ..Default::default()
             }],
+            // Externally defined symbols are read from occurrences, never from here.
             external_symbols: vec![SymbolInformation {
                 symbol: "scip-java maven jdk 17 java/lang/Object#".into(),
                 ..Default::default()
@@ -443,14 +428,9 @@ mod tests {
         };
         let got = decode(&encode(&index), &|_| None).unwrap();
         let s = &got.documents[0].symbols[0];
-        assert_eq!((s.kind.as_str(), s.display_name.as_str()), ("Class", "Dog"));
+        assert_eq!(s.kind, "Class");
         assert_eq!(s.relationships[0].symbol, "scip-java maven . . p/Animal#");
-        assert!(s.relationships[0].is_implementation);
-        assert_eq!(got.external_symbols[0].kind, "");
-        assert_eq!(
-            got.external_symbols[0].symbol,
-            "scip-java maven jdk 17 java/lang/Object#"
-        );
+        assert!(s.relationships[0].is_implementation && !s.relationships[0].is_reference);
     }
 
     /// Merging duplicate documents must not compare every occurrence with every other one:

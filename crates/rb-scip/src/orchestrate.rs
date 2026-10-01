@@ -13,11 +13,36 @@ pub enum RunStatus {
     Ok,
     /// The fetch or index phase failed; `stderr_tail` says why.
     Failed,
-    Timeout,
+    /// A phase ran over its budget (contract M3b amendment 31). Not cached: the budget is not
+    /// part of the cache key.
+    Timeout {
+        phase: Phase,
+        budget_secs: u64,
+    },
     /// No indexer can run for this job on this host; the reason is user-facing.
     Unsupported(String),
     /// The job was not attempted (SCIP disabled, or Docker unavailable); the reason is user-facing.
     Skipped(String),
+    /// The container runtime failed rather than the project's build (the `docker` client could
+    /// not start, or exited 125, 126 or 127: daemon error, command not invokable or not found;
+    /// contract M3b amendment 30). Not cached; the reason is the stderr tail.
+    Environment(String),
+}
+
+/// The two container phases of a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Fetch,
+    Index,
+}
+
+impl Phase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Fetch => "fetch",
+            Phase::Index => "index",
+        }
+    }
 }
 
 impl RunStatus {
@@ -26,27 +51,41 @@ impl RunStatus {
         match self {
             RunStatus::Ok => "ok",
             RunStatus::Failed => "failed",
-            RunStatus::Timeout => "timeout",
+            RunStatus::Timeout { .. } => "timeout",
             RunStatus::Unsupported(_) => "unsupported",
             RunStatus::Skipped(_) => "skipped",
+            RunStatus::Environment(_) => "environment",
         }
     }
 
-    /// The status a cache row recorded (`ok`, `failed` or `timeout`; anything else is `failed`,
-    /// since only finished runs are cached).
-    pub fn from_cached(status: &str) -> RunStatus {
+    /// Whether this outcome is written to the index cache: only a finished run of the project's
+    /// own build (`ok` or `failed`). A timeout depends on the budget, and an unsupported or
+    /// environment outcome on the host, so they are decided again on the next run.
+    pub fn is_cacheable(&self) -> bool {
+        matches!(self, RunStatus::Ok | RunStatus::Failed)
+    }
+
+    /// The status a cache row recorded: `ok` or `failed`. `None` for any other value (a
+    /// `timeout` written by an older binary), which the caller treats as a miss.
+    pub fn from_cached(status: &str) -> Option<RunStatus> {
         match status {
-            "ok" => RunStatus::Ok,
-            "timeout" => RunStatus::Timeout,
-            _ => RunStatus::Failed,
+            "ok" => Some(RunStatus::Ok),
+            "failed" => Some(RunStatus::Failed),
+            _ => None,
         }
     }
 
-    /// Why the job did not run, for `unsupported` and `skipped`.
-    pub fn reason(&self) -> Option<&str> {
+    /// Why the job did not finish, for every status but `ok` and `failed`.
+    pub fn reason(&self) -> Option<String> {
         match self {
-            RunStatus::Unsupported(r) | RunStatus::Skipped(r) => Some(r),
-            _ => None,
+            RunStatus::Unsupported(r) | RunStatus::Skipped(r) | RunStatus::Environment(r) => {
+                Some(r.clone())
+            }
+            RunStatus::Timeout { phase, budget_secs } => Some(format!(
+                "{} phase over its {budget_secs} s budget",
+                phase.as_str()
+            )),
+            RunStatus::Ok | RunStatus::Failed => None,
         }
     }
 }
@@ -87,23 +126,64 @@ pub fn image_for(job: &Job) -> &'static str {
     }
 }
 
-/// The image `job` runs in and its index is cached under: the digest reference itself for a
-/// pinned image, the image ID for the locally built scip-java one. `Err` is the user-facing
-/// reason the job is `unsupported`: the local image is absent, and nothing builds it implicitly.
-pub fn resolve_image(job: &Job, runner: &dyn Runner) -> Result<String, String> {
-    let image = image_for(job);
-    match job.indexer {
-        Indexer::ScipTypescript => Ok(image.to_owned()),
-        Indexer::ScipJava => runner.image_id(image).ok_or_else(|| {
-            format!(
-                "scip-java: image {image} is not available locally; build it as \
-                 docker/scip-java/README.md describes"
-            )
-        }),
+/// The indexer images on this host, looked up once per `rb index` through
+/// [`Runner::image_id`] (contract M3b amendment 29): what each job runs in and caches under,
+/// and the identity a snapshot's `tool_versions` records, so a graph indexed without an image
+/// is not "up to date" once the image exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Images {
+    /// scip-java: the local image's ID (it has no registry digest), or the user-facing reason
+    /// its jobs are `unsupported`: the image is absent, and nothing builds it implicitly.
+    pub java: Result<String, String>,
+    /// scip-typescript: the pinned image's ID when it is present. Its jobs run by and cache
+    /// under the digest reference either way (Docker pulls it when absent).
+    pub typescript: Option<String>,
+}
+
+impl Images {
+    pub fn resolve(runner: &dyn Runner) -> Images {
+        Images {
+            java: runner.image_id(SCIP_JAVA_IMAGE).ok_or_else(|| {
+                format!(
+                    "scip-java: image {SCIP_JAVA_IMAGE} is not available locally; build it as \
+                     docker/scip-java/README.md describes"
+                )
+            }),
+            typescript: runner.image_id(SCIP_TYPESCRIPT_IMAGE),
+        }
+    }
+
+    /// No lookup was made (SCIP off, Docker unavailable): nothing is known to be present.
+    pub fn unresolved() -> Images {
+        Images {
+            java: Err(format!(
+                "scip-java: image {SCIP_JAVA_IMAGE} was not looked up"
+            )),
+            typescript: None,
+        }
+    }
+
+    /// The image `job` runs in and its index is cached under: the digest reference itself for
+    /// a pinned image, the image ID for the locally built scip-java one. `Err` is the reason
+    /// the job is `unsupported`.
+    pub fn for_job(&self, job: &Job) -> Result<String, String> {
+        match job.indexer {
+            Indexer::ScipTypescript => Ok(SCIP_TYPESCRIPT_IMAGE.to_owned()),
+            Indexer::ScipJava => self.java.clone(),
+        }
+    }
+
+    /// The identity recorded per indexer: the image ID, or `absent`.
+    pub fn identity(&self, indexer: Indexer) -> &str {
+        let id = match indexer {
+            Indexer::ScipJava => self.java.as_deref().ok(),
+            Indexer::ScipTypescript => self.typescript.as_deref(),
+        };
+        id.unwrap_or("absent")
     }
 }
 
-/// Runs `job` in `image` (from [`resolve_image`]) over `files` (`(root-relative path, bytes)`)
+/// Runs `job` in `image` (from [`Images::for_job`]) over `files` (`(root-relative path, bytes)`)
 /// with `cache_dir` holding package-manager caches shared across jobs. `work_dir` names the
 /// job (the caller names it after the job's input hash); this run's export lives next to it in
 /// a directory of its own, `<work_dir>-<pid>-<nanos>` (created, removed afterwards), and its
@@ -120,7 +200,7 @@ pub fn run_job(
     runner: &dyn Runner,
 ) -> anyhow::Result<ScipRun> {
     let started = std::time::Instant::now();
-    if let Fetch::Gradle { .. } = job.fetch {
+    if job.fetch == Fetch::Gradle {
         // Only the Maven path is verified (contract M3b amendment 8); Gradle is M6.
         return Ok(ScipRun {
             status: RunStatus::Unsupported("scip-java Gradle builds are not verified yet".into()),
@@ -154,27 +234,73 @@ pub fn run_job(
         }
         index.name = Some(format!("{name}-index"));
         for fetch in &fetches {
-            let outcome = runner.run(fetch)?;
+            let outcome = match runner.run(fetch) {
+                Ok(outcome) => outcome,
+                Err(e) => return Ok(environment(format!("{e:#}"), started)),
+            };
             if !outcome.ok() {
-                return Ok(finished(&outcome, None, started));
+                return Ok(finished(&outcome, None, Phase::Fetch, fetch, started));
             }
         }
-        let outcome = runner.run(&index)?;
+        let outcome = match runner.run(&index) {
+            Ok(outcome) => outcome,
+            Err(e) => return Ok(environment(format!("{e:#}"), started)),
+        };
         let index_bytes = if outcome.ok() {
             std::fs::read(work_dir.join("index.scip")).ok()
         } else {
             None
         };
-        Ok(finished(&outcome, index_bytes, started))
+        Ok(finished(
+            &outcome,
+            index_bytes,
+            Phase::Index,
+            &index,
+            started,
+        ))
     })();
     let _ = std::fs::remove_dir_all(work_dir);
     result
 }
 
-fn finished(outcome: &Outcome, index: Option<Vec<u8>>, started: std::time::Instant) -> ScipRun {
-    let status = if outcome.timed_out {
-        RunStatus::Timeout
-    } else if outcome.ok() && index.is_some() {
+/// Exit codes the `docker` client reserves for its own failures (the daemon refused the run,
+/// the command could not be invoked, the command was not found).
+const DOCKER_CLIENT_EXIT_CODES: [i32; 3] = [125, 126, 127];
+
+fn environment(reason: String, started: std::time::Instant) -> ScipRun {
+    ScipRun {
+        status: RunStatus::Environment(reason.trim().to_owned()),
+        index: None,
+        stderr_tail: String::new(),
+        elapsed: started.elapsed(),
+    }
+}
+
+fn finished(
+    outcome: &Outcome,
+    index: Option<Vec<u8>>,
+    phase: Phase,
+    run: &ContainerRun,
+    started: std::time::Instant,
+) -> ScipRun {
+    if outcome.timed_out {
+        return ScipRun {
+            status: RunStatus::Timeout {
+                phase,
+                budget_secs: run.timeout.as_secs(),
+            },
+            index: None,
+            stderr_tail: outcome.stderr_tail.trim().to_owned(),
+            elapsed: started.elapsed(),
+        };
+    }
+    if outcome
+        .exit_code
+        .is_some_and(|code| DOCKER_CLIENT_EXIT_CODES.contains(&code))
+    {
+        return environment(outcome.stderr_tail.clone(), started);
+    }
+    let status = if outcome.ok() && index.is_some() {
         RunStatus::Ok
     } else {
         RunStatus::Failed
@@ -219,7 +345,14 @@ fn typescript_runs(
         entrypoint: None,
         args: Vec::new(),
     };
-    let quiet = ["--no-audit", "--no-fund", "--loglevel=error"];
+    // Type indexing needs no lifecycle scripts, and the fetch phase runs the project's own code
+    // otherwise (contract M3b amendment 27).
+    let quiet = [
+        "--no-audit",
+        "--no-fund",
+        "--loglevel=error",
+        "--ignore-scripts",
+    ];
     let (entrypoint, args): (&str, Vec<String>) = match job.fetch {
         Fetch::Npm {
             lockfile: NodeLock::PackageLock,
@@ -231,15 +364,22 @@ fn typescript_runs(
             lockfile: NodeLock::Yarn,
         } => (
             "yarn",
-            ["install", "--frozen-lockfile", "--non-interactive"]
-                .map(String::from)
-                .to_vec(),
+            [
+                "install",
+                "--frozen-lockfile",
+                "--non-interactive",
+                "--ignore-scripts",
+            ]
+            .map(String::from)
+            .to_vec(),
         ),
         Fetch::Npm {
             lockfile: NodeLock::Pnpm,
         } => (
             "pnpm",
-            ["install", "--frozen-lockfile"].map(String::from).to_vec(),
+            ["install", "--frozen-lockfile", "--ignore-scripts"]
+                .map(String::from)
+                .to_vec(),
         ),
         Fetch::Npm {
             lockfile: NodeLock::None,
@@ -247,7 +387,7 @@ fn typescript_runs(
             "/usr/local/bin/actual-npm",
             once("install").chain(quiet).map(String::from).collect(),
         ),
-        Fetch::Maven { .. } | Fetch::Gradle { .. } => {
+        Fetch::Maven | Fetch::Gradle => {
             anyhow::bail!("a Java fetch on a TypeScript job")
         }
     };
@@ -256,9 +396,11 @@ fn typescript_runs(
         args,
         ..base.clone()
     };
-    let mut index_args: Vec<String> = ["index", "--output", "index.scip", "--no-progress-bar"]
-        .map(String::from)
-        .to_vec();
+    // Projects follow `--`, so a directory named like an option (`--help`) is a project.
+    let mut index_args: Vec<String> =
+        ["index", "--output", "index.scip", "--no-progress-bar", "--"]
+            .map(String::from)
+            .to_vec();
     index_args.extend(job.projects.iter().cloned());
     let index = ContainerRun {
         network: Network::None,
@@ -275,9 +417,9 @@ fn typescript_runs(
 /// index phase can run the same build with `--offline` under `--network none`. Arguments after
 /// `--` replace scip-java's default Maven arguments, so they are repeated plus `--offline`.
 /// Maven logs to stdout by default; `MAVEN_OPTS` moves its logger to stderr so a failed build's
-/// `[ERROR]` lines reach the stderr tail. scip-java prefers a repository's own `./mvnw` when it
-/// is executable, which would download Maven; exported files are never executable, so the
-/// image's `mvn` is always the one used.
+/// `[ERROR]` lines reach the stderr tail. scip-java prefers a repository's own `./mvnw` when
+/// `access(X_OK)` says it is executable, which Docker Desktop's mounts say of every file, so
+/// [`export`] leaves the wrapper out and the image's `mvn` is always the one used.
 fn java_runs(
     image: &str,
     work_dir: &Path,
@@ -343,8 +485,12 @@ fn once(s: &str) -> std::iter::Once<&str> {
     std::iter::once(s)
 }
 
+/// Build wrappers scip-java would run instead of the image's tools when they sit in the build
+/// root (contract M3b amendment 25); they download a build tool and are not exported.
+const BUILD_WRAPPERS: [&str; 4] = ["mvnw", "mvnw.cmd", "gradlew", "gradlew.bat"];
+
 /// Writes `files` under `dir`, which is recreated empty first. Paths never escape `dir`. Files
-/// are written with default permissions, never executable.
+/// are written with default permissions; the build wrappers at the root are skipped.
 fn export(files: &[(String, Vec<u8>)], dir: &Path) -> anyhow::Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
@@ -355,6 +501,9 @@ fn export(files: &[(String, Vec<u8>)], dir: &Path) -> anyhow::Result<()> {
             !path.split('/').any(|p| p == ".." || p.is_empty()) && !path.starts_with('/'),
             "unsafe path in export: {path}"
         );
+        if BUILD_WRAPPERS.contains(&path.as_str()) {
+            continue;
+        }
         let dest: PathBuf = dir.join(path);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -373,12 +522,14 @@ mod tests {
     const JAVA_ID: &str = "sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2";
 
     /// Records runs; the index phase (the one without network) writes a fake `index.scip`
-    /// unless told to fail. Knows the scip-java image when `java_image` is set.
+    /// unless told to fail. Knows the scip-java image when `java_image` is set. `fetch_outcome`
+    /// replaces the fetch phase's outcome (a runtime failure, a timeout) when set.
     struct Fake {
         runs: RefCell<Vec<ContainerRun>>,
         fail_fetch: bool,
         fail_index: bool,
         java_image: bool,
+        fetch_outcome: Option<anyhow::Result<Outcome>>,
     }
 
     impl Fake {
@@ -388,6 +539,7 @@ mod tests {
                 fail_fetch,
                 fail_index,
                 java_image: true,
+                fetch_outcome: None,
             }
         }
     }
@@ -396,6 +548,12 @@ mod tests {
         fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
             self.runs.borrow_mut().push(run.clone());
             let is_index = run.network == Network::None;
+            if !is_index && let Some(outcome) = &self.fetch_outcome {
+                return match outcome {
+                    Ok(o) => Ok(o.clone()),
+                    Err(e) => Err(anyhow::anyhow!("{e}")),
+                };
+            }
             let fail = if is_index {
                 self.fail_index
             } else {
@@ -451,11 +609,18 @@ mod tests {
         let cache = tmp.path().join("cache");
         let fake = Fake::new(false, false);
         let job = ts_job(NodeLock::PackageLock);
-        let image = resolve_image(&job, &fake).unwrap();
+        let images = Images::resolve(&fake);
+        let image = images.for_job(&job).unwrap();
         assert_eq!(
             image, SCIP_TYPESCRIPT_IMAGE,
             "a pinned image is its own key"
         );
+        assert_eq!(
+            images.identity(Indexer::ScipTypescript),
+            "absent",
+            "the fake has no scip-typescript image"
+        );
+        assert_eq!(images.identity(Indexer::ScipJava), JAVA_ID);
         let run = run_job(
             &job,
             &image,
@@ -489,6 +654,8 @@ mod tests {
         );
         assert_eq!(runs[0].args[0], "ci");
         assert_eq!(runs[1].network, Network::None);
+        // Contract M3b amendment 36: a project directory named like an option (`--help`) is
+        // not taken for one.
         assert_eq!(
             runs[1].args,
             [
@@ -496,6 +663,7 @@ mod tests {
                 "--output",
                 "index.scip",
                 "--no-progress-bar",
+                "--",
                 ".",
                 "sub"
             ]
@@ -554,8 +722,8 @@ mod tests {
         let work = tmp.path().join("work");
         let cache = tmp.path().join("cache");
         let fake = Fake::new(false, false);
-        let job = java_job(Fetch::Maven { wrapper: false });
-        let image = resolve_image(&job, &fake).unwrap();
+        let job = java_job(Fetch::Maven);
+        let image = Images::resolve(&fake).for_job(&job).unwrap();
         assert_eq!(image, JAVA_ID);
         let budget = Budget {
             cpus: 3.0,
@@ -709,7 +877,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fake = Fake::new(true, false);
         let run = run_job(
-            &java_job(Fetch::Maven { wrapper: true }),
+            &java_job(Fetch::Maven),
             JAVA_ID,
             &files(),
             &tmp.path().join("w"),
@@ -732,7 +900,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fake = Fake::new(false, false);
         let run = run_job(
-            &java_job(Fetch::Gradle { wrapper: true }),
+            &java_job(Fetch::Gradle),
             JAVA_ID,
             &files(),
             &tmp.path().join("w"),
@@ -752,19 +920,176 @@ mod tests {
             java_image: false,
             ..Fake::new(false, false)
         };
-        let reason =
-            resolve_image(&java_job(Fetch::Maven { wrapper: false }), &no_image).unwrap_err();
+        let images = Images::resolve(&no_image);
+        let reason = images.for_job(&java_job(Fetch::Maven)).unwrap_err();
         assert!(
             reason.contains("rb-scip-java:0.13.1") && reason.contains("docker/scip-java/README.md"),
             "{reason}"
         );
+        assert_eq!(images.identity(Indexer::ScipJava), "absent");
         assert_eq!(
-            resolve_image(&ts_job(NodeLock::None), &no_image).as_deref(),
+            images.for_job(&ts_job(NodeLock::None)).as_deref(),
             Ok(SCIP_TYPESCRIPT_IMAGE),
-            "a pinned image needs no lookup"
+            "a pinned image runs by its digest reference whether or not it is present"
         );
 
         let bad = vec![("../escape".to_owned(), b"x".to_vec())];
         assert!(export(&bad, &tmp.path().join("e")).is_err());
+    }
+
+    /// Contract M3b amendment 25: a repository's Maven or Gradle wrapper at the build root is
+    /// not exported, so scip-java can only use the image's `mvn`; the same names deeper in the
+    /// tree are ordinary files.
+    #[test]
+    fn export_skips_the_build_wrappers_at_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files: Vec<(String, Vec<u8>)> = [
+            "pom.xml",
+            "mvnw",
+            "mvnw.cmd",
+            "gradlew",
+            "gradlew.bat",
+            "src/Main.java",
+            "sub/mvnw",
+            ".mvn/wrapper/maven-wrapper.properties",
+        ]
+        .map(|p| (p.to_owned(), b"x".to_vec()))
+        .to_vec();
+        let dir = tmp.path().join("e");
+        export(&files, &dir).unwrap();
+        let mut written: Vec<String> = walkdir(&dir)
+            .into_iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned())
+            .collect();
+        written.sort();
+        assert_eq!(
+            written,
+            [
+                ".mvn/wrapper/maven-wrapper.properties",
+                "pom.xml",
+                "src/Main.java",
+                "sub/mvnw"
+            ]
+        );
+    }
+
+    fn walkdir(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(walkdir(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// Contract M3b amendment 27: the fetch phase installs packages without their lifecycle
+    /// scripts, for every lockfile kind.
+    #[test]
+    fn npm_fetches_run_without_lifecycle_scripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (lockfile, entrypoint, first) in [
+            (NodeLock::PackageLock, "/usr/local/bin/actual-npm", "ci"),
+            (NodeLock::None, "/usr/local/bin/actual-npm", "install"),
+            (NodeLock::Yarn, "yarn", "install"),
+            (NodeLock::Pnpm, "pnpm", "install"),
+        ] {
+            let fake = Fake::new(false, false);
+            run_job(
+                &ts_job(lockfile),
+                SCIP_TYPESCRIPT_IMAGE,
+                &files(),
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &fake,
+            )
+            .unwrap();
+            let runs = fake.runs.borrow();
+            let fetch = &runs[0];
+            assert_eq!(
+                fetch.entrypoint.as_deref(),
+                Some(entrypoint),
+                "{lockfile:?}"
+            );
+            assert_eq!(fetch.args[0], first, "{lockfile:?}");
+            assert!(
+                fetch.args.iter().any(|a| a == "--ignore-scripts"),
+                "{lockfile:?}: {:?}",
+                fetch.args
+            );
+        }
+    }
+
+    /// Contract M3b amendments 30 and 31: a `docker run` that the client or daemon refused
+    /// (exit 125/126/127), or a client that could not start, is an `environment` outcome with
+    /// the stderr tail as its reason; a phase over its budget is a `timeout` that names the
+    /// phase and the budget. Neither is the project's fault (the caller does not cache them).
+    #[test]
+    fn runtime_failures_are_environment_and_timeouts_name_their_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = |exit_code: Option<i32>, timed_out: bool, stderr: &str| Outcome {
+            exit_code,
+            timed_out,
+            stderr_tail: stderr.into(),
+            elapsed: Duration::from_millis(1),
+        };
+        let run_with = |fetch_outcome: anyhow::Result<Outcome>| {
+            let fake = Fake {
+                fetch_outcome: Some(fetch_outcome),
+                ..Fake::new(false, false)
+            };
+            let budget = Budget {
+                fetch_timeout: Duration::from_secs(7),
+                ..Budget::default()
+            };
+            let run = run_job(
+                &ts_job(NodeLock::PackageLock),
+                SCIP_TYPESCRIPT_IMAGE,
+                &files(),
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &budget,
+                &fake,
+            )
+            .unwrap();
+            assert_eq!(fake.runs.borrow().len(), 1, "nothing runs after the fetch");
+            run.status
+        };
+        for code in [125, 126, 127] {
+            assert_eq!(
+                run_with(Ok(outcome(Some(code), false, "shim: docker run refused"))),
+                RunStatus::Environment("shim: docker run refused".into()),
+                "exit {code}"
+            );
+        }
+        assert_eq!(
+            run_with(Err(anyhow::anyhow!("starting docker: No such file"))),
+            RunStatus::Environment("starting docker: No such file".into())
+        );
+        assert_eq!(
+            run_with(Ok(outcome(None, true, ""))),
+            RunStatus::Timeout {
+                phase: Phase::Fetch,
+                budget_secs: 7
+            }
+        );
+        // A build that fails with any other code is the project's (cached by the caller).
+        assert_eq!(
+            run_with(Ok(outcome(Some(1), false, "[ERROR] boom"))),
+            RunStatus::Failed
+        );
+        assert_eq!(
+            RunStatus::Timeout {
+                phase: Phase::Index,
+                budget_secs: 900
+            }
+            .reason()
+            .as_deref(),
+            Some("index phase over its 900 s budget")
+        );
     }
 }

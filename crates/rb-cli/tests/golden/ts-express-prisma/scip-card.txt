@@ -10,4 +10,4 @@ auth-api  (path: ., deployable)
 │    unowned             0 files    0%
 ├─ Packages (1)
 │    npm/@prisma/client@5.22.0
-└─ APIs, tables and call graph: not indexed yet (M2–M4)
+└─ Endpoints and request paths: not indexed yet (M4)

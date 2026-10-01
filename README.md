@@ -3,16 +3,18 @@
 A deterministic, LLM-free code-intelligence graph for Git repositories. It is built with Rust, Postgres and Apache AGE.
 The design is in [docs/repository-brain-design.md](docs/repository-brain-design.md).
 
-**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax) and M2a (SQL core).** `rb` indexes a commit into a snapshot containing:
+**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution) and M3b (SCIP).** `rb` indexes a commit into a snapshot containing:
 
 - one `File` node per blob, with its blob SHA, size, language and binary/generated flags;
 - one `Service` per detected project (package.json, Maven, Gradle, go.mod / `package main`, Cargo, pyproject, Dockerfile, `rb.toml`), marked deployable or library;
 - `Owner` nodes from CODEOWNERS (GitHub semantics), with `OWNED_BY` edges that cite the deciding CODEOWNERS line;
 - `Symbol` nodes for the definitions Tree-sitter finds in TypeScript/TSX/JavaScript, Java, Python and Go files, with `DEFINED_IN` (pointing at the name) and `CONTAINS` edges. Parse results are cached per blob, so a re-index only parses changed files.
-- `Table` nodes from SQL parsed with the real Postgres parser. `MIGRATES` edges come from `.sql` files, and `QUERIES` edges come from SQL strings in code (exact when passed to a known database call).
-- `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests, syntax errors, oversized files).
+- `Table` nodes from SQL parsed with the real Postgres parser. `MIGRATES` edges come from `.sql` files, `QUERIES` edges from SQL strings in code (exact when passed to a known database call) and from ORM calls, and `MAPS_TO` edges from ORM entity mappings (JPA, Prisma, TypeORM, SQLAlchemy, Django).
+- `CALLS`, `REFERENCES` and `IMPLEMENTS` edges between symbols: exact (provenance `scip`) where a SCIP indexer ran for the project in a container, heuristic otherwise (resolved from imports, packages and typed bindings, never by bare name across the repository).
+- `Package` nodes and `DEPENDS_ON` edges from the external symbols a SCIP index names.
+- `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests, syntax errors, oversized files, unresolved references, one `scip_status` per build root).
 
-Each snapshot is stored relationally and projected into an AGE graph. ORM mappings, call edges and routes arrive in M2b–M4.
+Each snapshot is stored relationally and projected into an AGE graph. Routes and cross-service request paths arrive in M4.
 
 ## Quickstart
 
@@ -26,6 +28,8 @@ target/debug/rb dump > snapshot.jsonl  # canonical, id-independent dump
 target/debug/rb service                # list services; `rb service <dir|name>` shows a card
 target/debug/rb find login --kind symbol  # search nodes by key or name
 target/debug/rb table-deps users         # migrations and code touching a table
+target/debug/rb callers AuthService.login --depth 2   # what calls a function or method (Q1)
+target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2)
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
 ```
 
@@ -37,6 +41,24 @@ Run `rb` from the project root. AGE's CSV loaders only read files under the serv
 | `RB_AGE_LOAD_DIR` | `var/age-load` |
 
 If 55432 is taken, start the database on another port with `RB_DB_PORT=55433 docker compose up -d --wait` and point `RB_DATABASE_URL` at it.
+
+### SCIP indexers
+
+`rb index` runs a SCIP indexer in a container for every Maven project (`pom.xml`) and every npm, yarn or pnpm package with a `tsconfig.json`, and replaces that project's heuristic symbol keys and code edges with exact ones (design §5.2–§5.3, contract `tasks/contract-m3b.md`). It needs Docker and the two images:
+
+```sh
+docker build -t rb-scip-java:0.13.1 docker/scip-java      # slim local scip-java image (see docker/scip-java/README.md)
+docker pull --platform linux/amd64 sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845
+```
+
+Each job exports the project's files, runs a fetch phase on Docker's default bridge network (`mvn … go-offline` and the build, or `npm ci --ignore-scripts`; no credentials, no host toolchains), then indexes with `--network none`. Indexes are cached in the database by `(project input hash, image)`, so an unchanged project runs no container. Without Docker or an image the project stays heuristic and `rb status` says so (`scip: … skipped`/`unsupported`); the images' identities are part of the snapshot's tool configuration, so such a snapshot is rebuilt once they exist.
+
+| Flag | Meaning |
+|---|---|
+| `--no-scip` | run no indexer; every project is heuristic (a different tool configuration from a run with indexers) |
+| `--scip-work-dir <dir>` (`RB_SCIP_WORK_DIR`, default `var/scip`) | exports and package caches; must be a path the container runtime can bind-mount |
+| `--scip-timeout-secs <n>` | budget per phase (defaults 600 s fetch, 900 s index); a run over it is killed and reported as `timeout`, not cached |
+| `--no-cache` | also re-run every SCIP job and replace its cached outcome |
 
 ## Development
 
@@ -54,9 +76,12 @@ Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e
 | `crates/rb-git` | commit → manifest (gitoxide), CODEOWNERS, glob matcher, boundary detection |
 | `crates/rb-syntax` | Tree-sitter extraction (definitions, references, SQL candidates) and heuristic symbol keys |
 | `crates/rb-sql` | SQL statements → tables and operations (pg_query parse-tree walk) |
-| `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → snapshot graph + diagnostics |
+| `crates/rb-frameworks` | ORM packs: JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django |
+| `crates/rb-scip` | SCIP: project detection, container jobs (fetch + offline index), index cache key, `index.scip` decoding, symbol parsing |
+| `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → SCIP jobs (cached) → join → snapshot graph + diagnostics |
 | `crates/rb-store` | migrations, snapshot publish/retention, evidence, AGE projection, read-only Cypher, find/service queries |
 | `crates/rb-cli` | the `rb` binary |
+| `docker/scip-java/` | the slim scip-java image |
 | `migrations/` | SQL schema, embedded into the binary |
 | `fixtures/` | golden fixture repositories |
 | `crates/rb-cli/tests/golden/` | reviewed golden outputs (`RB_BLESS=1` rewrites them; review before committing) |

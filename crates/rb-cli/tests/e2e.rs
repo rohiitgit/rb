@@ -52,12 +52,44 @@ fn db_url() -> Option<Db> {
     Some(Db { url, _guard: guard })
 }
 
-/// Materialises `fixtures/<name>` as a git repository with a fixed identity and date.
+/// Materialises `fixtures/<name>` as a git repository with a fixed identity and date, from the
+/// files the workspace tracks (contract M3b amendment 40): an IDE's build output under a
+/// fixture, ignored by the workspace, would otherwise be committed into the fixture repository.
 fn fixture_repo(name: &str) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
-    copy_dir(&workspace_root().join("fixtures").join(name), tmp.path());
+    let from = workspace_root().join("fixtures").join(name);
+    for path in tracked_files(name) {
+        let target = tmp.path().join(&path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(from.join(&path), target).unwrap();
+    }
     commit_all(tmp.path());
     tmp
+}
+
+/// The fixture-relative paths `git ls-files` lists for `fixtures/<name>`.
+fn tracked_files(name: &str) -> Vec<String> {
+    let prefix = format!("fixtures/{name}/");
+    let out = Command::new("git")
+        .args(["ls-files", "-z", "--", prefix.trim_end_matches('/')])
+        .current_dir(workspace_root())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git ls-files failed for {name}");
+    let files: Vec<String> = out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            String::from_utf8(p.to_vec())
+                .unwrap()
+                .strip_prefix(&prefix)
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert!(!files.is_empty(), "no tracked files under {prefix}");
+    files
 }
 
 /// A repository built from inline `(path, contents)` pairs.
@@ -96,19 +128,6 @@ fn commit_all(dir: &Path) {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-    }
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            std::fs::create_dir_all(&target).unwrap();
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).unwrap();
-        }
     }
 }
 
@@ -189,6 +208,18 @@ fn check_fixture(fixture: &str, tag: &str) {
     );
     let graph = &indexed.graph;
     let node = |id: i64| graph.nodes().iter().find(|n| n.id == id).unwrap();
+
+    // The fixture commit holds the tracked files and nothing else (amendment 40).
+    let mut files: Vec<String> = graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::File)
+        .map(|n| n.key.clone())
+        .collect();
+    files.sort();
+    let mut tracked = tracked_files(fixture);
+    tracked.sort();
+    assert_eq!(files, tracked, "the fixture repository's files");
 
     // Invariant: every File has exactly one IN_SERVICE edge.
     for f in graph.nodes().iter().filter(|n| n.kind == NodeKind::File) {
@@ -707,6 +738,32 @@ fn scip_ts_express_prisma() {
     // already be served from it; the second run must be.
     let first = rb(&url, &["index", path, "--repo", &name]);
     assert!(first.contains("scip: . scip-typescript ok"), "{first}");
+    // Amendment 33 (S1): scip-typescript emits UTF-16 columns and no document text, so the
+    // decoder converts them with the blob. The call to `createSession` sits after a BMP and an
+    // astral character on its line; its exact edge must land on the byte span Tree-sitter
+    // reports for the call, which the join only matches when the conversion happened.
+    let auth_ts = std::fs::read_to_string(
+        workspace_root().join("fixtures/ts-express-prisma/src/routes/auth.ts"),
+    )
+    .unwrap();
+    let (line, text) = auth_ts
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("createSession(user.id)"))
+        .expect("the non-ASCII call line");
+    assert!(
+        text.contains("héllo 😀"),
+        "the fixture line lost its non-ASCII text: {text}"
+    );
+    let col = text.find("createSession(").unwrap() as i64;
+    let span = serde_json::json!([
+        line as i64,
+        col,
+        line as i64,
+        col + "createSession".len() as i64
+    ]);
+    let evidence = serde_json::json!(["src/routes/auth.ts", span]);
+    let create_session = "scip-typescript npm auth-api 1.0.0 src/db/`users.ts`/createSession().";
 
     // S6, S7: exact edges between SCIP keys, and no heuristic code edge in the project.
     golden(
@@ -731,6 +788,7 @@ fn scip_ts_express_prisma() {
     );
     let dump = rb(&url, &["dump", "--repo", &name]);
     let mut exact_calls = 0;
+    let mut non_ascii_call = false;
     for line in dump.lines() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
         let kind = row
@@ -745,9 +803,27 @@ fn scip_ts_express_prisma() {
                 "{line}"
             );
             exact_calls += usize::from(kind == "CALLS");
+            if kind == "CALLS"
+                && row[5] == create_session
+                && row
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .as_array()
+                    .is_some_and(|evs| evs.contains(&evidence))
+            {
+                non_ascii_call = true;
+            }
         }
     }
     assert!(exact_calls >= 2, "{dump}");
+    assert!(
+        non_ascii_call,
+        "no exact call into createSession() at {evidence} in {dump}"
+    );
+    let status = rb(&url, &["status", "--repo", &name]);
+    assert!(status.contains("unconverted 0"), "{status}");
     // S6: the SCIP key itself and the `path:line` form name the same symbol as the suffix; the
     // bare name still lists both `findUserByEmail` methods rather than picking one.
     let key = "scip-typescript npm auth-api 1.0.0 src/db/`users.ts`/findUserByEmail().";
@@ -797,36 +873,20 @@ fn scip_ts_express_prisma() {
         "{second}"
     );
     assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
-    // Amendment 20: `--no-cache` bypasses the index cache's reads, so the container runs again;
-    // its outcome replaces the row and gives the same graph. Only the `scip_status` diagnostic's
-    // `elapsed_ms` moves, since it is the (new) container run's time (amendment 2).
-    let third = rb(
-        &url,
-        &["index", path, "--repo", &name, "--force", "--no-cache"],
-    );
-    assert!(
-        third.contains("scip: . scip-typescript ok ") && !third.contains("(cached"),
-        "{third}"
-    );
-    assert_eq!(
-        mask_elapsed_ms(&rb(&url, &["dump", "--repo", &name])),
-        mask_elapsed_ms(&dump)
-    );
-}
-
-/// `dump` with every `"elapsed_ms":<n>` replaced by `"elapsed_ms":<elapsed>`.
-fn mask_elapsed_ms(dump: &str) -> String {
-    let key = "\"elapsed_ms\":";
-    let mut out = String::with_capacity(dump.len());
-    let mut rest = dump;
-    while let Some(at) = rest.find(key) {
-        let after = at + key.len();
-        out.push_str(&rest[..after]);
-        out.push_str("<elapsed>");
-        rest = rest[after..].trim_start_matches(|c: char| c.is_ascii_digit());
+    // Amendments 20 and 32 (S12): `--no-cache` bypasses the index cache's reads, so the
+    // container runs again and its outcome replaces the row; two fresh runs of one commit dump
+    // byte-identically, since no run time enters the graph.
+    for _ in 0..2 {
+        let fresh = rb(
+            &url,
+            &["index", path, "--repo", &name, "--force", "--no-cache"],
+        );
+        assert!(
+            fresh.contains("scip: . scip-typescript ok ") && !fresh.contains("(cached"),
+            "{fresh}"
+        );
+        assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
     }
-    out.push_str(rest);
-    out
 }
 
 /// Contract M3b amendment 17: whether SCIP ran is part of the snapshot's tool configuration.
@@ -868,30 +928,68 @@ fn scip_availability_is_part_of_the_tool_configuration() {
     }
 }
 
-/// The `code:` and `scip:` lines of `rb status`, with each job's run time masked: it is the
-/// container's (or the cached run's), not a function of the commit.
+/// The `code:` and `scip:` lines of `rb status`, as printed: nothing in them depends on the
+/// run (the container's time is printed by `rb index` only; amendment 32).
 fn scip_status_lines(url: &str, name: &str) -> String {
     let status = rb(url, &["status", "--repo", name]);
-    let masked: Vec<String> = status
+    let lines: Vec<&str> = status
         .lines()
         .filter(|l| {
             let l = l.trim_start();
             l.starts_with("code:") || l.starts_with("scip:")
         })
-        .map(|l| {
-            l.split(' ')
-                .map(|token| {
-                    let t = token.trim_end_matches(',');
-                    match t.strip_suffix('s') {
-                        Some(n) if n.parse::<f64>().is_ok() => token.replace(t, "<elapsed>"),
-                        _ => token.to_owned(),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
         .collect();
-    format!("{}\n", masked.join("\n"))
+    format!("{}\n", lines.join("\n"))
+}
+
+/// Contract M3b amendment 29: the indexer images' identities are part of the snapshot's tool
+/// configuration. With a `docker` shim on `PATH` whose `image inspect` fails (everything else
+/// reaches the real client), the Java fixture indexes with scip-java `unsupported` and a
+/// heuristic graph; the same commit with the real `docker` is not "up to date".
+#[test]
+fn scip_image_identity_is_part_of_the_tool_configuration() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let repo = fixture_repo("java-spring-jpa");
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipimg_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let inherited = std::env::var("PATH").unwrap();
+    let real_docker = inherited
+        .split(':')
+        .map(|dir| Path::new(dir).join("docker"))
+        .find(|p| p.is_file())
+        .expect("docker on PATH");
+    let shim_dir = tempfile::tempdir().unwrap();
+    let shim = shim_dir.path().join("docker");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n  echo 'shim: image inspect refused' >&2\n  exit 1\nfi\nexec '{}' \"$@\"\n",
+            real_docker.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let shimmed = format!("{}:{inherited}", shim_dir.path().display());
+    let absent = rb_with_path(&url, &["index", path, "--repo", &name], Some(&shimmed));
+    assert!(absent.contains("scip: . scip-java unsupported"), "{absent}");
+    let again = rb_with_path(&url, &["index", path, "--repo", &name], Some(&shimmed));
+    assert!(again.contains("up to date"), "{again}");
+    let present = rb(&url, &["index", path, "--repo", &name]);
+    assert!(
+        !present.contains("up to date") && present.contains("scip: . scip-java ok"),
+        "{present}"
+    );
 }
 
 /// Docker answering and the local scip-java image built (docker/scip-java/README.md); the
@@ -1055,6 +1153,22 @@ fn scip_java_spring_jpa() {
     );
     assert!(second.contains("scip: . scip-java ok (cached"), "{second}");
     assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    // Amendment 34: the container runs again on `--no-cache` (a broken runner cannot pass this
+    // test from the cache) and the fresh index gives the same graph.
+    let started = std::time::Instant::now();
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    eprintln!(
+        "scip_java_spring_jpa: fresh index {:.1?}",
+        started.elapsed()
+    );
+    assert!(
+        fresh.contains("scip: . scip-java ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
 }
 
 /// Contract M3b S10 and invariant 4: a monorepo mixing a Maven project that indexes, one that
@@ -1148,4 +1262,62 @@ fn scip_polyglot_monorepo() {
         "{second}"
     );
     assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    // Amendment 34: every job runs again on `--no-cache`, and the graph is the same.
+    let started = std::time::Instant::now();
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    eprintln!(
+        "scip_polyglot_monorepo: fresh index {:.1?}",
+        started.elapsed()
+    );
+    assert!(
+        fresh.contains("scip: services/auth scip-java ok ")
+            && fresh.contains("scip: services/broken scip-java failed ")
+            && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    // A failed job's `stderr_tail` is the build tool's text, not a function of the commit:
+    // Maven's wording depends on the shared `.m2` negative cache ("was not found … during a
+    // previous attempt" against "Could not find artifact"), and npm's tail names a timestamped
+    // log file. Everything else in the two dumps is byte-identical, and both tails carry the
+    // same resolution summary.
+    let fresh_dump = rb(&url, &["dump", "--repo", &name]);
+    let (fresh_rows, fresh_tails) = without_failed_stderr(&fresh_dump);
+    let (rows, tails) = without_failed_stderr(&dump);
+    assert_eq!(fresh_rows, rows);
+    assert_eq!(fresh_tails.len(), 2, "{fresh_tails:?}");
+    assert!(
+        fresh_tails["services/broken"]
+            .contains("The following artifacts could not be resolved: com.acme:nope:jar:0.0.0")
+            && tails["services/broken"]
+                .contains("The following artifacts could not be resolved: com.acme:nope:jar:0.0.0"),
+        "{fresh_tails:?}"
+    );
+}
+
+/// `dump`'s rows with the `stderr_tail` removed from every failed `scip_status` diagnostic,
+/// plus those tails by build root.
+fn without_failed_stderr(dump: &str) -> (Vec<String>, BTreeMap<String, String>) {
+    let mut tails = BTreeMap::new();
+    let rows = dump
+        .lines()
+        .map(|line| {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row[0] == "D"
+                && row[1] == "scip_status"
+                && row[4]["status"] == "failed"
+                && let Some(tail) = row[4].as_object_mut().unwrap().remove("stderr_tail")
+            {
+                tails.insert(
+                    row[2].as_str().unwrap().to_owned(),
+                    tail.as_str().unwrap().to_owned(),
+                );
+                return row.to_string();
+            }
+            line.to_owned()
+        })
+        .collect();
+    (rows, tails)
 }

@@ -8,6 +8,6 @@ authRouter.post("/login", async (req, res) => {
   if (!user) {
     return res.status(401).end();
   }
-  const session = await createSession(user.id);
+  const welcome = "héllo 😀", session = await createSession(user.id);
   res.json({ token: session.token });
 });

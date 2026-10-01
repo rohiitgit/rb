@@ -191,6 +191,9 @@ pub struct Supertype {
     /// opposed to the class it extends.
     #[serde(default)]
     pub implements: bool,
+    /// Span of the clause item as written (`Foo`, `a.b.Foo`, `Foo<A, B>` including the
+    /// arguments), so an exact index's occurrence inside it can say which type it names.
+    pub span: Span,
 }
 
 /// A name assigned in a Python class body. Strings are decoded and booleans kept as
@@ -698,12 +701,12 @@ fn text(node: Node<'_>, source: &[u8]) -> String {
     String::from_utf8_lossy(&source[node.byte_range()]).into_owned()
 }
 
-fn span(node: Node<'_>) -> Span {
+pub(crate) fn span(node: Node<'_>) -> Span {
     let (s, e) = (node.start_position(), node.end_position());
     [point(s.row), point(s.column), point(e.row), point(e.column)]
 }
 
-fn point(v: usize) -> i32 {
+pub(crate) fn point(v: usize) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 

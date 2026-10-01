@@ -28,8 +28,10 @@ use rb_model::{
 };
 use serde_json::{Value, json};
 
-/// Identifies the extraction pipeline; bump whenever indexing output changes for the same input.
-pub const PIPELINE: &str = "m1b-syntax-1";
+/// Identifies the extraction pipeline; bump whenever indexing output changes for the same input,
+/// so a snapshot an older binary built is not "up to date" for this one (it had stayed
+/// `m1b-syntax-1` through M2b–M3a; contract M3b amendment 42).
+pub const PIPELINE: &str = "m3b-scip-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -424,18 +426,23 @@ pub fn assemble(
 }
 
 /// One `scip_status` diagnostic per job (contract M3b S9). Its detail is a function of the
-/// commit and the cache, never of this run: whether the index was served from the cache is
-/// reported by `rb index`, not recorded here, so a warm re-index dumps byte-identically.
+/// commit and the cache, never of this run: whether the index was served from the cache and
+/// how long the container ran are reported by `rb index`, not recorded here (design §3.3 rule
+/// 4: wall-clock time never enters the graph), so fresh runs and warm re-indexes dump
+/// byte-identically (amendment 32).
 fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic {
     let mut detail = json!({
         "indexer": p.indexer,
         "status": p.status.as_str(),
-        "elapsed_ms": p.elapsed_ms,
         "unpinned": p.unpinned,
     });
     match p.status.reason() {
         Some(reason) => detail["reason"] = reason.into(),
         None => detail["image"] = p.image.as_str().into(),
+    }
+    if let rb_scip::RunStatus::Timeout { phase, budget_secs } = &p.status {
+        detail["phase"] = phase.as_str().into();
+        detail["budget_secs"] = (*budget_secs).into();
     }
     if let Some(c) = coverage {
         detail["coverage"] = json!({
@@ -449,6 +456,8 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "references_unanchored": c.references_unanchored,
             "references_unmatched": c.references_unmatched,
             "files_without_document": c.files_without_document,
+            "supertypes_unresolved": c.supertypes_unresolved,
+            "occurrences_unconverted": c.occurrences_unconverted,
         });
     }
     if p.status != rb_scip::RunStatus::Ok && !p.stderr_tail.is_empty() {
@@ -958,6 +967,94 @@ mod tests {
             ]
         );
         assert_eq!(files_without_document(&diagnostics), 1);
+    }
+
+    /// Contract M3b amendments 1 and 38: a file belongs to the deepest build root containing
+    /// it. `pkg/src/a.ts` lies under the outer root, whose ok index happens to carry a document
+    /// for it, and under the nested `pkg` package, whose own job failed: the nested root owns
+    /// it, so it keeps its heuristic call and the outer index's document for it is not used.
+    #[test]
+    fn a_file_of_a_nested_failed_package_stays_heuristic_under_an_ok_outer_root() {
+        let outer = rb_syntax::extract(
+            rb_syntax::Language::TypeScript,
+            b"export function f() {}\nexport function g() { f(); }\n",
+        )
+        .unwrap();
+        let nested = rb_syntax::extract(
+            rb_syntax::Language::TypeScript,
+            b"export function h() {}\nexport function t() { h(); }\n",
+        )
+        .unwrap();
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: [
+                "package.json",
+                "tsconfig.json",
+                "src/a.ts",
+                "pkg/package.json",
+                "pkg/tsconfig.json",
+                "pkg/src/a.ts",
+            ]
+            .map(entry)
+            .to_vec(),
+            skipped: vec![],
+        };
+        let boundaries = Boundaries::new(
+            vec![
+                project(".", "package.json"),
+                project("pkg", "pkg/package.json"),
+            ],
+            vec![],
+        );
+        let outer_sym = |name: &str| format!("scip-typescript npm p 1.0.0 src/`a.ts`/{name}().");
+        let nested_sym =
+            |name: &str| format!("scip-typescript npm p 1.0.0 pkg/src/`a.ts`/{name}().");
+        let mut failed = ok_project("pkg", "scip-typescript", vec![]);
+        failed.status = rb_scip::RunStatus::Failed;
+        failed.index = None;
+        let content = Content {
+            facts: BTreeMap::from([
+                ("src/a.ts", (rb_syntax::Language::TypeScript, &outer)),
+                ("pkg/src/a.ts", (rb_syntax::Language::TypeScript, &nested)),
+            ]),
+            scip: vec![
+                ok_project(
+                    "",
+                    "scip-typescript",
+                    vec![
+                        document_for("src/a.ts", &outer, &outer_sym),
+                        document_for("pkg/src/a.ts", &nested, &nested_sym),
+                    ],
+                ),
+                failed,
+            ],
+            ..Content::default()
+        };
+        let (g, _) = assemble(&manifest, None, &boundaries, &content).unwrap();
+        let nested_keys = rb_syntax::symbol_keys("pkg/src/a.ts", &nested);
+        let t = nested_keys[nested
+            .definitions
+            .iter()
+            .position(|d| d.name == "t")
+            .unwrap()]
+        .clone();
+        let h = nested_keys[nested
+            .definitions
+            .iter()
+            .position(|d| d.name == "h")
+            .unwrap()]
+        .clone();
+        assert_eq!(
+            calls(&g),
+            [
+                (t, h, Provenance::Heuristic),
+                (outer_sym("g"), outer_sym("f"), Provenance::Scip),
+            ]
+        );
+        assert!(
+            !g.nodes().iter().any(|n| n.key == nested_sym("h")),
+            "the outer index's document for the nested file was used"
+        );
     }
 
     #[test]

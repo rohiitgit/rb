@@ -157,35 +157,51 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
             }
         }
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
-            for heritage in def
-                .children(&mut cursor)
-                .filter(|c| c.kind() == "class_heritage")
-            {
-                let mut hc = heritage.walk();
-                for clause in heritage.named_children(&mut hc) {
-                    match clause.kind() {
-                        // `extends Base<Id>`: the type arguments are a sibling of the value.
-                        "extends_clause" => {
-                            if let Some(value) = clause.child_by_field_name("value") {
-                                out.push(Supertype {
-                                    name: text(value, source),
-                                    type_args: clause
-                                        .child_by_field_name("type_arguments")
-                                        .map(|a| named_texts(a, source))
-                                        .unwrap_or_default(),
-                                    implements: false,
-                                });
+            for child in def.children(&mut cursor) {
+                match child.kind() {
+                    "class_heritage" => {
+                        let mut hc = child.walk();
+                        for clause in child.named_children(&mut hc) {
+                            match clause.kind() {
+                                // `extends Base<Id>`: the type arguments are a sibling of the
+                                // value; the span covers both.
+                                "extends_clause" => {
+                                    if let Some(value) = clause.child_by_field_name("value") {
+                                        let type_arguments =
+                                            clause.child_by_field_name("type_arguments");
+                                        let mut span = crate::span(value);
+                                        if let Some(args) = type_arguments {
+                                            let end = args.end_position();
+                                            span[2] = crate::point(end.row);
+                                            span[3] = crate::point(end.column);
+                                        }
+                                        out.push(Supertype {
+                                            name: text(value, source),
+                                            type_args: type_arguments
+                                                .map(|a| named_texts(a, source))
+                                                .unwrap_or_default(),
+                                            implements: false,
+                                            span,
+                                        });
+                                    }
+                                }
+                                "implements_clause" => {
+                                    let mut cc = clause.walk();
+                                    out.extend(clause.named_children(&mut cc).map(|t| Supertype {
+                                        implements: true,
+                                        ..supertype(t, source)
+                                    }));
+                                }
+                                _ => {}
                             }
                         }
-                        "implements_clause" => {
-                            let mut cc = clause.walk();
-                            out.extend(clause.named_children(&mut cc).map(|t| Supertype {
-                                implements: true,
-                                ..supertype(t, source)
-                            }));
-                        }
-                        _ => {}
                     }
+                    // `interface X extends A, B<T>`.
+                    "extends_type_clause" => {
+                        let mut cc = child.walk();
+                        out.extend(child.named_children(&mut cc).map(|t| supertype(t, source)));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -247,12 +263,14 @@ fn supertype(node: Node<'_>, source: &[u8]) -> Supertype {
             name,
             type_args,
             implements: false,
+            span: crate::span(node),
         };
     }
     Supertype {
         name: text(node, source),
         type_args: Vec::new(),
         implements: false,
+        span: crate::span(node),
     }
 }
 
@@ -570,5 +588,54 @@ export @Entity({ name: 'orders', schema: 'shop' }) class Order {}
             ]
         );
         assert_eq!(supers(Language::TypeScript, TS), ["User: Base<Id> Named"]);
+    }
+
+    /// An interface's `extends` list names supertypes (contract M3b amendment 28), each with
+    /// the span of its clause item, so the join can resolve it through the occurrence there.
+    #[test]
+    fn typescript_interfaces_extend_interfaces() {
+        let src = "interface Mid extends Base, Other<T> { extra(): void }\nclass Svc implements Mid {}\nclass Sub extends Svc {}\n";
+        assert_eq!(
+            supers(Language::TypeScript, src),
+            ["Mid: Base Other<T>", "Svc: Mid", "Sub: Svc"]
+        );
+        let f = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        fn at(src: &str, line: usize, token: &str) -> crate::Span {
+            let col = src.lines().nth(line).unwrap().find(token).unwrap() as i32;
+            let line = line as i32;
+            [line, col, line, col + token.len() as i32]
+        }
+        let spans: Vec<(String, bool, crate::Span)> = f
+            .definitions
+            .iter()
+            .flat_map(|d| &d.supertypes)
+            .map(|s| (s.name.clone(), s.implements, s.span))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("Base".into(), false, at(src, 0, "Base")),
+                ("Other".into(), false, at(src, 0, "Other<T>")),
+                ("Mid".into(), true, at(src, 1, "Mid")),
+                ("Svc".into(), false, at(src, 2, "Svc")),
+            ]
+        );
+        // Java: the span covers the qualified or generic type as written.
+        let java =
+            "package p;\nclass A extends a.Base implements Repo<List<String>>, Outer.Listener {}\n";
+        let f = extract(Language::Java, java.as_bytes()).unwrap();
+        let spans: Vec<(String, crate::Span)> = f.definitions[0]
+            .supertypes
+            .iter()
+            .map(|s| (s.name.clone(), s.span))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("a.Base".into(), at(java, 1, "a.Base")),
+                ("Repo".into(), at(java, 1, "Repo<List<String>>")),
+                ("Outer.Listener".into(), at(java, 1, "Outer.Listener")),
+            ]
+        );
     }
 }
