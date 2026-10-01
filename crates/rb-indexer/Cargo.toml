@@ -17,6 +17,10 @@ rb-syntax.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Encoding real `index.scip` bytes in the join's tests, so they run through `rb_scip::decode`
+# (contract M3b amendment 59); the same pins as `rb-scip`.
+protobuf.workspace = true
+scip.workspace = true
 tempfile.workspace = true
 
 [lints]

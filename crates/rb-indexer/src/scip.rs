@@ -82,6 +82,11 @@ pub(crate) struct Coverage {
     /// symbol in the same document resolve to them. Not part of `definitions_matched`.
     pub definitions_local: usize,
     pub definitions_total: usize,
+    /// `definitions_total − definitions_matched − definitions_local` (contract M3b amendment
+    /// 62): definitions the index gives no definition occurrence at their name that names
+    /// them (S7's second exception), including any an occurrence was rejected for by the name
+    /// guard (amendment 59).
+    pub definitions_without_occurrence: usize,
     /// Tree-sitter references matched to an occurrence of a symbol defined in the index.
     pub references_matched: usize,
     /// Matched an occurrence, but the symbol is defined outside the index (a dependency).
@@ -121,6 +126,12 @@ pub(crate) struct Coverage {
     /// (contract M3b amendment 54). Non-zero means the join failed to anchor a definition both
     /// sides know, not that the link leaves the project.
     pub relationships_dropped_in_project: usize,
+    /// The subset of `relationships_dropped` from a member the syntax deliberately has no
+    /// definition for (an anonymous class's method, design §8.2) into a target defined in the
+    /// project: a document-local source symbol with a definition occurrence in the
+    /// relationship's document that binds to no Tree-sitter definition (contract M3b amendment
+    /// 62). Not a join gap, and no edge is possible, but the link exists and is counted.
+    pub relationships_anonymous: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -222,11 +233,17 @@ pub(crate) fn join(
                 is_local_definition(o)
                     && local_names[di].get(o.symbol.as_str()) == Some(&d.name.as_str())
             };
-            let global_at_name = at_name(is_global_definition);
+            // The occurrence at the name must name the definition (contract M3b amendment 59):
+            // one an indexer's position error moved there is unmatched, not another key.
+            let names_d = |o: &&rb_scip::Occurrence| {
+                names_token(o, &local_names[di], &facts.imports, &d.name)
+            };
+            let global_at_name = at_name(is_global_definition).filter(names_d);
             let local_at_name = global_at_name
                 .is_none()
                 .then(|| at_name(is_local_definition))
-                .flatten();
+                .flatten()
+                .filter(names_d);
             let global_by_name = (global_at_name.is_none() && local_at_name.is_none())
                 .then(|| definition_before_name(d, by_span, &global_named))
                 .flatten();
@@ -277,15 +294,13 @@ pub(crate) fn join(
         }
     }
     // Whether `symbol`, named in document `di`, is defined in the project (see
-    // `Coverage::relationships_dropped_in_project`).
+    // `Coverage::relationships_dropped_in_project`). A local symbol is when it is bound to a
+    // definition of that document (amendment 54), which places its definition occurrence at a
+    // Tree-sitter definition's name by construction; its display name is not consulted, since
+    // scip-typescript leaves it empty (amendment 60).
     let in_project = |symbol: &str, di: usize| -> bool {
         if symbol.starts_with("local ") {
-            let Some(name) = local_names[di].get(symbol) else {
-                return false;
-            };
-            local_sites[di]
-                .get(symbol)
-                .is_some_and(|lines| lines.iter().any(|&l| name_lines[di].contains(&(l, *name))))
+            locals[di].contains_key(symbol)
         } else {
             let Some(name) = rb_scip::last_descriptor_name(symbol) else {
                 return false;
@@ -339,7 +354,8 @@ pub(crate) fn join(
             ),
             None => Source::File,
         };
-        // References: the name's range is a non-definition occurrence.
+        // References: the name's range is a non-definition occurrence that names the token
+        // (amendment 59); one that does not is counted unmatched.
         for r in &facts.references {
             let kind = match r.kind {
                 RefKind::Call => EdgeKind::Calls,
@@ -349,6 +365,7 @@ pub(crate) fn join(
             let Some(o) = by_span
                 .get(&r.span)
                 .and_then(|os| os.iter().find(|o| !o.is_definition()))
+                .filter(|o| names_token(o, &local_names[di], &facts.imports, &r.name))
             else {
                 out.coverage.references_unmatched += 1;
                 continue;
@@ -450,9 +467,17 @@ pub(crate) fn join(
                     usize::from(in_project(&s.symbol, di) && in_project(&rel.symbol, di));
             };
             // A source without a matched definition (a local class expression, a field) has no
-            // node to start an edge from: its relationships are dropped and counted.
+            // node to start an edge from: its relationships are dropped and counted. A local
+            // defined here that binds to no Tree-sitter definition is an anonymous class's
+            // member (amendment 62).
             let Some((i, source_key)) = key_of(&s.symbol) else {
-                implementations.for_each(&mut dropped);
+                let anonymous = s.symbol.starts_with("local ")
+                    && local_sites[di].contains_key(s.symbol.as_str());
+                for rel in implementations {
+                    out.coverage.relationships_anonymous +=
+                        usize::from(anonymous && in_project(&rel.symbol, di));
+                    dropped(rel);
+                }
                 continue;
             };
             let source_local = s.symbol.starts_with("local ");
@@ -505,12 +530,39 @@ pub(crate) fn join(
         }
     }
     out.edges.extend(implements);
+    out.coverage.definitions_without_occurrence = out.coverage.definitions_total
+        - out.coverage.definitions_matched
+        - out.coverage.definitions_local;
     out.edges.sort_by(|a, b| {
         (&a.src, a.kind as u8, &a.dst, &a.at).cmp(&(&b.src, b.kind as u8, &b.dst, &b.at))
     });
     out.edges.dedup();
     out.packages.sort();
     out
+}
+
+/// Whether occurrence `o`, matched at a token whose text is `text` in a file with `imports`,
+/// names that token (contract M3b amendment 59): a global symbol in one of the forms
+/// [`rb_scip::may_name`] accepts, or through an import alias (the local name of a default
+/// import, whose symbol is the module's default export under its own name; of a named import
+/// `{ name as text }`, `name`); a local symbol by its display name when the index gives one
+/// (scip-typescript leaves it empty). An occurrence that another position error moved onto
+/// another token is then not taken for it.
+fn names_token(
+    o: &rb_scip::Occurrence,
+    local_names: &BTreeMap<&str, &str>,
+    imports: &[rb_syntax::Import],
+    text: &str,
+) -> bool {
+    if o.symbol.starts_with("local ") {
+        return local_names
+            .get(o.symbol.as_str())
+            .is_none_or(|n| n.is_empty() || *n == text);
+    }
+    rb_scip::may_name(&o.symbol, text)
+        || imports.iter().flat_map(|i| &i.names).any(|n| {
+            n.local == text && (n.name == "default" || rb_scip::may_name(&o.symbol, &n.name))
+        })
 }
 
 fn is_global_definition(o: &rb_scip::Occurrence) -> bool {
@@ -763,6 +815,7 @@ mod tests {
                 definitions_matched_by_name: 0,
                 definitions_local: 0,
                 definitions_total: 5,
+                definitions_without_occurrence: 0,
                 references_matched: 2,
                 references_external: 1,
                 references_undocumented: 0,
@@ -774,6 +827,7 @@ mod tests {
                 occurrences_unconverted: 0,
                 relationships_dropped: 0,
                 relationships_dropped_in_project: 0,
+                relationships_anonymous: 0,
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -1582,23 +1636,25 @@ mod tests {
 
     /// Contract M3b amendment 54: a local class's method (`local 7`) is called from the
     /// enclosing global method; the call is an exact edge to the local definition's
-    /// heuristic key, counted as matched.
+    /// heuristic key, counted as matched. The layout is scip-typescript's (a class declared
+    /// inside a method is a local symbol); scip-java gives local classes global symbols
+    /// (amendment 62).
     #[test]
     fn a_call_to_a_local_definition_is_exact() {
-        let src = "package p;\nclass C {\n  void run() {\n    class Local { void go() {} }\n    new Local().go();\n  }\n}\n";
-        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
-        let path = "p/C.java";
-        let sym = |d: &str| format!("scip-java maven . . p/C#{d}");
+        let src = "export class C {\n  run() {\n    class Local { go() {} }\n    new Local().go();\n  }\n}\n";
+        let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let path = "src/c.ts";
+        let sym = |d: &str| format!("scip-typescript npm t 1.0.0 src/`c.ts`/C#{d}");
         let index = ScipIndex {
             documents: vec![Document {
                 path: path.into(),
                 occurrences: vec![
-                    occ_at(at_nth(src, 1, "C", 0), &sym(""), 1),
-                    occ_at(at_nth(src, 2, "run", 0), &sym("run()."), 1),
-                    occ_at(at_nth(src, 3, "Local", 0), "local 6", 1),
-                    occ_at(at_nth(src, 3, "go", 0), "local 7", 1),
-                    occ_at(at_nth(src, 4, "Local", 0), "local 6", 0),
-                    occ_at(at_nth(src, 4, "go", 0), "local 7", 0),
+                    occ_at(at_nth(src, 0, "C", 0), &sym(""), 1),
+                    occ_at(at_nth(src, 1, "run", 0), &sym("run()."), 1),
+                    occ_at(at_nth(src, 2, "Local", 0), "local 6", 1),
+                    occ_at(at_nth(src, 2, "go", 0), "local 7", 1),
+                    occ_at(at_nth(src, 3, "Local", 0), "local 6", 0),
+                    occ_at(at_nth(src, 3, "go", 0), "local 7", 0),
                 ],
                 ..Default::default()
             }],
@@ -1610,9 +1666,9 @@ mod tests {
             .iter()
             .position(|d| d.name == "go")
             .expect("the local class's method is a Tree-sitter definition");
-        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
+        let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([(path, heuristic.clone())]);
-        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
         assert!(
             edge_lines(&joined).contains(&format!("{} Calls {}", sym("run()."), heuristic[go])),
             "{:?}",
@@ -1736,6 +1792,326 @@ mod tests {
             joined.coverage.relationships_dropped_in_project, 1,
             "B#m() → A#m()"
         );
+        // Contract M3b amendment 62: the anonymous class's link into the project is counted
+        // on its own; `A#m()`'s occurrence is two columns off its name and `B#m()`'s sits on
+        // the first `m` of its line (in `implements`), so both are definitions without an
+        // occurrence (still in project: each lies on its definition's name line).
+        assert_eq!(joined.coverage.relationships_anonymous, 1, "local 5 → A#");
+        assert_eq!(
+            joined.coverage.definitions_without_occurrence, 2,
+            "A#m() and B#m()"
+        );
+    }
+
+    /// Contract M3b amendment 60 (the evaluator's I2): scip-typescript keys classes declared
+    /// inside a function as locals and gives them no display name. `B extends A` inside `inner`
+    /// relates `local 2 → local 0` and `local 3 → local 1`; both ends are bound locals, so the
+    /// dropped links are counted in project, whatever their display names.
+    #[test]
+    fn typescript_local_to_local_relationships_are_counted_in_project() {
+        let src = "export function inner() {\n  class A { m() { return 1; } }\n  class B extends A { m() { return 2; } }\n  return new B().m();\n}\n";
+        let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let path = "src/mixin.ts";
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences: vec![
+                    occ_at(
+                        at_nth(src, 0, "inner", 0),
+                        "scip-typescript npm t 1.0.0 src/`mixin.ts`/inner().",
+                        1,
+                    ),
+                    occ_at(at_nth(src, 1, "A", 0), "local 0", 1),
+                    occ_at(at_nth(src, 1, "m", 0), "local 1", 1),
+                    occ_at(at_nth(src, 2, "B", 0), "local 2", 1),
+                    occ_at(at_nth(src, 2, "A", 0), "local 0", 0),
+                    occ_at(at_nth(src, 2, "m", 0), "local 3", 1),
+                ],
+                symbols: vec![
+                    implementation("local 2", "local 0"),
+                    implementation("local 3", "local 1"),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            index.documents[0]
+                .symbols
+                .iter()
+                .all(|s| s.display_name.is_empty())
+        );
+        let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        assert_eq!(joined.coverage.definitions_local, 4);
+        assert_eq!(joined.coverage.relationships_dropped, 2);
+        assert_eq!(joined.coverage.relationships_dropped_in_project, 2);
+        assert_eq!(joined.coverage.relationships_anonymous, 0);
+    }
+
+    /// Contract M3b amendment 59, second line of defence (the evaluator's I1): the decoder of
+    /// pass 6 read scip-java's lines as `\n`-separated, so after the lone CR in `LoneCr2.java`
+    /// the definition occurrence of `m0` sat at `m2`'s name, `m2`'s at `m3`'s and `zeta`'s at
+    /// `beta`'s, and the call occurrence of `zeta()` at the `beta()` call. These are those
+    /// spans (the measured raw ranges, read as Tree-sitter rows). An occurrence must name its
+    /// token: no definition takes another method's key, no call is evidenced at another call,
+    /// and every rejected occurrence is counted (definitions without occurrence, references
+    /// unmatched).
+    #[test]
+    fn an_occurrence_must_name_its_token() {
+        let src = "package t;\n\npublic class LoneCr2 {\n\tint m1() { return 0; }\r\tint m0() { return 1; }\n\tint m2() { return zeta(); }\n\tint m3() { return beta(); }\n\tint zeta() { return 2; }\n\tint beta() { return 3; }\n}\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let path = "src/main/java/t/LoneCr2.java";
+        let sym = |d: &str| format!("scip-java maven . . t/LoneCr2#{d}");
+        let raw = |line: i32, start: i32, end: i32| -> Span { [line, start, line, end] };
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences: vec![
+                    occ_at(raw(2, 13, 20), &sym(""), 1),
+                    occ_at(raw(2, 13, 20), &sym("`<init>`()."), 1),
+                    occ_at(raw(3, 5, 7), &sym("m1()."), 1),
+                    occ_at(raw(4, 5, 7), &sym("m0()."), 1),
+                    occ_at(raw(5, 5, 7), &sym("m2()."), 1),
+                    occ_at(raw(5, 19, 23), &sym("zeta()."), 0),
+                    occ_at(raw(6, 5, 7), &sym("m3()."), 1),
+                    occ_at(raw(6, 19, 23), &sym("beta()."), 0),
+                    occ_at(raw(7, 5, 9), &sym("zeta()."), 1),
+                    occ_at(raw(8, 5, 9), &sym("beta()."), 1),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // The spans are where the evaluator found them: `m0`'s occurrence on `m2`'s name and
+        // `zeta`'s call occurrence on the `beta` call.
+        let def_at = |name: &str| {
+            facts
+                .definitions
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap()
+                .name_span
+        };
+        assert_eq!(def_at("m2"), raw(4, 5, 7));
+        assert_eq!(def_at("beta"), raw(7, 5, 9));
+        let beta_call = facts
+            .references
+            .iter()
+            .find(|r| r.name == "beta")
+            .unwrap()
+            .span;
+        assert_eq!(beta_call, raw(5, 19, 23));
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        let replaced: Vec<(&str, &str)> = joined.keys[path]
+            .iter()
+            .map(|(i, s)| (facts.definitions[*i].name.as_str(), s.as_str()))
+            .collect();
+        assert_eq!(
+            replaced,
+            [("LoneCr2", sym("").as_str()), ("m1", sym("m1().").as_str())]
+        );
+        assert!(joined.edges.is_empty(), "{:?}", edge_lines(&joined));
+        assert_eq!(joined.coverage.definitions_matched, 2);
+        assert_eq!(joined.coverage.definitions_total, 7);
+        assert_eq!(joined.coverage.definitions_without_occurrence, 5);
+        assert_eq!(
+            joined.coverage.references_unmatched, 2,
+            "the zeta() call has no occurrence, the beta() call's names zeta"
+        );
+    }
+
+    /// One document of `tool` (`scip-java` or `scip-typescript`) as an encoded `index.scip`,
+    /// with occurrences `(symbol, roles, raw line, raw start, raw end)`.
+    fn encoded_index(
+        tool: &str,
+        path: &str,
+        occurrences: &[(String, i32, i32, i32, i32)],
+    ) -> Vec<u8> {
+        use protobuf::Message as _;
+        scip::types::Index {
+            metadata: Some(scip::types::Metadata {
+                tool_info: Some(scip::types::ToolInfo {
+                    name: tool.into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            documents: vec![scip::types::Document {
+                relative_path: path.into(),
+                occurrences: occurrences
+                    .iter()
+                    .map(
+                        |(symbol, roles, line, start, end)| scip::types::Occurrence {
+                            symbol: symbol.clone(),
+                            symbol_roles: *roles,
+                            range: vec![*line, *start, *end],
+                            ..Default::default()
+                        },
+                    )
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
+    }
+
+    /// Contract M3b amendment 59 (the evaluator's I1), through the decoder: the raw ranges
+    /// `rb-scip-java:0.13.1` and scip-typescript 0.4.0 emitted for a lone CR (both) and a
+    /// U+2028 inside a string literal (TypeScript), decoded from the files' text and joined.
+    /// Every definition gets its own key, and each call is evidenced at its own token.
+    #[test]
+    fn indexer_line_terminators_join_on_the_tokens_the_indexer_meant() {
+        // (language, tool, path, symbol prefix, text, measured occurrences, expected calls
+        // `(caller, callee, the callee token's nth call)`).
+        type Case<'a> = (
+            Language,
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a str,
+            Vec<(&'a str, i32, i32, i32, i32)>,
+            Vec<(&'a str, &'a str)>,
+        );
+        let cases: Vec<Case<'_>> = vec![
+            (
+                Language::Java,
+                "scip-java",
+                "t/LoneCr2.java",
+                "scip-java maven . . t/LoneCr2#",
+                "package t;\n\npublic class LoneCr2 {\n\tint m1() { return 0; }\r\tint m0() { return 1; }\n\tint m2() { return zeta(); }\n\tint m3() { return beta(); }\n\tint zeta() { return 2; }\n\tint beta() { return 3; }\n}\n",
+                vec![
+                    ("", 1, 2, 13, 20),
+                    ("m1().", 1, 3, 5, 7),
+                    ("m0().", 1, 4, 5, 7),
+                    ("m2().", 1, 5, 5, 7),
+                    ("zeta().", 0, 5, 19, 23),
+                    ("m3().", 1, 6, 5, 7),
+                    ("beta().", 0, 6, 19, 23),
+                    ("zeta().", 1, 7, 5, 9),
+                    ("beta().", 1, 8, 5, 9),
+                ],
+                vec![("m2", "zeta"), ("m3", "beta")],
+            ),
+            (
+                Language::TypeScript,
+                "scip-typescript",
+                "src/cr.ts",
+                "scip-typescript npm eol-ts 1.0.0 src/`cr.ts`/K#",
+                "export class K {\n  m1() { return 0; }\r  m0() { return 1; }\n  m2() { return this.zeta(); }\n  m3() { return this.beta(); }\n  zeta() { return 2; }\n  beta() { return 3; }\n}\n",
+                vec![
+                    ("", 1, 0, 13, 14),
+                    ("m1().", 1, 1, 2, 4),
+                    ("m0().", 1, 2, 2, 4),
+                    ("m2().", 1, 3, 2, 4),
+                    ("zeta().", 0, 3, 21, 25),
+                    ("m3().", 1, 4, 2, 4),
+                    ("beta().", 0, 4, 21, 25),
+                    ("zeta().", 1, 5, 2, 6),
+                    ("beta().", 1, 6, 2, 6),
+                ],
+                vec![("m2", "zeta"), ("m3", "beta")],
+            ),
+            (
+                Language::TypeScript,
+                "scip-typescript",
+                "src/ls.ts",
+                "scip-typescript npm eol-ts 1.0.0 src/`ls.ts`/L#",
+                "export class L {\n  m1() { return \"a\u{2028}b\"; }\n  m0() { return 1; }\n  m2() { return this.zeta(); }\n  // c \u{2029} d\n  m3() { return this.beta(); }\n  /* e \u{85} f */ m4() { return this.m3(); }\n  zeta() { return 2; }\n  beta() { return 3; }\n}\n",
+                vec![
+                    ("", 1, 0, 13, 14),
+                    ("m1().", 1, 1, 2, 4),
+                    ("m0().", 1, 3, 2, 4),
+                    ("m2().", 1, 4, 2, 4),
+                    ("zeta().", 0, 4, 21, 25),
+                    // After U+2029 the line comment ends for TypeScript: `d` is a property.
+                    ("d.", 1, 6, 1, 2),
+                    ("m3().", 1, 7, 2, 4),
+                    ("beta().", 0, 7, 21, 25),
+                    ("m4().", 1, 8, 14, 16),
+                    ("m3().", 0, 8, 33, 35),
+                    ("zeta().", 1, 9, 2, 6),
+                    ("beta().", 1, 10, 2, 6),
+                ],
+                vec![("m2", "zeta"), ("m3", "beta"), ("m4", "m3")],
+            ),
+        ];
+        for (language, tool, path, prefix, src, measured, calls) in cases {
+            let occurrences: Vec<(String, i32, i32, i32, i32)> = measured
+                .iter()
+                .map(|&(d, roles, line, start, end)| {
+                    (format!("{prefix}{d}"), roles, line, start, end)
+                })
+                .collect();
+            let bytes = encoded_index(tool, path, &occurrences);
+            let index =
+                rb_scip::decode(&bytes, &|p| (p == path).then(|| src.as_bytes().to_vec())).unwrap();
+            let facts = rb_syntax::extract(language, src.as_bytes()).unwrap();
+            let files = BTreeMap::from([(path, (language, &facts))]);
+            let keys: BTreeMap<&str, Vec<String>> =
+                BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+            let joined = join(&index, "", &files, &keys, &[language]);
+            // Every method keeps its own name in its key.
+            for (i, d) in facts.definitions.iter().enumerate() {
+                let expected = match d.kind {
+                    rb_syntax::DefKind::Class => prefix.to_owned(),
+                    _ => format!("{prefix}{}().", d.name),
+                };
+                assert_eq!(
+                    joined.keys[path].get(&i),
+                    Some(&expected),
+                    "{path}: {}",
+                    d.name
+                );
+            }
+            assert_eq!(
+                joined.coverage.definitions_matched, joined.coverage.definitions_total,
+                "{path}"
+            );
+            // Each call is evidenced at its own callee token.
+            let mut got: Vec<(String, String, Span)> = joined
+                .edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .map(|e| {
+                    let Source::Symbol(src_key) = &e.src else {
+                        panic!("a call outside a method")
+                    };
+                    (src_key.clone(), e.dst.clone(), e.at.span)
+                })
+                .collect();
+            got.sort();
+            let mut expected: Vec<(String, String, Span)> = calls
+                .iter()
+                .map(|&(caller, callee)| {
+                    let token = format!(".{callee}()");
+                    let token = if language == Language::Java {
+                        format!(" {callee}()")
+                    } else {
+                        token
+                    };
+                    let offset = src.find(&token).unwrap() + 1;
+                    let row = src[..offset].matches('\n').count() as i32;
+                    let col = (offset - src[..offset].rfind('\n').map_or(0, |n| n + 1)) as i32;
+                    (
+                        format!("{prefix}{caller}()."),
+                        format!("{prefix}{callee}()."),
+                        [row, col, row, col + callee.len() as i32],
+                    )
+                })
+                .collect();
+            expected.sort();
+            assert_eq!(got, expected, "{path}");
+        }
     }
 
     /// Contract M3b amendment 26 (the evaluator's J1): two project types named `Common`. With
@@ -2008,6 +2384,7 @@ mod tests {
                 definitions_matched_by_name: 0,
                 definitions_local: 0,
                 definitions_total: 1,
+                definitions_without_occurrence: 0,
                 references_matched: 0,
                 references_external: 1,
                 references_undocumented: 1,
@@ -2019,6 +2396,7 @@ mod tests {
                 occurrences_unconverted: 0,
                 relationships_dropped: 0,
                 relationships_dropped_in_project: 0,
+                relationships_anonymous: 0,
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();

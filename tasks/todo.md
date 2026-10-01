@@ -218,6 +218,14 @@ Findings from the research step (2026-09-29):
       - [x] H5/H6 docs (amendment 57, design §5.3/§13, amendment 2, singular "1 SCIP job").
       - [x] Verify: fmt, clippy, 294 unit tests, e2e twice with containers (no `skipping:`), stub scan; goldens re-blessed (3 status files) and read; public repos fresh == cached: petclinic 240/240, 256, 13; class-validator 417/424 + 6 local, 398, 2 (diff classified); jsoup 4,874 + 117 local, 14,013, 688, 0 in project; samples 20/20 and 10/10.
       - [x] Records: contract measurement, CHANGELOG, IMPLEMENT.md, lessons; cleanup of `var/fix-pass5/` and `fx5_*`; commit.
+    - [x] Evaluator pass 6 (test-first, one amendment each, 59–63; `tasks/eval-m3b-pass6.md`):
+      - [x] I1 measured first with both real images on `var/fix-pass6/eol` (javac: `\n`, lone `\r`, `\r\n`; TypeScript: those and U+2028/U+2029; neither U+0085; 72/72 occurrences explained); `rb_scip::decode` converts every position through its byte offset by the indexer's own line rule (`Lines::position`, one path with the column rules); name guard on exact-span definitions and references (`names_token`, `rb_scip::may_name`; strict-equality rejections 2,137 enumerated into constructors, `validate0:`, accessors, default-import aliases; 0 with the rule on four repos, fixtures, scratch). Units in rb-scip and rb-indexer (through the real decoder), mutation-checked.
+      - [x] I2 bound locals are in project by binding (`typescript_local_to_local_relationships_are_counted_in_project`).
+      - [x] I3 qualified supertype names built from identifiers (`comments_inside_a_qualified_supertype_name_are_skipped`).
+      - [x] I4 `definitions_without_occurrence`, `relationships_anonymous` stored and printed; amendment 54's local-class sentence corrected; `a_call_to_a_local_definition_is_exact` in scip-typescript's layout; goldens re-blessed by a container run (two new zero fields per `ok` line).
+      - [x] I5 design §13/§5.3, `PIPELINE` `m3b-scip-2` with the bump rule.
+      - [x] spring-retry tests without documents: cause found (Develocity local build cache serves `testCompile`), recorded as an open item.
+      - [x] Verify: fmt, clippy, 300 unit tests, e2e twice with containers (no `skipping:`), stub scan; public repos fresh == cached, edge sets identical to `79d2c33`; records; cleanup; commit.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
@@ -236,3 +244,7 @@ Findings from the research step (2026-09-29):
 ## Review (evaluator pass 5)
 - All six findings fixed test-first (amendments 53–58). The tab rule was measured before it was coded: every scip-java occurrence on the scratch project's tab lines is javac's tab-expanded column minus 7 per leading tab, so the decoder converts it and the join's name guard is a second line of defence. Local definitions are bound per document and keep heuristic keys; jsoup's join gaps dropped to 0 in project.
 - Found while measuring: the local binding applies to scip-typescript too (class-validator +6 correct edges), and scip-typescript emits a reference, not a definition, at a named class expression, so one class-validator definition stays unanchored; S7 names that case. jsoup's 52 relationships from anonymous classes' methods stay dropped, because Tree-sitter has no definition for them (design §8.2); they are not counted as in-project gaps.
+
+## Review (evaluator pass 6)
+- All five findings fixed test-first (amendments 59–63). Line terminators were measured on both real images before any code: scip-java counts a lone CR, scip-typescript also U+2028/U+2029, Tree-sitter only `\n`; the decoder now converts each position through its byte offset, and a name guard on exact-span matches rejects an occurrence that does not name its token (0 rejections on four public repositories, the fixtures and the scratch project after the measured naming forms were enumerated).
+- Found while measuring: a U+2029 inside a TypeScript `//` comment ends the comment for TypeScript but not for Tree-sitter (scip-typescript indexed the rest of the line as a class property); spring-retry's test sources are skipped by scip-java because a Develocity build cache serves `testCompile` (open item). The edge sets of all four public repositories are unchanged; only the coverage diagnostic gains two fields.

@@ -176,14 +176,15 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
                                                 | "nested_identifier"
                                         )
                                     {
+                                        let (name, span) = name_and_span(value, source);
                                         out.push(Supertype {
-                                            name: text(value, source),
+                                            name,
                                             type_args: clause
                                                 .child_by_field_name("type_arguments")
                                                 .map(|a| named_texts(a, source))
                                                 .unwrap_or_default(),
                                             implements: false,
-                                            span: crate::span(value),
+                                            span,
                                         });
                                     }
                                 }
@@ -267,15 +268,16 @@ fn supertype(node: Node<'_>, source: &[u8]) -> Supertype {
         "generic_type" => {
             let children: Vec<Node<'_>> = node.named_children(&mut c).collect();
             let name = children.iter().find(|n| n.kind() != "type_arguments");
+            let (name, span) = name_and_span(*name.unwrap_or(&node), source);
             Supertype {
-                name: name.map(|n| text(*n, source)).unwrap_or_default(),
+                name,
                 type_args: children
                     .iter()
                     .find(|n| n.kind() == "type_arguments")
                     .map(|a| named_texts(*a, source))
                     .unwrap_or_default(),
                 implements: false,
-                span: crate::span(*name.unwrap_or(&node)),
+                span,
             }
         }
         "annotated_type" => {
@@ -293,12 +295,53 @@ fn supertype(node: Node<'_>, source: &[u8]) -> Supertype {
 }
 
 fn plain_supertype(node: Node<'_>, source: &[u8]) -> Supertype {
+    let (name, span) = name_and_span(node, source);
     Supertype {
-        name: text(node, source),
+        name,
         type_args: Vec::new(),
         implements: false,
-        span: crate::span(node),
+        span,
     }
+}
+
+/// A type name and its span. A qualified name (`a.b.C`: Java `scoped_type_identifier`,
+/// TypeScript `nested_type_identifier`, `nested_identifier` and `member_expression`, Python
+/// `attribute`) is its identifiers joined by `.`, without the comments and whitespace that may
+/// sit between them (`t./* c */Base` is `t.Base`; contract M3b amendment 61), and its span runs
+/// from the first identifier to the last. Any other node, or a qualified one holding something
+/// else (`a.b().C`), is its text and its own span.
+fn name_and_span(node: Node<'_>, source: &[u8]) -> (String, crate::Span) {
+    const QUALIFIED: &[&str] = &[
+        "scoped_type_identifier",
+        "nested_type_identifier",
+        "nested_identifier",
+        "member_expression",
+        "attribute",
+    ];
+    const IDENTIFIER: &[&str] = &["identifier", "type_identifier", "property_identifier"];
+    fn identifiers<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) -> bool {
+        let mut c = node.walk();
+        node.named_children(&mut c).all(|n| {
+            if is_comment(n) {
+                true
+            } else if IDENTIFIER.contains(&n.kind()) {
+                out.push(n);
+                true
+            } else {
+                QUALIFIED.contains(&n.kind()) && identifiers(n, out)
+            }
+        })
+    }
+    let mut parts = Vec::new();
+    if QUALIFIED.contains(&node.kind())
+        && identifiers(node, &mut parts)
+        && let (Some(first), Some(last)) = (parts.first(), parts.last())
+    {
+        let (start, end) = (crate::span(*first), crate::span(*last));
+        let name: Vec<String> = parts.iter().map(|n| text(*n, source)).collect();
+        return (name.join("."), [start[0], start[1], end[2], end[3]]);
+    }
+    (text(node, source), crate::span(node))
 }
 
 fn type_list_items(node: Node<'_>) -> Vec<Node<'_>> {
@@ -766,6 +809,54 @@ export @Entity({ name: 'orders', schema: 'shop' }) class Order {}
                 ("I".into(), at(ts, 2, "I")),
                 ("J".into(), at(ts, 2, "J")),
             ]
+        );
+    }
+
+    /// Contract M3b amendment 61: a comment inside a qualified supertype name
+    /// (`t./* inner */CBase`) is not part of the name; the name is the identifiers joined by
+    /// `.` and the span runs from the first identifier to the last.
+    #[test]
+    fn comments_inside_a_qualified_supertype_name_are_skipped() {
+        let names_and_spans = |language: Language, src: &str| -> Vec<(String, crate::Span)> {
+            extract(language, src.as_bytes())
+                .unwrap()
+                .definitions
+                .iter()
+                .flat_map(|d| d.supertypes.iter().map(|s| (s.name.clone(), s.span)))
+                .collect()
+        };
+        // From the start of `first` to the end of the identifier `last` begins with (both
+        // matched on `line`; the text after the identifier only locates it).
+        let between = |src: &str, line: usize, first: &str, last: &str| -> crate::Span {
+            let (a, b) = (at(src, line, first), at(src, line, last));
+            let identifier = last.trim_end_matches(|c: char| !c.is_alphanumeric());
+            [a[0], a[1], b[0], b[1] + identifier.len() as i32]
+        };
+        let java = "package p;\nclass Q1 extends t./* inner */CBase implements a . /* x */ b.I, java.util./* y */List<String> {}\n";
+        assert_eq!(
+            names_and_spans(Language::Java, java),
+            [
+                ("t.CBase".into(), between(java, 1, "t./", "CBase")),
+                ("a.b.I".into(), between(java, 1, "a . ", "I,")),
+                ("java.util.List".into(), between(java, 1, "java", "List")),
+            ]
+        );
+        let ts = "class Q extends ns./* c */Base implements m./* d */I {}\n";
+        assert_eq!(
+            names_and_spans(Language::TypeScript, ts),
+            [
+                ("ns.Base".into(), between(ts, 0, "ns", "Base")),
+                ("m.I".into(), between(ts, 0, "m./", "I {")),
+            ]
+        );
+        let python = "class A(models.  # c\n    Model):\n    pass\n";
+        let span = {
+            let (a, b) = (at(python, 0, "models"), at(python, 1, "Model"));
+            [a[0], a[1], b[2], b[3]]
+        };
+        assert_eq!(
+            names_and_spans(Language::Python, python),
+            [("models.Model".into(), span)]
         );
     }
 }

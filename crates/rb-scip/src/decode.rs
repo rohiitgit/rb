@@ -1,6 +1,8 @@
 //! Decoding an `index.scip` (design §5.1). Ranges become 0-based `[line, byte col, line, byte
 //! col]` spans like Tree-sitter's; SCIP's columns are code units in the document's position
-//! encoding, which scip-java and scip-typescript leave unset while meaning UTF-16.
+//! encoding, which scip-java and scip-typescript leave unset while meaning UTF-16, and SCIP's
+//! lines are the indexer's, which also end at terminators Tree-sitter does not count as rows
+//! (contract M3b amendment 59).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -82,9 +84,15 @@ pub fn decode(
 ) -> anyhow::Result<ScipIndex> {
     let index = scip::types::Index::parse_from_bytes(bytes).context("parsing index.scip")?;
     let metadata = index.metadata.as_ref();
-    let scip_java = metadata
+    let tool = metadata
         .and_then(|m| m.tool_info.as_ref())
-        .is_some_and(|t| t.name == "scip-java");
+        .map_or("", |t| t.name.as_str());
+    let scip_java = tool == "scip-java";
+    let breaks = match tool {
+        "scip-java" => LineBreaks::Java,
+        "scip-typescript" => LineBreaks::TypeScript,
+        _ => LineBreaks::Lf,
+    };
     // Duplicate documents for one path (scip-typescript #330) merge into ordered sets, which
     // drop repeats and give the decoded order without a per-item scan.
     struct Merged {
@@ -113,17 +121,14 @@ pub fn decode(
         } else {
             Some(doc.text.clone().into_bytes())
         };
-        let lines: Option<Vec<&[u8]>> = text.as_deref().map(|t| t.split(|&b| b == b'\n').collect());
+        let lines = text.as_deref().map(|t| Lines::new(t, breaks));
         let mut unconverted = 0;
-        // `None` when the line's text is unknown: the column then stays in code units.
-        let convert = |line: i32, col: i32| -> Option<i32> {
-            if units_per == Units::Bytes {
-                return Some(col);
+        // `None` when the line's text is unknown: the position then stays the indexer's.
+        let convert = |line: i32, col: i32| -> Option<(i32, i32)> {
+            match &lines {
+                Some(lines) => lines.position(line, col, units_per),
+                None => (units_per == Units::Bytes).then_some((line, col)),
             }
-            let line = lines
-                .as_ref()
-                .and_then(|ls| usize::try_from(line).ok().and_then(|l| ls.get(l)))?;
-            Some(byte_column(line, col, units_per))
         };
         let mut occurrences = Vec::with_capacity(doc.occurrences.len());
         for occ in &doc.occurrences {
@@ -131,15 +136,19 @@ pub fn decode(
                 continue;
             };
             let mut failed = false;
-            let mut col = |line: i32, col: i32| {
-                convert(line, col).unwrap_or_else(|| {
-                    failed = true;
-                    col
-                })
+            let mut span_of = |(sl, sc, el, ec): (i32, i32, i32, i32)| -> Span {
+                let mut at = |line: i32, col: i32| {
+                    convert(line, col).unwrap_or_else(|| {
+                        failed = true;
+                        (line, col)
+                    })
+                };
+                let (start, end) = (at(sl, sc), at(el, ec));
+                [start.0, start.1, end.0, end.1]
             };
-            let span = [sl, col(sl, sc), el, col(el, ec)];
-            let enclosing = enclosing_of(&occ.typed_enclosing_range, &occ.enclosing_range)
-                .map(|(sl, sc, el, ec)| [sl, col(sl, sc), el, col(el, ec)]);
+            let span = span_of((sl, sc, el, ec));
+            let enclosing =
+                enclosing_of(&occ.typed_enclosing_range, &occ.enclosing_range).map(&mut span_of);
             if failed {
                 unconverted += 1;
             }
@@ -190,6 +199,88 @@ enum Units {
     /// next multiple of 8 and any other character by its UTF-16 length, and scip-java then
     /// subtracts 7 for each tab that starts the line. On a line without a tab this is `Utf16`.
     Javac,
+}
+
+/// Where an indexer starts a new line (contract M3b amendment 59; measured with
+/// `rb-scip-java:0.13.1` and scip-typescript 0.4.0). Tree-sitter's rows end at `\n` only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineBreaks {
+    /// `\n` only (an indexer whose rule is unknown is read as Tree-sitter reads the text).
+    Lf,
+    /// javac's `LineMap`: `\n`, `\r` and `\r\n` (the Java line terminators, JLS §3.4).
+    Java,
+    /// TypeScript's scanner (`computeLineStarts`): those and U+2028, U+2029.
+    TypeScript,
+}
+
+/// A document's text indexed twice: by the indexer's lines and by Tree-sitter's rows. An
+/// indexer position converts through its byte offset in the text, so a line terminator only
+/// one side counts cannot shift a position onto another line.
+struct Lines<'t> {
+    text: &'t [u8],
+    /// Each indexer line's bytes, `start..end`, without its terminator.
+    lines: Vec<(usize, usize)>,
+    /// The byte offset each Tree-sitter row starts at.
+    rows: Vec<usize>,
+}
+
+impl<'t> Lines<'t> {
+    fn new(text: &'t [u8], breaks: LineBreaks) -> Self {
+        let mut lines = Vec::new();
+        let mut start = 0;
+        let mut i = 0;
+        while i < text.len() {
+            let terminator = match (text[i], breaks) {
+                (b'\n', _) => 1,
+                (b'\r', LineBreaks::Java | LineBreaks::TypeScript) => {
+                    if text.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    }
+                }
+                // U+2028 and U+2029 are `E2 80 A8` and `E2 80 A9`.
+                (0xE2, LineBreaks::TypeScript)
+                    if text.get(i + 1) == Some(&0x80)
+                        && matches!(text.get(i + 2), Some(0xA8 | 0xA9)) =>
+                {
+                    3
+                }
+                _ => 0,
+            };
+            if terminator == 0 {
+                i += 1;
+                continue;
+            }
+            lines.push((start, i));
+            i += terminator;
+            start = i;
+        }
+        lines.push((start, text.len()));
+        let rows = std::iter::once(0)
+            .chain(
+                text.iter()
+                    .enumerate()
+                    .filter(|&(_, &b)| b == b'\n')
+                    .map(|(i, _)| i + 1),
+            )
+            .collect();
+        Lines { text, lines, rows }
+    }
+
+    /// Tree-sitter's `(row, byte column)` for the indexer's `(line, column)`, the column in
+    /// `units`; `None` for a line the text does not have.
+    fn position(&self, line: i32, col: i32, units: Units) -> Option<(i32, i32)> {
+        let &(start, end) = self.lines.get(usize::try_from(line).ok()?)?;
+        let offset =
+            start + usize::try_from(byte_column(&self.text[start..end], col, units)).ok()?;
+        // `rows[0]` is 0, so at least one row starts at or before the offset.
+        let row = self.rows.partition_point(|&r| r <= offset) - 1;
+        Some((
+            i32::try_from(row).ok()?,
+            i32::try_from(offset - self.rows[row]).ok()?,
+        ))
+    }
 }
 
 /// The byte offset of code unit `col` within `line`. A column past the end clamps to the line's
@@ -691,6 +782,184 @@ mod tests {
             [0, 40, 0, 43],
             "Box's raw columns, read as code units"
         );
+    }
+
+    /// Decodes one document of `tool` holding `text`, with one occurrence per measured
+    /// `(token, nth, raw line, raw start, raw end)`, and returns the decoded spans next to the
+    /// spans Tree-sitter gives the tokens: the `nth` match of `token` in `text` (a token `b()`
+    /// stands for the name before its `(`), its row counted by `\n` only and its column in bytes.
+    fn decoded_and_expected(
+        tool: &str,
+        text: &str,
+        measured: &[(&str, usize, i32, i32, i32)],
+    ) -> (Vec<Span>, Vec<Span>) {
+        let occurrences = measured
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, _, line, start, end))| {
+                let mut o = occ(&format!("scip-java maven . . p/T#m{i}()."), 0);
+                o.range = vec![line, start, end];
+                o
+            })
+            .collect();
+        let index = Index {
+            metadata: Some(Metadata {
+                tool_info: Some(ToolInfo {
+                    name: tool.into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            documents: vec![ScipDocument {
+                relative_path: "T".into(),
+                occurrences,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let got = decode(&encode(&index), &|_| Some(text.as_bytes().to_vec())).unwrap();
+        let d = &got.documents[0];
+        assert_eq!(d.unconverted, 0);
+        // Decoded occurrences are sorted by span; the symbols give back the measured order.
+        let mut decoded: Vec<(String, Span)> = d
+            .occurrences
+            .iter()
+            .map(|o| (o.symbol.clone(), o.span))
+            .collect();
+        decoded.sort_by_key(|(symbol, _)| {
+            symbol
+                .trim_start_matches("scip-java maven . . p/T#m")
+                .trim_end_matches("().")
+                .parse::<usize>()
+                .unwrap()
+        });
+        let expected = measured
+            .iter()
+            .map(|&(token, nth, ..)| {
+                let offset = text.match_indices(token).nth(nth).unwrap().0;
+                let row = text[..offset].matches('\n').count() as i32;
+                let col = (offset - text[..offset].rfind('\n').map_or(0, |n| n + 1)) as i32;
+                let len = token.find('(').unwrap_or(token.len()) as i32;
+                [row, col, row, col + len]
+            })
+            .collect();
+        (
+            decoded.into_iter().map(|(_, span)| span).collect(),
+            expected,
+        )
+    }
+
+    /// Contract M3b amendment 59: javac numbers lines after `\n`, `\r` and `\r\n`, and
+    /// TypeScript's scanner also after U+2028 and U+2029, while Tree-sitter's rows count `\n`
+    /// only. The texts and raw ranges are the ones measured with `rb-scip-java:0.13.1` and
+    /// scip-typescript 0.4.0 (`var/fix-pass6/eol`): a lone CR between members (the evaluator's
+    /// `LoneCr2`), lone CRs before tab-indented lines and inside a block comment, U+2028, U+2029
+    /// and U+0085 inside a Java string literal and comment (not line terminators for javac), and
+    /// U+2028 inside a TypeScript string literal, U+2029 in a line comment and U+0085 in a block
+    /// comment (not a terminator for TypeScript). Every occurrence must land on its token.
+    #[test]
+    fn indexer_lines_follow_the_indexers_line_terminators() {
+        let lone_cr2 = "package t;\n\npublic class LoneCr2 {\n\tint m1() { return 0; }\r\tint m0() { return 1; }\n\tint m2() { return zeta(); }\n\tint m3() { return beta(); }\n\tint zeta() { return 2; }\n\tint beta() { return 3; }\n}\n";
+        let lone_cr2_measured: &[(&str, usize, i32, i32, i32)] = &[
+            ("m1", 0, 3, 5, 7),
+            ("m0", 0, 4, 5, 7),
+            ("m2", 0, 5, 5, 7),
+            ("zeta", 0, 5, 19, 23),
+            ("m3", 0, 6, 5, 7),
+            ("beta", 0, 6, 19, 23),
+            ("zeta", 1, 7, 5, 9),
+            ("beta", 1, 8, 5, 9),
+        ];
+        let (got, expected) = decoded_and_expected("scip-java", lone_cr2, lone_cr2_measured);
+        assert_eq!(got, expected, "LoneCr2.java");
+        let lone_cr_tab = "package t;\n\npublic class LoneCrTab {\n\tint a() { return 0; }\r\t\tint b()\t{ return a(); }\r\r\tint c() { return\tb(); }\n  /* x\r y */ int d() { return c(); }\n}\n";
+        let (got, expected) = decoded_and_expected(
+            "scip-java",
+            lone_cr_tab,
+            &[
+                ("a()", 0, 3, 5, 6),
+                ("b()", 0, 4, 6, 7),
+                ("a()", 1, 4, 19, 20),
+                ("c()", 0, 6, 5, 6),
+                ("b()", 1, 6, 25, 26),
+                ("d()", 0, 8, 10, 11),
+                ("c()", 1, 8, 23, 24),
+            ],
+        );
+        assert_eq!(got, expected, "LoneCrTab.java");
+        let java_ls = "package t;\n\npublic class Ls {\n\tString s() { return \"a\u{2028}b\u{2029}c\u{85}d\"; }\n\t// note \u{2028} here \u{2029} and \u{85}\n\tint a() { return s().length(); } int b() { return a(); }\n\tint c() { return b(); }\n}\n";
+        let (got, expected) = decoded_and_expected(
+            "scip-java",
+            java_ls,
+            &[
+                ("s()", 0, 3, 8, 9),
+                ("a()", 0, 5, 5, 6),
+                ("s()", 1, 5, 18, 19),
+                ("length", 0, 5, 22, 28),
+                ("b()", 0, 5, 38, 39),
+                ("a()", 1, 5, 51, 52),
+                ("c()", 0, 6, 5, 6),
+                ("b()", 1, 6, 18, 19),
+            ],
+        );
+        assert_eq!(got, expected, "Ls.java");
+        let crlf = "package t;\r\n\r\npublic class Crlf {\r\n\tint a() { return 0; }\r\n\tint b()\t{ return a(); }\r\n}\r\n";
+        let (got, expected) = decoded_and_expected(
+            "scip-java",
+            crlf,
+            &[
+                ("a()", 0, 3, 5, 6),
+                ("b()", 0, 4, 5, 6),
+                ("a()", 1, 4, 18, 19),
+            ],
+        );
+        assert_eq!(got, expected, "Crlf.java");
+
+        let cr_ts = "export class K {\n  m1() { return 0; }\r  m0() { return 1; }\n  m2() { return this.zeta(); }\n  m3() { return this.beta(); }\n  zeta() { return 2; }\n  beta() { return 3; }\n}\n";
+        let (got, expected) = decoded_and_expected(
+            "scip-typescript",
+            cr_ts,
+            &[
+                ("m1", 0, 1, 2, 4),
+                ("m0", 0, 2, 2, 4),
+                ("m2", 0, 3, 2, 4),
+                ("zeta", 0, 3, 21, 25),
+                ("m3", 0, 4, 2, 4),
+                ("beta", 0, 4, 21, 25),
+                ("zeta", 1, 5, 2, 6),
+                ("beta", 1, 6, 2, 6),
+            ],
+        );
+        assert_eq!(got, expected, "cr.ts");
+        let ls_ts = "export class L {\n  m1() { return \"a\u{2028}b\"; }\n  m0() { return 1; }\n  m2() { return this.zeta(); }\n  // c \u{2029} d\n  m3() { return this.beta(); }\n  /* e \u{85} f */ m4() { return this.m3(); }\n  zeta() { return 2; }\n  beta() { return 3; }\n}\n";
+        let ls_ts_measured: &[(&str, usize, i32, i32, i32)] = &[
+            ("m1", 0, 1, 2, 4),
+            ("m0", 0, 3, 2, 4),
+            ("m2", 0, 4, 2, 4),
+            ("zeta", 0, 4, 21, 25),
+            ("d\n", 0, 6, 1, 2),
+            ("m3", 0, 7, 2, 4),
+            ("beta", 0, 7, 21, 25),
+            ("m4", 0, 8, 14, 16),
+            ("m3", 1, 8, 33, 35),
+            ("zeta", 1, 9, 2, 6),
+            ("beta", 1, 10, 2, 6),
+        ];
+        let (got, mut expected) = decoded_and_expected("scip-typescript", ls_ts, ls_ts_measured);
+        // `d` ends the line comment's U+2029 line (scip-typescript reads it as a class
+        // property): one byte, without the `\n` that located it.
+        expected[4][3] -= 1;
+        assert_eq!(got, expected, "ls.ts");
+
+        // The rules are the indexers' own: read as scip-java's, the TypeScript file's U+2028
+        // is not a line break and `m0` lands elsewhere; read by `\n` alone, the lone CR shifts
+        // `m0` onto `m2` (the evaluator's finding I1).
+        let (got, expected) = decoded_and_expected("scip-java", ls_ts, ls_ts_measured);
+        assert_ne!(got[1], expected[1]);
+        let (got, expected) = decoded_and_expected("other", lone_cr2, lone_cr2_measured);
+        assert_eq!(got[1], expected[2], "\\n only: m0's position is m2's");
     }
 
     #[test]

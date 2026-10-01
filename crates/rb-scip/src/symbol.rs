@@ -11,6 +11,48 @@ pub fn last_descriptor_name(symbol: &str) -> Option<String> {
     parsed.descriptors.last().map(|d| d.name.clone())
 }
 
+/// Whether an occurrence of the global `symbol` may stand at a token whose text is `text`
+/// (contract M3b amendment 59): its last descriptor's name is the text, or one of the forms
+/// the indexers give a name that differs from the token (measured on the fixtures and on
+/// spring-petclinic, class-validator, jsoup and spring-retry):
+/// - a constructor, `` Foo#`<init>`(). `` (scip-java: a constructor declaration, `new Foo()`) or
+///   `` Foo#`<constructor>`(). `` (scip-typescript: `new Foo()`), stands at its type's name;
+/// - a scip-typescript object-literal property is named with a numeric suffix (`validate0:`
+///   for `validate`);
+/// - a scip-typescript accessor is named `<get>x` or `<set>x` for `x`.
+///
+/// `false` for local symbols and strings the grammar rejects. An import alias (a default
+/// import's local name) is the caller's to accept: it needs the file's imports.
+pub fn may_name(symbol: &str, text: &str) -> bool {
+    if scip::symbol::is_local_symbol(symbol) {
+        return false;
+    }
+    let Ok(parsed) = scip::symbol::parse_symbol(symbol) else {
+        return false;
+    };
+    let mut descriptors = parsed.descriptors.iter().rev();
+    let Some(last) = descriptors.next() else {
+        return false;
+    };
+    let name = last.name.as_str();
+    if name == text {
+        return true;
+    }
+    if matches!(name, "<init>" | "<constructor>") {
+        return descriptors.next().is_some_and(|d| d.name == text);
+    }
+    if let Some(accessed) = name
+        .strip_prefix("<get>")
+        .or_else(|| name.strip_prefix("<set>"))
+    {
+        return accessed == text;
+    }
+    last.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Meta)
+        && name
+            .strip_prefix(text)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The symbol of a global symbol's last type: the symbol cut after its last type descriptor
 /// (`… p/Dog#` for `… p/Dog#sound().`, itself for `… p/Dog#`), byte for byte a prefix of the
 /// original, so it can be looked up among the index's definitions. `None` for local symbols,
@@ -108,6 +150,55 @@ mod tests {
         assert_eq!(last_descriptor_name("local 3"), None);
         assert_eq!(last_descriptor_name("not a symbol"), None);
         assert_eq!(last_descriptor_name(""), None);
+    }
+
+    /// Contract M3b amendment 59: the forms in which an indexer's symbol names a token whose
+    /// text differs from its last descriptor, and nothing else.
+    #[test]
+    fn a_symbol_may_name_its_token_in_the_measured_forms_only() {
+        let java = "scip-java maven maven/org.jsoup/jsoup 1.24.1 org/jsoup/";
+        let ts = "scip-typescript npm class-validator 0.15.1 src/";
+        let yes = [
+            (format!("{java}Jsoup#parse()."), "parse"),
+            (format!("{java}Jsoup#`<init>`()."), "Jsoup"),
+            (format!("{java}Connection#Method#`<init>`()."), "Method"),
+            (
+                format!(
+                    "{ts}metadata/`ValidationMetadata.ts`/ValidationMetadata#`<constructor>`()."
+                ),
+                "ValidationMetadata",
+            ),
+            (
+                format!("{ts}decorator/array/`ArrayContains.ts`/validate0:"),
+                "validate",
+            ),
+            (format!("{ts}decorator/`Is6.ts`/isISO63910:"), "isISO6391"),
+            (
+                format!(
+                    "{ts}metadata/`ConstraintMetadata.ts`/ConstraintMetadata#`<get>instance`()."
+                ),
+                "instance",
+            ),
+            (format!("{ts}`a.ts`/A#`<set>value`()."), "value"),
+        ];
+        for (symbol, text) in &yes {
+            assert!(may_name(symbol, text), "{symbol} at {text}");
+        }
+        let no = [
+            (format!("{java}LoneCr2#m0()."), "m2"),
+            (format!("{java}LoneCr2#zeta()."), "beta"),
+            (format!("{java}Jsoup#`<init>`()."), "Other"),
+            (format!("{java}Jsoup#`<init>`()."), "init"),
+            (format!("{ts}`a.ts`/validate0."), "validate"),
+            (format!("{ts}`a.ts`/validate:"), "valid"),
+            (format!("{ts}`a.ts`/validatex:"), "validate"),
+            (format!("{ts}`a.ts`/A#`<get>value`()."), "<get>"),
+            ("local 3".to_owned(), "m"),
+            ("not a symbol".to_owned(), "not"),
+        ];
+        for (symbol, text) in &no {
+            assert!(!may_name(symbol, text), "{symbol} at {text}");
+        }
     }
 
     /// The type symbol is the symbol cut after its last type descriptor (a member's enclosing

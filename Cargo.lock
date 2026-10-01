@@ -1971,12 +1971,14 @@ name = "rb-indexer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "protobuf",
  "rb-frameworks",
  "rb-git",
  "rb-model",
  "rb-scip",
  "rb-sql",
  "rb-syntax",
+ "scip",
  "serde_json",
  "tempfile",
 ]

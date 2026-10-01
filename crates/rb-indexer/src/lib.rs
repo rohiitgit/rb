@@ -30,8 +30,10 @@ use serde_json::{Value, json};
 
 /// Identifies the extraction pipeline; bump whenever indexing output changes for the same input,
 /// so a snapshot an older binary built is not "up to date" for this one (it had stayed
-/// `m1b-syntax-1` through M2b–M3a; contract M3b amendment 42).
-pub const PIPELINE: &str = "m3b-scip-1";
+/// `m1b-syntax-1` through M2b–M3a; contract M3b amendment 42). That includes every change to
+/// the SCIP decoder or join (`rb_scip::decode`, `scip::join`): evaluator passes 4 and 5 changed
+/// the join's output without a bump (contract M3b amendment 63).
+pub const PIPELINE: &str = "m3b-scip-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -453,6 +455,7 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "definitions_matched_by_name": c.definitions_matched_by_name,
             "definitions_local": c.definitions_local,
             "definitions_total": c.definitions_total,
+            "definitions_without_occurrence": c.definitions_without_occurrence,
             "references_matched": c.references_matched,
             "references_external": c.references_external,
             "references_undocumented": c.references_undocumented,
@@ -464,6 +467,7 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "occurrences_unconverted": c.occurrences_unconverted,
             "relationships_dropped": c.relationships_dropped,
             "relationships_dropped_in_project": c.relationships_dropped_in_project,
+            "relationships_anonymous": c.relationships_anonymous,
         });
     }
     if matches!(

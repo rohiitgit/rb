@@ -645,10 +645,11 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         let n = |k: &str| c[k].as_u64().unwrap_or(0);
         let _ = write!(
             line,
-            ", definitions matched {}/{} ({} by name), references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}, relationships dropped {} ({} in project)",
+            ", definitions matched {}/{} ({} by name), definitions without occurrence {}, references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}, relationships dropped {} ({} in project, {} anonymous)",
             n("definitions_matched"),
             n("definitions_total"),
             n("definitions_matched_by_name"),
+            n("definitions_without_occurrence"),
             n("references_matched"),
             n("references_external"),
             n("references_undocumented"),
@@ -657,7 +658,8 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
             n("references_unmatched"),
             n("occurrences_unconverted"),
             n("relationships_dropped"),
-            n("relationships_dropped_in_project")
+            n("relationships_dropped_in_project"),
+            n("relationships_anonymous")
         );
         // Files the indexer left out (excluded by its tsconfig): no edges of any kind.
         if n("files_without_document") > 0 {
@@ -1139,23 +1141,26 @@ mod tests {
         );
         let ok = diagnostic(json!({
             "indexer": "scip-java", "status": "ok", "unpinned": false, "image": "sha256:1",
-            "coverage": {"definitions_matched": 2, "definitions_total": 3, "relationships_dropped": 4},
+            "coverage": {"definitions_matched": 2, "definitions_total": 3,
+                         "definitions_without_occurrence": 1, "relationships_dropped": 4},
         }));
-        assert!(
-            scip_status_line(&ok)
-                .ends_with(", unconverted 0, relationships dropped 4 (0 in project)"),
-            "{}",
-            scip_status_line(&ok)
+        // Contract M3b amendment 62: the definitions without an occurrence and the anonymous
+        // classes' links are printed, zero or not.
+        assert_eq!(
+            scip_status_line(&ok),
+            "scip: . scip-java ok, definitions matched 2/3 (0 by name), definitions without occurrence 1, references matched 0, external 0, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0, relationships dropped 4 (0 in project, 0 anonymous)"
         );
         // Local definitions (contract M3b amendment 54) are printed when there are any.
         let local = diagnostic(json!({
             "indexer": "scip-java", "status": "ok", "unpinned": false, "image": "sha256:1",
             "coverage": {"definitions_matched": 2, "definitions_local": 1, "definitions_total": 3,
-                         "relationships_dropped": 4, "relationships_dropped_in_project": 1},
+                         "relationships_dropped": 4, "relationships_dropped_in_project": 1,
+                         "relationships_anonymous": 2},
         }));
         assert!(
-            scip_status_line(&local)
-                .ends_with(", relationships dropped 4 (1 in project), 1 local definitions"),
+            scip_status_line(&local).ends_with(
+                ", relationships dropped 4 (1 in project, 2 anonymous), 1 local definitions"
+            ),
             "{}",
             scip_status_line(&local)
         );
