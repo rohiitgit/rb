@@ -191,8 +191,9 @@ pub struct Supertype {
     /// opposed to the class it extends.
     #[serde(default)]
     pub implements: bool,
-    /// Span of the clause item as written (`Foo`, `a.b.Foo`, `Foo<A, B>` including the
-    /// arguments), so an exact index's occurrence inside it can say which type it names.
+    /// Span of the type's name only, the qualified name as written (`Foo`, `a.b.Outer.Inner`),
+    /// without type arguments and without type-use annotations (contract M3b amendment 43), so
+    /// an exact index's type occurrence inside it names this type and not an argument's.
     pub span: Span,
 }
 

@@ -324,6 +324,20 @@ impl Store {
         })
     }
 
+    /// The snapshot's SCIP jobs that did not finish (`environment`, `timeout`, `skipped` or
+    /// `unsupported`; contract M3b amendment 44), counted over its stored `scip_status`
+    /// diagnostics: such a snapshot is heuristic for a reason the next run may not have, so
+    /// `rb index` does not take it for "up to date" while SCIP is on.
+    pub fn unfinished_scip_jobs(&mut self, snapshot_id: i64) -> anyhow::Result<i64> {
+        let row = self.client.query_one(
+            "SELECT count(*) FROM rb.diagnostic
+             WHERE snapshot_id = $1 AND kind = 'scip_status'
+               AND detail->>'status' IN ('environment', 'timeout', 'skipped', 'unsupported')",
+            &[&snapshot_id],
+        )?;
+        Ok(row.get(0))
+    }
+
     pub fn services(&mut self, snapshot_id: i64) -> anyhow::Result<Vec<ServiceSummary>> {
         let rows = self.client.query(
             "SELECT s.key, s.name, s.attrs,

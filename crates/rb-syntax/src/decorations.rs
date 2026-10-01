@@ -163,25 +163,27 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
                         let mut hc = child.walk();
                         for clause in child.named_children(&mut hc) {
                             match clause.kind() {
-                                // `extends Base<Id>`: the type arguments are a sibling of the
-                                // value; the span covers both.
+                                // `extends Base<Id>`: the span is the name's; the type
+                                // arguments are a sibling. A value that is not a name
+                                // (`mixin(Base)`, `(Base)`) declares no supertype: there is
+                                // no type name an index occurrence could resolve.
                                 "extends_clause" => {
-                                    if let Some(value) = clause.child_by_field_name("value") {
-                                        let type_arguments =
-                                            clause.child_by_field_name("type_arguments");
-                                        let mut span = crate::span(value);
-                                        if let Some(args) = type_arguments {
-                                            let end = args.end_position();
-                                            span[2] = crate::point(end.row);
-                                            span[3] = crate::point(end.column);
-                                        }
+                                    if let Some(value) = clause.child_by_field_name("value")
+                                        && matches!(
+                                            value.kind(),
+                                            "identifier"
+                                                | "member_expression"
+                                                | "nested_identifier"
+                                        )
+                                    {
                                         out.push(Supertype {
                                             name: text(value, source),
-                                            type_args: type_arguments
+                                            type_args: clause
+                                                .child_by_field_name("type_arguments")
                                                 .map(|a| named_texts(a, source))
                                                 .unwrap_or_default(),
                                             implements: false,
-                                            span,
+                                            span: crate::span(value),
                                         });
                                     }
                                 }
@@ -246,26 +248,41 @@ pub(crate) fn class_constants(
         .collect()
 }
 
-/// A type node (`Foo`, `a.b.Foo`, `Foo<A, B>`, Python `models.Model`) as a supertype.
+/// A type node (`Foo`, `a.b.Foo`, `Foo<A, B>`, `@Tag Foo`, Python `models.Model`) as a
+/// supertype. The span is the name's only (contract M3b amendment 43): a generic type's name
+/// child without its arguments, an annotated type's type without its annotations.
 fn supertype(node: Node<'_>, source: &[u8]) -> Supertype {
-    if node.kind() == "generic_type" {
-        let name = node
-            .named_child(0)
-            .map(|n| text(n, source))
-            .unwrap_or_default();
-        let mut c = node.walk();
-        let type_args = node
-            .named_children(&mut c)
-            .find(|n| n.kind() == "type_arguments")
-            .map(|a| named_texts(a, source))
-            .unwrap_or_default();
-        return Supertype {
-            name,
-            type_args,
-            implements: false,
-            span: crate::span(node),
-        };
+    let mut c = node.walk();
+    match node.kind() {
+        "generic_type" => {
+            let children: Vec<Node<'_>> = node.named_children(&mut c).collect();
+            let name = children.iter().find(|n| n.kind() != "type_arguments");
+            Supertype {
+                name: name.map(|n| text(*n, source)).unwrap_or_default(),
+                type_args: children
+                    .iter()
+                    .find(|n| n.kind() == "type_arguments")
+                    .map(|a| named_texts(*a, source))
+                    .unwrap_or_default(),
+                implements: false,
+                span: crate::span(*name.unwrap_or(&node)),
+            }
+        }
+        "annotated_type" => {
+            let inner = node
+                .named_children(&mut c)
+                .filter(|n| !matches!(n.kind(), "annotation" | "marker_annotation"))
+                .last();
+            match inner {
+                Some(inner) => supertype(inner, source),
+                None => plain_supertype(node, source),
+            }
+        }
+        _ => plain_supertype(node, source),
     }
+}
+
+fn plain_supertype(node: Node<'_>, source: &[u8]) -> Supertype {
     Supertype {
         name: text(node, source),
         type_args: Vec::new(),
@@ -591,7 +608,7 @@ export @Entity({ name: 'orders', schema: 'shop' }) class Order {}
     }
 
     /// An interface's `extends` list names supertypes (contract M3b amendment 28), each with
-    /// the span of its clause item, so the join can resolve it through the occurrence there.
+    /// the span of its name, so the join can resolve it through the occurrence there.
     #[test]
     fn typescript_interfaces_extend_interfaces() {
         let src = "interface Mid extends Base, Other<T> { extra(): void }\nclass Svc implements Mid {}\nclass Sub extends Svc {}\n";
@@ -600,11 +617,6 @@ export @Entity({ name: 'orders', schema: 'shop' }) class Order {}
             ["Mid: Base Other<T>", "Svc: Mid", "Sub: Svc"]
         );
         let f = extract(Language::TypeScript, src.as_bytes()).unwrap();
-        fn at(src: &str, line: usize, token: &str) -> crate::Span {
-            let col = src.lines().nth(line).unwrap().find(token).unwrap() as i32;
-            let line = line as i32;
-            [line, col, line, col + token.len() as i32]
-        }
         let spans: Vec<(String, bool, crate::Span)> = f
             .definitions
             .iter()
@@ -615,27 +627,81 @@ export @Entity({ name: 'orders', schema: 'shop' }) class Order {}
             spans,
             [
                 ("Base".into(), false, at(src, 0, "Base")),
-                ("Other".into(), false, at(src, 0, "Other<T>")),
+                ("Other".into(), false, at(src, 0, "Other")),
                 ("Mid".into(), true, at(src, 1, "Mid")),
                 ("Svc".into(), false, at(src, 2, "Svc")),
             ]
         );
-        // Java: the span covers the qualified or generic type as written.
-        let java =
-            "package p;\nclass A extends a.Base implements Repo<List<String>>, Outer.Listener {}\n";
+    }
+
+    /// `line`'s first `token` as a span.
+    fn at(src: &str, line: usize, token: &str) -> crate::Span {
+        let col = src.lines().nth(line).unwrap().find(token).unwrap() as i32;
+        let line = line as i32;
+        [line, col, line, col + token.len() as i32]
+    }
+
+    /// Contract M3b amendment 43: a supertype's span is its name only, the qualified name as
+    /// written, without type arguments (`Marker<Marker.Disc>` → `Marker`) and without type-use
+    /// annotations (`@Tag Shape` → `Shape`); a TypeScript `extends` value that is not a name
+    /// (`mixin(Abs)`) declares no supertype.
+    #[test]
+    fn supertype_spans_cover_the_name_only() {
+        let java = "package p;\nclass Face extends Marker<Marker.Disc> implements @Tag Shape, a.b.Outer.Inner, Repo<List<String>> {}\n";
         let f = extract(Language::Java, java.as_bytes()).unwrap();
-        let spans: Vec<(String, crate::Span)> = f.definitions[0]
+        let spans: Vec<(String, Vec<String>, crate::Span)> = f.definitions[0]
             .supertypes
             .iter()
-            .map(|s| (s.name.clone(), s.span))
+            .map(|s| (s.name.clone(), s.type_args.clone(), s.span))
             .collect();
         assert_eq!(
             spans,
             [
-                ("a.Base".into(), at(java, 1, "a.Base")),
-                ("Repo".into(), at(java, 1, "Repo<List<String>>")),
-                ("Outer.Listener".into(), at(java, 1, "Outer.Listener")),
+                (
+                    "Marker".into(),
+                    vec!["Marker.Disc".into()],
+                    at(java, 1, "Marker")
+                ),
+                ("Shape".into(), vec![], at(java, 1, "Shape")),
+                (
+                    "a.b.Outer.Inner".into(),
+                    vec![],
+                    at(java, 1, "a.b.Outer.Inner")
+                ),
+                (
+                    "Repo".into(),
+                    vec!["List<String>".into()],
+                    at(java, 1, "Repo")
+                ),
             ]
+        );
+        let ts = "class A extends Base<Base.Options> implements NS.Inner, Other<T> {}\nclass B extends NS.Base {}\nclass C extends mixin(Abs) {}\nclass D extends (Abs) {}\n";
+        let f = extract(Language::TypeScript, ts.as_bytes()).unwrap();
+        let spans: Vec<(String, String, Vec<String>, crate::Span)> = f
+            .definitions
+            .iter()
+            .flat_map(|d| d.supertypes.iter().map(move |s| (d.name.clone(), s)))
+            .map(|(d, s)| (d, s.name.clone(), s.type_args.clone(), s.span))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                (
+                    "A".into(),
+                    "Base".into(),
+                    vec!["Base.Options".into()],
+                    at(ts, 0, "Base")
+                ),
+                ("A".into(), "NS.Inner".into(), vec![], at(ts, 0, "NS.Inner")),
+                (
+                    "A".into(),
+                    "Other".into(),
+                    vec!["T".into()],
+                    at(ts, 0, "Other")
+                ),
+                ("B".into(), "NS.Base".into(), vec![], at(ts, 1, "NS.Base")),
+            ],
+            "`C extends mixin(Abs)` and `D extends (Abs)` declare no supertype"
         );
     }
 }

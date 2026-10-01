@@ -8,6 +8,11 @@ use std::time::Duration;
 use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_JAVA_IMAGE, SCIP_TYPESCRIPT_IMAGE};
 use crate::runner::{ContainerRun, Network, Outcome, Runner};
 
+/// The fetch and index recipe, part of every index's cache key (contract M3b amendment 47).
+/// Bump it whenever the container commands, the images' invocation or the export rules change:
+/// an index produced by another recipe is then a cache miss, never served as "cached".
+pub const RECIPE: &str = "m3b-2";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Ok,
@@ -25,7 +30,9 @@ pub enum RunStatus {
     Skipped(String),
     /// The container runtime failed rather than the project's build (the `docker` client could
     /// not start, or exited 125, 126 or 127: daemon error, command not invokable or not found;
-    /// contract M3b amendment 30). Not cached; the reason is the stderr tail.
+    /// contract M3b amendment 30). Not cached. The reason is the first line of the client's
+    /// text with absolute paths redacted (amendment 49); the run's `stderr_tail` keeps the
+    /// whole text for the terminal.
     Environment(String),
 }
 
@@ -134,10 +141,9 @@ pub fn image_for(job: &Job) -> &'static str {
 pub struct Images {
     /// scip-java: the local image's ID (it has no registry digest), or the user-facing reason
     /// its jobs are `unsupported`: the image is absent, and nothing builds it implicitly.
+    /// scip-typescript needs no field: its jobs run by, cache under and are identified by the
+    /// pinned digest reference (Docker pulls it when absent; contract M3b amendment 48).
     pub java: Result<String, String>,
-    /// scip-typescript: the pinned image's ID when it is present. Its jobs run by and cache
-    /// under the digest reference either way (Docker pulls it when absent).
-    pub typescript: Option<String>,
 }
 
 impl Images {
@@ -149,7 +155,6 @@ impl Images {
                      docker/scip-java/README.md describes"
                 )
             }),
-            typescript: runner.image_id(SCIP_TYPESCRIPT_IMAGE),
         }
     }
 
@@ -159,7 +164,6 @@ impl Images {
             java: Err(format!(
                 "scip-java: image {SCIP_JAVA_IMAGE} was not looked up"
             )),
-            typescript: None,
         }
     }
 
@@ -173,13 +177,13 @@ impl Images {
         }
     }
 
-    /// The identity recorded per indexer: the image ID, or `absent`.
+    /// The identity recorded per indexer: the digest reference of a pinned image, the image ID
+    /// of the locally built one, or `absent`.
     pub fn identity(&self, indexer: Indexer) -> &str {
-        let id = match indexer {
-            Indexer::ScipJava => self.java.as_deref().ok(),
-            Indexer::ScipTypescript => self.typescript.as_deref(),
-        };
-        id.unwrap_or("absent")
+        match indexer {
+            Indexer::ScipJava => self.java.as_deref().unwrap_or("absent"),
+            Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
+        }
     }
 }
 
@@ -267,13 +271,42 @@ pub fn run_job(
 /// the command could not be invoked, the command was not found).
 const DOCKER_CLIENT_EXIT_CODES: [i32; 3] = [125, 126, 127];
 
-fn environment(reason: String, started: std::time::Instant) -> ScipRun {
+fn environment(text: String, started: std::time::Instant) -> ScipRun {
     ScipRun {
-        status: RunStatus::Environment(reason.trim().to_owned()),
+        status: RunStatus::Environment(redact_host_paths(&text)),
         index: None,
-        stderr_tail: String::new(),
+        stderr_tail: text.trim().to_owned(),
         elapsed: started.elapsed(),
     }
+}
+
+/// The first non-empty line of a docker client's text with every absolute path replaced by
+/// `<host path>`, so the stored reason names no host (contract M3b amendment 49). A path is a
+/// `/` that starts a token or follows a `scheme://` (`unix:///Users/…/docker.sock`), a quote,
+/// `=` or `(`, up to the token's end; closing punctuation after it is kept.
+pub fn redact_host_paths(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    line.split(' ')
+        .map(|token| {
+            let start = token.match_indices('/').map(|(i, _)| i).find(|&i| {
+                i == 0
+                    || token[..i].ends_with("://")
+                    || matches!(token.as_bytes()[i - 1], b'\'' | b'"' | b'=' | b'(')
+            });
+            match start {
+                Some(i) => {
+                    let kept = token.trim_end_matches(['.', ',', ':', ';', ')', '\'', '"']);
+                    format!("{}<host path>{}", &token[..i], &token[kept.len().max(i)..])
+                }
+                None => token.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn finished(
@@ -346,12 +379,15 @@ fn typescript_runs(
         args: Vec::new(),
     };
     // Type indexing needs no lifecycle scripts, and the fetch phase runs the project's own code
-    // otherwise (contract M3b amendment 27).
+    // otherwise (contract M3b amendment 27). No log file: a failed install would otherwise end
+    // its stderr with a timestamped log path, which is not a function of the commit
+    // (amendment 46).
     let quiet = [
         "--no-audit",
         "--no-fund",
         "--loglevel=error",
         "--ignore-scripts",
+        "--logs-max=0",
     ];
     let (entrypoint, args): (&str, Vec<String>) = match job.fetch {
         Fetch::Npm {
@@ -617,8 +653,8 @@ mod tests {
         );
         assert_eq!(
             images.identity(Indexer::ScipTypescript),
-            "absent",
-            "the fake has no scip-typescript image"
+            SCIP_TYPESCRIPT_IMAGE,
+            "a pinned image is identified by its digest reference, without a lookup"
         );
         assert_eq!(images.identity(Indexer::ScipJava), JAVA_ID);
         let run = run_job(
@@ -986,8 +1022,9 @@ mod tests {
         out
     }
 
-    /// Contract M3b amendment 27: the fetch phase installs packages without their lifecycle
-    /// scripts, for every lockfile kind.
+    /// Contract M3b amendments 27 and 46: the fetch phase installs packages without their
+    /// lifecycle scripts, for every lockfile kind, and npm writes no log file (its path is
+    /// timestamped and would end a failed job's stderr tail).
     #[test]
     fn npm_fetches_run_without_lifecycle_scripts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1021,7 +1058,66 @@ mod tests {
                 "{lockfile:?}: {:?}",
                 fetch.args
             );
+            assert_eq!(
+                fetch.args.iter().any(|a| a == "--logs-max=0"),
+                entrypoint == "/usr/local/bin/actual-npm",
+                "{lockfile:?}: {:?}",
+                fetch.args
+            );
         }
+    }
+
+    /// Contract M3b amendment 49: an `environment` reason is the first line of the docker
+    /// client's text with absolute paths redacted, so the dump names no host; the run's
+    /// `stderr_tail` keeps the whole text for the terminal.
+    #[test]
+    fn environment_reasons_name_no_host_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text = "Cannot connect to the Docker daemon at unix:///Users/rohit/.colima/default/docker.sock. Is the docker daemon running?\nSee '/usr/local/bin/docker --help'.";
+        let fake = Fake {
+            fetch_outcome: Some(Ok(Outcome {
+                exit_code: Some(125),
+                timed_out: false,
+                stderr_tail: text.into(),
+                elapsed: Duration::from_millis(1),
+            })),
+            ..Fake::new(false, false)
+        };
+        let run = run_job(
+            &ts_job(NodeLock::PackageLock),
+            SCIP_TYPESCRIPT_IMAGE,
+            &files(),
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &fake,
+        )
+        .unwrap();
+        let reason = run.status.reason().unwrap();
+        assert_eq!(
+            reason,
+            "Cannot connect to the Docker daemon at unix://<host path>. Is the docker daemon running?"
+        );
+        assert!(!reason.contains("/Users") && !reason.contains("unix:///"));
+        assert_eq!(run.stderr_tail, text, "the terminal gets the whole text");
+        assert_eq!(
+            redact_host_paths(
+                "\n docker: Error response from daemon: No such image: sha256:0000\n\nRun 'docker run --help' for more information"
+            ),
+            "docker: Error response from daemon: No such image: sha256:0000"
+        );
+        assert_eq!(
+            redact_host_paths(
+                "starting docker: /Users/x/bin/docker: No such file or directory (os error 2)"
+            ),
+            "starting docker: <host path>: No such file or directory (os error 2)"
+        );
+        assert_eq!(
+            redact_host_paths(
+                "See '/usr/local/bin/docker --help' (DOCKER_HOST=unix:///var/run/docker.sock)."
+            ),
+            "See '<host path> --help' (DOCKER_HOST=unix://<host path>)."
+        );
     }
 
     /// Contract M3b amendments 30 and 31: a `docker run` that the client or daemon refused

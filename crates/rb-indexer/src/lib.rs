@@ -116,10 +116,9 @@ pub fn index_commit(
         .filter_map(Result::transpose)
         .collect::<anyhow::Result<_>>()?;
     let docker = rb_scip::DockerRunner::default();
-    let mode = match &scip.mode {
-        ScipMode::Off => projects::Mode::Skip("SCIP disabled (--no-scip)".into()),
-        ScipMode::Unavailable(reason) => projects::Mode::Skip(reason.clone()),
-        ScipMode::On => projects::Mode::Run(&docker),
+    let mode = match scip.mode.skip_reason() {
+        None => projects::Mode::Run(&docker),
+        Some(reason) => projects::Mode::Skip(reason.into()),
     };
     if let projects::Mode::Run(_) = mode {
         std::fs::create_dir_all(&scip.work_dir)?;
@@ -426,10 +425,12 @@ pub fn assemble(
 }
 
 /// One `scip_status` diagnostic per job (contract M3b S9). Its detail is a function of the
-/// commit and the cache, never of this run: whether the index was served from the cache and
-/// how long the container ran are reported by `rb index`, not recorded here (design §3.3 rule
-/// 4: wall-clock time never enters the graph), so fresh runs and warm re-indexes dump
-/// byte-identically (amendment 32).
+/// commit and the cache, never of this run or this host: whether the index was served from the
+/// cache and how long the container ran are reported by `rb index`, not recorded here (design
+/// §3.3 rule 4: wall-clock time never enters the graph), so fresh runs and warm re-indexes dump
+/// byte-identically (amendment 32); the `stderr_tail` is recorded for a `failed` or `timeout`
+/// job (the build tool's text) and not for an `environment` one, whose text is the docker
+/// client's and names the host (its redacted first line is the `reason`; amendment 49).
 fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic {
     let mut detail = json!({
         "indexer": p.indexer,
@@ -458,9 +459,14 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "files_without_document": c.files_without_document,
             "supertypes_unresolved": c.supertypes_unresolved,
             "occurrences_unconverted": c.occurrences_unconverted,
+            "relationships_dropped": c.relationships_dropped,
         });
     }
-    if p.status != rb_scip::RunStatus::Ok && !p.stderr_tail.is_empty() {
+    if matches!(
+        p.status,
+        rb_scip::RunStatus::Failed | rb_scip::RunStatus::Timeout { .. }
+    ) && !p.stderr_tail.is_empty()
+    {
         detail["stderr_tail"] = p.stderr_tail.as_str().into();
     }
     Diagnostic {
@@ -1055,6 +1061,33 @@ mod tests {
             !g.nodes().iter().any(|n| n.key == nested_sym("h")),
             "the outer index's document for the nested file was used"
         );
+    }
+
+    /// Contract M3b amendment 49: an `environment` job's diagnostic carries the redacted
+    /// reason only; the docker client's whole text (which names the host) stays out of the
+    /// dump, while a failed build's stderr tail is recorded.
+    #[test]
+    fn scip_status_records_no_environment_detail() {
+        let mut project = ok_project("", "scip-java", vec![]);
+        project.index = None;
+        project.status = rb_scip::RunStatus::Environment(
+            "Cannot connect to the Docker daemon at unix://<host path>. Is the docker daemon running?".into(),
+        );
+        project.stderr_tail =
+            "Cannot connect to the Docker daemon at unix:///Users/rohit/.colima/default/docker.sock. Is the docker daemon running?".into();
+        let d = scip_status(&project, None);
+        assert_eq!(d.detail["status"], "environment");
+        assert_eq!(
+            d.detail["reason"],
+            "Cannot connect to the Docker daemon at unix://<host path>. Is the docker daemon running?"
+        );
+        assert!(d.detail.get("stderr_tail").is_none(), "{}", d.detail);
+        assert!(!d.detail.to_string().contains("/Users"), "{}", d.detail);
+
+        project.status = rb_scip::RunStatus::Failed;
+        project.stderr_tail = "[ERROR] boom".into();
+        let d = scip_status(&project, None);
+        assert_eq!(d.detail["stderr_tail"], "[ERROR] boom");
     }
 
     #[test]

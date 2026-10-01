@@ -198,6 +198,17 @@ Findings from the research step (2026-09-29):
       - [x] Phase D (e2e, fixtures, goldens): F16 `copy_dir` from `git ls-files` + file-set assertion; F9 fixture line and span assertion; F10 `--no-cache` steps (polyglot: failed jobs' stderr tails excluded, amendment 34); F8 two fresh runs byte-identical, `mask_elapsed_ms` gone; F5 shim test; goldens re-blessed by container runs (14 e2e tests green on Docker Desktop).
       - [x] Phase E: public repos (petclinic with its wrapper, class-validator), precision samples, docs (contract, README, design §5.2/§5.3/§13/§14, IMPLEMENT.md, CHANGELOG.md, lessons), verification loop, cleanup of `var/fix-pass3/`, commit.
     - [x] Commit (pass 3).
+    - [x] Evaluator pass 4 (test-first, one amendment each, 43–52; `tasks/eval-m3b-pass4.md`):
+      - [x] G1/G3 name-span supertypes: `Supertype.span` is the type's name only (Java `generic_type` name child, `annotated_type` inner type; TS `extends_clause.value`, non-name values yield nothing); `declared_supertypes` takes the last type occurrence inside the name span; units `supertype_spans_cover_the_name_only`, `a_nested_type_argument_is_not_the_supertype`, `an_annotated_supertype_resolves_to_the_type`; J1/T1 kept.
+      - [x] G2 unfinished jobs re-index: `Store::unfinished_scip_jobs`, `rebuild_reason` in `rb index` (`rebuilding: n SCIP jobs did not finish last time`); unit `rebuild_reason_requires_finished_scip_jobs`; e2e `scip_unfinished_jobs_are_not_up_to_date` (shim exit 125, then real docker; `--scip-timeout-secs 1`, then default budget).
+      - [x] G4 `--logs-max=0` on the npm fetch (unit); S12 and invariant 5 restated (amendment 46); polyglot e2e asserts the npm tail is byte-identical between fresh runs.
+      - [x] G5 `rb_scip::RECIPE` (`m3b-2`) mixed into `project_input_hash`; unit `the_recipe_is_part_of_the_key`.
+      - [x] G6 scip-typescript identified by its digest reference; the e2e shim refuses `image inspect` for `rb-scip-java:0.13.1` only; mutation-checked (deleting `tools["scip_java"]` fails the test).
+      - [x] G7 fixed `skipped` reason (`docker is not available`), `environment` reason redacted (`redact_host_paths`), detail on stderr only; units in rb-indexer and rb-scip.
+      - [x] G8 `rb status` prints a timeout's detail once (`scip_status_line_prints_a_timeout_once`).
+      - [x] G9 README "Container runtime" note, `--scip-work-dir` under the home directory; design §5.2.
+      - [x] G10 `relationships_dropped` in coverage and on the `scip:` line (`dropped_relationships_are_counted`); goldens re-blessed by container runs, the Java fixture's 8 identified.
+      - [x] Verify: fmt, clippy, unit tests (awk-summed), e2e twice with containers, stub scan, public repos (petclinic 13 `IMPLEMENTS` read in the source, class-validator), cleanup, commit.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
@@ -208,3 +219,7 @@ Findings from the research step (2026-09-29):
 - All 18 findings fixed test-first (amendments 25–42). The join resolves declared supertypes through the index's own heritage occurrences (J1 no longer yields the reverse exact edge; T1 chains through a TypeScript interface); the export leaves Maven/Gradle wrappers out, so spring-petclinic indexes with its `mvnw` present on Docker Desktop.
 - Found while verifying: a failed job's `stderr_tail` is not a function of the commit (Maven's negative-cache wording, npm's timestamped log path), so the polyglot fresh-run comparison excludes those two fields (amendment 34). `--ignore-scripts` leaves Prisma's client ungenerated, which moves one TypeScript reference from `undocumented` to `local` (amendment 27).
 - Environment: the Docker CLI's current context was `colima` (a dead socket); every container step ran with `DOCKER_CONTEXT=desktop-linux` and nothing touched the context setting.
+
+## Review (evaluator pass 4)
+- All ten findings fixed test-first (amendments 43–52). A declared supertype's span is now its name only and resolves to the last type occurrence inside it, so a nested type argument (`Marker<Marker.Disc>`) or a type-use annotation (`@Tag Shape`) no longer picks the wrong type; a snapshot whose SCIP jobs did not all finish is rebuilt by the next plain run; the fetch recipe is part of the index cache key.
+- Found while verifying: a session slip — `git checkout -- <file>` to undo a temporary trace discarded the file's uncommitted work; it was restored from the diff recorded in the session transcript and verified by the file's test suite and the unchanged diff stat (lesson recorded).

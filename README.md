@@ -51,14 +51,25 @@ docker build -t rb-scip-java:0.13.1 docker/scip-java      # slim local scip-java
 docker pull --platform linux/amd64 sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845
 ```
 
-Each job exports the project's files, runs a fetch phase on Docker's default bridge network (`mvn … go-offline` and the build, or `npm ci --ignore-scripts`; no credentials, no host toolchains), then indexes with `--network none`. Indexes are cached in the database by `(project input hash, image)`, so an unchanged project runs no container. Without Docker or an image the project stays heuristic and `rb status` says so (`scip: … skipped`/`unsupported`); the images' identities are part of the snapshot's tool configuration, so such a snapshot is rebuilt once they exist.
+Each job exports the project's files, runs a fetch phase on Docker's default bridge network (`mvn … go-offline` and the build, or `npm ci --ignore-scripts --logs-max=0`; no credentials, no host toolchains), then indexes with `--network none`. Indexes are cached in the database by `(project input hash, image)`; the input hash covers the project's blobs and the fetch recipe (`rb_scip::RECIPE`), so an unchanged project runs no container and an index from an older recipe is never served. Without Docker or an image the project stays heuristic and `rb status` says so (`scip: … skipped`/`unsupported`); the images' identities are part of the snapshot's tool configuration, and a snapshot whose jobs did not all finish (`skipped`, `unsupported`, `environment`, `timeout`) is never "up to date" while SCIP is on, so the next `rb index` tries again (`rebuilding: n SCIP jobs did not finish last time`).
 
 | Flag | Meaning |
 |---|---|
 | `--no-scip` | run no indexer; every project is heuristic (a different tool configuration from a run with indexers) |
-| `--scip-work-dir <dir>` (`RB_SCIP_WORK_DIR`, default `var/scip`) | exports and package caches; must be a path the container runtime can bind-mount |
+| `--scip-work-dir <dir>` (`RB_SCIP_WORK_DIR`, default `var/scip`) | exports and package caches; must lie under the home directory (the path the runtime's VM shares, see below) |
 | `--scip-timeout-secs <n>` | budget per phase (defaults 600 s fetch, 900 s index); a run over it is killed and reported as `timeout`, not cached |
 | `--no-cache` | also re-run every SCIP job and replace its cached outcome |
+
+#### Container runtime
+
+`rb` talks to whatever daemon the Docker CLI's **current context** selects (`docker context show`), and the two images must exist in that daemon. Docker Desktop (`desktop-linux`) is the runtime of record: the e2e tests, the goldens and the public-repo measurements were made on it. If `docker context show` prints something else (another runtime such as colima holds neither image and would let `docker run` pull scip-typescript into its own VM), run `rb` with `DOCKER_CONTEXT=desktop-linux` in the environment, or switch once with `docker context use desktop-linux`. Then, in that context:
+
+```sh
+docker build -t rb-scip-java:0.13.1 docker/scip-java      # slim scip-java image (docker/scip-java/README.md); absent → `unsupported`
+docker pull --platform linux/amd64 sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845
+```
+
+Bind mounts come from the directories the runtime shares with its VM, the home directory by default, so `--scip-work-dir` (default `var/scip` under the project) must stay under it; a work directory elsewhere (`/tmp`) mounts as an empty directory inside the container.
 
 ## Development
 

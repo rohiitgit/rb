@@ -1,6 +1,6 @@
   code: 50.0% of references to own code resolved (2 resolved, 0 ambiguous, 2 unresolved; 6 external); 1 exact calls (scip)
   scip: apps/web scip-typescript failed unpinned
-  scip: packages/shared scip-typescript ok unpinned, definitions matched 1/1 (0 by name), references matched 0, external 0, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0
-  scip: services/auth scip-java ok, definitions matched 9/9 (1 by name), references matched 1, external 3, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0
+  scip: packages/shared scip-typescript ok unpinned, definitions matched 1/1 (0 by name), references matched 0, external 0, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0, relationships dropped 0
+  scip: services/auth scip-java ok, definitions matched 9/9 (1 by name), references matched 1, external 3, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0, relationships dropped 0
   scip: services/broken scip-java failed
-  scip: services/notification scip-typescript ok unpinned, definitions matched 0/0 (0 by name), references matched 0, external 0, undocumented 0, local 2, unanchored 0, unmatched 5, unconverted 0
+  scip: services/notification scip-typescript ok unpinned, definitions matched 0/0 (0 by name), references matched 0, external 0, undocumented 0, local 2, unanchored 0, unmatched 5, unconverted 0, relationships dropped 0

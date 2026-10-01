@@ -942,10 +942,39 @@ fn scip_status_lines(url: &str, name: &str) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-/// Contract M3b amendment 29: the indexer images' identities are part of the snapshot's tool
-/// configuration. With a `docker` shim on `PATH` whose `image inspect` fails (everything else
-/// reaches the real client), the Java fixture indexes with scip-java `unsupported` and a
-/// heuristic graph; the same commit with the real `docker` is not "up to date".
+/// A `PATH` whose first `docker` is a shell shim: `refuse` is a shell condition over the
+/// client's arguments (`$1`, `$2`, …, `$*`); when it holds the shim prints `message` on stderr
+/// and exits with `code`, otherwise the real client runs.
+fn docker_shim(dir: &Path, refuse: &str, message: &str, code: i32) -> String {
+    let inherited = std::env::var("PATH").unwrap();
+    let real_docker = inherited
+        .split(':')
+        .map(|dir| Path::new(dir).join("docker"))
+        .find(|p| p.is_file())
+        .expect("docker on PATH");
+    let shim = dir.join("docker");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif {refuse}; then\n  echo '{message}' >&2\n  exit {code}\nfi\nexec '{}' \"$@\"\n",
+            real_docker.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!("{}:{inherited}", dir.display())
+}
+
+/// Contract M3b amendments 29, 44 and 48: the scip-java image's identity is part of the
+/// snapshot's tool configuration. With a `docker` shim on `PATH` whose `image inspect` fails
+/// for `rb-scip-java:0.13.1` only (everything else reaches the real client), the Java fixture
+/// indexes with scip-java `unsupported` and a heuristic graph, and `tool_versions.scip_java`
+/// is `absent`; the same commit with the real `docker` is not "up to date". Deleting
+/// `scip_java` from `tool_versions` makes this test fail: `scip_typescript` is the pinned
+/// digest in both runs, so nothing else distinguishes them.
 #[test]
 fn scip_image_identity_is_part_of_the_tool_configuration() {
     let Some(url) = db_url() else { return };
@@ -960,35 +989,129 @@ fn scip_image_identity_is_part_of_the_tool_configuration() {
         url: &url,
         repos: vec![name.clone()],
     };
-    let inherited = std::env::var("PATH").unwrap();
-    let real_docker = inherited
-        .split(':')
-        .map(|dir| Path::new(dir).join("docker"))
-        .find(|p| p.is_file())
-        .expect("docker on PATH");
     let shim_dir = tempfile::tempdir().unwrap();
-    let shim = shim_dir.path().join("docker");
-    std::fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n  echo 'shim: image inspect refused' >&2\n  exit 1\nfi\nexec '{}' \"$@\"\n",
-            real_docker.display()
+    let shimmed = docker_shim(
+        shim_dir.path(),
+        &format!(
+            "[ \"$1\" = image ] && [ \"$2\" = inspect ] && case \" $* \" in *\" {} \"*) true ;; *) false ;; esac",
+            rb_scip::jobs::SCIP_JAVA_IMAGE
         ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let shimmed = format!("{}:{inherited}", shim_dir.path().display());
+        "shim: image inspect refused",
+        1,
+    );
     let absent = rb_with_path(&url, &["index", path, "--repo", &name], Some(&shimmed));
     assert!(absent.contains("scip: . scip-java unsupported"), "{absent}");
+    let mut store = Store::connect(&url).unwrap();
+    let tools = store.live_snapshot(&name).unwrap().unwrap().tool_versions;
+    assert_eq!(tools["scip_java"], "absent", "{tools}");
+    assert_eq!(
+        tools["scip_typescript"],
+        rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE,
+        "{tools}"
+    );
+    // Amendment 44: an `unsupported` job did not finish, so with the image still absent the
+    // snapshot is rebuilt (cheaply: facts and index caches are warm), not "up to date".
     let again = rb_with_path(&url, &["index", path, "--repo", &name], Some(&shimmed));
-    assert!(again.contains("up to date"), "{again}");
+    assert!(
+        again.contains("rebuilding: 1 SCIP jobs did not finish last time")
+            && again.contains("scip: . scip-java unsupported"),
+        "{again}"
+    );
     let present = rb(&url, &["index", path, "--repo", &name]);
     assert!(
         !present.contains("up to date") && present.contains("scip: . scip-java ok"),
         "{present}"
+    );
+    let tools = store.live_snapshot(&name).unwrap().unwrap().tool_versions;
+    assert!(
+        tools["scip_java"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("sha256:")),
+        "{tools}"
+    );
+    assert!(
+        rb(&url, &["index", path, "--repo", &name]).contains("up to date"),
+        "every job finished"
+    );
+}
+
+/// Contract M3b amendment 44: a snapshot whose SCIP jobs did not all finish is never "up to
+/// date". With a `docker` shim that refuses `run` (exit 125), the Java fixture's job (run with
+/// `--no-cache`, since the index cache outlives test runs) is `environment` and nothing is
+/// cached; the next plain run with the real `docker` rebuilds and the job is `ok`. A
+/// `--scip-timeout-secs 1` run leaves a `timeout`; the next default-budget run rebuilds and
+/// serves the index from the cache.
+#[test]
+fn scip_unfinished_jobs_are_not_up_to_date() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let repo = fixture_repo("java-spring-jpa");
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipunf_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let shim_dir = tempfile::tempdir().unwrap();
+    let shimmed = docker_shim(
+        shim_dir.path(),
+        "[ \"$1\" = run ]",
+        "shim: docker run refused for /Users/nobody/sock",
+        125,
+    );
+    let refused = rb_with_path(
+        &url,
+        &["index", path, "--repo", &name, "--no-cache"],
+        Some(&shimmed),
+    );
+    assert!(
+        refused.contains("scip: . scip-java environment")
+            && refused.contains(": shim: docker run refused for <host path>"),
+        "{refused}"
+    );
+    // Amendment 49: the stored reason names no host path.
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    assert!(
+        dump.contains("\"reason\":\"shim: docker run refused for <host path>\"")
+            && !dump.contains("/Users/nobody"),
+        "{dump}"
+    );
+    let rebuilt = rb(&url, &["index", path, "--repo", &name]);
+    assert!(
+        rebuilt.contains("rebuilding: 1 SCIP jobs did not finish last time")
+            && rebuilt.contains("scip: . scip-java ok"),
+        "{rebuilt}"
+    );
+    assert!(
+        rb(&url, &["index", path, "--repo", &name]).contains("up to date"),
+        "every job finished"
+    );
+
+    let timed_out = rb(
+        &url,
+        &[
+            "index",
+            path,
+            "--repo",
+            &name,
+            "--force",
+            "--no-cache",
+            "--scip-timeout-secs",
+            "1",
+        ],
+    );
+    assert!(
+        timed_out.contains("scip: . scip-java timeout") && timed_out.contains("1 s budget)"),
+        "{timed_out}"
+    );
+    let rebuilt = rb(&url, &["index", path, "--repo", &name]);
+    assert!(
+        rebuilt.contains("rebuilding: 1 SCIP jobs did not finish last time")
+            && rebuilt.contains("scip: . scip-java ok (cached"),
+        "{rebuilt}"
     );
 }
 
@@ -1278,11 +1401,12 @@ fn scip_polyglot_monorepo() {
             && !fresh.contains("(cached"),
         "{fresh}"
     );
-    // A failed job's `stderr_tail` is the build tool's text, not a function of the commit:
-    // Maven's wording depends on the shared `.m2` negative cache ("was not found … during a
-    // previous attempt" against "Could not find artifact"), and npm's tail names a timestamped
-    // log file. Everything else in the two dumps is byte-identical, and both tails carry the
-    // same resolution summary.
+    // A failed job's `stderr_tail` is the build tool's text, not a function of the commit
+    // (amendment 46): Maven's wording depends on the shared `.m2` negative cache ("was not
+    // found … during a previous attempt" against "Could not find artifact", whose entries
+    // expire daily). Everything else in the two dumps is byte-identical, both Maven tails carry
+    // the same resolution summary, and npm's tail, which `--logs-max=0` keeps free of its
+    // timestamped log path, is byte-identical.
     let fresh_dump = rb(&url, &["dump", "--repo", &name]);
     let (fresh_rows, fresh_tails) = without_failed_stderr(&fresh_dump);
     let (rows, tails) = without_failed_stderr(&dump);
@@ -1294,6 +1418,12 @@ fn scip_polyglot_monorepo() {
             && tails["services/broken"]
                 .contains("The following artifacts could not be resolved: com.acme:nope:jar:0.0.0"),
         "{fresh_tails:?}"
+    );
+    assert_eq!(fresh_tails["apps/web"], tails["apps/web"]);
+    assert!(
+        !fresh_tails["apps/web"].contains("_logs"),
+        "{}",
+        fresh_tails["apps/web"]
     );
 }
 

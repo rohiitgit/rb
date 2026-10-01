@@ -15,7 +15,7 @@ pub mod hash;
 pub use hash::project_input_hash;
 pub mod orchestrate;
 
-pub use orchestrate::{Budget, Images, Phase, RunStatus, ScipRun, image_for, run_job};
+pub use orchestrate::{Budget, Images, Phase, RECIPE, RunStatus, ScipRun, image_for, run_job};
 pub mod symbol;
 
 pub use symbol::{Package, last_descriptor_name, package, type_symbol_of};

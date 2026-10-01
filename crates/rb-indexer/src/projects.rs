@@ -75,6 +75,17 @@ impl ScipMode {
             ScipMode::On => "on",
         }
     }
+
+    /// The `skipped` reason every job records when no job runs, `None` when they run. Fixed
+    /// text: the detailed Docker error names the host's socket path and is printed by `rb
+    /// index` only, never stored (contract M3b amendment 49).
+    pub fn skip_reason(&self) -> Option<&'static str> {
+        match self {
+            ScipMode::Off => Some("SCIP disabled (--no-scip)"),
+            ScipMode::Unavailable(_) => Some("docker is not available"),
+            ScipMode::On => None,
+        }
+    }
 }
 
 /// How SCIP jobs run for one `index_commit`.
@@ -622,6 +633,23 @@ mod tests {
         assert!(!ran[0].cached && ran[0].status == RunStatus::Ok);
         assert_eq!(*fine.runs.borrow(), 4, "the stale row was not served");
         assert_eq!(cache.puts, 2, "the row is replaced");
+    }
+
+    /// Contract M3b amendment 49: the stored `skipped` reason is fixed text; the Docker error
+    /// behind `Unavailable` (which names the host's socket) is not stored.
+    #[test]
+    fn skip_reasons_name_no_host() {
+        let unavailable = ScipMode::Unavailable(
+            "docker is not available: Cannot connect to the Docker daemon at unix:///Users/rohit/.colima/default/docker.sock. Is the docker daemon running?".into(),
+        );
+        let reason = unavailable.skip_reason().unwrap();
+        assert_eq!(reason, "docker is not available");
+        assert!(!reason.contains("/Users") && !reason.contains("unix://"));
+        assert_eq!(
+            ScipMode::Off.skip_reason(),
+            Some("SCIP disabled (--no-scip)")
+        );
+        assert_eq!(ScipMode::On.skip_reason(), None);
     }
 
     #[test]

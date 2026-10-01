@@ -105,6 +105,11 @@ pub(crate) struct Coverage {
     /// decoder had no line text to convert them with (contract M3b amendment 33); non-zero
     /// means the spans above may be off on non-ASCII lines.
     pub occurrences_unconverted: usize,
+    /// `is_implementation` relationships that gave no edge because their source or target
+    /// symbol has no matched project definition (a local class expression, a field, an
+    /// external type; contract M3b amendment 52). Relationships the direction rule rejects
+    /// (the reverse side of an override) are not dropped: their forward twin is the edge.
+    pub relationships_dropped: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -321,12 +326,17 @@ pub(crate) fn join(
             definition_of.entry(symbol.as_str()).or_insert(*i);
         }
         for s in &doc.symbols {
+            let implementations = s.relationships.iter().filter(|r| r.is_implementation);
+            // A source without a matched definition (a local class expression, a field) has no
+            // node to start an edge from: its relationships are dropped and counted.
             let Some(&i) = definition_of.get(s.symbol.as_str()) else {
+                out.coverage.relationships_dropped += implementations.count();
                 continue;
             };
             let holder = (di, type_holder(facts, i));
-            for rel in s.relationships.iter().filter(|r| r.is_implementation) {
+            for rel in implementations {
                 if !nodes.contains(rel.symbol.as_str()) {
+                    out.coverage.relationships_dropped += 1;
                     continue;
                 }
                 let targets = rb_scip::type_symbol_of(&rel.symbol)
@@ -384,13 +394,15 @@ fn is_type(d: &rb_syntax::Definition) -> bool {
 }
 
 /// The SCIP symbol each declared supertype of `d` names, resolved through the index's own
-/// occurrences (contract M3b amendment 26): inside the clause item's span, the earliest-starting
-/// reference occurrence whose symbol is a type (its descriptor ends with `#`), replaced by a
-/// later one in the same span whose symbol extends it (`Outer#` then `Outer#Listener#` for
-/// `Outer.Listener`). A namespace occurrence at a qualifier (`a/` in `a.Circle`) and the type
-/// arguments of a generic supertype (`List#`, `String#` in `Repo<List<String>>`) are passed
-/// over. `None` when the span holds no type occurrence: the indexer did not say which type is
-/// meant, and nothing is guessed.
+/// occurrences (contract M3b amendments 26 and 43): the last reference occurrence inside the
+/// supertype's name span whose symbol is a type (its descriptor ends with `#`). The name span
+/// holds the qualified name only, so a qualifier's namespace occurrence (`a/` in `a.Circle`) is
+/// passed over as not a type, an outer type's occurrence gives way to the nested type after it
+/// (`Outer#` then `Outer#Inner#` for `Outer.Inner`; scip-typescript's `NS#`, `NS/` then
+/// `NS/Inner#` for a namespace-merged class), and type arguments (`Marker.Disc` in
+/// `Marker<Marker.Disc>`) and type-use annotations lie outside the span. `None` when the span
+/// holds no type occurrence: the indexer did not say which type is meant, and nothing is
+/// guessed.
 fn declared_supertypes(
     d: &rb_syntax::Definition,
     by_span: &BTreeMap<Span, Vec<&rb_scip::Occurrence>>,
@@ -400,22 +412,14 @@ fn declared_supertypes(
         .map(|s| {
             let start: Span = [s.span[0], s.span[1], i32::MIN, i32::MIN];
             let end: Span = [s.span[2], s.span[3], i32::MAX, i32::MAX];
-            let mut resolved: Option<&str> = None;
-            for o in by_span
+            by_span
                 .range(start..=end)
                 .filter(|(span, _)| (span[2], span[3]) <= (s.span[2], s.span[3]))
                 .flat_map(|(_, os)| os.iter().copied())
-            {
-                if o.is_definition() || o.symbol.starts_with("local ") || !o.symbol.ends_with('#') {
-                    continue;
-                }
-                match resolved {
-                    None => resolved = Some(&o.symbol),
-                    Some(outer) if o.symbol.starts_with(outer) => resolved = Some(&o.symbol),
-                    Some(_) => {}
-                }
-            }
-            resolved.map(str::to_owned)
+                .rfind(|o| {
+                    !o.is_definition() && !o.symbol.starts_with("local ") && o.symbol.ends_with('#')
+                })
+                .map(|o| o.symbol.clone())
         })
         .collect()
 }
@@ -611,6 +615,7 @@ mod tests {
                 files_without_document: 0,
                 supertypes_unresolved: 0,
                 occurrences_unconverted: 0,
+                relationships_dropped: 0,
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -833,10 +838,62 @@ mod tests {
         files: &[(&str, &str)],
         relationships: &[(&str, &str)],
     ) -> Vec<String> {
-        let prefix = match language {
+        implements_lines(
+            language,
+            &hierarchy_joined(language, files, relationships, &[]),
+        )
+    }
+
+    /// The `Implements` edges of a join, without the symbol prefix.
+    fn implements_lines(language: Language, joined: &Joined) -> Vec<String> {
+        edge_lines(joined)
+            .into_iter()
+            .filter(|l| l.contains(" Implements "))
+            .map(|l| l.replace(symbol_prefix(language), ""))
+            .collect()
+    }
+
+    fn symbol_prefix(language: Language) -> &'static str {
+        match language {
             Language::Java => "scip-java maven . . ",
             _ => "scip-typescript npm t1 1.0.0 ",
-        };
+        }
+    }
+
+    /// A type's symbol: nested types carry their outer type (`b/Marker#Disc#`), methods their
+    /// type (`b/Marker#Disc#area().`).
+    fn symbol_in(
+        prefix: &str,
+        scope: &str,
+        f: &FileFacts,
+        d: &rb_syntax::Definition,
+    ) -> Option<String> {
+        let outer = d.parent.map(|p| &f.definitions[p]);
+        match d.kind {
+            rb_syntax::DefKind::Class | rb_syntax::DefKind::Interface => {
+                match outer.and_then(|o| symbol_in(prefix, scope, f, o)) {
+                    Some(outer) => Some(format!("{outer}{}#", d.name)),
+                    None => Some(format!("{prefix}{scope}/{}#", d.name)),
+                }
+            }
+            rb_syntax::DefKind::Method => {
+                let outer = symbol_in(prefix, scope, f, outer?)?;
+                Some(format!("{outer}{}().", d.name))
+            }
+            _ => None,
+        }
+    }
+
+    /// The join of the synthetic index described at [`hierarchy`], plus `extra` reference
+    /// occurrences `(path, span, symbol without the prefix)` for what the helper does not
+    /// emit (type arguments, annotations).
+    fn hierarchy_joined(
+        language: Language,
+        files: &[(&str, &str)],
+        relationships: &[(&str, &str)],
+        extra: &[(&str, Span, &str)],
+    ) -> Joined {
+        let prefix = symbol_prefix(language);
         let facts: Vec<(String, FileFacts)> = files
             .iter()
             .map(|(path, src)| {
@@ -856,17 +913,7 @@ mod tests {
         };
         let type_symbol = |scope: &str, name: &str| format!("{prefix}{scope}/{name}#");
         let symbol_of = |path: &str, f: &FileFacts, d: &rb_syntax::Definition| -> Option<String> {
-            let scope = scope_of(path, f);
-            match d.kind {
-                rb_syntax::DefKind::Class | rb_syntax::DefKind::Interface => {
-                    Some(type_symbol(&scope, &d.name))
-                }
-                rb_syntax::DefKind::Method => {
-                    let parent = &f.definitions[d.parent?];
-                    Some(format!("{prefix}{scope}/{}#{}().", parent.name, d.name))
-                }
-                _ => None,
-            }
+            symbol_in(prefix, &scope_of(path, f), f, d)
         };
         let types: Vec<(String, String)> = facts
             .iter()
@@ -939,6 +986,14 @@ mod tests {
                         }
                     }
                 }
+                occurrences.extend(extra.iter().filter(|(p, ..)| p == path).map(
+                    |(_, span, symbol)| Occurrence {
+                        span: *span,
+                        symbol: format!("{prefix}{symbol}"),
+                        roles: 0,
+                        enclosing: None,
+                    },
+                ));
                 Document {
                     path: path.clone(),
                     occurrences,
@@ -975,12 +1030,208 @@ mod tests {
             .iter()
             .map(|(p, f)| (p.as_str(), rb_syntax::symbol_keys(p, f)))
             .collect();
-        let joined = join(&index, "", &by_path, &keys, &[language]);
-        edge_lines(&joined)
+        join(&index, "", &by_path, &keys, &[language])
+    }
+
+    /// `line`'s `token` (its `nth` occurrence on the line, 0-based) as a span.
+    fn at_nth(src: &str, line: usize, token: &str, nth: usize) -> Span {
+        let text = src.lines().nth(line).unwrap();
+        let col = text
+            .match_indices(token)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("{token:?} #{nth} in {text:?}"))
+            .0 as i32;
+        let line = line as i32;
+        [line, col, line, col + token.len() as i32]
+    }
+
+    /// Contract M3b amendment 43 (the evaluator's G1): `interface Face extends
+    /// Marker<Marker.Disc>` has three type occurrences in its clause, `Marker#` at the raw
+    /// type, `Marker#` and `Marker#Disc#` inside the argument; only the first lies in the
+    /// name's span, so `Face`'s supertype is `Marker#`, scip-java's reverse link
+    /// `Face#area() → Marker#Disc#area()` is rejected, and the forward edges (`Face# →
+    /// Marker#`, `Disc# → Face#`, `Disc#area() → Face#area()`) are emitted; `Cfg extends
+    /// Base<Base.Options>` keeps `Cfg#run() IMPLEMENTS Base#run()`. Nothing is unresolved.
+    #[test]
+    fn a_nested_type_argument_is_not_the_supertype() {
+        let marker = "package b;\npublic interface Marker<T> { class Disc implements Face { public double area() { return 1; } } }\n";
+        let face =
+            "package b;\npublic interface Face extends Marker<Marker.Disc> { double area(); }\n";
+        let both = |a: &'static str, b: &'static str| [(a, b), (b, a)];
+        let rels: Vec<(&str, &str)> = [
+            both("b/Face#", "b/Marker#"),
+            both("b/Marker#Disc#", "b/Face#"),
+            both("b/Marker#Disc#area().", "b/Face#area()."),
+        ]
+        .concat();
+        let joined = hierarchy_joined(
+            Language::Java,
+            &[("b/Marker.java", marker), ("b/Face.java", face)],
+            &rels,
+            &[
+                ("b/Face.java", at_nth(face, 1, "Marker", 1), "b/Marker#"),
+                ("b/Face.java", at_nth(face, 1, "Disc", 0), "b/Marker#Disc#"),
+            ],
+        );
+        assert_eq!(
+            implements_lines(Language::Java, &joined),
+            [
+                "b/Face# Implements b/Marker#",
+                "b/Marker#Disc# Implements b/Face#",
+                "b/Marker#Disc#area(). Implements b/Face#area().",
+            ]
+        );
+        assert_eq!(joined.coverage.supertypes_unresolved, 0);
+        assert_eq!(joined.coverage.relationships_dropped, 0);
+
+        let base =
+            "package a;\npublic class Base<T> { public static class Options {} void run() {} }\n";
+        let cfg = "package a;\npublic class Cfg extends Base<Base.Options> { void run() {} }\n";
+        let rels: Vec<(&str, &str)> = [
+            both("a/Cfg#", "a/Base#"),
+            both("a/Cfg#run().", "a/Base#run()."),
+        ]
+        .concat();
+        let joined = hierarchy_joined(
+            Language::Java,
+            &[("a/Base.java", base), ("a/Cfg.java", cfg)],
+            &rels,
+            &[
+                ("a/Cfg.java", at_nth(cfg, 1, "Base", 1), "a/Base#"),
+                (
+                    "a/Cfg.java",
+                    at_nth(cfg, 1, "Options", 0),
+                    "a/Base#Options#",
+                ),
+            ],
+        );
+        assert_eq!(
+            implements_lines(Language::Java, &joined),
+            [
+                "a/Cfg# Implements a/Base#",
+                "a/Cfg#run(). Implements a/Base#run().",
+            ]
+        );
+        assert_eq!(joined.coverage.supertypes_unresolved, 0);
+    }
+
+    /// Contract M3b amendment 45 (the evaluator's G3): `implements @Tag Shape` has the
+    /// annotation's `Tag#` before `Shape#`; the name span excludes the annotation, so the
+    /// supertype is `Shape#` and both forward edges are emitted.
+    #[test]
+    fn an_annotated_supertype_resolves_to_the_type() {
+        let shape = "package a;\npublic interface Shape { double area(); }\n";
+        let sq = "package a;\npublic class Sq implements @Tag Shape { public double area() { return 1; } }\n";
+        let both = |a: &'static str, b: &'static str| [(a, b), (b, a)];
+        let rels: Vec<(&str, &str)> = [
+            both("a/Sq#", "a/Shape#"),
+            both("a/Sq#area().", "a/Shape#area()."),
+        ]
+        .concat();
+        let joined = hierarchy_joined(
+            Language::Java,
+            &[("a/Shape.java", shape), ("a/Sq.java", sq)],
+            &rels,
+            &[("a/Sq.java", at_nth(sq, 1, "Tag", 0), "a/Tag#")],
+        );
+        assert_eq!(
+            implements_lines(Language::Java, &joined),
+            [
+                "a/Sq# Implements a/Shape#",
+                "a/Sq#area(). Implements a/Shape#area().",
+            ]
+        );
+        assert_eq!(joined.coverage.supertypes_unresolved, 0);
+    }
+
+    /// Contract M3b amendment 52: an `is_implementation` relationship whose source (a local
+    /// class expression) or target (a dependency's type) has no matched project definition
+    /// gives no edge and is counted; the relationships that give edges, and the reverse links
+    /// the direction rule rejects, are not.
+    #[test]
+    fn dropped_relationships_are_counted() {
+        let src = "export interface I { m(): void }\nexport class A implements I { m() {} }\n";
+        let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let path = "src/a.ts";
+        let sym = |d: &str| format!("scip-typescript npm p 1.0.0 src/`a.ts`/{d}");
+        let def = |name: &str| {
+            let d = facts.definitions.iter().find(|d| d.name == name).unwrap();
+            Occurrence {
+                span: d.name_span,
+                symbol: sym(&format!(
+                    "{}{}",
+                    d.parent
+                        .map_or(String::new(), |p| format!("{}#", facts.definitions[p].name)),
+                    if d.kind == rb_syntax::DefKind::Method {
+                        format!("{name}().")
+                    } else {
+                        format!("{name}#")
+                    }
+                )),
+                roles: 1,
+                enclosing: None,
+            }
+        };
+        let rel = |to: &str| Relationship {
+            symbol: to.into(),
+            is_implementation: true,
+            ..Default::default()
+        };
+        let i_ref = at_nth(src, 1, "I", 0);
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences: vec![
+                    def("I"),
+                    def("m"),
+                    def("A"),
+                    Occurrence {
+                        span: i_ref,
+                        symbol: sym("I#"),
+                        roles: 0,
+                        enclosing: None,
+                    },
+                ],
+                symbols: vec![
+                    SymbolInfo {
+                        symbol: sym("A#"),
+                        relationships: vec![
+                            rel(&sym("I#")),
+                            rel("scip-typescript npm lib 2.0.0 `index.d.ts`/Ext#"),
+                        ],
+                        ..Default::default()
+                    },
+                    SymbolInfo {
+                        symbol: sym("I#"),
+                        relationships: vec![rel(&sym("A#"))],
+                        ..Default::default()
+                    },
+                    SymbolInfo {
+                        symbol: "local 12".into(),
+                        relationships: vec![rel(&sym("I#"))],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        let implements: Vec<String> = edge_lines(&joined)
             .into_iter()
             .filter(|l| l.contains(" Implements "))
-            .map(|l| l.replace(prefix, ""))
-            .collect()
+            .collect();
+        assert_eq!(
+            implements,
+            [format!("{} Implements {}", sym("A#"), sym("I#"))]
+        );
+        assert_eq!(
+            joined.coverage.relationships_dropped, 2,
+            "the local class expression's and the external target's"
+        );
     }
 
     /// Contract M3b amendment 26 (the evaluator's J1): two project types named `Common`. With
@@ -1261,6 +1512,7 @@ mod tests {
                 files_without_document: 0,
                 supertypes_unresolved: 0,
                 occurrences_unconverted: 0,
+                relationships_dropped: 0,
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();
@@ -1359,6 +1611,30 @@ mod tests {
                 Some(sym("p/Outer#Inner#")),
                 None,
             ]
+        );
+        // scip-typescript on a class merged with a namespace (`class NS {}; namespace NS {
+        // class Inner {} }`) emits `NS#` and `NS/` at `NS` and `NS/Inner#` at `Inner`: the
+        // last type occurrence in the name is the nested type, although its symbol does not
+        // extend the outer type's.
+        let ts = "class A extends NS.Inner {}\n";
+        let ts_facts = rb_syntax::extract(Language::TypeScript, ts.as_bytes()).unwrap();
+        let ts_sym = |d: &str| format!("scip-typescript npm p 1.0.0 src/`a.ts`/{d}");
+        let ts_occurrences = [
+            occ([0, 16, 0, 18], ts_sym("NS#"), 0),
+            occ([0, 16, 0, 18], ts_sym("NS/"), 0),
+            occ([0, 19, 0, 24], ts_sym("NS/Inner#"), 0),
+        ];
+        assert_eq!(ts.find("NS.Inner"), Some(16));
+        let ts_by_span =
+            ts_occurrences
+                .iter()
+                .fold(BTreeMap::<Span, Vec<&Occurrence>>::new(), |mut m, o| {
+                    m.entry(o.span).or_default().push(o);
+                    m
+                });
+        assert_eq!(
+            declared_supertypes(&ts_facts.definitions[0], &ts_by_span),
+            [Some(ts_sym("NS/Inner#"))]
         );
         let index = ScipIndex {
             documents: vec![Document {

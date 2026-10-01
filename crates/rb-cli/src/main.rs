@@ -66,8 +66,8 @@ struct IndexArgs {
     #[arg(long)]
     no_scip: bool,
     /// Directory for indexer exports and package caches; the container runtime must be able to
-    /// bind-mount it (a path the runtime shares with its VM, such as one under the home
-    /// directory).
+    /// bind-mount it, so it must lie under the home directory (the path Docker Desktop's VM
+    /// shares; see README, "Container runtime").
     #[arg(long, env = "RB_SCIP_WORK_DIR", default_value = "var/scip")]
     scip_work_dir: PathBuf,
     /// Seconds a SCIP job's index phase may take (its fetch phase gets the same budget); a run
@@ -414,23 +414,35 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
             Err(reason) => rb_indexer::ScipMode::Unavailable(reason),
         }
     };
-    let images = match scip_mode {
+    let images = match &scip_mode {
         rb_indexer::ScipMode::On => rb_scip::Images::resolve(&rb_scip::DockerRunner::default()),
-        _ => rb_scip::Images::unresolved(),
+        rb_indexer::ScipMode::Unavailable(detail) => {
+            // The detail names the host (its socket path); the stored reason does not
+            // (contract M3b amendment 49).
+            eprintln!("scip: {detail}; every project stays heuristic");
+            rb_scip::Images::unresolved()
+        }
+        rb_indexer::ScipMode::Off => rb_scip::Images::unresolved(),
     };
     let tools = tool_versions(&scip_mode, &images);
 
-    if !force
-        && let Some(live) = store.live_snapshot(&repo)?
-        && live.commit_sha == commit_sha
-        && live.tool_versions == tools
-    {
-        println!(
-            "{repo}: up to date — live snapshot {} already covers {} (use --force to rebuild)",
-            live.id,
-            short(&commit_sha)
-        );
-        return Ok(());
+    if !force && let Some(live) = store.live_snapshot(&repo)? {
+        let scip_on = scip_mode == rb_indexer::ScipMode::On;
+        let mut unfinished = |id: i64| store.unfinished_scip_jobs(id);
+        match rebuild_reason(&live, &commit_sha, &tools, scip_on, &mut unfinished)? {
+            None => {
+                println!(
+                    "{repo}: up to date — live snapshot {} already covers {} (use --force to rebuild)",
+                    live.id,
+                    short(&commit_sha)
+                );
+                return Ok(());
+            }
+            Some(Rebuild::UnfinishedJobs(n)) => {
+                println!("{repo}: rebuilding: {n} SCIP jobs did not finish last time");
+            }
+            Some(Rebuild::Commit | Rebuild::Tools) => {}
+        }
     }
 
     let mut budget = rb_scip::Budget::default();
@@ -516,8 +528,52 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
             }
         }
         println!("{line}");
+        // The docker client's whole text, for the terminal only: the stored reason is its
+        // redacted first line (contract M3b amendment 49).
+        if matches!(j.status, rb_scip::RunStatus::Environment(_)) {
+            for l in j.stderr_tail.lines() {
+                eprintln!("    {l}");
+            }
+        }
     }
     Ok(())
+}
+
+/// Why the live snapshot is rebuilt instead of being "up to date".
+#[derive(Debug, PartialEq, Eq)]
+enum Rebuild {
+    Commit,
+    Tools,
+    /// The last run left this many SCIP jobs unfinished (contract M3b amendment 44).
+    UnfinishedJobs(i64),
+}
+
+/// Whether `live` covers a run of `commit_sha` with `tools` (contract M3b amendments 5, 17, 29
+/// and 44): the same commit, the same tool configuration and, when SCIP is on, no job of the
+/// last run left unfinished (`unfinished` counts the live snapshot's `environment`, `timeout`,
+/// `skipped` and `unsupported` jobs; those outcomes are not cached and are decided again, so a
+/// snapshot that records them is heuristic for a reason the next run may not have). With SCIP
+/// off or unavailable every job is skipped by configuration, which `tools` already records.
+fn rebuild_reason(
+    live: &SnapshotInfo,
+    commit_sha: &str,
+    tools: &Value,
+    scip_on: bool,
+    unfinished: &mut dyn FnMut(i64) -> anyhow::Result<i64>,
+) -> anyhow::Result<Option<Rebuild>> {
+    if live.commit_sha != commit_sha {
+        return Ok(Some(Rebuild::Commit));
+    }
+    if live.tool_versions != *tools {
+        return Ok(Some(Rebuild::Tools));
+    }
+    if scip_on {
+        let n = unfinished(live.id)?;
+        if n > 0 {
+            return Ok(Some(Rebuild::UnfinishedJobs(n)));
+        }
+    }
+    Ok(None)
 }
 
 /// ` (fetch phase, 600 s budget)` after a `timeout` status (contract M3b amendment 31).
@@ -564,19 +620,21 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
     if d.detail["unpinned"].as_bool() == Some(true) {
         line.push_str(" unpinned");
     }
-    if let (Some(phase), Some(budget)) =
-        (d.detail["phase"].as_str(), d.detail["budget_secs"].as_u64())
-    {
-        line.push_str(&timeout_detail(phase, budget));
-    }
-    if let Some(reason) = d.detail["reason"].as_str() {
-        let _ = write!(line, ": {reason}");
+    // A timeout's stored `reason` is rendered from its phase and budget, so the detail is
+    // printed once, as `rb index` prints it (contract M3b amendment 50).
+    match (d.detail["phase"].as_str(), d.detail["budget_secs"].as_u64()) {
+        (Some(phase), Some(budget)) => line.push_str(&timeout_detail(phase, budget)),
+        _ => {
+            if let Some(reason) = d.detail["reason"].as_str() {
+                let _ = write!(line, ": {reason}");
+            }
+        }
     }
     if let Some(c) = d.detail.get("coverage") {
         let n = |k: &str| c[k].as_u64().unwrap_or(0);
         let _ = write!(
             line,
-            ", definitions matched {}/{} ({} by name), references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}",
+            ", definitions matched {}/{} ({} by name), references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}, relationships dropped {}",
             n("definitions_matched"),
             n("definitions_total"),
             n("definitions_matched_by_name"),
@@ -586,7 +644,8 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
             n("references_local"),
             n("references_unanchored"),
             n("references_unmatched"),
-            n("occurrences_unconverted")
+            n("occurrences_unconverted"),
+            n("relationships_dropped")
         );
         // Files the indexer left out (excluded by its tsconfig): no edges of any kind.
         if n("files_without_document") > 0 {
@@ -686,8 +745,9 @@ impl rb_indexer::FactsCache for StoreCache<'_, '_> {
 
 /// What a snapshot was built with; `scip` (`on`, `off`, `unavailable`) because a run without
 /// indexers is a different graph, whether they were turned off or Docker was missing, and with
-/// `on` the identity of each indexer image (its ID, or `absent`; contract M3b amendment 29),
-/// since a graph indexed without an image is heuristic and a rebuilt image may index differently.
+/// `on` the identity of each indexer image (the pinned one's digest reference; the local one's
+/// ID, or `absent`; contract M3b amendments 29 and 48), since a graph indexed without an image
+/// is heuristic and a rebuilt image may index differently.
 fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value {
     let mut tools = json!({
         "rb": env!("CARGO_PKG_VERSION"),
@@ -946,18 +1006,25 @@ mod tests {
         );
     }
 
-    /// Contract M3b amendments 29 and 31: the image identities are recorded only when SCIP is
-    /// on; a timeout prints its phase and budget.
+    /// Contract M3b amendments 29, 31 and 48: the image identities are recorded only when SCIP
+    /// is on (the pinned scip-typescript image by its digest reference, the local scip-java
+    /// one by its ID or `absent`); a timeout prints its phase and budget.
     #[test]
     fn tool_versions_record_image_identities_when_scip_is_on() {
         let images = rb_scip::Images {
             java: Err("absent".into()),
-            typescript: Some("sha256:abc".into()),
         };
         let on = tool_versions(&rb_indexer::ScipMode::On, &images);
         assert_eq!(on["scip"], "on");
         assert_eq!(on["scip_java"], "absent");
-        assert_eq!(on["scip_typescript"], "sha256:abc");
+        assert_eq!(on["scip_typescript"], rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE);
+        let present = rb_scip::Images {
+            java: Ok("sha256:abc".into()),
+        };
+        assert_eq!(
+            tool_versions(&rb_indexer::ScipMode::On, &present)["scip_java"],
+            "sha256:abc"
+        );
         assert_eq!(on["pipeline"], rb_indexer::PIPELINE);
         let off = tool_versions(&rb_indexer::ScipMode::Off, &rb_scip::Images::unresolved());
         assert_eq!(off["scip"], "off");
@@ -968,6 +1035,95 @@ mod tests {
         );
         assert!(unavailable.get("scip_java").is_none());
         assert_eq!(timeout_detail("fetch", 600), " (fetch phase, 600 s budget)");
+    }
+
+    /// Contract M3b amendment 44: the live snapshot covers a run only with the same commit, the
+    /// same tools and, with SCIP on, no unfinished job; with SCIP off or unavailable the count
+    /// is not consulted.
+    #[test]
+    fn rebuild_reason_requires_finished_scip_jobs() {
+        let tools = json!({"rb": "1", "scip": "on"});
+        let live = SnapshotInfo {
+            id: 7,
+            repo: "r".into(),
+            commit_sha: "c".repeat(40),
+            status: "live".into(),
+            tool_versions: tools.clone(),
+            age_graph: None,
+        };
+        // The fake store: the snapshots asked about, and the count it answers.
+        let asked = RefCell::new(Vec::new());
+        let count = |n: i64| {
+            let asked = &asked;
+            move |id: i64| -> anyhow::Result<i64> {
+                asked.borrow_mut().push(id);
+                Ok(n)
+            }
+        };
+        let commit = "c".repeat(40);
+        assert_eq!(
+            rebuild_reason(&live, &commit, &tools, true, &mut count(0)).unwrap(),
+            None
+        );
+        assert_eq!(
+            rebuild_reason(&live, &commit, &tools, true, &mut count(2)).unwrap(),
+            Some(Rebuild::UnfinishedJobs(2))
+        );
+        assert_eq!(
+            rebuild_reason(&live, &commit, &tools, false, &mut count(2)).unwrap(),
+            None,
+            "skipped by configuration"
+        );
+        assert_eq!(
+            rebuild_reason(&live, &"d".repeat(40), &tools, true, &mut count(0)).unwrap(),
+            Some(Rebuild::Commit)
+        );
+        assert_eq!(
+            rebuild_reason(&live, &commit, &json!({"rb": "2"}), true, &mut count(0)).unwrap(),
+            Some(Rebuild::Tools)
+        );
+        assert_eq!(
+            *asked.borrow(),
+            [7, 7],
+            "the count is read for the matching snapshot only"
+        );
+    }
+
+    /// Contract M3b amendment 50: a timeout's detail is printed once; other statuses print
+    /// their reason; coverage lists `relationships dropped` (amendment 52).
+    #[test]
+    fn scip_status_line_prints_a_timeout_once() {
+        let diagnostic = |detail: Value| rb_model::Diagnostic {
+            kind: "scip_status".into(),
+            path: Some(".".into()),
+            span: None,
+            detail,
+        };
+        let timeout = diagnostic(json!({
+            "indexer": "scip-typescript", "status": "timeout", "unpinned": true,
+            "phase": "fetch", "budget_secs": 3, "reason": "fetch phase over its 3 s budget",
+        }));
+        assert_eq!(
+            scip_status_line(&timeout),
+            "scip: . scip-typescript timeout unpinned (fetch phase, 3 s budget)"
+        );
+        let environment = diagnostic(json!({
+            "indexer": "scip-java", "status": "environment", "unpinned": false,
+            "reason": "docker: Error response from daemon: No such image",
+        }));
+        assert_eq!(
+            scip_status_line(&environment),
+            "scip: . scip-java environment: docker: Error response from daemon: No such image"
+        );
+        let ok = diagnostic(json!({
+            "indexer": "scip-java", "status": "ok", "unpinned": false, "image": "sha256:1",
+            "coverage": {"definitions_matched": 2, "definitions_total": 3, "relationships_dropped": 4},
+        }));
+        assert!(
+            scip_status_line(&ok).ends_with(", unconverted 0, relationships dropped 4"),
+            "{}",
+            scip_status_line(&ok)
+        );
     }
 
     #[test]
