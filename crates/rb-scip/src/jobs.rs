@@ -199,6 +199,72 @@ fn relative(dir: &str, root: &str) -> String {
     }
 }
 
+/// The source encoding a Maven build declares when it is not UTF-8 (contract M3b amendment
+/// 64), read from every `pom.xml` of the build: the first value of a
+/// `project.build.sourceEncoding`, `maven.compiler.encoding` or `encoding` element (the last
+/// also configures other plugins; reading it as the sources' encoding errs towards rejecting)
+/// that is not UTF-8 after resolving `${property}` through the poms' own simple elements; an
+/// unresolved value counts as not UTF-8. `None` when every declaration is UTF-8 or there is
+/// none: javac then reads UTF-8 (measured with `rb-scip-java:0.13.1`). A declaration in a
+/// parent pom outside the repository is not visible here (open item).
+pub fn maven_source_encoding(poms: &[&[u8]]) -> Option<String> {
+    let elements: Vec<(String, String)> = poms
+        .iter()
+        .flat_map(|pom| simple_elements(&String::from_utf8_lossy(pom)))
+        .collect();
+    let resolve = |value: &str| -> String {
+        let mut value = value.to_owned();
+        // A bounded chain of `${a}` → `${b}` → value.
+        for _ in 0..8 {
+            let Some(name) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+                break;
+            };
+            match elements.iter().find(|(n, _)| n == name) {
+                Some((_, v)) => value.clone_from(v),
+                None => break,
+            }
+        }
+        value
+    };
+    elements
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "project.build.sourceEncoding" | "maven.compiler.encoding" | "encoding"
+            )
+        })
+        .map(|(_, value)| resolve(value))
+        .find(|value| !value.eq_ignore_ascii_case("UTF-8") && !value.eq_ignore_ascii_case("UTF8"))
+}
+
+/// `<name>text</name>` elements whose content holds no markup, outside comments, with the
+/// content trimmed.
+fn simple_elements(xml: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find('<') {
+        rest = &rest[open..];
+        if let Some(comment) = rest.strip_prefix("<!--") {
+            rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
+            continue;
+        }
+        let Some(close) = rest.find('>') else {
+            break;
+        };
+        let name = &rest[1..close];
+        rest = &rest[close + 1..];
+        if name.is_empty() || name.contains(|c: char| c.is_whitespace() || "/?!".contains(c)) {
+            continue;
+        }
+        let content = &rest[..rest.find('<').unwrap_or(rest.len())];
+        if rest[content.len()..].starts_with(&format!("</{name}>")) {
+            out.push((name.to_owned(), content.trim().to_owned()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +366,62 @@ mod tests {
             ]
         );
         assert!(jobs(&["README.md"]).is_empty());
+    }
+
+    /// Contract M3b amendment 64 (`source_encoding`): measured with `rb-scip-java:0.13.1`
+    /// (`var/fix-pass7/scratch`), javac reads the sources in the declared
+    /// `project.build.sourceEncoding`, and as UTF-8 when nothing is declared; an ISO-8859-1
+    /// build shifts every later column of a non-ASCII line.
+    #[test]
+    fn a_maven_build_declaring_another_source_encoding_is_found() {
+        let pom = |body: &str| format!("<project><properties>{body}</properties></project>");
+        let found = |poms: &[String]| {
+            maven_source_encoding(&poms.iter().map(|p| p.as_bytes()).collect::<Vec<_>>())
+        };
+        // Undeclared, UTF-8 in any spelling, or a property resolving to UTF-8.
+        assert_eq!(found(&[pom("")]), None);
+        assert_eq!(
+            found(&[pom(
+                "<project.build.sourceEncoding> utf8 </project.build.sourceEncoding>"
+            )]),
+            None
+        );
+        assert_eq!(
+            found(&[
+                pom("<enc.x>UTF-8</enc.x>"),
+                pom("<maven.compiler.encoding>${enc.x}</maven.compiler.encoding>"),
+            ]),
+            None
+        );
+        // petclinic's `<encoding.source>` is another element; a comment declares nothing.
+        assert_eq!(
+            found(&[pom(
+                "<encoding.source>ISO-8859-1</encoding.source><!-- <encoding>Cp1252</encoding> -->"
+            )]),
+            None
+        );
+        // Anything else, in any module's pom, or a property that does not resolve.
+        assert_eq!(
+            found(&[pom(
+                "<project.build.sourceEncoding>ISO-8859-1</project.build.sourceEncoding>"
+            )])
+            .as_deref(),
+            Some("ISO-8859-1")
+        );
+        assert_eq!(
+            found(&[
+                pom("<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>"),
+                "<project><build><plugins><plugin><configuration><encoding>Cp1252</encoding></configuration></plugin></plugins></build></project>".to_owned(),
+            ])
+            .as_deref(),
+            Some("Cp1252")
+        );
+        assert_eq!(
+            found(&[pom(
+                "<maven.compiler.encoding>${missing}</maven.compiler.encoding>"
+            )])
+            .as_deref(),
+            Some("${missing}")
+        );
     }
 }

@@ -132,6 +132,12 @@ pub(crate) struct Coverage {
     /// relationship's document that binds to no Tree-sitter definition (contract M3b amendment
     /// 62). Not a join gap, and no edge is possible, but the link exists and is counted.
     pub relationships_anonymous: usize,
+    /// Documents with facts that the agreement check rejected (contract M3b amendment 64): the
+    /// indexer and Tree-sitter may read the file differently, so the whole file stays Tier B
+    /// and none of its definitions or references is counted above.
+    pub documents_rejected: usize,
+    /// `documents_rejected` by the first reason that applied.
+    pub documents_rejected_reasons: BTreeMap<rb_scip::Rejection, usize>,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -159,11 +165,45 @@ pub(crate) fn join(
             format!("{root}/{doc}")
         }
     };
-    // Every global symbol the index defines, so references to dependencies are told apart.
-    let defined: BTreeSet<&str> = index
-        .documents
+    let mut out = Joined::default();
+    // The documents with facts, each with its occurrences by span, that pass the agreement
+    // check (contract M3b amendment 64): a rejected document is left out entirely, as if the
+    // index had none for its file except that it is counted as rejected, not as missing.
+    let mut indexed: BTreeSet<String> = BTreeSet::new();
+    let mut docs: Vec<Doc<'_>> = Vec::new();
+    for doc in &index.documents {
+        let path = repo_path(&doc.path);
+        let Some(&(_, facts)) = files.get(path.as_str()) else {
+            continue;
+        };
+        indexed.insert(path.clone());
+        let rejected = doc.rejected.or_else(|| {
+            definition_disagreement(facts, &doc.occurrences)
+                .then_some(rb_scip::Rejection::DefinitionDisagreement)
+        });
+        if let Some(reason) = rejected {
+            out.coverage.documents_rejected += 1;
+            *out.coverage
+                .documents_rejected_reasons
+                .entry(reason)
+                .or_default() += 1;
+            continue;
+        }
+        let by_span = doc.occurrences.iter().fold(
+            BTreeMap::<Span, Vec<&rb_scip::Occurrence>>::new(),
+            |mut m, o| {
+                m.entry(o.span).or_default().push(o);
+                m
+            },
+        );
+        docs.push((path, doc, facts, by_span));
+    }
+    // Every global symbol the accepted documents define, so references to dependencies are
+    // told apart; a symbol defined only in a rejected document is the project's own but has no
+    // node (`references_undocumented`).
+    let defined: BTreeSet<&str> = docs
         .iter()
-        .flat_map(|d| &d.occurrences)
+        .flat_map(|(_, d, ..)| &d.occurrences)
         .filter(|o| o.is_definition() && !o.symbol.starts_with("local "))
         .map(|o| o.symbol.as_str())
         .collect();
@@ -173,42 +213,15 @@ pub(crate) fn join(
     // a dependency.
     let own_packages: BTreeSet<Option<rb_scip::Package>> =
         defined.iter().map(|s| rb_scip::package(s)).collect();
-    let mut out = Joined::default();
-    // The documents with facts, each with its occurrences by span.
-    let docs: Vec<Doc<'_>> = index
-        .documents
-        .iter()
-        .filter_map(|doc| {
-            let path = repo_path(&doc.path);
-            let (_, facts) = *files.get(path.as_str())?;
-            let by_span = doc.occurrences.iter().fold(
-                BTreeMap::<Span, Vec<&rb_scip::Occurrence>>::new(),
-                |mut m, o| {
-                    m.entry(o.span).or_default().push(o);
-                    m
-                },
-            );
-            Some((path, doc, facts, by_span))
-        })
-        .collect();
     out.documented = docs.iter().map(|(path, ..)| path.clone()).collect();
     out.coverage.files_without_document = files
         .iter()
-        .filter(|(path, (language, _))| {
-            languages.contains(language) && !out.documented.contains(**path)
-        })
+        .filter(|(path, (language, _))| languages.contains(language) && !indexed.contains(**path))
         .count();
-    // Each document's local symbols by name (`SymbolInformation.display_name`): a local
-    // symbol's string carries none.
-    let local_names: Vec<BTreeMap<&str, &str>> = docs
+    // Per document, how its tokens may be named (contract M3b amendments 59 and 66).
+    let naming: Vec<Naming<'_>> = docs
         .iter()
-        .map(|(_, doc, ..)| {
-            doc.symbols
-                .iter()
-                .filter(|s| s.symbol.starts_with("local "))
-                .map(|s| (s.symbol.as_str(), s.display_name.as_str()))
-                .collect()
-        })
+        .map(|(_, doc, facts, by_span)| Naming::new(doc, facts, by_span))
         .collect();
     // Definitions first, over every document: the name's range is a definition occurrence of a
     // global symbol. The matched symbols are the only targets an edge may have, since only they
@@ -231,13 +244,12 @@ pub(crate) fn join(
             };
             let local_named = |o: &rb_scip::Occurrence| {
                 is_local_definition(o)
-                    && local_names[di].get(o.symbol.as_str()) == Some(&d.name.as_str())
+                    && naming[di].local_names.get(o.symbol.as_str()) == Some(&d.name.as_str())
             };
             // The occurrence at the name must name the definition (contract M3b amendment 59):
-            // one an indexer's position error moved there is unmatched, not another key.
-            let names_d = |o: &&rb_scip::Occurrence| {
-                names_token(o, &local_names[di], &facts.imports, &d.name)
-            };
+            // one an indexer's position error moved there is unmatched, not another key. A
+            // local symbol is not bound yet: its name, when known, decides.
+            let names_d = |o: &&rb_scip::Occurrence| naming[di].names_token(o, None, &d.name);
             let global_at_name = at_name(is_global_definition).filter(names_d);
             let local_at_name = global_at_name
                 .is_none()
@@ -365,7 +377,12 @@ pub(crate) fn join(
             let Some(o) = by_span
                 .get(&r.span)
                 .and_then(|os| os.iter().find(|o| !o.is_definition()))
-                .filter(|o| names_token(o, &local_names[di], &facts.imports, &r.name))
+                .filter(|o| {
+                    let bound = locals[di]
+                        .get(o.symbol.as_str())
+                        .map(|&i| facts.definitions[i].name.as_str());
+                    naming[di].names_token(o, bound, &r.name)
+                })
             else {
                 out.coverage.references_unmatched += 1;
                 continue;
@@ -541,28 +558,135 @@ pub(crate) fn join(
     out
 }
 
-/// Whether occurrence `o`, matched at a token whose text is `text` in a file with `imports`,
-/// names that token (contract M3b amendment 59): a global symbol in one of the forms
-/// [`rb_scip::may_name`] accepts, or through an import alias (the local name of a default
-/// import, whose symbol is the module's default export under its own name; of a named import
-/// `{ name as text }`, `name`); a local symbol by its display name when the index gives one
-/// (scip-typescript leaves it empty). An occurrence that another position error moved onto
-/// another token is then not taken for it.
-fn names_token(
-    o: &rb_scip::Occurrence,
-    local_names: &BTreeMap<&str, &str>,
-    imports: &[rb_syntax::Import],
-    text: &str,
-) -> bool {
-    if o.symbol.starts_with("local ") {
-        return local_names
-            .get(o.symbol.as_str())
-            .is_none_or(|n| n.is_empty() || *n == text);
+/// How a document's tokens may be named, beyond [`rb_scip::may_name`] (contract M3b amendments
+/// 59 and 66): each local symbol's name, and each import alias with the symbol it stands for.
+struct Naming<'a> {
+    /// A local symbol's `SymbolInformation.display_name` (scip-java), else the text at its
+    /// definition occurrence as the decoder read it (`Document::local_names`; scip-typescript
+    /// gives no display names).
+    local_names: BTreeMap<&'a str, &'a str>,
+    /// A default import's local name and the symbol of the import's own occurrence there: the
+    /// first occurrence inside the import statement that is not a module (its descriptor does
+    /// not end with `/`). scip-typescript gives the local name the symbol the export resolves
+    /// to (`h.ts/helper().`, `K#`, through a re-export `index.d.ts/validator/isLatLong().`),
+    /// never a `default` descriptor (measured, amendment 66).
+    default_imports: BTreeMap<&'a str, &'a str>,
+    /// Named imports `{ name as local }`: `local` → `name`.
+    named_imports: BTreeMap<&'a str, &'a str>,
+}
+
+impl<'a> Naming<'a> {
+    fn new(
+        doc: &'a rb_scip::Document,
+        facts: &'a FileFacts,
+        by_span: &BTreeMap<Span, Vec<&'a rb_scip::Occurrence>>,
+    ) -> Self {
+        let mut local_names: BTreeMap<&str, &str> = doc
+            .local_names
+            .iter()
+            .map(|(symbol, name)| (symbol.as_str(), name.as_str()))
+            .collect();
+        for s in &doc.symbols {
+            if s.symbol.starts_with("local ") && !s.display_name.is_empty() {
+                local_names.insert(s.symbol.as_str(), s.display_name.as_str());
+            }
+        }
+        let mut default_imports = BTreeMap::new();
+        let mut named_imports = BTreeMap::new();
+        for import in &facts.imports {
+            for n in &import.names {
+                if n.name != "default" {
+                    named_imports.insert(n.local.as_str(), n.name.as_str());
+                    continue;
+                }
+                let start: Span = [import.span[0], import.span[1], i32::MIN, i32::MIN];
+                let end: Span = [import.span[2], import.span[3], i32::MAX, i32::MAX];
+                let site = by_span
+                    .range(start..=end)
+                    .filter(|(span, _)| (span[2], span[3]) <= (import.span[2], import.span[3]))
+                    .flat_map(|(_, os)| os.iter())
+                    .find(|o| !o.symbol.ends_with('/'));
+                if let Some(o) = site {
+                    default_imports.insert(n.local.as_str(), o.symbol.as_str());
+                }
+            }
+        }
+        Naming {
+            local_names,
+            default_imports,
+            named_imports,
+        }
     }
-    rb_scip::may_name(&o.symbol, text)
-        || imports.iter().flat_map(|i| &i.names).any(|n| {
-            n.local == text && (n.name == "default" || rb_scip::may_name(&o.symbol, &n.name))
-        })
+
+    /// Whether occurrence `o`, matched at a token whose text is `text`, names that token
+    /// (contract M3b amendments 59 and 66), so that an occurrence a position error moved onto
+    /// another token is not taken for it:
+    /// - a global symbol in one of the forms [`rb_scip::may_name`] accepts; at a default
+    ///   import's local name, the symbol of that import's own occurrence; at a named import's
+    ///   local name `{ name as text }`, a symbol that may name `name`;
+    /// - a local symbol whose name is known when that name is the text; else, when it is
+    ///   bound to a definition of this document (`bound`, that definition's name), when the
+    ///   definition's name is the text; else (no name, no definition here: no edge can come
+    ///   of it) it is accepted.
+    fn names_token(&self, o: &rb_scip::Occurrence, bound: Option<&str>, text: &str) -> bool {
+        if o.symbol.starts_with("local ") {
+            return match self.local_names.get(o.symbol.as_str()) {
+                Some(name) => *name == text,
+                None => bound.is_none_or(|name| name == text),
+            };
+        }
+        rb_scip::may_name(&o.symbol, text)
+            || self.default_imports.get(text) == Some(&o.symbol.as_str())
+            || self
+                .named_imports
+                .get(text)
+                .is_some_and(|name| rb_scip::may_name(&o.symbol, name))
+    }
+}
+
+/// Whether Tree-sitter contradicts the index about a document's definitions (contract M3b
+/// amendment 64, `definition_disagreement`): a global definition occurrence of a method or a
+/// type (its descriptor ends with `).` or `#`) that no Tree-sitter definition accounts for —
+/// none has its name there with a name the symbol may name ([`rb_scip::may_name`]), and none
+/// has it before its name naming it (the amendment-7 fallback) — and that lies where
+/// Tree-sitter reads something else: on a definition's name or a reference, or inside a
+/// function or method (whose body cannot hold a global method or type the syntax misses).
+/// Outside those places Tree-sitter deliberately captures some forms not at all, and they are
+/// not disagreements: Java annotation interfaces and their elements, scip-typescript's
+/// `<constructor>` at the `constructor` keyword (measured on the four public repositories:
+/// 52 such occurrences, 0 documents rejected).
+fn definition_disagreement(facts: &FileFacts, occurrences: &[rb_scip::Occurrence]) -> bool {
+    let tokens: BTreeSet<Span> = facts
+        .definitions
+        .iter()
+        .map(|d| d.name_span)
+        .chain(facts.references.iter().map(|r| r.span))
+        .collect();
+    let inside = |outer: Span, inner: Span| {
+        (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
+    };
+    occurrences.iter().any(|o| {
+        if !is_global_definition(o) || !(o.symbol.ends_with(").") || o.symbol.ends_with('#')) {
+            return false;
+        }
+        let name = rb_scip::last_descriptor_name(&o.symbol);
+        let accounted = facts.definitions.iter().any(|d| {
+            (d.name_span == o.span && rb_scip::may_name(&o.symbol, &d.name))
+                || (name.as_deref() == Some(d.name.as_str())
+                    && inside(
+                        [d.span[0], d.span[1], d.name_span[0], d.name_span[1]],
+                        o.span,
+                    ))
+        });
+        !accounted
+            && (tokens.contains(&o.span)
+                || facts.definitions.iter().any(|d| {
+                    matches!(
+                        d.kind,
+                        rb_syntax::DefKind::Function | rb_syntax::DefKind::Method
+                    ) && inside(d.span, o.span)
+                }))
+    })
 }
 
 fn is_global_definition(o: &rb_scip::Occurrence) -> bool {
@@ -828,6 +952,8 @@ mod tests {
                 relationships_dropped: 0,
                 relationships_dropped_in_project: 0,
                 relationships_anonymous: 0,
+                documents_rejected: 0,
+                documents_rejected_reasons: BTreeMap::new(),
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -999,7 +1125,8 @@ mod tests {
         );
 
         // Swapped names: the occurrence inside `login`'s annotation names `logout` and vice
-        // versa, so neither matches; the class still does, at its name.
+        // versa, so neither matches, and since each lies inside a method Tree-sitter has, the
+        // document disagrees with the syntax and is rejected whole (contract M3b amendment 64).
         let joined = join(
             &index(vec![
                 def(class_name.name_span, sym("")),
@@ -1011,13 +1138,15 @@ mod tests {
             &keys,
             java,
         );
-        assert_eq!(joined.keys[path].len(), 1);
+        assert!(joined.keys.is_empty() && joined.documented.is_empty());
         assert_eq!(
             (
-                joined.coverage.definitions_matched,
-                joined.coverage.definitions_matched_by_name
+                joined.coverage.definitions_total,
+                joined.coverage.documents_rejected,
+                joined.coverage.documents_rejected_reasons
+                    [&rb_scip::Rejection::DefinitionDisagreement]
             ),
-            (1, 0)
+            (0, 1, 1)
         );
         // A local symbol inside the annotations is never a match.
         let joined = join(
@@ -1736,14 +1865,14 @@ mod tests {
         let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
         let path = "p/A.java";
         let sym = |d: &str| format!("scip-java maven . . p/{d}");
-        let a_m = at_nth(src, 1, "m", 0);
         let index = ScipIndex {
             documents: vec![Document {
                 path: path.into(),
                 occurrences: vec![
                     occ_at(at_nth(src, 1, "A", 0), &sym("A#"), 1),
-                    // `A#m()`'s definition occurrence two columns off its name: unmatched.
-                    occ_at([a_m[0], a_m[1] + 2, a_m[2], a_m[3] + 2], &sym("A#m()."), 1),
+                    // `A#m()`'s definition occurrence inside the `interface` keyword: unmatched
+                    // (outside any method and on no token, so no disagreement either).
+                    occ_at(at_nth(src, 1, "e", 0), &sym("A#m()."), 1),
                     occ_at(at_nth(src, 2, "B", 0), &sym("B#"), 1),
                     occ_at(at_nth(src, 2, "A", 0), &sym("A#"), 0),
                     occ_at(at_nth(src, 2, "m", 0), &sym("B#m()."), 1),
@@ -1793,9 +1922,9 @@ mod tests {
             "B#m() → A#m()"
         );
         // Contract M3b amendment 62: the anonymous class's link into the project is counted
-        // on its own; `A#m()`'s occurrence is two columns off its name and `B#m()`'s sits on
-        // the first `m` of its line (in `implements`), so both are definitions without an
-        // occurrence (still in project: each lies on its definition's name line).
+        // on its own; `A#m()`'s occurrence sits in `interface` and `B#m()`'s on the first `m`
+        // of its line (in `implements`), so both are definitions without an occurrence (still
+        // in project: each lies on its definition's name line).
         assert_eq!(joined.coverage.relationships_anonymous, 1, "local 5 → A#");
         assert_eq!(
             joined.coverage.definitions_without_occurrence, 2,
@@ -1851,14 +1980,15 @@ mod tests {
         assert_eq!(joined.coverage.relationships_anonymous, 0);
     }
 
-    /// Contract M3b amendment 59, second line of defence (the evaluator's I1): the decoder of
-    /// pass 6 read scip-java's lines as `\n`-separated, so after the lone CR in `LoneCr2.java`
-    /// the definition occurrence of `m0` sat at `m2`'s name, `m2`'s at `m3`'s and `zeta`'s at
-    /// `beta`'s, and the call occurrence of `zeta()` at the `beta()` call. These are those
-    /// spans (the measured raw ranges, read as Tree-sitter rows). An occurrence must name its
-    /// token: no definition takes another method's key, no call is evidenced at another call,
-    /// and every rejected occurrence is counted (definitions without occurrence, references
-    /// unmatched).
+    /// Contract M3b amendment 59, second line of defence (the evaluator's I1), and amendment 64:
+    /// the decoder of pass 6 read scip-java's lines as `\n`-separated, so after the lone CR in
+    /// `LoneCr2.java` the definition occurrence of `m0` sat at `m2`'s name, `m2`'s at `m3`'s
+    /// and `zeta`'s at `beta`'s, and the call occurrence of `zeta()` at the `beta()` call. These
+    /// are those spans (the measured raw ranges, read as Tree-sitter rows): a method's
+    /// occurrence on another method's name is a disagreement, and the document is rejected
+    /// whole. Where the definitions agree, an occurrence must still name its token: a call
+    /// occurrence moved onto another call, or a field's occurrence on a method's name, is not
+    /// taken for it, and is counted (references unmatched, definitions without occurrence).
     #[test]
     fn an_occurrence_must_name_its_token() {
         let src = "package t;\n\npublic class LoneCr2 {\n\tint m1() { return 0; }\r\tint m0() { return 1; }\n\tint m2() { return zeta(); }\n\tint m3() { return beta(); }\n\tint zeta() { return 2; }\n\tint beta() { return 3; }\n}\n";
@@ -1866,27 +1996,6 @@ mod tests {
         let path = "src/main/java/t/LoneCr2.java";
         let sym = |d: &str| format!("scip-java maven . . t/LoneCr2#{d}");
         let raw = |line: i32, start: i32, end: i32| -> Span { [line, start, line, end] };
-        let index = ScipIndex {
-            documents: vec![Document {
-                path: path.into(),
-                occurrences: vec![
-                    occ_at(raw(2, 13, 20), &sym(""), 1),
-                    occ_at(raw(2, 13, 20), &sym("`<init>`()."), 1),
-                    occ_at(raw(3, 5, 7), &sym("m1()."), 1),
-                    occ_at(raw(4, 5, 7), &sym("m0()."), 1),
-                    occ_at(raw(5, 5, 7), &sym("m2()."), 1),
-                    occ_at(raw(5, 19, 23), &sym("zeta()."), 0),
-                    occ_at(raw(6, 5, 7), &sym("m3()."), 1),
-                    occ_at(raw(6, 19, 23), &sym("beta()."), 0),
-                    occ_at(raw(7, 5, 9), &sym("zeta()."), 1),
-                    occ_at(raw(8, 5, 9), &sym("beta()."), 1),
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        // The spans are where the evaluator found them: `m0`'s occurrence on `m2`'s name and
-        // `zeta`'s call occurrence on the `beta` call.
         let def_at = |name: &str| {
             facts
                 .definitions
@@ -1895,31 +2004,71 @@ mod tests {
                 .unwrap()
                 .name_span
         };
+        let call_at = |name: &str| {
+            facts
+                .references
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .span
+        };
+        // The spans are where the evaluator found them: `m0`'s occurrence on `m2`'s name and
+        // `zeta`'s call occurrence on the `beta` call.
         assert_eq!(def_at("m2"), raw(4, 5, 7));
         assert_eq!(def_at("beta"), raw(7, 5, 9));
-        let beta_call = facts
-            .references
-            .iter()
-            .find(|r| r.name == "beta")
-            .unwrap()
-            .span;
-        assert_eq!(beta_call, raw(5, 19, 23));
+        assert_eq!(call_at("beta"), raw(5, 19, 23));
         let files = BTreeMap::from([(path, (Language::Java, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys, &[Language::Java]);
-        let replaced: Vec<(&str, &str)> = joined.keys[path]
-            .iter()
-            .map(|(i, s)| (facts.definitions[*i].name.as_str(), s.as_str()))
-            .collect();
-        assert_eq!(
-            replaced,
-            [("LoneCr2", sym("").as_str()), ("m1", sym("m1().").as_str())]
-        );
+        let joined_with = |occurrences: Vec<Occurrence>| {
+            let index = ScipIndex {
+                documents: vec![Document {
+                    path: path.into(),
+                    occurrences,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            join(&index, "", &files, &keys, &[Language::Java])
+        };
+        let joined = joined_with(vec![
+            occ_at(raw(2, 13, 20), &sym(""), 1),
+            occ_at(raw(2, 13, 20), &sym("`<init>`()."), 1),
+            occ_at(raw(3, 5, 7), &sym("m1()."), 1),
+            occ_at(raw(4, 5, 7), &sym("m0()."), 1),
+            occ_at(raw(5, 5, 7), &sym("m2()."), 1),
+            occ_at(raw(5, 19, 23), &sym("zeta()."), 0),
+            occ_at(raw(6, 5, 7), &sym("m3()."), 1),
+            occ_at(raw(6, 19, 23), &sym("beta()."), 0),
+            occ_at(raw(7, 5, 9), &sym("zeta()."), 1),
+            occ_at(raw(8, 5, 9), &sym("beta()."), 1),
+        ]);
+        assert!(joined.keys.is_empty(), "{:?}", joined.keys);
         assert!(joined.edges.is_empty(), "{:?}", edge_lines(&joined));
-        assert_eq!(joined.coverage.definitions_matched, 2);
-        assert_eq!(joined.coverage.definitions_total, 7);
-        assert_eq!(joined.coverage.definitions_without_occurrence, 5);
+        assert_eq!(joined.coverage.definitions_total, 0);
+        assert_eq!(
+            joined.coverage.documents_rejected_reasons,
+            BTreeMap::from([(rb_scip::Rejection::DefinitionDisagreement, 1)])
+        );
+
+        // The definitions at their names; a field's occurrence (not a method or a type) on
+        // `m2`'s name, and `zeta()`'s call occurrence on the `beta()` call.
+        let mut occurrences: Vec<Occurrence> = ["m1", "m0", "m3", "zeta", "beta"]
+            .iter()
+            .map(|name| occ_at(def_at(name), &sym(&format!("{name}().")), 1))
+            .collect();
+        occurrences.push(occ_at(raw(2, 13, 20), &sym(""), 1));
+        occurrences.push(occ_at(def_at("m2"), &sym("m0."), 1));
+        occurrences.push(occ_at(call_at("beta"), &sym("zeta()."), 0));
+        let joined = joined_with(occurrences);
+        let replaced: Vec<&str> = joined.keys[path]
+            .keys()
+            .map(|i| facts.definitions[*i].name.as_str())
+            .collect();
+        assert_eq!(replaced, ["LoneCr2", "m1", "m0", "m3", "zeta", "beta"]);
+        assert!(joined.edges.is_empty(), "{:?}", edge_lines(&joined));
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(joined.coverage.definitions_without_occurrence, 1, "m2");
         assert_eq!(
             joined.coverage.references_unmatched, 2,
             "the zeta() call has no occurrence, the beta() call's names zeta"
@@ -2053,12 +2202,27 @@ mod tests {
                 })
                 .collect();
             let bytes = encoded_index(tool, path, &occurrences);
-            let index =
+            let mut index =
                 rb_scip::decode(&bytes, &|p| (p == path).then(|| src.as_bytes().to_vec())).unwrap();
             let facts = rb_syntax::extract(language, src.as_bytes()).unwrap();
             let files = BTreeMap::from([(path, (language, &facts))]);
             let keys: BTreeMap<&str, Vec<String>> =
                 BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+            // A lone CR in a Java file is a line terminator javac counts and Tree-sitter-java
+            // does not: since pass 7 the file stays Tier B whole (contract M3b amendment 64).
+            // The conversion is still exercised through the join with the rejection lifted.
+            if tool == "scip-java" {
+                assert_eq!(
+                    index.documents[0].rejected,
+                    Some(rb_scip::Rejection::CommentTerminator)
+                );
+                let joined = join(&index, "", &files, &keys, &[language]);
+                assert!(joined.keys.is_empty() && joined.edges.is_empty(), "{path}");
+                assert_eq!(joined.coverage.documents_rejected, 1);
+                index.documents[0].rejected = None;
+            } else {
+                assert_eq!(index.documents[0].rejected, None, "{path}");
+            }
             let joined = join(&index, "", &files, &keys, &[language]);
             // Every method keeps its own name in its key.
             for (i, d) in facts.definitions.iter().enumerate() {
@@ -2397,6 +2561,8 @@ mod tests {
                 relationships_dropped: 0,
                 relationships_dropped_in_project: 0,
                 relationships_anonymous: 0,
+                documents_rejected: 0,
+                documents_rejected_reasons: BTreeMap::new(),
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();
@@ -2637,9 +2803,424 @@ mod tests {
         for o in &mut shifted.documents[0].occurrences {
             o.span[1] += 1;
         }
+        // Every method's definition occurrence now lies inside the method, off its name: the
+        // document disagrees with the syntax and the file is left to Tier B whole (contract M3b
+        // amendment 64), counted as rejected and not as a file without a document.
         let joined = join(&shifted, "svc", &files, &keys, java);
-        assert!(joined.keys.is_empty());
-        assert_eq!(joined.coverage.definitions_matched, 0);
-        assert_eq!(joined.coverage.references_unmatched, 4);
+        assert!(joined.keys.is_empty() && joined.edges.is_empty());
+        assert!(joined.documented.is_empty());
+        assert_eq!(joined.coverage.definitions_total, 0);
+        assert_eq!(joined.coverage.references_unmatched, 0);
+        assert_eq!(joined.coverage.files_without_document, 0);
+        assert_eq!(joined.coverage.documents_rejected, 1);
+    }
+
+    /// The span Tree-sitter gives the `nth` match of `needle` in `src` (rows by `\n`, byte
+    /// columns), cut to the identifier it starts with (`b()` stands for `b`).
+    fn tok(src: &str, needle: &str, nth: usize) -> Span {
+        let offset = src
+            .match_indices(needle)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("{needle:?} #{nth}"))
+            .0;
+        let len = needle
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(needle.len());
+        let row = src[..offset].matches('\n').count() as i32;
+        let col = (offset - src[..offset].rfind('\n').map_or(0, |n| n + 1)) as i32;
+        [row, col, row, col + len as i32]
+    }
+
+    /// Joins one index over Java or TypeScript files given as `(path, source)`.
+    fn join_sources(language: Language, sources: &[(&str, &str)], index: &ScipIndex) -> Joined {
+        let facts: Vec<(&str, FileFacts)> = sources
+            .iter()
+            .map(|(path, src)| (*path, rb_syntax::extract(language, src.as_bytes()).unwrap()))
+            .collect();
+        let files: BTreeMap<&str, (Language, &FileFacts)> = facts
+            .iter()
+            .map(|(path, f)| (*path, (language, f)))
+            .collect();
+        let keys: BTreeMap<&str, Vec<String>> = facts
+            .iter()
+            .map(|(path, f)| (*path, rb_syntax::symbol_keys(path, f)))
+            .collect();
+        join(index, "", &files, &keys, &[language])
+    }
+
+    const COMMENT_CR: &str = "package t;\n\npublic class CommentCr {\n\tint good() { // note\r return a(); } int evil() {\n\t\treturn b();\n\t}\n\tint a() { return 1; }\n\tint b() { return 2; }\n}\n";
+    const PLAIN: &str = "package t;\n\npublic class Plain {\n    int a() { return b(); }\n    int b() { return 1; }\n}\n";
+
+    /// `Plain.java` as scip-java indexes it: every definition and the call at its token.
+    fn plain_document() -> Document {
+        let sym = |d: &str| format!("scip-java maven . . t/Plain#{d}");
+        Document {
+            path: "t/Plain.java".into(),
+            occurrences: vec![
+                occ_at(tok(PLAIN, "Plain", 0), &sym(""), 1),
+                occ_at(tok(PLAIN, "a()", 0), &sym("a()."), 1),
+                occ_at(tok(PLAIN, "b()", 0), &sym("b()."), 0),
+                occ_at(tok(PLAIN, "b()", 1), &sym("b()."), 1),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Contract M3b amendment 64 (the evaluator's J2): javac ends `good`'s `// note` comment at
+    /// the lone CR, so it compiles `good() { return a(); }` and `evil() { return b(); }`;
+    /// Tree-sitter-java's comment runs to `\n`, so its `good` holds `return b();` and there is
+    /// no `evil`. The decoder rejects the document for the lone CR (`comment_terminator`);
+    /// with that check bypassed (a hand-built document, the occurrences at the spans
+    /// `rb-scip-java:0.13.1` gave them on `var/fix-pass7/scratch/t7`), `evil`'s definition
+    /// occurrence inside Tree-sitter's `good` rejects it (`definition_disagreement`). Either way
+    /// the whole file stays Tier B, `good → b` is never an exact edge, and a clean document of
+    /// the same index keeps its exact edges.
+    #[test]
+    fn a_document_the_parsers_read_differently_stays_heuristic_whole() {
+        let path = "t/CommentCr.java";
+        let sym = |d: &str| format!("scip-java maven . . t/CommentCr#{d}");
+        let hand_built = Document {
+            path: path.into(),
+            occurrences: vec![
+                occ_at(tok(COMMENT_CR, "CommentCr", 0), &sym(""), 1),
+                occ_at(tok(COMMENT_CR, "CommentCr", 0), &sym("`<init>`()."), 1),
+                occ_at(tok(COMMENT_CR, "good", 0), &sym("good()."), 1),
+                occ_at(tok(COMMENT_CR, "a()", 0), &sym("a()."), 0),
+                occ_at(tok(COMMENT_CR, "evil", 0), &sym("evil()."), 1),
+                occ_at(tok(COMMENT_CR, "b()", 0), &sym("b()."), 0),
+                occ_at(tok(COMMENT_CR, "a()", 1), &sym("a()."), 1),
+                occ_at(tok(COMMENT_CR, "b()", 1), &sym("b()."), 1),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            tok(COMMENT_CR, "evil", 0),
+            [3, 41, 3, 45],
+            "the measured span"
+        );
+        assert_eq!(
+            tok(COMMENT_CR, "b()", 0),
+            [4, 9, 4, 10],
+            "the measured span"
+        );
+        let bytes = encoded_index("scip-java", path, &[]);
+        let decoded = rb_scip::decode(&bytes, &|p| {
+            (p == path).then(|| COMMENT_CR.as_bytes().to_vec())
+        })
+        .unwrap();
+        for (document, reason) in [
+            (
+                decoded.documents[0].clone(),
+                rb_scip::Rejection::CommentTerminator,
+            ),
+            (hand_built, rb_scip::Rejection::DefinitionDisagreement),
+        ] {
+            // `User` calls into the rejected file: its symbols have no node, like those of a
+            // file without a document (`references_undocumented`).
+            let user = "package t;\nclass User { int u() { return new CommentCr().good(); } }\n";
+            let user_document = Document {
+                path: "t/User.java".into(),
+                occurrences: vec![
+                    occ_at(tok(user, "User", 0), "scip-java maven . . t/User#", 1),
+                    occ_at(tok(user, "u()", 0), "scip-java maven . . t/User#u().", 1),
+                    occ_at(tok(user, "CommentCr", 0), &sym(""), 0),
+                    occ_at(tok(user, "good", 0), &sym("good()."), 0),
+                ],
+                ..Default::default()
+            };
+            let index = ScipIndex {
+                documents: vec![document, plain_document(), user_document],
+                ..Default::default()
+            };
+            let joined = join_sources(
+                Language::Java,
+                &[
+                    (path, COMMENT_CR),
+                    ("t/Plain.java", PLAIN),
+                    ("t/User.java", user),
+                ],
+                &index,
+            );
+            assert_eq!(
+                (
+                    joined.coverage.references_undocumented,
+                    joined.coverage.references_unanchored
+                ),
+                (2, 0)
+            );
+            assert_eq!(
+                edge_lines(&joined),
+                ["scip-java maven . . t/Plain#a(). Calls scip-java maven . . t/Plain#b()."],
+                "{reason:?}"
+            );
+            assert_eq!(
+                joined.documented,
+                BTreeSet::from(["t/Plain.java".to_owned(), "t/User.java".to_owned()])
+            );
+            assert!(!joined.keys.contains_key(path));
+            assert_eq!(
+                joined.coverage.documents_rejected_reasons,
+                BTreeMap::from([(reason, 1)])
+            );
+            assert_eq!(joined.coverage.documents_rejected, 1);
+            assert_eq!(joined.coverage.files_without_document, 0);
+            assert_eq!(
+                joined.coverage.definitions_total, 5,
+                "Plain's and User's only"
+            );
+        }
+    }
+
+    /// Contract M3b amendment 64 (the evaluator's J1): `Enc.java` is valid UTF-8 in a build
+    /// declaring ISO-8859-1, so javac counts each `é` as two units and every later position of
+    /// the line lands right of its token. The spans are the ones `rb-scip-java:0.13.1` gave on
+    /// `var/fix-pass7/scratch/t7enc`, decoded as UTF-8: `p()`'s definition on `q`'s name, the
+    /// `z()` call occurrence on the `z` of `z(1)`, `q()` and `z(+1)` at the line's end. The
+    /// document disagrees with the syntax even without the pom's signal, so `q → z()` is never
+    /// an exact edge; with the pom's signal the decoder's caller records `source_encoding`
+    /// first. A Latin-1 byte (`Lat.java`) is `not_utf8`.
+    #[test]
+    fn a_document_read_in_another_encoding_is_rejected() {
+        let src = format!(
+            "package t;\n\npublic class Enc {{\n    int z() {{ return 0; }}\n    int z(int x) {{ return x; }}\n    /* {} */ int p() {{ return z(); }} int q() {{ return z(1); }}\n}}\n",
+            "é".repeat(24)
+        );
+        let src = src.as_str();
+        let path = "t/Enc.java";
+        let sym = |d: &str| format!("scip-java maven . . t/Enc#{d}");
+        let end = src.lines().nth(5).unwrap().len() as i32;
+        let document = Document {
+            path: path.into(),
+            occurrences: vec![
+                occ_at(tok(src, "Enc", 0), &sym(""), 1),
+                occ_at(tok(src, "z()", 0), &sym("z()."), 1),
+                occ_at(tok(src, "z(int", 0), &sym("z(+1)."), 1),
+                occ_at(tok(src, "q()", 0), &sym("p()."), 1),
+                occ_at(tok(src, "z(1)", 0), &sym("z()."), 0),
+                occ_at([5, end, 5, end], &sym("q()."), 1),
+                occ_at([5, end, 5, end], &sym("z(+1)."), 0),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(tok(src, "q()", 0), [5, 87, 5, 88], "the measured span");
+        assert_eq!(tok(src, "z(1)", 0), [5, 100, 5, 101], "the measured span");
+        for (rejected, reason) in [
+            (None, rb_scip::Rejection::DefinitionDisagreement),
+            (
+                Some(rb_scip::Rejection::SourceEncoding),
+                rb_scip::Rejection::SourceEncoding,
+            ),
+        ] {
+            let index = ScipIndex {
+                documents: vec![Document {
+                    rejected,
+                    ..document.clone()
+                }],
+                ..Default::default()
+            };
+            let joined = join_sources(Language::Java, &[(path, src)], &index);
+            assert!(joined.edges.is_empty(), "{:?}", edge_lines(&joined));
+            assert!(joined.keys.is_empty());
+            assert_eq!(
+                joined.coverage.documents_rejected_reasons,
+                BTreeMap::from([(reason, 1)])
+            );
+        }
+        let latin1 = src.replace(&"é".repeat(24), &"\u{e9}".repeat(12));
+        let latin1: Vec<u8> = latin1
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap())
+            .collect();
+        let bytes = encoded_index("scip-java", "t/Lat.java", &[]);
+        let decoded = rb_scip::decode(&bytes, &|_| Some(latin1.clone())).unwrap();
+        assert_eq!(
+            decoded.documents[0].rejected,
+            Some(rb_scip::Rejection::NotUtf8)
+        );
+    }
+
+    /// Contract M3b amendment 64: forms Tree-sitter deliberately does not capture, outside
+    /// any method, are not disagreements (measured on spring-retry, jsoup and class-validator):
+    /// Java annotation interfaces and their elements, top-level or nested, and
+    /// scip-typescript's `<constructor>` at the `constructor` keyword.
+    #[test]
+    fn forms_tree_sitter_does_not_capture_are_no_disagreement() {
+        let java = "package p;\npublic @interface Backoff {\n  long delay() default 0;\n}\nclass Outer {\n  @interface Inner { int value(); }\n  void run() {}\n}\n";
+        let sym = |d: &str| format!("scip-java maven . . p/{d}");
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "p/Backoff.java".into(),
+                occurrences: vec![
+                    occ_at(tok(java, "Backoff", 0), &sym("Backoff#"), 1),
+                    occ_at(tok(java, "delay", 0), &sym("Backoff#delay()."), 1),
+                    occ_at(tok(java, "Outer", 0), &sym("Outer#"), 1),
+                    occ_at(tok(java, "Inner", 0), &sym("Outer#Inner#"), 1),
+                    occ_at(tok(java, "value", 0), &sym("Outer#Inner#value()."), 1),
+                    occ_at(tok(java, "run", 0), &sym("Outer#run()."), 1),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let joined = join_sources(Language::Java, &[("p/Backoff.java", java)], &index);
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(
+            joined.coverage.definitions_matched, joined.coverage.definitions_total,
+            "Outer and run"
+        );
+        let ts = "export class K {\n  constructor() {}\n  m() { return 1; }\n}\n";
+        let sym = |d: &str| format!("scip-typescript npm t 1.0.0 src/`k.ts`/K#{d}");
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "src/k.ts".into(),
+                occurrences: vec![
+                    occ_at(tok(ts, "K", 0), &sym(""), 1),
+                    occ_at(tok(ts, "constructor", 0), &sym("`<constructor>`()."), 1),
+                    occ_at(tok(ts, "m()", 0), &sym("m()."), 1),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let joined = join_sources(Language::TypeScript, &[("src/k.ts", ts)], &index);
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(joined.coverage.definitions_without_occurrence, 0);
+        // Outside a method, a method's definition on a token Tree-sitter reads otherwise (the
+        // call in a field initializer) is a disagreement.
+        let field =
+            "package p;\nclass F {\n  int x = compute();\n  int compute() { return 1; }\n}\n";
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "p/F.java".into(),
+                occurrences: vec![
+                    occ_at(tok(field, "F", 0), "scip-java maven . . p/F#", 1),
+                    occ_at(
+                        tok(field, "compute()", 0),
+                        "scip-java maven . . p/F#compute().",
+                        1,
+                    ),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let joined = join_sources(Language::Java, &[("p/F.java", field)], &index);
+        assert_eq!(joined.coverage.documents_rejected, 1);
+    }
+
+    /// Contract M3b amendment 66 (the evaluator's J4): a default import's local name stands
+    /// only for the symbol of that import's own occurrence (scip-typescript gives it the
+    /// symbol the export resolves to, `h.ts/helper().`). `zz()` is accepted through its import
+    /// `zz`; a symbol named `zzzzzz` at the `helper` token is not (it was, through any default
+    /// import named `helper`), nor is the imported symbol at a token that is no import's
+    /// local name (`other`).
+    #[test]
+    fn a_default_import_alias_names_only_its_imports_symbol() {
+        let h = "export default function helper() { return 1; }\n";
+        let alias = "import helper from './h';\nimport zz from './h';\nexport class A2 { zzzzzz() { return 1; } }\nexport function q() { return helper(); }\nexport function r() { return zz(); }\nexport function s() { return other(); }\nfunction other() { return 2; }\n";
+        let pkg = "scip-typescript npm t 1.0.0 src/";
+        let helper = format!("{pkg}`h.ts`/helper().");
+        let module = format!("{pkg}`h.ts`/");
+        let sym = |d: &str| format!("{pkg}`alias.ts`/{d}");
+        let index = ScipIndex {
+            documents: vec![
+                Document {
+                    path: "src/h.ts".into(),
+                    occurrences: vec![occ_at(tok(h, "helper", 0), &helper, 1)],
+                    ..Default::default()
+                },
+                Document {
+                    path: "src/alias.ts".into(),
+                    occurrences: vec![
+                        occ_at(tok(alias, "helper", 0), &helper, 0),
+                        occ_at(tok(alias, "'./h'", 0), &module, 0),
+                        occ_at(tok(alias, "zz", 0), &helper, 0),
+                        occ_at(tok(alias, "'./h'", 1), &module, 0),
+                        occ_at(tok(alias, "A2", 0), &sym("A2#"), 1),
+                        occ_at(tok(alias, "zzzzzz", 0), &sym("A2#zzzzzz()."), 1),
+                        occ_at(tok(alias, "q() {", 0), &sym("q()."), 1),
+                        occ_at(tok(alias, "helper()", 0), &sym("A2#zzzzzz()."), 0),
+                        occ_at(tok(alias, "r() {", 0), &sym("r()."), 1),
+                        occ_at(tok(alias, "zz();", 0), &helper, 0),
+                        occ_at(tok(alias, "s() {", 0), &sym("s()."), 1),
+                        occ_at(tok(alias, "other()", 0), &helper, 0),
+                        occ_at(tok(alias, "other()", 1), &sym("other()."), 1),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let joined = join_sources(
+            Language::TypeScript,
+            &[("src/h.ts", h), ("src/alias.ts", alias)],
+            &index,
+        );
+        assert_eq!(
+            edge_lines(&joined),
+            [format!("{} Calls {helper}", sym("r()."))]
+        );
+        assert_eq!(
+            joined.coverage.references_unmatched, 2,
+            "helper() and other()"
+        );
+        assert_eq!(joined.coverage.documents_rejected, 0);
+    }
+
+    /// Contract M3b amendment 66 (the evaluator's J4): a local symbol names a token only by
+    /// its name (scip-java's display name, or the text at its definition occurrence) or, with
+    /// none known (scip-typescript), by the definition it is bound to. A local whose name is
+    /// `stop` does not bind to `go`, and `local 1` (`Local`) at the `go()` call is no call to
+    /// `Local`.
+    #[test]
+    fn a_local_symbol_names_its_token_by_its_name_or_its_binding() {
+        let src = "export function outer() {\n  class Local { go() { return 1; } }\n  return new Local().go();\n}\n";
+        let path = "src/o.ts";
+        let outer = "scip-typescript npm t 1.0.0 src/`o.ts`/outer().";
+        let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let heuristic = rb_syntax::symbol_keys(path, &facts);
+        let local = facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "Local")
+            .unwrap();
+        let named = |symbol: &str, name: &str| SymbolInfo {
+            symbol: symbol.into(),
+            display_name: name.into(),
+            ..Default::default()
+        };
+        // With display names, as scip-java gives them; without, as scip-typescript does.
+        for (go_definition, symbols, bound) in [
+            (
+                "local 9",
+                vec![named("local 1", "Local"), named("local 9", "stop")],
+                1,
+            ),
+            ("local 2", vec![], 2),
+        ] {
+            let index = ScipIndex {
+                documents: vec![Document {
+                    path: path.into(),
+                    occurrences: vec![
+                        occ_at(tok(src, "outer", 0), outer, 1),
+                        occ_at(tok(src, "Local", 0), "local 1", 1),
+                        occ_at(tok(src, "go()", 0), go_definition, 1),
+                        occ_at(tok(src, "Local()", 0), "local 1", 0),
+                        occ_at(tok(src, "go()", 1), "local 1", 0),
+                    ],
+                    symbols,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let joined = join_sources(Language::TypeScript, &[(path, src)], &index);
+            assert_eq!(
+                edge_lines(&joined),
+                [format!("{outer} References {}", heuristic[local])],
+                "{go_definition}"
+            );
+            assert_eq!(joined.coverage.definitions_local, bound, "{go_definition}");
+            assert_eq!(joined.coverage.references_unmatched, 1, "{go_definition}");
+        }
     }
 }

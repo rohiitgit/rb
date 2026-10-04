@@ -248,7 +248,12 @@ pub(crate) fn run_projects(
                 blobs.get(path.as_str()).and_then(|b| read_blob(b).ok())
             };
             match rb_scip::decode(bytes, &source_of) {
-                Ok(index) => project.index = Some(index),
+                Ok(mut index) => {
+                    if job.fetch == rb_scip::jobs::Fetch::Maven {
+                        reject_for_source_encoding(&mut index, &under_root, read_blob, &source_of);
+                    }
+                    project.index = Some(index);
+                }
                 Err(e) => {
                     project.status = RunStatus::Failed(rb_scip::Phase::Index);
                     project.stderr_tail = format!("decoding index.scip: {e:#}");
@@ -258,6 +263,31 @@ pub(crate) fn run_projects(
         out.push(project);
     }
     Ok(out)
+}
+
+/// Contract M3b amendment 64 (`source_encoding`): when a Maven build declares a source encoding
+/// other than UTF-8 in any of its poms, javac reads every non-ASCII file differently from
+/// Tree-sitter, so each such document is rejected (the first reason found stays).
+fn reject_for_source_encoding(
+    index: &mut ScipIndex,
+    under_root: &[(&str, &str)],
+    read_blob: &dyn Fn(&str) -> anyhow::Result<Vec<u8>>,
+    source_of: &dyn Fn(&str) -> Option<Vec<u8>>,
+) {
+    let poms: Vec<Vec<u8>> = under_root
+        .iter()
+        .filter(|(path, _)| path.rsplit('/').next() == Some("pom.xml"))
+        .filter_map(|(_, blob)| read_blob(blob).ok())
+        .collect();
+    let poms: Vec<&[u8]> = poms.iter().map(Vec::as_slice).collect();
+    if rb_scip::maven_source_encoding(&poms).is_none() {
+        return;
+    }
+    for doc in &mut index.documents {
+        if doc.rejected.is_none() && source_of(&doc.path).is_some_and(|text| !text.is_ascii()) {
+            doc.rejected = Some(rb_scip::Rejection::SourceEncoding);
+        }
+    }
 }
 
 /// `path` is at or below `root` (`""` is the repository root).
@@ -573,6 +603,76 @@ mod tests {
         assert!(warm[0].cached);
         assert_eq!(*fake.runs.borrow(), 3, "no container ran");
         assert_eq!(warm[0].image, JAVA_ID);
+    }
+
+    /// Contract M3b amendment 64 (`source_encoding`): a Maven build declaring ISO-8859-1 has
+    /// javac read a non-ASCII file differently from Tree-sitter (the evaluator's `Enc.java`:
+    /// valid UTF-8, every later column of the line one unit off per `é`), so that document is
+    /// rejected; an ASCII document of the same build, and every document of a UTF-8 build,
+    /// is not.
+    #[test]
+    fn a_non_utf8_maven_build_rejects_its_non_ascii_documents() {
+        use protobuf::Message as _;
+        let index = scip::types::Index {
+            documents: ["src/Enc.java", "src/Plain.java"]
+                .map(|path| scip::types::Document {
+                    relative_path: path.into(),
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+        let files = vec![
+            entry("svc/pom.xml", "1"),
+            entry("svc/src/Enc.java", "2"),
+            entry("svc/src/Plain.java", "3"),
+        ];
+        let rejected = |encoding: &str| {
+            let tmp = tempfile::tempdir().unwrap();
+            let pom = format!(
+                "<project><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>"
+            );
+            let sources: HashMap<String, Vec<u8>> = HashMap::from([
+                ("1".repeat(40), pom.into_bytes()),
+                (
+                    "2".repeat(40),
+                    "class Enc { /* \u{e9} */ int p() { return 0; } }\n".into(),
+                ),
+                ("3".repeat(40), b"class Plain {}\n".to_vec()),
+            ]);
+            let read = |blob: &str| Ok(sources[blob].clone());
+            let fake = Fake::new(index.clone(), false, true);
+            let opts = options(tmp.path(), &fake);
+            let projects = run_projects(
+                &files,
+                &read,
+                &Mode::Run(&fake),
+                &opts,
+                &mut MemCache::default(),
+            )
+            .unwrap();
+            projects[0]
+                .index
+                .as_ref()
+                .unwrap()
+                .documents
+                .iter()
+                .map(|d| (d.path.clone(), d.rejected))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rejected("ISO-8859-1"),
+            [
+                (
+                    "src/Enc.java".to_owned(),
+                    Some(rb_scip::Rejection::SourceEncoding)
+                ),
+                ("src/Plain.java".to_owned(), None),
+            ]
+        );
+        assert!(rejected("UTF-8").iter().all(|(_, r)| r.is_none()));
     }
 
     /// Contract M3b amendments 30 and 31: a `docker run` the client or daemon refused (exit 125)

@@ -35,6 +35,52 @@ pub struct Document {
     /// Occurrences whose columns could not be converted (no source text): kept as code units.
     /// Both supported indexers leave the encoding unset and mean UTF-16, which is assumed then.
     pub unconverted: usize,
+    /// Set when the text shows that the indexer and Tree-sitter may read the file differently
+    /// (contract M3b amendment 64); the join then leaves the whole file to Tier B.
+    pub rejected: Option<Rejection>,
+    /// Each local symbol's name as the text reads it at its first definition occurrence (a
+    /// single-line span with text; contract M3b amendment 66): scip-typescript gives locals no
+    /// display name, so this is what the join's name guard compares a token with.
+    pub local_names: BTreeMap<String, String>,
+}
+
+/// Why a document the index has does not own its file (contract M3b amendment 64): a sign that
+/// the indexer and Tree-sitter read the file differently, so the indexer's positions may name
+/// other tokens than Tree-sitter's. The decoder decides the first three and the fourth's
+/// caller ([`crate::jobs::maven_source_encoding`]); the join decides the last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Rejection {
+    /// The blob is not valid UTF-8, which Tree-sitter's spans and the column conversion assume.
+    NotUtf8,
+    /// The index carries `Document.text` and it is not the blob.
+    TextDiffers,
+    /// The build declares a source encoding other than UTF-8 and the blob is not ASCII.
+    SourceEncoding,
+    /// scip-java: the blob holds a lone `\r` or a `\u000a`/`\u000d` escape, which javac reads
+    /// as a line terminator (also inside a `//` comment) and Tree-sitter-java does not.
+    CommentTerminator,
+    /// A global method or type definition occurrence that no Tree-sitter definition accounts for.
+    DefinitionDisagreement,
+}
+
+impl Rejection {
+    pub const ALL: [Rejection; 5] = [
+        Rejection::NotUtf8,
+        Rejection::TextDiffers,
+        Rejection::SourceEncoding,
+        Rejection::CommentTerminator,
+        Rejection::DefinitionDisagreement,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rejection::NotUtf8 => "not_utf8",
+            Rejection::TextDiffers => "text_differs",
+            Rejection::SourceEncoding => "source_encoding",
+            Rejection::CommentTerminator => "comment_terminator",
+            Rejection::DefinitionDisagreement => "definition_disagreement",
+        }
+    }
 }
 
 /// Ordered by span, then symbol, roles and enclosing range: the order of a document's
@@ -116,8 +162,12 @@ pub fn decode(
                 }
             }
         };
+        let blob = source_of(&path);
+        let rejected = blob
+            .as_deref()
+            .and_then(|blob| rejection(blob, &doc.text, scip_java));
         let text: Option<Vec<u8>> = if doc.text.is_empty() {
-            source_of(&path)
+            blob
         } else {
             Some(doc.text.clone().into_bytes())
         };
@@ -159,6 +209,17 @@ pub fn decode(
                 enclosing,
             });
         }
+        let mut local_names = BTreeMap::new();
+        if let Some(lines) = &lines {
+            for o in occurrences
+                .iter()
+                .filter(|o| o.is_definition() && o.symbol.starts_with("local "))
+            {
+                if let Some(name) = lines.text_at(o.span) {
+                    local_names.entry(o.symbol.clone()).or_insert(name);
+                }
+            }
+        }
         let entry = documents.entry(path.clone()).or_insert_with(|| Merged {
             document: Document {
                 path,
@@ -171,6 +232,10 @@ pub fn decode(
         entry.occurrences.extend(occurrences);
         entry.symbols.extend(doc.symbols.iter().map(symbol_info));
         entry.document.unconverted += unconverted;
+        entry.document.rejected = entry.document.rejected.or(rejected);
+        for (symbol, name) in local_names {
+            entry.document.local_names.entry(symbol).or_insert(name);
+        }
     }
     let documents = documents
         .into_values()
@@ -187,6 +252,36 @@ pub fn decode(
             .map(|t| format!("{} {}", t.name, t.version))
             .unwrap_or_default(),
         documents,
+    })
+}
+
+/// The first sign in `blob` (and the index's `text`, when it has one) that the indexer and
+/// Tree-sitter may read the file differently (contract M3b amendment 64).
+fn rejection(blob: &[u8], text: &str, scip_java: bool) -> Option<Rejection> {
+    if std::str::from_utf8(blob).is_err() {
+        return Some(Rejection::NotUtf8);
+    }
+    if !text.is_empty() && text.as_bytes() != blob {
+        return Some(Rejection::TextDiffers);
+    }
+    (scip_java && has_javac_only_line_terminator(blob)).then_some(Rejection::CommentTerminator)
+}
+
+/// A lone `\r`, or a Unicode escape `\u000a`/`\u000d` (any number of `u`, either case; JLS
+/// §3.3 translates escapes before comments end), anywhere in the text: javac ends a `//`
+/// comment there and Tree-sitter-java does not. A literal `\\u000a` (an escaped backslash) is
+/// rejected too: the rule is kept simple, and a false rejection costs coverage only.
+fn has_javac_only_line_terminator(blob: &[u8]) -> bool {
+    blob.iter().enumerate().any(|(i, &b)| match b {
+        b'\r' => blob.get(i + 1) != Some(&b'\n'),
+        b'\\' if blob.get(i + 1) == Some(&b'u') => {
+            let digits = &blob[i + 1..];
+            let digits = &digits[digits.iter().take_while(|&&c| c == b'u').count()..];
+            digits.len() >= 4
+                && (digits[..4].eq_ignore_ascii_case(b"000a")
+                    || digits[..4].eq_ignore_ascii_case(b"000d"))
+        }
+        _ => false,
     })
 }
 
@@ -227,8 +322,14 @@ struct Lines<'t> {
 impl<'t> Lines<'t> {
     fn new(text: &'t [u8], breaks: LineBreaks) -> Self {
         let mut lines = Vec::new();
-        let mut start = 0;
-        let mut i = 0;
+        // TypeScript's `sys.readFile` drops a leading byte-order mark, so scip-typescript's
+        // line 0 starts after it (contract M3b amendment 65). javac rejects one (no index).
+        let mut start = if breaks == LineBreaks::TypeScript && text.starts_with(b"\xEF\xBB\xBF") {
+            3
+        } else {
+            0
+        };
+        let mut i = start;
         while i < text.len() {
             let terminator = match (text[i], breaks) {
                 (b'\n', _) => 1,
@@ -266,6 +367,21 @@ impl<'t> Lines<'t> {
             )
             .collect();
         Lines { text, lines, rows }
+    }
+
+    /// The text of a converted single-line span (Tree-sitter rows, byte columns), when it is
+    /// non-empty UTF-8 inside one row.
+    fn text_at(&self, span: Span) -> Option<String> {
+        if span[0] != span[2] || span[1] >= span[3] {
+            return None;
+        }
+        let row = *self.rows.get(usize::try_from(span[0]).ok()?)?;
+        let start = row + usize::try_from(span[1]).ok()?;
+        let end = row + usize::try_from(span[3]).ok()?;
+        let bytes = self.text.get(start..end)?;
+        (!bytes.contains(&b'\n'))
+            .then(|| std::str::from_utf8(bytes).ok().map(str::to_owned))
+            .flatten()
     }
 
     /// Tree-sitter's `(row, byte column)` for the indexer's `(line, column)`, the column in
@@ -960,6 +1076,167 @@ mod tests {
         assert_ne!(got[1], expected[1]);
         let (got, expected) = decoded_and_expected("other", lone_cr2, lone_cr2_measured);
         assert_eq!(got[1], expected[2], "\\n only: m0's position is m2's");
+    }
+
+    /// The decoded document of `tool` at `path` whose source blob is `blob` (`None`: not in the
+    /// repository) and whose `Document.text` is `text`, with one occurrence at `[0, 0, 1]`.
+    fn decoded_document(tool: &str, text: &str, blob: Option<&[u8]>) -> Document {
+        let mut o = occ("scip-java maven . . p/T#", ROLE_DEFINITION);
+        o.range = vec![0, 0, 1];
+        let doc = ScipDocument {
+            relative_path: "T".into(),
+            text: text.into(),
+            occurrences: vec![o],
+            ..Default::default()
+        };
+        let index = Index {
+            metadata: Some(Metadata {
+                tool_info: Some(ToolInfo {
+                    name: tool.into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            // A duplicate document (scip-typescript #330) keeps the rejection.
+            documents: vec![doc.clone(), doc],
+            ..Default::default()
+        };
+        let mut got = decode(&encode(&index), &|_| blob.map(<[u8]>::to_vec)).unwrap();
+        assert_eq!(got.documents.len(), 1);
+        got.documents.remove(0)
+    }
+
+    /// Contract M3b amendment 64: the signs, visible in the text alone, that an indexer and
+    /// Tree-sitter read a file differently. Measured with `rb-scip-java:0.13.1` and
+    /// scip-typescript 0.4.0 (`var/fix-pass7/scratch`): a Latin-1 byte shifts both indexers'
+    /// later columns (the evaluator's `Lat.java`, `lat.ts`); javac ends a `//` comment at a
+    /// lone CR and at a `\u000a` escape, Tree-sitter-java does not (`CommentCr.java`,
+    /// `UEsc.java`), while TypeScript and Tree-sitter-typescript agree on a lone CR (`cmt.ts`).
+    #[test]
+    fn documents_the_parsers_may_read_differently_are_rejected() {
+        let latin1: &[u8] = b"/* \xe9\xe9 */ a(b())\n";
+        for tool in ["scip-java", "scip-typescript"] {
+            assert_eq!(
+                decoded_document(tool, "", Some(latin1)).rejected,
+                Some(Rejection::NotUtf8),
+                "{tool}"
+            );
+            let utf8 = "/* \u{e9}\u{1F600} */ a(b())\r\n".as_bytes();
+            assert_eq!(
+                decoded_document(tool, "", Some(utf8)).rejected,
+                None,
+                "{tool}"
+            );
+            // `Document.text` (neither indexer emits it; another tool may) must be the blob.
+            assert_eq!(
+                decoded_document(tool, "a(b())\n", Some(b"a(c())\n")).rejected,
+                Some(Rejection::TextDiffers),
+                "{tool}"
+            );
+            assert_eq!(
+                decoded_document(tool, "a(b())\n", Some(b"a(b())\n")).rejected,
+                None,
+                "{tool}"
+            );
+        }
+        let comment_cr: &[u8] =
+            b"class C {\n\tint good() { // note\r return a(); } int evil() {\n\t\treturn b();\n\t}\n}\n";
+        let escapes: [&[u8]; 4] = [
+            b"// note \\u000a return a(); }",
+            b"// note \\u000A x",
+            b"// note \\uu000d x",
+            b"// note \\u000D x",
+        ];
+        assert_eq!(
+            decoded_document("scip-java", "", Some(comment_cr)).rejected,
+            Some(Rejection::CommentTerminator)
+        );
+        for text in escapes {
+            assert_eq!(
+                decoded_document("scip-java", "", Some(text)).rejected,
+                Some(Rejection::CommentTerminator),
+                "{}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        assert_eq!(
+            decoded_document("scip-java", "", Some(b"// \\u000b \\u00a0 \\n\r\n")).rejected,
+            None
+        );
+        assert_eq!(
+            decoded_document("scip-typescript", "", Some(comment_cr)).rejected,
+            None,
+            "TypeScript ends a line comment at a lone CR as Tree-sitter does"
+        );
+        // Without the blob nothing is compared: such a document has no Tree-sitter facts.
+        assert_eq!(decoded_document("scip-java", "", None).rejected, None);
+        assert_eq!(
+            Rejection::ALL.map(Rejection::as_str),
+            [
+                "not_utf8",
+                "text_differs",
+                "source_encoding",
+                "comment_terminator",
+                "definition_disagreement"
+            ]
+        );
+    }
+
+    /// Contract M3b amendment 66: a local symbol's name is the text at its definition
+    /// occurrence (scip-typescript gives locals no display name); a reference does not name it,
+    /// and a multi-line or empty span gives no name.
+    #[test]
+    fn local_names_are_read_at_their_definition_occurrences() {
+        let text = "function f() {\n  const loc = 1;\n  return loc;\n}\n";
+        let at = |symbol: &str, roles: i32, range: [i32; 3]| {
+            let mut o = occ(symbol, roles);
+            o.range = range.to_vec();
+            o
+        };
+        let doc = ScipDocument {
+            relative_path: "a.ts".into(),
+            occurrences: vec![
+                at("local 0", ROLE_DEFINITION, [1, 8, 11]),
+                at("local 0", 0, [2, 9, 12]),
+                at("local 1", 0, [2, 9, 12]),
+                at("local 2", ROLE_DEFINITION, [1, 8, 8]),
+            ],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let got = decode(&encode(&index), &|_| Some(text.as_bytes().to_vec())).unwrap();
+        assert_eq!(
+            got.documents[0].local_names,
+            BTreeMap::from([("local 0".to_owned(), "loc".to_owned())])
+        );
+    }
+
+    /// Contract M3b amendment 65: TypeScript's `sys.readFile` drops a leading byte-order mark,
+    /// so scip-typescript's line-0 columns start after it (measured on `bom.ts`: `aa` at column
+    /// 16); later lines and other tools are unaffected.
+    #[test]
+    fn typescript_line_zero_starts_after_a_byte_order_mark() {
+        let bom = "\u{FEFF}export function aa() { return bb(); } export function bb() { return 1; }\nexport function dd() { aa(); }\n";
+        let measured: &[(&str, usize, i32, i32, i32)] = &[
+            ("aa", 0, 0, 16, 18),
+            ("bb", 0, 0, 30, 32),
+            ("bb", 1, 0, 54, 56),
+            ("dd", 0, 1, 16, 18),
+            ("aa", 1, 1, 23, 25),
+        ];
+        let (got, expected) = decoded_and_expected("scip-typescript", bom, measured);
+        assert_eq!(got, expected);
+        let (got, expected) = decoded_and_expected("scip-java", bom, measured);
+        assert_ne!(
+            got[0], expected[0],
+            "javac rejects a BOM; no other tool skips it"
+        );
+        assert_eq!(got[3], expected[3]);
     }
 
     #[test]

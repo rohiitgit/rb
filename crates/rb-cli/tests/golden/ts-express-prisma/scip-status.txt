@@ -1,2 +1,2 @@
   code: no heuristic references to own code (0 external); 2 exact calls (scip)
-  scip: . scip-typescript ok, definitions matched 4/4 (0 by name), definitions without occurrence 0, references matched 2, external 0, undocumented 0, local 4, unanchored 0, unmatched 10, unconverted 0, relationships dropped 0 (0 in project, 0 anonymous)
+  scip: . scip-typescript ok, definitions matched 4/4 (0 by name), definitions without occurrence 0, references matched 2, external 0, undocumented 0, local 4, unanchored 0, unmatched 10, unconverted 0, documents rejected 0, relationships dropped 0 (0 in project, 0 anonymous)

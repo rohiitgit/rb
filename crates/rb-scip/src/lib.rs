@@ -3,10 +3,10 @@
 
 pub mod decode;
 
-pub use decode::{Document, Occurrence, Relationship, ScipIndex, SymbolInfo, decode};
+pub use decode::{Document, Occurrence, Rejection, Relationship, ScipIndex, SymbolInfo, decode};
 pub mod jobs;
 
-pub use jobs::{Indexer, Job, jobs};
+pub use jobs::{Indexer, Job, jobs, maven_source_encoding};
 pub mod runner;
 
 pub use runner::{ContainerRun, DockerRunner, Network, Outcome, Runner, docker_available};

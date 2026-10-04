@@ -1977,41 +1977,54 @@ func (s *Server) helper() {}
         );
     }
 
+    /// The resolution of `n` declarations of one name grows linearly: four times the sites
+    /// take well under eight times as long (a quadratic lookup takes sixteen). A ratio of the
+    /// best of three runs, not a wall-clock bound, so host load cannot fail it (contract M3b
+    /// amendment 67).
     #[test]
     fn many_declarations_of_one_name_stay_fast() {
-        let mut src = String::from("class A:\n    def f(self):\n        pass\n\ndef run():\n");
-        for _ in 0..40_000 {
-            src.push_str("    x = A()\n    x.f()\n");
-        }
-        // Parsing is not under test: time the resolution alone.
-        let facts = rb_syntax::extract(PY, src.as_bytes()).unwrap();
-        let by_path: BTreeMap<&str, (Language, &FileFacts)> =
-            BTreeMap::from([("app/many.py", (PY, &facts))]);
-        let mut b = GraphBuilder::new();
-        b.add_node(
-            NodeKey::new(NodeKind::File, "app/many.py"),
-            "app/many.py",
-            Attrs::new(),
-        )
-        .unwrap();
-        let keys = BTreeMap::from([("app/many.py", rb_syntax::symbol_keys("app/many.py", &facts))]);
-        crate::syntax::add_symbols(&mut b, "app/many.py", &facts, &keys["app/many.py"]).unwrap();
-        let started = std::time::Instant::now();
-        add_edges(&mut b, &by_path, &BTreeMap::new(), &keys, &BTreeSet::new()).unwrap();
-        assert!(
-            started.elapsed().as_millis() < 1500,
-            "{:?}",
-            started.elapsed()
-        );
-        let g = b.finish().unwrap();
-        // Every `x.f()` site resolves to the one method, so the edges aggregate into one.
-        assert_eq!(
-            g.edges()
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Calls)
-                .count(),
-            1
-        );
+        let resolve = |n: usize| {
+            let mut src = String::from("class A:\n    def f(self):\n        pass\n\ndef run():\n");
+            for _ in 0..n {
+                src.push_str("    x = A()\n    x.f()\n");
+            }
+            // Parsing is not under test: time the resolution alone.
+            let facts = rb_syntax::extract(PY, src.as_bytes()).unwrap();
+            let by_path: BTreeMap<&str, (Language, &FileFacts)> =
+                BTreeMap::from([("app/many.py", (PY, &facts))]);
+            let keys =
+                BTreeMap::from([("app/many.py", rb_syntax::symbol_keys("app/many.py", &facts))]);
+            let mut best = std::time::Duration::MAX;
+            let mut calls = 0;
+            for _ in 0..3 {
+                let mut b = GraphBuilder::new();
+                b.add_node(
+                    NodeKey::new(NodeKind::File, "app/many.py"),
+                    "app/many.py",
+                    Attrs::new(),
+                )
+                .unwrap();
+                crate::syntax::add_symbols(&mut b, "app/many.py", &facts, &keys["app/many.py"])
+                    .unwrap();
+                let started = std::time::Instant::now();
+                add_edges(&mut b, &by_path, &BTreeMap::new(), &keys, &BTreeSet::new()).unwrap();
+                best = best.min(started.elapsed());
+                calls = b
+                    .finish()
+                    .unwrap()
+                    .edges()
+                    .iter()
+                    .filter(|e| e.kind == EdgeKind::Calls)
+                    .count();
+            }
+            // Every `x.f()` site resolves to the one method, so the edges aggregate into one.
+            assert_eq!(calls, 1);
+            best
+        };
+        let small = resolve(5_000);
+        let large = resolve(20_000);
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        assert!(ratio < 8.0, "{small:?} → {large:?}: ×{ratio:.1}");
     }
 
     #[test]

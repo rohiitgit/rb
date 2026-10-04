@@ -32,8 +32,9 @@ use serde_json::{Value, json};
 /// so a snapshot an older binary built is not "up to date" for this one (it had stayed
 /// `m1b-syntax-1` through M2b–M3a; contract M3b amendment 42). That includes every change to
 /// the SCIP decoder or join (`rb_scip::decode`, `scip::join`): evaluator passes 4 and 5 changed
-/// the join's output without a bump (contract M3b amendment 63).
-pub const PIPELINE: &str = "m3b-scip-2";
+/// the join's output without a bump (contract M3b amendment 63); `m3b-scip-3` adds the
+/// per-document agreement check (amendment 64).
+pub const PIPELINE: &str = "m3b-scip-3";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -468,6 +469,12 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "relationships_dropped": c.relationships_dropped,
             "relationships_dropped_in_project": c.relationships_dropped_in_project,
             "relationships_anonymous": c.relationships_anonymous,
+            "documents_rejected": c.documents_rejected,
+            "documents_rejected_reasons": c
+                .documents_rejected_reasons
+                .iter()
+                .map(|(reason, n)| (reason.as_str().to_owned(), Value::from(*n)))
+                .collect::<serde_json::Map<String, Value>>(),
         });
     }
     if matches!(

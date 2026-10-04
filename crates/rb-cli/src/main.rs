@@ -645,11 +645,19 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         let n = |k: &str| c[k].as_u64().unwrap_or(0);
         let _ = write!(
             line,
-            ", definitions matched {}/{} ({} by name), definitions without occurrence {}, references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}, relationships dropped {} ({} in project, {} anonymous)",
+            ", definitions matched {}/{} ({} by name)",
             n("definitions_matched"),
             n("definitions_total"),
             n("definitions_matched_by_name"),
-            n("definitions_without_occurrence"),
+        );
+        // A field a snapshot written before it existed lacks is omitted, not printed as 0
+        // (contract M3b amendment 67): `definitions_without_occurrence` from amendment 62.
+        if let Some(without) = c["definitions_without_occurrence"].as_u64() {
+            let _ = write!(line, ", definitions without occurrence {without}");
+        }
+        let _ = write!(
+            line,
+            ", references matched {}, external {}, undocumented {}, local {}, unanchored {}, unmatched {}, unconverted {}",
             n("references_matched"),
             n("references_external"),
             n("references_undocumented"),
@@ -657,6 +665,25 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
             n("references_unanchored"),
             n("references_unmatched"),
             n("occurrences_unconverted"),
+        );
+        // Documents the agreement check left to Tier B (contract M3b amendment 64), with the
+        // reasons when there are any; omitted for a snapshot written before it existed.
+        if let Some(rejected) = c["documents_rejected"].as_u64() {
+            let _ = write!(line, ", documents rejected {rejected}");
+            if let Some(reasons) = c["documents_rejected_reasons"]
+                .as_object()
+                .filter(|r| !r.is_empty())
+            {
+                let reasons: Vec<String> = reasons
+                    .iter()
+                    .map(|(reason, k)| format!("{reason} {}", k.as_u64().unwrap_or(0)))
+                    .collect();
+                let _ = write!(line, " ({})", reasons.join(", "));
+            }
+        }
+        let _ = write!(
+            line,
+            ", relationships dropped {} ({} in project, {} anonymous)",
             n("relationships_dropped"),
             n("relationships_dropped_in_project"),
             n("relationships_anonymous")
@@ -1142,13 +1169,36 @@ mod tests {
         let ok = diagnostic(json!({
             "indexer": "scip-java", "status": "ok", "unpinned": false, "image": "sha256:1",
             "coverage": {"definitions_matched": 2, "definitions_total": 3,
-                         "definitions_without_occurrence": 1, "relationships_dropped": 4},
+                         "definitions_without_occurrence": 1, "relationships_dropped": 4,
+                         "documents_rejected": 0, "documents_rejected_reasons": {}},
         }));
-        // Contract M3b amendment 62: the definitions without an occurrence and the anonymous
-        // classes' links are printed, zero or not.
+        // Contract M3b amendments 62 and 64: the definitions without an occurrence, the
+        // rejected documents and the anonymous classes' links are printed, zero or not.
         assert_eq!(
             scip_status_line(&ok),
-            "scip: . scip-java ok, definitions matched 2/3 (0 by name), definitions without occurrence 1, references matched 0, external 0, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0, relationships dropped 4 (0 in project, 0 anonymous)"
+            "scip: . scip-java ok, definitions matched 2/3 (0 by name), definitions without occurrence 1, references matched 0, external 0, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0, documents rejected 0, relationships dropped 4 (0 in project, 0 anonymous)"
+        );
+        let rejected = diagnostic(json!({
+            "indexer": "scip-java", "status": "ok", "unpinned": false, "image": "sha256:1",
+            "coverage": {"definitions_without_occurrence": 0, "documents_rejected": 3,
+                         "documents_rejected_reasons": {"comment_terminator": 2, "not_utf8": 1}},
+        }));
+        assert!(
+            scip_status_line(&rejected).contains(
+                ", unconverted 0, documents rejected 3 (comment_terminator 2, not_utf8 1), relationships dropped 0"
+            ),
+            "{}",
+            scip_status_line(&rejected)
+        );
+        // Contract M3b amendment 67: a snapshot written before a field existed (the evaluator's
+        // `fp3_class_validator`, before amendments 62 and 64) omits it instead of printing 0.
+        let old = diagnostic(json!({
+            "indexer": "scip-typescript", "status": "ok", "unpinned": false, "image": "sha256:1",
+            "coverage": {"definitions_matched": 417, "definitions_total": 424},
+        }));
+        assert_eq!(
+            scip_status_line(&old),
+            "scip: . scip-typescript ok, definitions matched 417/424 (0 by name), references matched 0, external 0, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0, relationships dropped 0 (0 in project, 0 anonymous)"
         );
         // Local definitions (contract M3b amendment 54) are printed when there are any.
         let local = diagnostic(json!({

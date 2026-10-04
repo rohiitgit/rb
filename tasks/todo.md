@@ -226,6 +226,14 @@ Findings from the research step (2026-09-29):
       - [x] I5 design §13/§5.3, `PIPELINE` `m3b-scip-2` with the bump rule.
       - [x] spring-retry tests without documents: cause found (Develocity local build cache serves `testCompile`), recorded as an open item.
       - [x] Verify: fmt, clippy, 300 unit tests, e2e twice with containers (no `skipping:`), stub scan; public repos fresh == cached, edge sets identical to `79d2c33`; records; cleanup; commit.
+    - [x] Evaluator pass 7 (test-first, one amendment each, 64–67; `tasks/eval-m3b-pass7.md`; decision: per-document agreement check, whole-file Tier B fallback):
+      - [x] Amendment skeletons 64–67 and invariant 1 restated.
+      - [x] Measured with the real images on `var/fix-pass7/scratch` (no `Document.text` from either indexer; javac reads an undeclared build as UTF-8; ISO-8859-1 builds shift non-ASCII lines only; scip-typescript strips the BOM; default imports carry the export's own symbol).
+      - [x] Phase 1 (rb-scip): `Rejection` (`not_utf8`, `text_differs`, `comment_terminator` in the decoder; `source_encoding` from the Maven poms); TypeScript BOM on line 0; units.
+      - [x] Phase 2 (rb-indexer): `definition_disagreement` in the join (calibrated to 0 on four repos + fixtures), rejected documents fall back whole-file, `documents_rejected(_reasons)` in coverage; `source_encoding` applied in `run_projects`; J4 name guard (import-site symbol, local names from the definition occurrence); `PIPELINE` `m3b-scip-3`; units, mutations M9/M14/M15/M22.
+      - [x] Phase 3 (rb-cli, e2e): status line (`documents rejected`, old snapshots omit `definitions without occurrence`); goldens re-blessed by container runs; growth-ratio timing test.
+      - [x] Phase 4: four public repos fresh == cached, edge sets == `82f34d4`; scratch J1–J4 cases; records; cleanup; commit.
+      - [x] Resumed after an interruption: phases 1–3 were in the tree uncommitted; reviewed, `in_root`'s displaced doc comment restored, amendment 64's reason order corrected to the pipeline's, every mutation (M9, M14, M15, M22, the agreement check's clauses, quadratic `add_edges`) re-run and failing, scratch cases re-run with `--no-cache` on the real images, design §5.3/§13 updated.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
@@ -248,3 +256,7 @@ Findings from the research step (2026-09-29):
 ## Review (evaluator pass 6)
 - All five findings fixed test-first (amendments 59–63). Line terminators were measured on both real images before any code: scip-java counts a lone CR, scip-typescript also U+2028/U+2029, Tree-sitter only `\n`; the decoder now converts each position through its byte offset, and a name guard on exact-span matches rejects an occurrence that does not name its token (0 rejections on four public repositories, the fixtures and the scratch project after the measured naming forms were enumerated).
 - Found while measuring: a U+2029 inside a TypeScript `//` comment ends the comment for TypeScript but not for Tree-sitter (scip-typescript indexed the rest of the line as a class property); spring-retry's test sources are skipped by scip-java because a Develocity build cache serves `testCompile` (open item). The edge sets of all four public repositories are unchanged; only the coverage diagnostic gains two fields.
+
+## Review (evaluator pass 7)
+- All five findings fixed test-first (amendments 64–67). A document is SCIP-owned only when the indexer and Tree-sitter read it alike (`not_utf8`, `text_differs`, `comment_terminator`, `source_encoding`, `definition_disagreement`); otherwise the whole file is Tier B and counted. The J2 layout is rejected by `comment_terminator` and, with the decoder bypassed, by `definition_disagreement`. Calibration: 0 rejected documents on the four public repositories and the fixtures; edge sets identical to `82f34d4` on every edge kind.
+- Found while resuming: amendment 64 said the reasons are tested in listed order, but the decoder's `comment_terminator` comes before `source_encoding` (applied after decoding); the amendment now states the pipeline's order. `text_differs` cannot fire with today's indexers (no `Document.text` emitted, measured) and stays as a guard.
