@@ -38,8 +38,9 @@ use serde_json::{Value, json};
 /// agreement and the encoding tie (amendments 72 and 73), `m3b-scip-6` kind-aware pairing, a
 /// type anchored by its type symbol, the syntax-error rule for TypeScript and compact
 /// constructors as definitions (amendment 75), `m3b-scip-7` the `structural_escape` reason and
-/// supertypes confirmed by the index (amendments 77 and 78).
-pub const PIPELINE: &str = "m3b-scip-7";
+/// supertypes confirmed by the index (amendments 77 and 78), `m3b-scip-8` an escaped backslash
+/// as a structural escape (amendment 80).
+pub const PIPELINE: &str = "m3b-scip-8";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

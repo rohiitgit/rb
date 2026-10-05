@@ -264,6 +264,12 @@ Findings from the research step (2026-09-29):
       - [x] Mutations SE1–SE8, SC1–SC4, MK2, MK13: each fails a unit.
       - [x] Verify: fmt, clippy, 333 unit tests, e2e 15/15 twice, stub scan; nine public repos fresh == cached, rejections 0, `supertypes_unconfirmed` 0, edge sets identical to `2406e57`.
       - [x] Records (contract 77–79, amendment 71 table, invariant 1, CHANGELOG, IMPLEMENT.md, design §5.3/§13, lessons); cleanup; commit.
+    - [x] Evaluator pass 12 (amendment 80; `tasks/eval-m3b-pass12.md`; O1: an escaped backslash is structural unless `u` follows; O2: the produced-backslash rule's unit):
+      - [x] Phase 1 (rb-scip `decode.rs`, rb-indexer `lib.rs`): backslash clause with the `u` exemption; units `escaped_backslashes_reject_a_scip_java_document`, `a_produced_backslash_leaves_the_next_escape_eligible`; the "agree" unit corrected; `PIPELINE` `m3b-scip-8`.
+      - [x] Mutations: clause removed, exemption removed, R1 on the pass-11 rule: each fails a unit; R1 on the new rule is equivalent (recorded).
+      - [x] Real image `var/close-m3b/t12bs`: `Bs7`, `Bs4` rejected `structural_escape`, no false exact edge; seven Java repos `documents rejected 0`, counts unchanged, fresh == cached.
+      - [x] Verify: fmt, clippy, 335 unit tests, e2e 15/15 twice (no `skipping:`), stub scan.
+      - [x] Records (contract 80, amendments 71/77 in place, design §5.3, CHANGELOG); cleanup; commit.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).

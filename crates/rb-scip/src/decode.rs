@@ -330,13 +330,16 @@ fn has_javac_only_line_terminator(blob: &[u8]) -> bool {
 }
 
 /// Whether `blob` holds a Java Unicode escape that decodes to structural ASCII (contract M3b
-/// amendment 77, `structural_escape`): `/ * { } ( ) ; , " ' = < >` or a line terminator. An
-/// escape is a backslash eligible to begin one (JLS §3.3: preceded by an even number of
-/// contiguous backslashes), one or more `u` and four hex digits. A backslash an escape
-/// produces (`\u005c`) is not counted towards the next one's eligibility, so a following
-/// escape is read as one: a rejection costs coverage only. Malformed digits are no escape
-/// (javac would not compile the file). `.`, `@` and `:` are left out: json-schema-validator
-/// writes `case '\u002E':` (measured), and the checks downstream remain for them.
+/// amendments 77 and 80, `structural_escape`): `/ * { } ( ) ; , " ' = < >`, a line terminator,
+/// or a backslash not immediately followed by `u`. javac's produced backslash escapes the next
+/// character inside a literal (`"\u005c"; /*"` is one string for javac, a string and a comment
+/// for Tree-sitter-java); followed by `u` (vavr's Javadoc `\u005Cu0131`, measured as the only
+/// form) it is inert in a comment and illegal in a literal. An escape is a backslash eligible
+/// to begin one (JLS §3.3: preceded by an even number of contiguous backslashes), one or more
+/// `u` and four hex digits. A backslash an escape produces is not counted towards the next
+/// one's eligibility. Malformed digits are no escape (javac would not compile the file). `.`,
+/// `@` and `:` are left out: json-schema-validator writes `case '\u002E':` (measured), and
+/// the checks downstream remain for them.
 fn has_structural_escape(blob: &[u8]) -> bool {
     const STRUCTURAL: &[u8] = b"/*{}();,\"'=<>\n\r";
     let mut backslashes = 0usize;
@@ -356,7 +359,10 @@ fn has_structural_escape(blob: &[u8]) -> bool {
                 let code = digits.iter().fold(0u32, |n, &d| {
                     n * 16 + char::from(d).to_digit(16).unwrap_or(0)
                 });
-                if u8::try_from(code).is_ok_and(|c| STRUCTURAL.contains(&c)) {
+                let next = blob.get(i + 5 + us);
+                if u8::try_from(code)
+                    .is_ok_and(|c| STRUCTURAL.contains(&c) || (c == b'\\' && next != Some(&b'u')))
+                {
                     return true;
                 }
                 backslashes = 0;
@@ -1394,13 +1400,13 @@ mod tests {
         assert_eq!(java("s = \"§§u002a §§u0022\";\n"), None);
         assert!(!has_structural_escape(b"\\\\u002a"));
         // Escapes javac and Tree-sitter agree on: in identifiers and literals of other
-        // characters, a backslash, malformed digits; `.`, `@`, `:` (measured on
-        // json-schema-validator: `case '§u002E':`), and jsoup's `-`, `!`, controls.
+        // characters, malformed digits; `.`, `@`, `:` (measured on json-schema-validator:
+        // `case '§u002E':`), and jsoup's `-`, `!`, controls. A backslash is not among them
+        // (amendment 80, `escaped_backslashes_reject_a_scip_java_document`).
         for text in [
             "int §u0061§u0062 = 1;\n",
             "char c = '§u002E'; char d = '§u0040'; char e = '§u003a';\n",
             "String s = \"§u002d§u0021§u0000§u007f§u00e9§u2028\";\n",
-            "String s = \"§u005c\";\n",
             "String s = \"§u00zz §u002\";\n",
             "// §n §u §uu\n",
         ] {
@@ -1411,6 +1417,64 @@ mod tests {
         assert_eq!(
             decoded_document("scip-typescript", "", Some(ts.as_bytes())).rejected,
             None
+        );
+    }
+
+    /// Contract M3b amendment 80 (evaluator pass 12, O1 and O2): an escape that decodes to a
+    /// backslash is structural unless `u` follows it. javac's produced backslash escapes the
+    /// next character inside a literal (JLS §3.3, §3.10.7), Tree-sitter-java reads `§u005c` as
+    /// a complete escape sequence, so `"§u005c"; /*"` is one string for javac and a string
+    /// followed by a block comment for Tree-sitter: the evaluator's `Bs7` and `Bs4` (rows as
+    /// measured on `var/eval-pass12/t12esc`) gave false exact `Bs7#n() → b()`, `Bs4#n() → b()`
+    /// and `Bs4#n() IMPLEMENTS J4#n()`. Followed by `u` (vavr's Javadoc `§u005Cu0131`, the only
+    /// form measured on the seven Java repositories) the backslash is inert in a comment and
+    /// illegal in a literal. Here `§` stands for a backslash.
+    #[test]
+    fn escaped_backslashes_reject_a_scip_java_document() {
+        let java = |text: &str| {
+            let blob = text.replace('§', "\\");
+            decoded_document("scip-java", "", Some(blob.as_bytes())).rejected
+        };
+        let bs7 = "package p;\n\nenum Bs7 {\n  A { String s = \"§u005c\"; /*\"; { new Object() { /* */ void n() { b(); } String t = \"§u005c\"; /*\"; }; } /* */ } ;\n  static void b() {}\n}\n";
+        let bs4 = "package p;\n\nenum Bs4 {\n  A { String s = \"§u005c\"; /*\"; { new J4() { /* */ public void n() { b(); } String t = \"§u005c\"; /*\"; }; } /* */ } ;\n  static void b() {}\n}\n\ninterface J4 { void n(); }\n";
+        for text in [bs7, bs4] {
+            assert_eq!(java(text), Some(Rejection::StructuralEscape), "{text}");
+        }
+        // Whatever follows but `u`, in either case of the digits and with any number of `u`;
+        // also at the end of the blob.
+        for text in [
+            "String s = \"§u005c\";\n",
+            "String s = \"§u005C\"; /*\";\n",
+            "/* §uu005cn */\n",
+            "/* §u005cU0131 */\n",
+            "// §u005c",
+        ] {
+            assert_eq!(java(text), Some(Rejection::StructuralEscape), "{text}");
+        }
+        // vavr's form: a backslash and the text `u0131`, for javac as for Tree-sitter.
+        for text in [
+            "/** Turkish dotless i: §u005cu0131. */\n",
+            "/** {@code '§u005Cu0131'} and {@code '§u005Cu0020'} */\n",
+            "/* §u005cuu0131 §uuu005cu0131 */\n",
+        ] {
+            assert_eq!(java(text), None, "{text}");
+        }
+        // An escaped backslash (`§§u005c`) begins no escape, as before.
+        assert_eq!(java("String s = \"§§u005c\";\n"), None);
+    }
+
+    /// Contract M3b amendment 77's produced-backslash rule (evaluator pass 12, O2, mutant R1):
+    /// the backslash `§u005c` produces does not count towards the next escape's eligibility
+    /// (JLS §3.3), so `§u005c§u002a/` is `§*/` for javac and `§u002a` is read as an escape.
+    /// Since amendment 80 the first escape alone rejects this text, so R1 is equivalent on the
+    /// current rule; the unit pins the rule for the escape after it (with amendment 80's clause
+    /// removed, R1 fails it).
+    #[test]
+    fn a_produced_backslash_leaves_the_next_escape_eligible() {
+        let blob = "/* §u005c§u002a/ */\n".replace('§', "\\");
+        assert_eq!(
+            decoded_document("scip-java", "", Some(blob.as_bytes())).rejected,
+            Some(Rejection::StructuralEscape)
         );
     }
 
