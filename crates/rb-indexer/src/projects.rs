@@ -267,7 +267,9 @@ pub(crate) fn run_projects(
 
 /// Contract M3b amendment 64 (`source_encoding`): when a Maven build declares a source encoding
 /// other than UTF-8 in any of its poms, javac reads every non-ASCII file differently from
-/// Tree-sitter, so each such document is rejected (the first reason found stays).
+/// Tree-sitter, so each such document is rejected. The decoder's reasons found earlier stay,
+/// except `encoding_ambiguous` (amendment 69): the pom's declaration is the more specific
+/// signal and is recorded instead.
 fn reject_for_source_encoding(
     index: &mut ScipIndex,
     under_root: &[(&str, &str)],
@@ -284,7 +286,11 @@ fn reject_for_source_encoding(
         return;
     }
     for doc in &mut index.documents {
-        if doc.rejected.is_none() && source_of(&doc.path).is_some_and(|text| !text.is_ascii()) {
+        if matches!(
+            doc.rejected,
+            None | Some(rb_scip::Rejection::EncodingAmbiguous)
+        ) && source_of(&doc.path).is_some_and(|text| !text.is_ascii())
+        {
             doc.rejected = Some(rb_scip::Rejection::SourceEncoding);
         }
     }
@@ -609,14 +615,39 @@ mod tests {
     /// javac read a non-ASCII file differently from Tree-sitter (the evaluator's `Enc.java`:
     /// valid UTF-8, every later column of the line one unit off per `é`), so that document is
     /// rejected; an ASCII document of the same build, and every document of a UTF-8 build,
-    /// is not.
+    /// is not. `Enc.java` also has an occurrence whose raw column names an `a` under both a
+    /// UTF-8 and an ISO-8859-1 reading (contract M3b amendment 69): the pom's signal, read
+    /// first, is the reason recorded in the ISO-8859-1 build, `encoding_ambiguous` in the
+    /// UTF-8 one.
     #[test]
     fn a_non_utf8_maven_build_rejects_its_non_ascii_documents() {
         use protobuf::Message as _;
+        let enc_text = "class Enc { /* \u{e9} */ int aa() { return 0; } }\n";
+        let second_a = enc_text.find("aa").unwrap() + 1;
+        // Raw column 25 is the second `a` read as UTF-16 units and the first read as bytes.
+        assert_eq!(enc_text[..second_a].chars().count(), 25);
+        assert_eq!(&enc_text[25..26], "a");
         let index = scip::types::Index {
+            metadata: Some(scip::types::Metadata {
+                tool_info: Some(scip::types::ToolInfo {
+                    name: "scip-java".into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
             documents: ["src/Enc.java", "src/Plain.java"]
                 .map(|path| scip::types::Document {
                     relative_path: path.into(),
+                    occurrences: (path == "src/Enc.java")
+                        .then(|| scip::types::Occurrence {
+                            symbol: "scip-java maven . . Enc#a().".into(),
+                            range: vec![0, 25, 26],
+                            ..Default::default()
+                        })
+                        .into_iter()
+                        .collect(),
                     ..Default::default()
                 })
                 .to_vec(),
@@ -636,10 +667,7 @@ mod tests {
             );
             let sources: HashMap<String, Vec<u8>> = HashMap::from([
                 ("1".repeat(40), pom.into_bytes()),
-                (
-                    "2".repeat(40),
-                    "class Enc { /* \u{e9} */ int p() { return 0; } }\n".into(),
-                ),
+                ("2".repeat(40), enc_text.into()),
                 ("3".repeat(40), b"class Plain {}\n".to_vec()),
             ]);
             let read = |blob: &str| Ok(sources[blob].clone());
@@ -672,7 +700,16 @@ mod tests {
                 ("src/Plain.java".to_owned(), None),
             ]
         );
-        assert!(rejected("UTF-8").iter().all(|(_, r)| r.is_none()));
+        assert_eq!(
+            rejected("UTF-8"),
+            [
+                (
+                    "src/Enc.java".to_owned(),
+                    Some(rb_scip::Rejection::EncodingAmbiguous)
+                ),
+                ("src/Plain.java".to_owned(), None),
+            ]
+        );
     }
 
     /// Contract M3b amendments 30 and 31: a `docker run` the client or daemon refused (exit 125)

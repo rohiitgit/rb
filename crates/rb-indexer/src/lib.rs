@@ -33,8 +33,9 @@ use serde_json::{Value, json};
 /// `m1b-syntax-1` through M2b–M3a; contract M3b amendment 42). That includes every change to
 /// the SCIP decoder or join (`rb_scip::decode`, `scip::join`): evaluator passes 4 and 5 changed
 /// the join's output without a bump (contract M3b amendment 63); `m3b-scip-3` adds the
-/// per-document agreement check (amendment 64).
-pub const PIPELINE: &str = "m3b-scip-3";
+/// per-document agreement check (amendment 64), `m3b-scip-4` its `encoding_ambiguous` and
+/// `structure_disagreement` reasons (amendments 68 and 69).
+pub const PIPELINE: &str = "m3b-scip-4";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

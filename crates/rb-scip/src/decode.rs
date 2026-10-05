@@ -56,20 +56,29 @@ pub enum Rejection {
     TextDiffers,
     /// The build declares a source encoding other than UTF-8 and the blob is not ASCII.
     SourceEncoding,
+    /// scip-java: an occurrence on a non-ASCII line names its token under an ISO-8859-1
+    /// reading of the line as well as under the UTF-8 one, or that reading names more tokens
+    /// (contract M3b amendment 69): the positions cannot show that javac read UTF-8.
+    EncodingAmbiguous,
     /// scip-java: the blob holds a lone `\r` or a `\u000a`/`\u000d` escape, which javac reads
     /// as a line terminator (also inside a `//` comment) and Tree-sitter-java does not.
     CommentTerminator,
     /// A global method or type definition occurrence that no Tree-sitter definition accounts for.
     DefinitionDisagreement,
+    /// scip-java: a reference Tree-sitter places in another definition than the index's own
+    /// enclosing ranges do (contract M3b amendment 68).
+    StructureDisagreement,
 }
 
 impl Rejection {
-    pub const ALL: [Rejection; 5] = [
+    pub const ALL: [Rejection; 7] = [
         Rejection::NotUtf8,
         Rejection::TextDiffers,
         Rejection::SourceEncoding,
+        Rejection::EncodingAmbiguous,
         Rejection::CommentTerminator,
         Rejection::DefinitionDisagreement,
+        Rejection::StructureDisagreement,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -77,8 +86,10 @@ impl Rejection {
             Rejection::NotUtf8 => "not_utf8",
             Rejection::TextDiffers => "text_differs",
             Rejection::SourceEncoding => "source_encoding",
+            Rejection::EncodingAmbiguous => "encoding_ambiguous",
             Rejection::CommentTerminator => "comment_terminator",
             Rejection::DefinitionDisagreement => "definition_disagreement",
+            Rejection::StructureDisagreement => "structure_disagreement",
         }
     }
 }
@@ -181,10 +192,13 @@ pub fn decode(
             }
         };
         let mut occurrences = Vec::with_capacity(doc.occurrences.len());
+        // Each occurrence's range as the indexer wrote it, for reading it in another encoding.
+        let mut raw = Vec::with_capacity(doc.occurrences.len());
         for occ in &doc.occurrences {
             let Some((sl, sc, el, ec)) = range_of(&occ.typed_range, &occ.range) else {
                 continue;
             };
+            raw.push((sl, sc, el, ec));
             let mut failed = false;
             let mut span_of = |(sl, sc, el, ec): (i32, i32, i32, i32)| -> Span {
                 let mut at = |line: i32, col: i32| {
@@ -209,6 +223,22 @@ pub fn decode(
                 enclosing,
             });
         }
+        // Contract M3b amendment 69: javac's encoding is a build setting that cannot all be
+        // read statically, so a scip-java document whose positions an ISO-8859-1 reading
+        // explains as well as the UTF-8 one (or better) is not trusted.
+        let rejected = rejected.or_else(|| {
+            let lines = lines.as_ref()?;
+            let display_names: BTreeMap<&str, &str> = doc
+                .symbols
+                .iter()
+                .filter(|s| s.symbol.starts_with("local ") && !s.display_name.is_empty())
+                .map(|s| (s.symbol.as_str(), s.display_name.as_str()))
+                .collect();
+            (units_per == Units::Javac
+                && !lines.text.is_ascii()
+                && encoding_ambiguous(lines, &occurrences, &raw, &display_names))
+            .then_some(Rejection::EncodingAmbiguous)
+        });
         let mut local_names = BTreeMap::new();
         if let Some(lines) = &lines {
             for o in occurrences
@@ -285,6 +315,55 @@ fn has_javac_only_line_terminator(blob: &[u8]) -> bool {
     })
 }
 
+/// Whether a scip-java document's positions fail to show that javac read its text as UTF-8
+/// (contract M3b amendment 69, `encoding_ambiguous`). Each single-line occurrence is read twice:
+/// as converted (UTF-16 units of the UTF-8 text) and with one column per byte, as javac counts
+/// a file it reads as ISO-8859-1 (or any single-byte encoding). Where the two spans differ
+/// (after a non-ASCII byte on the line), each is checked against the occurrence's symbol: a
+/// global symbol by [`crate::may_name`], a local one by its display name (scip-java gives
+/// one). Ambiguous when some occurrence names its token under both readings (nothing tells
+/// which encoding placed it), or when the ISO-8859-1 reading names more tokens than the UTF-8
+/// one (javac evidently read single bytes).
+fn encoding_ambiguous(
+    lines: &Lines<'_>,
+    occurrences: &[Occurrence],
+    raw: &[(i32, i32, i32, i32)],
+    display_names: &BTreeMap<&str, &str>,
+) -> bool {
+    let names = |o: &Occurrence, span: Span| {
+        lines.text_at(span).is_some_and(|text| {
+            if o.symbol.starts_with("local ") {
+                display_names.get(o.symbol.as_str()) == Some(&text.as_str())
+            } else {
+                crate::symbol::may_name(&o.symbol, &text)
+            }
+        })
+    };
+    let (mut utf8, mut iso) = (0usize, 0usize);
+    for (o, &(sl, sc, el, ec)) in occurrences.iter().zip(raw) {
+        if sl != el {
+            continue;
+        }
+        let (Some(start), Some(end)) = (
+            lines.position(sl, sc, Units::JavacLatin1),
+            lines.position(el, ec, Units::JavacLatin1),
+        ) else {
+            continue;
+        };
+        let other = [start.0, start.1, end.0, end.1];
+        if other == o.span {
+            continue;
+        }
+        let (as_utf8, as_iso) = (names(o, o.span), names(o, other));
+        if as_utf8 && as_iso {
+            return true;
+        }
+        utf8 += usize::from(as_utf8);
+        iso += usize::from(as_iso);
+    }
+    iso > utf8
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Units {
     Bytes,
@@ -294,6 +373,9 @@ enum Units {
     /// next multiple of 8 and any other character by its UTF-16 length, and scip-java then
     /// subtracts 7 for each tab that starts the line. On a line without a tab this is `Utf16`.
     Javac,
+    /// `Javac` for a text javac read as ISO-8859-1: every byte is one column (contract M3b
+    /// amendment 69; only [`encoding_ambiguous`] reads positions this way).
+    JavacLatin1,
 }
 
 /// Where an indexer starts a new line (contract M3b amendment 59; measured with
@@ -406,10 +488,27 @@ fn byte_column(line: &[u8], col: i32, units: Units) -> i32 {
     let Ok(mut target) = usize::try_from(col) else {
         return 0;
     };
-    if units == Units::Javac {
+    if matches!(units, Units::Javac | Units::JavacLatin1) {
         // Undo scip-java's correction of leading tabs (7 per tab) to get javac's column.
         let leading = line.iter().take_while(|&&b| b == b'\t').count();
         target = target.saturating_add(7 * leading);
+    }
+    if units == Units::JavacLatin1 {
+        let mut seen = 0usize;
+        for (byte, &b) in line.iter().enumerate() {
+            if seen >= target {
+                return i32::try_from(byte).unwrap_or(i32::MAX);
+            }
+            seen = if b == b'\t' {
+                (seen / 8 + 1) * 8
+            } else {
+                seen + 1
+            };
+            if seen > target {
+                return i32::try_from(byte).unwrap_or(i32::MAX);
+            }
+        }
+        return i32::try_from(line.len()).unwrap_or(i32::MAX);
     }
     let text = String::from_utf8_lossy(line);
     let mut seen = 0usize;
@@ -425,7 +524,7 @@ fn byte_column(line: &[u8], col: i32, units: Units) -> i32 {
             continue;
         }
         seen += match units {
-            Units::Utf16 | Units::Javac => ch.len_utf16(),
+            Units::Utf16 | Units::Javac | Units::JavacLatin1 => ch.len_utf16(),
             Units::Chars => 1,
             Units::Bytes => ch.len_utf8(),
         };
@@ -1178,10 +1277,161 @@ mod tests {
                 "not_utf8",
                 "text_differs",
                 "source_encoding",
+                "encoding_ambiguous",
                 "comment_terminator",
-                "definition_disagreement"
+                "definition_disagreement",
+                "structure_disagreement"
             ]
         );
+    }
+
+    /// The evaluator's K2 layout (`var/fix-pass8/cfg` and `utf`): line 5 holds 17 `é` before
+    /// `return a.z(); } { new B().z(); }`, so the byte offsets of the later tokens differ by 17
+    /// between a UTF-8 and an ISO-8859-1 reading.
+    fn k2_text(class: &str) -> String {
+        format!(
+            "package p;\n\npublic class {class} {{\n  static class A {{ int z() {{ return 1; }} }}\n  static class B {{ int z() {{ return 2; }} }}\n    int p(A a) {{ /* {} */ return a.z(); }} {{ new B().z(); }}\n}}\n",
+            "\u{e9}".repeat(17)
+        )
+    }
+
+    /// The scip-java document of `text` with occurrences `(symbol, roles, line, start, end)`
+    /// in raw columns and `local 0` displayed as `a`, decoded from the blob `text`.
+    fn k2_decoded(tool: &str, text: &str, raw: &[(&str, i32, i32, i32, i32)]) -> Document {
+        let doc = ScipDocument {
+            relative_path: "K.java".into(),
+            occurrences: raw
+                .iter()
+                .map(|&(symbol, roles, line, start, end)| {
+                    let mut o = occ(symbol, roles);
+                    o.range = vec![line, start, end];
+                    o
+                })
+                .collect(),
+            symbols: vec![SymbolInformation {
+                symbol: "local 0".into(),
+                display_name: "a".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index = Index {
+            metadata: Some(Metadata {
+                tool_info: Some(ToolInfo {
+                    name: tool.into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let mut got = decode(&encode(&index), &|_| Some(text.as_bytes().to_vec())).unwrap();
+        got.documents.remove(0)
+    }
+
+    /// Contract M3b amendment 69 (the evaluator's K2): when an occurrence's raw position names
+    /// its token under an ISO-8859-1 reading of the line (one column per byte) as well as
+    /// under the UTF-8 one, or the ISO-8859-1 reading names more tokens, the positions cannot
+    /// show that javac read UTF-8, so the document is `encoding_ambiguous`. The raw ranges are
+    /// the ones `rb-scip-java:0.13.1` emitted: `Cfg.java` in a build whose
+    /// `.mvn/maven.config` sets ISO-8859-1 (also `Arg.java`, `-encoding` in `compilerArgs`, and
+    /// `Mod.java`, a module overriding the encoding property: the same columns), and
+    /// `Utf.java` in a UTF-8 build.
+    #[test]
+    fn positions_another_encoding_explains_make_the_document_ambiguous() {
+        let p = "scip-java maven . . p/";
+        let sym = |d: &str| format!("{p}{d}");
+        let (a_z, b_init, b_z) = (sym("K#A#z()."), sym("K#B#`<init>`()."), sym("K#B#z()."));
+        let head = [
+            (sym("K#p()."), ROLE_DEFINITION, 5, 8, 9),
+            (sym("K#A#"), 0, 5, 10, 11),
+        ];
+        let with = |rest: &[(&str, i32, i32, i32, i32)]| -> Vec<(String, i32, i32, i32, i32)> {
+            head.iter()
+                .cloned()
+                .chain(
+                    rest.iter()
+                        .map(|&(s, r, l, a, b)| (s.to_owned(), r, l, a, b)),
+                )
+                .collect()
+        };
+        let decoded = |tool: &str, text: &str, raw: &[(String, i32, i32, i32, i32)]| {
+            let raw: Vec<(&str, i32, i32, i32, i32)> = raw
+                .iter()
+                .map(|(s, r, l, a, b)| (s.as_str(), *r, *l, *a, *b))
+                .collect();
+            k2_decoded(tool, text, &raw).rejected
+        };
+        let text = k2_text("K");
+        let text = text.as_str();
+        // The measured ranges: ISO-8859-1 (javac counted each `é` byte as a column) …
+        let iso = with(&[
+            ("local 0", ROLE_DEFINITION, 5, 12, 13),
+            ("local 0", 0, 5, 65, 66),
+            (&a_z, 0, 5, 67, 68),
+            (&b_init, 0, 5, 80, 81),
+            (&b_z, 0, 5, 84, 85),
+        ]);
+        // … and UTF-8 (one column per `é`).
+        let utf8 = with(&[
+            ("local 0", ROLE_DEFINITION, 5, 12, 13),
+            ("local 0", 0, 5, 48, 49),
+            (&a_z, 0, 5, 50, 51),
+            (&b_init, 0, 5, 63, 64),
+            (&b_z, 0, 5, 67, 68),
+        ]);
+        assert_eq!(
+            decoded("scip-java", text, &iso),
+            Some(Rejection::EncodingAmbiguous)
+        );
+        // `B#z()` at raw 67 names a `z` under both readings (the run of `é` is exactly the
+        // distance between the two calls of `z`), so the UTF-8 build's document is rejected
+        // too: the positions alone cannot tell this occurrence's encoding.
+        assert_eq!(
+            decoded("scip-java", text, &utf8),
+            Some(Rejection::EncodingAmbiguous)
+        );
+        // Without that occurrence the UTF-8 reading names every token and the other none.
+        assert_eq!(decoded("scip-java", text, &utf8[..utf8.len() - 1]), None);
+        // One ambiguous occurrence alone: `A#z()` at raw 67 is the `z` of `a.z()` read as
+        // ISO-8859-1 and the `z` of `.z()` after `new B()` read as UTF-8.
+        assert_eq!(
+            decoded("scip-java", text, &with(&[(&a_z, 0, 5, 67, 68)])),
+            Some(Rejection::EncodingAmbiguous)
+        );
+        // No occurrence ambiguous, but the ISO-8859-1 reading names more tokens (2 to 0).
+        assert_eq!(
+            decoded(
+                "scip-java",
+                text,
+                &with(&[("local 0", 0, 5, 65, 66), (&b_init, 0, 5, 80, 81)])
+            ),
+            Some(Rejection::EncodingAmbiguous)
+        );
+        // A local is checked by its display name: `a` at raw 65 read as ISO-8859-1 (1 to 0).
+        assert_eq!(
+            decoded("scip-java", text, &with(&[("local 0", 0, 5, 65, 66)])),
+            Some(Rejection::EncodingAmbiguous)
+        );
+        // scip-typescript is not javac; an ASCII line reads alike under both.
+        assert_eq!(decoded("scip-typescript", text, &iso), None);
+        let ascii = text.replace('\u{e9}', "e");
+        assert_eq!(decoded("scip-java", &ascii, &iso), None);
+        // On ASCII text the one-column-per-byte reading keeps javac's tab rule (amendment 53),
+        // so a tab-indented line of a non-ASCII file is never read two ways.
+        for line in [&b"\t\tint a = b;\tc();"[..], b"  x\ty \t\tz", b"\t"] {
+            for col in 0..24 {
+                assert_eq!(
+                    byte_column(line, col, Units::JavacLatin1),
+                    byte_column(line, col, Units::Javac),
+                    "{} at {col}",
+                    String::from_utf8_lossy(line)
+                );
+            }
+        }
     }
 
     /// Contract M3b amendment 66: a local symbol's name is the text at its definition

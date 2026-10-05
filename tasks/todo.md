@@ -234,6 +234,14 @@ Findings from the research step (2026-09-29):
       - [x] Phase 3 (rb-cli, e2e): status line (`documents rejected`, old snapshots omit `definitions without occurrence`); goldens re-blessed by container runs; growth-ratio timing test.
       - [x] Phase 4: four public repos fresh == cached, edge sets == `82f34d4`; scratch J1–J4 cases; records; cleanup; commit.
       - [x] Resumed after an interruption: phases 1–3 were in the tree uncommitted; reviewed, `in_root`'s displaced doc comment restored, amendment 64's reason order corrected to the pipeline's, every mutation (M9, M14, M15, M22, the agreement check's clauses, quadratic `add_edges`) re-run and failing, scratch cases re-run with `--no-cache` on the real images, design §5.3/§13 updated.
+    - [x] Evaluator pass 8 (test-first, one amendment each, 68–71; `tasks/eval-m3b-pass8.md`; decision: two structural checks, not more per-quirk rules):
+      - [x] Amendment skeletons 68–71, invariant 1's reason list restated.
+      - [x] Measured with the real images on `var/fix-pass8` (`esc`, `ann`, `ts`, `tsd`, `cfg`, `arg`, `mod`, `utf`): scip-java enclosing ranges on every definition kind except an implicit `<init>`, raw columns; scip-typescript partial and starting at decorators; javac's ISO-8859-1 columns are byte offsets in all three K2 layouts.
+      - [x] Phase 1 (rb-scip): `encoding_ambiguous` (`Units::JavacLatin1`, both readings checked against the symbol), `Rejection` gains it and `structure_disagreement`; unit with the measured ranges.
+      - [x] Phase 2 (rb-indexer): `Anchors` per document, `structure_disagreement` (Java only) before acceptance; `source_encoding` wins over `encoding_ambiguous`; K3 units (N24, N25, N27); `PIPELINE` `m3b-scip-4`.
+      - [x] Mutations N24, N25, N27, S1–S7, E1–E6: each fails a unit.
+      - [x] Verify: fmt, clippy, 318 unit tests, e2e 15/15 twice with containers (goldens unchanged), stub scan; five public repos fresh == cached, 0 rejections, dumps identical to `11ae499`'s apart from the header; scratch K1/K2 cases have no false exact edge.
+      - [x] Records (contract 68–71 and corrections to 64, open items, CHANGELOG, IMPLEMENT.md, design §5.3/§13, lessons); cleanup; commit.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
@@ -260,3 +268,8 @@ Findings from the research step (2026-09-29):
 ## Review (evaluator pass 7)
 - All five findings fixed test-first (amendments 64–67). A document is SCIP-owned only when the indexer and Tree-sitter read it alike (`not_utf8`, `text_differs`, `comment_terminator`, `source_encoding`, `definition_disagreement`); otherwise the whole file is Tier B and counted. The J2 layout is rejected by `comment_terminator` and, with the decoder bypassed, by `definition_disagreement`. Calibration: 0 rejected documents on the four public repositories and the fixtures; edge sets identical to `82f34d4` on every edge kind.
 - Found while resuming: amendment 64 said the reasons are tested in listed order, but the decoder's `comment_terminator` comes before `source_encoding` (applied after decoding); the amendment now states the pipeline's order. `text_differs` cannot fire with today's indexers (no `Document.text` emitted, measured) and stays as a guard.
+
+## Review (evaluator pass 8)
+- K1–K4 fixed test-first (amendments 68–71). The edge source is now checked against the index's own enclosing ranges (Java), and javac's encoding is decided from the positions when the build cannot be read; both calibrated to 0 rejections on five public repositories with edge sets unchanged.
+- Found while measuring: scip-typescript's class and method ranges include decorators, which Tree-sitter-typescript places outside them, so the structure check is Java-only. The evaluator's K2 layout is genuinely ambiguous even in a UTF-8 build (its `é` run equals the distance between the two `z` calls), so `Utf.java` is rejected too; recorded.
+- `field_chains_binding_chains_and_big_packages_stay_fast` (a wall-clock M3a test, 2 s/3 s bounds) failed in some mutation runs while a fresh build competed for CPU; it passed in every clean run. Not changed here (no defect found); a candidate for the growth-ratio treatment given to `many_declarations_of_one_name_stay_fast`.
