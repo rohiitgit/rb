@@ -214,7 +214,10 @@ pub(crate) fn join(
     // in the index's own enclosing ranges is rejected too. Whether a reference would become an
     // edge is judged against the targets of every document that reached this point, a superset
     // of the final ones (a rejection only removes targets), so the outcome does not depend on
-    // the documents' order.
+    // the documents' order. Of the checks, only the syntax-error rule applies to the other
+    // languages (amendment 75): scip-typescript's compiler reads a merge-conflict marker as
+    // trivia up to the next marker, Tree-sitter keeps the text between them with `ERROR`
+    // nodes, so a method only Tree-sitter sees could source an exact edge.
     let candidate_nodes: BTreeSet<&str> = anchors
         .iter()
         .flat_map(|a| a.replaced.values().map(String::as_str))
@@ -223,16 +226,18 @@ pub(crate) fn join(
         .iter()
         .zip(naming.iter().zip(&anchors))
         .map(|((path, doc, facts, by_span), (naming, anchors))| {
-            files[path.as_str()].0 != Language::Java
-                || !(definitions_unpaired(facts, doc, anchors)
-                    || structure_disagreement(
-                        facts,
-                        by_span,
-                        &doc.occurrences,
-                        naming,
-                        anchors,
-                        &candidate_nodes,
-                    ))
+            if files[path.as_str()].0 != Language::Java {
+                return facts.syntax_error.is_none();
+            }
+            !(definitions_unpaired(facts, doc, anchors)
+                || structure_disagreement(
+                    facts,
+                    by_span,
+                    &doc.occurrences,
+                    naming,
+                    anchors,
+                    &candidate_nodes,
+                ))
         })
         .collect();
     let mut docs_kept = Vec::with_capacity(docs.len());
@@ -623,7 +628,16 @@ impl<'a> Anchors<'a> {
             // one an indexer's position error moved there is unmatched, not another key. A
             // local symbol is not bound yet: its name, when known, decides.
             let names_d = |o: &&rb_scip::Occurrence| naming.names_token(o, None, &d.name);
-            let global_at_name = at_name(is_global_definition).filter(names_d);
+            // A type is anchored by a global type symbol only: scip-java puts the implicit
+            // constructor alone at a type's name when the type's own occurrence is at an earlier
+            // mention of the name (a class annotation naming a nested type of the class), and
+            // the amendment-7 fallback below finds that one (amendment 75).
+            let global_at_name = if is_type(d) {
+                at_name(|o| is_global_definition(o) && o.symbol.ends_with('#'))
+            } else {
+                at_name(is_global_definition)
+            }
+            .filter(names_d);
             let local_at_name = global_at_name
                 .is_none()
                 .then(|| at_name(is_local_definition))
@@ -754,7 +768,15 @@ fn structure_disagreement(
 /// - a Tree-sitter syntax error is a disagreement (an escape such as `\u002f\u002a` that opens
 ///   a comment for javac only leaves Tree-sitter `ERROR` nodes);
 /// - every Tree-sitter definition (Java's are all methods, constructors and types) must be
-///   anchored by a definition occurrence, global or a bound local;
+///   paired (amendment 75): a type anchored by a global type symbol (descriptor `#`), a method
+///   or constructor by a global method or constructor symbol (`).`), or a method by a bound
+///   local of kind `Method` whose innermost enclosing definition range (any other definition
+///   occurrence, global or local) is an enum constant of the method's Tree-sitter parent: a
+///   member of the parent's anchored type (`rb_scip::type_symbol_of`) whose kind is
+///   unspecified (scip-java 0.13.1's enum constants; its fields are `Field`, its methods
+///   `Method`) or `EnumMember`. That is the enum-constant-body shape amendment 54 binds;
+///   a field, a local variable, or an anonymous class's method elsewhere at a Tree-sitter
+///   method's name is a member javac compiled differently;
 /// - every global method, constructor or type definition occurrence with an enclosing range
 ///   must anchor a Tree-sitter definition, except an annotation interface (`kind` `Interface`,
 ///   related to `java/lang/annotation/Annotation#`) and its elements, which Tree-sitter-java
@@ -765,7 +787,52 @@ fn structure_disagreement(
 /// Measured on spring-petclinic, jsoup, spring-retry, networknt/json-schema-validator and
 /// spring-petclinic-rest: the only unpaired forms are those annotation forms (1, 48 and 4
 /// occurrences on jsoup, spring-retry and spring-petclinic-rest) and implicit constructors.
+/// Every bound local on them is an enum constant body's method (jsoup's 117, amendment 75).
 fn definitions_unpaired(facts: &FileFacts, doc: &rb_scip::Document, anchors: &Anchors<'_>) -> bool {
+    let inside = |outer: Span, inner: Span| {
+        (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
+    };
+    let kinds: BTreeMap<&str, &str> = doc
+        .symbols
+        .iter()
+        .map(|s| (s.symbol.as_str(), s.kind.as_str()))
+        .collect();
+    // The symbol of the innermost definition range around `o` other than its own symbol's.
+    let innermost = |o: &rb_scip::Occurrence| {
+        doc.occurrences
+            .iter()
+            .filter(|e| e.is_definition() && e.symbol != o.symbol)
+            .filter_map(|e| Some((e.enclosing?, e.symbol.as_str())))
+            .filter(|(range, _)| inside(*range, o.span))
+            .max_by_key(|(range, _)| {
+                (
+                    (range[0], range[1]),
+                    std::cmp::Reverse((range[2], range[3])),
+                )
+            })
+            .map(|(_, symbol)| symbol)
+    };
+    let paired = |i: usize| {
+        let d = &facts.definitions[i];
+        let Some(o) = anchors.occurrences.get(&i) else {
+            return false;
+        };
+        if !o.symbol.starts_with("local ") {
+            return o.symbol.ends_with(if is_type(d) { "#" } else { ")." });
+        }
+        let parent = d
+            .parent
+            .and_then(|p| anchors.occurrences.get(&p))
+            .map(|p| p.symbol.as_str());
+        !is_type(d)
+            && kinds.get(o.symbol.as_str()) == Some(&"Method")
+            && innermost(o).is_some_and(|constant| {
+                matches!(kinds.get(constant), Some(&("" | "EnumMember")))
+                    && parent.is_some_and(|parent| {
+                        rb_scip::type_symbol_of(constant).as_deref() == Some(parent)
+                    })
+            })
+    };
     let anchored: BTreeSet<&str> = anchors
         .occurrences
         .values()
@@ -787,7 +854,7 @@ fn definitions_unpaired(facts: &FileFacts, doc: &rb_scip::Document, anchors: &An
         rb_scip::type_symbol_of(symbol).is_some_and(|t| annotations.contains(t.as_str()))
     };
     facts.syntax_error.is_some()
-        || (0..facts.definitions.len()).any(|i| !anchors.occurrences.contains_key(&i))
+        || !(0..facts.definitions.len()).all(paired)
         || doc.occurrences.iter().any(|o| {
             is_method_or_type_definition(o)
                 && o.enclosing.is_some()
@@ -1933,6 +2000,25 @@ mod tests {
         }
     }
 
+    /// scip-java 0.13.1's symbol information for a method of an enum constant's body: a
+    /// `local` symbol of kind `Method` with its display name; the constant itself has symbol
+    /// information without a kind (measured on jsoup and `var/fix-pass10/x10esc`, amendment 75).
+    fn local_method(symbol: &str, name: &str) -> SymbolInfo {
+        SymbolInfo {
+            symbol: symbol.into(),
+            kind: "Method".into(),
+            display_name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn enum_constant(symbol: &str) -> SymbolInfo {
+        SymbolInfo {
+            symbol: symbol.into(),
+            ..Default::default()
+        }
+    }
+
     fn implementation(from: &str, to: &str) -> SymbolInfo {
         SymbolInfo {
             symbol: from.into(),
@@ -1962,7 +2048,10 @@ mod tests {
                 path: path.into(),
                 occurrences: vec![
                     occ_at(at_nth(src, 1, "Base", 0), &sym(""), 1),
-                    occ_at(at_nth(src, 2, "A", 0), &sym("A."), 1),
+                    enclosed(
+                        occ_at(at_nth(src, 2, "A", 0), &sym("A."), 1),
+                        between(src, "A {", 0, "} }"),
+                    ),
                     occ_at(at_nth(src, 2, "process", 0), "local 3", 1),
                     occ_at(at_nth(src, 2, "helper", 0), &sym("helper()."), 0),
                     occ_at(at_nth(src, 3, "process", 0), &sym("process()."), 1),
@@ -1970,9 +2059,10 @@ mod tests {
                 ],
                 symbols: vec![
                     SymbolInfo {
-                        display_name: "process".into(),
-                        ..implementation("local 3", &sym("process()."))
+                        relationships: implementation("local 3", &sym("process().")).relationships,
+                        ..local_method("local 3", "process")
                     },
+                    enum_constant(&sym("A.")),
                     implementation(&sym("process()."), "local 3"),
                 ],
                 ..Default::default()
@@ -2066,8 +2156,16 @@ mod tests {
                     path: "a/A.java".into(),
                     occurrences: vec![
                         occ_at(at_nth(a, 1, "A", 0), "scip-java maven . . a/A#", 1),
+                        enclosed(
+                            occ_at(at_nth(a, 2, "X", 0), "scip-java maven . . a/A#X.", 1),
+                            between(a, "X {", 0, "} }"),
+                        ),
                         occ_at(at_nth(a, 2, "go", 0), "local 3", 1),
                         occ_at(at_nth(a, 3, "go", 0), "scip-java maven . . a/A#go().", 1),
+                    ],
+                    symbols: vec![
+                        enum_constant("scip-java maven . . a/A#X."),
+                        local_method("local 3", "go"),
                     ],
                     ..Default::default()
                 },
@@ -3711,6 +3809,10 @@ mod tests {
                     path: "t/E.java".into(),
                     occurrences: vec![
                         enclosed(occ_at(tok(en, "E", 0), &sym(""), 1), [1, 0, 4, 1]),
+                        enclosed(
+                            occ_at(tok(en, "A", 0), &sym("A."), 1),
+                            between(en, "A {", 0, "} }"),
+                        ),
                         enclosed(occ_at(tok(en, "v()", 0), "local 1", 1), v),
                         occ_at(tok(en, "b()", 0), &sym("b()."), 0),
                         enclosed(
@@ -3718,11 +3820,7 @@ mod tests {
                             between(en, "int b", 0, "}"),
                         ),
                     ],
-                    symbols: vec![SymbolInfo {
-                        symbol: "local 1".into(),
-                        display_name: "v".into(),
-                        ..Default::default()
-                    }],
+                    symbols: vec![enum_constant(&sym("A.")), local_method("local 1", "v")],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4108,20 +4206,26 @@ mod tests {
     /// range of `v` (stretched to row 3) holds the field initializer's `b()`, which Tree-sitter
     /// credits to `E`, the innermost range is the local's and the document is rejected; where
     /// the call of the bound local `w` lies outside the range of `v`, its Tree-sitter source,
-    /// it is rejected too. With the measured ranges neither is.
+    /// it is rejected too. With the measured ranges neither is. `w` is declared before `v`, so
+    /// the stretched range of `v` never holds `w`'s definition, which then stays paired
+    /// (amendment 75: its innermost enclosing range is the constant `A`).
     #[test]
     fn bound_locals_are_checked_as_ranges_and_as_targets() {
-        let en = "package t;\nenum E {\n  A { int v() { return w(); } int w() { return 1; } };\n  int f = b();\n  int b() { return 1; }\n}\n";
+        let en = "package t;\nenum E {\n  A { int w() { return 1; } int v() { return w(); } };\n  int f = b();\n  int b() { return 1; }\n}\n";
         let sym = |d: &str| format!("scip-java maven . . t/E#{d}");
         let rejected = |v: Span| {
             let mut occurrences = vec![
                 enclosed(occ_at(tok(en, "E", 0), &sym(""), 1), [1, 0, 5, 1]),
-                enclosed(occ_at(tok(en, "v()", 0), "local 1", 1), v),
-                occ_at(tok(en, "w()", 0), "local 2", 0),
                 enclosed(
-                    occ_at(tok(en, "w()", 1), "local 2", 1),
+                    occ_at(tok(en, "A", 0), &sym("A."), 1),
+                    between(en, "A {", 0, "} }"),
+                ),
+                enclosed(occ_at(tok(en, "v()", 0), "local 1", 1), v),
+                enclosed(
+                    occ_at(tok(en, "w()", 0), "local 2", 1),
                     between(en, "int w", 0, "}"),
                 ),
+                occ_at(tok(en, "w()", 1), "local 2", 0),
                 occ_at(tok(en, "b()", 0), &sym("b()."), 0),
                 enclosed(
                     occ_at(tok(en, "b()", 1), &sym("b()."), 1),
@@ -4133,15 +4237,11 @@ mod tests {
                 documents: vec![Document {
                     path: "t/E.java".into(),
                     occurrences,
-                    symbols: ["v", "w"]
-                        .iter()
-                        .zip(["local 1", "local 2"])
-                        .map(|(name, symbol)| SymbolInfo {
-                            symbol: symbol.into(),
-                            display_name: (*name).into(),
-                            ..Default::default()
-                        })
-                        .collect(),
+                    symbols: vec![
+                        enum_constant(&sym("A.")),
+                        local_method("local 1", "v"),
+                        local_method("local 2", "w"),
+                    ],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4157,7 +4257,7 @@ mod tests {
         let f_end = between(en, "int f", 0, ";");
         assert_eq!(rejected([v[0], v[1], f_end[2], f_end[3]]), structure);
         // `v`'s range ending before `w()`.
-        let w_call = tok(en, "w()", 0);
+        let w_call = tok(en, "w()", 1);
         assert_eq!(rejected([v[0], v[1], v[2], w_call[1] - 1]), structure);
     }
 
@@ -4259,7 +4359,8 @@ mod tests {
                     local_name("local 2", "anon"),
                     local_name("local 4", "run"),
                     local_name("local 5", "s"),
-                    local_name("local 8", "v"),
+                    local_method("local 8", "v"),
+                    enum_constant(&format!("{p}E#A.")),
                 ],
                 ..Default::default()
             }],
@@ -4444,5 +4545,602 @@ mod tests {
         let wrong = joined(&zz);
         assert!(wrong.edges.is_empty(), "{:?}", edge_lines(&wrong));
         assert_eq!(wrong.coverage.references_unmatched, 1);
+    }
+
+    /// Contract M3b amendment 75 (the evaluator's M1): `\u002a/` ends a block comment for
+    /// javac only, so javac compiles a member named `n` that is not a method of the class while
+    /// Tree-sitter-java reads a method `n` of the class: an anonymous class's method inside `m`
+    /// (`Anon1`; `Anon2`'s implements `I2#n()`), a local variable holding a lambda (`Loc1`), a
+    /// field holding one (`Fld1`), an anonymous class's method in a field initializer (`Anon3`),
+    /// a local variable of an initializer block (`Init1`), and an anonymous class's method
+    /// inside a method of an enum constant's body (`Enm2`). `Enm1` is the shape amendment 54
+    /// binds: `n` is a method of the enum constant `A`'s body for javac, a method of the enum for
+    /// Tree-sitter, and both credit its body to `n`.
+    fn restructured_member_source(file: &str) -> &'static str {
+        match file {
+            "Anon1" => {
+                "package p;\n\nclass Anon1 {\n  void m() { Object x = new Object() /* \\u002a/ { { /* */ ; } void n() { b(); } /* \\u002a/ }; } /* */\n  void b() {}\n}\n"
+            }
+            "Anon2" => {
+                "package p;\n\nclass Anon2 {\n  void m() { I2 x = new I2() /* \\u002a/ { { /* */ ; } public void n() { b(); } /* \\u002a/ }; } /* */\n  void b() {}\n}\n\ninterface I2 { void n(); }\n"
+            }
+            "Loc1" => {
+                "package p;\n\nclass Loc1 {\n  void m() { /* \\u002a/ { /* */ } Runnable n /* \\u002a/ = /* */ () /* \\u002a/ -> /* */ { b(); } /* \\u002a/ ; } /* */\n  void b() {}\n}\n"
+            }
+            "Fld1" => {
+                "package p;\n\nclass Fld1 {\n  Runnable n /* \\u002a/ = /* */ () /* \\u002a/ -> /* */ { b(); } /* \\u002a/ ; /* */\n  void b() {}\n}\n"
+            }
+            "Anon3" => {
+                "package p;\n\nclass Anon3 {\n  Object f = new Object() /* \\u002a/ { /* */ ; void n() { b(); } /* \\u002a/ } ; /* */\n  void b() {}\n}\n"
+            }
+            "Init1" => {
+                "package p;\n\nclass Init1 {\n  /* \\u002a/ { /* */ Runnable n /* \\u002a/ = /* */ () /* \\u002a/ -> /* */ { b(); } /* \\u002a/ ; } /* */\n  void b() {}\n}\n"
+            }
+            "Enm1" => {
+                "package p;\n\nenum Enm1 {\n  A /* \\u002a/ { /* */ ; void n() { b(); } /* \\u002a/ } ; /* */\n  void b() {}\n}\n"
+            }
+            "Enm2" => {
+                "package p;\n\nenum Enm2 {\n  A /* \\u002a/ { void x() { new Object() { /* */ ; void n() { b(); } /* \\u002a/ }; } } /* */ ;\n  void b() {}\n}\n"
+            }
+            _ => unreachable!("{file}"),
+        }
+    }
+
+    /// The occurrences and symbol information `rb-scip-java:0.13.1` gave `file`
+    /// (`var/fix-pass10/x10esc`, decoded; ASCII, so the spans are the raw ones): occurrences as
+    /// `(span, descriptor, roles, enclosing range)` with the descriptor after `p/`, and symbols
+    /// as `(symbol, kind, display name, implemented symbol)`. JDK occurrences are left out.
+    #[allow(clippy::type_complexity)]
+    fn restructured_member_measured(
+        file: &str,
+    ) -> (
+        Vec<(Span, &'static str, i32, Option<Span>)>,
+        Vec<(
+            &'static str,
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+        )>,
+    ) {
+        let class = |name: &str, close: i32| {
+            vec![
+                (
+                    [2, 6, 2, 6 + name.len() as i32],
+                    "",
+                    1,
+                    Some([2, 0, close, 1]),
+                ),
+                ([2, 6, 2, 6 + name.len() as i32], "`<init>`().", 1, None),
+            ]
+        };
+        let (mut occurrences, symbols) = match file {
+            "Anon1" => (
+                vec![
+                    ([3, 7, 3, 8], "m().", 1, Some([3, 2, 3, 95])),
+                    ([3, 20, 3, 21], "local 0", 1, Some([3, 13, 3, 93])),
+                    ([3, 67, 3, 68], "local 2", 1, Some([3, 62, 3, 79])),
+                    ([3, 73, 3, 74], "b().", 0, None),
+                    ([4, 7, 4, 8], "b().", 1, Some([4, 2, 4, 13])),
+                ],
+                vec![
+                    ("local 0", "Variable", "x", None),
+                    ("local 2", "Method", "n", None),
+                ],
+            ),
+            "Anon2" => (
+                vec![
+                    ([3, 7, 3, 8], "m().", 1, Some([3, 2, 3, 94])),
+                    ([3, 13, 3, 15], "I2#", 0, None),
+                    ([3, 16, 3, 17], "local 0", 1, Some([3, 13, 3, 92])),
+                    ([3, 24, 3, 26], "I2#", 0, None),
+                    ([3, 66, 3, 67], "local 2", 1, Some([3, 54, 3, 78])),
+                    ([3, 72, 3, 73], "b().", 0, None),
+                    ([4, 7, 4, 8], "b().", 1, Some([4, 2, 4, 13])),
+                    ([7, 10, 7, 12], "I2#", 1, Some([7, 0, 7, 26])),
+                    ([7, 20, 7, 21], "I2#n().", 1, Some([7, 15, 7, 24])),
+                ],
+                vec![
+                    ("local 0", "Variable", "x", None),
+                    ("local 2", "Method", "n", Some("I2#n().")),
+                ],
+            ),
+            "Loc1" => (
+                vec![
+                    ([3, 7, 3, 8], "m().", 1, Some([3, 2, 3, 110])),
+                    ([3, 43, 3, 44], "local 0", 1, Some([3, 34, 3, 108])),
+                    ([3, 89, 3, 90], "b().", 0, None),
+                    ([4, 7, 4, 8], "b().", 1, Some([4, 2, 4, 13])),
+                ],
+                vec![("local 0", "Variable", "n", None)],
+            ),
+            "Fld1" => (
+                vec![
+                    ([3, 11, 3, 12], "n.", 1, Some([3, 2, 3, 76])),
+                    ([3, 57, 3, 58], "b().", 0, None),
+                    ([4, 7, 4, 8], "b().", 1, Some([4, 2, 4, 13])),
+                ],
+                vec![("n.", "Field", "n", None)],
+            ),
+            "Anon3" => (
+                vec![
+                    ([3, 9, 3, 10], "f.", 1, Some([3, 2, 3, 79])),
+                    ([3, 52, 3, 53], "local 1", 1, Some([3, 47, 3, 64])),
+                    ([3, 58, 3, 59], "b().", 0, None),
+                    ([4, 7, 4, 8], "b().", 1, Some([4, 2, 4, 13])),
+                ],
+                vec![("f.", "Field", "f", None), ("local 1", "Method", "n", None)],
+            ),
+            "Init1" => (
+                vec![
+                    ([3, 30, 3, 31], "local 0", 1, Some([3, 21, 3, 95])),
+                    ([3, 76, 3, 77], "b().", 0, None),
+                    ([4, 7, 4, 8], "b().", 1, Some([4, 2, 4, 13])),
+                ],
+                vec![("local 0", "Variable", "n", None)],
+            ),
+            "Enm1" => (
+                vec![
+                    ([3, 2, 3, 3], "local 1", 0, None),
+                    ([3, 2, 3, 3], "A.", 1, Some([3, 2, 3, 55])),
+                    ([3, 30, 3, 31], "local 2", 1, Some([3, 25, 3, 42])),
+                    ([3, 36, 3, 37], "b().", 0, None),
+                    ([4, 7, 4, 8], "b().", 1, Some([4, 2, 4, 13])),
+                ],
+                vec![("A.", "", "A", None), ("local 2", "Method", "n", None)],
+            ),
+            "Enm2" => (
+                vec![
+                    ([3, 2, 3, 3], "local 1", 0, None),
+                    ([3, 2, 3, 3], "A.", 1, Some([3, 2, 3, 86])),
+                    ([3, 22, 3, 23], "local 2", 1, Some([3, 17, 3, 84])),
+                    ([3, 56, 3, 57], "local 4", 1, Some([3, 51, 3, 68])),
+                    ([3, 62, 3, 63], "b().", 0, None),
+                    ([4, 7, 4, 8], "b().", 1, Some([4, 2, 4, 13])),
+                ],
+                vec![
+                    ("A.", "", "A", None),
+                    ("local 2", "Method", "x", None),
+                    ("local 4", "Method", "n", None),
+                ],
+            ),
+            _ => unreachable!("{file}"),
+        };
+        occurrences.extend(if file.starts_with("Enm") {
+            vec![
+                ([2, 5, 2, 9], "", 1, Some([2, 0, 5, 1])),
+                ([2, 5, 2, 9], "`<init>`().", 1, None),
+            ]
+        } else {
+            class(file, 5)
+        });
+        (occurrences, symbols)
+    }
+
+    /// `file`'s measured document; every global span is on a token its symbol may name, and
+    /// every local's on its display name.
+    fn restructured_member_document(file: &str) -> Document {
+        let src = restructured_member_source(file);
+        let rows: Vec<&str> = src.lines().collect();
+        let text = |s: Span| &rows[s[0] as usize][s[1] as usize..s[3] as usize];
+        let (measured, symbols) = restructured_member_measured(file);
+        let global = |d: &str| {
+            if d.starts_with("local ") {
+                d.to_owned()
+            } else if d.starts_with("I2#") {
+                format!("scip-java maven maven/t10/x10esc 1.0 p/{d}")
+            } else {
+                format!("scip-java maven maven/t10/x10esc 1.0 p/{file}#{d}")
+            }
+        };
+        let symbols: Vec<SymbolInfo> = symbols
+            .into_iter()
+            .map(|(symbol, kind, name, implemented)| SymbolInfo {
+                symbol: global(symbol),
+                kind: kind.into(),
+                display_name: name.into(),
+                relationships: implemented
+                    .map(|to| Relationship {
+                        symbol: global(to),
+                        is_implementation: true,
+                        ..Default::default()
+                    })
+                    .into_iter()
+                    .collect(),
+            })
+            .collect();
+        let mut occurrences: Vec<Occurrence> = measured
+            .into_iter()
+            .map(|(span, d, roles, enclosing)| {
+                let symbol = global(d);
+                let named = match symbols.iter().find(|s| s.symbol == symbol) {
+                    Some(s) if d.starts_with("local ") && roles == 1 => {
+                        s.display_name == text(span)
+                    }
+                    _ => d.starts_with("local ") || rb_scip::may_name(&symbol, text(span)),
+                };
+                assert!(named, "{file}: {d} at {:?}", text(span));
+                Occurrence {
+                    span,
+                    symbol,
+                    roles,
+                    enclosing,
+                }
+            })
+            .collect();
+        occurrences.sort();
+        Document {
+            path: format!("p/{file}.java"),
+            occurrences,
+            symbols,
+            ..Default::default()
+        }
+    }
+
+    /// Contract M3b amendment 75 (the evaluator's M1): a Tree-sitter method is paired only by
+    /// a global method or constructor occurrence, or by a local method of an enum constant's
+    /// body bound to a method of that enum; a local variable, an anonymous class's method or a
+    /// field at its name leaves it unpaired and rejects the document whole
+    /// (`structure_disagreement`), so `n → b` (and `Anon2`'s `n IMPLEMENTS I2#n()`) is never an
+    /// exact edge, while `Plain` in the same index keeps its own. The `bf43351` binary emitted
+    /// each of those edges as exact on the real image (`var/fix-pass10/x10esc`). `Enm1`, the
+    /// enum-constant-body shape, is accepted: its edge is the one a constant body's method
+    /// gives (amendment 54).
+    #[test]
+    fn a_method_only_tree_sitter_sees_is_not_paired_by_a_local_or_a_field() {
+        let plain = "package p;\n\nclass Plain {\n  void m() { b(); }\n  void b() {}\n}\n";
+        let p = "scip-java maven maven/t10/x10esc 1.0 p/";
+        let sym = |d: &str| format!("{p}Plain#{d}");
+        let plain_document = Document {
+            path: "p/Plain.java".into(),
+            occurrences: vec![
+                enclosed(occ_at(tok(plain, "Plain", 0), &sym(""), 1), [2, 0, 5, 1]),
+                occ_at(tok(plain, "Plain", 0), &sym("`<init>`()."), 1),
+                enclosed(
+                    occ_at(tok(plain, "m()", 0), &sym("m()."), 1),
+                    between(plain, "void m", 0, "}"),
+                ),
+                occ_at(tok(plain, "b()", 0), &sym("b()."), 0),
+                enclosed(
+                    occ_at(tok(plain, "b()", 1), &sym("b()."), 1),
+                    between(plain, "void b", 0, "}"),
+                ),
+            ],
+            ..Default::default()
+        };
+        for file in ["Anon1", "Anon2", "Loc1", "Fld1", "Anon3", "Init1", "Enm2"] {
+            let src = restructured_member_source(file);
+            let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+            assert!(facts.syntax_error.is_none(), "{file}");
+            assert!(
+                facts.definitions.iter().any(|d| d.name == "n"),
+                "{file}: Tree-sitter reads a method `n`"
+            );
+            let path = format!("p/{file}.java");
+            let index = ScipIndex {
+                documents: vec![restructured_member_document(file), plain_document.clone()],
+                ..Default::default()
+            };
+            let joined = join_sources(
+                Language::Java,
+                &[(path.as_str(), src), ("p/Plain.java", plain)],
+                &index,
+            );
+            assert_eq!(
+                joined.coverage.documents_rejected_reasons,
+                BTreeMap::from([(rb_scip::Rejection::StructureDisagreement, 1)]),
+                "{file}"
+            );
+            assert_eq!(
+                edge_lines(&joined),
+                [format!("{} Calls {}", sym("m()."), sym("b()."))],
+                "{file}"
+            );
+            assert!(!joined.documented.contains(&path), "{file}");
+        }
+        let enm1 = restructured_member_source("Enm1");
+        let index = ScipIndex {
+            documents: vec![restructured_member_document("Enm1")],
+            ..Default::default()
+        };
+        let joined = join_sources(Language::Java, &[("p/Enm1.java", enm1)], &index);
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(joined.coverage.definitions_local, 1);
+        assert_eq!(
+            edge_lines(&joined),
+            [format!(
+                "rb-heuristic . . . `p/Enm1.java`/Enm1#n(). Calls {p}Enm1#b()."
+            )]
+        );
+    }
+
+    /// Contract M3b amendment 75 (the evaluator's M3): scip-java places a type's definition
+    /// occurrence at the first mention of its name, which a class annotation naming one of
+    /// the class's own nested types holds (`@Ext(Fut.Inner.class)`; vavr's `FutureTest` and
+    /// `JavaConvertersTest`); at the class's name there is only the implicit constructor,
+    /// without a range. The class anchors through its type symbol by the amendment-7 fallback,
+    /// never through the constructor, so the document is accepted with the class keyed
+    /// `Fut#`. Measured on `var/fix-pass10/x10esc` (`rb-scip-java:0.13.1`).
+    #[test]
+    fn a_type_anchors_through_its_type_symbol_not_its_implicit_constructor() {
+        let src = "package p;\n\n@Deprecated\n@Ext(Fut.Inner.class)\npublic class Fut {\n  static class Inner {}\n  void m() { b(); }\n  void b() {}\n}\n";
+        let p = "scip-java maven maven/t10/x10esc 1.0 p/";
+        let measured: &[(Span, &str, i32, Option<Span>)] = &[
+            ([3, 1, 3, 4], "Ext#", 0, None),
+            ([3, 5, 3, 8], "Fut#", 0, None),
+            ([3, 5, 3, 8], "Fut#", 1, Some([2, 0, 8, 1])),
+            ([3, 9, 3, 14], "Fut#Inner#", 0, None),
+            ([3, 15, 3, 20], "Fut#Inner#class.", 0, None),
+            ([4, 13, 4, 16], "Fut#`<init>`().", 1, None),
+            ([5, 15, 5, 20], "Fut#Inner#", 1, Some([5, 2, 5, 23])),
+            ([5, 15, 5, 20], "Fut#Inner#`<init>`().", 1, None),
+            ([6, 7, 6, 8], "Fut#m().", 1, Some([6, 2, 6, 19])),
+            ([6, 13, 6, 14], "Fut#b().", 0, None),
+            ([7, 7, 7, 8], "Fut#b().", 1, Some([7, 2, 7, 13])),
+        ];
+        let rows: Vec<&str> = src.lines().collect();
+        let occurrences = measured
+            .iter()
+            .map(|&(span, d, roles, enclosing)| {
+                let symbol = format!("{p}{d}");
+                let text = &rows[span[0] as usize][span[1] as usize..span[3] as usize];
+                assert!(rb_scip::may_name(&symbol, text), "{d} at {text}");
+                Occurrence {
+                    span,
+                    symbol,
+                    roles,
+                    enclosing,
+                }
+            })
+            .collect();
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "p/Fut.java".into(),
+                occurrences,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let class = facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "Fut")
+            .unwrap();
+        let joined = join_sources(Language::Java, &[("p/Fut.java", src)], &index);
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(joined.keys["p/Fut.java"][&class], format!("{p}Fut#"));
+        assert_eq!(joined.coverage.definitions_matched_by_name, 1);
+        assert_eq!(
+            joined.coverage.definitions_matched,
+            joined.coverage.definitions_total
+        );
+        assert_eq!(
+            edge_lines(&joined),
+            [format!("{p}Fut#m(). Calls {p}Fut#b().")]
+        );
+    }
+
+    /// A record's compact canonical constructor is a Tree-sitter definition (contract M3b
+    /// amendment 75; open item of amendment 72), paired with the constructor occurrence
+    /// scip-java gives at its name: `Rec2(String)` is `` `<init>`(). `` and the compact one,
+    /// declared second, `` `<init>`(+1). `` (source order; measured on
+    /// `var/fix-pass10/x10esc`). The document is accepted and the compact constructor is the
+    /// source of the call in its body, not the record.
+    #[test]
+    fn a_compact_constructor_pairs_with_its_constructor_occurrence() {
+        let src = "package p;\n\nrecord Rec2(int x) {\n  Rec2(String s) { this(s.length()); }\n  Rec2 {\n    check(x);\n  }\n  static void check(int v) {}\n  static Rec2 make() { return new Rec2(1); }\n}\n";
+        let p = "scip-java maven maven/t10/x10esc 1.0 p/Rec2#";
+        let measured: &[(Span, &str, i32, Option<Span>)] = &[
+            ([2, 7, 2, 11], "", 1, Some([2, 0, 9, 1])),
+            ([2, 16, 2, 17], "local 1", 1, None),
+            ([2, 16, 2, 17], "x.", 1, Some([2, 12, 2, 17])),
+            ([3, 2, 3, 6], "`<init>`().", 1, Some([3, 2, 3, 38])),
+            ([3, 14, 3, 15], "local 0", 1, Some([3, 7, 3, 15])),
+            ([3, 19, 3, 23], "`<init>`(+1).", 0, None),
+            ([3, 24, 3, 25], "local 0", 0, None),
+            ([4, 2, 4, 6], "`<init>`(+1).", 1, Some([4, 2, 6, 3])),
+            ([5, 4, 5, 9], "check().", 0, None),
+            ([5, 10, 5, 11], "local 1", 0, None),
+            ([7, 14, 7, 19], "check().", 1, Some([7, 2, 7, 29])),
+            ([7, 24, 7, 25], "local 2", 1, Some([7, 20, 7, 25])),
+            ([8, 9, 8, 13], "", 0, None),
+            ([8, 14, 8, 18], "make().", 1, Some([8, 2, 8, 44])),
+            ([8, 34, 8, 38], "`<init>`(+1).", 0, None),
+        ];
+        let occurrences = measured
+            .iter()
+            .map(|&(span, d, roles, enclosing)| Occurrence {
+                span,
+                symbol: if d.starts_with("local ") {
+                    d.to_owned()
+                } else {
+                    format!("{p}{d}")
+                },
+                roles,
+                enclosing,
+            })
+            .collect();
+        let local = |symbol: &str, name: &str| SymbolInfo {
+            symbol: symbol.into(),
+            display_name: name.into(),
+            ..Default::default()
+        };
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "p/Rec2.java".into(),
+                occurrences,
+                symbols: vec![
+                    local("local 0", "s"),
+                    local("local 1", "x"),
+                    local("local 2", "v"),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let compact = facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "Rec2" && d.name_span == [4, 2, 4, 6])
+            .expect("the compact constructor is a definition");
+        let joined = join_sources(Language::Java, &[("p/Rec2.java", src)], &index);
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(
+            joined.keys["p/Rec2.java"][&compact],
+            format!("{p}`<init>`(+1).")
+        );
+        let edges = edge_lines(&joined);
+        assert!(
+            edges.contains(&format!("{p}`<init>`(+1). Calls {p}check().")),
+            "{edges:?}"
+        );
+        assert!(
+            !edges.iter().any(|e| e.starts_with(&format!("{p} "))),
+            "the record is no source: {edges:?}"
+        );
+    }
+
+    /// Contract M3b amendment 75 (the evaluator's M2): the TypeScript scanner treats a
+    /// merge-conflict marker's `=======` line as trivia up to the next `>>>>>>> ` line, while
+    /// Tree-sitter-typescript keeps what lies between them (with `ERROR` nodes): scip-typescript
+    /// sees `m1` holding `helper()`, Tree-sitter a method `m9` the compiler never saw. A
+    /// TypeScript document with a Tree-sitter syntax error is rejected
+    /// (`structure_disagreement`), so `C#m9() → helper()` is never exact. Measured on
+    /// `var/fix-pass10/x10ts` (scip-typescript 0.4.0).
+    #[test]
+    fn a_typescript_document_tree_sitter_cannot_parse_is_rejected() {
+        let conflict = "export function helper(): number { return 1; }\nexport class C {\n  m1(): void {\n=======\n  }\n  m9(): void {\n>>>>>>> x\n    helper();\n  }\n}\n";
+        let plain = "import { helper } from './conflict';\nexport class P {\n  run(): number { return helper(); }\n}\n";
+        let pkg = "scip-typescript npm x10ts 1.0.0 src/";
+        let (c, pl) = (format!("{pkg}`conflict.ts`/"), format!("{pkg}`plain.ts`/"));
+        let index = ScipIndex {
+            documents: vec![
+                Document {
+                    path: "src/conflict.ts".into(),
+                    occurrences: vec![
+                        enclosed(occ_at([0, 0, 0, 0], &c, 1), [0, 0, 10, 0]),
+                        enclosed(
+                            occ_at([0, 16, 0, 22], &format!("{c}helper()."), 1),
+                            [0, 0, 0, 46],
+                        ),
+                        enclosed(occ_at([1, 13, 1, 14], &format!("{c}C#"), 1), [1, 0, 9, 1]),
+                        enclosed(
+                            occ_at([2, 2, 2, 4], &format!("{c}C#m1()."), 1),
+                            [2, 2, 8, 3],
+                        ),
+                        occ_at([7, 4, 7, 10], &format!("{c}helper()."), 0),
+                    ],
+                    ..Default::default()
+                },
+                Document {
+                    path: "src/plain.ts".into(),
+                    occurrences: vec![
+                        enclosed(occ_at([0, 0, 0, 0], &pl, 1), [0, 0, 4, 0]),
+                        occ_at([0, 9, 0, 15], &format!("{c}helper()."), 0),
+                        occ_at([0, 23, 0, 35], &c, 0),
+                        enclosed(occ_at([1, 13, 1, 14], &format!("{pl}P#"), 1), [1, 0, 3, 1]),
+                        enclosed(
+                            occ_at([2, 2, 2, 5], &format!("{pl}P#run()."), 1),
+                            [2, 2, 2, 36],
+                        ),
+                        occ_at([2, 25, 2, 31], &format!("{c}helper()."), 0),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let facts = rb_syntax::extract(Language::TypeScript, conflict.as_bytes()).unwrap();
+        assert!(facts.syntax_error.is_some());
+        assert!(facts.definitions.iter().any(|d| d.name == "m9"));
+        let joined = join_sources(
+            Language::TypeScript,
+            &[("src/conflict.ts", conflict), ("src/plain.ts", plain)],
+            &index,
+        );
+        assert_eq!(
+            joined.coverage.documents_rejected_reasons,
+            BTreeMap::from([(rb_scip::Rejection::StructureDisagreement, 1)])
+        );
+        assert!(!joined.documented.contains("src/conflict.ts"));
+        assert!(joined.documented.contains("src/plain.ts"));
+        // `helper` is defined only in the rejected document: no node, no edge (amendment 64).
+        assert!(joined.edges.is_empty(), "{:?}", edge_lines(&joined));
+        assert_eq!(joined.coverage.references_undocumented, 1);
+    }
+
+    /// Contract M3b amendment 75: a bound local pairs a Tree-sitter definition only in the
+    /// enum-constant-body shape, each part of it needed: the local is a method (kind
+    /// `Method`), the Tree-sitter definition is a method, and the innermost definition range
+    /// around the local is an enum constant (kind unspecified, as scip-java 0.13.1 gives it)
+    /// of the Tree-sitter parent's type. `E`'s occurrences follow `Enm1`'s measured shape.
+    #[test]
+    fn the_enum_constant_body_shape_needs_every_part() {
+        let rejected =
+            |src: &str, n: &str, local_kind: &str, constant: &str, constant_kind: &str| {
+                let sym = |d: &str| format!("scip-java maven . . p/{d}");
+                let mut occurrences = vec![
+                    enclosed(occ_at(tok(src, "E", 0), &sym("E#"), 1), [2, 0, 5, 1]),
+                    enclosed(
+                        occ_at(tok(src, "A", 0), &sym(constant), 1),
+                        between(src, "A {", 0, "} }"),
+                    ),
+                    enclosed(
+                        occ_at(tok(src, n, 0), "local 2", 1),
+                        between(src, n, 0, "}"),
+                    ),
+                ];
+                // `b`'s definition, after the call in the constant's body when there is one.
+                let calls = src.matches("b()").count() - 1;
+                if calls == 1 {
+                    occurrences.push(occ_at(tok(src, "b()", 0), &sym("E#b()."), 0));
+                }
+                occurrences.push(enclosed(
+                    occ_at(tok(src, "b()", calls), &sym("E#b()."), 1),
+                    between(src, "void b", 0, "}"),
+                ));
+                occurrences.sort();
+                let index = ScipIndex {
+                    documents: vec![Document {
+                        path: "p/E.java".into(),
+                        occurrences,
+                        symbols: vec![
+                            SymbolInfo {
+                                kind: constant_kind.into(),
+                                ..enum_constant(&sym(constant))
+                            },
+                            SymbolInfo {
+                                kind: local_kind.into(),
+                                ..local_method("local 2", "n")
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                join_sources(Language::Java, &[("p/E.java", src)], &index)
+                    .coverage
+                    .documents_rejected
+            };
+        let src = "package p;\n\nenum E {\n  A { void n() { b(); } };\n  void b() {}\n}\n";
+        assert_eq!(rejected(src, "n()", "Method", "E#A.", ""), 0);
+        assert_eq!(rejected(src, "n()", "Method", "E#A.", "EnumMember"), 0);
+        // A field of the constant's body, or of another kind than a method.
+        assert_eq!(rejected(src, "n()", "Field", "E#A.", ""), 1);
+        // The innermost range is a field's, not an enum constant's.
+        assert_eq!(rejected(src, "n()", "Method", "E#A.", "Field"), 1);
+        // A constant of another type than the Tree-sitter parent's.
+        assert_eq!(rejected(src, "n()", "Method", "F#A.", ""), 1);
+        // A type Tree-sitter reads where the index has the local method.
+        let class = "package p;\n\nenum E {\n  A { class n {} };\n  void b() {}\n}\n";
+        let facts = rb_syntax::extract(Language::Java, class.as_bytes()).unwrap();
+        assert!(
+            facts
+                .definitions
+                .iter()
+                .any(|d| d.name == "n" && is_type(d))
+        );
+        assert_eq!(rejected(class, "n {", "Method", "E#A.", ""), 1);
     }
 }

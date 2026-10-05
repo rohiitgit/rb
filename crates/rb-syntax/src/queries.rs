@@ -35,11 +35,13 @@ const TYPESCRIPT_SUPPLEMENT: &str = "
 (enum_declaration name: (identifier) @name) @definition.class
 ";
 
-/// Java's `tags.scm` has no enums, records or constructors.
+/// Java's `tags.scm` has no enums, records or constructors (a record's compact canonical
+/// constructor included).
 const JAVA_SUPPLEMENT: &str = "
 (enum_declaration name: (identifier) @name) @definition.class
 (record_declaration name: (identifier) @name) @definition.class
 (constructor_declaration name: (identifier) @name) @definition.method
+(compact_constructor_declaration name: (identifier) @name) @definition.method
 ";
 
 pub(crate) fn for_language(language: Language) -> &'static Grammar {

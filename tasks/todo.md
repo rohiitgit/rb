@@ -250,6 +250,13 @@ Findings from the research step (2026-09-29):
       - [x] Mutations A1, B1, X1, U1, C1, U1C1, R1, EX1–EX3, S8, S9, S10, E3, E3b, E3c: each fails a unit.
       - [x] Verify: fmt, clippy, 322 unit tests, e2e 15/15 twice with containers (48.07 s, 40.89 s; goldens unchanged), stub scan; six public repos fresh == cached, 0 rejections, dumps identical to `5502422`'s; scratch projects as recorded.
       - [x] Records (contract 72–74, corrections to 71, open items, CHANGELOG, IMPLEMENT.md, design §5.3/§13, lessons); cleanup; commit.
+    - [x] Evaluator pass 10 (test-first; amendments 75–76; `tasks/eval-m3b-pass10.md`; decisions: kind-aware pairing (M1), syntax-error rule for TypeScript (M2), a type anchored by its type symbol (M3), compact constructors brought in):
+      - [x] Rebuilt the evaluator's layouts on the real image (`var/fix-pass10/x10esc` Anon1, Anon2, Loc1, Fld1, plus Anon3, Init1, Enm1, Enm2, Fut, Rec, Rec2; `x10ts` conflict.ts); the `bf43351` binary emits every false exact edge (and three more: Anon3, Init1, Enm2).
+      - [x] Measured with a probe (real decoder and extractor): jsoup's 117 bound locals are all kind `Method` inside a kindless enum constant of the Tree-sitter parent; the decision's literal rule (ii) would pass Anon3 and Init1, so (ii) is the enum-constant-body shape.
+      - [x] Phase 1 (rb-indexer `scip.rs`, rb-syntax `queries.rs`/`lib.rs`, `PIPELINE` `m3b-scip-6`): failing units first (5), then the fix; 5 existing units given the measured constant and local kind.
+      - [x] Mutations P1–P7, T1, S1, C1, B1, X1, S9, S10: each fails a unit.
+      - [x] Verify: fmt, clippy, 328 unit tests, e2e 15/15 twice with containers, stub scan; eight public repos fresh == cached; six dumps byte-identical to `bf43351`'s; vavr and TheAlgorithms diffs confined to the four previously rejected files.
+      - [x] Records (contract 75–76, corrections to 71, open items, CHANGELOG, IMPLEMENT.md, design §5.3/§13, lessons); cleanup; commit.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
@@ -287,3 +294,7 @@ Findings from the research step (2026-09-29):
 - Found while measuring: scip-java marks every annotation interface by its relation to `java/lang/annotation/Annotation#`, which identifies the only legitimate ranged unpaired form without the source text; a record's compact constructor is a member Tree-sitter-java does not capture, so its calls had a wrong exact source before and the file is now Tier B (open item). The two-way rule makes `definitions_without_occurrence` 0 by construction for accepted Java documents; that counter now matters for TypeScript only.
 - Session slip: a scratch-repository commit landed in the project repository through a relative `cd`; undone at once without touching the working tree (lesson recorded).
 
+
+## Review (evaluator pass 10)
+- M1–M3 fixed test-first and compact constructors brought in (amendments 75–76). A Tree-sitter definition is paired only by an occurrence of its own kind, or (a method) by an enum constant body's local method; a type is anchored by its type symbol, never its implicit constructor; a TypeScript document with a syntax error is rejected. Calibrated: 0 rejections on eight public repositories (vavr and TheAlgorithms 2 → 0), six dumps byte-identical to `bf43351`.
+- Found while measuring: the decided rule (ii) ("innermost method/type range is the parent's") still paired an anonymous class's method in a field initializer and a local variable of an initializer block (both reproduced as false exact edges on the real image), so the binding was narrowed to the measured enum-constant-body shape (recorded as a deviation in amendment 75). scip-java leaves enum constants without a `SymbolInformation.kind`, which is what identifies them.

@@ -829,6 +829,29 @@ interface Mfa { String send(String e); }
         );
     }
 
+    /// A record's compact canonical constructor is a constructor definition (named like the
+    /// record) and the source of the calls in its body (contract M3b amendment 75).
+    #[test]
+    fn java_compact_constructors_are_constructors() {
+        let src = "record Rec(int x) {\n  Rec(String s) { this(s.length()); }\n  Rec {\n    check(x);\n  }\n  static void check(int v) {}\n}\n";
+        assert_eq!(
+            outline(Language::Java, src),
+            [
+                "class Rec@0:7",
+                "method Rec.Rec@1:2",
+                "method Rec.Rec@2:2",
+                "method Rec.check@5:14",
+            ]
+        );
+        let facts = extract(Language::Java, src.as_bytes()).unwrap();
+        let check = facts.references.iter().find(|r| r.name == "check").unwrap();
+        let source = &facts.definitions[check.enclosing.unwrap()];
+        assert_eq!(
+            (source.kind, source.name_span),
+            (DefKind::Method, [2, 2, 2, 5])
+        );
+    }
+
     const PYTHON: &str = "import os
 
 class Auth:
