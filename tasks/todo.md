@@ -257,6 +257,13 @@ Findings from the research step (2026-09-29):
       - [x] Mutations P1–P7, T1, S1, C1, B1, X1, S9, S10: each fails a unit.
       - [x] Verify: fmt, clippy, 328 unit tests, e2e 15/15 twice with containers, stub scan; eight public repos fresh == cached; six dumps byte-identical to `bf43351`'s; vavr and TheAlgorithms diffs confined to the four previously rejected files.
       - [x] Records (contract 75–76, corrections to 71, open items, CHANGELOG, IMPLEMENT.md, design §5.3/§13, lessons); cleanup; commit.
+    - [x] Evaluator pass 11 (test-first; amendments 77–79; `tasks/eval-m3b-pass11.md`; decisions: `structural_escape` for N1 and the `*/` class, index-confirmed supertypes for N2, N3 doc, N4 units):
+      - [x] Measure: structural-escape scan over the seven public Java repos (json-schema-validator's two `case '\u002E':` → `.`/`@`/`:` dropped, then 0); rebuilt `t11esc` (Enm3, Enm4, Enm7, Sup1, Plain, Chain) on the real image, the `2406e57` binary emits all six false exact edges; `t11ts` shows scip-typescript relates interfaces to nothing.
+      - [x] Phase 1 (rb-scip `decode.rs`): `Rejection::StructuralEscape`, JLS backslash rule; unit first.
+      - [x] Phase 2 (rb-indexer `scip.rs`, `lib.rs`; rb-cli `main.rs`): walk steps confirmed by the origin's relationships (deviation recorded in amendment 78), `supertypes_unconfirmed`; N2/N4 units first; `PIPELINE` `m3b-scip-7`.
+      - [x] Mutations SE1–SE8, SC1–SC4, MK2, MK13: each fails a unit.
+      - [x] Verify: fmt, clippy, 333 unit tests, e2e 15/15 twice, stub scan; nine public repos fresh == cached, rejections 0, `supertypes_unconfirmed` 0, edge sets identical to `2406e57`.
+      - [x] Records (contract 77–79, amendment 71 table, invariant 1, CHANGELOG, IMPLEMENT.md, design §5.3/§13, lessons); cleanup; commit.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
@@ -298,3 +305,7 @@ Findings from the research step (2026-09-29):
 ## Review (evaluator pass 10)
 - M1–M3 fixed test-first and compact constructors brought in (amendments 75–76). A Tree-sitter definition is paired only by an occurrence of its own kind, or (a method) by an enum constant body's local method; a type is anchored by its type symbol, never its implicit constructor; a TypeScript document with a syntax error is rejected. Calibrated: 0 rejections on eight public repositories (vavr and TheAlgorithms 2 → 0), six dumps byte-identical to `bf43351`.
 - Found while measuring: the decided rule (ii) ("innermost method/type range is the parent's") still paired an anonymous class's method in a field initializer and a local variable of an initializer block (both reproduced as false exact edges on the real image), so the binding was narrowed to the measured enum-constant-body shape (recorded as a deviation in amendment 75). scip-java leaves enum constants without a `SymbolInformation.kind`, which is what identifies them.
+
+## Review (evaluator pass 11)
+- N1–N4 fixed test-first (amendments 77–79). A scip-java document holding a Unicode escape of structural ASCII is rejected at the decoder (`structural_escape`), which closes the `*/` class of passes 8–11 at its input; the `IMPLEMENTS` walk steps only onto supertypes the origin type's symbol information relates it to. Calibrated: 0 rejections and 0 unconfirmed supertypes on nine public repositories, edge sets identical to `2406e57`.
+- Found while measuring: json-schema-validator writes `case '\u002E':`, so `.`, `@`, `:` left the set as the decision prescribed; scip-typescript 0.4.0 relates an interface to no supertype, so the per-step confirmation the decision worded would have dropped true edges through TypeScript interfaces; the walk is confirmed by its origin's transitive relationships instead (recorded deviation).

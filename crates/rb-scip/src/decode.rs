@@ -46,8 +46,9 @@ pub struct Document {
 
 /// Why a document the index has does not own its file (contract M3b amendment 64): a sign that
 /// the indexer and Tree-sitter read the file differently, so the indexer's positions may name
-/// other tokens than Tree-sitter's. The decoder decides the first three and the fourth's
-/// caller ([`crate::jobs::maven_source_encoding`]); the join decides the last.
+/// other tokens than Tree-sitter's. The decoder decides `not_utf8`, `text_differs`,
+/// `encoding_ambiguous`, `comment_terminator` and `structural_escape`; its caller
+/// `source_encoding` ([`crate::jobs::maven_source_encoding`]); the join the last two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Rejection {
     /// The blob is not valid UTF-8, which Tree-sitter's spans and the column conversion assume.
@@ -63,6 +64,11 @@ pub enum Rejection {
     /// scip-java: the blob holds a lone `\r` or a `\u000a`/`\u000d` escape, which javac reads
     /// as a line terminator (also inside a `//` comment) and Tree-sitter-java does not.
     CommentTerminator,
+    /// scip-java: the blob holds a Unicode escape that decodes to a character delimiting Java's
+    /// structure (comments, blocks, parentheses, statements, literals, operators that close
+    /// generics; contract M3b amendment 77). javac translates escapes before lexing (JLS §3.3)
+    /// and Tree-sitter-java does not, so such an escape can restructure the file for javac only.
+    StructuralEscape,
     /// A global method or type definition occurrence that no Tree-sitter definition accounts for.
     DefinitionDisagreement,
     /// scip-java: a reference Tree-sitter places in another definition than the index's own
@@ -71,12 +77,13 @@ pub enum Rejection {
 }
 
 impl Rejection {
-    pub const ALL: [Rejection; 7] = [
+    pub const ALL: [Rejection; 8] = [
         Rejection::NotUtf8,
         Rejection::TextDiffers,
         Rejection::SourceEncoding,
         Rejection::EncodingAmbiguous,
         Rejection::CommentTerminator,
+        Rejection::StructuralEscape,
         Rejection::DefinitionDisagreement,
         Rejection::StructureDisagreement,
     ];
@@ -88,6 +95,7 @@ impl Rejection {
             Rejection::SourceEncoding => "source_encoding",
             Rejection::EncodingAmbiguous => "encoding_ambiguous",
             Rejection::CommentTerminator => "comment_terminator",
+            Rejection::StructuralEscape => "structural_escape",
             Rejection::DefinitionDisagreement => "definition_disagreement",
             Rejection::StructureDisagreement => "structure_disagreement",
         }
@@ -294,7 +302,13 @@ fn rejection(blob: &[u8], text: &str, scip_java: bool) -> Option<Rejection> {
     if !text.is_empty() && text.as_bytes() != blob {
         return Some(Rejection::TextDiffers);
     }
-    (scip_java && has_javac_only_line_terminator(blob)).then_some(Rejection::CommentTerminator)
+    if !scip_java {
+        return None;
+    }
+    if has_javac_only_line_terminator(blob) {
+        return Some(Rejection::CommentTerminator);
+    }
+    has_structural_escape(blob).then_some(Rejection::StructuralEscape)
 }
 
 /// A lone `\r`, or a Unicode escape `\u000a`/`\u000d` (any number of `u`, either case; JLS
@@ -313,6 +327,48 @@ fn has_javac_only_line_terminator(blob: &[u8]) -> bool {
         }
         _ => false,
     })
+}
+
+/// Whether `blob` holds a Java Unicode escape that decodes to structural ASCII (contract M3b
+/// amendment 77, `structural_escape`): `/ * { } ( ) ; , " ' = < >` or a line terminator. An
+/// escape is a backslash eligible to begin one (JLS §3.3: preceded by an even number of
+/// contiguous backslashes), one or more `u` and four hex digits. A backslash an escape
+/// produces (`\u005c`) is not counted towards the next one's eligibility, so a following
+/// escape is read as one: a rejection costs coverage only. Malformed digits are no escape
+/// (javac would not compile the file). `.`, `@` and `:` are left out: json-schema-validator
+/// writes `case '\u002E':` (measured), and the checks downstream remain for them.
+fn has_structural_escape(blob: &[u8]) -> bool {
+    const STRUCTURAL: &[u8] = b"/*{}();,\"'=<>\n\r";
+    let mut backslashes = 0usize;
+    let mut i = 0;
+    while i < blob.len() {
+        if blob[i] != b'\\' {
+            backslashes = 0;
+            i += 1;
+            continue;
+        }
+        let us = blob[i + 1..].iter().take_while(|&&c| c == b'u').count();
+        let digits = blob
+            .get(i + 1 + us..i + 5 + us)
+            .filter(|d| d.iter().all(u8::is_ascii_hexdigit));
+        match digits {
+            Some(digits) if us > 0 && backslashes.is_multiple_of(2) => {
+                let code = digits.iter().fold(0u32, |n, &d| {
+                    n * 16 + char::from(d).to_digit(16).unwrap_or(0)
+                });
+                if u8::try_from(code).is_ok_and(|c| STRUCTURAL.contains(&c)) {
+                    return true;
+                }
+                backslashes = 0;
+                i += 5 + us;
+            }
+            _ => {
+                backslashes += 1;
+                i += 1;
+            }
+        }
+    }
+    false
 }
 
 /// Whether a scip-java document's positions fail to show that javac read its text as UTF-8
@@ -1283,9 +1339,78 @@ mod tests {
                 "source_encoding",
                 "encoding_ambiguous",
                 "comment_terminator",
+                "structural_escape",
                 "definition_disagreement",
                 "structure_disagreement"
             ]
+        );
+    }
+
+    /// Contract M3b amendment 77 (`structural_escape`): a scip-java document holding a Unicode
+    /// escape that decodes to structural ASCII is rejected, whatever it sits in. javac
+    /// translates every escape before lexing (JLS §3.3), Tree-sitter-java reads it as text, so
+    /// `§u002a/` ends a block comment for javac only: the evaluator's pass-11 `Enm3`, `Enm4`,
+    /// `Enm7` and `Sup1` (rows as measured on `var/fix-pass11/t11esc`) gave false exact edges
+    /// through the checks downstream. A `§` preceded by an odd number of `§` begins no escape;
+    /// `.`, `@` and `:` are not in the set (json-schema-validator's `case '§u002E':`, measured),
+    /// nor is an escape in an identifier. Here `§` stands for a backslash.
+    #[test]
+    fn structural_escapes_reject_a_scip_java_document() {
+        let java = |text: &str| {
+            let blob = text.replace('§', "\\");
+            decoded_document("scip-java", "", Some(blob.as_bytes())).rejected
+        };
+        let measured = [
+            "  A { /* §u002a/ { new Object() { /* */ void n() { b(); } /* §u002a/ }; } /* */ } ;\n",
+            "class Sup1 /* §u002a/ <T /* */ extends Sup2 /* §u002a/ > /* */ {\n",
+            "  A(new Object() /* §u002a/ .hashCode( /* */ ), /* §u002a/ new /* */ B3 /* §u002a/ () /* */ { public void n() { b(); } } /* §u002a/ ) /* */ ;\n",
+        ];
+        for text in measured {
+            assert_eq!(java(text), Some(Rejection::StructuralEscape), "{text}");
+        }
+        for hex in [
+            "002f", "002a", "007b", "007d", "0028", "0029", "003b", "002c", "0022", "0027", "003d",
+            "003c", "003e", "002A", "007B", "007D", "003B", "002C", "003D", "003C", "003E",
+        ] {
+            let text = format!("class C {{ int f() {{ return 1; }} /* §u{hex} */ }}\n");
+            assert_eq!(java(&text), Some(Rejection::StructuralEscape), "{text}");
+        }
+        // Line terminators are structural too; `comment_terminator`, met first, records them.
+        for hex in ["000a", "000d", "000A", "000D"] {
+            let text = format!("// §u{hex} x\n");
+            assert_eq!(java(&text), Some(Rejection::CommentTerminator), "{text}");
+            assert!(
+                has_structural_escape(text.replace('§', "\\").as_bytes()),
+                "{text}"
+            );
+        }
+        // Any number of `u`; a `§` after an even number of `§` begins an escape.
+        assert_eq!(java("/* §uuu002a/ */\n"), Some(Rejection::StructuralEscape));
+        assert_eq!(
+            java("s = \"§§§u0022\";\n"),
+            Some(Rejection::StructuralEscape)
+        );
+        // An escaped backslash: `§§u002a` is a backslash and the text `u002a` for javac too.
+        assert_eq!(java("s = \"§§u002a §§u0022\";\n"), None);
+        assert!(!has_structural_escape(b"\\\\u002a"));
+        // Escapes javac and Tree-sitter agree on: in identifiers and literals of other
+        // characters, a backslash, malformed digits; `.`, `@`, `:` (measured on
+        // json-schema-validator: `case '§u002E':`), and jsoup's `-`, `!`, controls.
+        for text in [
+            "int §u0061§u0062 = 1;\n",
+            "char c = '§u002E'; char d = '§u0040'; char e = '§u003a';\n",
+            "String s = \"§u002d§u0021§u0000§u007f§u00e9§u2028\";\n",
+            "String s = \"§u005c\";\n",
+            "String s = \"§u00zz §u002\";\n",
+            "// §n §u §uu\n",
+        ] {
+            assert_eq!(java(text), None, "{text}");
+        }
+        // TypeScript translates no escapes before lexing.
+        let ts = "  A { /* §u002a/ x */ }\n".replace('§', "\\");
+        assert_eq!(
+            decoded_document("scip-typescript", "", Some(ts.as_bytes())).rejected,
+            None
         );
     }
 

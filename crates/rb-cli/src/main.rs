@@ -705,6 +705,15 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
                 n("supertypes_unresolved")
             );
         }
+        // Declared supertypes the type's own symbol information does not relate it to
+        // (contract M3b amendment 78): the walk does not lead through them either.
+        if n("supertypes_unconfirmed") > 0 {
+            let _ = write!(
+                line,
+                ", {} supertypes unconfirmed",
+                n("supertypes_unconfirmed")
+            );
+        }
         // Definitions scip-java keys as document-local symbols: they keep heuristic keys
         // (contract M3b amendment 54).
         if n("definitions_local") > 0 {
@@ -1213,6 +1222,19 @@ mod tests {
             ),
             "{}",
             scip_status_line(&local)
+        );
+        // Declared supertypes the index does not confirm (contract M3b amendment 78) are
+        // printed when there are any, after the unresolved ones.
+        let unconfirmed = diagnostic(json!({
+            "indexer": "scip-java", "status": "ok", "unpinned": false, "image": "sha256:1",
+            "coverage": {"definitions_matched": 2, "definitions_total": 2,
+                         "supertypes_unresolved": 2, "supertypes_unconfirmed": 1},
+        }));
+        assert!(
+            scip_status_line(&unconfirmed)
+                .ends_with(", 2 supertypes unresolved, 1 supertypes unconfirmed"),
+            "{}",
+            scip_status_line(&unconfirmed)
         );
     }
 

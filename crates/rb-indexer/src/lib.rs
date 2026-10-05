@@ -37,8 +37,9 @@ use serde_json::{Value, json};
 /// `structure_disagreement` reasons (amendments 68 and 69), `m3b-scip-5` the two-way definition
 /// agreement and the encoding tie (amendments 72 and 73), `m3b-scip-6` kind-aware pairing, a
 /// type anchored by its type symbol, the syntax-error rule for TypeScript and compact
-/// constructors as definitions (amendment 75).
-pub const PIPELINE: &str = "m3b-scip-6";
+/// constructors as definitions (amendment 75), `m3b-scip-7` the `structural_escape` reason and
+/// supertypes confirmed by the index (amendments 77 and 78).
+pub const PIPELINE: &str = "m3b-scip-7";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -469,6 +470,7 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             "references_unmatched": c.references_unmatched,
             "files_without_document": c.files_without_document,
             "supertypes_unresolved": c.supertypes_unresolved,
+            "supertypes_unconfirmed": c.supertypes_unconfirmed,
             "occurrences_unconverted": c.occurrences_unconverted,
             "relationships_dropped": c.relationships_dropped,
             "relationships_dropped_in_project": c.relationships_dropped_in_project,
