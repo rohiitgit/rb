@@ -323,7 +323,10 @@ fn has_javac_only_line_terminator(blob: &[u8]) -> bool {
 /// global symbol by [`crate::may_name`], a local one by its display name (scip-java gives
 /// one). Ambiguous when some occurrence names its token under both readings (nothing tells
 /// which encoding placed it), or when the ISO-8859-1 reading names more tokens than the UTF-8
-/// one (javac evidently read single bytes).
+/// one (javac evidently read single bytes), or as many: a tie, also 0 to 0, when some
+/// occurrence reads differently (amendment 73; javac's `<init>` at `this`/`super` never names
+/// its token, and read as UTF-8 it can land on a same-named token and offset a genuine
+/// ISO-8859-1 occurrence).
 fn encoding_ambiguous(
     lines: &Lines<'_>,
     occurrences: &[Occurrence],
@@ -339,7 +342,7 @@ fn encoding_ambiguous(
             }
         })
     };
-    let (mut utf8, mut iso) = (0usize, 0usize);
+    let (mut utf8, mut iso, mut differing) = (0usize, 0usize, 0usize);
     for (o, &(sl, sc, el, ec)) in occurrences.iter().zip(raw) {
         if sl != el {
             continue;
@@ -358,10 +361,11 @@ fn encoding_ambiguous(
         if as_utf8 && as_iso {
             return true;
         }
+        differing += 1;
         utf8 += usize::from(as_utf8);
         iso += usize::from(as_iso);
     }
-    iso > utf8
+    differing > 0 && iso >= utf8
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1432,6 +1436,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Contract M3b amendment 73 (the evaluator's L2): a tie rejects. In an ISO-8859-1 build
+    /// (`.mvn/maven.config`), javac's `` `<init>`(). `` occurrence at `this` never names its
+    /// own token, and read as UTF-8 it lands on the `Wxyz` of the later `Wxyz()` call, which a
+    /// constructor may name; that offsets the one genuine ISO-8859-1 occurrence (`Wxyz#Wxyz().`
+    /// at the call). 1 to 1 is `encoding_ambiguous`; so is 0 to 0 when an occurrence reads
+    /// differently, since then nothing shows that javac read UTF-8. The raw ranges are the ones
+    /// `rb-scip-java:0.13.1` emitted on `var/fix-pass9/x9lat`.
+    #[test]
+    fn a_tie_between_the_readings_is_ambiguous() {
+        let text = format!(
+            "package p;\n\nclass Wxyz {{\n  Wxyz(int q) {{}}\n  int Wxyz() {{ return 1; }}\n  Wxyz() {{ /* {} */ this(1); Wxyz(); }}\n}}\n",
+            "\u{e9}".repeat(9)
+        );
+        let p = "scip-java maven . . p/Wxyz#";
+        let (init, init1, method) = (
+            format!("{p}`<init>`()."),
+            format!("{p}`<init>`(+1)."),
+            format!("{p}Wxyz()."),
+        );
+        let row = text.lines().nth(5).unwrap();
+        // Raw columns are javac's ISO-8859-1 ones, one per byte: `this` and the call's `Wxyz`.
+        assert_eq!(row.find("this"), Some(36));
+        assert_eq!(row.find("Wxyz();"), Some(45));
+        let measured = [
+            (init1.as_str(), ROLE_DEFINITION, 5, 2, 6),
+            (init.as_str(), 0, 5, 36, 40),
+            (method.as_str(), 0, 5, 45, 49),
+        ];
+        let rejected =
+            |raw: &[(&str, i32, i32, i32, i32)]| k2_decoded("scip-java", &text, raw).rejected;
+        assert_eq!(rejected(&measured), Some(Rejection::EncodingAmbiguous));
+        // Each side's occurrence alone is not a tie: 1 to 0 for UTF-8 is accepted, 0 to 1 is
+        // rejected by the count rule.
+        assert_eq!(rejected(&measured[..2]), None);
+        assert_eq!(
+            rejected(&[measured[0], measured[2]]),
+            Some(Rejection::EncodingAmbiguous)
+        );
+        // 0 to 0: `<init>` at `this` read both ways names nothing, and nothing else is read
+        // differently.
+        assert_eq!(
+            rejected(&[measured[0], (init.as_str(), 0, 5, 37, 41)]),
+            Some(Rejection::EncodingAmbiguous)
+        );
+        // Before the non-ASCII run the two readings agree, so nothing is counted.
+        assert_eq!(rejected(&measured[..1]), None);
     }
 
     /// Contract M3b amendment 66: a local symbol's name is the text at its definition

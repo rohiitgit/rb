@@ -242,6 +242,14 @@ Findings from the research step (2026-09-29):
       - [x] Mutations N24, N25, N27, S1–S7, E1–E6: each fails a unit.
       - [x] Verify: fmt, clippy, 318 unit tests, e2e 15/15 twice with containers (goldens unchanged), stub scan; five public repos fresh == cached, 0 rejections, dumps identical to `11ae499`'s apart from the header; scratch K1/K2 cases have no false exact edge.
       - [x] Records (contract 68–71 and corrections to 64, open items, CHANGELOG, IMPLEMENT.md, design §5.3/§13, lessons); cleanup; commit.
+    - [x] Evaluator pass 9 (test-first; amendments 72–74; `tasks/eval-m3b-pass9.md`; decision: two-way definition agreement for Java documents, folded into `structure_disagreement`):
+      - [x] Rebuilt the evaluator's layouts on the real image (`var/fix-pass9/x9esc` Hid1–3, 5–7, 9, 10; `x9lat` Wxyz, Abcd; `x9sjis` Sj3) and a forms project (`x9forms`); the `5502422` binary reproduces every L1–L4 false exact edge.
+      - [x] Calibrated with a temporary trace (removed): unpaired SCIP definitions are implicit `<init>` (no range) and annotation forms only (jsoup 1, spring-retry 48, petclinic-rest 4); Tree-sitter-only definitions 0; syntax errors 0; 0 rejections after the annotation exemption.
+      - [x] Phase 1 (rb-scip): tie rule `differing > 0 && iso >= utf8`; unit `a_tie_between_the_readings_is_ambiguous`.
+      - [x] Phase 2 (rb-indexer): `definitions_unpaired` ((a), (b), syntax error), clause 2 over every method/type range; units for Hid1–10, each side alone, the annotation exemption, bound locals (S9, S10); two amended units; `PIPELINE` `m3b-scip-5`.
+      - [x] Mutations A1, B1, X1, U1, C1, U1C1, R1, EX1–EX3, S8, S9, S10, E3, E3b, E3c: each fails a unit.
+      - [x] Verify: fmt, clippy, 322 unit tests, e2e 15/15 twice with containers (48.07 s, 40.89 s; goldens unchanged), stub scan; six public repos fresh == cached, 0 rejections, dumps identical to `5502422`'s; scratch projects as recorded.
+      - [x] Records (contract 72–74, corrections to 71, open items, CHANGELOG, IMPLEMENT.md, design §5.3/§13, lessons); cleanup; commit.
 
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
@@ -273,3 +281,9 @@ Findings from the research step (2026-09-29):
 - K1–K4 fixed test-first (amendments 68–71). The edge source is now checked against the index's own enclosing ranges (Java), and javac's encoding is decided from the positions when the build cannot be read; both calibrated to 0 rejections on five public repositories with edge sets unchanged.
 - Found while measuring: scip-typescript's class and method ranges include decorators, which Tree-sitter-typescript places outside them, so the structure check is Java-only. The evaluator's K2 layout is genuinely ambiguous even in a UTF-8 build (its `é` run equals the distance between the two `z` calls), so `Utf.java` is rejected too; recorded.
 - `field_chains_binding_chains_and_big_packages_stay_fast` (a wall-clock M3a test, 2 s/3 s bounds) failed in some mutation runs while a fresh build competed for CPU; it passed in every clean run. Not changed here (no defect found); a candidate for the growth-ratio treatment given to `many_declarations_of_one_name_stay_fast`.
+
+## Review (evaluator pass 9)
+- L1–L5 fixed test-first (amendments 72–74). A Java document is SCIP-owned only when its definitions agree both ways (every ranged method, constructor or type the index defines is a Tree-sitter definition, every Tree-sitter definition has an occurrence, no Tree-sitter syntax error), and the structure check's clause 2 sees every method or type range; `encoding_ambiguous` rejects a tie. Calibrated to 0 rejections on six public repositories with edge sets byte-identical to `5502422`.
+- Found while measuring: scip-java marks every annotation interface by its relation to `java/lang/annotation/Annotation#`, which identifies the only legitimate ranged unpaired form without the source text; a record's compact constructor is a member Tree-sitter-java does not capture, so its calls had a wrong exact source before and the file is now Tier B (open item). The two-way rule makes `definitions_without_occurrence` 0 by construction for accepted Java documents; that counter now matters for TypeScript only.
+- Session slip: a scratch-repository commit landed in the project repository through a relative `cd`; undone at once without touching the working tree (lesson recorded).
+
