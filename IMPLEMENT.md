@@ -238,7 +238,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] e2e flake: AGE 1.8 on PG 18 kills backends under concurrent graph DDL; tests serialized, risk recorded in design §14.
 - [x] Commit
 
-## M3b SCIP orchestration: implemented, evaluator passes 1–7 fixed (verdict pending the next evaluator pass)
+## M3b SCIP orchestration: complete (closed 2026-10-06, contract amendment 81)
 
 - **Decided so far:** see `tasks/contract-m3b.md` (draft). Indexers run in pinned containers with the network disabled during indexing; an index is cached by `(project_input_hash, indexer_digest)`; a project is fully SCIP or fully heuristic. scip-java and scip-typescript first.
 - **Environment checked 2026-10-01:** Docker 29.5.2 on colima (arm64); `--network none` verified to block egress; about 4.8 GiB free on the host disk, so image sizes matter.
@@ -263,6 +263,8 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Evaluator pass 9 (amendments 72–74, `tasks/eval-m3b-pass9.md`):** a Java document's definitions must agree both ways (`structure_disagreement`, join): every global method, constructor or type definition occurrence with a range anchors a Tree-sitter definition (annotation interfaces and their elements excepted, identified by `kind` `Interface` and the relation to `java/lang/annotation/Annotation#`), every Tree-sitter definition is anchored, and Tree-sitter parsed the file without a syntax error; clause 2 of the structure check considers every method, constructor or type range, anchored or not. Members only javac sees (a `\u002a/` that ends a comment for javac only) or only Tree-sitter sees no longer give exact edges from the wrong source. `encoding_ambiguous` rejects a tie between the readings. Calibrated on five public Java repositories: the only unpaired forms are implicit constructors (no range) and annotation forms; 0 rejections, edge sets unchanged. `PIPELINE` `m3b-scip-5`.
 - **Evaluator pass 10 (amendments 75–76, `tasks/eval-m3b-pass10.md`):** pairing is kind-aware (`definitions_unpaired`, Java): a Tree-sitter type pairs only with a type symbol, a method or constructor only with a method or constructor symbol, and a bound local only when it is a method of an enum constant's body (kind `Method`, innermost enclosing definition an enum constant of the Tree-sitter parent), so a field, a local variable or an anonymous class's method at the name of a method only Tree-sitter sees no longer makes its calls exact (`Anon1`–`Anon3`, `Loc1`, `Fld1`, `Init1`, `Enm2` rejected on the real image); a type is anchored at its name only by a type symbol, so a class whose own occurrence sits in its annotation is found by the amendment-7 fallback instead of its implicit constructor (vavr 2 → 0 rejected, +1,274 exact edges); a TypeScript document with a Tree-sitter syntax error is rejected (merge-conflict markers); compact canonical constructors are captured as constructors (TheAlgorithms/Java 2 → 0 rejected). `PIPELINE` `m3b-scip-6`.
 - **Evaluator pass 11 (amendments 77–79, `tasks/eval-m3b-pass11.md`):** the escape trick is rejected at the input: the decoder rejects a scip-java document holding a Unicode escape that decodes to `/ * { } ( ) ; , " ' = < >` or a line terminator (`structural_escape`, JLS backslash-parity rule; `.`, `@`, `:` left out after json-schema-validator's `case '\u002E':`), 0 documents on seven public Java repositories, the evaluator's `Enm3`/`Enm4`/`Enm7`/`Sup1` rejected on the real image; the `IMPLEMENTS` walk steps onto a declared supertype only when the walk's origin type's symbol information relates it to that supertype (both indexers relate a class to every supertype transitively; scip-typescript relates an interface to nothing, measured), counted `supertypes_unconfirmed` (0 on nine public repositories, edge sets unchanged). `PIPELINE` `m3b-scip-7`.
+- **Evaluator pass 12 (amendment 80, `tasks/eval-m3b-pass12.md`):** an escape decoding to a backslash is structural unless `u` immediately follows it (javac's produced backslash escapes the next quote inside a literal; Tree-sitter reads `\u005c` as complete), which closes the evaluator's `Bs7`/`Bs4`; vavr's Javadoc `\u005Cu…` stays accepted; 0 documents on seven Java repositories, counts unchanged. `PIPELINE` `m3b-scip-8`.
+- **Closed (amendment 81):** final status S1–S13 and invariants 1–6, the review history of passes 1–12 and the consolidated open items are in the contract.
 - **Open:** Gradle (M6), workspace installs for nested npm packages (M6), tsconfig `include`/`exclude` awareness for excluded files (M6), lockfile-resolved package versions (M4 `DEPENDS_ON` work), a registry allow-list for the fetch phase (M5; design §14). spring-retry's test sources get no scip-java document because a Develocity build cache serves `testCompile` (contract open items).
 
 ### Status
@@ -282,7 +284,8 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Evaluator pass 9 fixes (amendments 72–74): two-way definition agreement, encoding tie, 15 e2e tests with containers
 - [x] Evaluator pass 10 fixes (amendments 75–76): kind-aware pairing, type anchoring, TypeScript syntax errors, compact constructors, 15 e2e tests with containers
 - [x] Evaluator pass 11 fixes (amendments 77–79): structural escapes, index-confirmed supertypes, 15 e2e tests with containers
-- [ ] Evaluator re-check of pass 11
+- [x] Evaluator pass 12 fixes (amendment 80): escaped backslash as a structural escape, 15 e2e tests with containers
+- [x] M3b closed (amendment 81): final status, review history, open items carried forward; nine public repositories re-measured with the closing binary
 
 ### Environment incident (2026-09-30 evening, wall clock)
 
@@ -292,3 +295,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **To restore:** a container runtime whose VM shares the home directory; `docker compose up -d --wait` and `rb migrate` for the database; `docker build -t rb-scip-java:0.13.1 docker/scip-java`; pull `sourcegraph/scip-typescript@sha256:028c0042…` for linux/amd64.
 - Follow-up: the e2e fixture copy should skip ignored files (an IDE's `target/` inside a fixture broke `orm_table_deps_goldens`).
 - **Restored on Docker Desktop (the user's choice, 2026-09-30 22:00 wall clock):** `compose.yaml` takes its host port from `RB_DB_PORT` (default 55432); the database runs on 55433 while the dead VM's forward holds 55432, freshly migrated (0001–0004). `--network none`, amd64 emulation and home-directory bind mounts were re-verified there.
+
+## M4 Frameworks: not started
+
+- Design §13: route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card. Exit: Q3/Q4 goldens on `polyglot-monorepo`, precision guards green. Contract to be written first.

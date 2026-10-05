@@ -1,4 +1,4 @@
-# M3b contract: SCIP orchestration and exact edges (draft, planner, 2026-10-01)
+# M3b contract: SCIP orchestration and exact edges (draft, planner, 2026-10-01; closed 2026-10-06, amendment 81)
 
 Written before any code. M3b is done only when every assertion below is backed by a passing test or a recorded measurement. Sections marked *pending research* are filled in once the indexer facts are verified (image digests, invocations, build requirements).
 
@@ -360,3 +360,75 @@ The edge sets are the ones measured below (256 and 394 exact `CALLS`, 36 and 5 p
 - **square/javapoet @ `b9017a9503b7` and FasterXML/java-classmate @ `f525e498215b`: no index (evaluator pass 9).** javapoet: `failed (fetch phase)`, javac "class file has wrong version 65.0, should be 53.0" (a Java 8 target); java-classmate: `failed (fetch phase)`, `dependency:go-offline` wants `com.sun:tools:jar` from `/opt/java/openjdk/../lib/tools.jar`. Both exit 0 and stay Tier B (invariant 4). Four of the six Maven repositories tried in passes 8–9 got no SCIP coverage. Follow-up with the M6 build recipes (a JDK matching the project's target, compile-only goals).
 - ~~**Compact canonical constructors (amendment 72).**~~ Closed by amendment 75: captured as constructors (TheAlgorithms/Java's 2 documents are accepted).
 - **mybatis/mybatis-3 @ `34147d0bd2f5`: no index (evaluator pass 10).** `failed (fetch phase)`: `license-maven-plugin:format` needs a git directory ("One of setGitDir or setWorkTree must be called"), and the export has no `.git`. Exit 0, Tier B (invariant 4). Follow-up with the M6 build recipes (skip the license plugin, or compile-only goals). Five of the nine Maven repositories tried in passes 8–10 got no SCIP coverage.
+
+## Closing (2026-10-06)
+
+81. **M3b is closed.** Evaluator pass 12 (`tasks/eval-m3b-pass12.md`, against `4402377`) judged every assertion and invariant PASS except S5, S13 and invariant 2, all three on O1; O1 and O2 are fixed in `263a20f` (amendment 80) and verified there (real image, seven Java repositories, unit and e2e suites). No evaluator pass re-checked `263a20f`: the review loop is closed here by decision, with the fix verified by the generator against the evaluator's own repro, mutation list and calibration. The final binary (sha1 `5946b89faeea`) was also run on the two TypeScript repositories, so all nine public repositories below are measured at the closing code.
+
+    **Final status:**
+
+    | # | Status | Evidence |
+    |---|---|---|
+    | S1 | PASS (documented vector open) | decoder units; Shift_JIS stays open (amendment 71) |
+    | S2 | PASS | Maven and npm detected on all nine public repositories and the scratch projects |
+    | S3 | PASS | every run `ok`; network phases unchanged since amendment 27 |
+    | S4 | PASS | every cached run `(cached)` |
+    | S5 | PASS (since `263a20f`) | O1's `Bs7`/`Bs4` rejected `structural_escape`, no false exact edge (amendment 80); N1–N4 layouts as pass 12 |
+    | S6 | PASS | e2e 15/15 twice |
+    | S7 | PASS as worded | rejected documents carry heuristic edges only; accepted documents no heuristic code edge |
+    | S8 | PASS | counts and dumps as the baseline |
+    | S9 | PASS | rejection reasons and `supertypes_unconfirmed` printed and recorded |
+    | S10 | PASS | goldens pass in both e2e runs |
+    | S11 | PASS | nine public counts reproduced exactly (table below); sampled precision 120/120 `CALLS`, 52/52 `IMPLEMENTS` (pass 11, edge sets unchanged since) |
+    | S12 | PASS | fresh = cached by `cmp` on all nine and on `t12bs` |
+    | S13 | PASS (since `263a20f`) | fmt, clippy, 335 unit tests, e2e 15/15 twice without `skipping:`, stub scan clean; O2's unit kills R1 against the pass-11 rule (R1 equivalent under amendment 80) |
+    | Inv. 1 | PASS as worded | never a mix within a file |
+    | Inv. 2 | PASS (since `263a20f`) | no false exact edge from any known layout of the escape class |
+    | Inv. 3 | PASS | no host paths in dumps; network phases unchanged |
+    | Inv. 4 | PASS | failures stay Tier B with exit 0 (pass-10 evidence stands) |
+    | Inv. 5 | PASS | as S12 |
+    | Inv. 6 | PASS | spans are the tokens' own ranges |
+
+    **Final numbers** (release binary sha1 `5946b89faeea`, `--no-cache --force` then cached, `documents rejected 0` and no unconfirmed supertypes on each; fresh = cached):
+
+    | Repository @ commit | Indexer | `CALLS` / `IMPLEMENTS` (exact) | Nodes / edges |
+    |---|---|---|---|
+    | spring-projects/spring-petclinic @ `818c4136ea97` | scip-java | 256 / 13 | 417 / 927 |
+    | typestack/class-validator @ `2e1a5c27dbd6` | scip-typescript | 398 / 2 | 639 / 1,447 |
+    | jhy/jsoup @ `088614f4a145` | scip-java | 14,013 / 688 | 5,323 / 25,561 |
+    | spring-projects/spring-retry @ `40f557cc27ab` | scip-java | 459 / 252 | 1,823 / 5,793 |
+    | networknt/json-schema-validator @ `95825f33f76b` | scip-java | 6,449 / 731 | 4,301 / 14,515 |
+    | spring-petclinic/spring-petclinic-rest @ `afc8fc1d3b8e` | scip-java | 652 / 166 | 836 / 2,366 |
+    | vavr-io/vavr @ `7791b586d290` | scip-java | 27,257 / 5,994 | 13,442 / 59,934 |
+    | TheAlgorithms/Java @ `68dc5f54dde2` | scip-java | 10,374 / 269 | 13,054 / 39,575 |
+    | typestack/routing-controllers @ `bf6fbfdc7fa5` | scip-typescript | 169 / 38 | 642 / 1,640 |
+
+    **Review history** (severity as each report graded it; passes 1 and 2 left no report file in the repository and their severities are not recorded):
+
+    | Pass | Findings | Fix commit | Amendments |
+    |---|---|---|---|
+    | 1 | 7 (D1–D7; severity not recorded) | `18970c7` | 15–20 |
+    | 2 | 4 (E1–E4; severity not recorded) | `74e0b20` | 21–24 |
+    | 3 | 18: 5 major, 12 minor, 1 doc | `5e7c341` | 25–42 |
+    | 4 | 10: 2 major, 7 minor, 1 doc | `9a8ec74` | 43–52 |
+    | 5 | 6: 2 major, 2 minor, 2 doc | `79d2c33` | 53–58 |
+    | 6 | 5: 1 major, 3 minor, 1 doc | `82f34d4` | 59–63 |
+    | 7 | 5: 2 major, 2 minor, 1 doc | `11ae499` | 64–67 |
+    | 8 | 4: 2 major, 1 minor, 1 doc | `5502422` | 68–71 |
+    | 9 | 5: 1 major, 4 minor (two of them documented vectors reproduced) | `bf43351` | 72–74 |
+    | 10 | 3: 1 major, 2 minor | `2406e57` | 75–76 |
+    | 11 | 4: 2 major, 2 minor | `4402377` | 77–79 |
+    | 12 | 2: 1 major, 1 minor | `263a20f` | 80 |
+
+    From pass 7 on, every major was a variant of one class: the indexer's compiler and Tree-sitter reading one file differently (line terminators, encodings, Unicode escapes, conflict markers). Passes 8–11 hardened downstream checks one layout at a time; amendment 77 rejected the trick at its input, and pass 12's only major was a character left out of that input rule.
+
+    **Open items carried forward** (details in "Open items (after evaluator pass 11)" above and in amendment 71's uncovered vectors):
+    - **Effective source encoding** (Shift_JIS and other multi-byte encodings that are not UTF-8; encodings set outside the poms under the build root): read it in the fetch phase (`help:evaluate`, the compiler plugin's effective configuration).
+    - **TypeScript structure:** restructurings Tree-sitter parses without an error (`-->` at line start, a `>>>>>>>` conflict marker closing generics) stay uncovered; other conflict-marker trivia is covered only where Tree-sitter leaves an `ERROR`.
+    - **TypeScript interface-method `IMPLEMENTS`** (amendment 78's cost): an interface origin relates to nothing, so an interface method overriding a super-interface method gets no exact `IMPLEMENTS`; 0 on class-validator and routing-controllers, to be measured on an interface-heavy repository.
+    - **Gradle** (`unsupported`; M6).
+    - **spring-retry's test tree** (a Develocity build cache serves `testCompile`; 68 files without a document).
+    - **M6 build recipes** for javapoet (JDK target), java-classmate (`tools.jar`), mybatis-3 (license plugin needs `.git`), commons-cli (no `index.scip`), failsafe (javadoc in the offline `verify`).
+    - **Workspace installs** for nested npm packages (M6).
+    - **tsconfig `include`/`exclude`** awareness for excluded files (M6).
+    - **Fetch-phase egress allow-list** and per-repository caches (M5; design §14).

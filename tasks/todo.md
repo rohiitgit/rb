@@ -157,7 +157,7 @@ Findings from the research step (2026-09-29):
 - [x] 0. Research: indexer images/digests/invocations, `scip` crate API, fixture buildability; contract facts recorded.
 - [x] 1. rb-scip: decode `index.scip`, position-encoding conversion (S1).
 - [x] 2. rb-scip: project detection, container jobs, fetch/index phases, cache (S2–S4).
-- [ ] 3. Indexer: the SCIP⋈Tree-sitter join, key replacement, exact edges, packages, coverage (S5–S9).
+- [x] 3. Indexer: the SCIP⋈Tree-sitter join, key replacement, exact edges, packages, coverage (S5–S9).
   - [x] 3a. Join: `Source` enum for file-level edges, targets limited to symbols the graph has, coverage.
   - [x] 3b. `index_commit` runs jobs (`ScipOptions`, `ScipCache`, Docker check), decodes, assembles with a precomputed keys map, excludes SCIP-ok files from Tier B, emits `scip_status`; CLI flags `--no-scip`, `--scip-work-dir`; `rb status` lines; `exact_calls`; e2e `scip_ts_express_prisma` with goldens; docs.
   - [x] 3c. scip-java through the slim local image (Maven only; Gradle stays `unsupported`):
@@ -168,12 +168,12 @@ Findings from the research step (2026-09-29):
     - [x] Docs: contract amendments 7–10, IMPLEMENT.md, CHANGELOG.md; verification loop; disk check.
     - Review: `rb callers` reports the dispatch step as `dispatch` (not `exact`) by the M3a CHA rule even though both edges are exact (amendment 9); `apps/web` fails under SCIP because `@acme/shared` is a workspace package (M6).
   - [x] 3d. Packages / `DEPENDS_ON` from external symbols (S8): `rb_scip::package` + key rule (unit), `Joined::packages` (unit), one edge per service and package with one evidence (unit), `ServiceCard.packages` + `rb service` rendering, e2e card goldens on all three SCIP fixtures. Lockfile versions: out of scope (amendment 12).
-- [ ] 4. Public repos (S11), evaluator passes, docs, commit.
+- [x] 4. Public repos (S11), evaluator passes, docs, commit.
   - [x] spring-petclinic with scip-java: measured, 20/20 sample, callers compared with the heuristic twin, `CALLS` diff classified.
   - [x] hono → class-validator (amendment 13): measured, 20/20 sample, callers compared; found the "files without a document" gap and fixed the count (amendment 14).
   - [x] m3b repos deleted from the database, work dirs removed, caches kept; disk figures in the contract.
   - [x] Docs: contract (S8, S11, amendments 11–14, measurement section), IMPLEMENT.md, CHANGELOG.md, design §5.5/§13, lessons.
-  - [ ] Evaluator passes, commit.
+  - [x] Evaluator passes, commit.
     - [x] Pass 1 fixes (test-first, one amendment each, 15–20):
       - [x] D1 ownership by document: `Joined.documented` → `exact_files`; `files_without_document` counts the indexer's languages only; unit (Python under Maven, excluded TS) + e2e (`scripts/tool.py` in the Java fixture; re-bless `scip-card.txt`, `scip-status.txt`).
       - [x] D2 `IMPLEMENTS` direction: only when A's type (or its method's enclosing type) declares a supertype named like B's last type descriptor; unit on a symmetric index; e2e golden `scip-impact-default-authenticate.txt`.
@@ -271,6 +271,8 @@ Findings from the research step (2026-09-29):
       - [x] Verify: fmt, clippy, 335 unit tests, e2e 15/15 twice (no `skipping:`), stub scan.
       - [x] Records (contract 80, amendments 71/77 in place, design §5.3, CHANGELOG); cleanup; commit.
 
+- [x] 5. M3b closed 2026-10-06 (contract amendment 81: final status, review history, open items carried forward).
+
 ## Review (evaluator pass 2)
 - The four defects are fixed test-first; each new test failed at HEAD 18970c7 for the reason the evaluator gave (the second E1 test, direct cases, passed before and after).
 - Found while hand-checking E3: the Java fixture's two "external" references that moved are a record's compiler-generated accessors, so `references_undocumented` covers generated members as well as files without a document.
@@ -315,3 +317,14 @@ Findings from the research step (2026-09-29):
 ## Review (evaluator pass 11)
 - N1–N4 fixed test-first (amendments 77–79). A scip-java document holding a Unicode escape of structural ASCII is rejected at the decoder (`structural_escape`), which closes the `*/` class of passes 8–11 at its input; the `IMPLEMENTS` walk steps only onto supertypes the origin type's symbol information relates it to. Calibrated: 0 rejections and 0 unconfirmed supertypes on nine public repositories, edge sets identical to `2406e57`.
 - Found while measuring: json-schema-validator writes `case '\u002E':`, so `.`, `@`, `:` left the set as the decision prescribed; scip-typescript 0.4.0 relates an interface to no supertype, so the per-step confirmation the decision worded would have dropped true edges through TypeScript interfaces; the walk is confirmed by its origin's transitive relationships instead (recorded deviation).
+
+## Review (evaluator pass 12 and closing)
+- O1 and O2 fixed (amendment 80, `263a20f`): an escape decoding to a backslash is structural unless `u` follows it; the produced-backslash rule has its unit. Calibrated: 0 rejections on seven Java repositories, counts unchanged, fresh == cached; the closing binary reproduces all nine public repositories' numbers.
+- Found while fixing: under the new clause the evaluator's mutant R1 is equivalent (a produced backslash reaches the parity count only before a `u`, which resets it), so its unit kills R1 only against the pass-11 rule; recorded rather than contorting the code. vavr writes the escape as upper-case `\u005C` followed by `u`, which the unit now covers.
+- M3b closed without a pass-13 re-check (amendment 81 says so). Open items carried forward are listed there.
+
+# M4 Frameworks (not started; design §13)
+
+Contents: route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card. Exit criteria: Q3/Q4 goldens on `polyglot-monorepo`; precision guards (must-not-exist edges) green.
+
+- [ ] Contract `tasks/contract-m4.md` (planner), confirmed before code.

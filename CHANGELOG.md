@@ -1,5 +1,8 @@
 # Changelog
 
+## [2026-10-06 01:35] (wall clock)
+- M3b closed (contract amendment 81): final status per S1–S13 and invariants 1–6 (S5, S13 and invariant 2 PASS since `263a20f`), review history of evaluator passes 1–12, open items carried forward (effective source encoding, TypeScript restructurings Tree-sitter parses cleanly, TypeScript interface-method `IMPLEMENTS`, Gradle, spring-retry's test tree, M6 build recipes, workspace installs, tsconfig include/exclude, fetch-phase egress allow-list). The closing binary (sha1 `5946b89faeea`) reproduces all nine public repositories' numbers, including class-validator (398 / 2) and routing-controllers (169 / 38), with 0 documents rejected and fresh == cached. Design §13 marks M3b done; README, IMPLEMENT.md and `tasks/todo.md` list M4 as next (not started). Records only; no code change.
+
 ## [2026-10-06 01:32] (wall clock)
 - M3b evaluator pass 12 fixes (`tasks/eval-m3b-pass12.md` O1–O2; contract amendment 80, amendments 71 and 77 corrected in place; design §5.3). `rb_indexer::PIPELINE` is `m3b-scip-8`.
   - **O1 (major):** `has_structural_escape` also rejects an escape that decodes to a backslash, unless `u` immediately follows it. javac's produced backslash escapes the next quote inside a literal while Tree-sitter-java reads `\u005c` as a complete escape, so `"\u005c"; /*"` restructured the file for javac only (the evaluator's `Bs7`, `Bs4`: false exact `n → b` and `Bs4#n() IMPLEMENTS J4#n()`). The `u` exemption keeps vavr's Javadoc form (`\u005Cu0131`, its only form). The unit that asserted `"\u005c"` harmless is corrected.
