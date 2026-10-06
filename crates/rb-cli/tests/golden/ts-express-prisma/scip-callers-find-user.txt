@@ -1,4 +1,4 @@
 callers of findUserByEmail().  src/db/users.ts:7  [auth-api]
 precision=rta
-  src/routes/auth.ts (top-level code)  [auth-api]  exact
+  src/routes/auth.ts (top-level code)  [auth-api]  exact  (entry: endpoint POST /api/v1/login, top-level)
 certainty: exact 1

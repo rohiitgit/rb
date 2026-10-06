@@ -166,15 +166,12 @@ pub(crate) fn pick_endpoint(
                 .enumerate()
                 .map(|(i, &id)| {
                     let node = ctx.node(id);
-                    let router = node.attrs.get("router").and_then(Value::as_str);
                     format!(
                         "  {}. {}  [{}]{}",
                         i + 1,
                         node.name,
                         ctx.endpoint_service(id),
-                        router.map_or_else(String::new, |r| format!(
-                            "  (prefix unknown, router {r})"
-                        ))
+                        router_note(node)
                     )
                 })
                 .collect();
@@ -185,6 +182,15 @@ pub(crate) fn pick_endpoint(
             )
         }
     }
+}
+
+/// `  (prefix unknown, router <file>#<binding>)` for an endpoint keyed by its router (contract
+/// M4a amendment 10, M4b S13 item 7), else nothing.
+fn router_note(e: &Node) -> String {
+    e.attrs
+        .get("router")
+        .and_then(Value::as_str)
+        .map_or_else(String::new, |r| format!("  (prefix unknown, router {r})"))
 }
 
 /// `  (via host gateway, suffix match, 2 candidates)`: the parts of a stitch that qualify it
@@ -272,7 +278,7 @@ pub(crate) fn render_text(graph: &Graph, path: &RequestPath) -> String {
     let ctx = Ctx::new(graph);
     let e = ctx.node(path.endpoint);
     let service = ctx.endpoint_service(path.endpoint);
-    let mut out = format!("Request path: {}  [{service}]\n", e.name);
+    let mut out = format!("Request path: {}  [{service}]{}\n", e.name, router_note(e));
     out.push_str(&crate::code::precision_lines(
         path.precision,
         path.pruned_by_rta,
@@ -344,6 +350,7 @@ pub(crate) fn render_json(graph: &Graph, path: &RequestPath) -> Value {
             "key": e.key,
             "name": e.name,
             "service": ctx.endpoint_service(path.endpoint),
+            "router": e.attrs.get("router"),
         },
         "precision": path.precision.as_str(),
         "pruned_by_rta": path.pruned_by_rta,
@@ -421,6 +428,29 @@ mod tests {
             id(keys[2])
         );
         assert_eq!(pick_endpoint(&graph, keys[1], None).unwrap(), id(keys[1]));
+        // The request path's header and JSON name the router too (M4b S13 item 7).
+        let path = rb_store::path::request_path(
+            &graph,
+            id(keys[1]),
+            rb_store::path::PathOptions::default(),
+        );
+        assert!(
+            render_text(&graph, &path).starts_with(
+                "Request path: GET /  [s]  (prefix unknown, router a.go#ArticlesRegister.router)\n"
+            ),
+            "{}",
+            render_text(&graph, &path)
+        );
+        assert_eq!(
+            render_json(&graph, &path)["endpoint"]["router"],
+            "a.go#ArticlesRegister.router"
+        );
+        let plain = rb_store::path::request_path(
+            &graph,
+            id(keys[0]),
+            rb_store::path::PathOptions::default(),
+        );
+        assert!(render_text(&graph, &plain).starts_with("Request path: GET /  [s]\n"));
     }
 
     /// S22: a `CONSUMES` step says how it was stitched (the host it named, the proxy it went

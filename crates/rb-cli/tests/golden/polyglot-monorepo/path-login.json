@@ -79,6 +79,7 @@
   "endpoint": {
     "key": "HTTP POST /api/v1/login @services/auth",
     "name": "POST /api/v1/login",
+    "router": null,
     "service": "auth-service"
   },
   "histogram": [

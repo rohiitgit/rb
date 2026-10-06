@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use rb_model::{Certainty, Edge, EdgeKind, Graph, Node, NodeKind};
+use rb_model::{Certainty, Edge, EdgeKind, Evidence, Graph, Node, NodeKind};
 
 /// Default and maximum caller depth (§9.2).
 pub const MAX_CALLER_DEPTH: usize = 25;
@@ -189,14 +189,15 @@ impl<'g> View<'g> {
         out
     }
 
-    /// Who calls (or references) `n`: `(source, certainty of the step, via dispatch, via reference)`.
-    /// Dispatch steps go through a method `n` overrides and are at most `dispatch` certain.
+    /// Who calls (or references) `n`: `(source, certainty of the step, via dispatch, via
+    /// reference, the edge's evidence)`. Dispatch steps go through a method `n` overrides and
+    /// are at most `dispatch` certain.
     fn callers_of(
         &self,
         n: i64,
         include_references: bool,
         min: Certainty,
-    ) -> Vec<(i64, Certainty, bool, bool)> {
+    ) -> Vec<(i64, Certainty, bool, bool, &'g [Evidence])> {
         let kinds: &[EdgeKind] = if include_references {
             &[EdgeKind::Calls, EdgeKind::References]
         } else {
@@ -216,12 +217,49 @@ impl<'g> View<'g> {
                         step.min(e.certainty),
                         dispatch,
                         kind == EdgeKind::References,
+                        e.evidence.as_slice(),
                     ));
                 }
             }
         }
         out.sort_by_cached_key(|a| (a.2, a.3, self.order_key(a.0)));
         out
+    }
+
+    /// The entry marks of `n` (contract M4b S11), sorted bytewise: its stored kinds; for a
+    /// file, `top-level`, and `test` in a test path; `endpoint <name>` per endpoint it handles,
+    /// an inline handler's only when evidence of the step that reached it (`reached_by`) lies
+    /// in its spans (M4a invariant 8).
+    fn entry_marks(&self, n: i64, reached_by: &[Evidence]) -> Vec<String> {
+        let node = self.node(n);
+        let mut marks: BTreeSet<String> =
+            entry_kinds(node).into_iter().map(str::to_owned).collect();
+        if node.kind == NodeKind::File {
+            marks.insert("top-level".into());
+            if rb_model::is_test_path(&node.key) {
+                marks.insert("test".into());
+            }
+        }
+        for e in self.inbound(n, EdgeKind::HandledBy, Certainty::Ambiguous) {
+            if let Some(spans) = crate::path::handler_spans(e)
+                && !reached_by
+                    .iter()
+                    .any(|ev| spans.iter().any(|s| crate::path::within(ev.span, *s)))
+            {
+                continue;
+            }
+            marks.insert(format!("endpoint {}", endpoint_display(self.node(e.src))));
+        }
+        marks.into_iter().collect()
+    }
+}
+
+/// An endpoint's name, then `  (prefix unknown, router <file>#<binding>)` when it is keyed by
+/// its router (contract M4a amendment 10, M4b S13 item 7).
+pub fn endpoint_display(node: &Node) -> String {
+    match node.attrs.get("router").and_then(serde_json::Value::as_str) {
+        Some(router) => format!("{}  (prefix unknown, router {router})", node.name),
+        None => node.name.clone(),
     }
 }
 
@@ -372,6 +410,8 @@ pub struct Caller {
     pub dispatch: bool,
     /// Reached through `REFERENCES` (a function value) rather than `CALLS`.
     pub reference: bool,
+    /// Its entry marks (contract M4b S11), empty for none; expansion continues past them.
+    pub entry: Vec<String>,
     pub callers: Vec<Caller>,
 }
 
@@ -389,29 +429,30 @@ pub fn callers(graph: &Graph, target: i64, opts: CallerOptions) -> CallerTree {
     let v = View::with_precision(graph, opts.precision);
     let depth = opts.depth.clamp(1, MAX_CALLER_DEPTH);
     let mut seen = HashSet::from([target]);
-    // node → (parent, certainty, dispatch, reference); children in discovery order.
-    let mut children: HashMap<i64, Vec<(i64, Certainty, bool, bool)>> = HashMap::new();
+    // node → its callers (without their own callers yet), in discovery order.
+    let mut children: HashMap<i64, Vec<Caller>> = HashMap::new();
     let mut frontier = vec![(target, Certainty::Exact)];
     for _ in 0..depth {
         let mut next = Vec::new();
         for &(n, c) in &frontier {
-            for (src, step, dispatch, reference) in
+            for (src, step, dispatch, reference, evidence) in
                 v.callers_of(n, opts.include_references, opts.min_certainty)
             {
                 // A recursive target is its own direct caller (listed once, without children).
-                if src == target && n == target {
-                    children
-                        .entry(n)
-                        .or_default()
-                        .push((src, c.min(step), dispatch, reference));
+                let recursive = src == target && n == target;
+                if !recursive && !seen.insert(src) {
                     continue;
                 }
-                if seen.insert(src) {
-                    let c = c.min(step);
-                    children
-                        .entry(n)
-                        .or_default()
-                        .push((src, c, dispatch, reference));
+                let c = c.min(step);
+                children.entry(n).or_default().push(Caller {
+                    node: src,
+                    certainty: c,
+                    dispatch,
+                    reference,
+                    entry: v.entry_marks(src, evidence),
+                    callers: Vec::new(),
+                });
+                if !recursive {
                     next.push((src, c));
                 }
             }
@@ -421,21 +462,18 @@ pub fn callers(graph: &Graph, target: i64, opts: CallerOptions) -> CallerTree {
         }
         frontier = next;
     }
-    fn build(n: i64, children: &HashMap<i64, Vec<(i64, Certainty, bool, bool)>>) -> Vec<Caller> {
+    fn build(n: i64, children: &HashMap<i64, Vec<Caller>>) -> Vec<Caller> {
         children
             .get(&n)
             .into_iter()
             .flatten()
-            .map(|&(node, certainty, dispatch, reference)| Caller {
-                node,
-                certainty,
-                dispatch,
-                reference,
-                callers: if node == n {
+            .map(|c| Caller {
+                callers: if c.node == n {
                     Vec::new()
                 } else {
-                    build(node, children)
+                    build(c.node, children)
                 },
+                ..c.clone()
             })
             .collect()
     }
@@ -577,7 +615,7 @@ pub fn impact(
         distance += 1;
         let mut next = Vec::new();
         for &(n, c) in &frontier {
-            for (src, step, _, _) in v.callers_of(n, true, min_certainty) {
+            for (src, step, _, _, _) in v.callers_of(n, true, min_certainty) {
                 if in_removed.contains(&src) || reached.contains_key(&src) {
                     continue;
                 }
@@ -1785,6 +1823,100 @@ mod tests {
             keys(&i.tests),
             ["1 app/src/test/ATest.java#t", "1 app/web/a.spec.ts"]
         );
+    }
+
+    /// Contract M4b S11: entry marks wherever an entry point appears in the caller tree, and
+    /// expansion past it; an inline handler's endpoint only for a call inside its spans.
+    #[test]
+    fn callers_mark_entry_points() {
+        let mut b = B::new();
+        let t = b.sym("app/a.java", "T");
+        let mut main = Attrs::new();
+        main.insert("entry".into(), serde_json::json!(["lifecycle", "main"]));
+        let m = b.sym_with("app/a.java", "main", false, main);
+        let outer = b.sym("app/a.java", "outer");
+        b.edge(&m, EdgeKind::Calls, &t);
+        b.edge(&outer, EdgeKind::Calls, &m);
+        let h = b.sym("app/h.java", "handle");
+        b.edge(&h, EdgeKind::Calls, &t);
+        let ep = NodeKey::new(NodeKind::Endpoint, "HTTP GET / @app ?router=r.go#g");
+        let mut attrs = Attrs::new();
+        attrs.insert("router".into(), "r.go#g".into());
+        b.b.add_node(ep.clone(), "GET /", attrs).unwrap();
+        b.edge(&ep, EdgeKind::HandledBy, &h);
+        // Top-level code of a test file, and of a server file inside and outside its inline
+        // handler (lines 5-9).
+        let spec = b.file("app/a.spec.ts");
+        b.edge(&spec, EdgeKind::Calls, &t);
+        let server = b.file("app/server.ts");
+        let inline = NodeKey::new(NodeKind::Endpoint, "HTTP POST /x @app");
+        b.b.add_node(inline.clone(), "POST /x", Attrs::new())
+            .unwrap();
+        let mut spans = Attrs::new();
+        spans.insert("handler_spans".into(), serde_json::json!([[5, 0, 9, 1]]));
+        b.b.add_edge(
+            NewEdge::new(
+                inline,
+                EdgeKind::HandledBy,
+                server.clone(),
+                Provenance::Treesitter,
+                Certainty::Exact,
+            )
+            .attrs(spans),
+        )
+        .unwrap();
+        let at = |line: i32| Evidence {
+            path: "app/server.ts".into(),
+            span: [line, 2, line, 6],
+        };
+        let t2 = b.sym("app/a.java", "T2");
+        for (dst, line) in [(&t, 6), (&t2, 12)] {
+            b.b.add_edge(
+                NewEdge::new(
+                    server.clone(),
+                    EdgeKind::Calls,
+                    dst.clone(),
+                    Provenance::Heuristic,
+                    Certainty::Heuristic,
+                )
+                .evidence(at(line)),
+            )
+            .unwrap();
+        }
+        let g = b.b.finish().unwrap();
+        let marks = |target: &NodeKey| -> Vec<String> {
+            let mut out = Vec::new();
+            fn walk(g: &Graph, cs: &[Caller], depth: usize, out: &mut Vec<String>) {
+                for c in cs {
+                    let k = &g.nodes().iter().find(|n| n.id == c.node).unwrap().key;
+                    out.push(format!("{depth} {k} [{}]", c.entry.join(", ")));
+                    walk(g, &c.callers, depth + 1, out);
+                }
+            }
+            let opts = CallerOptions {
+                precision: Precision::Rta,
+                ..opts(3)
+            };
+            walk(
+                &g,
+                &callers(&g, sym_id(&g, target), opts).callers,
+                1,
+                &mut out,
+            );
+            out
+        };
+        assert_eq!(
+            marks(&t),
+            [
+                "1 app/a.java#main [lifecycle, main]",
+                "2 app/a.java#outer []",
+                "1 app/a.spec.ts [test, top-level]",
+                "1 app/h.java#handle [endpoint GET /  (prefix unknown, router r.go#g)]",
+                "1 app/server.ts [endpoint POST /x, top-level]",
+            ]
+        );
+        // The same file outside the handler's spans is top-level code only.
+        assert_eq!(marks(&t2), ["1 app/server.ts [top-level]"]);
     }
 
     /// A chain `T → n1 → … → n<len>` of eligible symbols, plus `fan` symbols `T` calls.

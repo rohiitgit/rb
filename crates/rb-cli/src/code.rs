@@ -158,6 +158,10 @@ pub(crate) fn render_callers(graph: &Graph, tree: &CallerTree) -> String {
             if c.reference {
                 how.push_str(", as a reference");
             }
+            // Entry points are marked wherever they appear (contract M4b S11).
+            if !c.entry.is_empty() {
+                let _ = write!(how, "  (entry: {})", c.entry.join(", "));
+            }
             let _ = writeln!(out, "{}{}  {how}", "  ".repeat(depth), line(d, c.node));
             all.push(c.certainty);
             walk(d, &c.callers, depth + 1, out, all);
@@ -497,6 +501,25 @@ mod tests {
         assert!(
             !text.contains("breaks: requiring edges into it (2)"),
             "{text}"
+        );
+        // `rb callers` marks the endpoint handler and the test method (S11).
+        let h = graph.nodes().iter().find(|n| n.name == "h").unwrap().id;
+        let tree = rb_store::code::callers(
+            &graph,
+            h,
+            rb_store::code::CallerOptions {
+                depth: 2,
+                include_references: false,
+                min_certainty: Certainty::Ambiguous,
+                precision: Precision::Rta,
+            },
+        );
+        let callers = render_callers(&graph, &tree);
+        assert!(
+            callers.contains(
+                "  app/A.java/T  app/A.java:2  [app]  heuristic  (entry: endpoint GET /  (prefix unknown, router a.go#r))\n    app/test/ATest.java/t  app/test/ATest.java:2  [app]  heuristic  (entry: test)\n"
+            ),
+            "{callers}"
         );
         let json = impact_json(&graph, &impact);
         assert_eq!(json["endpoints"][0]["handler_removed"], true);

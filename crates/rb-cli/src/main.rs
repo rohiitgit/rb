@@ -1107,8 +1107,12 @@ fn api_line(a: &rb_store::Api) -> String {
     } else {
         format!("{}  → {}  [{certainty}]", a.name, handlers.join(", "))
     };
-    if a.prefix_unknown {
-        line.push_str("  (prefix unknown)");
+    match (&a.router, a.prefix_unknown) {
+        (Some(router), _) => {
+            let _ = write!(line, "  (prefix unknown, router {router})");
+        }
+        (None, true) => line.push_str("  (prefix unknown)"),
+        (None, false) => {}
     }
     line
 }
@@ -1432,6 +1436,7 @@ mod tests {
                 name: "GET /a".into(),
                 certainty: "heuristic".into(),
                 prefix_unknown: true,
+                router: Some("a.ts#r".into()),
                 handlers: vec![],
             },
             rb_store::Api {
@@ -1439,6 +1444,7 @@ mod tests {
                 name: "POST /b".into(),
                 certainty: "exact".into(),
                 prefix_unknown: false,
+                router: None,
                 handlers: vec![
                     handler("rb-heuristic . . . `A.java`/A#b().", "symbol", "ambiguous"),
                     handler("src/server.ts", "file", "ambiguous"),
@@ -1460,7 +1466,7 @@ mod tests {
             tail(&card),
             [
                 "├─ APIs (2)",
-                "│    GET /a  → (handler unresolved)  [heuristic]  (prefix unknown)",
+                "│    GET /a  → (handler unresolved)  [heuristic]  (prefix unknown, router a.ts#r)",
                 "│    POST /b  → A#b()., src/server.ts (top-level code)  [ambiguous]",
                 "├─ Calls APIs of (1)",
                 "│    notification  (services/notification)",

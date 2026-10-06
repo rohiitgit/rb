@@ -69,6 +69,10 @@ pub struct Api {
     /// `EXPOSES` certainty (the path's).
     pub certainty: String,
     pub prefix_unknown: bool,
+    /// The router a prefix-unknown endpoint is keyed by (`<file>#<binding>`; M4a amendment
+    /// 10), shown with it (M4b S13 item 7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router: Option<String>,
     /// By key; empty when the handler was not resolved.
     pub handlers: Vec<Handler>,
 }
@@ -692,6 +696,7 @@ impl Store {
                 name: r.get(1),
                 certainty: certainty_str(r.get(3))?,
                 prefix_unknown: attrs["prefix_unknown"].as_bool().unwrap_or(false),
+                router: attrs["router"].as_str().map(str::to_owned),
                 handlers: Vec::new(),
             });
             if let Some(kind) = r.get::<_, Option<String>>(4) {
