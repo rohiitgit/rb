@@ -487,7 +487,7 @@ Declarations that share a symbol key are aggregated per (symbol, table) rather t
 | `Service` | the project **directory** (`.` for the repo root, which is `role: unassigned` when no project is detected there). Names can collide, so name lookups return candidates instead of guessing (§9.1). |
 | `Table` | `schema.table` |
 | `Owner` | `@user`, `@org/team`, or email, verbatim from CODEOWNERS |
-| `Endpoint` | `HTTP <METHOD> <normalised path>` (path parameters → `{}`), or `GRPC <pkg.Service>/<Method>` |
+| `Endpoint` | `HTTP <METHOD> <normalised path>` (path parameters → `{}`), or `GRPC <pkg.Service>/<Method>`. *As decided in contract-m4a (D1):* HTTP keys end in ` @<service key>`, e.g. `HTTP POST /api/v1/login @services/auth`, so two services' `GET /health` stay distinct; the display name is `POST /api/v1/login`. |
 | `Package` | `<manager> <name>`; the version sits on the edge |
 
 ### 8.3 Relational schema (source of truth)
@@ -743,7 +743,7 @@ Shared tables are reported as **coupling**, deliberately kept separate from depe
 
 ### 9.6 Q4 — "Show the request path for login"
 
-Q4 is covered in §10, since it needs cross-service stitching.
+Q4 is covered in §10, since it needs cross-service stitching. It is built in M4a (`tasks/contract-m4a.md`): `rb path` with text and JSON output, goldens on `polyglot-monorepo`.
 
 ---
 
@@ -758,6 +758,12 @@ Server routes and client URLs are normalised to one form:
 - Configured global prefixes are prepended. Examples: `server.servlet.context-path` from `application.yml`/`.properties`, NestJS `setGlobalPrefix` and Express mount prefixes. Profile-specific values (`application-prod.yml`) produce one variant per profile, flagged.
 - Gateway rewrite rules are applied when their config is present (nginx `location`/`proxy_pass`, k8s Ingress paths, Spring Cloud Gateway routes, v1.x). Each rewrite adds an `Endpoint` alias.
 
+*As decided in contract-m4a (S3, D5):*
+- Catch-alls (`*`, `**`, `{*rest}`, `{rest...}`, `<path:p>`) become `{*}`, last segment only. Go's `{$}` is dropped.
+- Query strings and fragments are dropped; a space is percent-encoded.
+- A client hole inside a segment makes the segment `{}`, flagged `partial`.
+- M4a reads `src/main/resources/application.properties` only. YAML, profile files and gateway configs are deferred, and a Spring YAML file mentioning `context-path` is reported as `spring_config_unread`.
+
 ### 10.2 Stitching client call sites to endpoints (`http_stitch`)
 
 For each `HttpCall{method, url_template, base_ref}`:
@@ -767,6 +773,21 @@ For each `HttpCall{method, url_template, base_ref}`:
 3. **Match paths.** Otherwise, match the path against all endpoints. An exact normalised match is `exact`. A unique suffix match (unknown base prefix) is `heuristic`. Several matches are `ambiguous`, with an edge to each.
 4. **Unmatched** calls become diagnostics, e.g. calls to third-party APIs. The host is still recorded as an external `Endpoint` node with `external=true`.
 5. **Generated clients** (OpenAPI generator, Feign, gRPC stubs) are matched by operation ID or RPC name. This is `exact`, and it is the most reliable path, so fixture coverage should favour it.
+
+*As decided in contract-m4a (D2, D6, D9, S13, S14), this replaces the certainties above:*
+- **Certainty.** A `CONSUMES` edge is never `exact`: a string match across a network boundary depends on deployment.
+  - `synthetic` needs an exact path match, a known method, a host resolved to a non-proxy service from a literal, a constant or `application.properties`, and a single candidate.
+  - `heuristic` is any other single candidate.
+  - `ambiguous` covers 2–16 candidates, one edge each.
+  - More than 16 candidates give a diagnostic and no edge.
+  - The string-level match kind is kept as `match = exact | suffix`.
+- **Candidates.** A client's own service never supplies candidates.
+- **Hosts.** A host matches a service by its name or the last segment of its key, and only when that match is unique.
+  - A matched service with no endpoints is a proxy, and the call is path-matched across services.
+  - A loopback host means the caller's own service.
+  - A literal host naming no service is external, counted and never path-matched.
+- **Specificity.** The candidate with more literal segments wins, then an exact method over `ANY`.
+- **Deferred.** Feign is matched by its declared URL and mapping, not by operation ID. External `Endpoint` nodes and operation-ID matching come with the OpenAPI/gRPC packs (M6).
 
 ### 10.3 Assembling the request path
 
@@ -782,6 +803,14 @@ Input: an endpoint query such as `login`. Resolution matches `Endpoint` keys by 
   3. Nodes that don't lead to any sink are collapsed into "+ k helper calls". This keeps the output readable without hiding anything.
 - **Upstream tree:** inbound `CONSUMES` to the endpoint gives client call sites in other services. From there, inbound `CALLS` go to their entry points: frontend event handlers, gateway routes, other endpoints' handlers, or scheduled jobs. The depth is the same as downstream.
 - **Output:** the two trees joined at the endpoint, rendered as indented text, JSON or Mermaid/DOT. Every hop carries file:line and certainty.
+
+*As decided in contract-m4a (D7, D8, S15–S18):*
+- **Sinks** are `QUERIES → Table` and `CONSUMES → Endpoint`, so a leaf is not a sink and helper subtrees collapse; `--full` shows them.
+- **Scope.** The walk covers the handler's service plus library services. A call into another deployable service is shown and not followed.
+- **Inline handlers.** A handler that is an inline function is its enclosing definition (or `File`), restricted to the edges whose evidence lies in its span.
+- **Dispatch** is CHA until M4b brings RTA. `INJECTS` arrives with M4b.
+- **Limits.** `--hops` defaults to 4 (maximum 8).
+- **Output** is text and JSON; Mermaid/DOT are deferred.
 
 **Honest framing:** this is the set of *statically possible* paths, not the path a particular request took. Branch conditions are not evaluated. The output makes this clear with a header line.
 
@@ -914,7 +943,8 @@ Each milestone is shippable and has an exit criterion that is a test, not a demo
 | **M2 Data access** | `rb-sql`: sinks, template normalisation, pg_query, sqlparser fallback, JPQL tokenizer; ORM packs (JPA, Prisma, TypeORM, SQLAlchemy); `QUERIES/MAPS_TO/MIGRATES` | `rb table-deps` golden at the symbol level (service roll-up via file→service); SQL coverage metrics |
 | **M3a Tier B** | Import, package and binding facts; module resolution; heuristic `CALLS/REFERENCES/IMPLEMENTS`; resolution coverage; `rb callers`, `rb impact` over the in-memory graph | contract `tasks/contract-m3a.md` R1–R13: Q1/Q2 goldens on all fixtures with must-not-exist cases; ≥ 90% precision on a hand-checked sample of 4 public repos. **Done 2026-10-01** after six evaluator passes; resolved share of own-code references: gin 63%, petclinic 39%, requests 30%, hono 15%; sampled precision 96/96. |
 | **M3b SCIP** | SCIP orchestration in pinned containers (scip-java, scip-typescript first); SCIP⋈TS join; key replacement per project; `Package`/`DEPENDS_ON` from external symbols (change sets and orphan detection deferred: contract scope) | exact edges on the fixtures that build; cached and fresh indexes dump identically. **Done 2026-10-06** (built 2026-10-01; contract `tasks/contract-m3b.md` S1–S13, amendments 1–81 after twelve evaluator passes; final binary measured on nine public repositories): Maven and npm projects; spring-petclinic 256 exact `CALLS` and 13 `IMPLEMENTS`, class-validator 398 and 2, jsoup 14,013 and 688, spring-retry 459 and 252, networknt/json-schema-validator 6,449 and 731, spring-petclinic/spring-petclinic-rest 652 and 166, vavr 27,257 and 5,994, TheAlgorithms/Java 10,374 and 269, typestack/routing-controllers 169 and 38, 0 documents rejected and 0 supertypes unconfirmed on each (evaluator passes 6 and 7 sampled 80/80 `CALLS` and 32/32 `IMPLEMENTS` correct); open items (effective source encoding, TypeScript restructurings Tree-sitter parses cleanly, TypeScript interface-method `IMPLEMENTS`, Gradle, spring-retry's test tree, M6 build recipes, workspace installs, tsconfig include/exclude, a registry allow-list for the fetch phase) are listed in contract amendment 81 and carried to M4–M6. |
-| **M4 Frameworks** | route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card | Q3/Q4 goldens on `polyglot-monorepo`; precision guards (must-not-exist edges) green |
+| **M4a Endpoints and request paths** | Spring MVC, Express and Go (gin, `net/http`) route packs; `fetch`/axios, Feign/`RestTemplate`/`WebClient` and Go `net/http` client packs; endpoint normalisation; `http_stitch`; `rb path`; the Service Card's API section; the `rb impact` endpoint roll-up | contract `tasks/contract-m4a.md` S1–S28: Q4 goldens on `polyglot-monorepo` (TypeScript → Java → TypeScript, plus Go); must-exist and must-not-exist edge lists green on all three fixtures; no `CONSUMES` above `synthetic`; three public repositories measured (20/20 sampled endpoints). **Contract written 2026-10-06; not started.** |
+| **M4b DI and dispatch** | Spring DI synthesis (`INJECTS`, qualifiers, `@Primary`, profiles/conditionals); Spring Data synthetic implementations; RTA filter (`impl_instantiated`, `precision=rta` default); derived `DEPENDS_ON` (calls/http/package, lockfile versions); the rest of the full Service Card; Q3 service roll-up with endpoints; orphan detection; entry points in `rb callers` | Q3 goldens on `polyglot-monorepo` and `java-spring-jpa`; RTA precision guards (an uninstantiated implementation is not a dispatch target) green. **Not started.** |
 | **M5 Scale & API** | REST API with guard rails; bulk AGE loading; snapshot retention; `rb diff`; benchmark on 2 large OSS repos | §12.5 targets met or gaps documented with profiles |
 | **M6 Breadth** | scip-python/go/clang/rust-analyzer; Kotlin/C#; OpenAPI/gRPC packs; gateway configs; message topics; architecture-rule checks in Cypher as a CI gate | per-language fixtures; rules engine golden tests |
 

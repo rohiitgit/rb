@@ -296,6 +296,20 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - Follow-up: the e2e fixture copy should skip ignored files (an IDE's `target/` inside a fixture broke `orm_table_deps_goldens`).
 - **Restored on Docker Desktop (the user's choice, 2026-09-30 22:00 wall clock):** `compose.yaml` takes its host port from `RB_DB_PORT` (default 55432); the database runs on 55433 while the dead VM's forward holds 55432, freshly migrated (0001–0004). `--network none`, amd64 emulation and home-directory bind mounts were re-verified there.
 
-## M4 Frameworks: not started
+## M4a Endpoints and request paths: contract written, not started
 
-- Design §13: route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card. Exit: Q3/Q4 goldens on `polyglot-monorepo`, precision guards green. Contract to be written first.
+- **Split (2026-10-06):** M4 becomes M4a (this entry) and M4b. M4b covers Spring DI and Spring Data synthesis, RTA, derived `DEPENDS_ON`, the full Service Card, Q3's roll-up and orphan detection; it is not started. Design §13 has both rows.
+- **Contract:** `tasks/contract-m4a.md`, S1–S28 and invariants 1–13. Phases are in `tasks/todo.md`.
+- **Decided in the contract (D1–D12):**
+  - Endpoint keys carry the exposing service (`HTTP POST /api/v1/login @services/auth`; design §8.2 annotated).
+  - `CONSUMES` is never `exact`; `synthetic` is its maximum (design §10.2 annotated).
+  - Frameworks: Spring MVC, Express, gin and `net/http`. Clients: `fetch`, axios, Feign, `RestTemplate`, `WebClient`/`RestClient` and Go `net/http`. Python, NestJS, YAML config, gateway rewrites, external endpoint nodes and Mermaid/DOT are deferred, each with its reason.
+  - Config is read only from `application.properties`. Hosts match a service by name or directory, uniquely; a service without endpoints is a proxy; loopback means the caller's own service; any other unmatched literal host is external.
+  - Inline handlers are span-scoped. `rb path` sinks are tables and endpoints.
+  - Precision guards are `must-exist.txt` and `must-not-exist.txt` beside the goldens.
+  - No new dependency and no migration.
+- **Forks for the orchestrator:** F1 (may a name-matched host reach `synthetic`? recommended yes) and F2 (Python in M6, recommended).
+
+## M4b DI and dispatch: not started
+
+- Scope listed in `tasks/contract-m4a.md` ("Scope"); its contract is written after M4a closes.

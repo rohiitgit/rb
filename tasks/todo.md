@@ -323,8 +323,59 @@ Findings from the research step (2026-09-29):
 - Found while fixing: under the new clause the evaluator's mutant R1 is equivalent (a produced backslash reaches the parity count only before a `u`, which resets it), so its unit kills R1 only against the pass-11 rule; recorded rather than contorting the code. vavr writes the escape as upper-case `\u005C` followed by `u`, which the unit now covers.
 - M3b closed without a pass-13 re-check (amendment 81 says so). Open items carried forward are listed there.
 
-# M4 Frameworks (not started; design §13)
+# M4 Frameworks (split into M4a and M4b; design §13)
 
-Contents: route packs, HTTP-client packs, stitching; Spring DI + Spring Data; RTA filter; derived `DEPENDS_ON`; `rb path`; full Service Card. Exit criteria: Q3/Q4 goldens on `polyglot-monorepo`; precision guards (must-not-exist edges) green.
+- **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). Contract written; not started.
+- **M4b, DI and dispatch** (Spring DI, Spring Data synthesis, RTA, derived `DEPENDS_ON`, full Service Card, Q3 roll-up, orphan detection): not started. Its contract is written after M4a closes.
 
-- [ ] Contract `tasks/contract-m4.md` (planner), confirmed before code.
+## M4a phases
+
+Each phase has at most 5 hand-edited files (blessed goldens are reviewed separately and listed in the changelog), is test-first, and ends with its verification step. The checks run in every phase are fmt, `clippy --workspace --all-targets -D warnings` and the unit tests of the crates touched; the e2e suite runs with `RB_TEST_DATABASE_URL`. Any golden that changes gets a classified line diff before `RB_BLESS=1`.
+
+- [ ] **0. Preflight** (no code)
+  - Read the contract, the lessons and M3b amendment 81.
+  - Run `df`, `docker context show` and `docker image inspect` for both indexer images.
+  - Confirm from primary docs: Spring 6's stereotype requirement for handler detection (D12); gin's route and group API, and Go 1.22 `ServeMux` patterns (S6).
+  - Record the findings under "Verified facts" in the contract.
+  - **Verify:** the contract states each finding with its source.
+- [ ] **1. Neutral facts** (S1, S2). Files: `rb-syntax/src/lib.rs` (new fields, fingerprint list), new `rb-syntax/src/calls.rs` (call chains, argument summaries), `bindings.rs` (`init`, `constant`, `decorations`), `decorations.rs` (`span`), `strings.rs` (string templates with hole expressions, reusing the SQL decoding).
+  - Tests per language; positions derived from the source text; one test that every extractor module is fingerprinted.
+  - **Verify:** rb-syntax unit tests. The full e2e must pass **without re-blessing any golden**: these facts do not reach the graph yet. A golden diff here is a bug.
+- [ ] **2. Normaliser and route packs, pure functions** (S3–S6, the per-file parts). Files: `rb-frameworks/src/lib.rs` (module declarations), new `rb-frameworks/src/endpoint.rs` (normaliser, matching order D9), new `rb-frameworks/src/routes.rs` (Spring, Express, gin, `net/http` route facts; Feign exclusion; `route_on_interface`).
+  - Table tests per syntax and framework; a property test for idempotence; import-gated detection, each gate with a negative test.
+  - **Verify:** rb-frameworks unit tests; e2e unchanged.
+- [ ] **3. Client packs and folding, pure functions** (S9–S12, the per-file parts). Files: new `rb-frameworks/src/clients.rs` (`fetch`, axios, `RestTemplate`, `WebClient`/`RestClient`, Feign, Go `net/http`, `Sprintf`), new `rb-frameworks/src/fold.rs` (holes, constants, env defaults, `@Value`, placeholders; visited set and depth cap), `rb-frameworks/src/lib.rs`.
+  - Cycle test (`A = B; B = A`); 1,000-link depth test; mutable bindings never fold.
+  - **Verify:** rb-frameworks unit tests; e2e unchanged.
+- [ ] **4. Endpoints in the graph** (S4 properties, S5 cross-file mounts, S6 groups, S7, S8). Files: new `rb-indexer/src/routes.rs` (composition, aggregation per key, `EXPOSES`/`HANDLED_BY`, route diagnostics), `rb-indexer/src/lib.rs` (`Content.config` read by path, stage wiring, `PIPELINE = m4a-http-1`), `rb-indexer/src/resolve.rs` (expose the M3a lookup for handler names), `rb-indexer/src/scip.rs` (occurrence at a span, for exact handlers).
+  - Unit tests: mount cycle, 5,000-deep chain, composition growth ratio, a same-named unrelated handler that must not be linked, aggregation of duplicate registrations.
+  - **Verify:** unit tests, then e2e. Expected golden churn: new `Endpoint` nodes, `EXPOSES`, `HANDLED_BY` and route diagnostics in `dump.jsonl`, and the `tool_versions` pipeline. Classify each line, then bless.
+- [ ] **5. Stitching and coverage** (S12 across files, S13, S14). Files: new `rb-indexer/src/stitch.rs` (candidate index, D6 host rule, D9 specificity, certainty table, buckets, merge per edge), `rb-indexer/src/routes.rs` (cross-file constants), `rb-indexer/src/lib.rs`, `rb-store/src/query.rs` (HTTP coverage from diagnostics), `rb-cli/src/main.rs` (`http:` line in `rb status`).
+  - Table-driven unit test per certainty row and per D6/D9 clause; a test that the buckets sum to the site count; stitcher growth ratio plus the pathological all-`{}` input.
+  - **Verify:** unit tests, e2e (classified churn: `CONSUMES` edges, `http_*` diagnostics, `status-*.txt`).
+- [ ] **6. `rb path`** (S15–S19). Files: new `rb-store/src/path.rs` (input resolution, downstream and upstream walks, collapse, caps, histogram, JSON model), `rb-store/src/lib.rs`, new `rb-cli/src/path.rs` (text/JSON rendering, `--pick`), `rb-cli/src/main.rs` (subcommand).
+  - Unit tests on built graphs: `CALLS` cycle, self-recursion, `CONSUMES` A ↔ B, 5,000-deep chain cut at `--depth`, hop cap, node cap with `truncated`, inline-handler span scoping, an upstream continuation through an inline handler; `rb path` growth ratio.
+  - **Verify:** unit tests; e2e smoke on the current fixtures (goldens arrive in phase 8).
+- [ ] **7. Service Card API section and `rb impact` roll-up** (S20, S21). Files: `rb-store/src/query.rs` (card sections at query time), `rb-store/src/code.rs` (endpoint roll-up), `rb-cli/src/main.rs` (`render_card`), `rb-cli/src/code.rs` (impact rendering).
+  - **Verify:** unit tests; e2e. Card and impact goldens re-blessed after a classified diff; the "not indexed yet (M4)" line is gone from all five goldens.
+- [ ] **8a. Fixture plan, part 1** (contract "Fixture plan"). Files: `polyglot-monorepo/services/auth/.../AuthController.java`, `services/notification/src/server.ts`, new `services/notification/src/selfcheck.ts`, `services/billing/cmd/billing/main.go`, `services/billing/go.mod`. `git add` them, since `fixture_repo` copies tracked files only.
+  - **Verify:** e2e; classify the churn.
+- [ ] **8b. Fixture plan, part 2.** Files: new `polyglot-monorepo/apps/web/src/api/{billing,mfa,http}.ts`, new `java-spring-jpa/src/main/resources/application.properties`. `git add` them.
+  - **Verify:** e2e; classify the churn.
+- [ ] **8c. Goldens and precision guards** (S22, S23, S25, S26). Files: `rb-cli/tests/e2e.rs` (path goldens, guard runner, dump invariants, AGE parity for the new kinds), plus new `must-exist.txt` and `must-not-exist.txt` for each of the three fixtures.
+  - Mutations, each shown to fail a guard and then restored and checked with `cmp`: host restriction off, own-service exclusion off, Feign-route exclusion off, loopback rule off, external-host rule off.
+  - **Verify:** e2e twice; determinism (two repos, forced rebuild, warm = cold).
+- [ ] **9. SCIP mode** (S24). Files: `rb-cli/tests/e2e.rs` (`scip-path-login.txt`), plus the re-blessed SCIP goldens.
+  - Before the run: `df`, the images and the context (lessons 2026-10-01).
+  - **Verify:** SCIP e2e with containers; no `skipping:`; fresh = cached.
+- [ ] **10. Public repositories** (S27).
+  - Clone the candidates into the scratchpad. Verify that their routes and clients match the contract's description; record any substitution with its reason. Pin the commits.
+  - Run `--no-scip` fresh and cached, plus SCIP for spring-petclinic-microservices.
+  - Record the counts and buckets (one member per non-zero bucket), the time and the facts-cache size against the M3b binary.
+  - Sample 20 endpoints and the `CONSUMES` edges by the contract's rule and hand-check each against the source.
+  - **Verify:** the numbers are recorded in the contract's measurement section, computed by a tool, not summed by hand.
+- [ ] **11. Records and review** (S28).
+  - Records: contract amendments, design §8.2/§10/§13 sync, README status and quickstart (`rb path`), IMPLEMENT.md, CHANGELOG, lessons.
+  - Full verification loop and the stub scan.
+  - A separate evaluator pass; fix its findings test-first (each round adds contract amendments).
+  - Commit after each verified phase.
