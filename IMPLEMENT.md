@@ -334,7 +334,9 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - No new dependency and no migration.
 - **Forks for the orchestrator:** F1 (may a name-matched host reach `synthetic`? decided yes), F2 (Python in M6, decided as recommended) and F3 (identity of a prefix-unknown endpoint, raised by the gin measurement; decided: the router's identity in the key, amendment 10).
 
-## M4b DI and dispatch: contract written, not started
+## M4b DI and dispatch: in progress
+
+- [x] Phase 0 (preflight): primary-source checks, pins, invariant-1 baseline, gate matchers; contract amendments 1–3.
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):

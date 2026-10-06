@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4b phase 0: preflight
+- **Records only, no code change.** Contract `tasks/contract-m4b.md` gains "Checked in phase 0": D9's Spring rules, Spring Data's `Impl` fragment convention, `@EnableFeignClients`' default package (the annotated class's), Boot's JPA repository base (the auto-configuration package), Lombok's constructor rules, `Introspector.decapitalize` and the npm v2/v3 `packages` layout, each confirmed from a primary source (Spring Framework, Spring Data, Spring Boot and Lombok references, `DefaultListableBeanFactory` and `FeignClientsRegistrar` sources, Java SE API, npm docs). `ObjectFactory<T>` joins the wrapper list.
+- **Amendments 1–3:** Lombok generates its constructor even next to a declared one (two constructors, none marked: no points); under F2 the DI buckets `synthetic`/`heuristic` become `plain`/`capped` and every `INJECTS` carries `resolution`; gate D reads main sources only (measured: spring-petclinic's test-only `FilterType`/`ApplicationListener` imports).
+- **Public candidates** cloned under `var/m4b/` at the contract's pins (full SHAs recorded) and read: as planned, except spring-petclinic-microservices has no Lombok at its pin (Lombok stays unit-covered; substitution decided in phase 15).
+- **Baseline:** the `1f81c8f` binary kept as `var/m4b/bin/rb-1f81c8f`; the three fixtures dumped `--no-scip` (polyglot byte-identical to its golden).
+- **Gate matchers** (throwaway `var/m4b/scripts/gates.py`) over the fixtures and the four Java repositories: fixtures 0 hits; spring-petclinic `ImportRuntimeHints` (main) fails gate D and a test `includeFilters` fails S9 (g) repository-wide (recorded costs); the other three 0 hits; raw-text words 0 hits everywhere.
+- Environment: 10 GiB free, `desktop-linux`, both indexer images present, the `.m2` cache holds `spring-context` 6.1.13 and `spring-boot-autoconfigure` 3.3.4.
+- Files: `tasks/{contract-m4b,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-06] (wall clock) Close M4a
 - **Records only, no code change.** Evaluator pass 8 (`tasks/eval-m4a-pass8.md`, now tracked) was the verification-only re-check decided in contract amendment 17. It ran against `28e47ba` and returned **VERDICT: PASS**:
   - **W1–W6:** fixed end to end on the release binary. That covers Kotlin/Groovy interceptor beans, `.vue` and HTML hooks, generated, 1 MiB and over-cap files, the four axios binding forms, `jest.spyOn`/`vi.stubGlobal`/`["fetch"]`, and discovery keys in nested YAML, `.properties` and `ribbon.listOfServers`. All are `synthetic` with `95e1fbb`.

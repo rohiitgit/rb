@@ -520,9 +520,51 @@ The contract proceeds with each recommendation unless told otherwise.
 | `skipping:` is not a pass; a mutation run that printed nothing has not run | S24, S25 |
 | Name a counter by a positive property; identify one member per bucket | S7, S9, S27 |
 
+## Checked in phase 0 (2026-10-06)
+
+Environment: `df` 10 GiB free; `docker context show` = `desktop-linux`; `rb-scip-java:0.13.1` (`sha256:cbd99634…`, 0.93 GB) and `sourcegraph/scip-typescript@sha256:028c0042…` (1.63 GB) present. The `.m2` cache (`var/scip/cache/m2`) holds `spring-context-6.1.13.jar` and `spring-boot-autoconfigure-3.3.4.jar`, the versions the fixtures' Boot 3.3.4 parent selects, so the new fixture classes need no fetch.
+
+**Primary sources read for the "not verified" list:**
+
+| Item | Finding | Source |
+|---|---|---|
+| Implicit single constructor | Confirmed: "If a class only declares a single constructor to begin with, it will always be used, even if not annotated." Several constructors and none `@Autowired`: the primary/default constructor is used, so modelling it as `constructor_ambiguous` (no points) never adds an edge. | docs.spring.io, Framework reference, *Using `@Autowired`* |
+| Collections, arrays, `Map<String, T>` | Confirmed (`T[]`, `Set`/`List`/`Collection<T>`, `Map` only with `String` keys). | same page; `DefaultListableBeanFactory.resolveMultipleBeans` |
+| `Optional`, `ObjectProvider`/`ObjectFactory`, `jakarta.inject.Provider` | Confirmed as wrappers resolved like `T` (`DefaultListableBeanFactory.resolveDependency`). `ObjectFactory<T>` is added to D9's wrapper list (same branch as `ObjectProvider`). | spring-framework `main`, `DefaultListableBeanFactory.java` |
+| Narrowing order | `determineAutowireCandidate`: primary, then the dependency name against bean names (and aliases), then `@Priority`, then a unique default candidate. `@Qualifier` filters the type-matched candidates before this. D9's order (qualifier, primary, name) holds. Name fallback for parameters needs `-parameters` since 6.1: confirmed. `@Priority` (`jakarta.annotation`) is not modelled: such points stay `ambiguous` with every candidate listed, never a wrong single edge. `@Fallback` (6.2) is in `org.springframework.context.annotation` and outside gate D's plain set. | *Fine-tuning Annotation-based Autowiring with Qualifiers*; `DefaultListableBeanFactory.determineAutowireCandidate` |
+| `@Resource` | Confirmed: `name` attribute, else the field name or the setter's property name; only without an explicit name it falls back to a type match. | *Injection with `@Resource`* |
+| `Introspector.decapitalize` | Confirmed: "FooBah" → "fooBah", "X" → "x", "URL" stays "URL" (first two upper-case: unchanged). | Java SE 21 API, `java.beans.Introspector` |
+| Spring Data fragments | Confirmed: implementation = fragment interface name + postfix `Impl` (configurable by `repositoryImplementationPostfix`, which S2's attribute rule turns into `scan_unread`), found below the repository's package. D3's name-based rule ("implements, by name, an interface a repository extends") is broader than the convention and only keeps more types instantiated. | Spring Data Commons reference, *Custom Repository Implementations* |
+| `@EnableFeignClients` default | Confirmed from `FeignClientsRegistrar.getBasePackages`: `value`, `basePackages`, `basePackageClasses`; when all are empty, the package of the annotated class. A `clients` attribute replaces scanning; it is outside S2's attribute set, so it sets `scan_unread`. | spring-cloud-openfeign `main`, `FeignClientsRegistrar.java` |
+| Boot's JPA repository base | Confirmed: "the auto-configuration packages are searched for repositories", i.e. the package of the `@SpringBootApplication`/`@EnableAutoConfiguration` class; `@EnableJpaRepositories` overrides. | Spring Boot reference, *SQL Databases*, Spring Data JPA Repositories |
+| Lombok constructors | Field rules confirmed (`@RequiredArgsConstructor`: non-initialised `final` fields and non-initialised `@NonNull` fields; `@AllArgsConstructor`: every field; static fields skipped; declaration order). **Deviation:** "the existence of an explicit constructor does not stop these annotations from generating their own constructor" (amendment 1). | projectlombok.org, *@NoArgsConstructor, @RequiredArgsConstructor, @AllArgsConstructor* |
+| npm lockfile v2/v3 | Confirmed: `packages` keys are paths relative to the lockfile's root (`""`, `node_modules/x`, `node_modules/a/node_modules/b`, workspace folders); a workspace link entry is `{ "resolved": "<folder>", "link": true }` with no other field; v1 (npm 5/6) has no `packages`. | docs.npmjs.com, *package-lock.json* (v10) |
+
+**Public candidates** (cloned under `var/m4b/`, pinned commits checked out and read):
+
+| Candidate | Pin (full) | Layout read |
+|---|---|---|
+| spring-petclinic | `818c4136ea971c21674525f9053de0d9c7ad8cfe` | 2 `@SpringBootApplication` (one in tests), 18 `@Autowired`, 4 `@Bean`, 1 `@Profile`; 3 Spring Data repositories. As planned. |
+| spring-petclinic-rest | `afc8fc1d3b8ec8de69414482b3bd70a1da78cb95` | 29 `@Profile`, 7 `@Mapper`, 28 `@Autowired`. As planned. |
+| piggymetrics | `6bb2cf9ddbca980b664d3edbb6ff775d75369278` | 3 `@EnableFeignClients`, 4 `@FeignClient`, 4 `CrudRepository` repositories on MongoDB, 1 `@Qualifier`. As planned. |
+| spring-petclinic-microservices | `dc9ca15a71189bc4be6c02518d7180232c0555b7` | 8 `@SpringBootApplication`, 1 `@Primary`, 15 `@Bean`. **No Lombok** at this pin (0 `lombok.` imports): D9's Lombok rule cannot be measured here; it stays covered by units. A substitution is decided in phase 15 and recorded there. |
+| routing-controllers | `bf6fbfdc7fa5d4cd7d72eca8e5846b888ea58572` | TS library with `sample/` and `test/`. As planned. |
+| node-express-realworld-example-app | `30b68e1e881462b2f4164ea09ab4c4f5699c7b0b` | `package-lock.json` at the root. As planned. |
+| golang-gin-realworld-example-app | `626c372d259472148d93303f74aa9b9a1cdcef24` | `go.mod` at the root. As planned. |
+
+**Invariant-1 baseline.** The binary of `1f81c8f` (HEAD before M4b; code identical to `28e47ba`, M4a's closing binary) was built and kept as `var/m4b/bin/rb-1f81c8f`; the three fixtures were dumped `--no-scip` from their `git ls-files` copies (`var/m4b/base/*.jsonl`; polyglot's is byte-identical to its golden `dump.jsonl`).
+
+**Gate matchers run as a throwaway script** (`var/m4b/scripts/gates.py`, S6 gate D's import rule with exact package match, XML/factories files, the raw-text word list on unparsed files; S9 (g)'s surface), every hit read:
+- fixtures: 0 hits for gate D and S9 (g).
+- spring-petclinic: gate D: `org.springframework.context.annotation.ImportRuntimeHints` in `PetClinicApplication.java` (main; native-image hints, no bean definition, but outside the plain set: every point there is capped by `surface`, a recorded cost); `FilterType` and `ApplicationListener` in test sources only (amendment 3). S9 (g): `includeFilters` in `src/test/.../PetControllerTests.java` (`@WebMvcTest(includeFilters = …)`): (g) is repository-wide, so petclinic proves no type (recorded cost; a test context does instantiate main types).
+- spring-petclinic-rest, piggymetrics, spring-petclinic-microservices: 0 gate D hits on exact packages (`org.springframework.boot.autoconfigure.condition.*`, `.boot.test.*`, `.boot.context.*` are other packages and not gated); 0 S9 (g) hits.
+- Raw-text words on unparsed files: 0 hits in all seven repositories and the fixtures. Unparsed non-inert text files: 3, 19 and 4 in the fixtures, 34–95 in the Java repositories.
+
 ## Amendments
 
-None yet.
+1. **Lombok constructors with a declared constructor (phase 0, D9/S3).** Lombok generates its constructor even when the class declares one. So a class with `@RequiredArgsConstructor`/`@AllArgsConstructor` and a declared constructor has two or more constructors: Spring then uses the one marked `@Autowired` (a declared one, or the generated one through `onConstructor_ = @__(@Autowired)`/`onConstructor = @__({@Autowired})`), else none (`constructor_ambiguous`). S3's row "a declared constructor present (no generation)" becomes "a declared constructor present: two constructors, none marked, no points".
+2. **`INJECTS` coverage buckets under F2.** With `INJECTS` capped at `heuristic`, S7's `synthetic` and `heuristic` buckets become `plain` (one candidate, or a collection's candidates, reached without name fallback, with no conditional and no failed gate: S5's former `synthetic` row) and `capped` (one candidate otherwise). Every edge carries `resolution` (`unique`, `qualifier`, `primary` or `ambiguous`) and `capped_by` (the sorted failed gates, present only when non-empty). The status line reads `di: <p> injection points: <a> plain, <b> capped, <c> ambiguous, …`. Certainty: `heuristic` for one candidate or a collection, `ambiguous` for several; nothing is `synthetic`.
+3. **Gate D reads main sources only.** Test sources are never on the main runtime classpath (Maven packages `src/main` only), and invariant 6 already restricts DI to main sources, so a post-processor or registrar in a test configuration cannot change a main-source injection. Measured: spring-petclinic's test-only `FilterType` and `ApplicationListener` imports would otherwise cap every point. S9 (g) stays repository-wide, since a test context does instantiate main types.
 
 ## Orchestrator decisions on the forks (2026-10-06)
 

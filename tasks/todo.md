@@ -501,7 +501,7 @@ Same rules as M4a:
 
 `PIPELINE` becomes `m4b-di-1` at the first output change and is bumped on each later one.
 
-- [ ] **0. Preflight** (no code).
+- [x] **0. Preflight** (no code). Done 2026-10-06: contract "Checked in phase 0" and amendments 1–3 (Lombok with a declared constructor; F2's `plain`/`capped` buckets; gate D main sources only); pins checked out under `var/m4b/`; invariant-1 baseline binary `var/m4b/bin/rb-1f81c8f` and fixture dumps `var/m4b/base/`.
   - Read the contract (soundness section first), the lessons, and M4a amendments 14–18.
   - Run `df`, `docker context show`, and `docker image inspect` for both indexer images.
   - Confirm from primary docs the "not verified" list:
