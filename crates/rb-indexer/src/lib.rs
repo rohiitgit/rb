@@ -13,6 +13,7 @@ mod resolve;
 mod routes;
 mod scip;
 mod sql;
+mod stitch;
 mod syntax;
 
 pub use projects::{
@@ -41,8 +42,9 @@ use serde_json::{Value, json};
 /// constructors as definitions (amendment 75), `m3b-scip-7` the `structural_escape` reason and
 /// supertypes confirmed by the index (amendments 77 and 78), `m3b-scip-8` an escaped backslash
 /// as a structural escape (amendment 80).
-/// `m4a-http-1` adds endpoints, `EXPOSES`, `HANDLED_BY` and route diagnostics (contract M4a).
-pub const PIPELINE: &str = "m4a-http-1";
+/// `m4a-http-1` adds endpoints, `EXPOSES`, `HANDLED_BY` and route diagnostics (contract M4a),
+/// `m4a-http-2` `CONSUMES`, the `http_*` site diagnostics and `http_coverage`.
+pub const PIPELINE: &str = "m4a-http-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -459,15 +461,14 @@ pub fn assemble(
             .project_for(path)
             .map_or_else(|| boundaries::ROOT_DIR.to_owned(), |p| p.dir.clone())
     };
-    let mut context_paths: BTreeMap<String, String> = BTreeMap::new();
+    // Service key → its `application.properties` (a later file's keys win).
+    let mut properties: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for (path, text) in &content.config {
         if path.ends_with(".properties") {
-            if let Some(ctx) = rb_frameworks::fold::parse_properties(text)
-                .get("server.servlet.context-path")
-                .filter(|c| !c.trim().is_empty())
-            {
-                context_paths.insert(service_of(path), ctx.trim().to_owned());
-            }
+            properties
+                .entry(service_of(path))
+                .or_default()
+                .extend(rb_frameworks::fold::parse_properties(text));
         } else if text.contains("context-path") {
             diagnostics.push(Diagnostic {
                 kind: "spring_config_unread".into(),
@@ -477,7 +478,14 @@ pub fn assemble(
             });
         }
     }
-    diagnostics.extend(routes::add_endpoints(
+    let context_paths: BTreeMap<String, String> = properties
+        .iter()
+        .filter_map(|(service, p)| {
+            let ctx = p.get("server.servlet.context-path")?.trim();
+            (!ctx.is_empty()).then(|| (service.clone(), ctx.to_owned()))
+        })
+        .collect();
+    let (route_diagnostics, endpoints) = routes::add_endpoints(
         &mut b,
         &routes::Inputs {
             files: &content.facts,
@@ -488,7 +496,25 @@ pub fn assemble(
             service_of: &service_of,
             context_paths: &context_paths,
         },
-    )?);
+    )?;
+    diagnostics.extend(route_diagnostics);
+    // Client calls stitched to other services' endpoints (contract M4a S12–S14).
+    let sites = stitch::sites(&stitch::Inputs {
+        files: &content.facts,
+        index: &index,
+        keys: &keys,
+        service_of: &service_of,
+        properties: &properties,
+    });
+    let services: Vec<stitch::ServiceRef> = boundaries
+        .projects()
+        .iter()
+        .map(|p| stitch::ServiceRef {
+            key: p.dir.clone(),
+            name: p.name.clone(),
+        })
+        .collect();
+    diagnostics.extend(stitch::add_consumes(&mut b, &sites, &endpoints, &services)?);
     let (orm_index, orm_diagnostics) = orm::add_mappings(&mut b, &files, &prisma, &keys)?;
     diagnostics.extend(orm_diagnostics);
     for (path, (language, facts)) in &content.facts {

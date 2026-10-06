@@ -303,6 +303,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 2: normaliser (`endpoint.rs`) and route packs (`routes.rs`: Spring, Express, gin, `net/http`; amendment 2)
 - [x] Phase 3: client packs (`clients.rs`: fetch, axios, RestTemplate, WebClient/RestClient, Feign, Go `net/http`) and URL folding (`fold.rs`; amendment 3)
 - [x] Phase 4: endpoints in the graph (`rb-indexer/src/routes.rs`; `EXPOSES`, `HANDLED_BY`, route diagnostics; `PIPELINE = m4a-http-1`; amendment 4)
+- [x] Phase 5: stitching and coverage (`rb-indexer/src/stitch.rs`; `CONSUMES`, `http_*` diagnostics, `http_coverage`, the `rb status` `http:` line; `PIPELINE = m4a-http-2`; amendment 5)
 
 - **Split (2026-10-06):** M4 becomes M4a (this entry) and M4b. M4b covers Spring DI and Spring Data synthesis, RTA, derived `DEPENDS_ON`, the full Service Card, Q3's roll-up and orphan detection; it is not started. Design §13 has both rows.
 - **Contract:** `tasks/contract-m4a.md`, S1–S28 and invariants 1–13. Phases are in `tasks/todo.md`.

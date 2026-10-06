@@ -215,6 +215,7 @@ fn main() -> anyhow::Result<()> {
                         c.tables, c.query_sites, c.migration_statements, c.unparsed
                     );
                     println!("  {}", code_line(&store.resolution_coverage(live.id)?));
+                    println!("  {}", http_line(&store.http_coverage(live.id)?));
                     for d in store.load_diagnostics(live.id)? {
                         if d.kind == "scip_status" {
                             println!("  {}", scip_status_line(&d));
@@ -610,6 +611,36 @@ fn code_line(r: &rb_store::ResolutionCoverage) -> String {
             r.exact_calls
         )
     }
+}
+
+/// The `rb status` HTTP line (contract M4a S14): endpoints, the services exposing them, and the
+/// client call sites per bucket, zero buckets omitted, in a fixed order.
+fn http_line(c: &rb_store::HttpCoverage) -> String {
+    const ORDER: &[(&str, &str)] = &[
+        ("synthetic", "synthetic"),
+        ("heuristic", "heuristic"),
+        ("ambiguous", "ambiguous"),
+        ("too_ambiguous", "too ambiguous"),
+        ("unmatched", "unmatched"),
+        ("external", "external"),
+        ("dynamic", "dynamic"),
+        ("self", "self"),
+    ];
+    let mut line = format!(
+        "http: {} routes in {} services; {} client calls",
+        c.routes, c.services, c.sites
+    );
+    let parts: Vec<String> = ORDER
+        .iter()
+        .filter_map(|(bucket, label)| {
+            let n = *c.buckets.get(*bucket)?;
+            (n > 0).then(|| format!("{n} {label}"))
+        })
+        .collect();
+    if !parts.is_empty() {
+        let _ = write!(line, ": {}", parts.join(", "));
+    }
+    line
 }
 
 /// `.` for the repository root, as in the `scip_status` diagnostic.
@@ -1060,6 +1091,39 @@ mod tests {
         assert_eq!(
             code_line(&some),
             "code: 80.0% of references to own code resolved (3 resolved, 1 ambiguous, 1 unresolved; 2 external); 0 exact calls (scip)"
+        );
+    }
+
+    /// Contract M4a S14: zero buckets are omitted and the order is fixed, whatever the order of
+    /// the stored counts.
+    #[test]
+    fn http_line_orders_buckets_and_omits_zeros() {
+        let mut c = rb_store::HttpCoverage {
+            routes: 3,
+            services: 2,
+            sites: 0,
+            buckets: Default::default(),
+        };
+        assert_eq!(
+            http_line(&c),
+            "http: 3 routes in 2 services; 0 client calls"
+        );
+        for (bucket, n) in [
+            ("self", 1),
+            ("dynamic", 2),
+            ("external", 1),
+            ("unmatched", 0),
+            ("too_ambiguous", 1),
+            ("ambiguous", 2),
+            ("heuristic", 1),
+            ("synthetic", 2),
+        ] {
+            c.buckets.insert(bucket.into(), n);
+            c.sites += n;
+        }
+        assert_eq!(
+            http_line(&c),
+            "http: 3 routes in 2 services; 10 client calls: 2 synthetic, 1 heuristic, 2 ambiguous, 1 too ambiguous, 1 external, 2 dynamic, 1 self"
         );
     }
 

@@ -471,6 +471,57 @@ impl<'a> Index<'a> {
         self.imports.get(path).map_or(&[], Vec::as_slice)
     }
 
+    /// Where a constant named in `path` at `at` and not bound in that file is declared
+    /// (contract M4a S12), as `(file, owning type, declared name)`: a named import
+    /// (`import { BASE as B }` names the target files' top-level `BASE`), a Java static import
+    /// (`ROOT` of the imported type), or a qualified name (`Paths.ROOT`, `cfg.Base`, `ns.API`)
+    /// through what its qualifier names, as for a call (a variable never names a module or a
+    /// type). Sorted, without repeats.
+    pub(crate) fn constant_declarations(
+        &self,
+        path: &'a str,
+        name: &str,
+        at: rb_model::Span,
+    ) -> Vec<(&'a str, Option<usize>, String)> {
+        if let Some((qualifier, member)) = name.rsplit_once('.') {
+            return match self.container(path, None, qualifier, Some(at)) {
+                Some(Container::Types(ts)) => ts
+                    .into_iter()
+                    .map(|(f, t)| (f, Some(t), member.to_owned()))
+                    .collect(),
+                Some(Container::Module(files)) => files
+                    .into_iter()
+                    .map(|f| (f, None, member.to_owned()))
+                    .collect(),
+                None => Vec::new(),
+            };
+        }
+        let language = self.language(path);
+        let mut out = Vec::new();
+        for (import, targets) in self.facts(path).imports.iter().zip(&self.imports[path]) {
+            if language == Language::Java {
+                let named = import.wildcard || import.names.iter().any(|n| n.local == name);
+                if import.is_static && named {
+                    let module: Vec<&str> = import.module.split('.').collect();
+                    for &f in targets {
+                        for (tf, t) in self.java_type_path(f, &module) {
+                            out.push((tf, Some(t), name.to_owned()));
+                        }
+                    }
+                }
+                continue;
+            }
+            for n in import
+                .names
+                .iter()
+                .filter(|n| n.local == name && n.name != "default")
+            {
+                out.extend(targets.iter().map(|&f| (f, None, n.name.clone())));
+            }
+        }
+        dedup(out)
+    }
+
     fn facts(&self, path: &str) -> &'a FileFacts {
         self.files[path].1
     }

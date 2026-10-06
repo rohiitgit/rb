@@ -21,8 +21,8 @@ use serde_json::Value;
 
 pub use age::{LoadDir, graph_name};
 pub use query::{
-    FoundNode, OwnerShare, ResolutionCoverage, Resolved, ServiceCard, ServiceSummary, SqlCoverage,
-    TableAccess, TableDeps,
+    FoundNode, HttpCoverage, OwnerShare, ResolutionCoverage, Resolved, ServiceCard, ServiceSummary,
+    SqlCoverage, TableAccess, TableDeps,
 };
 
 /// A recorded SCIP indexer run (design §5.2).

@@ -122,6 +122,19 @@ pub struct SqlCoverage {
     pub tables: i64,
 }
 
+/// HTTP coverage of a snapshot (contract M4a S14): its endpoints, the services exposing them,
+/// and its client call sites per bucket, as the indexer counted them (`http_coverage`). A site's
+/// bucket cannot be read back from the edges: a `CONSUMES` edge carries its best site's
+/// certainty.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct HttpCoverage {
+    pub routes: i64,
+    pub services: i64,
+    pub sites: i64,
+    /// Bucket → sites; empty for a snapshot without client calls.
+    pub buckets: BTreeMap<String, i64>,
+}
+
 /// Outcome of resolving user input to exactly one node (design §9.1: never pick silently).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {
@@ -292,6 +305,38 @@ impl Store {
             migration_statements: r.get(1),
             unparsed: r.get(2),
             tables: r.get(3),
+        })
+    }
+
+    pub fn http_coverage(&mut self, snapshot_id: i64) -> anyhow::Result<HttpCoverage> {
+        let r = self.client.query_one(
+            "SELECT (SELECT count(*) FROM rb.node WHERE snapshot_id = $1 AND kind = 'endpoint'),
+                    (SELECT count(DISTINCT src) FROM rb.edge
+                     WHERE snapshot_id = $1 AND kind = 'EXPOSES'),
+                    (SELECT detail FROM rb.diagnostic
+                     WHERE snapshot_id = $1 AND kind = 'http_coverage')",
+            &[&snapshot_id],
+        )?;
+        let detail: Option<Value> = r.get(2);
+        let mut buckets = BTreeMap::new();
+        let mut sites = 0;
+        if let Some(Value::Object(counts)) = detail {
+            for (bucket, n) in counts {
+                let n = n
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("http_coverage {bucket}: {n}"))?;
+                if bucket == "sites" {
+                    sites = n;
+                } else {
+                    buckets.insert(bucket, n);
+                }
+            }
+        }
+        Ok(HttpCoverage {
+            routes: r.get(0),
+            services: r.get(1),
+            sites,
+            buckets,
         })
     }
 

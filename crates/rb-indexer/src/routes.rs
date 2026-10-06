@@ -206,6 +206,19 @@ struct Registration {
     at: Evidence,
 }
 
+/// An endpoint the stage added, as stitching reads it (contract M4a S13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndpointRef {
+    pub key: String,
+    pub method: String,
+    /// Normalised.
+    pub path: String,
+    pub service: String,
+    pub prefix_unknown: bool,
+    /// The certainty of its path (its `EXPOSES` edge).
+    pub certainty: Certainty,
+}
+
 #[derive(Default)]
 struct Endpoint {
     method: String,
@@ -216,11 +229,12 @@ struct Endpoint {
     registrations: Vec<Registration>,
 }
 
-/// Adds every endpoint with its edges; returns the route diagnostics.
+/// Adds every endpoint with its edges; returns the route diagnostics and the endpoints, in key
+/// order.
 pub(crate) fn add_endpoints(
     b: &mut GraphBuilder,
     inputs: &Inputs<'_, '_>,
-) -> anyhow::Result<Vec<Diagnostic>> {
+) -> anyhow::Result<(Vec<Diagnostic>, Vec<EndpointRef>)> {
     let mut composer = Composer::new(inputs);
     let mut endpoints: BTreeMap<String, Endpoint> = BTreeMap::new();
     let mut diagnostics = Vec::new();
@@ -312,10 +326,11 @@ pub(crate) fn add_endpoints(
             }
         }
     }
-    for (key, e) in endpoints {
-        add_endpoint(b, &key, e)?;
-    }
-    Ok(diagnostics)
+    let added = endpoints
+        .into_iter()
+        .map(|(key, e)| add_endpoint(b, key, e))
+        .collect::<anyhow::Result<_>>()?;
+    Ok((diagnostics, added))
 }
 
 /// A route's handler targets, each with its certainty and, for an inline function, its span;
@@ -370,8 +385,8 @@ fn handler_targets(
 /// The node and its edges, merged over registrations (contract M4a invariants 1 and 4): each
 /// edge takes the best registration's certainty, every registration's evidence, and an inline
 /// handler's spans.
-fn add_endpoint(b: &mut GraphBuilder, key: &str, e: Endpoint) -> anyhow::Result<()> {
-    let node = NodeKey::new(NodeKind::Endpoint, key);
+fn add_endpoint(b: &mut GraphBuilder, key: String, e: Endpoint) -> anyhow::Result<EndpointRef> {
+    let node = NodeKey::new(NodeKind::Endpoint, key.clone());
     let mut attrs = Attrs::new();
     attrs.insert("method".into(), e.method.clone().into());
     attrs.insert("path".into(), e.path.clone().into());
@@ -453,7 +468,14 @@ fn add_endpoint(b: &mut GraphBuilder, key: &str, e: Endpoint) -> anyhow::Result<
         edge.evidence = h.evidence.into_iter().collect();
         b.add_edge(edge)?;
     }
-    Ok(())
+    Ok(EndpointRef {
+        key,
+        method: e.method,
+        path: e.path,
+        service: e.service,
+        prefix_unknown: e.prefix_unknown,
+        certainty: exposes,
+    })
 }
 
 #[cfg(test)]
@@ -526,7 +548,7 @@ mod tests {
             service_of: &service_of,
             context_paths: &context_paths,
         };
-        let diagnostics = add_endpoints(&mut b, &inputs).unwrap();
+        let (diagnostics, _) = add_endpoints(&mut b, &inputs).unwrap();
         Built {
             graph: b.finish().unwrap(),
             diagnostics,

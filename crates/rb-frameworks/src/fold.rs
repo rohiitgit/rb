@@ -83,8 +83,9 @@ pub trait Lookup {
     fn facts(&self, file: usize) -> &FileFacts;
     fn language(&self, file: usize) -> Language;
     /// A name not bound in `file` (an imported constant, `Type.CONST` of another file, Go
-    /// `pkg.Const`): the file and binding index it names, if any.
-    fn external(&self, file: usize, name: &str) -> Option<(usize, usize)>;
+    /// `pkg.Const`), written at `at`: the file and binding index it names, if any. The position
+    /// lets a local variable shadow a same-named package or type qualifier.
+    fn external(&self, file: usize, name: &str, at: Span) -> Option<(usize, usize)>;
     /// The `application.properties` value of `key` for the service owning `file`.
     fn property(&self, file: usize, key: &str) -> Option<String>;
 }
@@ -183,7 +184,7 @@ impl<'l> Folder<'l> {
             .or_insert_with(|| FileScope::new(lookup.facts(file)));
         let local = local_binding(scope, language, name, at)
             .map(|b| (file, b))
-            .or_else(|| lookup.external(file, name));
+            .or_else(|| lookup.external(file, name, at));
         match local {
             Some((f, b)) => self.binding(f, b, depth + 1),
             None => (Folded::hole(), true),
@@ -474,7 +475,7 @@ mod tests {
         fn language(&self, file: usize) -> Language {
             self.files[file].0
         }
-        fn external(&self, file: usize, name: &str) -> Option<(usize, usize)> {
+        fn external(&self, file: usize, name: &str, _at: Span) -> Option<(usize, usize)> {
             let facts = &self.files[file].1;
             let (head, member) = name
                 .rsplit_once('.')
