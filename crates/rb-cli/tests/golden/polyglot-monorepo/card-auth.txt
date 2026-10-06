@@ -8,4 +8,11 @@ auth-service  (path: services/auth, deployable)
 │    @acme/data         2 files   33%
 │    unowned            0 files    0%
 ├─ Packages: none
-└─ Endpoints and request paths: not indexed yet (M4)
+├─ APIs (1)
+│    POST /api/v1/login  → AuthController#login().  [exact]
+├─ Calls APIs of (1)
+│    notification  (services/notification)
+│      POST /internal/mfa/email  [synthetic]  1 site
+└─ APIs called by (1)
+     @acme/web  (apps/web)
+       POST /api/v1/login  [heuristic]  1 site

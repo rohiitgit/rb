@@ -3,6 +3,7 @@ breaks: requiring edges into it (1):
   1  LoginForm().onSubmit().  apps/web/src/pages/Login.tsx:4  [@acme/web]  heuristic
 affects: reaches those through calls or references (1):
   2  LoginForm().  apps/web/src/pages/Login.tsx:3  [@acme/web]  heuristic
+endpoints: handled by the removed or impacted code (0):
 services: @acme/web (own) 2
 owners: @acme/frontend 2
 certainty: heuristic 2

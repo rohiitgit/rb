@@ -10,4 +10,7 @@ auth-api  (path: ., deployable)
 │    unowned             0 files    0%
 ├─ Packages (1)
 │    npm/@prisma/client@5.22.0
-└─ Endpoints and request paths: not indexed yet (M4)
+├─ APIs (1)
+│    POST /api/v1/login  → src/routes/auth.ts (top-level code)  [heuristic]
+├─ Calls APIs of: none
+└─ APIs called by: none

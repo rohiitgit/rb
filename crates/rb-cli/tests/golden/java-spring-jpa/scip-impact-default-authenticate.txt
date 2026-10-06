@@ -2,6 +2,8 @@ removing com/acme/auth/DefaultAuthService#authenticate().  src/main/java/com/acm
 breaks: requiring edges into it (0):
 affects: reaches those through calls or references (1):
   1  com/acme/auth/AuthController#login().  src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  dispatch
+endpoints: handled by the removed or impacted code (1):
+  2  POST /api/v1/login  [auth-service]  dispatch
 services: auth-service (own) 1
 owners: -
 certainty: dispatch 1

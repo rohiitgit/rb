@@ -974,8 +974,89 @@ fn render_card(c: &ServiceCard) -> String {
             out += &format!("│    {p}\n");
         }
     }
-    out += "└─ Endpoints and request paths: not indexed yet (M4)\n";
+    // The HTTP sections (contract M4a S20), the last one closing the tree.
+    let mut sections = vec![
+        section("APIs", c.apis.iter().map(api_line).collect()),
+        section("Calls APIs of", peer_lines(&c.consumes)),
+        section("APIs called by", peer_lines(&c.consumed_by)),
+    ];
+    if c.unstitched > 0 {
+        sections.push((
+            format!(
+                "HTTP client calls not stitched: {} (rb status)",
+                c.unstitched
+            ),
+            Vec::new(),
+        ));
+    }
+    let n = sections.len();
+    for (i, (head, lines)) in sections.into_iter().enumerate() {
+        let (branch, rail) = if i + 1 == n {
+            ("└", " ")
+        } else {
+            ("├", "│")
+        };
+        out += &format!("{branch}─ {head}\n");
+        for l in lines {
+            out += &format!("{rail}    {l}\n");
+        }
+    }
     out
+}
+
+/// A card section: `Title (n)` with its lines, or `Title: none`. Grouped sections count their
+/// groups (the lines not indented).
+fn section(title: &str, lines: Vec<String>) -> (String, Vec<String>) {
+    let n = lines.iter().filter(|l| !l.starts_with(' ')).count();
+    if n == 0 {
+        (format!("{title}: none"), lines)
+    } else {
+        (format!("{title} ({n})"), lines)
+    }
+}
+
+/// `POST /api/v1/login  → AuthController#login().  [exact]`: an endpoint, its handlers and the
+/// handler certainty (the path's when no handler was resolved).
+fn api_line(a: &rb_store::Api) -> String {
+    let handlers: Vec<String> = a
+        .handlers
+        .iter()
+        .map(|h| match h.kind.as_str() {
+            "file" => format!("{} (top-level code)", h.key),
+            _ => rb_store::code::symbol_display(&h.key).to_owned(),
+        })
+        .collect();
+    let certainty = a
+        .handlers
+        .iter()
+        .filter_map(|h| code::parse_certainty(&h.certainty).ok())
+        .max()
+        .map_or_else(|| a.certainty.clone(), |c| c.as_str().to_owned());
+    let mut line = if handlers.is_empty() {
+        format!("{}  → (handler unresolved)  [{certainty}]", a.name)
+    } else {
+        format!("{}  → {}  [{certainty}]", a.name, handlers.join(", "))
+    };
+    if a.prefix_unknown {
+        line.push_str("  (prefix unknown)");
+    }
+    line
+}
+
+/// `service  (key)` per peer, then `  ENDPOINT  [certainty]  n sites` per endpoint.
+fn peer_lines(peers: &[rb_store::HttpPeer]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for p in peers {
+        lines.push(format!("{}  ({})", p.service_name, p.service_key));
+        for u in &p.endpoints {
+            let sites = if u.sites == 1 { "site" } else { "sites" };
+            lines.push(format!(
+                "  {}  [{}]  {} {sites}",
+                u.name, u.certainty, u.sites
+            ));
+        }
+    }
+    lines
 }
 
 /// "1 file", "3 files".
@@ -1189,6 +1270,94 @@ mod tests {
         assert_eq!(
             http_line(&c),
             "http: 3 routes in 2 services; 10 client calls: 2 synthetic, 1 heuristic, 2 ambiguous, 1 too ambiguous, 1 external, 2 dynamic, 1 self"
+        );
+    }
+
+    /// Contract M4a S20: the three HTTP sections replace the M4 placeholder; an unresolved
+    /// handler and an unknown prefix are said so; the unstitched line closes the tree when
+    /// there is one.
+    #[test]
+    fn card_http_sections() {
+        let mut card = ServiceCard {
+            key: "services/auth".into(),
+            name: "auth-service".into(),
+            role: ServiceRole::Service,
+            detected_by: vec![],
+            manifests: vec![],
+            files: 1,
+            languages: vec![("java".into(), 1)],
+            owners: vec![],
+            file_owners: vec![],
+            unowned_files: 1,
+            packages: vec![],
+            apis: vec![],
+            consumes: vec![],
+            consumed_by: vec![],
+            unstitched: 0,
+        };
+        let tail = |card: &ServiceCard| -> Vec<String> {
+            render_card(card)
+                .lines()
+                .skip_while(|l| !l.starts_with("├─ Packages"))
+                .skip(1)
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            tail(&card),
+            [
+                "├─ APIs: none",
+                "├─ Calls APIs of: none",
+                "└─ APIs called by: none"
+            ]
+        );
+        let handler = |key: &str, kind: &str, c: &str| rb_store::Handler {
+            kind: kind.into(),
+            key: key.into(),
+            certainty: c.into(),
+        };
+        card.apis = vec![
+            rb_store::Api {
+                key: "HTTP GET /a @services/auth".into(),
+                name: "GET /a".into(),
+                certainty: "heuristic".into(),
+                prefix_unknown: true,
+                handlers: vec![],
+            },
+            rb_store::Api {
+                key: "HTTP POST /b @services/auth".into(),
+                name: "POST /b".into(),
+                certainty: "exact".into(),
+                prefix_unknown: false,
+                handlers: vec![
+                    handler("rb-heuristic . . . `A.java`/A#b().", "symbol", "ambiguous"),
+                    handler("src/server.ts", "file", "ambiguous"),
+                ],
+            },
+        ];
+        card.consumes = vec![rb_store::HttpPeer {
+            service_key: "services/notification".into(),
+            service_name: "notification".into(),
+            endpoints: vec![rb_store::HttpUse {
+                key: "HTTP POST /m @services/notification".into(),
+                name: "POST /m".into(),
+                certainty: "synthetic".into(),
+                sites: 2,
+            }],
+        }];
+        card.unstitched = 3;
+        assert_eq!(
+            tail(&card),
+            [
+                "├─ APIs (2)",
+                "│    GET /a  → (handler unresolved)  [heuristic]  (prefix unknown)",
+                "│    POST /b  → A#b()., src/server.ts (top-level code)  [ambiguous]",
+                "├─ Calls APIs of (1)",
+                "│    notification  (services/notification)",
+                "│      POST /m  [synthetic]  2 sites",
+                "├─ APIs called by: none",
+                "└─ HTTP client calls not stitched: 3 (rb status)",
+            ]
         );
     }
 

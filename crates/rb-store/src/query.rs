@@ -31,8 +31,8 @@ pub struct OwnerShare {
     pub files: usize,
 }
 
-/// Structure sections of the Service Card (design §9.5). APIs, tables, dependencies and the call
-/// graph arrive with later milestones.
+/// The Service Card (design §9.5): structure, packages and the HTTP sections (contract M4a S20),
+/// all computed at query time. Tables, service dependencies and the call graph arrive with M4b.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ServiceCard {
     pub key: String,
@@ -51,6 +51,54 @@ pub struct ServiceCard {
     pub unowned_files: usize,
     /// Keys of the packages the service depends on (`DEPENDS_ON`, design §5.5), sorted.
     pub packages: Vec<String>,
+    /// Endpoints it exposes, by key.
+    pub apis: Vec<Api>,
+    /// Other services' endpoints its code consumes, by service key.
+    pub consumes: Vec<HttpPeer>,
+    /// Services whose code consumes its endpoints, by service key.
+    pub consumed_by: Vec<HttpPeer>,
+    /// Its client call sites that were not stitched (`http_*` site diagnostics).
+    pub unstitched: i64,
+}
+
+/// An endpoint a service exposes, with its handlers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Api {
+    pub key: String,
+    pub name: String,
+    /// `EXPOSES` certainty (the path's).
+    pub certainty: String,
+    pub prefix_unknown: bool,
+    /// By key; empty when the handler was not resolved.
+    pub handlers: Vec<Handler>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Handler {
+    /// `symbol` or `file` (an inline handler in top-level code).
+    pub kind: String,
+    pub key: String,
+    /// `HANDLED_BY` certainty.
+    pub certainty: String,
+}
+
+/// A service on the other side of `CONSUMES` edges, and the endpoints involved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HttpPeer {
+    pub service_key: String,
+    pub service_name: String,
+    /// By endpoint key.
+    pub endpoints: Vec<HttpUse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HttpUse {
+    pub key: String,
+    pub name: String,
+    /// The best certainty among the edges.
+    pub certainty: String,
+    /// Client call sites, summed over the edges.
+    pub sites: i64,
 }
 
 /// One source's access to a table: a migration file (`MIGRATES`) or code (`QUERIES`).
@@ -489,6 +537,20 @@ impl Store {
         };
         let owners = targets("OWNED_BY")?;
         let packages = targets("DEPENDS_ON")?;
+        let apis = self.apis(snapshot_id, id)?;
+        let (consumes, consumed_by) = self.http_peers(snapshot_id, id, key)?;
+        let unstitched: i64 = self
+            .client
+            .query_one(
+                "SELECT count(*) FROM rb.diagnostic dg
+                 JOIN rb.edge m ON m.snapshot_id = dg.snapshot_id AND m.src = dg.file_id
+                               AND m.kind = 'IN_SERVICE'
+                 WHERE dg.snapshot_id = $1 AND m.dst = $2
+                   AND dg.kind IN ('http_unmatched', 'http_self', 'http_external',
+                                   'http_url_dynamic', 'http_too_ambiguous')",
+                &[&snapshot_id, &id],
+            )?
+            .get(0);
 
         Ok(ServiceCard {
             key: key.to_owned(),
@@ -502,8 +564,133 @@ impl Store {
             file_owners,
             unowned_files,
             packages,
+            apis,
+            consumes,
+            consumed_by,
+            unstitched,
         })
     }
+
+    /// The endpoints service `id` exposes, with their handlers, by key (bytewise).
+    fn apis(&mut self, snapshot_id: i64, id: i64) -> anyhow::Result<Vec<Api>> {
+        let rows = self.client.query(
+            "SELECT ep.key, ep.name, ep.attrs, x.certainty, h.kind, h.key, hb.certainty
+             FROM rb.edge x
+             JOIN rb.node ep ON ep.snapshot_id = x.snapshot_id AND ep.id = x.dst
+             LEFT JOIN rb.edge hb ON hb.snapshot_id = x.snapshot_id AND hb.src = ep.id
+                                 AND hb.kind = 'HANDLED_BY'
+             LEFT JOIN rb.node h ON h.snapshot_id = hb.snapshot_id AND h.id = hb.dst
+             WHERE x.snapshot_id = $1 AND x.src = $2 AND x.kind = 'EXPOSES'",
+            &[&snapshot_id, &id],
+        )?;
+        let mut apis: BTreeMap<String, Api> = BTreeMap::new();
+        for r in &rows {
+            let key: String = r.get(0);
+            let attrs: Value = r.get(2);
+            let api = apis.entry(key.clone()).or_insert(Api {
+                key,
+                name: r.get(1),
+                certainty: certainty_str(r.get(3))?,
+                prefix_unknown: attrs["prefix_unknown"].as_bool().unwrap_or(false),
+                handlers: Vec::new(),
+            });
+            if let Some(kind) = r.get::<_, Option<String>>(4) {
+                api.handlers.push(Handler {
+                    kind,
+                    key: r.get(5),
+                    certainty: certainty_str(r.get(6))?,
+                });
+            }
+        }
+        let mut apis: Vec<Api> = apis.into_values().collect();
+        for a in &mut apis {
+            a.handlers.sort_by(|x, y| x.key.cmp(&y.key));
+        }
+        Ok(apis)
+    }
+
+    /// The service's outbound and inbound `CONSUMES`, grouped by the other service, then by
+    /// endpoint, each with the best certainty and the summed sites.
+    fn http_peers(
+        &mut self,
+        snapshot_id: i64,
+        id: i64,
+        key: &str,
+    ) -> anyhow::Result<(Vec<HttpPeer>, Vec<HttpPeer>)> {
+        // Each edge with the service of its source's file and the service exposing its target.
+        let rows = self.client.query(
+            "SELECT ss.key, ss.name, ts.key, ts.name, ep.key, ep.name, c.certainty, c.attrs
+             FROM rb.edge c
+             JOIN rb.node s ON s.snapshot_id = c.snapshot_id AND s.id = c.src
+             LEFT JOIN rb.edge d ON d.snapshot_id = c.snapshot_id AND d.src = s.id
+                                AND d.kind = 'DEFINED_IN'
+             JOIN rb.edge m ON m.snapshot_id = c.snapshot_id AND m.kind = 'IN_SERVICE'
+                           AND m.src = CASE WHEN s.kind = 'file' THEN s.id ELSE d.dst END
+             JOIN rb.node ss ON ss.snapshot_id = c.snapshot_id AND ss.id = m.dst
+             JOIN rb.node ep ON ep.snapshot_id = c.snapshot_id AND ep.id = c.dst
+             JOIN rb.node ts ON ts.snapshot_id = c.snapshot_id AND ts.kind = 'service'
+                            AND ts.key = ep.attrs->>'service'
+             WHERE c.snapshot_id = $1 AND c.kind = 'CONSUMES' AND (ss.id = $2 OR ts.key = $3)",
+            &[&snapshot_id, &id, &key],
+        )?;
+        let (mut out, mut inbound) = (Peers::new(), Peers::new());
+        for r in &rows {
+            let (source, target): (String, String) = (r.get(0), r.get(2));
+            let attrs: Value = r.get(7);
+            let edge = (
+                r.get::<_, String>(4),
+                r.get::<_, String>(5),
+                rb_model::Certainty::from_rank(r.get(6))?,
+                attrs["sites"].as_i64().unwrap_or(1),
+            );
+            if source == key {
+                record(&mut out, target.clone(), r.get(3), edge.clone());
+            }
+            if target == key {
+                record(&mut inbound, source, r.get(1), edge);
+            }
+        }
+        let flatten = |peers: Peers| -> Vec<HttpPeer> {
+            peers
+                .into_iter()
+                .map(|(service_key, (service_name, uses))| HttpPeer {
+                    service_key,
+                    service_name,
+                    endpoints: uses
+                        .into_iter()
+                        .map(|(key, (name, certainty, sites))| HttpUse {
+                            key,
+                            name,
+                            certainty: certainty.as_str().to_owned(),
+                            sites,
+                        })
+                        .collect(),
+                })
+                .collect()
+        };
+        Ok((flatten(out), flatten(inbound)))
+    }
+}
+
+fn certainty_str(rank: i16) -> anyhow::Result<String> {
+    Ok(rb_model::Certainty::from_rank(rank)?.as_str().to_owned())
+}
+
+/// Service key → (its name, endpoint key → (endpoint name, best certainty, sites)).
+type Peers = BTreeMap<String, (String, BTreeMap<String, (String, rb_model::Certainty, i64)>)>;
+
+/// One `CONSUMES` edge `(endpoint key, name, certainty, sites)` with the service on its other
+/// side.
+fn record(
+    peers: &mut Peers,
+    peer: String,
+    peer_name: String,
+    (key, name, certainty, sites): (String, String, rb_model::Certainty, i64),
+) {
+    let (_, uses) = peers.entry(peer).or_insert((peer_name, BTreeMap::new()));
+    let u = uses.entry(key).or_insert((name, certainty, 0));
+    u.1 = u.1.max(certainty);
+    u.2 += sites;
 }
 
 /// Every `Service` node carries a `role`; a missing or unknown one is corrupt data, not a default.

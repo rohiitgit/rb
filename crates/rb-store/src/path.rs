@@ -247,12 +247,12 @@ struct Walk<'g> {
 }
 
 /// Whether `inner` lies within `outer` (both `[row, col, row, col]`).
-fn within(inner: Span, outer: Span) -> bool {
+pub(crate) fn within(inner: Span, outer: Span) -> bool {
     (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
 }
 
-/// The `handler_spans` of a `HANDLED_BY` edge to an inline handler.
-fn handler_spans(e: &Edge) -> Option<Vec<Span>> {
+/// The `handler_spans` of a `HANDLED_BY` edge to an inline handler (shared with `rb impact`).
+pub(crate) fn handler_spans(e: &Edge) -> Option<Vec<Span>> {
     let spans = e.attrs.get("handler_spans")?.as_array()?;
     Some(
         spans

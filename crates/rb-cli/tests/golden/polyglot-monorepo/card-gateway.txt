@@ -6,4 +6,6 @@ edge-gateway  (path: gateway, deployable)
 │    @acme/platform      1 file  100%
 │    unowned            0 files    0%
 ├─ Packages: none
-└─ Endpoints and request paths: not indexed yet (M4)
+├─ APIs: none
+├─ Calls APIs of: none
+└─ APIs called by: none

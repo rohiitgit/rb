@@ -33,5 +33,9 @@
     }
   ],
   "unowned_files": 2,
-  "packages": []
+  "packages": [],
+  "apis": [],
+  "consumes": [],
+  "consumed_by": [],
+  "unstitched": 0
 }

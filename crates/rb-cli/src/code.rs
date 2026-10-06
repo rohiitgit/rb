@@ -66,6 +66,24 @@ fn line(d: &Describer<'_>, id: i64) -> String {
     s
 }
 
+/// `POST /api/v1/login  [auth-service]`: an endpoint's name and the name of its service.
+fn endpoint_label(graph: &Graph, id: i64) -> String {
+    let Some(e) = graph.nodes().iter().find(|n| n.id == id) else {
+        return id.to_string();
+    };
+    let key = e
+        .attrs
+        .get("service")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default();
+    let service = graph
+        .nodes()
+        .iter()
+        .find(|n| n.kind == rb_model::NodeKind::Service && n.key == key)
+        .map_or(key, |n| n.name.as_str());
+    format!("{}  [{service}]", e.name)
+}
+
 fn histogram<'c>(certainties: impl Iterator<Item = &'c Certainty>) -> String {
     let mut counts: BTreeMap<std::cmp::Reverse<Certainty>, usize> = BTreeMap::new();
     for c in certainties {
@@ -145,6 +163,21 @@ pub(crate) fn render_impact(graph: &Graph, impact: &Impact) -> String {
         &impact.affects,
         &mut out,
     );
+    // Endpoints the removed or impacted code handles (contract M4a S21).
+    let _ = writeln!(
+        out,
+        "endpoints: handled by the removed or impacted code ({}):",
+        impact.endpoints.len()
+    );
+    for x in &impact.endpoints {
+        let _ = writeln!(
+            out,
+            "  {}  {}  {}",
+            x.distance,
+            endpoint_label(graph, x.node),
+            x.certainty.as_str()
+        );
+    }
     let services: Vec<String> = impact
         .services
         .iter()

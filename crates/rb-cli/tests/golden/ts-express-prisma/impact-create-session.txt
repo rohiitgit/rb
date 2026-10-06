@@ -2,6 +2,8 @@ removing createSession().  src/db/users.ts:11  [auth-api]
 breaks: requiring edges into it (1):
   1  src/routes/auth.ts (top-level code)  [auth-api]  heuristic
 affects: reaches those through calls or references (0):
+endpoints: handled by the removed or impacted code (1):
+  2  POST /api/v1/login  [auth-api]  heuristic
 services: auth-api (own) 1
 owners: @acme/auth-team 1
 certainty: heuristic 1

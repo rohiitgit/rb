@@ -1,6 +1,7 @@
 //! Code questions over a snapshot graph held in memory (design §9.1–§9.3): which node the user
 //! means, who calls it (Q1), and what breaks if it is removed (Q2). Pure functions of the graph.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rb_model::{Certainty, Edge, EdgeKind, Graph, Node, NodeKind};
@@ -212,7 +213,7 @@ impl<'g> Describer<'g> {
 /// and scip-typescript keys carry the file in a descriptor, `` src/`users.ts`/Cache#get(). ``),
 /// else after the last space (a scip-java key's `scheme manager package version` head), else
 /// the whole key (contract M3b amendment 39).
-fn symbol_display(key: &str) -> &str {
+pub fn symbol_display(key: &str) -> &str {
     key.rsplit_once("`/")
         .or_else(|| key.rsplit_once(' '))
         .map_or(key, |(_, d)| d)
@@ -391,6 +392,10 @@ pub struct Impact {
     pub services: Vec<(String, usize, bool)>,
     /// Owners of the impacted nodes' files: `(owner key, impacted count)`.
     pub owners: Vec<(String, usize)>,
+    /// Endpoints handled by a removed, breaking or affected node (design §9.3 roll-up): one
+    /// more than the handler's distance (a removed handler's endpoint is at 1), the weaker of
+    /// the handler's certainty and its `HANDLED_BY`.
+    pub endpoints: Vec<Impacted>,
     pub truncated: bool,
 }
 
@@ -499,6 +504,7 @@ pub fn impact(graph: &Graph, target: i64, min_certainty: Certainty) -> Impact {
             .map(|e| v.node(e.dst).key.clone())
             .next()
     };
+    let endpoints = endpoint_rollup(&v, &removed, &breaks, &affects, min_certainty);
     let own = service_of(target);
     let mut services: BTreeMap<String, usize> = BTreeMap::new();
     let mut owners: BTreeMap<String, usize> = BTreeMap::new();
@@ -524,8 +530,67 @@ pub fn impact(graph: &Graph, target: i64, min_certainty: Certainty) -> Impact {
             })
             .collect(),
         owners: owners.into_iter().collect(),
+        endpoints,
         truncated,
     }
+}
+
+/// The endpoints the impacted set handles (contract M4a S21), at their smallest distance and,
+/// there, their best certainty; sorted by distance, then key. An inline handler (with
+/// `handler_spans`) handles an endpoint only within its spans, so it counts only when one of
+/// its requiring edges into the removed or impacted set has evidence there (invariant 8).
+fn endpoint_rollup(
+    v: &View<'_>,
+    removed: &[i64],
+    breaks: &[Impacted],
+    affects: &[Impacted],
+    min: Certainty,
+) -> Vec<Impacted> {
+    let impacted: HashMap<i64, (Certainty, usize)> = removed
+        .iter()
+        .map(|&n| (n, (Certainty::Exact, 0)))
+        .chain(
+            breaks
+                .iter()
+                .chain(affects)
+                .map(|x| (x.node, (x.certainty, x.distance))),
+        )
+        .collect();
+    let mut found: HashMap<i64, (usize, Certainty)> = HashMap::new();
+    for (&n, &(c, d)) in &impacted {
+        for e in v.inbound(n, EdgeKind::HandledBy, min) {
+            if d > 0
+                && let Some(spans) = crate::path::handler_spans(e)
+            {
+                let inside = v
+                    .outbound
+                    .get(&n)
+                    .into_iter()
+                    .flatten()
+                    .filter(|x| REQUIRING.contains(&x.kind) && impacted.contains_key(&x.dst))
+                    .flat_map(|x| &x.evidence)
+                    .any(|ev| spans.iter().any(|s| crate::path::within(ev.span, *s)));
+                if !inside {
+                    continue;
+                }
+            }
+            let candidate = (d + 1, c.min(e.certainty));
+            let best = found.entry(e.src).or_insert(candidate);
+            if (candidate.0, Reverse(candidate.1)) < (best.0, Reverse(best.1)) {
+                *best = candidate;
+            }
+        }
+    }
+    let mut out: Vec<Impacted> = found
+        .into_iter()
+        .map(|(node, (distance, certainty))| Impacted {
+            node,
+            certainty,
+            distance,
+        })
+        .collect();
+    out.sort_by(|a, b| (a.distance, &v.node(a.node).key).cmp(&(b.distance, &v.node(b.node).key)));
+    out
 }
 
 #[cfg(test)]
@@ -997,5 +1062,108 @@ mod tests {
         assert!(flat(&g, &tree).len() <= 3, "{:?}", flat(&g, &tree));
         let i = impact(&g, a, Certainty::Ambiguous);
         assert!(i.breaks.len() + i.affects.len() <= 2);
+    }
+
+    /// Contract M4a S21: endpoints handled by the removed, breaking or affected nodes, one
+    /// further than their handler, at the weaker certainty; an inline handler only when its
+    /// edge into the impacted set lies in its spans.
+    #[test]
+    fn impact_rolls_up_endpoints() {
+        let mut b = GraphBuilder::new();
+        let file = |p: &str| NodeKey::new(NodeKind::File, p);
+        let sym = |n: &str| {
+            NodeKey::new(
+                NodeKind::Symbol,
+                format!("rb-heuristic . . . `a.ts`/{n}()."),
+            )
+        };
+        let ep = |n: &str| NodeKey::new(NodeKind::Endpoint, format!("HTTP {n} @s"));
+        b.add_node(file("a.ts"), "a.ts", Attrs::new()).unwrap();
+        for n in ["svc", "other", "handle", "helper"] {
+            b.add_node(sym(n), n, Attrs::new()).unwrap();
+        }
+        for n in ["GET /inline", "GET /named"] {
+            b.add_node(ep(n), n, Attrs::new()).unwrap();
+        }
+        let edge =
+            |b: &mut GraphBuilder, s: NodeKey, kind, d: NodeKey, c, line: i32, attrs: Attrs| {
+                b.add_edge(
+                    NewEdge::new(s, kind, d, Provenance::Heuristic, c)
+                        .attrs(attrs)
+                        .evidence(Evidence {
+                            path: "a.ts".into(),
+                            span: [line, 2, line, 9],
+                        }),
+                )
+                .unwrap();
+            };
+        let mut spans = Attrs::new();
+        spans.insert("handler_spans".into(), serde_json::json!([[5, 0, 9, 1]]));
+        // The file's inline handler (lines 5–9) calls `svc`; its other top-level code (line 12)
+        // calls `other`.
+        edge(
+            &mut b,
+            ep("GET /inline"),
+            EdgeKind::HandledBy,
+            file("a.ts"),
+            Certainty::Exact,
+            5,
+            spans,
+        );
+        edge(
+            &mut b,
+            file("a.ts"),
+            EdgeKind::Calls,
+            sym("svc"),
+            Certainty::Heuristic,
+            6,
+            Attrs::new(),
+        );
+        edge(
+            &mut b,
+            file("a.ts"),
+            EdgeKind::Calls,
+            sym("other"),
+            Certainty::Heuristic,
+            12,
+            Attrs::new(),
+        );
+        // `GET /named` is handled by `handle`, which calls `helper`.
+        edge(
+            &mut b,
+            ep("GET /named"),
+            EdgeKind::HandledBy,
+            sym("handle"),
+            Certainty::Exact,
+            1,
+            Attrs::new(),
+        );
+        edge(
+            &mut b,
+            sym("handle"),
+            EdgeKind::Calls,
+            sym("helper"),
+            Certainty::Ambiguous,
+            2,
+            Attrs::new(),
+        );
+        let g = b.finish().unwrap();
+        let rollup = |name: &str| -> Vec<String> {
+            impact(&g, id(&g, &format!("{name}().")), Certainty::Ambiguous)
+                .endpoints
+                .iter()
+                .map(|x| {
+                    let key = &g.nodes().iter().find(|n| n.id == x.node).unwrap().key;
+                    format!("{} {key} [{}]", x.distance, x.certainty.as_str())
+                })
+                .collect()
+        };
+        assert_eq!(rollup("svc"), ["2 HTTP GET /inline @s [heuristic]"]);
+        assert!(
+            rollup("other").is_empty(),
+            "outside the inline handler's spans"
+        );
+        assert_eq!(rollup("handle"), ["1 HTTP GET /named @s [exact]"]);
+        assert_eq!(rollup("helper"), ["2 HTTP GET /named @s [ambiguous]"]);
     }
 }

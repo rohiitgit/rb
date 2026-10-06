@@ -3,6 +3,8 @@ breaks: requiring edges into it (2):
   1  com/acme/auth/AuthController#login().  src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  exact
   1  com/acme/auth/DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:14  [auth-service]  exact
 affects: reaches those through calls or references (0):
+endpoints: handled by the removed or impacted code (1):
+  2  POST /api/v1/login  [auth-service]  exact
 services: auth-service (own) 2
 owners: -
 certainty: exact 2
