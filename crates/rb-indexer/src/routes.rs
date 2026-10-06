@@ -34,6 +34,9 @@ pub(crate) struct Inputs<'a, 'r> {
     pub service_of: &'a dyn Fn(&str) -> String,
     /// Service key → `server.servlet.context-path` from its `application.properties`.
     pub context_paths: &'a BTreeMap<String, String>,
+    /// Services with Spring configuration M4a does not read (`config_unread`, evaluator pass 1,
+    /// P7): their endpoints' deployed prefix may be missing.
+    pub config_unread: &'a BTreeSet<String>,
 }
 
 /// The token a handler name ends with (`login` in `ctrl.login`) and its span, when the name is
@@ -217,6 +220,12 @@ pub(crate) struct EndpointRef {
     pub prefix_unknown: bool,
     /// The certainty of its path (its `EXPOSES` edge).
     pub certainty: Certainty,
+    /// Go `ServeMux` host patterns (`example.com/x`), lower-cased without the port: a client
+    /// matches only when its host is one of them. Empty: any host (evaluator pass 1, P8).
+    pub hosts: Vec<String>,
+    /// The service has Spring configuration M4a does not read (`config_unread`), so its deployed
+    /// prefix may be missing (evaluator pass 1, P7).
+    pub prefix_maybe_incomplete: bool,
 }
 
 #[derive(Default)]
@@ -227,6 +236,10 @@ struct Endpoint {
     frameworks: BTreeSet<&'static str>,
     /// The router of an endpoint whose prefix is unknown (part of its key, amendment 10).
     router: Option<String>,
+    /// `ServeMux` host patterns of its registrations (P8).
+    hosts: BTreeSet<String>,
+    /// A registration with no host pattern: the endpoint serves every host.
+    any_host: bool,
     registrations: Vec<Registration>,
 }
 
@@ -331,6 +344,12 @@ pub(crate) fn add_endpoints(
                     ..Endpoint::default()
                 });
                 e.frameworks.insert(r.framework.as_str());
+                match &r.host {
+                    Some(host) => {
+                        e.hosts.insert(host.clone());
+                    }
+                    None => e.any_host = true,
+                }
                 e.registrations.push(Registration {
                     path_certainty,
                     handler: handler.clone(),
@@ -345,7 +364,10 @@ pub(crate) fn add_endpoints(
     }
     let added = endpoints
         .into_iter()
-        .map(|(key, e)| add_endpoint(b, key, e))
+        .map(|(key, e)| {
+            let unread = inputs.config_unread.contains(&e.service);
+            add_endpoint(b, key, e, unread)
+        })
         .collect::<anyhow::Result<_>>()?;
     Ok((diagnostics, added))
 }
@@ -401,8 +423,13 @@ fn handler_targets(
 
 /// The node and its edges, merged over registrations (contract M4a invariants 1 and 4): each
 /// edge takes the best registration's certainty, every registration's evidence, and an inline
-/// handler's spans.
-fn add_endpoint(b: &mut GraphBuilder, key: String, e: Endpoint) -> anyhow::Result<EndpointRef> {
+/// handler's spans. `unread`: its service has Spring configuration M4a does not read.
+fn add_endpoint(
+    b: &mut GraphBuilder,
+    key: String,
+    e: Endpoint,
+    unread: bool,
+) -> anyhow::Result<EndpointRef> {
     let node = NodeKey::new(NodeKind::Endpoint, key.clone());
     let mut attrs = Attrs::new();
     attrs.insert("method".into(), e.method.clone().into());
@@ -415,6 +442,23 @@ fn add_endpoint(b: &mut GraphBuilder, key: String, e: Endpoint) -> anyhow::Resul
     if let Some(router) = &e.router {
         attrs.insert("prefix_unknown".into(), true.into());
         attrs.insert("router".into(), router.clone().into());
+    }
+    let hosts: Vec<String> = if e.any_host {
+        Vec::new()
+    } else {
+        e.hosts.iter().cloned().collect()
+    };
+    match hosts.as_slice() {
+        [] => {}
+        [host] => {
+            attrs.insert("host".into(), host.clone().into());
+        }
+        several => {
+            attrs.insert("host".into(), several.to_vec().into());
+        }
+    }
+    if unread {
+        attrs.insert("prefix_maybe_incomplete".into(), true.into());
     }
     b.add_node(node.clone(), endpoint_name(&e.method, &e.path), attrs)?;
 
@@ -493,6 +537,8 @@ fn add_endpoint(b: &mut GraphBuilder, key: String, e: Endpoint) -> anyhow::Resul
         service: e.service,
         prefix_unknown: e.router.is_some(),
         certainty: exposes,
+        hosts,
+        prefix_maybe_incomplete: unread,
     })
 }
 
@@ -505,6 +551,7 @@ mod tests {
     struct Built {
         graph: Graph,
         diagnostics: Vec<Diagnostic>,
+        endpoints: Vec<EndpointRef>,
     }
 
     /// Indexes `files` (path, language, source) with every file in the service named by its
@@ -520,13 +567,14 @@ mod tests {
                 )
             })
             .collect();
-        build_from(&facts, context_paths, &BTreeMap::new())
+        build_from(&facts, context_paths, &BTreeMap::new(), &[])
     }
 
     fn build_from(
         facts: &[(String, Language, FileFacts)],
         context_paths: &[(&str, &str)],
         exact: &BTreeMap<(&str, Span), String>,
+        config_unread: &[&str],
     ) -> Built {
         let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
             .iter()
@@ -557,6 +605,8 @@ mod tests {
             .iter()
             .map(|(s, c)| ((*s).to_owned(), (*c).to_owned()))
             .collect();
+        let config_unread: BTreeSet<String> =
+            config_unread.iter().map(|s| (*s).to_owned()).collect();
         let inputs = Inputs {
             files: &by_path,
             routes: &routes,
@@ -565,11 +615,13 @@ mod tests {
             exact_handlers: exact,
             service_of: &service_of,
             context_paths: &context_paths,
+            config_unread: &config_unread,
         };
-        let (diagnostics, _) = add_endpoints(&mut b, &inputs).unwrap();
+        let (diagnostics, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
         Built {
             graph: b.finish().unwrap(),
             diagnostics,
+            endpoints,
         }
     }
 
@@ -815,7 +867,7 @@ mod tests {
             let go = BTreeMap::new();
             let index = Index::new(&by_path, &go, &keys);
             let service_of = |_: &str| "svc".to_owned();
-            let (exact, context) = (BTreeMap::new(), BTreeMap::new());
+            let (exact, context, unread) = (BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
             (0..3)
                 .map(|_| {
                     let mut b = GraphBuilder::new();
@@ -840,6 +892,7 @@ mod tests {
                         exact_handlers: &exact,
                         service_of: &service_of,
                         context_paths: &context,
+                        config_unread: &unread,
                     };
                     add_endpoints(&mut b, &inputs).unwrap();
                     start.elapsed()
@@ -937,6 +990,79 @@ mod tests {
         assert!(edges(&without)[0].ends_with("/api/v1/login @auth [exact]"));
     }
 
+    /// Evaluator pass 1, P8 and P7: a `ServeMux` host pattern's host is an endpoint attribute
+    /// (one host as a string, several as a sorted array, none once any registration has no
+    /// host), and every endpoint of a service whose Spring configuration is partly unread is
+    /// flagged `prefix_maybe_incomplete`.
+    #[test]
+    fn host_patterns_and_unread_config_mark_endpoints() {
+        let go = "package main\nimport \"net/http\"\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"GET Example.com:8080/hosted\", h)\n\tmux.HandleFunc(\"GET b.example.com/two\", h)\n\tmux.HandleFunc(\"GET a.example.com/two\", h)\n\tmux.HandleFunc(\"GET c.example.com/any\", h)\n\tmux.HandleFunc(\"GET /any\", h)\n}\nfunc h() {}\n";
+        let spring = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass C {\n  @GetMapping(\"/latest\")\n  String l() { return \"\"; }\n}\n";
+        let facts: Vec<(String, Language, FileFacts)> = [
+            ("go/main.go", Language::Go, go),
+            ("stats/src/C.java", Language::Java, spring),
+        ]
+        .iter()
+        .map(|(p, l, src)| {
+            (
+                (*p).to_owned(),
+                *l,
+                rb_syntax::extract(*l, src.as_bytes()).unwrap(),
+            )
+        })
+        .collect();
+        let built = build_from(&facts, &[], &BTreeMap::new(), &["stats"]);
+        let attrs = |key: &str| {
+            built
+                .graph
+                .nodes()
+                .iter()
+                .find(|n| n.key == key)
+                .unwrap_or_else(|| panic!("{key}"))
+                .attrs
+                .clone()
+        };
+        assert_eq!(attrs("HTTP GET /hosted @go")["host"], "example.com");
+        assert_eq!(
+            attrs("HTTP GET /two @go")["host"],
+            json!(["a.example.com", "b.example.com"])
+        );
+        assert!(!attrs("HTTP GET /any @go").contains_key("host"));
+        assert!(!attrs("HTTP GET /any @go").contains_key("prefix_maybe_incomplete"));
+        assert_eq!(
+            attrs("HTTP GET /latest @stats")["prefix_maybe_incomplete"],
+            true
+        );
+        let refs: Vec<(&str, &[String], bool)> = built
+            .endpoints
+            .iter()
+            .map(|e| {
+                (
+                    e.key.as_str(),
+                    e.hosts.as_slice(),
+                    e.prefix_maybe_incomplete,
+                )
+            })
+            .collect();
+        assert_eq!(
+            refs,
+            [
+                ("HTTP GET /any @go", &[][..], false),
+                (
+                    "HTTP GET /hosted @go",
+                    &["example.com".to_owned()][..],
+                    false
+                ),
+                ("HTTP GET /latest @stats", &[][..], true),
+                (
+                    "HTTP GET /two @go",
+                    &["a.example.com".to_owned(), "b.example.com".to_owned()][..],
+                    false
+                ),
+            ]
+        );
+    }
+
     /// S8: in a file an exact index owns, the occurrence at the handler's token makes
     /// `HANDLED_BY` exact; without it the same name is heuristic.
     #[test]
@@ -960,7 +1086,7 @@ mod tests {
         let col = (start - app[..start].rfind('\n').unwrap() - 1) as i32;
         let handler = rb_syntax::symbol_keys("svc/handlers.ts", &facts[1].2)[0].clone();
         let certainty = |exact: &BTreeMap<(&str, Span), String>| {
-            let built = build_from(&facts, &[], exact);
+            let built = build_from(&facts, &[], exact, &[]);
             let g = &built.graph;
             let e = g
                 .edges()

@@ -762,7 +762,7 @@ Server routes and client URLs are normalised to one form:
 - Catch-alls (`*`, `**`, `{*rest}`, `{rest...}`, `<path:p>`) become `{*}`, last segment only. Go's `{$}` is dropped.
 - Query strings and fragments are dropped; a space is percent-encoded.
 - A client hole inside a segment makes the segment `{}`, flagged `partial`.
-- M4a reads `src/main/resources/application.properties` only. YAML, profile files and gateway configs are deferred, and a Spring YAML file mentioning `context-path` is reported as `spring_config_unread`.
+- M4a reads `src/main/resources/application.properties` only. YAML, profile files and gateway configs are deferred, and a Spring YAML file mentioning `context-path` is reported as `spring_config_unread`. A service with profile files, YAML, `bootstrap*` files or a Spring Cloud Config client gets one `config_unread` diagnostic; its endpoints are flagged `prefix_maybe_incomplete` and stitches into them, or from a site whose folded property such a file may set, stay below `synthetic` (contract M4a amendment 11).
 - *As decided in contract-m4a (amendment 10, fork F3):* when a route's prefix cannot be composed (an Express router mounted nowhere visible or through a default import, a gin group passed as a function parameter), the path is the tail below its router, the endpoint is flagged `prefix_unknown`, and its key carries the router's identity (the declaring file and the binding's scope-qualified name, no position), so it never merges with a route of the same tail on another router or with a known-prefix route.
 
 ### 10.2 Stitching client call sites to endpoints (`http_stitch`)

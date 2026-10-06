@@ -196,8 +196,9 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
 const AXIOS_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
 
 /// Local names of the `axios` module: default or namespace import, or a top-level
-/// `require("axios")`.
-fn axios_names(facts: &FileFacts) -> Vec<String> {
+/// `require("axios")`; plus the indices of those `require` bindings.
+fn axios_names(facts: &FileFacts) -> (Vec<String>, HashSet<usize>) {
+    let mut requires = HashSet::new();
     let mut names: Vec<String> = facts
         .imports
         .iter()
@@ -211,10 +212,11 @@ fn axios_names(facts: &FileFacts) -> Vec<String> {
             )
         })
         .collect();
-    for b in facts
+    for (i, b) in facts
         .bindings
         .iter()
-        .filter(|b| b.scope.is_none() && !b.member)
+        .enumerate()
+        .filter(|(_, b)| b.scope.is_none() && !b.member)
     {
         if let Some(c) = init_chain(facts, b)
             && c.root.is_none()
@@ -223,9 +225,10 @@ fn axios_names(facts: &FileFacts) -> Vec<String> {
             && c.links[0].args.first().and_then(literal).as_deref() == Some("axios")
         {
             names.push(b.name.clone());
+            requires.insert(i);
         }
     }
-    names
+    (names, requires)
 }
 
 fn init_chain<'f>(facts: &'f FileFacts, b: &Binding) -> Option<&'f CallChain> {
@@ -236,7 +239,15 @@ fn init_chain<'f>(facts: &'f FileFacts, b: &Binding) -> Option<&'f CallChain> {
 }
 
 fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
-    let names = axios_names(facts);
+    let (names, requires) = axios_names(facts);
+    // `name` at `at` is the axios module: one of its local names, not shadowed by a parameter
+    // or variable in effect there (evaluator pass 1, P6); the `require` binding is the module.
+    let is_axios = |name: &str, at: Span| {
+        names.iter().any(|n| n == name)
+            && facts
+                .binding_index_at(name, at)
+                .is_none_or(|bi| requires.contains(&bi))
+    };
     // Instances: `const api = axios.create({ baseURL })`.
     let mut instances: HashMap<usize, Option<UrlValue>> = HashMap::new();
     for (bi, b) in facts.bindings.iter().enumerate().filter(|(_, b)| !b.member) {
@@ -244,7 +255,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
             continue;
         };
         if let (Some(root), [link]) = (c.root.as_deref(), c.links.as_slice())
-            && names.iter().any(|n| n == root)
+            && is_axios(root, c.span)
             && link.name == "create"
         {
             let base = entry(link.args.first(), "baseURL").map(|a| UrlValue::of(Some(a)));
@@ -268,7 +279,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
         };
         // `axios(url | config)`.
         if chain.root.is_none() {
-            if names.contains(&first.name) && !first.args.is_empty() {
+            if is_axios(&first.name, chain.span) && !first.args.is_empty() {
                 out.calls.push(axios_call(
                     chain,
                     None,
@@ -281,7 +292,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
         }
         let root = chain.root.as_deref().unwrap_or_default();
         let bound = facts.binding_index_at(root, chain.span);
-        let (base, instance) = if names.iter().any(|n| n == root) {
+        let (base, instance) = if is_axios(root, chain.span) {
             (None, None)
         } else if let Some(base) = bound.and_then(|bi| instances.get(&bi)) {
             (base.clone(), None)
@@ -394,12 +405,25 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients) {
         out.calls.push(ClientCall {
             kind: ClientKind::RestTemplate,
             method,
-            url: UrlValue::of(first.args.first()),
-            base: None,
+            url: java_url(facts, first.args.first()),
+            // No root URI in sight: unknown, as for `WebClient` (a relative URL needs one).
+            base: Some(UrlValue::Unknown),
             instance: None,
             span: chain.span,
             source: chain.enclosing,
         });
+    }
+}
+
+/// A Java URL argument: a string or a name, or `String.format(lit, args…)` as a template whose
+/// verbs are holes (P1's Java form).
+fn java_url(facts: &FileScope<'_>, arg: Option<&Arg>) -> UrlValue {
+    match arg {
+        Some(Arg::Other { span }) => ["String", "java.lang.String"]
+            .iter()
+            .find_map(|root| format_template(facts, root, "format", *span))
+            .map_or(UrlValue::Unknown, UrlValue::Template),
+        other => UrlValue::of(other),
     }
 }
 
@@ -473,12 +497,17 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients) {
             .find(|l| l.name == "uri")
             .map_or_else(
                 || UrlValue::lit("", chain.span),
-                |l| UrlValue::of(l.args.first()),
+                |l| java_url(facts, l.args.first()),
             );
-        let base = fluent_base(chain, verb).or_else(|| {
-            let init = receiver.and_then(|b| init_chain(facts, b))?;
-            fluent_base(init, init.links.len())
-        });
+        // A server-side client has no origin of its own, so with no `baseUrl` in sight (one set
+        // in a constructor, say) the base is unknown, never empty: a relative URI is then
+        // matched by suffix (evaluator pass 1, suspected item 1).
+        let base = fluent_base(chain, verb)
+            .or_else(|| {
+                let init = receiver.and_then(|b| init_chain(facts, b))?;
+                fluent_base(init, init.links.len())
+            })
+            .or(Some(UrlValue::Unknown));
         out.calls.push(ClientCall {
             kind,
             method,
@@ -671,7 +700,7 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
         let url = match url {
             Some(Arg::Other { span }) => fmt
                 .as_deref()
-                .and_then(|fmt| sprintf(facts, fmt, *span))
+                .and_then(|fmt| format_template(facts, fmt, "Sprintf", *span))
                 .map_or(UrlValue::Unknown, UrlValue::Template),
             other => UrlValue::of(other),
         };
@@ -687,14 +716,20 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
     }
 }
 
-/// `fmt.Sprintf(lit, args…)` at `span` as a template whose verbs are holes naming their
-/// arguments (`%s %d %v %q` and the rest; `%%` is a literal `%`).
-fn sprintf(facts: &FileScope<'_>, fmt: &str, span: Span) -> Option<StrTemplate> {
+/// `<root>.<name>(lit, args…)` at `span` — Go's `fmt.Sprintf`, Java's `String.format` — as a
+/// template whose verbs are holes naming their arguments (`%s %d %v %q` and the rest; `%%` is a
+/// literal `%`).
+fn format_template(
+    facts: &FileScope<'_>,
+    root: &str,
+    name: &str,
+    span: Span,
+) -> Option<StrTemplate> {
     let chain = facts.chain_at(span)?;
     let [link] = chain.links.as_slice() else {
         return None;
     };
-    if chain.root.as_deref() != Some(fmt) || link.name != "Sprintf" {
+    if chain.root.as_deref() != Some(root) || link.name != name {
         return None;
     }
     let format = literal(link.args.first()?)?;
@@ -834,6 +869,19 @@ mod tests {
                 top_level: true,
             }]
         );
+        // A parameter or local named like the import shadows it: not axios (evaluator pass 1,
+        // P6), here and for `axios(…)` and `axios.create(…)`.
+        let shadowed = "import axios from \"axios\";\nexport async function p(axios: { get(u: string): void }) {\n  axios.get(\"/users/me\");\n  axios(\"/x\");\n}\nexport function l() {\n  const axios = mk();\n  axios.post(\"/y\", 1);\n  const api = axios.create({ baseURL: \"http://z\" });\n  api.get(\"/z\");\n}\nexport function ok() { axios.get(\"/real\"); }\n";
+        assert_eq!(calls(Language::TypeScript, shadowed), ["axios GET '/real'"]);
+        let facts = extract(Language::TypeScript, shadowed.as_bytes()).unwrap();
+        assert!(
+            clients(Language::TypeScript, &facts)
+                .axios_instances
+                .is_empty()
+        );
+        // `const axios = require("axios")` is the module itself, not a shadow.
+        let cjs = "const axios = require(\"axios\");\nfunction f() { axios.get(\"/c\"); }\n";
+        assert_eq!(calls(Language::JavaScript, cjs), ["axios GET '/c'"]);
         // Without the axios import, only a call on an imported name is kept, as a candidate the
         // indexer drops unless the import resolves to an axios instance; a local is nothing.
         let none = "import http from \"./my-http\";\nhttp.post(\"/x\", 1);\nconst local = mk();\nlocal.get(\"/y\");\n";
@@ -849,13 +897,24 @@ mod tests {
         assert_eq!(
             calls(Language::Java, src),
             [
-                "rest_template GET 'http://visits/owners/{id}'",
-                "rest_template PUT '{BASE}/x'",
-                "rest_template ? '/y'",
+                "rest_template GET 'http://visits/owners/{id}' base=?",
+                "rest_template PUT '{BASE}/x' base=?",
+                "rest_template ? '/y' base=?",
                 "web_client GET '/owners/{ownerId}' base='http://customers-service'",
-                "web_client POST 'http://visits-service/pets/visits'",
-                "rest_client DELETE '/r'",
+                "web_client POST 'http://visits-service/pets/visits' base=?",
+                "rest_client DELETE '/r' base=?",
                 "web_client GET '' base='http://x'",
+            ]
+        );
+        // A server-side client has no origin of its own: with no `baseUrl` in sight (one set in
+        // a constructor, say) the base is unknown, so a relative URI is matched by suffix
+        // (evaluator pass 1, suspected item). `String.format` is a template (P1's Java form).
+        let ctor = "package p;\nimport org.springframework.web.reactive.function.client.WebClient;\nimport org.springframework.web.client.RestTemplate;\nclass C {\n  private final WebClient client;\n  RestTemplate rest;\n  C(WebClient.Builder b) { this.client = b.baseUrl(\"http://customers\").build(); }\n  void m(int port, String id) {\n    client.get().uri(\"/owners\").retrieve();\n    rest.getForObject(String.format(\"http://localhost:%d/x/%s\", port, id), String.class);\n  }\n}\n";
+        assert_eq!(
+            calls(Language::Java, ctor),
+            [
+                "rest_template GET 'http://localhost:{port}/x/{id}' base=?",
+                "web_client GET '/owners' base=?",
             ]
         );
         // Same short names from another package are not clients.

@@ -7,6 +7,7 @@
 //! segment (suffix matches), and each is confirmed by the reference matcher
 //! ([`rb_frameworks::endpoint::match_path`]), so the index decides nothing D9 does not.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use rb_frameworks::clients::{ClientKind, FileClients, UrlValue};
@@ -96,6 +97,10 @@ pub(crate) struct Site {
     pub method: Option<String>,
     /// `None` when the URL is not a string or a name.
     pub url: Option<Folded>,
+    /// A Spring property the URL folded is also set by a configuration file M4a does not read
+    /// (a profile, YAML or bootstrap file), so the folded value may not be the deployed one
+    /// (evaluator pass 1, P7).
+    pub config_overridden: bool,
 }
 
 /// A service as the host rule (D6) sees it.
@@ -136,6 +141,21 @@ impl Outcome {
 // ---------------------------------------------------------------------------------------------
 // Sites: client facts with their URLs folded (S9–S12)
 
+/// What Spring configuration M4a does not read may set for one service (evaluator pass 1, P7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Overrides {
+    /// Keys set by profile, YAML or `bootstrap*` files.
+    pub keys: BTreeSet<String>,
+    /// A Spring Cloud Config client: the server may set any key.
+    pub all: bool,
+}
+
+impl Overrides {
+    pub(crate) fn sets(&self, key: &str) -> bool {
+        self.all || self.keys.contains(key)
+    }
+}
+
 /// What site collection reads.
 pub(crate) struct Inputs<'a, 'i> {
     pub files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
@@ -145,6 +165,8 @@ pub(crate) struct Inputs<'a, 'i> {
     pub service_of: &'i dyn Fn(&str) -> String,
     /// Service key → its `application.properties`.
     pub properties: &'i BTreeMap<String, BTreeMap<String, String>>,
+    /// Service key → what unread configuration may set.
+    pub overrides: &'i BTreeMap<String, Overrides>,
 }
 
 /// One file's top-level non-member bindings (`None`) and type members (`Some(type)`) by name.
@@ -158,6 +180,8 @@ struct Folding<'a, 'i> {
     ids: HashMap<&'a str, usize>,
     /// Per file.
     declared: Vec<Declared<'a>>,
+    /// The `(service, key)` of every property asked for since the last [`Folding::take_asked`].
+    asked: RefCell<Vec<(String, String)>>,
 }
 
 impl<'a, 'i> Folding<'a, 'i> {
@@ -182,7 +206,18 @@ impl<'a, 'i> Folding<'a, 'i> {
             paths,
             ids,
             declared,
+            asked: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Whether a property asked for since the last call is one unread configuration may set.
+    fn take_asked(&self) -> bool {
+        self.asked.take().iter().any(|(service, key)| {
+            self.inputs
+                .overrides
+                .get(service)
+                .is_some_and(|o| o.sets(key))
+        })
     }
 
     fn value(&self, file: usize, v: &UrlValue) -> Option<Folded> {
@@ -228,7 +263,14 @@ impl Lookup for Folding<'_, '_> {
 
     fn property(&self, file: usize, key: &str) -> Option<String> {
         let service = (self.inputs.service_of)(self.paths[file]);
-        self.inputs.properties.get(&service)?.get(key).cloned()
+        let value = self
+            .inputs
+            .properties
+            .get(&service)
+            .and_then(|p| p.get(key))
+            .cloned();
+        self.asked.borrow_mut().push((service, key.to_owned()));
+        value
     }
 }
 
@@ -248,6 +290,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
         let facts = inputs.files[path].1;
         let service = (inputs.service_of)(path);
         for call in &file_clients.calls {
+            folding.take_asked();
             let base = match &call.instance {
                 Some(name) => match imported_instance(inputs, &clients, path, facts, name) {
                     Some((target, base)) => base.map(|b| (folding.ids[target], b)),
@@ -273,6 +316,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 client: call.kind,
                 method: call.method.clone(),
                 url,
+                config_overridden: folding.take_asked(),
             });
         }
     }
@@ -311,14 +355,15 @@ fn imported_instance<'a>(
 }
 
 /// A URL relative to a base: the base then the URL (with a `/` between unless one side has it),
-/// unless the URL is absolute. An unknown base is a hole. The label is the weakest among the
-/// parts that resolved.
+/// unless the URL is absolute. An unknown base is a hole (none is added before a URL that starts
+/// with one). The label is the weakest among the parts that resolved.
 fn join(base: Option<Folded>, url: Folded) -> Folded {
     let absolute = {
         let u = client_url(&url.pieces);
         u.host.is_some() || u.host_dynamic
     };
-    if absolute {
+    // An unknown base before a URL that already starts with an unknown part adds nothing.
+    if absolute || (base.is_none() && url.pieces.first() == Some(&Piece::Hole)) {
         return url;
     }
     let base = base.unwrap_or(Folded {
@@ -489,31 +534,36 @@ impl<'e> Stitcher<'e> {
             return Outcome::bucket(Bucket::Dynamic);
         }
         let method = site.method.as_deref().unwrap_or(ANY);
+        // Candidates of every service the host allows, the caller's own included: they are
+        // ranked together, so excluding the own service never promotes a worse foreign match
+        // (evaluator pass 1, P2). An endpoint registered with a host pattern needs that host
+        // (P8).
         let found: Vec<(usize, PathMatch)> = self
             .index
             .candidates(&client, url.base_unknown)
             .into_iter()
-            .filter(|(i, _)| methods_match(method, &self.endpoints[*i].method))
+            .filter(|(i, _)| {
+                let e = &self.endpoints[*i];
+                methods_match(method, &e.method)
+                    && (e.hosts.is_empty()
+                        || url.host.as_ref().is_some_and(|h| e.hosts.contains(h)))
+                    && match scope {
+                        Scope::Only(s) => e.service == s,
+                        Scope::Any | Scope::Proxy => true,
+                    }
+            })
             .collect();
-        let (own, others): (Vec<_>, Vec<_>) = found
-            .into_iter()
-            .partition(|(i, _)| self.endpoints[*i].service == site.service);
-        let others: Vec<(usize, PathMatch)> = match scope {
-            Scope::Only(s) => others
-                .into_iter()
-                .filter(|(i, _)| self.endpoints[*i].service == s)
-                .collect(),
-            Scope::Any | Scope::Proxy => others,
-        };
-        if others.is_empty() {
-            let only_own = !own.is_empty() && !matches!(scope, Scope::Only(_));
-            return Outcome::bucket(if only_own {
-                Bucket::OwnService
-            } else {
-                Bucket::Unmatched
-            });
+        if found.is_empty() {
+            return Outcome::bucket(Bucket::Unmatched);
         }
-        let best = self.most_specific(others, method, client.len());
+        let best = self.most_specific(found, method, client.len());
+        // The best match is the caller's own endpoint: a call within the service (invariant 5).
+        if best
+            .iter()
+            .any(|(i, _)| self.endpoints[*i].service == site.service)
+        {
+            return Outcome::bucket(Bucket::OwnService);
+        }
         let n = best.len();
         if n > MAX_CANDIDATES {
             return Outcome {
@@ -562,7 +612,10 @@ impl<'e> Stitcher<'e> {
             && folded.origin >= Origin::Config
             && !url.flags.partial
             && !url.flags.wildcard_not_last
-            && !e.prefix_unknown;
+            && !url.flags.opaque_tail
+            && !site.config_overridden
+            && !e.prefix_unknown
+            && !e.prefix_maybe_incomplete;
         let certainty = if synthetic {
             Certainty::Synthetic
         } else {
@@ -738,6 +791,8 @@ mod tests {
         ("services/auth", "auth-service"),
         ("services/billing/cmd/billing", "billing"),
         ("services/notification", "notification"),
+        ("services/orders", "orders"),
+        ("services/users", "users"),
     ];
 
     fn services() -> Vec<ServiceRef> {
@@ -760,6 +815,8 @@ mod tests {
             service: service.to_owned(),
             prefix_unknown: false,
             certainty: Certainty::Exact,
+            hosts: Vec::new(),
+            prefix_maybe_incomplete: false,
         }
     }
 
@@ -809,6 +866,7 @@ mod tests {
             client: ClientKind::Fetch,
             method: method.map(str::to_owned),
             url: url.map(|(t, o)| folded(t, o)),
+            config_overridden: false,
         }
     }
 
@@ -919,6 +977,49 @@ mod tests {
             ),
             &with_param,
         );
+        // A client catch-all before the last segment, read as `{}` (`wildcard_not_last`).
+        let mut inner = eps.clone();
+        inner.push(ep("GET", "/u/{id}/x", NOTIFICATION));
+        lowered(
+            site(
+                AUTH,
+                Some("GET"),
+                Some(("http://notification/u/*/x", Literal)),
+                1,
+            ),
+            &inner,
+        );
+        // An opaque tail (evaluator pass 1, P3).
+        lowered(
+            site(
+                AUTH,
+                Some("POST"),
+                Some(("http://notification/internal/mfa/email{?}", Literal)),
+                1,
+            ),
+            &eps,
+        );
+        // An endpoint whose service has configuration M4a does not read (P7).
+        let mut unread = eps.clone();
+        unread[2].prefix_maybe_incomplete = true;
+        lowered(
+            site(
+                AUTH,
+                Some("POST"),
+                Some(("http://notification/internal/mfa/email", Literal)),
+                1,
+            ),
+            &unread,
+        );
+        // A folded property that a profile or YAML file also sets (P7).
+        let mut overridden = site(
+            AUTH,
+            Some("POST"),
+            Some(("http://notification/internal/mfa/email", Config)),
+            1,
+        );
+        overridden.config_overridden = true;
+        lowered(overridden, &eps);
         // An endpoint `{*}`.
         let mut wild = eps.clone();
         wild.push(ep("GET", "/static/*", NOTIFICATION));
@@ -1111,18 +1212,159 @@ mod tests {
             .0,
             Bucket::OwnService
         );
-        // Own candidates are never counted beside others': only notification's is linked.
+        // Own candidates rank with the others: an own endpoint as good as notification's makes
+        // the site `self` (evaluator pass 1, P2).
+        assert_eq!(
+            one(
+                &eps,
+                &site(
+                    BILLING,
+                    Some("POST"),
+                    Some(("/internal/mfa/email", Literal)),
+                    1,
+                ),
+            ),
+            (Bucket::OwnService, vec![])
+        );
+    }
+
+    /// Evaluator pass 1, P2 (measured on piggymetrics): a suffix match needs a literal in the
+    /// endpoint tail it matched, and the caller's own endpoints rank with the others, so the
+    /// own-service exclusion never promotes a worse foreign candidate.
+    #[test]
+    fn suffix_evidence_and_own_service_ranking() {
+        // `ExchangeRatesClient`: an unresolved Feign url and `/latest`; account and statistics
+        // (the caller's own service) each expose `GET /{name}`.
+        let eps = vec![
+            ep("GET", "/{name}", AUTH),
+            ep("GET", "/{accountName}", BILLING),
+            ep("GET", "/{x}", NOTIFICATION),
+        ];
+        assert_eq!(
+            one(
+                &eps,
+                &site(BILLING, Some("GET"), Some(("{?}/latest", Literal)), 1)
+            ),
+            (Bucket::Unmatched, vec![])
+        );
+        // An own endpoint ranked above a foreign one: `self`, not the foreign one.
+        let eps = vec![ep("POST", "/x/pay", BILLING), ep("POST", "/{p}/pay", AUTH)];
+        assert_eq!(
+            one(
+                &eps,
+                &site(BILLING, Some("POST"), Some(("{?}/x/pay", Literal)), 1)
+            ),
+            (Bucket::OwnService, vec![])
+        );
+        // A foreign endpoint ranked above an own one is linked.
+        let eps = vec![ep("POST", "/{p}/pay", BILLING), ep("POST", "/x/pay", AUTH)];
         let (bucket, links) = one(
             &eps,
-            &site(
-                BILLING,
-                Some("POST"),
-                Some(("/internal/mfa/email", Literal)),
-                1,
-            ),
+            &site(BILLING, Some("POST"), Some(("{?}/x/pay", Literal)), 1),
         );
         assert_eq!(bucket, Bucket::Heuristic);
-        assert!(links[0].starts_with("HTTP POST /internal/mfa/email @services/notification"));
+        assert!(
+            links[0].starts_with("HTTP POST /x/pay @services/auth "),
+            "{links:?}"
+        );
+        // A host naming another service still restricts the ranking to that service.
+        let eps = vec![ep("GET", "/a/b", BILLING), ep("GET", "/a/{x}", AUTH)];
+        assert_eq!(
+            one(
+                &eps,
+                &site(BILLING, Some("GET"), Some(("http://auth/a/b", Literal)), 1)
+            )
+            .0,
+            Bucket::Synthetic
+        );
+    }
+
+    /// Evaluator pass 1, P3: a hole glued to the end of the URL is an opaque tail, so
+    /// `"/api/items" + qs` matches `/api/items`, not another service's `/api/{name}` or an SPA
+    /// catch-all.
+    #[test]
+    fn an_opaque_tail_matches_the_literal_path() {
+        let eps = vec![
+            ep("GET", "/api/items", "services/orders"),
+            ep("GET", "/api/{name}", NOTIFICATION),
+            ep("GET", "/*", AUTH),
+        ];
+        let (bucket, links) = one(
+            &eps,
+            &site(WEB, Some("GET"), Some(("/api/items{?}", Literal)), 1),
+        );
+        assert_eq!(bucket, Bucket::Heuristic);
+        assert!(
+            links[0].starts_with("HTTP GET /api/items @services/orders "),
+            "{links:?}"
+        );
+        // A hole after `/` is still a whole-segment parameter.
+        let (_, links) = one(
+            &eps,
+            &site(WEB, Some("GET"), Some(("/api/items/{?}", Literal)), 1),
+        );
+        assert!(
+            links[0].starts_with("HTTP GET /{*} @services/auth "),
+            "{links:?}"
+        );
+    }
+
+    /// Evaluator pass 1, P1 (the evaluator's repros, folded URLs): a hole in the port keeps a
+    /// literal host, so loopback is `self`, an external host is never path-matched and a host
+    /// naming a service restricts candidates to it.
+    #[test]
+    fn port_holes_keep_the_host() {
+        const ORDERS: &str = "services/orders";
+        const USERS: &str = "services/users";
+        let eps = vec![
+            ep("GET", "/orders/{id}", ORDERS),
+            ep("GET", "/health", USERS),
+            ep("GET", "/users/me", USERS),
+        ];
+        for (service, url, want) in [
+            (USERS, "http://localhost:{?}/orders/1", Bucket::OwnService),
+            (
+                WEB,
+                "https://status.example.com:{?}/orders/1",
+                Bucket::External,
+            ),
+            (WEB, "http://users:{?}/orders/1", Bucket::Unmatched),
+            (ORDERS, "http://localhost:{?}/health", Bucket::OwnService),
+            (ORDERS, "http://127.0.0.1:{?}/users/me", Bucket::OwnService),
+            (ORDERS, "http://users:{?}/users/me", Bucket::Synthetic),
+            // Only a hole in the host itself restricts nothing.
+            (ORDERS, "http://{?}:8080/users/me", Bucket::Heuristic),
+        ] {
+            assert_eq!(
+                one(&eps, &site(service, Some("GET"), Some((url, Literal)), 1)).0,
+                want,
+                "{service} {url}"
+            );
+        }
+    }
+
+    /// Evaluator pass 1, P8: an endpoint registered with a Go `ServeMux` host pattern is matched
+    /// only by a client whose host equals it.
+    #[test]
+    fn host_patterns_restrict_their_endpoints() {
+        let mut hosted = ep("GET", "/v2/things", NOTIFICATION);
+        hosted.hosts = vec!["api.example.com".into()];
+        let mut named = ep("GET", "/hosted", NOTIFICATION);
+        named.hosts = vec!["notification".into()];
+        let eps = vec![hosted, named];
+        for (url, want) in [
+            ("http://notification/v2/things", Bucket::Unmatched),
+            ("/v2/things", Bucket::Unmatched),
+            ("{?}/v2/things", Bucket::Unmatched),
+            ("http://notification:3000/hosted", Bucket::Synthetic),
+            ("/hosted", Bucket::Unmatched),
+        ] {
+            assert_eq!(
+                one(&eps, &site(AUTH, Some("GET"), Some((url, Literal)), 1)).0,
+                want,
+                "{url}"
+            );
+        }
     }
 
     /// Invariant 7 and D6: a literal host naming no service is external, never path-matched; a
@@ -1632,6 +1874,29 @@ mod tests {
         go_modules: &[(&str, &str)],
         properties: &[(&str, &str, &str)],
     ) -> Vec<String> {
+        collect_sites(files, go_modules, properties, &[])
+            .iter()
+            .map(|s| {
+                let url = s.url.as_ref().map_or("?".to_owned(), |u| {
+                    format!("{} [{}]", render(u), u.origin.as_str())
+                });
+                format!(
+                    "{} {} {} {url}",
+                    s.at.path,
+                    s.client.as_str(),
+                    s.method.as_deref().unwrap_or("?")
+                )
+            })
+            .collect()
+    }
+
+    /// The sites of `files`, folded as the indexer folds them (see [`folded_sites`]).
+    fn collect_sites(
+        files: &[(&str, Language, &str)],
+        go_modules: &[(&str, &str)],
+        properties: &[(&str, &str, &str)],
+        overrides: &[(&str, &str)],
+    ) -> Vec<Site> {
         let facts: Vec<(&str, Language, FileFacts)> = files
             .iter()
             .map(|(p, l, src)| (*p, *l, rb_syntax::extract(*l, src.as_bytes()).unwrap()))
@@ -1655,27 +1920,89 @@ mod tests {
                 .insert((*k).to_owned(), (*v).to_owned());
         }
         let service_of = |p: &str| p.split('/').next().unwrap_or(p).to_owned();
+        let overrides: BTreeMap<String, Overrides> = overrides
+            .iter()
+            .map(|(service, key)| {
+                (
+                    (*service).to_owned(),
+                    Overrides {
+                        keys: BTreeSet::from([(*key).to_owned()]),
+                        all: *key == "*",
+                    },
+                )
+            })
+            .collect();
         let inputs = Inputs {
             files: &by_path,
             index: &index,
             keys: &keys,
             service_of: &service_of,
             properties: &props,
+            overrides: &overrides,
         };
         sites(&inputs)
+    }
+
+    /// Evaluator pass 1, P1, from source: a port hole written as a template literal, a
+    /// concatenation, a Java `+` or `String.format`, and a Go `fmt.Sprintf` keeps the literal
+    /// host, so loopback is `self`, an external host `external` and a named host restricts the
+    /// candidates; `orders` exposes `GET /orders/{id}`, `users` `GET /users/me`.
+    #[test]
+    fn port_holes_keep_the_host_in_every_source_form() {
+        let ts = "export async function f(port: number) {\n  await fetch(`http://localhost:${port}/orders/1`);\n  await fetch(\"http://localhost:\" + port + \"/orders/1\");\n  await fetch(`https://status.example.com:${port}/orders/1`);\n  await fetch(`http://users:${port}/orders/1`);\n  await fetch(`http://users:${port}/users/me`);\n  await fetch(`http://${host}:${port}/users/me`);\n}\n";
+        let java = "package p;\nimport org.springframework.web.client.RestTemplate;\nclass C {\n  RestTemplate rest;\n  void a(int port) {\n    rest.getForObject(\"http://localhost:\" + port + \"/orders/1\", String.class);\n    rest.getForObject(String.format(\"http://localhost:%d/orders/1\", port), String.class);\n    rest.getForObject(String.format(\"http://users:%d/users/me\", port), String.class);\n  }\n}\n";
+        let go = "package main\nimport (\n\t\"fmt\"\n\t\"net/http\"\n)\nfunc f(port int) {\n\thttp.Get(fmt.Sprintf(\"http://localhost:%d/orders/1\", port))\n\thttp.Get(fmt.Sprintf(\"https://status.example.com:%d/orders/1\", port))\n\thttp.Get(fmt.Sprintf(\"http://users:%d/users/me\", port))\n}\n";
+        let sites = collect_sites(
+            &[
+                ("web/src/a.ts", Language::TypeScript, ts),
+                ("orders/src/main/java/p/C.java", Language::Java, java),
+                ("orders/cmd/main.go", Language::Go, go),
+            ],
+            &[],
+            &[],
+            &[],
+        );
+        let eps = vec![
+            ep("GET", "/orders/{id}", "orders"),
+            ep("GET", "/users/me", "users"),
+        ];
+        let services: Vec<ServiceRef> = ["web", "orders", "users"]
+            .iter()
+            .map(|s| ServiceRef {
+                key: (*s).to_owned(),
+                name: (*s).to_owned(),
+            })
+            .collect();
+        let stitcher = Stitcher::new(&eps, &services);
+        let got: Vec<String> = sites
             .iter()
             .map(|s| {
-                let url = s.url.as_ref().map_or("?".to_owned(), |u| {
-                    format!("{} [{}]", render(u), u.origin.as_str())
-                });
-                format!(
-                    "{} {} {} {url}",
-                    s.at.path,
-                    s.client.as_str(),
-                    s.method.as_deref().unwrap_or("?")
-                )
+                let o = stitcher.site(s);
+                let to = o
+                    .links
+                    .iter()
+                    .map(|l| format!(" -> {}", eps[l.endpoint].key))
+                    .collect::<String>();
+                format!("{} {} {}{to}", s.at.path, s.at.span[0], o.bucket.as_str())
             })
-            .collect()
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "orders/cmd/main.go 6 self",
+                "orders/cmd/main.go 7 external",
+                "orders/cmd/main.go 8 synthetic -> HTTP GET /users/me @users",
+                "orders/src/main/java/p/C.java 5 self",
+                "orders/src/main/java/p/C.java 6 self",
+                "orders/src/main/java/p/C.java 7 synthetic -> HTTP GET /users/me @users",
+                "web/src/a.ts 1 self",
+                "web/src/a.ts 2 self",
+                "web/src/a.ts 3 external",
+                "web/src/a.ts 4 unmatched",
+                "web/src/a.ts 5 synthetic -> HTTP GET /users/me @users",
+                "web/src/a.ts 6 heuristic -> HTTP GET /users/me @users",
+            ]
+        );
     }
 
     /// S12 across files: a TS named import (aliased), a Java `Type.CONST` and static import, a
@@ -1791,6 +2118,33 @@ mod tests {
                 "web/src/use.ts axios GET http://gateway/api/v1/me [literal]",
             ]
         );
+    }
+
+    /// Evaluator pass 1, P7: a site whose URL folded a property that unread configuration may
+    /// set (a profile file's key, or any key of a config client) is marked, and the mark is per
+    /// site: the `@Value` site and the Feign site are each judged by the keys they read.
+    #[test]
+    fn a_folded_property_set_by_unread_configuration_marks_the_site() {
+        let java = "package p;\nimport org.springframework.web.client.RestTemplate;\nclass C {\n  @Value(\"${users.url}\") String users;\n  @Value(\"${orders.url}\") String orders;\n  RestTemplate rest;\n  void a() { rest.getForObject(users + \"/users/me\", String.class); }\n  void b() { rest.getForObject(orders + \"/orders\", String.class); }\n  void c() { rest.getForObject(\"http://users/x\", String.class); }\n}\n";
+        let marked = |overrides: &[(&str, &str)]| -> Vec<bool> {
+            collect_sites(
+                &[("a/src/C.java", Language::Java, java)],
+                &[],
+                &[
+                    ("a", "users.url", "http://users"),
+                    ("a", "orders.url", "http://orders"),
+                ],
+                overrides,
+            )
+            .iter()
+            .map(|s| s.config_overridden)
+            .collect()
+        };
+        assert_eq!(marked(&[]), [false, false, false]);
+        assert_eq!(marked(&[("a", "users.url")]), [true, false, false]);
+        assert_eq!(marked(&[("a", "*")]), [true, true, false]);
+        // Another service's overrides do not mark this one's sites.
+        assert_eq!(marked(&[("b", "*")]), [false, false, false]);
     }
 
     /// Two declarations a name may mean fold to nothing: the constant is not known.

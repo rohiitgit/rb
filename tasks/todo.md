@@ -394,3 +394,15 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
   - [x] Full verification loop and the stub scan.
   - [ ] A separate evaluator pass; fix its findings test-first (each round adds contract amendments). M4a is not marked done until the evaluator decides.
   - Commit after each verified phase.
+
+## Review (M4a evaluator pass 1)
+- [x] Plan (orchestrator's decisions, contract amendment 11): P1 hosts past holes; P2 suffix evidence and own-service ranking; P3 opaque tails; P4 `rb path` scopes; P5 biting tests; P6 axios shadowing; P7 `config_unread`; P8 `ServeMux` hosts; P9 residue; P10 dead code; the two suspected items; honest open items; `PIPELINE = m4a-http-5`.
+- [x] Baseline: `d2aee54` release binary built and the four public repositories dumped before any change.
+- [x] P1–P3 (`rb-frameworks/src/endpoint.rs`, `clients.rs`) and the stitcher (`rb-indexer/src/stitch.rs`), test-first.
+- [x] P8 route host, P7 configuration (`routes.rs` ×2, `lib.rs`, `fold.rs`), test-first.
+- [x] P4 and suspected item 2 (`rb-store/src/path.rs`), test-first; P5 tests; both mutation batches (20 runs, all killed).
+- [x] Public repositories re-measured and diffed (only the expected rows changed; piggymetrics' false edge gone); fresh == cached == second repository.
+- [x] Records: contract, design §10, CHANGELOG, IMPLEMENT.md, lessons.
+- [x] Verification loop (fmt, clippy, 437 unit tests, e2e twice, stub scan); clean-up of `fx4a1_*` and `var/fix-m4a-1/`.
+- Found while fixing: the P4 drop also happens upstream (a file reached from two inline handlers); config *servers* first read as config clients; a hole in user information (`http://u:${p}@h`) would have been read as a port hole. Each fixed test-first.
+- [ ] Evaluator pass 2.

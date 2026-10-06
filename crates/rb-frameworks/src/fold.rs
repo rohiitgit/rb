@@ -7,7 +7,7 @@
 //! ([`MAX_FOLD_DEPTH`]) and a step budget ([`MAX_FOLD_STEPS`]); only results computed without
 //! hitting any of them are memoised (lesson 2026-09-30).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use rb_syntax::{Binding, DefKind, FileFacts, Init, Language, Span, StrTemplate, TemplatePart};
 
@@ -98,12 +98,6 @@ pub fn fold_template(lookup: &dyn Lookup, file: usize, template: &StrTemplate) -
 /// The value of a name (`API`, `this.base`, `Paths.ROOT`) written in `file` at `at`.
 pub fn fold_name(lookup: &dyn Lookup, file: usize, name: &str, at: Span) -> Folded {
     Folder::new(lookup).name(file, name, at, 0).0
-}
-
-/// Spring placeholders (`${k}`, `${k:default}`) in `text` written in `file`: a property is
-/// `config`, a default `env_default`, anything else a hole.
-pub fn fold_placeholders(lookup: &dyn Lookup, file: usize, text: &str) -> Folded {
-    placeholders(lookup, file, text)
 }
 
 /// Whether a name reads the environment (`process.env.X`, `import.meta.env.X`).
@@ -381,6 +375,55 @@ pub fn parse_properties(text: &str) -> BTreeMap<String, String> {
         out.insert(unescape(&key), unescape(value.trim_start()));
     }
     out
+}
+
+/// The dotted keys a Spring YAML file sets (`spring:` then `  cloud:` gives `spring` and
+/// `spring.cloud`), read by indentation: comments, document markers and list items are skipped
+/// and quotes around a key dropped. Not a YAML parser (none is a dependency): it answers only
+/// whether a file sets a key, for the `config_unread` caps (evaluator pass 1, P7).
+pub fn yaml_keys(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+            if trimmed.starts_with("---") {
+                stack.clear();
+            }
+            continue;
+        }
+        let Some(key) = yaml_key(trimmed) else {
+            continue;
+        };
+        let indent = line.len() - trimmed.len();
+        while stack.last().is_some_and(|(i, _)| *i >= indent) {
+            stack.pop();
+        }
+        let full = stack
+            .iter()
+            .map(|(_, k)| k.as_str())
+            .chain([key])
+            .collect::<Vec<_>>()
+            .join(".");
+        out.insert(full);
+        stack.push((indent, key.to_owned()));
+    }
+    out
+}
+
+/// The key of a `key: value` or `key:` line, unquoted.
+fn yaml_key(line: &str) -> Option<&str> {
+    let colon = line
+        .char_indices()
+        .find(|&(i, c)| c == ':' && line[i + 1..].chars().next().is_none_or(char::is_whitespace))
+        .map(|(i, _)| i)?;
+    let key = line[..colon].trim();
+    let key = key
+        .strip_prefix('\'')
+        .and_then(|k| k.strip_suffix('\''))
+        .or_else(|| key.strip_prefix('"').and_then(|k| k.strip_suffix('"')))
+        .unwrap_or(key);
+    (!key.is_empty() && !key.contains(char::is_whitespace)).then_some(key)
 }
 
 /// Splits at the first unescaped `=`, `:` or whitespace (with surrounding whitespace).
@@ -741,6 +784,74 @@ mod tests {
         assert!(clean);
         assert_eq!(folded.literal().unwrap(), "a".repeat(1 << 14));
         assert!(folder.steps <= 2 * 15, "{} resolutions", folder.steps);
+    }
+
+    /// Evaluator pass 1, P5: a result computed while a guard was hit is never memoised. In
+    /// `A + B` with `A = B + "x"` and `B = A`, folding `A` meets `B` on the way back to `A` (the
+    /// on-path guard): `B` is a hole there only because `A` was on the path. Memoised, the later
+    /// `B` would read as that hole instead of its own value, `{?}x`.
+    #[test]
+    fn results_cut_by_a_guard_are_not_memoised() {
+        let java = Files::new(&[(
+            Language::Java,
+            "C",
+            "class C {\n  static final String A = B + \"x\";\n  static final String B = A;\n  void m() { a(A + B); }\n}\n",
+        )]);
+        assert_eq!(fold_last_call(&java), "{?}x{?}x [constant]");
+    }
+
+    /// Evaluator pass 1, P5: the step budget bounds a wide input whose results are never clean
+    /// (so never memoised): each `Di = D(i-1) + D(i-1)` down to a self-reference costs 2^14
+    /// resolutions without the budget; with it, folding stops after `MAX_FOLD_STEPS` and the
+    /// result is not clean.
+    #[test]
+    fn the_step_budget_bounds_unclean_diamonds() {
+        let mut src = String::from("const Z = Z;\nconst D0 = Z + \"a\";\n");
+        for i in 1..15 {
+            src.push_str(&format!("const D{i} = D{} + D{};\n", i - 1, i - 1));
+        }
+        src.push_str("get(D14);\n");
+        let files = Files::new(&[(Language::TypeScript, "a", &src)]);
+        let facts = files.facts(0);
+        let rb_syntax::Arg::Name { text, span } = &facts.chains[0].links[0].args[0] else {
+            panic!()
+        };
+        let mut folder = Folder::new(&files);
+        let (folded, clean) = folder.name(0, text, *span, 0);
+        assert!(!clean);
+        assert!(folded.pieces.contains(&Piece::Hole));
+        // Past the budget, each pending level returns after one more (refused) resolution.
+        assert!(
+            folder.steps <= MAX_FOLD_STEPS + MAX_FOLD_DEPTH,
+            "{} resolutions",
+            folder.steps
+        );
+    }
+
+    /// Evaluator pass 1, P7: the dotted keys a Spring YAML file sets, by indentation (no YAML
+    /// parser is a dependency); used only to ask whether an unread file sets a key, so a key too
+    /// many is a cap too many, never a wrong value.
+    #[test]
+    fn yaml_keys_are_dotted_by_indentation() {
+        let text = "# comment\nspring:\n  application:\n    name: b\n  cloud.config:\n    uri: \"http://config:8888\"\n\nusers:\n  url: http://legacy  # trailing\n  list:\n    - a: 1\n'quoted.key': x\n---\nserver:\n  port: 1\n  servlet.context-path: /accounts\nnot a key\n";
+        let keys: Vec<String> = yaml_keys(text).into_iter().collect();
+        assert_eq!(
+            keys,
+            [
+                "quoted.key",
+                "server",
+                "server.port",
+                "server.servlet.context-path",
+                "spring",
+                "spring.application",
+                "spring.application.name",
+                "spring.cloud.config",
+                "spring.cloud.config.uri",
+                "users",
+                "users.list",
+                "users.url",
+            ]
+        );
     }
 
     #[test]

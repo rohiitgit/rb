@@ -25,6 +25,9 @@ pub struct Flags {
     pub partial: bool,
     /// A catch-all before the last segment, read as `{}`.
     pub wildcard_not_last: bool,
+    /// Client URLs: a hole ending the URL glued to literal text (`"/api/items" + qs`) was
+    /// dropped as an opaque tail (a query, fragment or extension; evaluator pass 1, P3).
+    pub opaque_tail: bool,
 }
 
 /// `method` upper-cased; `*` and `ALL` are [`ANY`].
@@ -242,29 +245,38 @@ pub fn client_url(pieces: &[Piece]) -> ClientUrl {
             let rest = &first[start..];
             let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
             let authority = &rest[..end];
+            let authority = authority.rsplit('@').next().unwrap_or(authority);
             if end == rest.len() && pieces.len() > 1 {
-                // A hole inside the authority (`http://${host}/x`).
-                out.host_dynamic = true;
-                pieces.remove(0);
-                // Skip the rest of the authority, up to the first `/` of a later literal.
-                while let Some(p) = pieces.first().cloned() {
-                    match p {
-                        Piece::Hole => {
-                            pieces.remove(0);
-                        }
-                        Piece::Lit(l) => match l.find(['/', '?', '#']) {
-                            Some(i) => {
-                                pieces[0] = Piece::Lit(l[i..].to_owned());
-                                break;
-                            }
-                            None => {
-                                pieces.remove(0);
-                            }
-                        },
+                // A hole follows the literal authority. Only a hole inside the host makes the
+                // host unknown (evaluator pass 1, P1): `http://localhost:${port}/x` keeps
+                // `localhost` with an unknown port, `http://${host}/x` and `http://api.${d}/x`
+                // do not keep a host.
+                // An `@` later in the authority puts the host after user information that
+                // holds the hole (`http://user:${pass}@host/x`): not literal before the hole.
+                let end = if userinfo_follows(&pieces[1..]) {
+                    AuthorityEnd::InHost
+                } else {
+                    authority_before_hole(authority)
+                };
+                match end {
+                    AuthorityEnd::Port(host) => {
+                        out.host = Some(host.to_ascii_lowercase());
+                        pieces.remove(0);
+                        skip_authority(&mut pieces);
+                    }
+                    AuthorityEnd::Complete => {
+                        let (host, port) = split_port(authority);
+                        out.host = Some(host.to_ascii_lowercase());
+                        out.port = port.map(str::to_owned);
+                        pieces.remove(0);
+                    }
+                    AuthorityEnd::InHost => {
+                        out.host_dynamic = true;
+                        pieces.remove(0);
+                        skip_authority(&mut pieces);
                     }
                 }
             } else {
-                let authority = authority.rsplit('@').next().unwrap_or(authority);
                 let (host, port) = split_port(authority);
                 out.host = Some(host.to_ascii_lowercase());
                 out.port = port.map(str::to_owned);
@@ -274,6 +286,8 @@ pub fn client_url(pieces: &[Piece]) -> ClientUrl {
     }
     // Segments as lists of pieces; stop at a query or fragment in literal text.
     let mut segs: Vec<Vec<Piece>> = vec![Vec::new()];
+    // Whether the URL ends with a hole that no `?` or `#` in literal text cut off.
+    let mut ends_in_hole = pieces.last() == Some(&Piece::Hole);
     'outer: for p in pieces {
         match p {
             Piece::Hole => segs.last_mut().expect("never empty").push(Piece::Hole),
@@ -295,6 +309,7 @@ pub fn client_url(pieces: &[Piece]) -> ClientUrl {
                                     .expect("never empty")
                                     .push(Piece::Lit(current));
                             }
+                            ends_in_hole = false;
                             break 'outer;
                         }
                         c => current.push(c),
@@ -308,9 +323,21 @@ pub fn client_url(pieces: &[Piece]) -> ClientUrl {
             }
         }
     }
-    let segs: Vec<Vec<Piece>> = segs.into_iter().filter(|s| !s.is_empty()).collect();
-    let last = segs.len().saturating_sub(1);
+    let mut segs: Vec<Vec<Piece>> = segs.into_iter().filter(|s| !s.is_empty()).collect();
     let mut flags = Flags::default();
+    // A hole ending the URL glued to literal text (`/api/items${qs}`) is an opaque tail: far
+    // more often a query or an extension than a parameter, so it is dropped and flagged
+    // (evaluator pass 1, P3).
+    if ends_in_hole
+        && let Some(seg) = segs.last_mut()
+        && matches!(seg.first(), Some(Piece::Lit(_)))
+        && seg.last() == Some(&Piece::Hole)
+        && seg.iter().skip(1).all(|p| *p == Piece::Hole)
+    {
+        seg.truncate(1);
+        flags.opaque_tail = true;
+    }
+    let last = segs.len().saturating_sub(1);
     let normalised: Vec<Segment> = segs
         .iter()
         .enumerate()
@@ -337,6 +364,73 @@ pub fn client_url(pieces: &[Piece]) -> ClientUrl {
     out
 }
 
+/// Where the literal authority before a hole stops.
+enum AuthorityEnd<'a> {
+    /// `host:` — the host is complete and the hole is (part of) the port.
+    Port(&'a str),
+    /// `host:digits` or a bracketed IPv6 literal (`[::1]`, `[::1]:3000`): the authority is
+    /// complete and the hole follows it.
+    Complete,
+    /// Anything else (`""`, `api.`, `localhost`): the hole may be part of the host.
+    InHost,
+}
+
+fn authority_before_hole(authority: &str) -> AuthorityEnd<'_> {
+    if let Some(host) = authority.strip_suffix(':') {
+        let plain = !host.is_empty() && !host.contains(['[', ']', ':']);
+        let bracketed = host.starts_with('[') && host.ends_with(']') && host.len() > 2;
+        if plain || bracketed {
+            return AuthorityEnd::Port(host);
+        }
+        return AuthorityEnd::InHost;
+    }
+    if authority.starts_with('[') && authority.ends_with(']') && authority.len() > 2 {
+        return AuthorityEnd::Complete;
+    }
+    match split_port(authority) {
+        (host, Some(port)) if !host.is_empty() && !port.is_empty() => AuthorityEnd::Complete,
+        _ => AuthorityEnd::InHost,
+    }
+}
+
+/// Whether an `@` appears in the authority's remaining literal text (before the first `/`, `?`
+/// or `#` of a later literal).
+fn userinfo_follows(pieces: &[Piece]) -> bool {
+    for p in pieces {
+        if let Piece::Lit(l) = p {
+            let end = l.find(['/', '?', '#']);
+            if l[..end.unwrap_or(l.len())].contains('@') {
+                return true;
+            }
+            if end.is_some() {
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Drops the rest of an authority from the front of `pieces`: holes and literal text up to the
+/// first `/`, `?` or `#` of a later literal.
+fn skip_authority(pieces: &mut Vec<Piece>) {
+    while let Some(p) = pieces.first().cloned() {
+        match p {
+            Piece::Hole => {
+                pieces.remove(0);
+            }
+            Piece::Lit(l) => match l.find(['/', '?', '#']) {
+                Some(i) => {
+                    pieces[0] = Piece::Lit(l[i..].to_owned());
+                    break;
+                }
+                None => {
+                    pieces.remove(0);
+                }
+            },
+        }
+    }
+}
+
 fn merge(pieces: &[Piece]) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::new();
     for p in pieces {
@@ -350,7 +444,7 @@ fn merge(pieces: &[Piece]) -> Vec<Piece> {
 }
 
 /// `host:port` → `(host, Some(port))`; IPv6 literals keep their brackets.
-fn split_port(authority: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_port(authority: &str) -> (&str, Option<&str>) {
     if authority.starts_with('[') {
         return match authority.find("]:") {
             Some(i) => (&authority[..=i], Some(&authority[i + 2..])),
@@ -395,7 +489,9 @@ pub fn matches(client: &[Segment], endpoint: &[Segment]) -> Option<bool> {
 }
 
 /// Exact match of a client path, or, when its base is unknown, a match of its known part (with
-/// at least one literal segment) against the endpoint path's tail.
+/// at least one literal segment) against the endpoint path's tail. The matched tail must hold a
+/// literal segment too: a tail of parameters and catch-alls is no evidence that the client calls
+/// that endpoint (evaluator pass 1, P2).
 pub fn match_path(
     client: &[Segment],
     base_unknown: bool,
@@ -411,7 +507,11 @@ pub fn match_path(
         return None;
     }
     (0..=endpoint.len()).find_map(|i| {
-        matches(client, &endpoint[i..]).map(|wildcard| PathMatch {
+        let tail = &endpoint[i..];
+        if literal_segments(tail) == 0 {
+            return None;
+        }
+        matches(client, tail).map(|wildcard| PathMatch {
             suffix: true,
             wildcard,
         })
@@ -634,6 +734,133 @@ mod tests {
         assert_eq!((u.host, u.path.as_str()), (None, "/internal/x"));
         // Idempotent with the server normaliser.
         assert_eq!(norm_path(&u.path), u.path);
+    }
+
+    /// Evaluator pass 1, P1: a hole in the port (or anything after the host) keeps a literal
+    /// host; only a hole inside the host itself makes it unknown.
+    #[test]
+    fn a_port_hole_keeps_the_host() {
+        let host = |pieces: &[Piece]| {
+            let u = client_url(pieces);
+            (u.host, u.port, u.host_dynamic, u.path)
+        };
+        for (first, want) in [
+            ("http://localhost:", "localhost"),
+            ("https://status.example.com:", "status.example.com"),
+            ("http://Users:", "users"),
+            ("http://127.0.0.1:", "127.0.0.1"),
+            ("http://[::1]:", "[::1]"),
+            ("http://admin@localhost:", "localhost"),
+            ("//cdn.example.com:", "cdn.example.com"),
+        ] {
+            assert_eq!(
+                host(&[lit(first), Piece::Hole, lit("/orders/1")]),
+                (Some(want.to_owned()), None, false, "/orders/1".to_owned()),
+                "{first}"
+            );
+        }
+        // Several holes and literal digits in the port are all port.
+        assert_eq!(
+            host(&[
+                lit("http://users:"),
+                Piece::Hole,
+                lit("0"),
+                Piece::Hole,
+                lit("/x")
+            ]),
+            (Some("users".to_owned()), None, false, "/x".to_owned())
+        );
+        // A literal port and a hole after the authority: the host is known.
+        let u = client_url(&[lit("http://users:3000"), Piece::Hole, lit("/x")]);
+        assert_eq!(
+            (u.host.as_deref(), u.port.as_deref(), u.host_dynamic),
+            (Some("users"), Some("3000"), false)
+        );
+        // A hole in user information: the host after `@` is not literal text before the hole.
+        for rest in ["@users/x", "@users:3000/x"] {
+            let u = client_url(&[lit("http://admin:"), Piece::Hole, lit(rest)]);
+            assert!(u.host_dynamic && u.host.is_none(), "{rest}");
+            assert_eq!(u.path, "/x", "{rest}");
+        }
+        // A hole inside the host: unknown.
+        for first in [
+            "http://",
+            "http://api.",
+            "http://localhost",
+            "http://users-",
+        ] {
+            let u = client_url(&[lit(first), Piece::Hole, lit("/x")]);
+            assert!(u.host_dynamic && u.host.is_none(), "{first}");
+            assert_eq!(u.path, "/x", "{first}");
+        }
+    }
+
+    /// Evaluator pass 1, P3: a hole that ends the URL glued to literal text is an opaque tail
+    /// (a query, a fragment, an extension): dropped from the path and flagged. Glued inside a
+    /// segment elsewhere it makes that segment `{}`, flagged `partial`; after a `/` it is a
+    /// whole-segment parameter as before.
+    #[test]
+    fn a_glued_trailing_hole_is_an_opaque_tail() {
+        let u = client_url(&[lit("/api/items"), Piece::Hole]);
+        assert_eq!(u.path, "/api/items");
+        assert!(u.flags.opaque_tail && !u.flags.partial);
+        let u = client_url(&[lit("http://h/api/items?x="), Piece::Hole]);
+        assert_eq!(u.path, "/api/items");
+        assert!(
+            !u.flags.opaque_tail,
+            "a query in literal text is dropped as before"
+        );
+        let u = client_url(&[lit("/f/file."), Piece::Hole, Piece::Hole]);
+        assert_eq!(u.path, "/f/file.");
+        assert!(u.flags.opaque_tail);
+        let u = client_url(&[lit("/api/item"), Piece::Hole, lit("/y")]);
+        assert_eq!(u.path, "/api/{}/y");
+        assert!(u.flags.partial && !u.flags.opaque_tail);
+        let u = client_url(&[lit("/api/items/"), Piece::Hole]);
+        assert_eq!(u.path, "/api/items/{}");
+        assert!(!u.flags.partial && !u.flags.opaque_tail);
+        let u = client_url(&[lit("/a/b"), Piece::Hole, lit("?q=1")]);
+        assert_eq!(u.path, "/a/{}");
+        assert!(u.flags.partial && !u.flags.opaque_tail);
+        // An unknown base and an opaque tail: `${base}/x${qs}`.
+        let u = client_url(&[Piece::Hole, lit("/x"), Piece::Hole]);
+        assert_eq!((u.base_unknown, u.path.as_str()), (true, "/x"));
+        assert!(u.flags.opaque_tail);
+        // A template that is only a hole after a literal host has no opaque tail to drop.
+        let u = client_url(&[lit("http://users/"), Piece::Hole]);
+        assert_eq!(u.path, "/{}");
+        assert!(!u.flags.opaque_tail);
+    }
+
+    /// Evaluator pass 1, P2: a suffix match needs a literal segment in the endpoint tail it
+    /// matched; a tail of parameters and catch-alls is no evidence.
+    #[test]
+    fn a_suffix_match_needs_a_literal_in_the_matched_tail() {
+        for endpoint in ["/{name}", "/{*}", "/accounts/{name}/{*}", "/a/{x}/{y}"] {
+            assert_eq!(
+                match_path(&segs("/latest"), true, &segs(endpoint)),
+                None,
+                "{endpoint}"
+            );
+        }
+        let m = Some(PathMatch {
+            suffix: true,
+            wildcard: false,
+        });
+        assert_eq!(match_path(&segs("/latest"), true, &segs("/api/latest")), m);
+        assert_eq!(
+            match_path(&segs("/rates/latest"), true, &segs("/rates/{x}")),
+            m
+        );
+        // A catch-all endpoint matches by suffix only through a literal before it.
+        assert_eq!(
+            match_path(&segs("/api/x/y"), true, &segs("/v1/api/{*}")),
+            Some(PathMatch {
+                suffix: true,
+                wildcard: true,
+            })
+        );
+        assert_eq!(match_path(&segs("/x/y"), true, &segs("/v1/api/{*}")), None);
     }
 
     fn segs(p: &str) -> Vec<Segment> {

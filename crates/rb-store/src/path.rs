@@ -215,6 +215,9 @@ struct Item {
     keep: bool,
 }
 
+/// The inline-handler spans a node is walked within (`None`: the whole node).
+type Scope = Option<Vec<Span>>;
+
 /// A node whose neighbours the next level adds.
 struct Frontier {
     item: usize,
@@ -240,8 +243,10 @@ struct Walk<'g> {
     opts: PathOptions,
     items: Vec<Item>,
     truncated: BTreeSet<Limit>,
-    /// Symbols and files placed in the current direction.
-    seen: HashSet<i64>,
+    /// Symbols and files expanded in the current direction, each with its inline-handler scope:
+    /// one `File` handling several endpoints inline is walked once per span scope, so no
+    /// endpoint's downstream (or upstream continuation) is dropped (evaluator pass 1, P4).
+    seen: HashSet<(i64, Scope)>,
     /// Endpoints expanded in the current direction.
     endpoints: HashSet<i64>,
 }
@@ -308,11 +313,14 @@ impl<'g> Walk<'g> {
             .next()
     }
 
-    /// Whether `n` is code of a deployable service other than `home` (D8).
+    /// Whether `n` is code of a deployable service other than `home` (D8): `role = service`, or
+    /// any service that exposes endpoints, since it serves requests whatever its manifest says
+    /// (an Express package without a start script is `library`; evaluator pass 1).
     fn crosses(&self, n: i64, home: Option<i64>) -> bool {
         match (self.service_of(n), home) {
             (Some(s), Some(h)) if s != h => {
                 self.v.node(s).attrs.get("role").and_then(|r| r.as_str()) == Some("service")
+                    || self.v.outbound(s, EdgeKind::Exposes).next().is_some()
             }
             _ => false,
         }
@@ -339,6 +347,22 @@ impl<'g> Walk<'g> {
         out
     }
 
+    /// Upstream: the inline-handler spans of `n` (from its inbound `HANDLED_BY` edges) that the
+    /// evidence it was reached by lies in; `None` when `n` is no inline handler.
+    fn inline_scope(&self, n: i64, reached_by: &[Span]) -> Scope {
+        let mut scope: Option<BTreeSet<Span>> = None;
+        for e in self.v.inbound(n, EdgeKind::HandledBy, Certainty::Ambiguous) {
+            if let Some(spans) = handler_spans(e) {
+                scope.get_or_insert_with(BTreeSet::new).extend(
+                    spans
+                        .into_iter()
+                        .filter(|s| reached_by.iter().any(|ev| within(*ev, *s))),
+                );
+            }
+        }
+        scope.map(|s| s.into_iter().collect())
+    }
+
     // -----------------------------------------------------------------------------------------
     // Downstream (S16)
 
@@ -363,12 +387,13 @@ impl<'g> Walk<'g> {
                 break;
             };
             roots.push(i);
-            if self.seen.insert(c.node) {
+            let spans = c.edge.and_then(handler_spans);
+            if self.seen.insert((c.node, spans.clone())) {
                 frontier.push(Frontier {
                     item: i,
                     node: c.node,
                     branch: b,
-                    spans: c.edge.and_then(handler_spans),
+                    spans,
                     home: self.service_of(c.node),
                 });
             }
@@ -421,7 +446,7 @@ impl<'g> Walk<'g> {
                             self.add(&c, b, true)
                         }
                         Via::Calls | Via::Dispatch => {
-                            if !self.seen.insert(c.node) {
+                            if !self.seen.insert((c.node, None)) {
                                 continue;
                             }
                             let i = self.add(&c, b, false);
@@ -502,14 +527,19 @@ impl<'g> Walk<'g> {
                 break;
             };
             roots.push(i);
-            if self.seen.insert(c.node) {
+            let reached_by: Vec<Span> = c
+                .edge
+                .map(|e| e.evidence.iter().map(|ev| ev.span).collect())
+                .unwrap_or_default();
+            if self
+                .seen
+                .insert((c.node, self.inline_scope(c.node, &reached_by)))
+            {
                 frontier.push(Frontier {
                     item: i,
                     node: c.node,
                     branch: b,
-                    spans: c
-                        .edge
-                        .map(|e| e.evidence.iter().map(|ev| ev.span).collect()),
+                    spans: Some(reached_by),
                     home: None,
                 });
             }
@@ -587,7 +617,14 @@ impl<'g> Walk<'g> {
                         }
                         i
                     } else {
-                        if !self.seen.insert(c.node) {
+                        let reached_by: Vec<Span> = c
+                            .edge
+                            .map(|e| e.evidence.iter().map(|ev| ev.span).collect())
+                            .unwrap_or_default();
+                        if !self
+                            .seen
+                            .insert((c.node, self.inline_scope(c.node, &reached_by)))
+                        {
                             continue;
                         }
                         let i = self.add(&c, b, true);
@@ -596,9 +633,7 @@ impl<'g> Walk<'g> {
                                 item: i,
                                 node: c.node,
                                 branch: b,
-                                spans: c
-                                    .edge
-                                    .map(|e| e.evidence.iter().map(|ev| ev.span).collect()),
+                                spans: Some(reached_by),
                                 home: None,
                             });
                         }
@@ -1276,6 +1311,220 @@ mod tests {
             let ratio = b.as_secs_f64() / a.as_secs_f64();
             assert!(ratio < 2.5, "{a:?} → {b:?} ({ratio:.2}×)");
         }
+    }
+
+    /// Evaluator pass 1, P4: two endpoints handled inline in one file each walk their own
+    /// span-scoped downstream, so the second endpoint's table is not dropped because the file
+    /// was already walked for the first.
+    #[test]
+    fn inline_handlers_in_one_file_each_walk_their_own_scope() {
+        let mut b = G::new(&[("auth", "service"), ("notify", "service")]);
+        let login = b.endpoint("POST /login", "auth");
+        let email = b.endpoint("POST /email", "notify");
+        let sms = b.endpoint("POST /sms", "notify");
+        let ctl = b.sym("auth/a.ts", "login", 1);
+        b.edge(&login, HandledBy, &ctl, Exact, ("auth/a.ts", 0));
+        let both = b.sym("auth/a.ts", "sendBoth", 5);
+        b.edge(&ctl, Calls, &both, Exact, ("auth/a.ts", 2));
+        b.edge(&both, Consumes, &email, Synthetic, ("auth/a.ts", 6));
+        b.edge(&both, Consumes, &sms, Synthetic, ("auth/a.ts", 7));
+        let server = b.file("notify/server.ts");
+        for (ep, span) in [(&email, [2, 0, 5, 1]), (&sms, [7, 0, 10, 1])] {
+            let mut spans = Attrs::new();
+            spans.insert("handler_spans".into(), json!([span]));
+            b.edge_attrs(
+                ep,
+                HandledBy,
+                &server,
+                Exact,
+                ("notify/server.ts", span[0]),
+                spans,
+            );
+        }
+        let email_log = b.table("public.email_log");
+        let sms_log = b.table("public.sms_log");
+        b.edge(&server, Queries, &email_log, Exact, ("notify/server.ts", 3));
+        b.edge(&server, Queries, &sms_log, Exact, ("notify/server.ts", 8));
+        let g = b.finish();
+        let p = request_path(&g, id(&g, &login), PathOptions::default());
+        assert_eq!(
+            lines(&g, &p.downstream),
+            [
+                "handler login [exact]",
+                "  calls sendBoth [exact]",
+                "    consumes HTTP POST /email @notify [synthetic]",
+                "      handler notify/server.ts [exact] ~synthetic",
+                "        queries public.email_log [exact] ~synthetic",
+                "    consumes HTTP POST /sms @notify [synthetic]",
+                "      handler notify/server.ts [exact] ~synthetic",
+                "        queries public.sms_log [exact] ~synthetic",
+            ]
+        );
+        assert!(p.truncated.is_empty(), "{:?}", p.truncated);
+    }
+
+    /// The upstream counterpart of P4: one file reached from two inline handlers (through two
+    /// helpers consuming the endpoint) continues into each handler's endpoint.
+    #[test]
+    fn upstream_reaches_each_inline_handler_of_one_file() {
+        let mut b = G::new(&[("a", "service"), ("n", "service"), ("x", "service")]);
+        let target = b.endpoint("GET /t", "x");
+        let e1 = b.endpoint("POST /e1", "n");
+        let e2 = b.endpoint("POST /e2", "n");
+        let server = b.file("n/server.ts");
+        for (ep, span) in [(&e1, [2, 0, 5, 1]), (&e2, [7, 0, 10, 1])] {
+            let mut spans = Attrs::new();
+            spans.insert("handler_spans".into(), json!([span]));
+            b.edge_attrs(
+                ep,
+                HandledBy,
+                &server,
+                Exact,
+                ("n/server.ts", span[0]),
+                spans,
+            );
+        }
+        let mail = b.sym("n/lib.ts", "sendMail", 1);
+        let text = b.sym("n/lib.ts", "sendSms", 5);
+        b.edge(&server, Calls, &mail, Heuristic, ("n/server.ts", 3));
+        b.edge(&server, Calls, &text, Heuristic, ("n/server.ts", 8));
+        b.edge(&mail, Consumes, &target, Heuristic, ("n/lib.ts", 2));
+        b.edge(&text, Consumes, &target, Heuristic, ("n/lib.ts", 6));
+        let c1 = b.sym("a/c.ts", "c1", 1);
+        let c2 = b.sym("a/c.ts", "c2", 5);
+        b.edge(&c1, Consumes, &e1, Heuristic, ("a/c.ts", 2));
+        b.edge(&c2, Consumes, &e2, Heuristic, ("a/c.ts", 6));
+        let g = b.finish();
+        let p = request_path(&g, id(&g, &target), PathOptions::default());
+        assert_eq!(
+            lines(&g, &p.upstream),
+            [
+                "consumes sendMail [heuristic]",
+                "  called_by n/server.ts [heuristic]",
+                "    handles HTTP POST /e1 @n [exact] ~heuristic",
+                "      consumes c1 [heuristic]",
+                "consumes sendSms [heuristic]",
+                "  called_by n/server.ts [heuristic]",
+                "    handles HTTP POST /e2 @n [exact] ~heuristic",
+                "      consumes c2 [heuristic]",
+            ]
+        );
+    }
+
+    /// Evaluator pass 1, P5: upstream stops at the hop cap, and a chain of callers deeper than
+    /// `--depth` is cut and named in `truncated`.
+    #[test]
+    fn upstream_hops_and_depth_are_capped() {
+        // Ten services, each endpoint consumed by the handler of the next one's.
+        let services: Vec<(String, &str)> = (0..10).map(|i| (format!("s{i}"), "service")).collect();
+        let refs: Vec<(&str, &str)> = services.iter().map(|(s, r)| (s.as_str(), *r)).collect();
+        let mut b = G::new(&refs);
+        let eps: Vec<NodeKey> = (0..10)
+            .map(|i| b.endpoint("GET /x", &format!("s{i}")))
+            .collect();
+        for i in 0..10 {
+            let h = b.sym(&format!("s{i}/h.ts"), "h", 0);
+            b.edge(&eps[i], HandledBy, &h, Exact, (&format!("s{i}/h.ts"), 0));
+            if i > 0 {
+                b.edge(
+                    &h,
+                    Consumes,
+                    &eps[i - 1],
+                    Heuristic,
+                    (&format!("s{i}/h.ts"), 1),
+                );
+            }
+        }
+        let g = b.finish();
+        let entered = |p: &RequestPath| {
+            lines(&g, &p.upstream)
+                .iter()
+                .filter(|l| l.trim_start().starts_with("handles"))
+                .count()
+        };
+        let p = request_path(&g, id(&g, &eps[0]), PathOptions::default());
+        assert_eq!(
+            entered(&p),
+            DEFAULT_HOPS + 1,
+            "4 expanded hops and the endpoint beyond"
+        );
+        assert_eq!(p.truncated, BTreeSet::from([Limit::Hops]));
+        let p = request_path(
+            &g,
+            id(&g, &eps[0]),
+            PathOptions {
+                hops: 99,
+                ..PathOptions::default()
+            },
+        );
+        assert_eq!(entered(&p), MAX_HOPS + 1, "--hops is capped at 8");
+
+        // A client called through a chain of 100 callers.
+        let mut b = G::new(&[("s", "service"), ("w", "service")]);
+        let e = b.endpoint("GET /c", "s");
+        let mut prev = b.sym("w/c.ts", "c0", 0);
+        b.edge(&prev, Consumes, &e, Heuristic, ("w/c.ts", 0));
+        for i in 1..=100 {
+            let caller = b.sym("w/c.ts", &format!("c{i}"), i);
+            b.edge(&caller, Calls, &prev, Exact, ("w/c.ts", i));
+            prev = caller;
+        }
+        let g = b.finish();
+        let p = request_path(&g, id(&g, &e), PathOptions::default());
+        assert_eq!(
+            depth(&p.upstream),
+            DEFAULT_DEPTH + 1,
+            "the client and 12 callers"
+        );
+        assert_eq!(p.truncated, BTreeSet::from([Limit::Depth]));
+        let (g, e) = chain(3);
+        assert!(
+            request_path(&g, id(&g, &e), PathOptions::default())
+                .truncated
+                .is_empty()
+        );
+    }
+
+    /// Evaluator pass 1, suspected item 2: an Express service without a start script is
+    /// `role = library`, yet it serves requests; a call into the code of a service that exposes
+    /// endpoints crosses into it (D8) whatever its role, while a library exposing none is walked
+    /// in-process.
+    #[test]
+    fn a_library_role_service_that_exposes_endpoints_is_crossed_into() {
+        let mut b = G::new(&[
+            ("auth", "service"),
+            ("notify", "library"),
+            ("shared", "library"),
+        ]);
+        let login = b.endpoint("POST /login", "auth");
+        let email = b.endpoint("POST /email", "notify");
+        let notify = NodeKey::new(NodeKind::Service, "notify");
+        b.edge(
+            &notify,
+            EdgeKind::Exposes,
+            &email,
+            Exact,
+            ("notify/server.ts", 1),
+        );
+        let ctl = b.sym("auth/a.ts", "login", 1);
+        b.edge(&login, HandledBy, &ctl, Exact, ("auth/a.ts", 0));
+        let send = b.sym("notify/mail.ts", "send", 1);
+        let hash = b.sym("shared/u.ts", "hash", 1);
+        let t = b.table("t");
+        b.edge(&ctl, Calls, &send, Heuristic, ("auth/a.ts", 2));
+        b.edge(&ctl, Calls, &hash, Heuristic, ("auth/a.ts", 3));
+        b.edge(&hash, Queries, &t, Exact, ("shared/u.ts", 2));
+        let g = b.finish();
+        let p = request_path(&g, id(&g, &login), PathOptions::default());
+        assert_eq!(
+            lines(&g, &p.downstream),
+            [
+                "handler login [exact]",
+                "  crosses send [heuristic]",
+                "  calls hash [heuristic]",
+                "    queries t [exact] ~heuristic",
+            ]
+        );
     }
 
     /// Ambiguous handlers are each a root; the weakest step bounds the branch below.

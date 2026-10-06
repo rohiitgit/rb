@@ -164,3 +164,11 @@
 ## 2026-10-06: count test results from a log that holds both streams
 - **Mistake (caught before recording):** `cargo test > log 2>&1` was written as `2>&1 > log`, which sends stderr (where cargo prints `Running …`) to the terminal; the awk sum keyed on `Running` lines then counted every `test result` line, the e2e suite's 17 included, and gave 436 instead of 419.
 - **Rule:** redirect as `> file 2>&1`, and check that the per-crate lines the sum is built from name every binary (`unittests`, `tests/e2e.rs`) before trusting the total.
+
+## 2026-10-06: a gap list that says "never a false X" must also say which false Y remain
+- **Mistake:** M4a's open items described every gap as "a missed or less precise result, never a false `synthetic`". That was true and hid false `heuristic` stitches: evaluator pass 1 found one on a public repository and three from common idioms (a port hole, a query tail, a suffix tail of only parameters), plus a silently incomplete `rb path` answer.
+- **Rule:** when a record bounds the worst failure ("never a false `synthetic`"), it also lists the weaker false results still possible, each with the input shape that produces it and its measured count, so the bound cannot be read as "no false edges".
+
+## 2026-10-06: a visited set over a scoped node is keyed by the scope
+- **Mistake:** `rb path` kept one visited set of nodes, but an inline-handler `File` is walked within one endpoint's spans at a time; the second endpoint handled in the same file found the file "seen" and lost its downstream, with nothing in `collapsed` or `truncated`. The same keying dropped an upstream continuation.
+- **Rule:** when a walk restricts what it follows from a node (spans, a scope, a filter), key its visited set by (node, restriction), and test two restrictions of one node in both directions.

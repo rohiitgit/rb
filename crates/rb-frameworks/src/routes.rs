@@ -76,6 +76,9 @@ pub struct RouteFact {
     pub span: Span,
     /// The definition containing the registration (`None` at top level).
     pub enclosing: Option<usize>,
+    /// A Go `ServeMux` host pattern's host (`example.com/x`), lower-cased without the port; the
+    /// route serves only requests for that host (evaluator pass 1, P8).
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +500,7 @@ fn spring(facts: &FileScope<'_>, out: &mut FileRoutes) {
                                         handler: Handler::Definition(m),
                                         span: d.span,
                                         enclosing: Some(m),
+                                        host: None,
                                     });
                                 }
                             }
@@ -666,6 +670,7 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 handler: handler(facts, handlers),
                 span: chain.span,
                 enclosing: chain.enclosing,
+                host: None,
             });
         }
     }
@@ -803,6 +808,7 @@ fn gin(facts: &FileScope<'_>, out: &mut FileRoutes) {
             handler: handler(facts, &args[1..]),
             span: chain.span,
             enclosing: chain.enclosing,
+            host: None,
         });
     }
 }
@@ -851,7 +857,7 @@ fn net_http(facts: &FileScope<'_>, out: &mut FileRoutes) {
             dynamic(out, chain.span, format!("{:?}", link.args[0]));
             continue;
         };
-        let (method, path) = serve_mux_pattern(&pattern);
+        let (method, host, path) = serve_mux_pattern(&pattern);
         out.routes.push(RouteFact {
             framework: Framework::NetHttp,
             method,
@@ -860,25 +866,35 @@ fn net_http(facts: &FileScope<'_>, out: &mut FileRoutes) {
             handler: handler(facts, &link.args[1..]),
             span: chain.span,
             enclosing: chain.enclosing,
+            host,
         });
     }
 }
 
-/// A Go 1.22 `ServeMux` pattern `[METHOD ][HOST]/[PATH]` as `(method, path)`. A path ending in
-/// `/` (without `{$}`) matches its whole subtree, so it gets a trailing `{*}`.
-pub fn serve_mux_pattern(pattern: &str) -> (String, String) {
+/// A Go 1.22 `ServeMux` pattern `[METHOD ][HOST]/[PATH]` as `(method, host, path)`; the host is
+/// lower-cased without its port. A path ending in `/` (without `{$}`) matches its whole subtree,
+/// so it gets a trailing `{*}`.
+pub fn serve_mux_pattern(pattern: &str) -> (String, Option<String>, String) {
     let pattern = pattern.trim();
     let (method, rest) = match pattern.split_once([' ', '\t']) {
         Some((m, rest)) if !m.contains('/') => (norm_method(m), rest.trim_start()),
         _ => (ANY.to_owned(), pattern),
     };
-    let path = rest.find('/').map_or("/", |i| &rest[i..]);
+    let start = rest.find('/').unwrap_or(rest.len());
+    let host = &rest[..start];
+    let (host, _) = crate::endpoint::split_port(host);
+    let host = (!host.is_empty()).then(|| host.to_ascii_lowercase());
+    let path = if start < rest.len() {
+        &rest[start..]
+    } else {
+        "/"
+    };
     let path = if path.ends_with('/') {
         format!("{path}{{*}}")
     } else {
         path.to_owned()
     };
-    (method, path)
+    (method, host, path)
 }
 
 #[cfg(test)]
@@ -905,7 +921,11 @@ mod tests {
                     RouteBase::Router(i) => format!("router {}", r_name(&facts, language, i)),
                     RouteBase::Unknown(b) => format!("unknown {}", binding_identity(&facts, b)),
                 };
-                format!("{} {} {base} {handler}", r.method, norm_path(&r.path))
+                let host = r
+                    .host
+                    .as_ref()
+                    .map_or(String::new(), |h| format!(" host={h}"));
+                format!("{} {} {base} {handler}{host}", r.method, norm_path(&r.path))
             })
             .collect()
     }
@@ -1235,19 +1255,29 @@ public class AuthController {
 
     #[test]
     fn net_http_patterns() {
-        let src = "package main\nimport \"net/http\"\nfunc main() {\n\thttp.HandleFunc(\"POST /items/{id}\", create)\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"GET example.com/files/{path...}\", files)\n\tmux.Handle(\"/static/\", http.HandlerFunc(static))\n\tmux.HandleFunc(\"/exact/{$}\", exact)\n\tother.HandleFunc(\"/no\", h)\n}\n";
+        let src = "package main\nimport \"net/http\"\nfunc main() {\n\thttp.HandleFunc(\"POST /items/{id}\", create)\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"GET example.com/files/{path...}\", files)\n\tmux.Handle(\"/static/\", http.HandlerFunc(static))\n\tmux.HandleFunc(\"/exact/{$}\", exact)\n\tmux.HandleFunc(\"Example.com:8080/hosted\", hosted)\n\tother.HandleFunc(\"/no\", h)\n}\n";
+        // A host pattern keeps its host, lower-cased without the port (evaluator pass 1, P8).
         assert_eq!(
             summary(Language::Go, src),
             [
                 "POST /items/{} root name create",
-                "GET /files/{*} root name files",
+                "GET /files/{*} root name files host=example.com",
                 "ANY /static/{*} root name static",
                 "ANY /exact root name exact",
+                "ANY /hosted root name hosted host=example.com",
             ]
         );
         assert_eq!(
             serve_mux_pattern("/"),
-            ("ANY".to_owned(), "/{*}".to_owned())
+            ("ANY".to_owned(), None, "/{*}".to_owned())
+        );
+        assert_eq!(
+            serve_mux_pattern("GET api.example.com/v2/things"),
+            (
+                "GET".to_owned(),
+                Some("api.example.com".to_owned()),
+                "/v2/things".to_owned()
+            )
         );
     }
 }
