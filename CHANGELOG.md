@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M5 phase 1: whole-snapshot reads and the AGE DDL lock (S1, S2)
+- **S1:** `Store::read_tx` runs a closure's statements in one `REPEATABLE READ READ ONLY` transaction (a nested call joins it; `begin()` refuses a write inside it; `cypher` refuses to nest); `Store::read_snapshot` adds `snapshot {id} does not exist` when the snapshot was gone before the transaction started. `load_graph`, `load_diagnostics` and `status` read through it; the CLI's `status`, `dump`, `find`, `service`, `table-deps`, `callers`, `impact` and `path` read the live pointer and the snapshot in one transaction (`on_live`).
+- **S2:** `RB_AGE_DDL_LOCK` (`pg_advisory_xact_lock`) before `create_graph` and before every `drop_graph`; `delete_repo` and retention take the repository row first, the publishers' order.
+- **Tests** (new `crates/rb-store/src/db_tests.rs`, database via `RB_TEST_DATABASE_URL`, skipped without it): `a_snapshot_deleted_during_a_read_is_read_whole` (a test-only hook deletes the repository between the node and edge statements; failed first: nodes and no edges), `a_read_transaction_is_one_snapshot_and_read_only` (a concurrent flip is invisible; a write inside is refused; failed first), `graph_ddl_waits_for_the_ddl_lock` (a publish and a delete wait while another session holds the lock; failed first).
+- **Mutations** (`var/m5/mut/p1.json`): 4/4 killed (no transaction, `READ COMMITTED`, `create_graph` and `drop_graph` unlocked).
+- **S2 measurement** (`var/m5/scripts/s2_load.sh`, M5 release binary): 3 runs, 120 concurrent publishes, 1,984 reader runs: 0 failures, 0 `failed to re-find shared lock object` (phase 0: also 0 on `afae548`, not reproduced).
+- **Invariant 1:** the three fixture dumps byte-identical to the `afae548` baseline. No golden changed.
+- **Verification:** fmt, clippy clean; 562 unit tests outside e2e (3 of them database tests, vacuous without the URL), `rb-store` with the database 44/44; e2e 18/18 twice (`--nocapture`, no `skipping`); stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-store/src/{lib,age,db_tests}.rs`, `crates/rb-cli/src/main.rs`, `tasks/{contract-m5,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M5 phase 0: preflight
 - Records only, no code change. Contract `tasks/contract-m5.md` gains "Checked in phase 0" and amendment 1 (benchmark pins). Scripts and outputs under `var/m5/` (not tracked).
 - **Invariant-1 baseline:** no code differs between `304fe4a`, `afae548` and `8b52aad`; the release build is kept as `var/m5/base/rb-afae548`; the three fixtures dumped `--no-scip` from `git ls-files` copies (polyglot's equals its golden `dump.jsonl`); the four M4b closing repositories' dumps at their pins are `var/fix-m4b-1/dumps/*-fresh.jsonl` (same code).

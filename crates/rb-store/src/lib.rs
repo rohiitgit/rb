@@ -7,6 +7,8 @@
 mod age;
 pub mod card;
 pub mod code;
+#[cfg(test)]
+mod db_tests;
 pub mod path;
 mod query;
 pub mod rollup;
@@ -33,6 +35,32 @@ pub(crate) mod work {
     #[cfg(test)]
     pub(crate) fn take() -> u64 {
         COUNT.with(|c| c.replace(0))
+    }
+}
+
+/// Test-only interleaving points (contract M5 S1): a hook runs once, on this thread, between the
+/// statements of a read.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static AFTER_NODES: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    /// Runs `body` with `hook` armed to run after `load_graph` has read a snapshot's nodes.
+    pub(crate) fn with_after_nodes<T>(hook: impl FnMut() + 'static, body: impl FnOnce() -> T) -> T {
+        AFTER_NODES.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        let out = body();
+        AFTER_NODES.with(|h| *h.borrow_mut() = None);
+        out
+    }
+
+    pub(crate) fn after_nodes() {
+        let hook = AFTER_NODES.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -103,6 +131,12 @@ pub const KEEP_RETIRED: i64 = 2;
 /// Arbitrary constant for `pg_advisory_xact_lock` so concurrent `rb migrate` runs serialise.
 const MIGRATION_LOCK: i64 = 0x7262_6d69_6772;
 
+/// The database-wide advisory lock every AGE graph DDL statement (`create_graph`, `drop_graph`)
+/// runs under, transaction-scoped (contract M5 D10, S2; design §14: concurrent graph DDL from
+/// several processes has killed backends with `failed to re-find shared lock object`). Taken
+/// after any repository row lock, never before.
+pub const RB_AGE_DDL_LOCK: i64 = 0x7262_6167_6464;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotInfo {
     pub id: i64,
@@ -125,6 +159,9 @@ pub struct RepoStatus {
 
 pub struct Store {
     client: Client,
+    /// Inside [`Store::read_tx`]: statements belong to its transaction, and nothing may open
+    /// another one.
+    in_read: bool,
 }
 
 impl Store {
@@ -133,12 +170,25 @@ impl Store {
             .with_context(|| format!("connecting to {}", redact(url)))?;
         // AGE's cypher() and agtype live in ag_catalog; rb.* is always schema-qualified.
         client.batch_execute(r#"SET search_path = ag_catalog, "$user", public"#)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            in_read: false,
+        })
+    }
+
+    /// A read-write transaction; refused inside [`Store::read_tx`], whose transaction it would
+    /// otherwise end.
+    fn begin(&mut self) -> anyhow::Result<postgres::Transaction<'_>> {
+        anyhow::ensure!(
+            !self.in_read,
+            "cannot write inside a read-only snapshot transaction"
+        );
+        Ok(self.client.transaction()?)
     }
 
     /// Applies pending migrations; returns the names applied by this call.
     pub fn migrate(&mut self) -> anyhow::Result<Vec<&'static str>> {
-        let mut tx = self.client.transaction()?;
+        let mut tx = self.begin()?;
         tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])?;
         // Objects created by migrations must land in `public`, not in AGE's ag_catalog.
         tx.batch_execute("SET LOCAL search_path = public")?;
@@ -234,7 +284,9 @@ impl Store {
     }
 
     pub fn delete_repo(&mut self, name: &str) -> anyhow::Result<bool> {
-        let mut tx = self.client.transaction()?;
+        let mut tx = self.begin()?;
+        // The repository row before the DDL lock, in the publishers' order.
+        tx.execute("SELECT 1 FROM rb.repo WHERE name = $1 FOR UPDATE", &[&name])?;
         let graphs = tx.query(
             "SELECT s.age_graph FROM rb.snapshot s JOIN rb.repo r ON r.id = s.repo_id
              WHERE r.name = $1 AND s.age_graph IS NOT NULL",
@@ -328,7 +380,7 @@ impl Store {
         diagnostics: &[Diagnostic],
         load_dir: &LoadDir,
     ) -> anyhow::Result<()> {
-        let mut tx = self.client.transaction()?;
+        let mut tx = self.begin()?;
         // Serialise publishers of the same repo.
         tx.execute(
             "SELECT 1 FROM rb.repo WHERE id = $1 FOR UPDATE",
@@ -478,7 +530,11 @@ impl Store {
 
     /// Drops snapshots beyond the live one plus [`KEEP_RETIRED`] retired ones, and all failed ones.
     fn apply_retention(&mut self, repo_id: i64) -> anyhow::Result<()> {
-        let mut tx = self.client.transaction()?;
+        let mut tx = self.begin()?;
+        tx.execute(
+            "SELECT 1 FROM rb.repo WHERE id = $1 FOR UPDATE",
+            &[&repo_id],
+        )?;
         let doomed = tx.query(
             "SELECT id, age_graph FROM rb.snapshot WHERE repo_id = $1 AND (
                status = 'failed'
@@ -535,6 +591,49 @@ impl Store {
 
     /// Reads a snapshot back into a [`Graph`] (used by `rb dump` and the determinism tests).
     pub fn load_graph(&mut self, snapshot_id: i64) -> anyhow::Result<Graph> {
+        self.read_snapshot(snapshot_id, |s| s.graph_rows(snapshot_id))
+    }
+
+    /// Runs `f` with every statement on this connection inside one `REPEATABLE READ READ ONLY`
+    /// transaction (contract M5 S1, invariant 4), so a command's reads see one state of the
+    /// database whatever other sessions commit meanwhile. A call inside another is part of it.
+    pub fn read_tx<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        if self.in_read {
+            return f(self);
+        }
+        self.client
+            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
+        self.in_read = true;
+        let result = f(self);
+        self.in_read = false;
+        // A failed read rolls back; its own error is the one reported.
+        let end = self
+            .client
+            .batch_execute(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        let value = result?;
+        end?;
+        Ok(value)
+    }
+
+    /// [`Store::read_tx`] over one snapshot: `snapshot {id} does not exist` when it was deleted
+    /// before the transaction started; read whole when it is deleted afterwards.
+    pub fn read_snapshot<T>(
+        &mut self,
+        snapshot_id: i64,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.read_tx(|s| {
+            s.client
+                .query_opt("SELECT 1 FROM rb.snapshot WHERE id = $1", &[&snapshot_id])?
+                .with_context(|| format!("snapshot {snapshot_id} does not exist"))?;
+            f(s)
+        })
+    }
+
+    fn graph_rows(&mut self, snapshot_id: i64) -> anyhow::Result<Graph> {
         let nodes = self
             .client
             .query(
@@ -552,6 +651,8 @@ impl Store {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        #[cfg(test)]
+        hooks::after_nodes();
         let edges = self
             .client
             .query(
@@ -603,6 +704,10 @@ impl Store {
 
     /// Reads a snapshot's diagnostics, in canonical order.
     pub fn load_diagnostics(&mut self, snapshot_id: i64) -> anyhow::Result<Vec<Diagnostic>> {
+        self.read_snapshot(snapshot_id, |s| s.diagnostic_rows(snapshot_id))
+    }
+
+    fn diagnostic_rows(&mut self, snapshot_id: i64) -> anyhow::Result<Vec<Diagnostic>> {
         let mut out = self
             .client
             .query(
@@ -634,6 +739,10 @@ impl Store {
         query: &str,
         columns: &[String],
     ) -> anyhow::Result<Vec<Vec<String>>> {
+        anyhow::ensure!(
+            !self.in_read,
+            "cypher runs in its own read-only transaction"
+        );
         let snap = self.snapshot(snapshot_id)?;
         let Some(graph) = snap.age_graph else {
             bail!("snapshot {snapshot_id} has no AGE projection");
@@ -657,7 +766,12 @@ impl Store {
         Ok(out)
     }
 
+    /// The live snapshot and its counts, read in one transaction (contract M5 S1).
     pub fn status(&mut self, repo: &str) -> anyhow::Result<RepoStatus> {
+        self.read_tx(|s| s.status_rows(repo))
+    }
+
+    fn status_rows(&mut self, repo: &str) -> anyhow::Result<RepoStatus> {
         let live = self.live_snapshot(repo)?;
         let snapshots: i64 = self
             .client

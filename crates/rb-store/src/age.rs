@@ -61,6 +61,7 @@ fn write_and_load(
     dir: &LoadDir,
     host_dir: &Path,
 ) -> anyhow::Result<()> {
+    lock_ddl(tx)?;
     tx.execute("SELECT ag_catalog.create_graph($1::text::name)", &[&name])?;
     for kind in NodeKind::ALL {
         tx.execute(
@@ -145,7 +146,17 @@ fn write_and_load(
     Ok(())
 }
 
+/// Takes [`crate::RB_AGE_DDL_LOCK`] for the rest of the transaction (contract M5 S2).
+fn lock_ddl(tx: &mut Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&crate::RB_AGE_DDL_LOCK],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn drop_graph_if_exists(tx: &mut Transaction<'_>, name: &str) -> anyhow::Result<()> {
+    lock_ddl(tx)?;
     let exists = tx
         .query_opt(
             "SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1::text::name",

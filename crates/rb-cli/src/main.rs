@@ -237,7 +237,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Index(args) => index(&mut store, &cli.age_load_dir, args)?,
-        Command::Status { repo } => {
+        Command::Status { repo } => store.read_tx(|store| {
             let repos = match repo {
                 Some(r) => vec![r],
                 None => store.repo_names()?,
@@ -278,19 +278,22 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-        }
+            Ok(())
+        })?,
         Command::Dump {
             repo,
             snapshot,
             output,
         } => {
-            let snap = match snapshot {
-                Some(id) => store.snapshot(id)?,
-                None => live_snapshot(&mut store, repo)?,
-            };
-            let graph = store.load_graph(snap.id)?;
-            let diagnostics = store.load_diagnostics(snap.id)?;
-            let dump = canonical_dump(&snap.commit_sha, &graph, &diagnostics);
+            let dump = store.read_tx(|store| {
+                let snap = match snapshot {
+                    Some(id) => store.snapshot(id)?,
+                    None => live_snapshot(store, repo)?,
+                };
+                let graph = store.load_graph(snap.id)?;
+                let diagnostics = store.load_diagnostics(snap.id)?;
+                Ok(canonical_dump(&snap.commit_sha, &graph, &diagnostics))
+            })?;
             match output {
                 Some(p) => {
                     std::fs::write(&p, dump).with_context(|| format!("writing {}", p.display()))?
@@ -303,18 +306,17 @@ fn main() -> anyhow::Result<()> {
             kind,
             limit,
             repo,
-        } => {
-            let snap = live_snapshot(&mut store, repo)?;
+        } => on_live(&mut store, repo, |store, snap| {
             for n in store.find(snap.id, &text, kind, limit)? {
                 println!("{}\t{}\t{}", n.kind, n.key, n.name);
             }
-        }
+            Ok(())
+        })?,
         Command::Service {
             service,
             repo,
             json,
-        } => {
-            let snap = live_snapshot(&mut store, repo)?;
+        } => on_live(&mut store, repo, |store, snap| {
             match service {
                 None => {
                     let services = store.services(snap.id)?;
@@ -351,7 +353,8 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-        }
+            Ok(())
+        })?,
         Command::TableDeps {
             table,
             repo,
@@ -364,31 +367,33 @@ fn main() -> anyhow::Result<()> {
                 "--hops must be between 0 and {}",
                 rb_store::rollup::MAX_HOPS
             );
-            let snap = live_snapshot(&mut store, repo)?;
-            let found = match store.resolve_table(snap.id, &table)? {
-                Resolved::One(n) => n,
-                Resolved::None => {
-                    bail!("no table matches {table:?} (try `rb find {table} --kind table`)")
+            on_live(&mut store, repo, |store, snap| {
+                let found = match store.resolve_table(snap.id, &table)? {
+                    Resolved::One(n) => n,
+                    Resolved::None => {
+                        bail!("no table matches {table:?} (try `rb find {table} --kind table`)")
+                    }
+                    Resolved::Ambiguous(candidates) => {
+                        let list: Vec<String> =
+                            candidates.iter().map(|c| format!("  {}", c.key)).collect();
+                        bail!(
+                            "{table:?} matches several tables; pass schema.table:\n{}",
+                            list.join("\n")
+                        );
+                    }
+                };
+                let deps = store.table_deps(
+                    snap.id,
+                    &found.key,
+                    rb_store::rollup::RollupOptions { precision, hops },
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&deps)?);
+                } else {
+                    print!("{}", render_table_deps(&deps));
                 }
-                Resolved::Ambiguous(candidates) => {
-                    let list: Vec<String> =
-                        candidates.iter().map(|c| format!("  {}", c.key)).collect();
-                    bail!(
-                        "{table:?} matches several tables; pass schema.table:\n{}",
-                        list.join("\n")
-                    );
-                }
-            };
-            let deps = store.table_deps(
-                snap.id,
-                &found.key,
-                rb_store::rollup::RollupOptions { precision, hops },
-            )?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&deps)?);
-            } else {
-                print!("{}", render_table_deps(&deps));
-            }
+                Ok(())
+            })?;
         }
         Command::Callers {
             target,
@@ -404,8 +409,7 @@ fn main() -> anyhow::Result<()> {
                 "--depth must be between 1 and {}",
                 rb_store::code::MAX_CALLER_DEPTH
             );
-            let snap = live_snapshot(&mut store, repo)?;
-            let graph = store.load_graph(snap.id)?;
+            let graph = on_live(&mut store, repo, |store, snap| store.load_graph(snap.id))?;
             let t = code::pick_target(&graph, &target, pick)?;
             let tree = rb_store::code::callers(
                 &graph,
@@ -427,8 +431,7 @@ fn main() -> anyhow::Result<()> {
             precision,
             json,
         } => {
-            let snap = live_snapshot(&mut store, repo)?;
-            let graph = store.load_graph(snap.id)?;
+            let graph = on_live(&mut store, repo, |store, snap| store.load_graph(snap.id))?;
             let t = code::pick_target(&graph, &target, pick)?;
             let impact = rb_store::code::impact(&graph, t, min_certainty, precision);
             if json {
@@ -460,8 +463,7 @@ fn main() -> anyhow::Result<()> {
                 "--hops must be between 0 and {}",
                 rb_store::path::MAX_HOPS
             );
-            let snap = live_snapshot(&mut store, repo)?;
-            let graph = store.load_graph(snap.id)?;
+            let graph = on_live(&mut store, repo, |store, snap| store.load_graph(snap.id))?;
             let endpoint = path::pick_endpoint(&graph, &query, pick)?;
             let request = rb_store::path::request_path(
                 &graph,
@@ -1427,6 +1429,19 @@ fn percent(part: usize, total: usize) -> usize {
     } else {
         (part * 200 + total) / (total * 2)
     }
+}
+
+/// Runs `f` on the repository's live snapshot, the pointer and every read in one read-only
+/// transaction (contract M5 S1).
+fn on_live<T>(
+    store: &mut Store,
+    repo: Option<String>,
+    f: impl FnOnce(&mut Store, &SnapshotInfo) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    store.read_tx(|store| {
+        let snap = live_snapshot(store, repo)?;
+        store.read_snapshot(snap.id, |store| f(store, &snap))
+    })
 }
 
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
