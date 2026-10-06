@@ -1,5 +1,26 @@
 # Changelog
 
+## [2026-10-06] (wall clock) Close M4a
+- **Records only, no code change.** Evaluator pass 8 (`tasks/eval-m4a-pass8.md`, now tracked) was the verification-only re-check decided in contract amendment 17. It ran against `28e47ba` and returned **VERDICT: PASS**:
+  - **W1–W6:** fixed end to end on the release binary. That covers Kotlin/Groovy interceptor beans, `.vue` and HTML hooks, generated, 1 MiB and over-cap files, the four axios binding forms, `jest.spyOn`/`vi.stubGlobal`/`["fetch"]`, and discovery keys in nested YAML, `.properties` and `ribbon.listOfServers`. All are `synthetic` with `95e1fbb`.
+  - **Controls:** they stay `synthetic`, and the inert-text exemptions hide no executable code (`package.json` `scripts`, aliases, GitHub specs, other fields and XML content are scanned).
+  - **Mutation check:** 19 mutants run from a clean build. 18 are killed, pass 7's W5 mutant included.
+  - **Public repositories:** all seven are byte-identical to `95e1fbb`, with fresh == cached and 0 `synthetic` `CONSUMES`.
+  - **Regression:** fmt, clippy, 473 unit tests and e2e 17/17 twice are green, with the SCIP-mode path golden and `request_path_goldens` included. Invariant 13 shows 0 differing rows vs `38d55e4` on three repositories.
+  - **Finding X1** (minor, test gap): no unit row bites amendment 17's "HTML is not stripped" rule, though the behaviour is right end to end. It is carried as open item 24 (M4b).
+- **Contract amendment 18:**
+  - the final S1–S28 and invariant 1–13 table (all PASS);
+  - the review history of passes 1–8, with findings by severity and fix commits;
+  - the closing measurement on seven public repositories (195 endpoints, 94 sites, `CONSUMES` 13 heuristic and 2 ambiguous, 0 `synthetic`);
+  - the open items by milestone. M4b gets items 1, 2, 5, 7, 9, 15 and 24. M5 gets items 4, 6, 8, 10, 11, 16, 19–21 and 23, plus the **adversarial carrier review** (item 22), which starts from these forms:
+    - a fully qualified LoadBalancer type;
+    - discovery keys as nested JSON (`SPRING_APPLICATION_JSON`);
+    - CDATA-unaware XML comment stripping;
+    - X1's row.
+  - M6 gets items 3, 13, 14, 17 and 18. Item 12 is accepted.
+- **Records:** design §13 marks M4a done; README, IMPLEMENT.md and `tasks/todo.md` list M4b as next (not started); one closing lesson (state the soundness bar before adversarial review, and close on verification).
+- Files: `tasks/{contract-m4a,todo,lessons,eval-m4a-pass8}.md`, `docs/repository-brain-design.md`, `IMPLEMENT.md`, `README.md`, `CHANGELOG.md`.
+
 ## [2026-10-06] (wall clock) Fix M4a evaluator pass 7: raw-text taint, binding forms, discovery caps
 - Evaluator pass 7 (`tasks/eval-m4a-pass7.md`, now tracked; VERDICT FAIL against `95e1fbb`: W1–W4 blockers, W5 minor, W6 doc) fixed as the orchestrator decided: contract amendment 17 (raw-text taint for files without token facts, axios binding forms and a string-literal backstop, discovery configuration caps host-by-name `synthetic`, the closing decision), open items 10 and 22 updated, two new lessons. `rb_indexer::PIPELINE` is `m4a-http-11`.
   - **W1, W2** (`clients::raw_scan`, `RawScan`, `syntax::scan_unparsed`, `RAW_SCAN_BYTES` = 4 MiB): every non-binary file the parse plan leaves out (no grammar, generated, over 1 MiB) is read as lossy UTF-8 and scanned for whole-word surface names (`fetch`; `axios`; `RequestInterceptor`, `Capability`, `FeignBuilderCustomizer`, `Targeter`, `Feign`, `feign.`; `DefaultTransport`/`DefaultClient` in `.go` files only); a hit caps the kind repository-wide; a file over the cap is not read and taints every kind it is scanned for, and discovery. Inert (by the generator, stated as a deviation): prose (`.md`, `.markdown`, `.txt`, `.rst`, `.adoc`), npm lock files, `package.json` dependency entries with a registry range (no `:`/`/`), XML comments. `rb index` prints `scanned N other files as text`. Not cached: ≤ 11 ms per public repository.

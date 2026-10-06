@@ -325,8 +325,8 @@ Findings from the research step (2026-09-29):
 
 # M4 Frameworks (split into M4a and M4b; design §13)
 
-- **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). Built (phases 0–11 and fork F3); awaiting the evaluator, who decides whether M4a is done.
-- **M4b, DI and dispatch** (Spring DI, Spring Data synthesis, RTA, derived `DEPENDS_ON`, full Service Card, Q3 roll-up, orphan detection): not started. Its contract is written after M4a closes.
+- **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). **Closed 2026-10-06** (contract amendment 18) after eight evaluator passes; pass 8 (`tasks/eval-m4a-pass8.md`, verification only) VERDICT PASS.
+- **M4b, DI and dispatch** (Spring DI, Spring Data synthesis, RTA, derived `DEPENDS_ON`, full Service Card, Q3 roll-up, orphan detection): not started (next). Its contract is written next; it inherits M4a open items 1, 2, 5, 7, 9, 15 and 24.
 
 ## M4a phases
 
@@ -481,4 +481,9 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
 - [x] Records: contract (amendment 17, item 22, closing decision), CHANGELOG, IMPLEMENT.md, lessons.
 - [x] Verification loop; clean-up of `fx4a7_*` and `var/fix-m4a-7/`.
 - Found while fixing: the decided "any text file" scan would have capped the fixture's own hops (a `package.json` dependency, a `pom.xml` comment) and every axios repository (lock files), so inert classes were added with rows; the first mutation run showed the W5 hook row masked by the new literal backstop (clean row added) and a redundant language guard (deleted); Spring binds environment variables, so discovery words are matched with `_` read as `.`; an e2e attempt timed out on cypher under load with 87 scratch graphs in the database (dropped; two clean runs after).
-- [ ] Evaluator pass 7 re-check (verification only, closing decision).
+- [x] Evaluator pass 7 re-check: pass 8 (`tasks/eval-m4a-pass8.md`, verification only, VERDICT PASS; X1 minor test gap carried as open item 24).
+
+## M4a closing
+- [x] Evaluator pass 8 (verification only): W1–W6 repros and controls end to end, inert-text exemptions, 19 mutants from a clean build (18 killed; X1), seven public repositories byte-identical to `95e1fbb`, regression suite, invariant 13, docs vs code.
+- [x] M4a closed 2026-10-06 (contract amendment 18: final S1–S28/invariant table, review history of passes 1–8, closing measurement, open items by milestone with the M5 adversarial carrier review list); design §13, README, IMPLEMENT.md, CHANGELOG updated.
+- [ ] M4b: write its contract (not started).
