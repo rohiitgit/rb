@@ -570,6 +570,14 @@ pub struct Binding {
     /// `type_name` is then empty, as before.
     #[serde(default)]
     pub array: bool,
+    /// Java: the declaration's modifiers as written, sorted (as [`Definition::modifiers`]:
+    /// `final`, `static`, `private`, …), for fields, locals and parameters (contract M4b
+    /// amendment 6).
+    #[serde(default)]
+    pub modifiers: Vec<String>,
+    /// Java: a field or local declarator has an initialiser (`= …`), whatever its kind.
+    #[serde(default)]
+    pub initialised: bool,
 }
 
 /// Parses `source` and extracts its definitions and references.
@@ -694,6 +702,8 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                 parameter: b.parameter.map(|p| u32::try_from(p).unwrap_or(u32::MAX)),
                 type_args: b.type_args,
                 array: b.array,
+                modifiers: b.modifiers,
+                initialised: b.initialised,
             }
         })
         .collect();

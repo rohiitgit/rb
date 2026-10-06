@@ -29,6 +29,10 @@ pub(crate) struct RawBinding<'t> {
     pub type_args: Vec<String>,
     /// The declared type is an array.
     pub array: bool,
+    /// Java: the declaration's modifiers (contract M4b amendment 6).
+    pub modifiers: Vec<String>,
+    /// Java: the declarator has an initialiser.
+    pub initialised: bool,
 }
 
 /// Every binding in the file, in source order.
@@ -197,6 +201,8 @@ fn push<'t>(
             parameter: None,
             type_args: Vec::new(),
             array: false,
+            modifiers: Vec::new(),
+            initialised: false,
         });
     }
     name.is_some()
@@ -508,6 +514,10 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 if !is_var {
                     with_type_args(out, pushed, declared, source);
                 }
+                if let (true, Some(b)) = (pushed, out.last_mut()) {
+                    b.modifiers = crate::decorations::java_modifiers(node, source);
+                    b.initialised = d.child_by_field_name("value").is_some();
+                }
             }
         }
         // An interface's or annotation type's field: implicitly `static final`.
@@ -543,6 +553,9 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 source,
             );
             initialised(out, pushed, None, java_constant(node, source));
+            if let (true, Some(b)) = (pushed, out.last_mut()) {
+                b.modifiers = crate::decorations::java_modifiers(node, source);
+            }
             // A `spread_parameter` has no `name` field, so it is never recorded (unchanged).
             if node.kind() == "formal_parameter" {
                 positioned(out, pushed, index_among(node, JAVA_PARAMETERS));
@@ -1540,6 +1553,31 @@ mod parameter_tests {
         let facts = extract(Language::Java, src.as_bytes()).unwrap();
         let ns = facts.bindings.iter().find(|b| b.name == "ns").unwrap();
         assert_eq!(ns.type_name, "List");
+    }
+
+    /// Contract M4b amendment 6: a Java field's modifiers and whether it has an initialiser
+    /// (Lombok's constructor rules).
+    #[test]
+    fn java_field_modifiers_and_initialisers() {
+        let src = "class K {\n  private final Repo a;\n  private final int n = 3, m;\n  static Repo s;\n  @NonNull Repo b = null;\n  K(final Repo p) { int l = 1; }\n}\n";
+        let facts = extract(Language::Java, src.as_bytes()).unwrap();
+        let got: Vec<String> = facts
+            .bindings
+            .iter()
+            .map(|b| format!("{} [{}] {}", b.name, b.modifiers.join(" "), b.initialised))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "a [final private] false",
+                "n [final private] true",
+                "m [final private] false",
+                "s [static] false",
+                "b [] true",
+                "p [final] false",
+                "l [] true"
+            ]
+        );
     }
 
     #[test]

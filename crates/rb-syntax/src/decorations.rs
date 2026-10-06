@@ -474,6 +474,23 @@ const JAVA_MODIFIERS: &[&str] = &[
     "default",
 ];
 
+/// The [`JAVA_MODIFIERS`] keywords of a Java declaration's `modifiers` node, sorted.
+pub(crate) fn java_modifiers(node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut c = node.walk();
+    for m in node.children(&mut c).filter(|c| c.kind() == "modifiers") {
+        let mut mc = m.walk();
+        for t in m.children(&mut mc) {
+            let word = text(t, source);
+            if JAVA_MODIFIERS.contains(&word.as_str()) {
+                out.push(word);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// A definition's modifiers as written, sorted (contract M4b S1). Java: the keywords of its
 /// `modifiers` node in [`JAVA_MODIFIERS`]. TS/JS: `export` or `export_default` from an
 /// enclosing export statement (through a declarator and its declaration), `abstract` for an
@@ -481,18 +498,7 @@ const JAVA_MODIFIERS: &[&str] = &[
 pub(crate) fn modifiers(language: Language, def: Node<'_>, source: &[u8]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     match language {
-        Language::Java => {
-            let mut c = def.walk();
-            for m in def.children(&mut c).filter(|c| c.kind() == "modifiers") {
-                let mut mc = m.walk();
-                for t in m.children(&mut mc) {
-                    let word = text(t, source);
-                    if JAVA_MODIFIERS.contains(&word.as_str()) {
-                        out.push(word);
-                    }
-                }
-            }
-        }
+        Language::Java => out = java_modifiers(def, source),
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             let mut holder = def;
             if holder.kind() == "variable_declarator"

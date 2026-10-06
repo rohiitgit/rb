@@ -6,6 +6,7 @@
 //! turns the results into `MAPS_TO` and `QUERIES` edges.
 
 pub mod clients;
+pub mod di;
 pub mod endpoint;
 pub mod fold;
 pub mod routes;

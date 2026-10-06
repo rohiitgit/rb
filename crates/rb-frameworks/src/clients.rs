@@ -533,7 +533,7 @@ pub fn discovery_package(package: &str) -> bool {
 
 /// Text no runtime executes or reads as configuration: prose and npm lock files (which only
 /// record what the `package.json` files declare).
-fn inert(path: &str) -> bool {
+pub(crate) fn inert(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     matches!(

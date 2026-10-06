@@ -527,7 +527,7 @@ Same rules as M4a:
   - *Invariants:* one unit row per role, plus `getLogger(X.class)`, `@Import(X.class)`, a qualified name and a string; fingerprinted.
   - Files: `rb-syntax/src/lib.rs`, `imports.rs`, new `rb-syntax/src/mentions.rs`.
   - **Verify:** units; e2e unchanged.
-- [ ] **2. Spring facts, pure** (S2, S3).
+- [x] **2. Spring facts, pure** (S2, S3). Done: `rb_frameworks::di` (beans, points, scans, ambiguous constructors, unread classes, gate D findings in facts and in text); `Binding.modifiers`/`initialised` (amendment 6); 11 + 1 new units, seen failing first (empty `di`; missing fields); e2e unchanged.
   - *Derived:* per file: beans (stereotypes, `@Bean` methods with return types, Spring Data incl. store bases, Feign), bean names, qualifiers, `@Primary`, conditionals, annotations outside the inert list, scan and enable roots, `scan_unread`, injection points (forms, Lombok, wrappers, exclusions), and gate D's surface findings for the file.
   - *Invariants:* every Spring name is import-gated (negative test each); decoys give nothing.
   - Files: new `rb-frameworks/src/di.rs`, `rb-frameworks/src/lib.rs`.
