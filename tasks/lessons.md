@@ -151,3 +151,8 @@
 ## 2026-10-06: a mutation run that printed nothing has not run
 - **Mistake (caught before recording):** two mutation batches reported every mutant "not killed" or printed nothing at all: the first wrapped `cargo test` in `timeout`, which macOS does not have, and the second passed `cargo`'s arguments as one unquoted `$5`, which zsh does not word-split, so `cargo` was asked for a package named `rb-store --lib impact`. Both would have read as surviving mutants (or as passing guards) had I trusted the summary line.
 - **Rule:** a mutation harness prints the test runner's own result line for every mutant (`test result: …`), and a mutant with no such line is "not run", never "not killed". Pass argument lists as `"$@"` and check that every tool the harness calls exists (`command -v`) before the batch.
+
+## 2026-10-06: a ranking rule designed on exact matches must be re-derived for every match kind it ranks
+- **Mistake:** D9 ("most literal segments win") was written for exact matches and applied unchanged to suffix matches, where the client matches only the endpoint's tail. On spring-petclinic-microservices it sent 3 of 5 suffix calls to the endpoint with the longest path instead of the one whose tail the call names; the fixtures never showed it because their one suffix site had a single candidate.
+- **Rule:** when a rule orders candidates, restate it for each kind of match it orders (exact, suffix, wildcard) in terms of the part that actually matched, and give each kind a unit with two candidates where the whole-path reading and the matched-part reading disagree.
+

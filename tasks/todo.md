@@ -379,7 +379,8 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
   - *State:* none. *Derived:* the SCIP-mode login path (golden). *Invariants:* the Java hop is `exact` only through scip-java's occurrences; the named Express handler is `exact` only through the join's exact-handler map (mutation shown); fresh = cached. Files: `rb-cli/tests/e2e.rs` (`scip-path-login.txt`), plus the re-blessed SCIP goldens.
   - Before the run: `df`, the images and the context (lessons 2026-10-01).
   - **Verify:** SCIP e2e with containers; no `skipping:`; fresh = cached.
-- [ ] **10. Public repositories** (S27).
+- [x] **10. Public repositories** (S27). Done 2026-10-06 (contract amendment 9, fork F3, "Measurement").
+  - *State:* none new. *Derived:* suffix candidates ranked by the matched tail's literals (amendment 9). *Invariants:* certainty unchanged by the ranking fix; every measured number computed by a script from the dumps; clones and `m4a_*` repositories removed. Clones went to `var/m4a/` (the orchestrator's instruction) rather than the scratchpad.
   - Clone the candidates into the scratchpad. Verify that their routes and clients match the contract's description; record any substitution with its reason. Pin the commits.
   - Run `--no-scip` fresh and cached, plus SCIP for spring-petclinic-microservices.
   - Record the counts and buckets (one member per non-zero bucket), the time and the facts-cache size against the M3b binary.

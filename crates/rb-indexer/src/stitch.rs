@@ -513,7 +513,7 @@ impl<'e> Stitcher<'e> {
                 Bucket::Unmatched
             });
         }
-        let best = self.most_specific(others, method);
+        let best = self.most_specific(others, method, client.len());
         let n = best.len();
         if n > MAX_CANDIDATES {
             return Outcome {
@@ -585,17 +585,31 @@ impl<'e> Stitcher<'e> {
     }
 
     /// D9: the candidates with the most literal segments, then those whose method equals a known
-    /// client method over `ANY` ones.
+    /// client method over `ANY` ones. A suffix match counts the literals of the endpoint tail the
+    /// client's `client_len` segments matched (amendment 9); a tail ending in `{*}` has no fixed
+    /// length, so its whole path counts.
     fn most_specific(
         &self,
         found: Vec<(usize, PathMatch)>,
         method: &str,
+        client_len: usize,
     ) -> Vec<(usize, PathMatch)> {
-        let literals = |i: usize| literal_segments(&self.index.segments[i]);
-        let top = found.iter().map(|(i, _)| literals(*i)).max().unwrap_or(0);
+        let literals = |i: usize, m: &PathMatch| {
+            let segs = &self.index.segments[i];
+            if m.suffix && segs.last() != Some(&Segment::Wild) {
+                literal_segments(&segs[segs.len().saturating_sub(client_len)..])
+            } else {
+                literal_segments(segs)
+            }
+        };
+        let top = found
+            .iter()
+            .map(|(i, m)| literals(*i, m))
+            .max()
+            .unwrap_or(0);
         let mut best: Vec<(usize, PathMatch)> = found
             .into_iter()
-            .filter(|(i, _)| literals(*i) == top)
+            .filter(|(i, m)| literals(*i, m) == top)
             .collect();
         if method != ANY
             && best
@@ -1294,6 +1308,54 @@ mod tests {
         // An unknown method takes both sides of the method rule.
         let (bucket, _) = one(&eps, &site(WEB, None, Some(("/v/x", Literal)), 1));
         assert_eq!(bucket, Bucket::Ambiguous);
+    }
+
+    /// D9 for a suffix match (contract M4a amendment 9, measured on
+    /// spring-petclinic-microservices): specificity counts the literal segments of the endpoint
+    /// tail the client matched, not of the whole endpoint path. Counting the whole path sent
+    /// `hostname + "pets/visits"` to `/owners/{}/pets/{}/visits` (3 literals, matched tail
+    /// `{}/visits`) instead of `/pets/visits`, and `base + "/owners"` and `base + "vets"` to
+    /// `/api/gateway/owners/{}` (its tail `{}` matches any segment).
+    #[test]
+    fn suffix_specificity_counts_the_matched_tail() {
+        let eps = vec![
+            ep("GET", "/owners/{ownerId}/pets/{petId}/visits", AUTH),
+            ep("GET", "/pets/visits", AUTH),
+            ep("GET", "/api/gateway/owners/{ownerId}", NOTIFICATION),
+            ep("GET", "/owners", BILLING),
+            ep("GET", "/vets", BILLING),
+        ];
+        let target = |url: &str| {
+            let (bucket, links) = one(&eps, &site(WEB, Some("GET"), Some((url, Literal)), 1));
+            (
+                bucket,
+                links
+                    .iter()
+                    .map(|l| l.split(" [").next().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for (url, want) in [
+            ("{?}pets/visits", "HTTP GET /pets/visits @services/auth"),
+            (
+                "{?}/owners",
+                "HTTP GET /owners @services/billing/cmd/billing",
+            ),
+            ("{?}vets", "HTTP GET /vets @services/billing/cmd/billing"),
+        ] {
+            assert_eq!(
+                target(url),
+                (Bucket::Heuristic, vec![want.to_owned()]),
+                "{url}"
+            );
+        }
+        // A client longer than an endpoint's tail still counts only what it matched: both
+        // tails `{}/visits` and `pets/visits` are compared on two segments.
+        assert_eq!(
+            target("{?}/x/pets/visits").0,
+            Bucket::Unmatched,
+            "no endpoint ends in x/pets/visits"
+        );
     }
 
     /// Invariant 4: several sites of one source and endpoint are one edge with the best site's
