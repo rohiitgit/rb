@@ -5,6 +5,8 @@ breaks: requiring edges into it (1):
 affects: reaches those through calls or references (0):
 endpoints: handled by the removed or impacted code (1):
   2  POST /api/v1/login  [auth-api]  heuristic
+orphans: may become dead code (0):
+tests (0):
 services: auth-api (own) 1
 owners: @acme/auth-team 1
 certainty: exact 1

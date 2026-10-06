@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use rb_model::{Certainty, Edge, EdgeKind, Graph, Node, NodeKind};
 
@@ -460,13 +460,39 @@ pub struct Impact {
     /// Owners of the impacted nodes' files: `(owner key, impacted count)`.
     pub owners: Vec<(String, usize)>,
     /// Endpoints handled by a removed, breaking or affected node (design §9.3 roll-up): one
-    /// more than the handler's distance (a removed handler's endpoint is at 1), the weaker of
-    /// the handler's certainty and its `HANDLED_BY`.
+    /// more than the handler's distance (a removed handler's endpoint is at 1, and only there),
+    /// the weaker of the handler's certainty and its `HANDLED_BY`. They are not repeated under
+    /// `breaks` (M4a open item 7).
     pub endpoints: Vec<Impacted>,
+    /// What may become dead code (contract M4b S13, D11).
+    pub orphans: Orphans,
+    /// Impacted tests: nodes whose `entry` holds `test`, and files of test paths (§9.3).
+    pub tests: Vec<Impacted>,
     pub truncated: bool,
     pub precision: Precision,
     /// Dispatch steps skipped because their implementing type is never instantiated (S10).
     pub pruned_by_rta: usize,
+}
+
+/// The orphans of an impact, or why they were not computed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Orphans {
+    /// `library service`, `not in a deployable service`, or `not a symbol`.
+    NotComputed(&'static str),
+    /// Sorted by distance, then declaring file, line and key.
+    Computed(Vec<Orphan>),
+}
+
+/// A symbol that may become dead code: forward-reachable from the removed set within the
+/// target's service, and reached by no live node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Orphan {
+    pub node: i64,
+    /// Steps from the removed set.
+    pub distance: usize,
+    /// The node it was first reached from (removed or another orphan) and how: `calls`,
+    /// `references` or `dispatch`.
+    pub via: (i64, &'static str),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -580,6 +606,17 @@ pub fn impact(
             .next()
     };
     let endpoints = endpoint_rollup(&v, &removed, &breaks, &affects, min_certainty);
+    // An endpoint is listed once, under `endpoints` (M4a open item 7).
+    breaks.retain(|x| v.node(x.node).kind != NodeKind::Endpoint);
+    let (orphans, cut) = orphans(&v, target, &removed, &in_removed);
+    truncated |= cut;
+    let mut tests: Vec<Impacted> = breaks
+        .iter()
+        .chain(&affects)
+        .filter(|x| is_test(&v, x.node))
+        .cloned()
+        .collect();
+    tests.sort_by_key(|x| (x.distance, v.order_key(x.node)));
     let own = service_of(target);
     let mut services: BTreeMap<String, usize> = BTreeMap::new();
     let mut owners: BTreeMap<String, usize> = BTreeMap::new();
@@ -606,10 +643,155 @@ pub fn impact(
             .collect(),
         owners: owners.into_iter().collect(),
         endpoints,
+        orphans,
+        tests,
         truncated,
         precision,
         pruned_by_rta: v.pruned(),
     }
+}
+
+/// A test: a node whose stored `entry` holds `test` (S11), or a file of a test path (a TS/JS
+/// test file's top-level code).
+fn is_test(v: &View<'_>, n: i64) -> bool {
+    let node = v.node(n);
+    match node.kind {
+        NodeKind::File => rb_model::is_test_path(&node.key),
+        _ => entry_kinds(node).contains(&"test"),
+    }
+}
+
+/// The stored entry kinds of a node (S11), sorted as stored.
+pub fn entry_kinds(node: &Node) -> Vec<&str> {
+    node.attrs
+        .get("entry")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect()
+}
+
+/// The service node of `n`'s declaring file.
+fn service_node(v: &View<'_>, n: i64) -> Option<i64> {
+    let file = v.file_of(n)?;
+    v.outbound(file, EdgeKind::InService).map(|e| e.dst).next()
+}
+
+/// The orphans of removing `removed` (contract M4b S13, D11), and whether the candidate walk
+/// stopped at the node cap (unwalked nodes count as live, so a cut can only keep code).
+///
+/// Candidates are the symbols of the target's service forward-reachable from the removed set
+/// over `CALLS`, `REFERENCES` and dispatch. A candidate is live when it is ineligible or an
+/// entry point, when a requiring edge reaches it from a live node (every node outside the
+/// removed set and the candidates is live), or when it implements a live method (dispatch);
+/// liveness then flows forward along requiring edges and to implementations. The orphans are
+/// the candidates that are not live: the greatest fixpoint, so a dead cycle is found. Each walk
+/// is one breadth-first search with a visited set; every edge certainty counts, whatever
+/// `--min-certainty` says, since ignoring an edge could only make more orphans.
+fn orphans(
+    v: &View<'_>,
+    target: i64,
+    removed: &[i64],
+    in_removed: &HashSet<i64>,
+) -> (Orphans, bool) {
+    if v.node(target).kind != NodeKind::Symbol {
+        return (Orphans::NotComputed("not a symbol"), false);
+    }
+    let Some(service) = service_node(v, target) else {
+        return (Orphans::NotComputed("not in a deployable service"), false);
+    };
+    match v.node(service).attrs.get("role").and_then(|r| r.as_str()) {
+        Some("service") => {}
+        Some("library") => return (Orphans::NotComputed("library service"), false),
+        _ => return (Orphans::NotComputed("not in a deployable service"), false),
+    }
+    let any = Certainty::Ambiguous;
+    // Implementations a call to `m` may dispatch to (under RTA not through a pruned step).
+    let implementations = |m: i64| {
+        v.inbound(m, EdgeKind::Implements, any)
+            .filter(|e| v.dispatches(e))
+            .map(|e| e.src)
+    };
+
+    // Candidates, breadth-first from the removed set.
+    let mut candidates: HashMap<i64, Orphan> = HashMap::new();
+    let mut frontier: Vec<i64> = removed.to_vec();
+    let mut cut = false;
+    let mut distance = 0;
+    while !frontier.is_empty() && !cut {
+        distance += 1;
+        let mut next = Vec::new();
+        for &n in &frontier {
+            let reached = v
+                .outbound(n, EdgeKind::Calls)
+                .map(|e| (e.dst, "calls"))
+                .chain(
+                    v.outbound(n, EdgeKind::References)
+                        .map(|e| (e.dst, "references")),
+                )
+                .chain(implementations(n).map(|m| (m, "dispatch")));
+            for (m, how) in reached {
+                if in_removed.contains(&m)
+                    || candidates.contains_key(&m)
+                    || v.node(m).kind != NodeKind::Symbol
+                    || service_node(v, m) != Some(service)
+                {
+                    continue;
+                }
+                if candidates.len() >= IMPACT_NODE_CAP {
+                    cut = true;
+                    break;
+                }
+                candidates.insert(
+                    m,
+                    Orphan {
+                        node: m,
+                        distance,
+                        via: (n, how),
+                    },
+                );
+                next.push(m);
+            }
+        }
+        frontier = next;
+    }
+
+    // Liveness: seeds, then forward along requiring edges and to implementations.
+    let outside = |x: i64| !in_removed.contains(&x) && !candidates.contains_key(&x);
+    let mut live: HashSet<i64> = HashSet::new();
+    let mut queue: VecDeque<i64> = VecDeque::new();
+    for &c in candidates.keys() {
+        let node = v.node(c);
+        let eligible = node.attrs.get("orphan_eligible") == Some(&serde_json::Value::Bool(true));
+        let seed = !eligible
+            || !entry_kinds(node).is_empty()
+            || REQUIRING
+                .iter()
+                .any(|&k| v.inbound(c, k, any).any(|e| outside(e.src)))
+            || v.outbound(c, EdgeKind::Implements)
+                .any(|e| outside(e.dst) && v.dispatches(e));
+        if seed && live.insert(c) {
+            queue.push_back(c);
+        }
+    }
+    while let Some(x) = queue.pop_front() {
+        let forward = REQUIRING
+            .iter()
+            .flat_map(|&k| v.outbound(x, k).map(|e| e.dst))
+            .chain(implementations(x));
+        for y in forward.collect::<Vec<_>>() {
+            if candidates.contains_key(&y) && live.insert(y) {
+                queue.push_back(y);
+            }
+        }
+    }
+    let mut list: Vec<Orphan> = candidates
+        .into_values()
+        .filter(|o| !live.contains(&o.node))
+        .collect();
+    list.sort_by_cached_key(|o| (o.distance, v.order_key(o.node)));
+    (Orphans::Computed(list), cut)
 }
 
 /// The endpoints the impacted set handles (contract M4a S21), at their smallest distance and,
@@ -1340,5 +1522,313 @@ mod tests {
         );
         assert_eq!(rollup("handle"), ["1 HTTP GET /named @s [exact]"]);
         assert_eq!(rollup("helper"), ["2 HTTP GET /named @s [ambiguous]"]);
+    }
+
+    /// A graph built by name for `rb impact`'s roll-ups: files belong to the service named by
+    /// their first path segment (`app` deployable, `lib` a library); symbols are
+    /// `<path>#<name>`, `orphan_eligible` unless listed in `ineligible`.
+    struct B {
+        b: GraphBuilder,
+        line: i32,
+    }
+
+    impl B {
+        fn new() -> Self {
+            let mut b = GraphBuilder::new();
+            for (s, role) in [("app", "service"), ("lib", "library")] {
+                let mut attrs = Attrs::new();
+                attrs.insert("role".into(), role.into());
+                b.add_node(NodeKey::new(NodeKind::Service, s), s, attrs)
+                    .unwrap();
+            }
+            B { b, line: 0 }
+        }
+
+        fn file(&mut self, path: &str) -> NodeKey {
+            let f = NodeKey::new(NodeKind::File, path);
+            if !self.b.has_node(&f) {
+                self.b.add_node(f.clone(), path, Attrs::new()).unwrap();
+                let s = NodeKey::new(NodeKind::Service, path.split('/').next().unwrap());
+                self.b
+                    .add_edge(NewEdge::new(
+                        f.clone(),
+                        EdgeKind::InService,
+                        s,
+                        Provenance::Manifest,
+                        Certainty::Exact,
+                    ))
+                    .unwrap();
+            }
+            f
+        }
+
+        /// A symbol with `attrs` (`orphan_eligible: true` added unless `eligible` is false).
+        fn sym_with(
+            &mut self,
+            path: &str,
+            name: &str,
+            eligible: bool,
+            mut attrs: Attrs,
+        ) -> NodeKey {
+            let key = NodeKey::new(NodeKind::Symbol, format!("{path}#{name}"));
+            if eligible {
+                attrs.insert("orphan_eligible".into(), true.into());
+            }
+            self.b.add_node(key.clone(), name, attrs).unwrap();
+            let file = self.file(path);
+            self.line += 1;
+            self.b
+                .add_edge(
+                    NewEdge::new(
+                        key.clone(),
+                        EdgeKind::DefinedIn,
+                        file,
+                        Provenance::Treesitter,
+                        Certainty::Exact,
+                    )
+                    .evidence(Evidence {
+                        path: path.into(),
+                        span: [self.line, 0, self.line, 1],
+                    }),
+                )
+                .unwrap();
+            key
+        }
+
+        fn sym(&mut self, path: &str, name: &str) -> NodeKey {
+            self.sym_with(path, name, true, Attrs::new())
+        }
+
+        fn edge(&mut self, src: &NodeKey, kind: EdgeKind, dst: &NodeKey) {
+            self.b
+                .add_edge(NewEdge::new(
+                    src.clone(),
+                    kind,
+                    dst.clone(),
+                    Provenance::Heuristic,
+                    Certainty::Heuristic,
+                ))
+                .unwrap();
+        }
+    }
+
+    /// `distance name (via pred kind)` per orphan, or the reason they were not computed.
+    fn orphan_lines(g: &Graph, i: &Impact) -> Vec<String> {
+        let name = |id: i64| {
+            let k = &g.nodes().iter().find(|n| n.id == id).unwrap().key;
+            k.rsplit_once('#').map_or(k.clone(), |(_, n)| n.to_owned())
+        };
+        match &i.orphans {
+            Orphans::NotComputed(reason) => vec![format!("not computed: {reason}")],
+            Orphans::Computed(list) => list
+                .iter()
+                .map(|o| {
+                    format!(
+                        "{} {} (via {} {})",
+                        o.distance,
+                        name(o.node),
+                        name(o.via.0),
+                        o.via.1
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn sym_id(g: &Graph, key: &NodeKey) -> i64 {
+        g.nodes().iter().find(|n| n.key == key.key).unwrap().id
+    }
+
+    /// Contract M4b S13, D11: orphans are the candidates no live node reaches. A dead cycle is
+    /// orphaned; a cycle with an outside caller is not; an ineligible or entry candidate is a
+    /// live seed and keeps what it calls; an implementation of a live interface method lives by
+    /// dispatch, one of a dead or removed method does not.
+    #[test]
+    fn orphans_are_the_candidates_no_live_node_reaches() {
+        let mut b = B::new();
+        let t = b.sym("app/a.java", "T");
+        let outside = b.sym("app/b.java", "X");
+        // A dead mutual recursion, and a cycle with an outside caller.
+        let (a1, a2) = (b.sym("app/a.java", "a1"), b.sym("app/a.java", "a2"));
+        b.edge(&t, EdgeKind::Calls, &a1);
+        b.edge(&a1, EdgeKind::Calls, &a2);
+        b.edge(&a2, EdgeKind::Calls, &a1);
+        let (c1, c2) = (b.sym("app/a.java", "c1"), b.sym("app/a.java", "c2"));
+        b.edge(&t, EdgeKind::Calls, &c1);
+        b.edge(&c1, EdgeKind::Calls, &c2);
+        b.edge(&c2, EdgeKind::Calls, &c1);
+        b.edge(&outside, EdgeKind::Calls, &c2);
+        // An ineligible candidate and what it calls; an eligible one with an entry kind.
+        let f = b.sym_with("app/a.java", "f", false, Attrs::new());
+        let g1 = b.sym("app/a.java", "g");
+        b.edge(&t, EdgeKind::References, &f);
+        b.edge(&f, EdgeKind::Calls, &g1);
+        let mut entry = Attrs::new();
+        entry.insert("entry".into(), serde_json::json!(["scheduled"]));
+        let h = b.sym_with("app/a.java", "h", true, entry);
+        b.edge(&t, EdgeKind::Calls, &h);
+        // A dead interface method and its implementation; a live one and its implementation.
+        let (im, am) = (b.sym("app/a.java", "I.m"), b.sym("app/a.java", "A.m"));
+        b.edge(&t, EdgeKind::Calls, &im);
+        b.edge(&am, EdgeKind::Implements, &im);
+        let (jm, bm) = (b.sym("app/a.java", "J.m"), b.sym("app/a.java", "B.m"));
+        b.edge(&t, EdgeKind::Calls, &jm);
+        b.edge(&outside, EdgeKind::Calls, &jm);
+        b.edge(&bm, EdgeKind::Implements, &jm);
+        // A candidate implementing a method outside the candidates (live by definition).
+        let (em, fm) = (b.sym("app/a.java", "E.m"), b.sym("app/c.java", "F.m"));
+        b.edge(&t, EdgeKind::Calls, &em);
+        b.edge(&em, EdgeKind::Implements, &fm);
+        // Something in another service is never a candidate.
+        let l = b.sym("lib/l.java", "l");
+        b.edge(&t, EdgeKind::Calls, &l);
+        let g = b.b.finish().unwrap();
+        let i = impact(&g, sym_id(&g, &t), Certainty::Ambiguous, Precision::Cha);
+        assert_eq!(
+            orphan_lines(&g, &i),
+            [
+                "1 a1 (via T calls)",
+                "1 I.m (via T calls)",
+                "2 a2 (via a1 calls)",
+                "2 A.m (via I.m dispatch)",
+            ]
+        );
+
+        // An implementation of a removed method gets nothing from it.
+        let mut b = B::new();
+        let rm = b.sym("app/a.java", "R.m");
+        let cm = b.sym("app/a.java", "C.m");
+        b.edge(&cm, EdgeKind::Implements, &rm);
+        let g = b.b.finish().unwrap();
+        let i = impact(&g, sym_id(&g, &rm), Certainty::Ambiguous, Precision::Cha);
+        assert_eq!(orphan_lines(&g, &i), ["1 C.m (via R.m dispatch)"]);
+
+        // A target in a library service: not computed.
+        let mut b = B::new();
+        let lt = b.sym("lib/l.java", "T");
+        let lh = b.sym("lib/l.java", "h");
+        b.edge(&lt, EdgeKind::Calls, &lh);
+        let g = b.b.finish().unwrap();
+        let i = impact(&g, sym_id(&g, &lt), Certainty::Ambiguous, Precision::Cha);
+        assert_eq!(orphan_lines(&g, &i), ["not computed: library service"]);
+    }
+
+    /// Contract M4b S13 with `--precision rta`: an implementation whose dispatch step is
+    /// pruned gets no liveness from a live interface method.
+    #[test]
+    fn rta_orphans_follow_the_pruned_dispatch() {
+        let mut b = B::new();
+        let t = b.sym("app/a.java", "T");
+        let outside = b.sym("app/b.java", "X");
+        let (jm, km) = (b.sym("app/a.java", "J.m"), b.sym("app/a.java", "K.m"));
+        b.edge(&t, EdgeKind::Calls, &jm);
+        b.edge(&outside, EdgeKind::Calls, &jm);
+        let mut flagged = Attrs::new();
+        flagged.insert("impl_instantiated".into(), false.into());
+        b.b.add_edge(
+            NewEdge::new(
+                km.clone(),
+                EdgeKind::Implements,
+                jm.clone(),
+                Provenance::Heuristic,
+                Certainty::Heuristic,
+            )
+            .attrs(flagged),
+        )
+        .unwrap();
+        let g = b.b.finish().unwrap();
+        let cha = impact(&g, sym_id(&g, &t), Certainty::Ambiguous, Precision::Cha);
+        assert!(orphan_lines(&g, &cha).is_empty());
+        // Under `rta` `K.m` is not reached by dispatch at all: no candidate, no orphan.
+        let rta = impact(&g, sym_id(&g, &t), Certainty::Ambiguous, Precision::Rta);
+        assert!(orphan_lines(&g, &rta).is_empty());
+        assert_eq!(rta.pruned_by_rta, 1);
+    }
+
+    /// Contract M4b S13: impacted tests (an `entry` with `test`, a file of a test path), and
+    /// M4a item 7: an endpoint whose handler is removed is listed once, under `endpoints`.
+    #[test]
+    fn tests_and_endpoints_are_listed_once() {
+        let mut b = B::new();
+        let t = b.sym("app/src/main/A.java", "T");
+        let mut test = Attrs::new();
+        test.insert("entry".into(), serde_json::json!(["test"]));
+        let tm = b.sym_with("app/src/test/ATest.java", "t", false, test);
+        b.edge(&tm, EdgeKind::Calls, &t);
+        let spec = b.file("app/web/a.spec.ts");
+        b.edge(&spec, EdgeKind::Calls, &t);
+        let plain = b.sym("app/src/main/B.java", "user");
+        b.edge(&plain, EdgeKind::Calls, &t);
+        let ep = NodeKey::new(NodeKind::Endpoint, "HTTP GET /t @app");
+        b.b.add_node(ep.clone(), "GET /t", Attrs::new()).unwrap();
+        b.edge(&ep, EdgeKind::HandledBy, &t);
+        let g = b.b.finish().unwrap();
+        let i = impact(&g, sym_id(&g, &t), Certainty::Ambiguous, Precision::Cha);
+        let keys = |xs: &[Impacted]| -> Vec<String> {
+            xs.iter()
+                .map(|x| {
+                    let k = &g.nodes().iter().find(|n| n.id == x.node).unwrap().key;
+                    format!("{} {k}", x.distance)
+                })
+                .collect()
+        };
+        assert_eq!(
+            keys(&i.breaks),
+            [
+                "1 app/src/main/B.java#user",
+                "1 app/src/test/ATest.java#t",
+                "1 app/web/a.spec.ts"
+            ]
+        );
+        assert_eq!(keys(&i.endpoints), ["1 HTTP GET /t @app"]);
+        assert_eq!(
+            keys(&i.tests),
+            ["1 app/src/test/ATest.java#t", "1 app/web/a.spec.ts"]
+        );
+    }
+
+    /// A chain `T → n1 → … → n<len>` of eligible symbols, plus `fan` symbols `T` calls.
+    fn chain_and_fan(len: usize, fan: usize) -> (Graph, i64) {
+        let mut b = B::new();
+        let t = b.sym("app/a.java", "T");
+        let mut prev = t.clone();
+        for k in 0..len {
+            let n = b.sym("app/a.java", &format!("n{k}"));
+            b.edge(&prev, EdgeKind::Calls, &n);
+            prev = n;
+        }
+        for k in 0..fan {
+            let n = b.sym("app/a.java", &format!("f{k}"));
+            b.edge(&t, EdgeKind::Calls, &n);
+        }
+        let g = b.b.finish().unwrap();
+        let id = sym_id(&g, &t);
+        (g, id)
+    }
+
+    /// Invariant 8: a 5,000-deep chain is walked whole (one BFS with a visited set).
+    #[test]
+    fn a_5000_deep_dead_chain_is_orphaned() {
+        let (g, t) = chain_and_fan(5000, 0);
+        let i = impact(&g, t, Certainty::Ambiguous, Precision::Cha);
+        let Orphans::Computed(list) = &i.orphans else {
+            panic!("{:?}", i.orphans)
+        };
+        assert_eq!(list.len(), 5000);
+        assert_eq!(list.last().unwrap().distance, 5000);
+    }
+
+    /// Invariant 9: orphans grow linearly in chains and fans (counted, 4× → ≤ 5×).
+    #[test]
+    fn orphans_grow_linearly() {
+        let count = |len, fan| {
+            let (g, t) = chain_and_fan(len, fan);
+            crate::work::take();
+            let i = impact(&g, t, Certainty::Ambiguous, Precision::Cha);
+            assert!(matches!(i.orphans, Orphans::Computed(ref l) if l.len() == len + fan));
+            crate::work::take()
+        };
+        let (small, large) = (count(200, 200), count(800, 800));
+        assert!(large <= small * 5, "{small} -> {large}");
     }
 }

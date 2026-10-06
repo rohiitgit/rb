@@ -561,7 +561,9 @@ Same rules as M4a:
   - *Invariants:* import-gated kinds with decoys; one keeping row per eligibility rule; scan cost measured on the public repositories in phase 15; counted growth test.
   - Files: new `rb-indexer/src/liveness.rs`, `rb-indexer/src/syntax.rs` (attributes), `rb-indexer/src/lib.rs`.
   - **Verify:** units; e2e churn (symbol attributes) classified.
-- [ ] **8. Entry marks, orphans, tests and item 7 in the questions** (S11 query side, S13).
+- [x] **8a. `rb impact`: orphans, tests, item 7, `--json`** (S13). Done: `rb_store::code::{Orphans, Orphan, entry_kinds}`, the orphan walk (candidates BFS, liveness BFS, both with visited sets), `tests`, endpoints out of `breaks`; `rb impact --json`; `rb_model::is_test_path` (moved from rb-indexer); amendment 11; 5 + 1 units, 15 mutants killed (one survivor given a row). Files: `rb-store/src/code.rs`, `rb-cli/src/{code,main}.rs`, `rb-model/src/lib.rs`, `rb-indexer/src/di.rs`.
+- [ ] **8b. Entry marks and routers in the other answers** (S11 query side, S13 item 7): `(entry: …)` in `rb callers` (stored kinds, `endpoint <name>`, `top-level`), the router in the `rb path` header and the card's APIs.
+- (original phase 8 entry, split as above) **8. Entry marks, orphans, tests and item 7 in the questions** (S11 query side, S13).
   - *Derived (query time):* `(entry: …)` marks; the orphan reachability; `tests (n)`; endpoints listed once; the router shown for prefix-unknown endpoints; `rb impact --json`.
   - *Invariants:* the greatest-fixpoint formulation (dead cycle orphaned; a cycle with an outside caller live); dispatch liveness; library services not computed; 5,000-deep chain; counted growth.
   - Files: `rb-store/src/code.rs`, `rb-store/src/path.rs` (header), `rb-cli/src/code.rs`, `rb-cli/src/main.rs`, `rb-cli/src/path.rs`.

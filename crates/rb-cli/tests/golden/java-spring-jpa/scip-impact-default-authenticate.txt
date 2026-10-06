@@ -5,6 +5,8 @@ affects: reaches those through calls or references (1):
   1  com/acme/auth/AuthController#login().  src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  dispatch
 endpoints: handled by the removed or impacted code (1):
   2  POST /auth/api/v1/login  [auth-service]  synthetic
+orphans: may become dead code (0):
+tests (0):
 services: auth-service (own) 1
 owners: -
 certainty: dispatch 1

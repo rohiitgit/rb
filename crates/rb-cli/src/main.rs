@@ -167,6 +167,9 @@ enum Command {
         /// the dangerous failure here.
         #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
         precision: rb_store::code::Precision,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Show the request path through an endpoint (Q4): the client calls reaching it across
     /// services, and what its handler reaches (tables, other services' endpoints).
@@ -398,12 +401,20 @@ fn main() -> anyhow::Result<()> {
             min_certainty,
             pick,
             precision,
+            json,
         } => {
             let snap = live_snapshot(&mut store, repo)?;
             let graph = store.load_graph(snap.id)?;
             let t = code::pick_target(&graph, &target, pick)?;
             let impact = rb_store::code::impact(&graph, t, min_certainty, precision);
-            print!("{}", code::render_impact(&graph, &impact));
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&code::impact_json(&graph, &impact))?
+                );
+            } else {
+                print!("{}", code::render_impact(&graph, &impact));
+            }
         }
         Command::Path {
             query,

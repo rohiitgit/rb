@@ -186,6 +186,26 @@ impl fmt::Display for NodeKey {
     }
 }
 
+/// A test source (contract M4b invariant 6; shared by DI, RTA, orphans and `rb impact`'s tests): Maven `src/test/`, a `test`/`tests`/`__tests__` directory,
+/// `*Test.java`/`*Tests.java`/`*IT.java`, `*.test.*`/`*.spec.*`, `*_test.go`,
+/// `test_*.py`/`*_test.py`.
+pub fn is_test_path(path: &str) -> bool {
+    let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if dirs
+        .split('/')
+        .any(|d| matches!(d, "test" | "tests" | "__tests__"))
+    {
+        return true;
+    }
+    if let Some(stem) = name.strip_suffix(".java") {
+        return stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("IT");
+    }
+    if let Some(stem) = name.strip_suffix(".py") {
+        return stem.starts_with("test_") || stem.ends_with("_test");
+    }
+    name.ends_with("_test.go") || name.contains(".test.") || name.contains(".spec.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +232,27 @@ mod tests {
             assert_eq!(Certainty::from_rank(r).unwrap().rank(), r);
         }
         assert!(Certainty::from_rank(0).is_err());
+    }
+
+    #[test]
+    fn test_paths() {
+        for (path, want) in [
+            ("src/test/java/a/B.java", true),
+            ("a/__tests__/x.ts", true),
+            ("tests/x.py", true),
+            ("src/main/java/a/BTest.java", true),
+            ("src/main/java/a/BTests.java", true),
+            ("src/main/java/a/BIT.java", true),
+            ("web/a.spec.ts", true),
+            ("web/a.test.js", true),
+            ("pkg/a_test.go", true),
+            ("pkg/test_a.py", true),
+            ("pkg/a_test.py", true),
+            ("src/main/java/a/Testing.java", false),
+            ("src/main/java/a/Contest.java", false),
+            ("pkg/latest/a.go", false),
+        ] {
+            assert_eq!(is_test_path(path), want, "{path}");
+        }
     }
 }
