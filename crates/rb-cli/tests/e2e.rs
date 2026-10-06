@@ -1271,6 +1271,28 @@ fn code_question_goldens() {
     );
 }
 
+/// The edges of `dump` that `keep(kind, attributes)` selects, one per line in dump order:
+/// `<KIND> <src key> -> <dst key> [<certainty>] <attributes>`, the precision-guard grammar.
+fn edge_lines(dump: &str, keep: impl Fn(&str, &serde_json::Value) -> bool) -> String {
+    let mut out = String::new();
+    for line in dump.lines().skip(1) {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        if row[0] != "E" || !keep(row[3].as_str().unwrap_or_default(), &row[8]) {
+            continue;
+        }
+        let rank = usize::try_from(row[7].as_i64().unwrap() - 1).unwrap();
+        out.push_str(&format!(
+            "{} {} -> {} [{}] {}\n",
+            row[3].as_str().unwrap_or_default(),
+            row[2].as_str().unwrap_or_default(),
+            row[5].as_str().unwrap_or_default(),
+            CERTAINTIES[rank],
+            row[8]
+        ));
+    }
+    out
+}
+
 /// The line of `rb status` that starts with `prefix` (indentation ignored), newline-terminated.
 fn status_line(status: &str, prefix: &str) -> String {
     let line = status
@@ -1951,6 +1973,43 @@ fn scip_java_spring_jpa() {
     });
     assert!(python_call, "no heuristic main → helper call in {dump}");
     golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    // Contract M4b S25 (with F2): the injections end to end with scip-java's types. The plain
+    // single-bean rows (`AuthController → DefaultAuthService`, the `@Primary` hasher) are
+    // `heuristic` with `resolution` `unique`/`primary`, the profile issuers `ambiguous` and
+    // `conditional`; the DI and RTA coverage lines and the flagged `IMPLEMENTS` follow.
+    let status = rb(&url, &["status", "--repo", &name]);
+    let injects = format!(
+        "{}{}{}",
+        status_line(&status, "di:"),
+        status_line(&status, "rta:"),
+        edge_lines(&dump, |kind, attrs| {
+            kind == "INJECTS"
+                || (kind == "IMPLEMENTS"
+                    && attrs.get("impl_instantiated") == Some(&serde_json::Value::Bool(false)))
+        })
+    );
+    let package = "scip-java maven maven/com.acme/auth-service 1.4.0 com/acme/auth/";
+    for line in [
+        format!(
+            "INJECTS {package}AuthController# -> {package}DefaultAuthService# [heuristic] {{\"origin\":\"stereotype\",\"resolution\":\"unique\",\"sites\":1,\"via\":\"constructor\"}}"
+        ),
+        format!(
+            "INJECTS {package}DefaultAuthService# -> {package}BcryptHasher# [heuristic] {{\"origin\":\"stereotype\",\"primary\":true,\"resolution\":\"primary\",\"sites\":1,\"via\":\"constructor\"}}"
+        ),
+    ] {
+        assert!(injects.lines().any(|l| l == line), "{line}\n{injects}");
+    }
+    for issuer in ["JwtIssuer#", "DevIssuer#"] {
+        assert!(
+            injects
+                .lines()
+                .any(|l| l.contains(&format!("-> {package}{issuer} [ambiguous]"))
+                    && l.contains("\"conditional\":true")),
+            "{issuer}\n{injects}"
+        );
+    }
+    assert!(!injects.contains("[synthetic]"), "{injects}");
+    golden(fixture, "scip-injects.txt", &injects);
     // S8: Maven artifacts and the JDK, with the versions scip-java resolved.
     golden(
         fixture,

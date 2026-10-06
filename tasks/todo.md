@@ -598,7 +598,7 @@ Same rules as M4a:
   - *Invariants:* every guard line and dump check bitten by a recorded mutation (item 5's own-service mutation included; the dynamic-URL check settled as equivalent or bitten, with the reasoning); producer coverage for `INJECTS` and both `DEPENDS_ON` forms; the invariant-1 check against the phase-0 baseline; AGE parity for `INJECTS` and Service → Service `DEPENDS_ON`.
   - Files: `rb-cli/tests/e2e.rs`, plus the six guard files.
   - **Verify:** e2e twice; determinism (two repos, forced rebuild, warm = cold).
-- [ ] **14. SCIP mode** (S25).
+- [x] **14. SCIP mode** (S25). Done: `scip-injects.txt` from a container run (F2: the plain rows `heuristic` with `resolution`, the issuers `ambiguous`/`conditional`), equal to the `--no-scip` injections; SCIP tests twice (amendment 18).
   - Before the run: `df`, the images and the context.
   - *Derived:* `scip-injects.txt` (the `synthetic` row end to end).
   - *Invariants:* no `skipping:`; fresh = cached; every SCIP golden diff classified.
