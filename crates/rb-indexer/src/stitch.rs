@@ -140,6 +140,9 @@ struct Outcome {
     links: Vec<Link>,
     /// Candidates of a `too_ambiguous` site.
     candidates: usize,
+    /// Why an `unmatched` site is unmatched, when a rule removed its only path match
+    /// (`catch_all_only`, contract M4b S20).
+    detail: Option<&'static str>,
 }
 
 impl Outcome {
@@ -148,6 +151,7 @@ impl Outcome {
             bucket,
             links: Vec::new(),
             candidates: 0,
+            detail: None,
         }
     }
 }
@@ -633,6 +637,21 @@ impl<'e> Stitcher<'e> {
         if found.is_empty() {
             return Outcome::bucket(Bucket::Unmatched);
         }
+        // An endpoint that catches every path (`/{*}`, nothing literal before the wildcard) is a
+        // candidate only when the host names its service (contract M4b S20, M4a item 9): a
+        // single-page app's fallback would otherwise absorb every unknown call.
+        // Only catch-alls are removed, so nothing left means they were the only path matches.
+        let named = matches!(scope, Scope::Only(_));
+        let found: Vec<(usize, PathMatch)> = found
+            .into_iter()
+            .filter(|(i, _)| named || self.index.segments[*i] != [Segment::Wild])
+            .collect();
+        if found.is_empty() {
+            return Outcome {
+                detail: Some("catch_all_only"),
+                ..Outcome::bucket(Bucket::Unmatched)
+            };
+        }
         let best = self.most_specific(found, method, client.len());
         // The best match is the caller's own endpoint: a call within the service (invariant 5).
         if best
@@ -691,6 +710,7 @@ impl<'e> Stitcher<'e> {
                     })
                     .collect(),
                 candidates: n,
+                detail: None,
             };
         }
         let e = &self.endpoints[i];
@@ -728,6 +748,7 @@ impl<'e> Stitcher<'e> {
                 attrs,
             }],
             candidates: 1,
+            detail: None,
         }
     }
 
@@ -814,6 +835,9 @@ pub(crate) fn add_consumes(
             }
             if outcome.bucket == Bucket::TooAmbiguous {
                 detail["candidates"] = outcome.candidates.into();
+            }
+            if let Some(why) = outcome.detail {
+                detail["detail"] = why.into();
             }
             diagnostics.push(Diagnostic {
                 kind: kind.to_owned(),
@@ -1472,15 +1496,65 @@ mod tests {
             links[0].starts_with("HTTP GET /api/items @services/orders "),
             "{links:?}"
         );
-        // A hole after `/` is still a whole-segment parameter.
-        let (_, links) = one(
-            &eps,
-            &site(WEB, Some("GET"), Some(("/api/items/{?}", Literal)), 1),
-        );
+        // A hole after `/` is still a whole-segment parameter: only the catch-all matches, and
+        // a host-less call reaches no catch-all (contract M4b S20).
+        let s = site(WEB, Some("GET"), Some(("/api/items/{?}", Literal)), 1);
+        assert_eq!(one(&eps, &s), (Bucket::Unmatched, vec![]));
+        assert_eq!(detail(&eps, &s), Some("catch_all_only"));
+    }
+
+    /// The site's diagnostic detail, if any.
+    fn detail(endpoints: &[EndpointRef], s: &Site) -> Option<&'static str> {
+        let services = services();
+        Stitcher::new(endpoints, &services).site(s).detail
+    }
+
+    /// Contract M4b S20 (M4a item 9): an endpoint `/{*}` is a candidate only for a client whose
+    /// host names its service; otherwise a site it alone matches is `unmatched`
+    /// (`catch_all_only`). A catch-all under a literal prefix is unaffected.
+    #[test]
+    fn catch_alls_need_a_named_host() {
+        let eps = vec![
+            ep("GET", "/*", "services/users"),
+            ep("GET", "/assets/*", NOTIFICATION),
+            ep("GET", "/api/v1/login", AUTH),
+        ];
+        let call = |url: &str| site(WEB, Some("GET"), Some((url, Literal)), 1);
+        // Evaluator pass 1's `a1`.
+        let a1 = call("/totally/unknown/path");
+        assert_eq!(one(&eps, &a1), (Bucket::Unmatched, vec![]));
+        assert_eq!(detail(&eps, &a1), Some("catch_all_only"));
+        let mut b = GraphBuilder::new();
+        let diagnostics =
+            add_consumes(&mut b, std::slice::from_ref(&a1), &eps, &services()).unwrap();
+        let unmatched = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_unmatched")
+            .unwrap();
+        assert_eq!(unmatched.detail["detail"], "catch_all_only");
+        // Through a proxy host: still no catch-all.
+        let proxied = call("http://gateway/totally/unknown/path");
+        assert_eq!(one(&eps, &proxied).0, Bucket::Unmatched);
+        assert_eq!(detail(&eps, &proxied), Some("catch_all_only"));
+        // The host names the catch-all's service.
+        let (bucket, links) = one(&eps, &call("http://users/totally/unknown/path"));
+        assert_eq!(bucket, Bucket::Heuristic);
         assert!(
-            links[0].starts_with("HTTP GET /{*} @services/auth "),
+            links[0].starts_with("HTTP GET /{*} @services/users "),
             "{links:?}"
         );
+        // A literal prefix before `{*}` is a path match like any other.
+        let (bucket, links) = one(&eps, &call("/assets/app.js"));
+        assert_eq!(bucket, Bucket::Heuristic);
+        assert!(links[0].starts_with("HTTP GET /assets/{*} @services/notification "));
+        // Another path match next to the catch-all: matched, with no detail.
+        let login = call("/api/v1/login");
+        assert_eq!(one(&eps, &login).0, Bucket::Heuristic);
+        assert_eq!(detail(&eps, &login), None);
+        // No path match at all: unmatched without the detail.
+        let none = call("http://notification/nothing/here");
+        assert_eq!(one(&eps, &none).0, Bucket::Unmatched);
+        assert_eq!(detail(&eps, &none), None);
     }
 
     /// Evaluator pass 1, P1 (the evaluator's repros, folded URLs): a hole in the port keeps a

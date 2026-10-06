@@ -351,6 +351,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 8b: `rb callers` marks entry points (`(entry: …)`: stored kinds, `endpoint <name>`, `top-level`) and keeps expanding past them; prefix-unknown endpoints show their router in the `rb path` header and the card.
 - [x] Phase 9: `rb table-deps` rolls up callers to entry points per service (ops, direct/indirect, endpoints, entry kinds, best certainty) and lists services reaching the table only through APIs, up to `--hops` (amendment 12).
 - [x] Phase 10: the full Service Card: packages with versions, database tables, service dependencies `via=calls|http|package` and their inverse, shared tables, the call-graph summary and entry points by kind (amendment 13).
+- [x] Phase 11a: Express mounts of default imports (S19; node-express-realworld's layout needs more, amendment 14) and catch-all endpoints only for named hosts (S20); `PIPELINE = m4b-di-5`.
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):

@@ -70,8 +70,9 @@ use serde_json::{Value, json};
 /// and Service → Service `DEPENDS_ON` `via=package` (contract M4b S15, S16); `m4b-di-2` Spring
 /// DI's `INJECTS` edges, `di_*` diagnostics and `di_coverage` (S4–S8); `m4b-di-3` RTA's
 /// `impl_instantiated: false` on `IMPLEMENTS` and `rta_coverage` (S9); `m4b-di-4` the `Symbol`
-/// attributes `entry` and `orphan_eligible` and `orphan_coverage` (S11, S12).
-pub const PIPELINE: &str = "m4b-di-4";
+/// attributes `entry` and `orphan_eligible` and `orphan_coverage` (S11, S12); `m4b-di-5`
+/// Express mounts of default imports (S19) and catch-all endpoints only for named hosts (S20).
+pub const PIPELINE: &str = "m4b-di-5";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

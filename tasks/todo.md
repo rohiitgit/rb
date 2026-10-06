@@ -578,7 +578,9 @@ Same rules as M4a:
   - *Invariants:* bytewise order; a self-call excluded; two vias between one pair both shown.
   - Files: `rb-store/src/query.rs`, `rb-cli/src/main.rs` (`render_card`).
   - **Verify:** units; e2e (every card re-blessed after classification).
-- [ ] **11. M4a items 1, 9, 15** (S19–S21).
+- [x] **11a. M4a items 1 and 9** (S19, S20). Done: default-import mounts through `default_export` (`rb-indexer/src/routes.rs`), catch-alls only for named hosts with `catch_all_only` (`stitch.rs`); `PIPELINE = m4b-di-5`; amendment 14 (S19 measured on node-express-realworld: 0 of 19 resolved, layout recorded as an open item); 2 units + 1 changed row, 7 mutants killed (one equivalent check deleted). Invariant 1: fixture dumps unchanged apart from the phase-7 lines; node-express-realworld vs `1f81c8f`: additions and the six `Symbol` attribute lines only.
+- [ ] **11b. M4a item 15** (S21): DI-resolved client bases.
+- (original phase 11 entry, split as above) **11. M4a items 1, 9, 15** (S19–S21).
   - *Derived:* default-import mounts composed; catch-all candidates restricted to named hosts; DI-resolved client bases (`base_from_bean`).
   - *Invariants:* each can only lower or remove (`CONSUMES` diff against the baseline classified); M4a's `synthetic` bar untouched (the existing never-`synthetic` guards still green).
   - Files: `rb-frameworks/src/routes.rs`, `rb-indexer/src/routes.rs`, `rb-indexer/src/stitch.rs`, `rb-indexer/src/di.rs` (base lookup for S21).

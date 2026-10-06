@@ -157,7 +157,9 @@ impl<'a> Composer<'a> {
 
 /// The routers a mount's child names: a router of the same file, or a top-level router of a
 /// module the file imports by that name (named import, or `ns.name` through a namespace
-/// import). A default import names no router: export facts do not say which binding it is.
+/// import). A default import names the router its module's `export default` names
+/// (`FileFacts::default_export`, contract M4b S19), one level only: a default export that is
+/// itself an import is no router of that module, so its prefix stays unknown.
 fn mount_targets<'a>(
     inputs: &Inputs<'a, '_>,
     path: &'a str,
@@ -176,7 +178,7 @@ fn mount_targets<'a>(
             None => import
                 .names
                 .iter()
-                .find(|n| n.local == m.child && n.name != "default")
+                .find(|n| n.local == m.child)
                 .map(|n| n.name.as_str()),
             Some((head, tail)) if import.alias.as_deref() == Some(head) && !tail.contains('.') => {
                 Some(tail)
@@ -185,6 +187,18 @@ fn mount_targets<'a>(
         };
         let Some(exported) = exported else { continue };
         for &target in files {
+            let exported = if exported == "default" {
+                match inputs
+                    .files
+                    .get(target)
+                    .and_then(|(_, f)| f.default_export.as_deref())
+                {
+                    Some(name) => name,
+                    None => continue,
+                }
+            } else {
+                exported
+            };
             if let Some(routes) = inputs.routes.get(target) {
                 out.extend(
                     routes
@@ -694,6 +708,42 @@ mod tests {
             .unwrap();
         assert_eq!(node.name, "GET /health");
         assert_eq!(node.attrs["frameworks"], json!(["express"]));
+    }
+
+    /// Contract M4b S19 (M4a item 1): a mount of a default import resolves through the
+    /// module's default export, one level; a default export that is no router, or is itself an
+    /// import, leaves the prefix unknown.
+    #[test]
+    fn default_imported_routers_are_mounted() {
+        let app = "import express from \"express\";\nimport health from \"./routes/health\";\nimport { named } from \"./routes/named\";\nimport other from \"./routes/other\";\nimport again from \"./routes/again\";\nconst app = express();\napp.use(\"/ops\", health);\napp.use(\"/n\", named);\napp.use(\"/o\", other);\napp.use(\"/a\", again);\n";
+        let health = "import { Router } from \"express\";\nconst health = Router();\nhealth.get(\"/health\", (_q, s) => s.send(\"ok\"));\nexport default health;\n";
+        let named = "import { Router } from \"express\";\nexport const named = Router();\nnamed.get(\"/x\", (_q, s) => s.end());\n";
+        // The default export is a function, and the module's router is not exported at all.
+        let other = "import { Router } from \"express\";\nconst r = Router();\nr.get(\"/y\", (_q, s) => s.end());\nexport default function make() { return 1; }\n";
+        // A default re-export of another module's router: one level only.
+        let again = "import health from \"./health\";\nexport default health;\n";
+        let built = build(
+            &[
+                ("api/src/app.ts", Language::TypeScript, app),
+                ("api/src/routes/health.ts", Language::TypeScript, health),
+                ("api/src/routes/named.ts", Language::TypeScript, named),
+                ("api/src/routes/other.ts", Language::TypeScript, other),
+                ("api/src/routes/again.ts", Language::TypeScript, again),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built)
+                .iter()
+                .filter(|e| e.starts_with("EXPOSES"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "EXPOSES api -> HTTP GET /n/x @api [heuristic]",
+                "EXPOSES api -> HTTP GET /ops/health @api [heuristic]",
+                "EXPOSES api -> HTTP GET /y @api ?router=api/src/routes/other.ts#r [heuristic]",
+            ]
+        );
     }
 
     #[test]
