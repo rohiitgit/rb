@@ -326,7 +326,7 @@ Findings from the research step (2026-09-29):
 # M4 Frameworks (split into M4a and M4b; design §13)
 
 - **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). **Closed 2026-10-06** (contract amendment 18) after eight evaluator passes; pass 8 (`tasks/eval-m4a-pass8.md`, verification only) VERDICT PASS.
-- **M4b, DI and dispatch** (Spring DI, Spring Data beans, RTA, entry points, orphans, Q3 roll-up, package versions and service dependencies, full Service Card): contract `tasks/contract-m4b.md` (S1–S28, soundness claims and closing bar up front, forks F1–F6) written 2026-10-06; built 2026-10-06 (phases 0–15 and 16's records), pending the evaluator passes. Of the M4a open items it takes 1, 5, 7, 9, 15 and 24; item 2 moves to M6.
+- **M4b, DI and dispatch** (Spring DI, Spring Data beans, RTA, entry points, orphans, Q3 roll-up, package versions and service dependencies, full Service Card): contract `tasks/contract-m4b.md` (S1–S28, soundness claims and closing bar up front, forks F1–F6) written 2026-10-06; built 2026-10-06 (phases 0–16). **Closed 2026-10-07** (contract amendment 22) after two evaluator passes; pass 2 (`tasks/eval-m4b-pass2.md`, verification only) VERDICT PASS. Of the M4a open items it takes 1, 5, 7, 9, 15 and 24; item 2 moves to M6.
 
 ## M4a phases
 
@@ -612,11 +612,11 @@ Same rules as M4a:
   - Hand-check the samples (`INJECTS` 20, all proven types or 20, 10 `rb impact` orphan runs, 20 package edges, 2 tables per Java repository).
   - Record the wall time and facts-cache size against `28e47ba`.
   - **Verify:** numbers recorded in the contract's measurement section, computed by a tool; clones and `m4b_*` repositories removed afterwards.
-- [ ] **16. Records and review** (S28).
+- [x] **16. Records and review** (S28).
   - [x] Records: contract amendments (16–20), measurement and open items (15, with milestones); design §5.5/§6.2/§6.4/§8.5/§9.2–§9.5/§10.3/§13 (M4b: built, pending the evaluator); README (status, `--precision`, the `di:`/`rta:` lines, orphans, Q3's roll-up, the card's sections); IMPLEMENT.md; CHANGELOG; lessons.
   - [x] Full verification loop and the stub scan.
   - [x] Evaluator pass 1 (full review, `tasks/eval-m4b-pass1.md`, VERDICT FAIL on `531e14e`: Y1–Y3 blockers, Y4–Y10 major, Y11–Y14 minor, Y15 doc); fixed test-first as amendment 21, below.
-  - [ ] Evaluator pass 2 (verification only, per the contract's closing bar); new attack forms in residue classes go to M5's adversarial review, not the verdict.
+  - [x] Evaluator pass 2 (verification only, per the contract's closing bar); new attack forms in residue classes go to M5's adversarial review, not the verdict.
   - Commit after each verified phase.
 
 ## Review (M4b evaluator pass 1)
@@ -627,4 +627,12 @@ Same rules as M4a:
 - [x] Y8/Y11 Maven duplicates and duplicate properties → `@?` `heuristic` with `versions`; Y9 npm aliases keyed by the real package; Y10 `go.mod` `replace`.
 - [x] Y15 open items 16–22 and the weaker-false-results list; contract amendment 21, design, README.
 - [x] Verification: fmt, clippy, unit tests, e2e twice with the database and containers (no `skipping:`), stub scan; 33 mutants (31 killed, 2 equivalent with their code deleted); four public repositories against `531e14e` (three byte-identical, jhipster: one RTA proof withdrawn, orphan first-rule shift only), fresh == cached; the evaluator's repros end to end.
-- [ ] Evaluator pass 2 (verification only).
+- [x] Evaluator pass 2 (verification only): `tasks/eval-m4b-pass2.md`, VERDICT PASS.
+
+## M4b closing
+- [x] Evaluator pass 2 (verification only, against `304fe4a`): Y1–Y15 repros and controls end to end with runtime confirmations, 21 mutants from a clean build (21 killed), four public repositories against `531e14e` (three byte-identical, jhipster's claimed 8 lines), fresh == cached, samples (`INJECTS` 20/20, orphans 9/9, versions 20/20), regression suite, invariant 1, docs vs code (N1, N2 doc notes).
+- [x] M4b closed 2026-10-07 (contract amendment 22: final S1–S28/invariant table, review history of passes 1–2, closing measurement, open items by milestone with the M5 adversarial-review list, item 23); design §13, README, IMPLEMENT.md, CHANGELOG updated.
+
+# M5 Scale & API (design §13)
+
+- [ ] Not started. Write its contract first; it inherits M4b open items 3, 5, 6, 7, 10, 11, 15, 18, 19, 20, 21 and 23 and M4a's adversarial carrier review.

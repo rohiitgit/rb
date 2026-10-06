@@ -334,7 +334,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - No new dependency and no migration.
 - **Forks for the orchestrator:** F1 (may a name-matched host reach `synthetic`? decided yes), F2 (Python in M6, decided as recommended) and F3 (identity of a prefix-unknown endpoint, raised by the gin measurement; decided: the router's identity in the key, amendment 10).
 
-## M4b DI and dispatch: built, pending the evaluator passes
+## M4b DI and dispatch: complete (closed 2026-10-07, contract amendment 22)
 
 - [x] Phase 0 (preflight): primary-source checks, pins, invariant-1 baseline, gate matchers; contract amendments 1–3.
 - [x] Phase 1a: X1's HTML row; parameter positions, type arguments, array flag, return types and modifiers as facts (amendment 4); no golden change.
@@ -362,6 +362,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 15: eight public repositories measured (contract measurement section; amendments 19–20: a by-simple-name `@Bean` match fixed, `PIPELINE = m4b-di-7`).
 - [x] Phase 16 (records): contract measurement section and Open items (15, each with its milestone, plus the weaker false results still possible); design, README, todo and changelog synced. Next: evaluator pass 1 (full review), then pass 2 (verification only). M4b is not done until the evaluator decides.
 - [x] Evaluator pass 1 (`tasks/eval-m4b-pass1.md`, VERDICT FAIL, Y1–Y15) fixed as amendment 21 (`PIPELINE = m4b-di-8`): RTA opt-in (every question defaults to `cha`); RTA reads binary names, every text file and TS/JS module objects, and a supertype of a non-definition keeps its base; orphan rule (e) is transitive; gate M covers every assignable registration; `@Primary`/name never pick past generics or unread annotations; `@Named` read; Maven duplicates, npm aliases and `go.mod` replaces. Open items 16–22. Next: evaluator pass 2 (verification only).
+- [x] M4b closed (contract amendment 22): evaluator pass 2 (`tasks/eval-m4b-pass2.md`, verification only, against `304fe4a`) VERDICT PASS — Y1–Y15 hold end to end (JDK 21 and Spring 6.1.13 at run time, `go list` for `replace`), 21/21 mutants killed from a clean build, three public repositories byte-identical to `531e14e` and jhipster's claimed 8 lines, fresh == cached, fmt/clippy/559 unit tests/e2e 18/18 twice green, invariant 1 held; two doc notes (N1, N2) corrected in the records. Open items 1–23 by milestone (M5, M6) in amendment 22.
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
@@ -394,3 +395,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 
   Each has a recommendation.
 - No new dependency and no migration are planned.
+
+## M5 Scale & API: next
+
+- Not started. Scope in design §13 (REST API with guard rails, bulk AGE loading, snapshot retention, `rb diff`, benchmark on two large repositories); its contract is written next. Carried in from M4b: open items 3, 5, 6, 7, 10, 11, 15, 18, 19, 20, 21 and 23 of `tasks/contract-m4b.md` (the adversarial review of DI, RTA and orphans among them), plus M4a's adversarial carrier review.

@@ -619,6 +619,7 @@ Each item is a missed or less precise result, or a residue form, with where it w
 | 20 | **RTA and orphans still miss names that are computed:** a class name assembled at run time (`"com.acme." + kind + "Impl"`, a template literal with a hole), read from a binary file (a jar resource), from data (a database row, a message), or from outside the repository: the soundness table's residue ("reflection with computed names", "instantiation by data"). Binary names (`Outer$Inner`), every non-binary file and module objects are read since amendment 21 (Y1, Y14, Y7). | Evaluator pass 1 Y1, Y14. | M5 (adversarial review) |
 | 21 | **Orphan rule (e) depends on type resolution:** a supertype head that resolves to a same-named repository type although it names a library type (a wrong Tier B resolution) hides the external chain; the walk follows every candidate of an ambiguous head, but not a wrong unique one. Depth beyond 64 counts as external. | Evaluator pass 1 Y3. | M5 |
 | 22 | **Package versions not modelled:** `go.mod` `exclude` directives and `go.work` `replace`s (an excluded required version makes minimal version selection pick another; a workspace replace overrides the module's); Maven duplicates are keyed by `groupId:artifactId` only (two classifiers of one artifact at different versions read as a conflict, `@?`); npm aliases in `yarn.lock`/`pnpm-lock.yaml` (not read, open item 12). Each `exclude`/`go.work` case gives a `synthetic` `go_mod` version that may not be the selected one. | Evaluator pass 1 Y8–Y11 review. | M6 |
+| 23 | **M5 adversarial review list (evaluator pass 2):** (a) the `@Import`-registered `@Primary` bean outside the scan roots (pass 1 Y4): capped by gate M, but the single `heuristic` edge names the non-primary scanned bean; modelling `@Import`/`@Bean` registrants as candidates is a new use of the facts; (b) items 3, 18, 20 and 21 with their examples; (c) Maven's choice between duplicate declarations or properties (Y8, Y11) was not confirmed against Maven (none on the evaluator's host); the `@?` answer is safe either way. | `tasks/eval-m4b-pass2.md`. | M5 (adversarial review) |
 
 **Weaker false results still possible** (none `synthetic`; updated by amendment 21):
 - a `heuristic` `INJECTS` to a `@Bean` method for an external injected type whose name agrees with the return type as written but denotes another type (`Builder` imported from one library, a `@Bean` returning another library's `X.Builder`): amendment 19 removed the measured form (`ChatClient.Builder` vs `WebClient.Builder`); unqualified simple names remain heuristic by design (`external_type` in `capped_by`);
@@ -626,8 +627,9 @@ Each item is a missed or less precise result, or a residue form, with where it w
 - a `heuristic` `unique` `INJECTS` capped by `generic` to the only assignable bean when its type arguments differ from the point's (item 16; Spring fails to start there);
 - RTA (opt-in only): a type instantiated through a computed name or data (item 20); orphans: an override of a library method whose head Tier B resolves to a wrong repository type (item 21), and item 3's fragment form;
 - a `synthetic` `go_mod` version under an `exclude` or a `go.work` replace (item 22).
+- a `heuristic` `unique` `INJECTS` to the scanned bean when a `@Primary` class registered by `@Import` outside the scan roots wins at run time: amendment 21 caps it (`capped_by: [mention]`, bucket `capped`) but narrowing does not model `@Import` registrants, so the edge still names the bean Spring does not inject (evaluator pass 2, N1; M5 adversarial review, item 23).
 
-Removed by amendment 21: the Lombok form of item 14 and every `@Primary` pick past a generic, `@Named` or custom-qualified point (now `ambiguous`), `INJECTS` that ignored a class registered by `@Import` (now capped by `mention`), RTA proofs missed by binary names, text files, local and expression subclasses and module objects, orphans of overrides through in-repository bases, and the false versions of Y8–Y10.
+Removed by amendment 21: the Lombok form of item 14 and every `@Primary` pick past a generic, `@Named` or custom-qualified point (now `ambiguous`), RTA proofs missed by binary names, text files, local and expression subclasses and module objects, orphans of overrides through in-repository bases, and the false versions of Y8–Y10.
 
 ## Amendments
 
@@ -752,6 +754,59 @@ Removed by amendment 21: the Lombok form of item 14 and every `@Primary` pick pa
    - **Y10 (`go.mod` `replace`).** A replace applies by Go's rule (one naming the required version, else one naming none). A replace by another version of the same module sets the version (`synthetic`, `replaced: "<module> <version>"`); one by a directory that is no single service, or by another module, gives `@?` (`unresolved`, `exact` edge as D7's unresolved rows) with `replaced`.
    - **Y15.** Open items 16–22 and the weaker-false-results list record what remains.
    - **Measured** (release binaries, `--no-scip`, fresh `--no-cache` == cached on all four): spring-petclinic, spring-petclinic-microservices and realworld-spring dumps are byte-identical to `531e14e`'s; jhipster-sample-app differs only in `SearchWithPagination`'s two `IMPLEMENTS` losing `impl_instantiated: false` (kept by `export *`, Y7: `rta_coverage` proven 1 → 0, mention 13 → 14) and `orphan_coverage` moving 6 symbols' first failing rule from `mention` to `supertype` (Y3; eligible 35 both, no `orphan_eligible` changed). No `INJECTS`, `DEPENDS_ON` or package key changed. The evaluator's repros end to end in one scratch repository: `rta: 0 of 6`, `LambdaBase.greet` keeps `App#use()` under `--precision rta`, no orphans for `Probe.probe`, `Alerts → EmailNotifier` `capped_by: [mention]`, `dup@?`/`lib@?` with `versions`, `npm/bar@1.2.3` `alias: foo`, `gin@v1.9.1` `replaced`.
+
+22. **M4b is closed (evaluator pass 2, 2026-10-07).** Pass 2 (`tasks/eval-m4b-pass2.md`, against `304fe4a`) was the verification-only re-check decided in the closing bar. It returned **VERDICT: PASS**:
+    - Y1–Y15 hold end to end on the release binary, each reproduced first on a `531e14e` build, with extra forms of the same mechanisms (a local class in an anonymous body, a named class expression, `export *` behind a namespace import, a depth-2 base and an in-repository interface extending `ApplicationListener`, a scoped npm alias, a version-specific and a cross-module `replace`) and controls unchanged. Runtime confirmations: JDK 21 runs the RTA repros (`loaded`, `reflect`, `lambda-local`, `anon-local`); a Spring 6.1.13 context gives `Alerts -> sms`, `Catalog -> s`, `Encoder -> fast` and fails with two primaries; `go list -m` offline agrees with the three `replace` cases.
+    - 21 mutants of amendment 21's conditions from a clean build of `rb-syntax`, `rb-frameworks` and `rb-indexer`: 21 killed (R4 and D2 included; the default-precision mutant by 5 e2e tests).
+    - spring-petclinic, spring-petclinic-microservices and realworld-spring byte-identical to `531e14e`; jhipster-sample-app differs in exactly the 8 claimed lines; fresh == cached on all four.
+    - fmt, clippy, 559 unit tests, e2e 18/18 twice with containers (no `skipping`); invariant 1 against `28e47ba` (0 rows removed on two repositories); fixtures deterministic (fresh, cached, second name); no host paths; stub scan clean.
+
+    Its notes are non-blocking: **N1** (doc): the `@Import` form of Y4 is capped, not removed, so it moves from "Removed by amendment 21" to the weaker-false-results list (open item 23); **N2** (doc): stale `precision=rta` defaults in design §10's example and §13, and §5.5's manifest note without amendment 21's rules, corrected in the closing records.
+
+    **Final status of the assertions and invariants (pass 2):**
+
+    | # | Status | Evidence (pass 2) |
+    |---|---|---|
+    | S1–S3 | PASS | binary-name and supertype-role mutants killed; `@Named` stereotype; Lombok samples 8/8 |
+    | S4 | PASS | Y5, Y6, Y13 agree with Spring or are `ambiguous`; tie-break mutants killed |
+    | S5 | PASS | 0 `synthetic` `INJECTS` |
+    | S6 | PASS | Y4 capped by `mention`; registrant mutant killed |
+    | S7, S8 | PASS | buckets sum; Spring Data samples |
+    | S9 | PASS | Y1, Y2, Y7, Y14 keep their types; R4 killed |
+    | S10 | PASS | `cha` default everywhere, opt-in header; default mutant killed by e2e |
+    | S11 | PASS | goldens |
+    | S12, S13 | PASS | Y3 (depth 1, 2, interface) keeps; 9/9 public orphans |
+    | S14 | PASS | goldens |
+    | S15 | PASS | Y8–Y11 repros, `go list` agreement; 20/20 versions |
+    | S16–S18 | PASS | units, goldens |
+    | S19 | PASS as amended | open item 2 |
+    | S20–S23 | PASS | units; S22 as recorded in pass 1 |
+    | S24–S26 | PASS | e2e twice with containers; fresh == cached; fixtures deterministic |
+    | S27 | PASS | table below |
+    | S28 | PASS | verification loop green; no open defect |
+    | Inv 1–11 | PASS | inv 1: 0 rows removed vs `28e47ba`; inv 4: every pass-1 unproven form now safe; inv 8: depth-cap mutant killed |
+
+    **Review history** (severity as each report graded it):
+
+    | Pass | Commit evaluated | Findings | Fix commit | Amendment |
+    |---|---|---|---|---|
+    | 1 | `531e14e` | 15: 3 blocker (Y1–Y3), 7 major (Y4–Y10), 4 minor (Y11–Y14), 1 doc (Y15) | `304fe4a` | 21 |
+    | 2 | `304fe4a` | 0 findings; 2 doc notes (N1, N2) | — (closing) | 22 |
+
+    **Closing measurement** (release, `--no-scip`, pass 2):
+
+    | Repository (pin) | `INJECTS` | RTA types / proven | Orphan-eligible | `manifest` packages | vs `531e14e` | fresh == cached |
+    |---|---|---|---|---|---|---|
+    | spring-petclinic `818c4136ea97` | 6 | 8 / 0 | 0 | 28 | identical | yes |
+    | spring-petclinic-microservices `dc9ca15a7118` | 15 | 1 / 0 | 0 | 126 | identical | yes |
+    | realworld-spring `ee17e31aafe7` | 24 | 23 / 0 | 6 | 0 (Gradle) | identical | yes |
+    | jhipster-sample-app `6b000b5d23a3` | 19 | 16 / 0 | 35 | 101 | 8 lines (RTA proof withdrawn by `export *`, orphan first-rule shift) | yes |
+
+    Samples read in the source: `INJECTS` 20/20, orphans 9/9, package versions 20/20 (pass 1: 54/54, 22/22, 69/69; phase 15: 69/69, 12/12, 128/128). 0 `synthetic` `INJECTS`, 0 pruned-but-instantiated types and 0 false orphans in any sample.
+
+    **Open items by milestone** (the Open items table holds each with its evidence):
+    - **M5:** 3 (fragment orphans, adversarial review), 5 (gate M reads tests), 6 (RTA yield), 7 (Spring Boot module role), 10 (`rb callers --json`), 11 (facts-cache growth), 15 (adversarial review of DI, RTA and orphans), 18 (registration forms gate M cannot see), 19 (module-object approximation), 20 (computed names, adversarial review), 21 (rule (e) and wrong Tier B heads), 23 (pass 2's adversarial-review list: the `@Import` primary form, items 3/18/20/21, Maven duplicate choice). M5 also keeps M4a's adversarial carrier review.
+    - **M6:** 1 (gin parameter groups), 2 (Express router chains), 4 (autowired non-scanned objects), 8 (inherited Spring Data methods in Q3), 9 (generated interfaces, MyBatis XML), 12 (Gradle, pnpm, yarn, Python lockfiles, Kotlin DSL, Spring XML, profiles), 13 (Go manager naming for scip-go), 14 (Lombok-copied annotations), 16 (generic matching), 17 (custom qualifiers), 22 (`exclude`, `go.work`, classifiers, yarn/pnpm aliases).
 
 ## Orchestrator decisions on the forks (2026-10-06)
 
