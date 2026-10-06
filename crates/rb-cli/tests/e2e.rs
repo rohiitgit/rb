@@ -1119,6 +1119,78 @@ fn warm_facts_cache_equals_cold_run() {
     );
 }
 
+/// Contract M5 S5 (M4a open item 4): `rb index --no-cache` parses every file and still writes the
+/// facts it extracted, so a plain run afterwards parses nothing; both dump identically. The
+/// sources carry a per-run token so that no earlier run has cached their blobs.
+#[test]
+fn no_cache_writes_the_facts_it_extracted() {
+    let Some(url) = db_url() else { return };
+    let token = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let ts = format!("export function a_{token}(): number {{ return 1; }}\n");
+    let py = format!("def b_{token}():\n    return 2\n");
+    let java = format!("class C {{ int c_{token}() {{ return 3; }} }}\n");
+    let repo = repo_from(&[("src/a.ts", &ts), ("src/b.py", &py), ("src/C.java", &java)]);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_nocache_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--no-scip", "--no-cache"],
+    );
+    assert_eq!(parsed_count(&fresh), 3, "{fresh}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let plain = rb(
+        &url,
+        &["index", path, "--repo", &name, "--no-scip", "--force"],
+    );
+    assert_eq!(parsed_count(&plain), 0, "{plain}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+}
+
+/// Contract M5 S4: `rb gc --dry-run` and `rb gc`, scoped to this test's repositories, list
+/// nothing for a repository whose only graph is its live snapshot's; `rb cache prune --dry-run`
+/// reports rows and bytes and removes nothing; `rb cache prune` needs `--facts` or `--scip`.
+#[test]
+fn gc_and_cache_prune_commands() {
+    let Some(url) = db_url() else { return };
+    let repo = fixture_repo("ts-express-prisma");
+    let path = repo.path().to_str().unwrap();
+    let prefix = format!("t_gccli_{}_", std::process::id());
+    let name = format!("{prefix}a");
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    rb(
+        &url,
+        &["index", path, "--repo", &name, "--no-scip", "--force"],
+    );
+    for args in [
+        &["gc", "--dry-run", "--prefix", &prefix][..],
+        &["gc", "--prefix", &prefix],
+    ] {
+        assert_eq!(rb(&url, args), "gc: nothing to remove\n", "{args:?}");
+    }
+    let out = rb(&url, &["cache", "prune", "--facts", "--dry-run"]);
+    assert!(
+        out.starts_with("facts: would remove ") && out.ends_with(" bytes\n"),
+        "{out}"
+    );
+    let err = rb_fails(&url, &["cache", "prune"]);
+    assert!(err.contains("--facts") && err.contains("--scip"), "{err}");
+}
+
 /// Contract C11: facts cached under one extractor version are invisible to another.
 #[test]
 fn facts_cache_is_keyed_by_extractor_version() {

@@ -25,7 +25,7 @@ Each snapshot is stored relationally and projected into an AGE graph.
 docker compose up -d --wait            # Postgres 18 + AGE 1.8.0 on 127.0.0.1:55432
 cargo build
 target/debug/rb migrate
-target/debug/rb index /path/to/repo    # --rev <rev>, --repo <name>, --force
+target/debug/rb index /path/to/repo    # --rev <rev>, --repo <name>, --force, --no-cache, --keep <n>
 target/debug/rb status
 target/debug/rb dump > snapshot.jsonl  # canonical, id-independent dump
 target/debug/rb service                # list services; `rb service <dir|name>` shows a card
@@ -35,7 +35,11 @@ target/debug/rb callers AuthService.login --depth 2   # what calls a function or
 target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2): endpoints, orphans, tests; --json
 target/debug/rb path "POST /api/v1/login"             # the request path through an endpoint (Q4); --format json, --pick N
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
+target/debug/rb gc --dry-run           # graphs and `building` rows interrupted or older runs left
+target/debug/rb cache prune --facts --scip --dry-run   # cache rows of other extractor versions and images
 ```
+
+Snapshots: a publish writes the snapshot row, its rows, the AGE graph and the live flip in one transaction, so a failed or killed run leaves at most a `failed` row (written after the rollback). Each run keeps the live snapshot plus the `--keep` newest retired ones (default 2, at most 20, env `RB_KEEP_RETIRED`) and deletes older and `failed` rows; only the live snapshot keeps an AGE graph, and graphs are created and dropped one per transaction under a database-wide lock. Every read command reads the live pointer and the snapshot in one read-only transaction. `rb gc` (never implicit; `--dry-run` lists, `--prefix` limits it to repositories whose names start with the prefix) removes graphs no live snapshot names and `building` rows left by binaries before M5; `rb cache prune --facts|--scip` removes cache rows no current `rb` can read (an older `rb` sharing the database may, so it is never implicit) and prints rows and bytes.
 
 Run `rb` from the project root. AGE's CSV loaders only read files under the server's `/tmp/age/`, and `compose.yaml` mounts `./var/age-load` there. From anywhere else, set `RB_AGE_LOAD_DIR` to that directory.
 
@@ -124,7 +128,7 @@ Each job exports the project's files, runs a fetch phase on Docker's default bri
 | `--no-scip` | run no indexer; every project is heuristic (a different tool configuration from a run with indexers) |
 | `--scip-work-dir <dir>` (`RB_SCIP_WORK_DIR`, default `var/scip`) | exports and package caches; must lie under the home directory (the path the runtime's VM shares, see below) |
 | `--scip-timeout-secs <n>` | budget per phase (defaults 600 s fetch, 900 s index); a run over it is killed and reported as `timeout`, not cached |
-| `--no-cache` | also re-run every SCIP job and replace its cached outcome |
+| `--no-cache` | parse every file without reading cached facts (the facts are still written, so the next plain run reuses them), and re-run every SCIP job and replace its cached outcome |
 
 #### Container runtime
 

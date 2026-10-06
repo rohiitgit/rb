@@ -195,6 +195,38 @@ pub struct RetentionReport {
     pub live_marked_retired: Option<i64>,
 }
 
+/// What `rb gc` removes (contract M5 S4): AGE graphs named `rb_*` that are not a live
+/// snapshot's, and `building` rows (left by binaries before M5, which committed the row before
+/// loading). Every list is in bytewise name or id order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GcPlan {
+    pub graphs: Vec<GcGraph>,
+    pub building: Vec<GcSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GcGraph {
+    pub name: String,
+    /// The snapshot that still names the graph (not its repository's live one), if any.
+    pub snapshot: Option<i64>,
+    pub repo: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GcSnapshot {
+    pub id: i64,
+    pub repo: String,
+    pub commit_sha: String,
+}
+
+/// Rows a cache prune removes (or would remove) and their payload bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PruneReport {
+    pub rows: i64,
+    pub bytes: i64,
+}
+
 /// What a publish loads, in one transaction.
 struct Load<'a> {
     repo_id: i64,
@@ -705,6 +737,160 @@ impl Store {
         report.snapshots_deleted.sort_unstable();
         tx.commit()?;
         Ok(report)
+    }
+
+    /// What `rb gc` would remove, for repositories whose names start with `prefix` (graphs named
+    /// `rb_<prefix>…`; `""` for all): every `rb_*` graph that no snapshot names, or that a snapshot
+    /// other than its repository's live one names, and every `building` row.
+    pub fn gc_plan(&mut self, prefix: &str) -> anyhow::Result<GcPlan> {
+        let graph_prefix = format!("rb_{prefix}");
+        let graphs = self
+            .client
+            .query(
+                "SELECT g.name::text, s.id, r.name, s.status
+                 FROM ag_catalog.ag_graph g
+                 LEFT JOIN rb.snapshot s ON s.age_graph = g.name::text
+                 LEFT JOIN rb.repo r ON r.id = s.repo_id
+                 WHERE left(g.name::text, length($1)) = $1
+                   AND (s.id IS NULL OR s.id IS DISTINCT FROM r.live_snapshot_id)
+                 ORDER BY g.name::text COLLATE \"C\", s.id",
+                &[&graph_prefix],
+            )?
+            .iter()
+            .map(|r| GcGraph {
+                name: r.get(0),
+                snapshot: r.get(1),
+                repo: r.get(2),
+                status: r.get(3),
+            })
+            .collect();
+        let building = self
+            .client
+            .query(
+                "SELECT s.id, r.name, s.commit_sha FROM rb.snapshot s JOIN rb.repo r ON r.id = s.repo_id
+                 WHERE s.status = 'building' AND left(r.name, length($1)) = $1
+                 ORDER BY s.id",
+                &[&prefix],
+            )?
+            .iter()
+            .map(|r| GcSnapshot {
+                id: r.get(0),
+                repo: r.get(1),
+                commit_sha: r.get(2),
+            })
+            .collect();
+        Ok(GcPlan { graphs, building })
+    }
+
+    /// Removes what `plan` lists, re-checking each item under its locks: one graph per
+    /// transaction (the repository row, then [`RB_AGE_DDL_LOCK`]; a graph that a live snapshot
+    /// names by then is skipped), then each `building` row still `building`. Returns what was
+    /// removed.
+    pub fn gc_apply(&mut self, plan: &GcPlan) -> anyhow::Result<GcPlan> {
+        let mut removed = GcPlan::default();
+        for g in &plan.graphs {
+            let mut tx = self.begin()?;
+            if let Some(id) = g.snapshot {
+                tx.execute(
+                    "SELECT 1 FROM rb.repo r JOIN rb.snapshot s ON s.repo_id = r.id
+                     WHERE s.id = $1 FOR UPDATE OF r",
+                    &[&id],
+                )?;
+            }
+            age::lock_ddl(&mut tx)?;
+            // Under the DDL lock no publisher is between creating a graph and committing it.
+            let named_by_live = tx
+                .query_opt(
+                    "SELECT 1 FROM rb.snapshot s JOIN rb.repo r ON r.live_snapshot_id = s.id
+                     WHERE s.age_graph = $1",
+                    &[&g.name],
+                )?
+                .is_some();
+            if named_by_live {
+                continue;
+            }
+            age::drop_graph_if_exists(&mut tx, &g.name)?;
+            tx.execute(
+                "UPDATE rb.snapshot SET age_graph = NULL WHERE age_graph = $1",
+                &[&g.name],
+            )?;
+            tx.commit()?;
+            removed.graphs.push(g.clone());
+        }
+        for b in &plan.building {
+            let mut tx = self.begin()?;
+            tx.execute(
+                "SELECT 1 FROM rb.repo r JOIN rb.snapshot s ON s.repo_id = r.id
+                 WHERE s.id = $1 FOR UPDATE OF r",
+                &[&b.id],
+            )?;
+            let deleted = tx.execute(
+                "DELETE FROM rb.snapshot WHERE id = $1 AND status = 'building'",
+                &[&b.id],
+            )?;
+            tx.commit()?;
+            if deleted > 0 {
+                removed.building.push(b.clone());
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Facts-cache rows whose extractor is not `current_extractor` (rows are keyed
+    /// `<extractor>;<language>`), removed unless `dry_run` (contract M5 D13).
+    pub fn prune_facts(
+        &mut self,
+        current_extractor: &str,
+        dry_run: bool,
+    ) -> anyhow::Result<PruneReport> {
+        let current = format!("{current_extractor};");
+        let filter = "WHERE left(extractor, length($1)) <> $1";
+        let sql = if dry_run {
+            format!(
+                "SELECT count(*), COALESCE(sum(octet_length(facts)), 0)::bigint
+                 FROM rb.file_facts_cache {filter}"
+            )
+        } else {
+            format!(
+                "WITH gone AS (DELETE FROM rb.file_facts_cache {filter} RETURNING facts)
+                 SELECT count(*), COALESCE(sum(octet_length(facts)), 0)::bigint FROM gone"
+            )
+        };
+        let row = self.client.query_one(sql.as_str(), &[&current])?;
+        Ok(PruneReport {
+            rows: row.get(0),
+            bytes: row.get(1),
+        })
+    }
+
+    /// SCIP index rows whose image is none of `current_images`, removed unless `dry_run`
+    /// (contract M5 D13). An empty list is refused: it would remove every row.
+    pub fn prune_scip(
+        &mut self,
+        current_images: &[&str],
+        dry_run: bool,
+    ) -> anyhow::Result<PruneReport> {
+        anyhow::ensure!(
+            !current_images.is_empty(),
+            "no current SCIP image is known; nothing pruned"
+        );
+        let filter = "WHERE indexer_digest <> ALL($1)";
+        let sql = if dry_run {
+            format!(
+                "SELECT count(*), COALESCE(sum(octet_length(index)), 0)::bigint
+                 FROM rb.scip_index {filter}"
+            )
+        } else {
+            format!(
+                "WITH gone AS (DELETE FROM rb.scip_index {filter} RETURNING index)
+                 SELECT count(*), COALESCE(sum(octet_length(index)), 0)::bigint FROM gone"
+            )
+        };
+        let row = self.client.query_one(sql.as_str(), &[&current_images])?;
+        Ok(PruneReport {
+            rows: row.get(0),
+            bytes: row.get(1),
+        })
     }
 
     /// Cached syntax facts for `(blob, extractor)` rows; missing rows are simply absent.

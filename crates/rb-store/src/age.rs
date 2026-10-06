@@ -147,7 +147,7 @@ fn write_and_load(
 }
 
 /// Takes [`crate::RB_AGE_DDL_LOCK`] for the rest of the transaction (contract M5 S2).
-fn lock_ddl(tx: &mut Transaction<'_>) -> anyhow::Result<()> {
+pub(crate) fn lock_ddl(tx: &mut Transaction<'_>) -> anyhow::Result<()> {
     tx.execute(
         "SELECT pg_advisory_xact_lock($1)",
         &[&crate::RB_AGE_DDL_LOCK],

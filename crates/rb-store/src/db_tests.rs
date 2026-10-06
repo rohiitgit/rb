@@ -681,3 +681,223 @@ fn retention_never_selects_the_live_snapshot() {
     assert!(store.set_keep_retired(21).is_err() && store.set_keep_retired(-1).is_err());
     store.set_keep_retired(20).unwrap();
 }
+
+/// A scratch database (`t_store_db_<pid>_<tag>`, migrated) for operations that act on the whole
+/// database, such as `rb cache prune`; dropped, with its connections, when this value is.
+struct ScratchDb {
+    admin: String,
+    name: String,
+    url: String,
+}
+
+impl ScratchDb {
+    fn create(base_url: &str, tag: &str) -> ScratchDb {
+        let name = format!("t_store_db_{}_{tag}", std::process::id());
+        let mut admin = postgres::Client::connect(base_url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .unwrap();
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+        let (head, _) = base_url.rsplit_once('/').unwrap();
+        let url = format!("{head}/{name}");
+        Store::connect(&url).unwrap().migrate().unwrap();
+        ScratchDb {
+            admin: base_url.to_owned(),
+            name,
+            url,
+        }
+    }
+}
+
+impl Drop for ScratchDb {
+    fn drop(&mut self) {
+        if let Ok(mut admin) = postgres::Client::connect(&self.admin, postgres::NoTls) {
+            let _ = admin.batch_execute(&format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                self.name
+            ));
+        }
+    }
+}
+
+/// Contract M5 S4: `rb gc` lists, and then removes, a `building` row left by an older binary, an
+/// AGE graph no snapshot row names, and a graph a retired snapshot still names (a pre-M5
+/// retention); never the live snapshot's graph; one graph per transaction under the DDL lock.
+/// `--dry-run` removes nothing; a second run finds nothing. Scoped by repository prefix, as the
+/// e2e start-up clean-up uses it.
+#[test]
+fn gc_removes_stale_rows_and_graphs_but_never_the_live_graph() {
+    let Some(db) = db() else { return };
+    let prefix = format!("t_store_gc_{}_", std::process::id());
+    let repo = format!("{prefix}a");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let first = store
+        .publish_snapshot(
+            &repo,
+            &"a".repeat(40),
+            &json!({}),
+            &sample_graph(2, 0),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"b".repeat(40),
+            &json!({}),
+            &sample_graph(3, 1),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    // Plant what older binaries and interrupted runs leave behind.
+    let mut c = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    c.batch_execute(r#"SET search_path = ag_catalog, "$user", public"#)
+        .unwrap();
+    let stale: i64 = c
+        .query_one(
+            "INSERT INTO rb.snapshot (repo_id, commit_sha, status, tool_versions)
+             SELECT id, $2, 'building', '{}' FROM rb.repo WHERE name = $1 RETURNING id",
+            &[&repo, &"c".repeat(40)],
+        )
+        .unwrap()
+        .get(0);
+    let orphan = format!("rb_{repo}_999999999");
+    let retired_graph = crate::graph_name(&repo, first.id);
+    for g in [&orphan, &retired_graph] {
+        let mut tx = c.transaction().unwrap();
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&crate::RB_AGE_DDL_LOCK],
+        )
+        .unwrap();
+        tx.execute("SELECT ag_catalog.create_graph($1::text::name)", &[g])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    c.execute(
+        "UPDATE rb.snapshot SET age_graph = $2 WHERE id = $1",
+        &[&first.id, &retired_graph],
+    )
+    .unwrap();
+
+    let plan = store.gc_plan(&prefix).unwrap();
+    let graphs: Vec<(&str, Option<i64>)> = plan
+        .graphs
+        .iter()
+        .map(|g| (g.name.as_str(), g.snapshot))
+        .collect();
+    assert_eq!(
+        graphs,
+        [
+            (retired_graph.as_str(), Some(first.id)),
+            (orphan.as_str(), None)
+        ]
+    );
+    let building: Vec<i64> = plan.building.iter().map(|b| b.id).collect();
+    assert_eq!(building, [stale]);
+    // A dry run is the plan alone: nothing changed.
+    assert_eq!(store.gc_plan(&prefix).unwrap(), plan);
+
+    let removed = store.gc_apply(&plan).unwrap();
+    assert_eq!(removed, plan);
+    let state = repo_state(&mut c, &repo);
+    assert_eq!(state.graphs, vec![crate::graph_name(&repo, live.id)]);
+    assert_eq!((state.building, state.stray_age_graphs.len()), (0, 0));
+    assert_eq!(state.live, vec![live.id]);
+    assert_eq!(store.gc_plan(&prefix).unwrap(), crate::GcPlan::default());
+    // `gc_apply` re-checks under its locks: a stale plan naming the live graph, or a row that is
+    // no longer `building`, removes nothing.
+    let stale_plan = crate::GcPlan {
+        graphs: vec![crate::GcGraph {
+            name: crate::graph_name(&repo, live.id),
+            snapshot: Some(live.id),
+            repo: Some(repo.clone()),
+            status: Some("retired".into()),
+        }],
+        building: vec![crate::GcSnapshot {
+            id: live.id,
+            repo: repo.clone(),
+            commit_sha: live.commit_sha.clone(),
+        }],
+    };
+    assert_eq!(
+        store.gc_apply(&stale_plan).unwrap(),
+        crate::GcPlan::default()
+    );
+    let state = repo_state(&mut c, &repo);
+    assert_eq!(
+        (state.live, state.graphs),
+        (vec![live.id], vec![crate::graph_name(&repo, live.id)])
+    );
+    // Out of scope: a prefix that matches nothing lists nothing.
+    assert_eq!(
+        store.gc_plan(&format!("{prefix}zz")).unwrap(),
+        crate::GcPlan::default()
+    );
+}
+
+/// Contract M5 S4, D13: `rb cache prune` removes facts rows of other extractors and SCIP rows of
+/// other images, reports rows and bytes, keeps the current ones, and `--dry-run` removes
+/// nothing. In a scratch database: the prune is database-wide.
+#[test]
+fn cache_prune_keeps_the_current_rows() {
+    let Some(db) = db() else { return };
+    let scratch = ScratchDb::create(&db.url, "prune");
+    let mut store = Store::connect(&scratch.url).unwrap();
+    let blob = |n: u8| format!("{n:040}");
+    store
+        .save_facts(&[
+            (blob(1), "cur;v1;go".into(), b"{}".to_vec()),
+            (blob(1), "cur;v1;java".into(), b"{\"a\":1}".to_vec()),
+            (blob(1), "cur;v0;go".into(), b"{\"old\":1}".to_vec()),
+            (blob(2), "cur;v1x;go".into(), b"{\"x\":12}".to_vec()),
+        ])
+        .unwrap();
+    let entry = |bytes: &[u8]| crate::CachedScipIndex {
+        status: "ok".into(),
+        phase: None,
+        index: Some(bytes.to_vec()),
+        stderr_tail: String::new(),
+        elapsed_ms: 0,
+    };
+    store
+        .scip_index_put("h1", "img-current", &entry(b"abc"))
+        .unwrap();
+    store
+        .scip_index_put("h1", "img-old", &entry(b"abcdef"))
+        .unwrap();
+
+    for dry_run in [true, false] {
+        let facts = store.prune_facts("cur;v1", dry_run).unwrap();
+        assert_eq!((facts.rows, facts.bytes), (2, 17), "dry run {dry_run}");
+        let scip = store.prune_scip(&["img-current"], dry_run).unwrap();
+        assert_eq!((scip.rows, scip.bytes), (1, 6), "dry run {dry_run}");
+    }
+    let mut left = |extractor: &str| {
+        store
+            .load_facts(&[(blob(1), extractor.to_owned())])
+            .unwrap()
+            .len()
+    };
+    assert_eq!(
+        (left("cur;v1;go"), left("cur;v1;java"), left("cur;v0;go")),
+        (1, 1, 0)
+    );
+    assert!(store.scip_index_get("h1", "img-current").unwrap().is_some());
+    assert!(store.scip_index_get("h1", "img-old").unwrap().is_none());
+    assert_eq!(store.prune_facts("cur;v1", false).unwrap().rows, 0);
+    assert!(
+        store.prune_scip(&[], false).is_err(),
+        "no current image: refuse"
+    );
+}

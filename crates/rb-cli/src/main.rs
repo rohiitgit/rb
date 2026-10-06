@@ -58,9 +58,10 @@ struct IndexArgs {
     /// Rebuild even if the live snapshot already covers this commit with the same tools.
     #[arg(long)]
     force: bool,
-    /// Parse every file instead of reusing cached syntax facts (that cache is not updated
-    /// either), and run every SCIP job again instead of serving it from the index cache (its
-    /// outcome is stored, so a cached `failed` can be retried).
+    /// Parse every file instead of reusing cached syntax facts (the facts it extracts are still
+    /// written to that cache, so the next plain run reuses them), and run every SCIP job again
+    /// instead of serving it from the index cache (its outcome is stored, so a cached `failed`
+    /// can be retried).
     #[arg(long)]
     no_cache: bool,
     /// Run no SCIP indexer: every project is resolved heuristically and its job is `skipped`.
@@ -215,6 +216,21 @@ enum Command {
         #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
         precision: rb_store::code::Precision,
     },
+    /// Remove what interrupted or older runs left behind: AGE graphs named `rb_*` that are not a
+    /// live snapshot's, and `building` snapshot rows. Never runs implicitly.
+    Gc {
+        /// List what would be removed, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only repositories whose names start with this (graphs named `rb_<prefix>…`).
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
+    /// Manage the caches stored in the database.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
         /// openCypher query, e.g. "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)".
@@ -224,6 +240,22 @@ enum Command {
         /// Comma-separated names for the RETURN columns, in order.
         #[arg(long, default_value = "result", value_delimiter = ',')]
         cols: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Delete syntax-facts rows of other extractor versions (`--facts`) and SCIP index rows of
+    /// other indexer images (`--scip`); prints the rows and bytes removed. Never runs
+    /// implicitly: an older `rb` sharing the database may still read its rows.
+    Prune {
+        #[arg(long)]
+        facts: bool,
+        #[arg(long)]
+        scip: bool,
+        /// Report what would be removed, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -492,6 +524,39 @@ fn main() -> anyhow::Result<()> {
                 ),
             }
         }
+        Command::Gc { dry_run, prefix } => {
+            let plan = store.gc_plan(&prefix)?;
+            let done = if dry_run {
+                plan
+            } else {
+                store.gc_apply(&plan)?
+            };
+            print!("{}", gc_lines(&done, dry_run));
+        }
+        Command::Cache {
+            action:
+                CacheAction::Prune {
+                    facts,
+                    scip,
+                    dry_run,
+                },
+        } => {
+            ensure!(facts || scip, "pass --facts, --scip or both");
+            let verb = if dry_run { "would remove" } else { "removed" };
+            if facts {
+                let r = store.prune_facts(rb_syntax::extractor_id(), dry_run)?;
+                println!("facts: {verb} {} rows, {} bytes", r.rows, r.bytes);
+            }
+            if scip {
+                // Rows of an image this run cannot identify are not provably stale: refuse.
+                rb_scip::docker_available()
+                    .map_err(|e| anyhow::anyhow!("{e}; the current scip-java image is unknown, nothing pruned"))?;
+                let images = rb_scip::Images::resolve(&rb_scip::DockerRunner::default());
+                let java = images.java.map_err(|e| anyhow::anyhow!("{e}; nothing pruned"))?;
+                let r = store.prune_scip(&[&java, rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE], dry_run)?;
+                println!("scip: {verb} {} rows, {} bytes", r.rows, r.bytes);
+            }
+        }
         Command::Cypher { query, repo, cols } => {
             let snap = live_snapshot(&mut store, repo)?;
             for row in store.cypher(snap.id, &query, &cols)? {
@@ -595,6 +660,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
     };
     // Both caches live in the store; the indexer borrows each through its own trait.
     let cell = RefCell::new(&mut *store);
+    // `--no-cache` reads no facts but writes what it extracts (contract M5 S5).
     let rb_indexer::Indexed {
         commit_sha,
         graph,
@@ -606,7 +672,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         rb_indexer::index_commit(
             &path,
             &commit_sha,
-            &mut rb_indexer::NoCache,
+            &mut WriteOnlyFactsCache(&mut StoreCache(&cell)),
             &scip,
             &mut rb_indexer::WriteOnlyScipCache(&mut StoreCache(&cell)),
         )?
@@ -1009,6 +1075,59 @@ impl rb_indexer::FactsCache for StoreCache<'_, '_> {
             .collect::<anyhow::Result<Vec<_>>>()?;
         self.0.borrow_mut().save_facts(&rows)
     }
+}
+
+/// A facts cache that is never read, only written (`rb index --no-cache`, contract M5 S5, M4a
+/// open item 4): every file is parsed again, and its facts are stored for the next plain run,
+/// as [`rb_indexer::WriteOnlyScipCache`] does for SCIP jobs.
+struct WriteOnlyFactsCache<'a>(&'a mut dyn rb_indexer::FactsCache);
+
+impl rb_indexer::FactsCache for WriteOnlyFactsCache<'_> {
+    fn load(
+        &mut self,
+        _: &[rb_indexer::FactsKey],
+    ) -> anyhow::Result<HashMap<rb_indexer::FactsKey, rb_syntax::FileFacts>> {
+        Ok(HashMap::new())
+    }
+
+    fn save(
+        &mut self,
+        facts: &[(rb_indexer::FactsKey, rb_syntax::FileFacts)],
+    ) -> anyhow::Result<()> {
+        self.0.save(facts)
+    }
+}
+
+/// `rb gc`'s report: one line per graph and `building` row, then a summary.
+fn gc_lines(done: &rb_store::GcPlan, dry_run: bool) -> String {
+    if done.graphs.is_empty() && done.building.is_empty() {
+        return "gc: nothing to remove\n".to_owned();
+    }
+    let verb = if dry_run { "would drop" } else { "dropped" };
+    let mut out = String::new();
+    for g in &done.graphs {
+        let owner = match (&g.snapshot, &g.repo, &g.status) {
+            (Some(id), Some(repo), Some(status)) => format!("snapshot {id} of {repo} ({status})"),
+            _ => "no snapshot names it".to_owned(),
+        };
+        let _ = writeln!(out, "{verb} graph {}: {owner}", g.name);
+    }
+    for b in &done.building {
+        let _ = writeln!(
+            out,
+            "{verb} building snapshot {} of {} @ {}",
+            b.id,
+            b.repo,
+            short(&b.commit_sha)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "gc: {verb} {} graph(s) and {} building row(s)",
+        done.graphs.len(),
+        done.building.len()
+    );
+    out
 }
 
 /// What a snapshot was built with; `scip` (`on`, `off`, `unavailable`) because a run without
@@ -1525,6 +1644,76 @@ mod tests {
         assert_eq!(files(0), "0 files");
         assert_eq!(files(1), "1 file");
         assert_eq!(files(12), "12 files");
+    }
+
+    /// Contract M5 S5: the `--no-cache` facts cache answers no load and forwards every save.
+    #[test]
+    fn write_only_facts_cache_forwards_saves_only() {
+        #[derive(Default)]
+        struct Recorder {
+            loads: usize,
+            saved: Vec<String>,
+        }
+        impl rb_indexer::FactsCache for Recorder {
+            fn load(
+                &mut self,
+                _: &[rb_indexer::FactsKey],
+            ) -> anyhow::Result<HashMap<rb_indexer::FactsKey, rb_syntax::FileFacts>> {
+                self.loads += 1;
+                Ok(HashMap::new())
+            }
+            fn save(
+                &mut self,
+                facts: &[(rb_indexer::FactsKey, rb_syntax::FileFacts)],
+            ) -> anyhow::Result<()> {
+                self.saved.extend(facts.iter().map(|(k, _)| k.blob.clone()));
+                Ok(())
+            }
+        }
+        let mut inner = Recorder::default();
+        let key = rb_indexer::FactsKey {
+            blob: "b1".into(),
+            language: rb_syntax::Language::Go,
+        };
+        let facts = rb_syntax::extract(rb_syntax::Language::Go, b"package p\n").unwrap();
+        let mut cache = WriteOnlyFactsCache(&mut inner);
+        use rb_indexer::FactsCache as _;
+        assert!(cache.load(std::slice::from_ref(&key)).unwrap().is_empty());
+        cache.save(&[(key, facts)]).unwrap();
+        assert_eq!((inner.loads, inner.saved), (0, vec!["b1".to_owned()]));
+    }
+
+    /// Contract M5 S4: `rb gc`'s lines name each graph's owner or its absence.
+    #[test]
+    fn gc_lines_name_what_is_removed() {
+        let mut plan = rb_store::GcPlan::default();
+        assert_eq!(gc_lines(&plan, true), "gc: nothing to remove\n");
+        plan.graphs = vec![
+            rb_store::GcGraph {
+                name: "rb_x_7".into(),
+                snapshot: Some(7),
+                repo: Some("x".into()),
+                status: Some("retired".into()),
+            },
+            rb_store::GcGraph {
+                name: "rb_x_9".into(),
+                snapshot: None,
+                repo: None,
+                status: None,
+            },
+        ];
+        plan.building = vec![rb_store::GcSnapshot {
+            id: 8,
+            repo: "x".into(),
+            commit_sha: "a".repeat(40),
+        }];
+        assert_eq!(
+            gc_lines(&plan, false),
+            "dropped graph rb_x_7: snapshot 7 of x (retired)\n\
+             dropped graph rb_x_9: no snapshot names it\n\
+             dropped building snapshot 8 of x @ aaaaaaaaaaaa\n\
+             gc: dropped 2 graph(s) and 1 building row(s)\n"
+        );
     }
 
     /// Contract M5 S3: `--keep` is bounded at parse time (0-20).
