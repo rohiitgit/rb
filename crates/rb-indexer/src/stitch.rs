@@ -716,9 +716,15 @@ impl<'e> Stitcher<'e> {
         );
         attrs.insert("client".into(), site.client.as_str().into());
         let unverified = site.base_verified == Some(false);
+        // Matched by suffix because no host resolved: the base is unknown, whatever the label of
+        // the parts that did resolve (contract M5 S18, M4a open item 6). A suffix match whose
+        // host resolved (a hole after the port may hold a path prefix) keeps its label.
+        let unresolved = m.suffix && url.host.is_none();
         attrs.insert(
             "base".into(),
-            if unverified {
+            if unresolved {
+                "unresolved"
+            } else if unverified {
                 "unverified"
             } else {
                 folded.origin.as_str()
@@ -1304,7 +1310,7 @@ mod tests {
         assert_eq!(
             links,
             [
-                "HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing [heuristic] {\"base\":\"literal\",\"client\":\"fetch\",\"match\":\"suffix\"}"
+                "HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing [heuristic] {\"base\":\"unresolved\",\"client\":\"fetch\",\"match\":\"suffix\"}"
             ]
         );
         let (bucket, links) = one(
@@ -2644,6 +2650,32 @@ mod tests {
             .collect()
     }
 
+    /// Contract M5 S18 (M4a open item 6): a `CONSUMES` edge matched by suffix because no host
+    /// resolved (the client's base is a parameter, or the host itself has a hole) says
+    /// `base: unresolved`; one matched by suffix whose host resolved (a hole after the port
+    /// may hold a path prefix) keeps its label, as does an exact match.
+    #[test]
+    fn suffix_edges_without_a_host_say_the_base_is_unresolved() {
+        let ts = "export async function f(base: string, h: string, port: number, p: string) {\n  await fetch(`${base}/orders/1`);\n  await fetch(`http://${h}/orders/1`);\n  await fetch(`http://users:${port}${p}/users/me`);\n  await fetch(\"http://users/users/me\");\n}\n";
+        let eps = vec![
+            ep("GET", "/orders/{id}", "orders"),
+            ep("GET", "/users/me", "users"),
+        ];
+        assert_eq!(
+            stitched_bases(
+                &[("web/src/a.ts", Language::TypeScript, ts)],
+                &eps,
+                &["web", "orders", "users"]
+            ),
+            [
+                "web/src/a.ts 1 heuristic -> HTTP GET /orders/{} @orders [heuristic] base=unresolved match=suffix",
+                "web/src/a.ts 2 heuristic -> HTTP GET /orders/{} @orders [heuristic] base=unresolved match=suffix",
+                "web/src/a.ts 3 heuristic -> HTTP GET /users/me @users [heuristic] base=literal match=suffix",
+                "web/src/a.ts 4 synthetic -> HTTP GET /users/me @users [synthetic] base=literal match=exact",
+            ]
+        );
+    }
+
     /// Contract M4a amendment 14, Gate A (evaluator passes 3 and 4), from source: every
     /// repro of T1–T4 (a use or write before the declaration, in a nested function or a class;
     /// an aliased or default export; a Java field changed through another reference, an inner
@@ -3255,13 +3287,19 @@ mod tests {
             ),
             [
                 format!(
-                    "pay/src/main/java/p/C.java 5 heuristic -> {to} [heuristic] base=literal match=suffix"
+                    "pay/src/main/java/p/C.java 5 heuristic -> {to} [heuristic] base=unresolved match=suffix"
                 ),
-                // `fetch` sites first, then axios (pack order within a file).
+                // `fetch` sites first, then axios (pack order within a file). The suffix match
+                // whose host resolved keeps its label; those without a host are `unresolved`
+                // (contract M5 S18).
                 format!("web/src/l.ts 6 heuristic -> {to} [heuristic] base=literal match=suffix"),
                 format!("web/src/l.ts 7 synthetic -> {to} [synthetic] base=literal match=exact"),
-                format!("web/src/l.ts 3 heuristic -> {to} [heuristic] base=literal match=suffix"),
-                format!("web/src/l.ts 4 heuristic -> {to} [heuristic] base=literal match=suffix"),
+                format!(
+                    "web/src/l.ts 3 heuristic -> {to} [heuristic] base=unresolved match=suffix"
+                ),
+                format!(
+                    "web/src/l.ts 4 heuristic -> {to} [heuristic] base=unresolved match=suffix"
+                ),
                 format!("web/src/l.ts 5 synthetic -> {to} [synthetic] base=literal match=exact"),
             ]
         );

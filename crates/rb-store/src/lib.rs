@@ -9,6 +9,7 @@ pub mod card;
 pub mod code;
 #[cfg(test)]
 mod db_tests;
+pub mod diff;
 pub mod path;
 mod query;
 pub mod rollup;

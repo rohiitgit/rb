@@ -20,7 +20,7 @@ HANDLED_BY HTTP POST /internal/mfa/email @services/billing/cmd/billing -> rb-heu
 CONSUMES rb-heuristic . . . `apps/web/src/api/auth.ts`/login(). -> HTTP POST /api/v1/login @services/auth [heuristic] {"match":"exact","via_host":"gateway"}
 CONSUMES rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode(). -> HTTP POST /internal/mfa/email @services/notification [synthetic] {"host":"notification","match":"exact"}
 CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main.go`/notifyPaid(). -> HTTP POST /internal/mfa/email @services/notification [synthetic] {"host":"notification","match":"exact"}
-CONSUMES rb-heuristic . . . `apps/web/src/api/billing.ts`/payInvoice(). -> HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing [heuristic] {"match":"suffix"}
+CONSUMES rb-heuristic . . . `apps/web/src/api/billing.ts`/payInvoice(). -> HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing [heuristic] {"base":"unresolved","match":"suffix"}
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /internal/mfa/email @services/notification [ambiguous] {"candidates":2}
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing [ambiguous] {"candidates":2}
 # Contract M4b S8: a Feign client is a bean under @EnableFeignClients, a @Repository class a stereotype.

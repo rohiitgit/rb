@@ -43,6 +43,7 @@ fn cli_args(segment: &str, repo: &str, params: &[(&'static str, String)]) -> Vec
         "table-deps" => ("table-deps", Some("table")),
         "path" => ("path", Some("endpoint")),
         "cypher" => ("cypher", Some("query")),
+        "diff" => ("diff", None),
         other => panic!("no command for {other}"),
     };
     let mut args = vec![command.to_owned()];
@@ -50,10 +51,19 @@ fn cli_args(segment: &str, repo: &str, params: &[(&'static str, String)]) -> Vec
         let value = params.iter().find(|(k, _)| *k == p).expect("positional");
         args.push(value.1.clone());
     }
+    // `rb diff [<from>] [<to>]`: both selectors are positional, `from` first.
+    if segment == "diff" {
+        for p in ["from", "to"] {
+            if let Some((_, v)) = params.iter().find(|(k, _)| *k == p) {
+                args.push(v.clone());
+            }
+        }
+    }
     for (k, v) in params {
         match *k {
             k if Some(k) == positional => {}
-            "include_references" | "full" => {
+            "from" | "to" if segment == "diff" => {}
+            "include_references" | "full" | "diagnostics" => {
                 assert_eq!(v, "true");
                 args.push(format!("--{}", k.replace('_', "-")));
             }
@@ -278,6 +288,16 @@ fn table(url: &str, repo: &str, target: &str) -> (Vec<Set>, bool) {
             "cypher",
             vec![p("query", "RETURN 1"), p("timeout_ms", "30001")],
         ),
+        // Each repository was indexed twice: the default `from` is the live snapshot's parent.
+        ("diff", vec![]),
+        (
+            "diff",
+            vec![p("diagnostics", "true"), p("limit", "1"), p("offset", "1")],
+        ),
+        ("diff", vec![p("from", &snapshot), p("to", &snapshot)]),
+        ("diff", vec![p("from", "zz")]),
+        ("diff", vec![p("from", "9000000000000000000")]),
+        ("diff", vec![p("limit", "1001")]),
     ];
     if let Some(name) = &shared {
         sets.push(("callers", vec![p("target", name)]));

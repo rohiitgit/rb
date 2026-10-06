@@ -4,6 +4,7 @@
 //! the server only turn their input into [`Params`] and print [`Output::body`] or
 //! [`ApiError::body`].
 
+pub mod diff;
 pub mod error;
 pub mod params;
 pub mod render;
@@ -109,10 +110,11 @@ pub enum Endpoint {
     TableDeps,
     Path,
     Cypher,
+    Diff,
 }
 
 impl Endpoint {
-    pub const ALL: [Endpoint; 10] = [
+    pub const ALL: [Endpoint; 11] = [
         Endpoint::Status,
         Endpoint::Snapshots,
         Endpoint::Find,
@@ -123,6 +125,7 @@ impl Endpoint {
         Endpoint::TableDeps,
         Endpoint::Path,
         Endpoint::Cypher,
+        Endpoint::Diff,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -137,6 +140,7 @@ impl Endpoint {
             Endpoint::TableDeps => "table-deps",
             Endpoint::Path => "path",
             Endpoint::Cypher => "cypher",
+            Endpoint::Diff => "diff",
         }
     }
 
@@ -174,6 +178,8 @@ impl Endpoint {
                 "snapshot",
             ],
             Endpoint::Cypher => &["query", "columns", "timeout_ms", "snapshot"],
+            // `from` and `to` select the snapshots (D11).
+            Endpoint::Diff => &["from", "to", "limit", "offset", "diagnostics"],
         }
     }
 }
@@ -288,6 +294,13 @@ pub enum Query {
         columns: Vec<String>,
         timeout_ms: u64,
     },
+    Diff {
+        from: Option<String>,
+        to: Option<String>,
+        page: Page,
+        /// List the diagnostics' multiset difference, not only the counts per kind.
+        diagnostics: bool,
+    },
 }
 
 /// The largest `pick` accepted; a pick beyond the candidates lists them again.
@@ -364,6 +377,12 @@ pub fn parse(
             precision: p.precision("precision", Precision::Cha)?,
             pick: pick()?,
         },
+        Endpoint::Diff => Query::Diff {
+            from: p.text_opt("from")?,
+            to: p.text_opt("to")?,
+            page: Page::read(p, diff::LIMIT_MAX, diff::LIMIT_MAX)?,
+            diagnostics: p.boolean("diagnostics")?,
+        },
         Endpoint::Cypher => Query::Cypher {
             query: p.text("query")?,
             columns: columns(p)?,
@@ -420,6 +439,7 @@ impl Query {
             Query::TableDeps { .. } => Endpoint::TableDeps,
             Query::Path { .. } => Endpoint::Path,
             Query::Cypher { .. } => Endpoint::Cypher,
+            Query::Diff { .. } => Endpoint::Diff,
         }
     }
 
@@ -488,6 +508,19 @@ impl Query {
                 columns,
                 timeout_ms,
             } => json!({"query": query, "columns": columns, "timeout_ms": timeout_ms}),
+            // The selectors as given; `run` replaces them by the snapshot ids they resolve to.
+            Query::Diff {
+                from,
+                to,
+                page,
+                diagnostics,
+            } => json!({
+                "from": from,
+                "to": to,
+                "limit": page.limit,
+                "offset": page.offset,
+                "diagnostics": diagnostics,
+            }),
         }
     }
 }
@@ -525,6 +558,7 @@ pub enum Answer {
         path: Box<RequestPath>,
     },
     Cypher(CypherRows),
+    Diff(Box<diff::DiffAnswer>),
 }
 
 impl Serialize for Answer {
@@ -557,6 +591,7 @@ impl Serialize for Answer {
             Answer::Impact { ix, impact } => render::impact_json(ix, impact).serialize(s),
             Answer::TableDeps(deps) => deps.serialize(s),
             Answer::Path { ix, path } => render::path_json(ix, path).serialize(s),
+            Answer::Diff(d) => d.to_json().serialize(s),
             Answer::Cypher(rows) => {
                 json!({"columns": rows.columns, "rows": rows.rows}).serialize(s)
             }
@@ -681,6 +716,23 @@ pub fn run(
     }
     Ok(store.read_tx(|s| match &req.query {
         Query::Status => Ok(status(s, req.repo.as_deref())?),
+        Query::Diff {
+            from,
+            to,
+            page,
+            diagnostics,
+        } => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            Ok(diff::answer(
+                s,
+                indexes,
+                &repo,
+                from.as_deref(),
+                to.as_deref(),
+                *page,
+                *diagnostics,
+            )?)
+        }
         Query::Snapshots(page) => {
             let repo = resolve_repo(s, req.repo.as_deref())?;
             let live = live_snapshot(s, &repo).ok();
@@ -823,17 +875,26 @@ fn resolve_snapshot(
     if !store.repo_names()?.iter().any(|r| r == repo) {
         return Err(not_indexed(repo));
     }
-    match store.snapshot_opt(id)? {
-        Some(snap) if snap.repo != repo => Err(ApiError::not_found(format!(
+    if let Some(snap) = store.snapshot_opt(id)?
+        && snap.repo != repo
+    {
+        return Err(ApiError::not_found(format!(
             "snapshot {id} is not a snapshot of {repo:?}"
-        ))),
-        Some(snap) if snap.status == "live" || snap.status == "retired" => {
-            let live = store.live_snapshot(repo)?.is_some_and(|l| l.id == id);
-            Ok((snap, live))
-        }
+        )));
+    }
+    let snap = kept_snapshot(store, id)?;
+    let live = store.live_snapshot(repo)?.is_some_and(|l| l.id == id);
+    Ok((snap, live))
+}
+
+/// Snapshot `id` if it is kept (`live` or `retired`), whatever its repository: a `failed` row or
+/// an id never issued is `not_found`, a deleted one `snapshot_not_retained` (D17).
+pub(crate) fn kept_snapshot(store: &mut Store, id: i64) -> Result<SnapshotInfo, ApiError> {
+    match store.snapshot_opt(id)? {
+        Some(snap) if snap.status == "live" || snap.status == "retired" => Ok(snap),
         Some(snap) => Err(ApiError::not_found(format!(
-            "snapshot {id} of {repo:?} is {} and holds no graph",
-            snap.status
+            "snapshot {id} of {:?} is {} and holds no graph",
+            snap.repo, snap.status
         ))),
         None if store.snapshot_issued(id)? => Err(ApiError::new(
             ErrorKind::SnapshotNotRetained,
@@ -847,7 +908,7 @@ fn not_indexed(repo: &str) -> ApiError {
     ApiError::not_found(format!("repository {repo:?} is not indexed"))
 }
 
-fn snapshot_ref(snap: &SnapshotInfo) -> SnapshotRef {
+pub(crate) fn snapshot_ref(snap: &SnapshotInfo) -> SnapshotRef {
     SnapshotRef {
         id: snap.id,
         commit_sha: snap.commit_sha.clone(),
@@ -878,7 +939,7 @@ fn resolve_repo(store: &mut Store, repo: Option<&str>) -> Result<String, ApiErro
 
 /// The repository's live snapshot: `not_found` for a repository never indexed,
 /// `no_live_snapshot` for one without a live snapshot.
-fn live_snapshot(store: &mut Store, repo: &str) -> Result<SnapshotInfo, ApiError> {
+pub(crate) fn live_snapshot(store: &mut Store, repo: &str) -> Result<SnapshotInfo, ApiError> {
     if let Some(snap) = store.live_snapshot(repo)? {
         return Ok(snap);
     }
@@ -1106,7 +1167,7 @@ fn answer(
                 path: Box::new(path),
             }
         }
-        Query::Status | Query::Snapshots(_) | Query::Cypher { .. } => {
+        Query::Status | Query::Snapshots(_) | Query::Cypher { .. } | Query::Diff { .. } => {
             unreachable!("answered by `run` itself")
         }
     };

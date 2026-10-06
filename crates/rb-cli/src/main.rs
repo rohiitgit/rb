@@ -275,6 +275,35 @@ enum Command {
         #[arg(long)]
         precision: Option<String>,
     },
+    /// Compare two kept snapshots (`rb snapshots` lists them) by natural identity: endpoints,
+    /// table access and service dependencies added and removed, certainty shifts, then the
+    /// nodes and edges added, removed and changed (text lists the first 50 rows of each section;
+    /// `--json` pages them with `--limit`/`--offset`). Never re-indexes; names the tool versions
+    /// that differ.
+    Diff {
+        /// A snapshot id, or a commit prefix (4-40 hex digits) unique among the kept snapshots;
+        /// default: the parent of `to` while it is kept.
+        from: Option<String>,
+        /// As `from`; default: the live snapshot.
+        to: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Emit JSON (the API's envelope) instead of text.
+        #[arg(long)]
+        json: bool,
+        /// List the diagnostics added and removed, not only the counts per kind.
+        #[arg(long)]
+        diagnostics: bool,
+        /// List the edges whose only change is their evidence (text; JSON always lists them).
+        #[arg(long)]
+        evidence: bool,
+        /// Rows per section and page (1-1000; default 1000; JSON).
+        #[arg(long)]
+        limit: Option<String>,
+        /// Rows skipped first in every section (default 0; JSON).
+        #[arg(long)]
+        offset: Option<String>,
+    },
     /// Serve the REST API (design §11.2) on a loopback address until SIGINT or SIGTERM: the same
     /// answers as `rb … --json`, read-only, at most `--workers` at once and `--queue` waiting.
     Serve {
@@ -482,16 +511,21 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// How a question's answer is printed.
+/// How a question's answer is printed: JSON, or text (`evidence`: `rb diff`'s evidence-only
+/// edges listed, not only counted).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Out {
-    Text,
+    Text { evidence: bool },
     Json,
 }
 
 impl Out {
     fn json_if(json: bool) -> Out {
-        if json { Out::Json } else { Out::Text }
+        if json {
+            Out::Json
+        } else {
+            Out::Text { evidence: false }
+        }
     }
 }
 
@@ -639,6 +673,28 @@ fn asked(command: Command) -> Option<Asked> {
                 .set_opt("timeout_ms", timeout_ms);
             (Endpoint::Cypher, repo, p, Out::json_if(json))
         }
+        Command::Diff {
+            from,
+            to,
+            repo,
+            json,
+            diagnostics,
+            evidence,
+            limit,
+            offset,
+        } => {
+            p.set_opt("from", from)
+                .set_opt("to", to)
+                .set_flag("diagnostics", diagnostics)
+                .set_opt("limit", limit)
+                .set_opt("offset", offset);
+            let out = if json {
+                Out::Json
+            } else {
+                Out::Text { evidence }
+            };
+            (Endpoint::Diff, repo, p, out)
+        }
         Command::Migrate
         | Command::Index(_)
         | Command::Serve { .. }
@@ -659,8 +715,8 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
         Ok(output) => {
             match out {
                 Out::Json => print!("{}", output.body()),
-                Out::Text => {
-                    print!("{}", render_text(&output));
+                Out::Text { evidence } => {
+                    print!("{}", render_text(&output, evidence));
                     // A page that is not the last says so on stderr: stdout stays rows only.
                     if let Some(line) = more_line(&output.answer) {
                         eprintln!("{line}");
@@ -673,7 +729,7 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
             match out {
                 // The error body the server sends for the same request (contract M5 S14).
                 Out::Json => print!("{}", e.body()),
-                Out::Text => eprintln!("Error: {}", e.cli_text()),
+                Out::Text { .. } => eprintln!("Error: {}", e.cli_text()),
             }
             Ok(ExitCode::from(e.kind.exit_code()))
         }
@@ -706,8 +762,9 @@ fn more_line(answer: &Answer) -> Option<String> {
 }
 
 /// The text rendering of an answer (the CLI's own; JSON is `rb-api`'s).
-fn render_text(output: &rb_api::Output) -> String {
+fn render_text(output: &rb_api::Output, evidence: bool) -> String {
     match &output.answer {
+        Answer::Diff(d) => diff_text(d, evidence),
         Answer::Status { all, reports } => status_text(*all, reports),
         Answer::Snapshots(snapshots) => snapshots
             .items
@@ -1370,6 +1427,167 @@ fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value
             .into();
     }
     tools
+}
+
+/// Rows of one text section of `rb diff`: the first [`DIFF_TEXT_ROWS`], then how many more.
+const DIFF_TEXT_ROWS: usize = 50;
+
+fn diff_rows<T>(out: &mut String, sign: char, rows: &[T], render: impl Fn(&T) -> String) {
+    for r in rows.iter().take(DIFF_TEXT_ROWS) {
+        let _ = writeln!(out, "  {sign} {}", render(r));
+    }
+    if rows.len() > DIFF_TEXT_ROWS {
+        let _ = writeln!(
+            out,
+            "  … {} more (--json for all)",
+            rows.len() - DIFF_TEXT_ROWS
+        );
+    }
+}
+
+/// `rb diff`'s text (contract M5 S17): the header, the summaries, then each exact section's
+/// counts and first rows.
+fn diff_text(d: &rb_api::diff::DiffAnswer, evidence: bool) -> String {
+    use rb_model::diff::{Change, EdgeRow, NodeRow};
+    let mut out = String::new();
+    let side =
+        |s: &SnapshotInfo| format!("snapshot {} of {} @ {}", s.id, s.repo, short(&s.commit_sha));
+    let _ = writeln!(out, "diff {} → {}", side(&d.from), side(&d.to));
+    if !d.tools_differ.is_empty() {
+        let _ = writeln!(out, "tools differ: {}", d.tools_differ.join(", "));
+    }
+    let s = &d.summaries;
+    let summary = |out: &mut String, title: &str, added: usize, removed: usize| {
+        let _ = writeln!(out, "{title}: {added} added, {removed} removed");
+    };
+    summary(
+        &mut out,
+        "endpoints",
+        s.endpoints.added.len(),
+        s.endpoints.removed.len(),
+    );
+    let endpoint = |e: &rb_store::diff::EndpointRow| format!("{}  [{}]", e.display, e.service);
+    diff_rows(&mut out, '+', &s.endpoints.added, endpoint);
+    diff_rows(&mut out, '-', &s.endpoints.removed, endpoint);
+    summary(
+        &mut out,
+        "table access",
+        s.table_access.added.len(),
+        s.table_access.removed.len(),
+    );
+    let access =
+        |t: &rb_store::diff::TableAccessRow| format!("{}  {}  {}", t.service, t.table, t.op);
+    diff_rows(&mut out, '+', &s.table_access.added, access);
+    diff_rows(&mut out, '-', &s.table_access.removed, access);
+    summary(
+        &mut out,
+        "service dependencies",
+        s.service_dependencies.added.len(),
+        s.service_dependencies.removed.len(),
+    );
+    let dep = |x: &rb_store::diff::DependencyRow| format!("{} -> {}  via {}", x.from, x.to, x.via);
+    diff_rows(&mut out, '+', &s.service_dependencies.added, dep);
+    diff_rows(&mut out, '-', &s.service_dependencies.removed, dep);
+    if s.certainty.is_empty() {
+        out.push_str("certainty: no edge changed certainty\n");
+    } else {
+        let shifts: Vec<String> = s
+            .certainty
+            .iter()
+            .map(|(k, x)| format!("{k} {} raised, {} lowered", x.raised, x.lowered))
+            .collect();
+        let _ = writeln!(out, "certainty: {}", shifts.join("; "));
+    }
+    let e = &d.exact;
+    let _ = writeln!(
+        out,
+        "nodes: {} added, {} removed, {} changed",
+        e.nodes_added.len(),
+        e.nodes_removed.len(),
+        e.nodes_changed.len()
+    );
+    let node = |n: &NodeRow| format!("{} {}", n.kind, n.key);
+    diff_rows(&mut out, '+', &e.nodes_added, node);
+    diff_rows(&mut out, '-', &e.nodes_removed, node);
+    let node_change = |c: &Change<NodeRow>| {
+        let mut parts = Vec::new();
+        if c.before.name != c.after.name {
+            parts.push(format!("name {:?} → {:?}", c.before.name, c.after.name));
+        }
+        if c.before.attrs != c.after.attrs {
+            parts.push(format!(
+                "attrs {} → {}",
+                serde_json::Value::Object(c.before.attrs.clone()),
+                serde_json::Value::Object(c.after.attrs.clone())
+            ));
+        }
+        format!("{}: {}", node(&c.after), parts.join("; "))
+    };
+    diff_rows(&mut out, '~', &e.nodes_changed, node_change);
+    let _ = writeln!(
+        out,
+        "edges: {} added, {} removed, {} changed, {} evidence only",
+        e.edges_added.len(),
+        e.edges_removed.len(),
+        e.edges_changed.len(),
+        e.edges_evidence_only.len()
+    );
+    let edge = |x: &EdgeRow| {
+        format!(
+            "{} {} -> {} ({})",
+            x.kind, x.src_key, x.dst_key, x.provenance
+        )
+    };
+    let with_certainty = |x: &EdgeRow| format!("{}  [{}]", edge(x), x.certainty.as_str());
+    diff_rows(&mut out, '+', &e.edges_added, with_certainty);
+    diff_rows(&mut out, '-', &e.edges_removed, with_certainty);
+    let edge_change = |c: &Change<EdgeRow>| {
+        let mut parts = Vec::new();
+        if c.before.certainty != c.after.certainty {
+            parts.push(format!(
+                "certainty {} → {}",
+                c.before.certainty.as_str(),
+                c.after.certainty.as_str()
+            ));
+        }
+        if c.before.attrs != c.after.attrs {
+            parts.push(format!(
+                "attrs {} → {}",
+                serde_json::Value::Object(c.before.attrs.clone()),
+                serde_json::Value::Object(c.after.attrs.clone())
+            ));
+        }
+        if c.before.evidence != c.after.evidence {
+            parts.push(format!(
+                "evidence changed ({} → {} sites)",
+                c.before.evidence.len(),
+                c.after.evidence.len()
+            ));
+        }
+        format!("{}: {}", edge(&c.after), parts.join("; "))
+    };
+    diff_rows(&mut out, '~', &e.edges_changed, edge_change);
+    if evidence {
+        diff_rows(&mut out, '=', &e.edges_evidence_only, edge_change);
+    }
+    let changed: Vec<String> = d
+        .diagnostics
+        .counts
+        .iter()
+        .filter(|(_, (b, a))| b != a)
+        .map(|(k, (b, a))| format!("{k} {b} → {a}"))
+        .collect();
+    if changed.is_empty() {
+        out.push_str("diagnostics: no kind changed count\n");
+    } else {
+        let _ = writeln!(out, "diagnostics: {}", changed.join(", "));
+    }
+    if d.list_diagnostics {
+        let line = |x: &rb_model::Diagnostic| rb_model::diff::diagnostic_line(x);
+        diff_rows(&mut out, '+', &d.diagnostics.added, line);
+        diff_rows(&mut out, '-', &d.diagnostics.removed, line);
+    }
+    out
 }
 
 /// `rb status`'s text: per repository its live snapshot and counts, then its coverage lines.

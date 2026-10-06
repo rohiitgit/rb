@@ -1,0 +1,24 @@
+diff snapshot <from> of <repo> @ 45240eff4a4e → snapshot <live> of <repo> @ 4aab1ccd468a
+endpoints: 1 added, 0 removed
+  + POST /internal/mfa/push  [notification]
+table access: 1 added, 1 removed
+  + services/auth  audit.users  delete
+  - services/auth  audit.users  insert
+service dependencies: 1 added, 0 removed
+  + services/notification -> services/auth  via http
+certainty: no edge changed certainty
+nodes: 2 added, 0 removed, 4 changed
+  + symbol rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck().
+  + endpoint HTTP POST /internal/mfa/push @services/notification
+  ~ file services/auth/src/main/java/com/acme/auth/AuthController.java: attrs {"blob":"d663384b0885a9d54788a997bbce93e1ba9aba1a","lang":"java","size":732} → {"blob":"a5b7b6dade9ddc1ef64a47abdddfa67d19e59b6c","lang":"java","size":707}
+  ~ file services/auth/src/main/java/com/acme/auth/UserDao.java: attrs {"blob":"f8c93807d7d46615a8c4c55922ed36e315627b27","lang":"java","size":616} → {"blob":"a66a709459b8f06465e68f9323294424fb9a1a56","lang":"java","size":597}
+  ~ file services/notification/src/selfcheck.ts: attrs {"blob":"d72f2a9ce8cbeb8376a71c3bf401290392d6ca20","lang":"typescript","size":499} → {"blob":"9222f247d6c125da7e525563ca585a6122b2bfb6","lang":"typescript","size":679}
+  ~ file services/notification/src/server.ts: attrs {"blob":"ea51abb6b895eb6e3610cf6893dc84a4f820950b","lang":"typescript","size":662} → {"blob":"bc36789c07dbb35813b50a750875d6d16a2c9b23","lang":"typescript","size":659}
+edges: 4 added, 1 removed, 1 changed, 6 evidence only
+  + DEFINED_IN rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck(). -> services/notification/src/selfcheck.ts (treesitter)  [exact]
+  + CONSUMES rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck(). -> HTTP GET /api/v1/login @services/auth (http_stitch)  [synthetic]
+  + EXPOSES services/notification -> HTTP POST /internal/mfa/push @services/notification (treesitter)  [exact]
+  + HANDLED_BY HTTP POST /internal/mfa/push @services/notification -> services/notification/src/server.ts (treesitter)  [exact]
+  - CALLS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login(). -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch(). (heuristic)  [heuristic]
+  ~ QUERIES rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch(). -> audit.users (sql_literal): attrs {"ops":["insert"]} → {"ops":["delete"]}; evidence changed (1 → 1 sites)
+diagnostics: no kind changed count

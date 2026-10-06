@@ -1274,6 +1274,69 @@ fn work_cap_is_far_above_every_fixture_question() {
     assert!(max.iter().all(|&w| w > 0 && w * 10_000 <= WORK), "{max:?}");
 }
 
+/// Contract M5 S17: `rb diff`'s summaries use the Service Card's rule. On every fixture, for
+/// every service, the card's dependencies are exactly `service_dependencies` from that service,
+/// and every table operation of the card is in `table_access` for it (which adds migrations).
+/// No database: the fixtures are indexed in memory.
+#[test]
+fn diff_summaries_agree_with_the_service_card() {
+    use rb_store::code::SnapshotIndex;
+    for fixture in ["ts-express-prisma", "java-spring-jpa", "polyglot-monorepo"] {
+        let repo = fixture_repo(fixture);
+        let indexed = rb_indexer::index_commit(
+            repo.path(),
+            "HEAD",
+            &mut rb_indexer::NoCache,
+            &rb_indexer::ScipOptions::disabled(),
+            &mut rb_indexer::NoScipCache,
+        )
+        .unwrap();
+        let ix = SnapshotIndex::new(indexed.graph);
+        let deps = rb_store::diff::service_dependencies(&ix);
+        let access = rb_store::diff::table_access(&ix);
+        let services: Vec<String> = ix
+            .graph()
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Service)
+            .map(|n| n.key.clone())
+            .collect();
+        let mut compared = 0;
+        for key in &services {
+            let card = rb_store::card::card_sections(&ix, key);
+            let from_card: std::collections::BTreeSet<(String, String)> = card
+                .dependencies
+                .iter()
+                .map(|d| (d.key.clone(), d.via.clone()))
+                .collect();
+            let from_summary: std::collections::BTreeSet<(String, String)> = deps
+                .iter()
+                .filter(|d| &d.from == key)
+                .map(|d| (d.to.clone(), d.via.clone()))
+                .collect();
+            assert_eq!(from_card, from_summary, "{fixture} {key}");
+            for t in &card.tables {
+                let ops: Vec<String> = if t.ops.is_empty() {
+                    vec!["mapped".to_owned()]
+                } else {
+                    t.ops.clone()
+                };
+                for op in ops {
+                    assert!(
+                        access
+                            .iter()
+                            .any(|a| &a.service == key && a.table == t.key && a.op == op),
+                        "{fixture} {key} {} {op}",
+                        t.key
+                    );
+                }
+            }
+            compared += from_card.len() + card.tables.len();
+        }
+        assert!(compared > 0, "{fixture}: nothing compared");
+    }
+}
+
 /// Contract M5 S5 (M4a open item 4): `rb index --no-cache` parses every file and still writes the
 /// facts it extracted, so a plain run afterwards parses nothing; both dump identically. The
 /// sources carry a per-run token so that no earlier run has cached their blobs.
@@ -1845,6 +1908,334 @@ fn serve_answers_from_the_live_snapshot() {
         .status();
     let exit = server.child.wait().unwrap();
     assert!(exit.success(), "{exit:?}");
+}
+
+/// Commits the working tree of `dir` with the e2e's fixed identity at `date`.
+fn commit_at(dir: &Path, message: &str, date: &str) {
+    for args in [&["add", "-A"][..], &["commit", "-q", "-m", message]] {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "rb")
+            .env("GIT_AUTHOR_EMAIL", "rb@example.invalid")
+            .env("GIT_COMMITTER_NAME", "rb")
+            .env("GIT_COMMITTER_EMAIL", "rb@example.invalid")
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Replaces `old` (present exactly once) by `new` in `path`.
+fn edit(path: &Path, old: &str, new: &str) {
+    let text = std::fs::read_to_string(path).unwrap();
+    assert_eq!(text.matches(old).count(), 1, "{}: {old}", path.display());
+    std::fs::write(path, text.replace(old, new)).unwrap();
+}
+
+/// Contract M5 S17 (polyglot, `--no-scip`): a two-commit history — commit 2 adds the endpoint
+/// `POST /internal/mfa/push`, removes the call `users.touch(1L)` from `AuthController.login`,
+/// turns `UserDao.touch`'s `INSERT INTO audit.users` into a `DELETE`, and adds a call from
+/// notification to auth's `GET /api/v1/login` — indexed in order; `rb diff` (from the live
+/// snapshot's parent to it) names exactly the predicted summary rows, in text and JSON (goldens).
+#[test]
+fn diff_of_a_two_commit_history() {
+    let Some(url) = db_url() else { return };
+    let fixture = "polyglot-monorepo";
+    let repo = fixture_repo(fixture);
+    let root = repo.path();
+    edit(
+        &root.join("services/notification/src/server.ts"),
+        "// app.post(\"/internal/mfa/push\"",
+        "app.post(\"/internal/mfa/push\"",
+    );
+    edit(
+        &root.join("services/auth/src/main/java/com/acme/auth/AuthController.java"),
+        "        users.touch(1L);\n",
+        "",
+    );
+    edit(
+        &root.join("services/auth/src/main/java/com/acme/auth/UserDao.java"),
+        "jdbc.update(\"INSERT INTO audit.users (user_id, event) VALUES (?, 'touch')\", id);",
+        "jdbc.update(\"DELETE FROM audit.users WHERE user_id = ?\", id);",
+    );
+    let selfcheck = root.join("services/notification/src/selfcheck.ts");
+    let mut text = std::fs::read_to_string(&selfcheck).unwrap();
+    text.push_str("\n// Checks that auth's login page answers.\nexport async function loginCheck(): Promise<boolean> {\n  const res = await fetch(\"http://auth-service/api/v1/login\");\n  return res.ok;\n}\n");
+    std::fs::write(&selfcheck, text).unwrap();
+    commit_at(root, "second", "2026-01-02T00:00:00Z");
+    let path = root.to_str().unwrap();
+    let name = format!("t_diff_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    rb(
+        &url,
+        &[
+            "index",
+            path,
+            "--repo",
+            &name,
+            "--no-scip",
+            "--rev",
+            "HEAD~1",
+        ],
+    );
+    let first = live_id(&url, &name);
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    let second = live_id(&url, &name);
+
+    let json = rb(&url, &["diff", "--repo", &name, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let r = &v["result"];
+    assert_eq!(
+        (r["from"]["id"].as_i64(), r["to"]["id"].as_i64()),
+        (Some(first), Some(second))
+    );
+    // The rows predicted before blessing (contract M5 S17).
+    assert_eq!(
+        r["summary"],
+        serde_json::json!({
+            "endpoints": {
+                "added": [{"key": "HTTP POST /internal/mfa/push @services/notification",
+                           "display": "POST /internal/mfa/push", "service": "notification"}],
+                "removed": []
+            },
+            "table_access": {
+                "added": [{"service": "services/auth", "table": "audit.users", "op": "delete"}],
+                "removed": [{"service": "services/auth", "table": "audit.users", "op": "insert"}]
+            },
+            "service_dependencies": {
+                "added": [{"from": "services/notification", "to": "services/auth", "via": "http"}],
+                "removed": []
+            },
+            "certainty": {}
+        }),
+        "{json}"
+    );
+    assert_eq!(r["tools_differ"], serde_json::json!([]));
+    // The same request by commit prefix and by id gives the same body.
+    let commit = |id: i64| -> String {
+        Store::connect(&url)
+            .unwrap()
+            .snapshot(id)
+            .unwrap()
+            .commit_sha[..8]
+            .to_owned()
+    };
+    assert_eq!(
+        rb(
+            &url,
+            &[
+                "diff",
+                &commit(first),
+                &commit(second),
+                "--repo",
+                &name,
+                "--json"
+            ]
+        ),
+        json
+    );
+    assert_eq!(
+        rb(
+            &url,
+            &[
+                "diff",
+                &first.to_string(),
+                &second.to_string(),
+                "--repo",
+                &name,
+                "--json"
+            ]
+        ),
+        json
+    );
+    let text = rb(&url, &["diff", "--repo", &name]);
+    let stable_text = |t: &str| {
+        let head = format!("diff snapshot {first} of {name} @ ");
+        assert!(t.starts_with(&head), "{t}");
+        t.replace(
+            &format!("snapshot {first} of {name}"),
+            "snapshot <from> of <repo>",
+        )
+        .replace(
+            &format!("snapshot {second} of {name}"),
+            "snapshot <live> of <repo>",
+        )
+    };
+    golden(fixture, "diff-polyglot.txt", &stable_text(&text));
+    golden(
+        fixture,
+        "diff-polyglot.json",
+        &stable(&json, &name, second)
+            .replace(&format!("\"id\": {first},"), "\"id\": \"<from>\",")
+            .replace(&format!("\"from\": {first},"), "\"from\": \"<from>\",")
+            .replace(&format!("\"to\": {second}\n"), "\"to\": \"<live>\"\n"),
+    );
+    // The reverse diff is the inverse: added and removed swap.
+    let back: serde_json::Value = serde_json::from_str(&rb(
+        &url,
+        &[
+            "diff",
+            &second.to_string(),
+            &first.to_string(),
+            "--repo",
+            &name,
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(
+        back["result"]["summary"]["endpoints"]["removed"],
+        r["summary"]["endpoints"]["added"]
+    );
+    assert_eq!(
+        back["result"]["nodes"]["added"]["total"],
+        r["nodes"]["removed"]["total"]
+    );
+    // Selector errors: a commit prefix shared by both snapshots of one commit is ambiguous.
+    rb(
+        &url,
+        &["index", path, "--repo", &name, "--no-scip", "--force"],
+    );
+    let (code, out, _) = rb_exit(&url, &["diff", &commit(second), "--repo", &name, "--json"]);
+    let e: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (code, e["error"]["kind"].as_str()),
+        (4, Some("ambiguous")),
+        "{out}"
+    );
+    assert_eq!(e["error"]["candidates"].as_array().unwrap().len(), 2);
+    let (code, _, err) = rb_exit(&url, &["diff", "zz12", "--repo", &name]);
+    assert_eq!(code, 2, "{err}");
+}
+
+/// The `N` and `E` lines of a dump.
+fn row_lines(dump: &str) -> Vec<String> {
+    dump.lines()
+        .filter(|l| l.starts_with("[\"N\"") || l.starts_with("[\"E\""))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Contract M5 S16 on real snapshots: for every ordered pair of the three fixtures,
+/// `apply(dump lines of A, diff(A, B))` is B's dump lines; `rb diff A B --json` counts the same
+/// rows; and each fixture against its own forced rebuild is an empty diff.
+#[test]
+fn diffs_of_fixtures_apply_and_rebuilds_are_empty() {
+    let Some(url) = db_url() else { return };
+    let pid = std::process::id();
+    let fixtures = ["ts-express-prisma", "java-spring-jpa", "polyglot-monorepo"];
+    let repos: Vec<String> = fixtures
+        .iter()
+        .map(|f| format!("t_dapply_{}_{pid}", f.replace('-', "_")))
+        .collect();
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: repos.clone(),
+    };
+    let mut ids = Vec::new();
+    for (f, r) in fixtures.iter().zip(&repos) {
+        let dir = fixture_repo(f);
+        let path = dir.path().to_str().unwrap();
+        rb(&url, &["index", path, "--repo", r, "--no-scip"]);
+        rb(&url, &["index", path, "--repo", r, "--no-scip", "--force"]);
+        ids.push(live_id(&url, r));
+        // The rebuild's diff with its parent (the first build) is empty.
+        let v: serde_json::Value =
+            serde_json::from_str(&rb(&url, &["diff", "--repo", r, "--json"])).unwrap();
+        let res = &v["result"];
+        for (section, parts) in [
+            ("nodes", &["added", "removed", "changed"][..]),
+            ("edges", &["added", "removed", "changed", "evidence_only"]),
+        ] {
+            for part in parts {
+                assert_eq!(res[section][part]["total"], 0, "{f} {section}.{part}");
+            }
+        }
+        for summary in ["endpoints", "table_access", "service_dependencies"] {
+            assert_eq!(
+                res["summary"][summary]["added"],
+                serde_json::json!([]),
+                "{f}"
+            );
+            assert_eq!(
+                res["summary"][summary]["removed"],
+                serde_json::json!([]),
+                "{f}"
+            );
+        }
+    }
+    let mut store = Store::connect(&url).unwrap();
+    let graphs: Vec<rb_model::Graph> = ids
+        .iter()
+        .map(|&id| store.load_graph(id).unwrap())
+        .collect();
+    let dumps: Vec<String> = ids
+        .iter()
+        .map(|id| rb(&url, &["dump", "--snapshot", &id.to_string()]))
+        .collect();
+    for a in 0..3 {
+        for b in 0..3 {
+            let d = rb_model::diff::diff(&graphs[a], &graphs[b]);
+            let lines_a = row_lines(&dumps[a]);
+            let refs: Vec<&str> = lines_a.iter().map(String::as_str).collect();
+            assert_eq!(
+                rb_model::diff::apply(&refs, &d).unwrap(),
+                row_lines(&dumps[b]),
+                "{} -> {}",
+                fixtures[a],
+                fixtures[b]
+            );
+            assert_eq!(a == b, d.is_empty());
+            let v: serde_json::Value = serde_json::from_str(&rb(
+                &url,
+                &[
+                    "diff",
+                    &ids[a].to_string(),
+                    &ids[b].to_string(),
+                    "--repo",
+                    &repos[b],
+                    "--json",
+                ],
+            ))
+            .unwrap();
+            let total = |s: &str, p: &str| v["result"][s][p]["total"].as_u64().unwrap() as usize;
+            assert_eq!(
+                (
+                    total("nodes", "added"),
+                    total("nodes", "removed"),
+                    total("nodes", "changed"),
+                    total("edges", "added"),
+                    total("edges", "removed"),
+                    total("edges", "changed"),
+                    total("edges", "evidence_only"),
+                ),
+                (
+                    d.nodes_added.len(),
+                    d.nodes_removed.len(),
+                    d.nodes_changed.len(),
+                    d.edges_added.len(),
+                    d.edges_removed.len(),
+                    d.edges_changed.len(),
+                    d.edges_evidence_only.len(),
+                ),
+                "{} -> {}",
+                fixtures[a],
+                fixtures[b]
+            );
+        }
+    }
 }
 
 /// Contract M3a R9-R11: `rb callers` and `rb impact` goldens on every fixture, including the

@@ -79,6 +79,14 @@ impl Params {
         }
     }
 
+    /// An optional text; empty counts as given and is refused.
+    pub(crate) fn text_opt(&self, key: &str) -> Result<Option<String>, ApiError> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(_) => self.text(key).map(Some),
+        }
+    }
+
     /// An integer within `min..=max`, `default` when absent. Only decimal digits are accepted.
     pub(crate) fn int(&self, key: &str, default: u64, min: u64, max: u64) -> Result<u64, ApiError> {
         Ok(self.int_opt(key, min, max)?.unwrap_or(default))

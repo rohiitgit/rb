@@ -1,0 +1,728 @@
+{
+  "api": 1,
+  "repo": "<repo>",
+  "snapshot": {
+    "id": "<live>",
+    "commit_sha": "4aab1ccd468af53db9dd46e5b3a648d82e47f51f"
+  },
+  "query": {
+    "diagnostics": false,
+    "from": "<from>",
+    "limit": 1000,
+    "offset": 0,
+    "to": "<live>"
+  },
+  "limits": {},
+  "truncated": [],
+  "result": {
+    "diagnostics": {
+      "counts": {
+        "codeowners_ignored": {
+          "after": 1,
+          "before": 1
+        },
+        "codeowners_invalid_line": {
+          "after": 1,
+          "before": 1
+        },
+        "di_coverage": {
+          "after": 1,
+          "before": 1
+        },
+        "http_coverage": {
+          "after": 1,
+          "before": 1
+        },
+        "http_external": {
+          "after": 1,
+          "before": 1
+        },
+        "http_self": {
+          "after": 2,
+          "before": 2
+        },
+        "http_url_dynamic": {
+          "after": 1,
+          "before": 1
+        },
+        "orphan_coverage": {
+          "after": 1,
+          "before": 1
+        },
+        "rta_coverage": {
+          "after": 1,
+          "before": 1
+        },
+        "scip_status": {
+          "after": 5,
+          "before": 5
+        },
+        "unparsed_sql": {
+          "after": 1,
+          "before": 1
+        },
+        "unresolved_references": {
+          "after": 12,
+          "before": 12
+        }
+      }
+    },
+    "edges": {
+      "added": {
+        "items": [
+          {
+            "attrs": {},
+            "certainty": "exact",
+            "dst_key": "services/notification/src/selfcheck.ts",
+            "dst_kind": "file",
+            "evidence": [
+              [
+                "services/notification/src/selfcheck.ts",
+                [
+                  13,
+                  22,
+                  13,
+                  32
+                ]
+              ]
+            ],
+            "kind": "DEFINED_IN",
+            "provenance": "treesitter",
+            "src_key": "rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck().",
+            "src_kind": "symbol"
+          },
+          {
+            "attrs": {
+              "base": "literal",
+              "client": "fetch",
+              "host": "auth-service",
+              "match": "exact",
+              "sites": 1
+            },
+            "certainty": "synthetic",
+            "dst_key": "HTTP GET /api/v1/login @services/auth",
+            "dst_kind": "endpoint",
+            "evidence": [
+              [
+                "services/notification/src/selfcheck.ts",
+                [
+                  14,
+                  20,
+                  14,
+                  61
+                ]
+              ]
+            ],
+            "kind": "CONSUMES",
+            "provenance": "http_stitch",
+            "src_key": "rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck().",
+            "src_kind": "symbol"
+          },
+          {
+            "attrs": {},
+            "certainty": "exact",
+            "dst_key": "HTTP POST /internal/mfa/push @services/notification",
+            "dst_kind": "endpoint",
+            "evidence": [
+              [
+                "services/notification/src/server.ts",
+                [
+                  14,
+                  0,
+                  14,
+                  78
+                ]
+              ]
+            ],
+            "kind": "EXPOSES",
+            "provenance": "treesitter",
+            "src_key": "services/notification",
+            "src_kind": "service"
+          },
+          {
+            "attrs": {
+              "handler_spans": [
+                [
+                  14,
+                  31,
+                  14,
+                  77
+                ]
+              ]
+            },
+            "certainty": "exact",
+            "dst_key": "services/notification/src/server.ts",
+            "dst_kind": "file",
+            "evidence": [
+              [
+                "services/notification/src/server.ts",
+                [
+                  14,
+                  0,
+                  14,
+                  78
+                ]
+              ]
+            ],
+            "kind": "HANDLED_BY",
+            "provenance": "treesitter",
+            "src_key": "HTTP POST /internal/mfa/push @services/notification",
+            "src_kind": "endpoint"
+          }
+        ],
+        "limit": 1000,
+        "next_offset": null,
+        "offset": 0,
+        "total": 4
+      },
+      "changed": {
+        "items": [
+          {
+            "after": {
+              "attrs": {
+                "ops": [
+                  "delete"
+                ]
+              },
+              "certainty": "exact",
+              "dst_key": "audit.users",
+              "dst_kind": "table",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/UserDao.java",
+                  [
+                    19,
+                    20,
+                    19,
+                    63
+                  ]
+                ]
+              ],
+              "kind": "QUERIES",
+              "provenance": "sql_literal",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch().",
+              "src_kind": "symbol"
+            },
+            "before": {
+              "attrs": {
+                "ops": [
+                  "insert"
+                ]
+              },
+              "certainty": "exact",
+              "dst_key": "audit.users",
+              "dst_kind": "table",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/UserDao.java",
+                  [
+                    19,
+                    20,
+                    19,
+                    82
+                  ]
+                ]
+              ],
+              "kind": "QUERIES",
+              "provenance": "sql_literal",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch().",
+              "src_kind": "symbol"
+            }
+          }
+        ],
+        "limit": 1000,
+        "next_offset": null,
+        "offset": 0,
+        "total": 1
+      },
+      "evidence_only": {
+        "items": [
+          {
+            "after": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#loginPage().",
+              "dst_kind": "symbol",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    22,
+                    18,
+                    22,
+                    27
+                  ]
+                ]
+              ],
+              "kind": "CONTAINS",
+              "provenance": "treesitter",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#",
+              "src_kind": "symbol"
+            },
+            "before": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#loginPage().",
+              "dst_kind": "symbol",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    23,
+                    18,
+                    23,
+                    27
+                  ]
+                ]
+              ],
+              "kind": "CONTAINS",
+              "provenance": "treesitter",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#",
+              "src_kind": "symbol"
+            }
+          },
+          {
+            "after": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#logout().",
+              "dst_kind": "symbol",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    27,
+                    16,
+                    27,
+                    22
+                  ]
+                ]
+              ],
+              "kind": "CONTAINS",
+              "provenance": "treesitter",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#",
+              "src_kind": "symbol"
+            },
+            "before": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#logout().",
+              "dst_kind": "symbol",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    28,
+                    16,
+                    28,
+                    22
+                  ]
+                ]
+              ],
+              "kind": "CONTAINS",
+              "provenance": "treesitter",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#",
+              "src_kind": "symbol"
+            }
+          },
+          {
+            "after": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+              "dst_kind": "file",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    22,
+                    18,
+                    22,
+                    27
+                  ]
+                ]
+              ],
+              "kind": "DEFINED_IN",
+              "provenance": "treesitter",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#loginPage().",
+              "src_kind": "symbol"
+            },
+            "before": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+              "dst_kind": "file",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    23,
+                    18,
+                    23,
+                    27
+                  ]
+                ]
+              ],
+              "kind": "DEFINED_IN",
+              "provenance": "treesitter",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#loginPage().",
+              "src_kind": "symbol"
+            }
+          },
+          {
+            "after": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+              "dst_kind": "file",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    27,
+                    16,
+                    27,
+                    22
+                  ]
+                ]
+              ],
+              "kind": "DEFINED_IN",
+              "provenance": "treesitter",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#logout().",
+              "src_kind": "symbol"
+            },
+            "before": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+              "dst_kind": "file",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    28,
+                    16,
+                    28,
+                    22
+                  ]
+                ]
+              ],
+              "kind": "DEFINED_IN",
+              "provenance": "treesitter",
+              "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#logout().",
+              "src_kind": "symbol"
+            }
+          },
+          {
+            "after": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "HTTP GET /api/v1/login @services/auth",
+              "dst_kind": "endpoint",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    21,
+                    4,
+                    21,
+                    25
+                  ]
+                ]
+              ],
+              "kind": "EXPOSES",
+              "provenance": "treesitter",
+              "src_key": "services/auth",
+              "src_kind": "service"
+            },
+            "before": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "HTTP GET /api/v1/login @services/auth",
+              "dst_kind": "endpoint",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    22,
+                    4,
+                    22,
+                    25
+                  ]
+                ]
+              ],
+              "kind": "EXPOSES",
+              "provenance": "treesitter",
+              "src_key": "services/auth",
+              "src_kind": "service"
+            }
+          },
+          {
+            "after": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#loginPage().",
+              "dst_kind": "symbol",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    21,
+                    4,
+                    21,
+                    25
+                  ]
+                ]
+              ],
+              "kind": "HANDLED_BY",
+              "provenance": "treesitter",
+              "src_key": "HTTP GET /api/v1/login @services/auth",
+              "src_kind": "endpoint"
+            },
+            "before": {
+              "attrs": {},
+              "certainty": "exact",
+              "dst_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#loginPage().",
+              "dst_kind": "symbol",
+              "evidence": [
+                [
+                  "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                  [
+                    22,
+                    4,
+                    22,
+                    25
+                  ]
+                ]
+              ],
+              "kind": "HANDLED_BY",
+              "provenance": "treesitter",
+              "src_key": "HTTP GET /api/v1/login @services/auth",
+              "src_kind": "endpoint"
+            }
+          }
+        ],
+        "limit": 1000,
+        "next_offset": null,
+        "offset": 0,
+        "total": 6
+      },
+      "removed": {
+        "items": [
+          {
+            "attrs": {},
+            "certainty": "heuristic",
+            "dst_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch().",
+            "dst_kind": "symbol",
+            "evidence": [
+              [
+                "services/auth/src/main/java/com/acme/auth/AuthController.java",
+                [
+                  18,
+                  14,
+                  18,
+                  19
+                ]
+              ]
+            ],
+            "kind": "CALLS",
+            "provenance": "heuristic",
+            "src_key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login().",
+            "src_kind": "symbol"
+          }
+        ],
+        "limit": 1000,
+        "next_offset": null,
+        "offset": 0,
+        "total": 1
+      }
+    },
+    "from": {
+      "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223",
+      "id": "<from>",
+      "repo": "<repo>",
+      "status": "retired"
+    },
+    "nodes": {
+      "added": {
+        "items": [
+          {
+            "attrs": {
+              "kind": "function",
+              "orphan_eligible": true
+            },
+            "key": "rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck().",
+            "kind": "symbol",
+            "name": "loginCheck"
+          },
+          {
+            "attrs": {
+              "frameworks": [
+                "express"
+              ],
+              "method": "POST",
+              "path": "/internal/mfa/push",
+              "service": "services/notification"
+            },
+            "key": "HTTP POST /internal/mfa/push @services/notification",
+            "kind": "endpoint",
+            "name": "POST /internal/mfa/push"
+          }
+        ],
+        "limit": 1000,
+        "next_offset": null,
+        "offset": 0,
+        "total": 2
+      },
+      "changed": {
+        "items": [
+          {
+            "after": {
+              "attrs": {
+                "blob": "a5b7b6dade9ddc1ef64a47abdddfa67d19e59b6c",
+                "lang": "java",
+                "size": 707
+              },
+              "key": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+              "kind": "file",
+              "name": "AuthController.java"
+            },
+            "before": {
+              "attrs": {
+                "blob": "d663384b0885a9d54788a997bbce93e1ba9aba1a",
+                "lang": "java",
+                "size": 732
+              },
+              "key": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+              "kind": "file",
+              "name": "AuthController.java"
+            }
+          },
+          {
+            "after": {
+              "attrs": {
+                "blob": "a66a709459b8f06465e68f9323294424fb9a1a56",
+                "lang": "java",
+                "size": 597
+              },
+              "key": "services/auth/src/main/java/com/acme/auth/UserDao.java",
+              "kind": "file",
+              "name": "UserDao.java"
+            },
+            "before": {
+              "attrs": {
+                "blob": "f8c93807d7d46615a8c4c55922ed36e315627b27",
+                "lang": "java",
+                "size": 616
+              },
+              "key": "services/auth/src/main/java/com/acme/auth/UserDao.java",
+              "kind": "file",
+              "name": "UserDao.java"
+            }
+          },
+          {
+            "after": {
+              "attrs": {
+                "blob": "9222f247d6c125da7e525563ca585a6122b2bfb6",
+                "lang": "typescript",
+                "size": 679
+              },
+              "key": "services/notification/src/selfcheck.ts",
+              "kind": "file",
+              "name": "selfcheck.ts"
+            },
+            "before": {
+              "attrs": {
+                "blob": "d72f2a9ce8cbeb8376a71c3bf401290392d6ca20",
+                "lang": "typescript",
+                "size": 499
+              },
+              "key": "services/notification/src/selfcheck.ts",
+              "kind": "file",
+              "name": "selfcheck.ts"
+            }
+          },
+          {
+            "after": {
+              "attrs": {
+                "blob": "bc36789c07dbb35813b50a750875d6d16a2c9b23",
+                "lang": "typescript",
+                "size": 659
+              },
+              "key": "services/notification/src/server.ts",
+              "kind": "file",
+              "name": "server.ts"
+            },
+            "before": {
+              "attrs": {
+                "blob": "ea51abb6b895eb6e3610cf6893dc84a4f820950b",
+                "lang": "typescript",
+                "size": 662
+              },
+              "key": "services/notification/src/server.ts",
+              "kind": "file",
+              "name": "server.ts"
+            }
+          }
+        ],
+        "limit": 1000,
+        "next_offset": null,
+        "offset": 0,
+        "total": 4
+      },
+      "removed": {
+        "items": [],
+        "limit": 1000,
+        "next_offset": null,
+        "offset": 0,
+        "total": 0
+      }
+    },
+    "summary": {
+      "certainty": {},
+      "endpoints": {
+        "added": [
+          {
+            "display": "POST /internal/mfa/push",
+            "key": "HTTP POST /internal/mfa/push @services/notification",
+            "service": "notification"
+          }
+        ],
+        "removed": []
+      },
+      "service_dependencies": {
+        "added": [
+          {
+            "from": "services/notification",
+            "to": "services/auth",
+            "via": "http"
+          }
+        ],
+        "removed": []
+      },
+      "table_access": {
+        "added": [
+          {
+            "op": "delete",
+            "service": "services/auth",
+            "table": "audit.users"
+          }
+        ],
+        "removed": [
+          {
+            "op": "insert",
+            "service": "services/auth",
+            "table": "audit.users"
+          }
+        ]
+      }
+    },
+    "to": {
+      "commit_sha": "4aab1ccd468af53db9dd46e5b3a648d82e47f51f",
+      "id": "<live>",
+      "repo": "<repo>",
+      "status": "live"
+    },
+    "tools_differ": []
+  }
+}

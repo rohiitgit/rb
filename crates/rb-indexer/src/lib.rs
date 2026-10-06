@@ -79,7 +79,9 @@ use serde_json::{Value, json};
 /// orphan rule (e) walks the supertype chain; DI caps by every assignable registration, never
 /// narrows a generic or annotated point by `@Primary`, reads `@Named`; duplicate Maven
 /// versions, npm aliases and `go.mod` replaces).
-pub const PIPELINE: &str = "m4b-di-8";
+/// `m5-1`: a `CONSUMES` edge matched by suffix because no host resolved says `base: unresolved`
+/// (contract M5 S18, M4a open item 6).
+pub const PIPELINE: &str = "m5-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

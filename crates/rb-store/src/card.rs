@@ -114,40 +114,60 @@ impl Acc {
     }
 }
 
+/// Which service each node belongs to (the card's rule, shared with `rb diff`'s summaries): a
+/// file by its `IN_SERVICE` edge, a service itself, an endpoint by the service exposing it, any
+/// other node by its `DEFINED_IN` file's service.
+pub(crate) struct Membership {
+    service_of_file: HashMap<i64, i64>,
+    file_of: HashMap<i64, i64>,
+    exposed_by: HashMap<i64, i64>,
+}
+
+impl Membership {
+    /// One pass over the edges. Each element is spent from the request's budget (contract M5
+    /// D6, amendment 6): once it is refused the pass stops, and the caller names `work`.
+    pub(crate) fn new(ix: &SnapshotIndex) -> Membership {
+        let mut m = Membership {
+            service_of_file: HashMap::new(),
+            file_of: HashMap::new(),
+            exposed_by: HashMap::new(),
+        };
+        for e in ix.graph().edges() {
+            if !crate::work::spend(1) {
+                break;
+            }
+            match e.kind {
+                EdgeKind::InService => {
+                    m.service_of_file.insert(e.src, e.dst);
+                }
+                EdgeKind::DefinedIn => {
+                    m.file_of.entry(e.src).or_insert(e.dst);
+                }
+                EdgeKind::Exposes => {
+                    m.exposed_by.insert(e.dst, e.src);
+                }
+                _ => {}
+            }
+        }
+        m
+    }
+
+    pub(crate) fn service_of(&self, ix: &SnapshotIndex, n: i64) -> Option<i64> {
+        match ix.get_node(n)?.kind {
+            NodeKind::File => self.service_of_file.get(&n).copied(),
+            NodeKind::Service => Some(n),
+            NodeKind::Endpoint => self.exposed_by.get(&n).copied(),
+            _ => self.service_of_file.get(self.file_of.get(&n)?).copied(),
+        }
+    }
+}
+
 /// The derived sections of service `key`'s card.
 pub fn card_sections(ix: &SnapshotIndex, key: &str) -> CardSections {
     let graph = ix.graph();
     // Each file's service, each node's file.
-    let mut service_of_file: HashMap<i64, i64> = HashMap::new();
-    let mut file_of: HashMap<i64, i64> = HashMap::new();
-    let mut exposed_by: HashMap<i64, i64> = HashMap::new();
-    // Each element is spent from the request's budget (contract M5 D6, amendment 6): once it is
-    // refused the scans stop, and the caller names `work` in the answer's `truncated`.
-    for e in graph.edges() {
-        if !crate::work::spend(1) {
-            break;
-        }
-        match e.kind {
-            EdgeKind::InService => {
-                service_of_file.insert(e.src, e.dst);
-            }
-            EdgeKind::DefinedIn => {
-                file_of.entry(e.src).or_insert(e.dst);
-            }
-            EdgeKind::Exposes => {
-                exposed_by.insert(e.dst, e.src);
-            }
-            _ => {}
-        }
-    }
-    let service_of = |n: i64| -> Option<i64> {
-        match ix.get_node(n)?.kind {
-            NodeKind::File => service_of_file.get(&n).copied(),
-            NodeKind::Service => Some(n),
-            NodeKind::Endpoint => exposed_by.get(&n).copied(),
-            _ => service_of_file.get(file_of.get(&n)?).copied(),
-        }
-    };
+    let membership = Membership::new(ix);
+    let service_of = |n: i64| membership.service_of(ix, n);
     let Some(me) = graph
         .nodes()
         .iter()
