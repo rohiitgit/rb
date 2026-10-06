@@ -226,6 +226,9 @@ struct Frontier {
     /// Downstream: an inline handler's spans, which the first step's evidence must lie in.
     /// Upstream: the evidence of the step that reached the node.
     spans: Option<Vec<Span>>,
+    /// Downstream: the spans of inline handlers of other endpoints inside the node, whose code
+    /// runs only when those endpoints are requested (amendment 12, Q7).
+    outside: Vec<Span>,
     /// Downstream: the service of the hop's handler.
     home: Option<i64>,
 }
@@ -363,6 +366,23 @@ impl<'g> Walk<'g> {
         scope.map(|s| s.into_iter().collect())
     }
 
+    /// Downstream: the inline-handler spans of `n` (from its inbound `HANDLED_BY` edges) that
+    /// do not hold any of `own` (the spans the node is walked within): code there runs only
+    /// when its own endpoint is requested (invariant 8; amendment 12, Q7).
+    fn other_handlers(&self, n: i64, own: Option<&[Span]>) -> Vec<Span> {
+        let own = own.unwrap_or(&[]);
+        let mut out: BTreeSet<Span> = BTreeSet::new();
+        for e in self.v.inbound(n, EdgeKind::HandledBy, Certainty::Ambiguous) {
+            out.extend(
+                handler_spans(e)
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| !own.iter().any(|o| within(*o, *s))),
+            );
+        }
+        out.into_iter().collect()
+    }
+
     // -----------------------------------------------------------------------------------------
     // Downstream (S16)
 
@@ -393,6 +413,7 @@ impl<'g> Walk<'g> {
                     item: i,
                     node: c.node,
                     branch: b,
+                    outside: self.other_handlers(c.node, spans.as_deref()),
                     spans,
                     home: self.service_of(c.node),
                 });
@@ -406,11 +427,14 @@ impl<'g> Walk<'g> {
         for _ in 0..self.opts.depth {
             let mut next = Vec::new();
             for f in frontier {
+                // An edge counts when one of its evidence rows lies in the node's own spans (if
+                // any) and in no other endpoint's inline handler.
                 let inside = |e: &&Edge| {
-                    f.spans.as_ref().is_none_or(|spans| {
-                        e.evidence
-                            .iter()
-                            .any(|ev| spans.iter().any(|s| within(ev.span, *s)))
+                    e.evidence.iter().any(|ev| {
+                        f.spans
+                            .as_ref()
+                            .is_none_or(|spans| spans.iter().any(|s| within(ev.span, *s)))
+                            && !f.outside.iter().any(|o| within(ev.span, *o))
                     })
                 };
                 // A call to this node may dispatch to the methods implementing it (CHA).
@@ -456,6 +480,7 @@ impl<'g> Walk<'g> {
                                     node: c.node,
                                     branch: b,
                                     spans: None,
+                                    outside: self.other_handlers(c.node, None),
                                     home: f.home,
                                 });
                             }
@@ -540,6 +565,7 @@ impl<'g> Walk<'g> {
                     node: c.node,
                     branch: b,
                     spans: Some(reached_by),
+                    outside: Vec::new(),
                     home: None,
                 });
             }
@@ -634,6 +660,7 @@ impl<'g> Walk<'g> {
                                 node: c.node,
                                 branch: b,
                                 spans: Some(reached_by),
+                                outside: Vec::new(),
                                 home: None,
                             });
                         }
@@ -1283,33 +1310,28 @@ mod tests {
         (b.finish(), e)
     }
 
-    /// Invariant 11: doubling a fan-out (and fan-in) or a chain costs at most 2.5 times as much
-    /// (best of five; a ratio, not a wall-clock bound).
+    /// Invariant 11: four times a fan-out (and fan-in), or a chain, makes at most five times
+    /// the adjacency work (linear is four, quadratic sixteen). Counted, not timed, so machine
+    /// load cannot fail it (contract M4a amendment 12, Q4).
     #[test]
     fn rb_path_grows_linearly() {
-        let time = |g: &Graph, e: &NodeKey| {
+        let work = |g: &Graph, e: &NodeKey| {
             let e = id(g, e);
-            (0..5)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    request_path(
-                        g,
-                        e,
-                        PathOptions {
-                            depth: MAX_DEPTH,
-                            hops: MAX_HOPS,
-                            full: false,
-                        },
-                    );
-                    start.elapsed()
-                })
-                .min()
-                .unwrap()
+            crate::work::take();
+            request_path(
+                g,
+                e,
+                PathOptions {
+                    depth: MAX_DEPTH,
+                    hops: MAX_HOPS,
+                    full: false,
+                },
+            );
+            crate::work::take()
         };
-        for (small, large) in [(fan(1000), fan(2000)), (chain(1000), chain(2000))] {
-            let (a, b) = (time(&small.0, &small.1), time(&large.0, &large.1));
-            let ratio = b.as_secs_f64() / a.as_secs_f64();
-            assert!(ratio < 2.5, "{a:?} → {b:?} ({ratio:.2}×)");
+        for (small, large) in [(fan(500), fan(2000)), (chain(500), chain(2000))] {
+            let (a, b) = (work(&small.0, &small.1), work(&large.0, &large.1));
+            assert!(a > 0 && b <= 5 * a, "{a} → {b}");
         }
     }
 
@@ -1407,6 +1429,81 @@ mod tests {
                 "  called_by n/server.ts [heuristic]",
                 "    handles HTTP POST /e2 @n [exact] ~heuristic",
                 "      consumes c2 [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q7): a function reached by `CALLS` that
+    /// registers inline handlers of other endpoints is walked outside those handlers' spans:
+    /// calling it registers them, it does not run them.
+    #[test]
+    fn a_called_registrar_is_walked_outside_its_inline_handlers() {
+        let mut b = G::new(&[("loop", "service"), ("auth", "service")]);
+        let a = b.endpoint("GET /a", "loop");
+        let bb = b.endpoint("GET /b", "loop");
+        let login = b.endpoint("POST /login", "auth");
+        let fa = b.sym("loop/s.ts", "fa", 1);
+        let fb = b.sym("loop/s.ts", "fb", 7);
+        for (ep, f, span) in [(&a, &fa, [2, 0, 5, 1]), (&bb, &fb, [8, 0, 12, 1])] {
+            let mut spans = Attrs::new();
+            spans.insert("handler_spans".into(), json!([span]));
+            b.edge_attrs(ep, HandledBy, f, Exact, ("loop/s.ts", span[0]), spans);
+        }
+        let a_log = b.table("a_log");
+        let b_log = b.table("b_log");
+        let setup_log = b.table("setup_log");
+        let setup = b.sym("loop/s.ts", "setup", 14);
+        b.edge(&fa, Calls, &fb, Heuristic, ("loop/s.ts", 3));
+        b.edge(&fa, Queries, &a_log, Exact, ("loop/s.ts", 4));
+        b.edge(&fb, Queries, &b_log, Exact, ("loop/s.ts", 9));
+        b.edge(&fb, Consumes, &login, Heuristic, ("loop/s.ts", 10));
+        b.edge(&fb, Calls, &setup, Heuristic, ("loop/s.ts", 13));
+        b.edge(&setup, Queries, &setup_log, Exact, ("loop/s.ts", 15));
+        let g = b.finish();
+        let p = request_path(&g, id(&g, &a), PathOptions::default());
+        assert_eq!(
+            lines(&g, &p.downstream),
+            [
+                "handler fa [exact]",
+                "  queries a_log [exact]",
+                "  calls fb [heuristic]",
+                "    calls setup [heuristic]",
+                "      queries setup_log [exact] ~heuristic",
+            ]
+        );
+        // `/b` itself still walks its handler's span.
+        let p = request_path(&g, id(&g, &bb), PathOptions::default());
+        let got = lines(&g, &p.downstream);
+        assert!(
+            got.iter().any(|l| l.contains("queries b_log"))
+                && got.iter().any(|l| l.contains("consumes HTTP POST /login")),
+            "{got:?}"
+        );
+    }
+
+    /// Evaluator pass 2, Q5 (M21): an upstream root is keyed by its inline-handler scope, so
+    /// the same file reached again within that scope is not walked a second time.
+    #[test]
+    fn an_upstream_root_reached_again_in_its_scope_is_walked_once() {
+        let mut b = G::new(&[("n", "service"), ("x", "service")]);
+        let target = b.endpoint("GET /t", "x");
+        let a = b.endpoint("POST /a", "n");
+        let server = b.file("n/server.ts");
+        let mut spans = Attrs::new();
+        spans.insert("handler_spans".into(), json!([[2, 0, 5, 1]]));
+        b.edge_attrs(&a, HandledBy, &server, Exact, ("n/server.ts", 2), spans);
+        let helper = b.sym("n/lib.ts", "g", 1);
+        b.edge(&server, Consumes, &target, Heuristic, ("n/server.ts", 3));
+        b.edge(&server, Calls, &helper, Heuristic, ("n/server.ts", 4));
+        b.edge(&helper, Consumes, &target, Heuristic, ("n/lib.ts", 2));
+        let g = b.finish();
+        let p = request_path(&g, id(&g, &target), PathOptions::default());
+        assert_eq!(
+            lines(&g, &p.upstream),
+            [
+                "consumes g [heuristic]",
+                "consumes n/server.ts [heuristic]",
+                "  handles HTTP POST /a @n [exact] ~heuristic",
             ]
         );
     }

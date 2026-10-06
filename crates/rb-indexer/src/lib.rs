@@ -48,8 +48,10 @@ use serde_json::{Value, json};
 /// `m4a-http-4` the router's identity in the key of an endpoint whose prefix is unknown (M4a
 /// amendment 10, fork F3), `m4a-http-5` evaluator pass 1's fixes (M4a amendment 11: hosts kept
 /// past a port hole, suffix evidence and own-service ranking, opaque tails, `config_unread`,
-/// `ServeMux` hosts, unknown bases of server-side Java clients).
-pub const PIPELINE: &str = "m4a-http-5";
+/// `ServeMux` hosts, unknown bases of server-side Java clients), `m4a-http-6` evaluator pass
+/// 2's (M4a amendment 12: bases stated at the call or on the instance, partial hosts, a hole
+/// after a literal port, more Spring configuration counted, `node-fetch`).
+pub const PIPELINE: &str = "m4a-http-6";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -242,6 +244,9 @@ enum ConfigFile {
     Yaml,
     /// `bootstrap*.properties|yml|yaml`, not read.
     Bootstrap,
+    /// `config/application.properties` (Spring Boot's `classpath:/config/`, which overrides
+    /// the read file), not read (amendment 12).
+    ConfigDir,
     /// A Maven or Gradle build file, read for a Spring Cloud Config client dependency.
     Build,
 }
@@ -251,7 +256,12 @@ fn config_file(path: &str) -> Option<ConfigFile> {
     if matches!(name, "pom.xml" | "build.gradle" | "build.gradle.kts") {
         return Some(ConfigFile::Build);
     }
-    if dir != "src/main/resources" && !dir.ends_with("/src/main/resources") {
+    // `src/main/resources/` and Spring Boot's `classpath:/config/` location (amendment 12).
+    let resources = |d: &str| d == "src/main/resources" || d.ends_with("/src/main/resources");
+    let config_dir = dir
+        .strip_suffix("/config")
+        .is_some_and(|d| resources(d) || d == "src/main/resources");
+    if !resources(dir) && !config_dir {
         return None;
     }
     let (stem, ext) = name.rsplit_once('.')?;
@@ -261,6 +271,7 @@ fn config_file(path: &str) -> Option<ConfigFile> {
     let yaml = ext != "properties";
     match stem {
         "application" if yaml => Some(ConfigFile::Yaml),
+        "application" if config_dir => Some(ConfigFile::ConfigDir),
         "application" => Some(ConfigFile::Read),
         s if s.starts_with("application-") => Some(ConfigFile::Profile),
         s if s == "bootstrap" || s.starts_with("bootstrap-") => Some(ConfigFile::Bootstrap),
@@ -269,7 +280,7 @@ fn config_file(path: &str) -> Option<ConfigFile> {
 }
 
 /// A file the indexer reads as configuration: Spring's `application*`/`bootstrap*` files under
-/// `src/main/resources/`, and build files (contract M4a D5; evaluator pass 1, P7).
+/// `src/main/resources/` and its `config/` directory, and build files (contract M4a D5; evaluator pass 1, P7).
 fn is_config_input(path: &str) -> bool {
     config_file(path).is_some()
 }
@@ -297,6 +308,18 @@ fn is_config_client_key(key: &str) -> bool {
             && !key.starts_with("spring.cloud.config.server."))
 }
 
+/// `false` turns the config client off, whatever else configures it (amendment 12).
+const CONFIG_CLIENT_ENABLED: &str = "spring.cloud.config.enabled";
+
+/// One configuration file as read: path, text, kind, service, and its keys with their values.
+type ConfigRead<'a> = (
+    &'a str,
+    &'a str,
+    ConfigFile,
+    String,
+    BTreeMap<String, String>,
+);
+
 /// Reads the services' Spring configuration (evaluator pass 1, P7): `application.properties`
 /// is read; profile files, YAML, `bootstrap*` files and a Spring Cloud Config client (by build
 /// dependency, or by a `spring.config.import`/`spring.cloud.config` key) are not, so each such
@@ -309,28 +332,39 @@ fn spring_config(
 ) -> (SpringConfig, Vec<Diagnostic>) {
     let mut out = SpringConfig::default();
     let mut diagnostics = Vec::new();
-    // Service → (reasons, files).
-    let mut unread: BTreeMap<String, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+    // Each file's kind, service and entries; then the services that turn the client off.
+    let mut read: Vec<ConfigRead<'_>> = Vec::new();
     for (path, text) in config {
         let Some(kind) = config_file(path) else {
             continue;
         };
-        let service = service_of(path);
-        let keys: BTreeSet<String> = match kind {
-            ConfigFile::Build => BTreeSet::new(),
-            _ if path.ends_with(".properties") => {
-                let parsed = rb_frameworks::fold::parse_properties(text);
-                let keys = parsed.keys().cloned().collect();
-                if kind == ConfigFile::Read {
-                    out.properties
-                        .entry(service.clone())
-                        .or_default()
-                        .extend(parsed);
-                }
-                keys
-            }
-            _ => rb_frameworks::fold::yaml_keys(text),
+        let entries = match kind {
+            ConfigFile::Build => BTreeMap::new(),
+            _ if path.ends_with(".properties") => rb_frameworks::fold::parse_properties(text),
+            _ => rb_frameworks::fold::yaml_entries(text),
         };
+        read.push((path, text, kind, service_of(path), entries));
+    }
+    let disabled: BTreeSet<&str> = read
+        .iter()
+        .filter(|(.., entries)| {
+            entries
+                .get(CONFIG_CLIENT_ENABLED)
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"))
+        })
+        .map(|(_, _, _, service, _)| service.as_str())
+        .collect();
+    // Service → (reasons, files).
+    let mut unread: BTreeMap<String, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+    for (path, text, kind, service, entries) in &read {
+        let (path, text, kind, service) = (*path, *text, *kind, service.clone());
+        let keys: BTreeSet<String> = entries.keys().cloned().collect();
+        if kind == ConfigFile::Read {
+            out.properties
+                .entry(service.clone())
+                .or_default()
+                .extend(entries.clone());
+        }
         if matches!(kind, ConfigFile::Yaml | ConfigFile::Profile)
             && !path.ends_with(".properties")
             && text.contains("context-path")
@@ -342,14 +376,16 @@ fn spring_config(
                 detail: json!({ "key": "server.servlet.context-path" }),
             });
         }
-        let client = match kind {
-            ConfigFile::Build => CONFIG_CLIENT_DEPENDENCIES.iter().any(|d| text.contains(d)),
-            _ => keys.iter().any(|k| is_config_client_key(k)),
-        };
+        let client = !disabled.contains(service.as_str())
+            && match kind {
+                ConfigFile::Build => CONFIG_CLIENT_DEPENDENCIES.iter().any(|d| text.contains(d)),
+                _ => keys.iter().any(|k| is_config_client_key(k)),
+            };
         let reason = match kind {
             ConfigFile::Profile => Some("profile"),
             ConfigFile::Yaml => Some("yaml"),
             ConfigFile::Bootstrap => Some("bootstrap"),
+            ConfigFile::ConfigDir => Some("config_dir"),
             ConfigFile::Read | ConfigFile::Build => None,
         };
         if reason.is_none() && !client {
@@ -1444,6 +1480,94 @@ mod tests {
         let unread_services: Vec<&str> = spring.unread.iter().map(String::as_str).collect();
         assert_eq!(unread_services, ["a", "b", "c", "d", "e", "g", "h"]);
         assert!(!spring.overrides["h"].all, "a config server is no client");
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q3): Spring Boot's `classpath:/config/`
+    /// location counts (its `application.properties` is not read either, so it is counted with
+    /// the reason `config_dir`); a flow mapping's keys are overrides; a service that turns the
+    /// config client off (`spring.cloud.config.enabled=false`, in any file) is no client.
+    #[test]
+    fn config_directories_flow_mappings_and_disabled_clients() {
+        let res = "src/main/resources";
+        let files: Vec<(String, &str)> = vec![
+            (
+                format!("a/{res}/application.properties"),
+                "stripe.url=http://orders\n",
+            ),
+            (
+                format!("a/{res}/application-prod.yml"),
+                "stripe: { url: \"https://api.stripe.com\" }\n",
+            ),
+            (
+                format!("b/{res}/config/application-prod.properties"),
+                "users.url=https://legacy-users.example.com\n",
+            ),
+            (
+                format!("c/{res}/config/application.properties"),
+                "users.url=https://legacy-users.example.com\n",
+            ),
+            (
+                format!("d/{res}/application.properties"),
+                "spring.cloud.config.enabled=false\nspring.cloud.config.uri=http://c\n",
+            ),
+            (
+                "e/pom.xml".to_owned(),
+                "<artifactId>spring-cloud-starter-config</artifactId>",
+            ),
+            (
+                format!("e/{res}/application.properties"),
+                "spring.cloud.config.enabled=false\n",
+            ),
+            (
+                format!("f/{res}/application.yml"),
+                "spring: {cloud: {config: {enabled: \"false\"}}}\n",
+            ),
+            (
+                format!("g/{res}/application.properties"),
+                "spring.cloud.config.enabled=true\n",
+            ),
+        ];
+        assert!(files.iter().all(|(p, _)| is_config_input(p)));
+        assert!(!is_config_input(
+            "a/src/main/resources/config/messages.properties"
+        ));
+        assert!(!is_config_input(
+            "a/src/main/resources/config/x/application.yml"
+        ));
+        let config: BTreeMap<&str, String> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), (*t).to_owned()))
+            .collect();
+        let service_of = |p: &str| p.split('/').next().unwrap().to_owned();
+        let (spring, diagnostics) = spring_config(&config, &service_of);
+        let unread: Vec<String> = diagnostics
+            .iter()
+            .filter(|d| d.kind == "config_unread")
+            .map(|d| format!("{} {}", d.detail["service"], d.detail["reasons"]))
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                "\"a\" [\"profile\"]",
+                "\"b\" [\"profile\"]",
+                "\"c\" [\"config_dir\"]",
+                "\"f\" [\"yaml\"]",
+                "\"g\" [\"config_client\"]",
+            ]
+        );
+        assert!(spring.overrides["a"].sets("stripe.url"));
+        assert!(spring.overrides["b"].sets("users.url"));
+        assert!(spring.overrides["c"].sets("users.url"));
+        assert!(!spring.overrides["f"].all);
+        assert!(!spring.overrides.contains_key("d") && !spring.overrides.contains_key("e"));
+        assert!(spring.overrides["g"].all);
+        // `config/application.properties` is not merged into the read properties.
+        assert!(
+            !spring
+                .properties
+                .get("c")
+                .is_some_and(|p| p.contains_key("users.url"))
+        );
     }
 
     #[test]

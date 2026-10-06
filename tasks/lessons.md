@@ -172,3 +172,15 @@
 ## 2026-10-06: a visited set over a scoped node is keyed by the scope
 - **Mistake:** `rb path` kept one visited set of nodes, but an inline-handler `File` is walked within one endpoint's spans at a time; the second endpoint handled in the same file found the file "seen" and lost its downstream, with nothing in `collapsed` or `truncated`. The same keying dropped an upstream continuation.
 - **Rule:** when a walk restricts what it follows from a node (spans, a scope, a filter), key its visited set by (node, restriction), and test two restrictions of one node in both directions.
+
+## 2026-10-06: a value a library merges from several places is read from all of them, or is unknown
+- **Mistake:** the axios pack read `baseURL` from the instance and from `axios(config)`, but not from a verb call's request config, which axios merges over the instance defaults; `api.get("/orders/1", { baseURL: "https://api.stripe.com" })` became a false `synthetic` edge to the instance's service. `RestTemplate` ignored a visible `rootUri(…)` the same way.
+- **Rule:** before trusting a configured value, list every place the library lets a caller set it (instance, call arguments, setters, builders) from its documentation, read each, and make "present but unreadable" unknown rather than falling back to another source; test one call per place with a contradicting value.
+
+## 2026-10-06: a record that says a rule applies must be backed by a test of the rule's effect, not of the field
+- **Mistake:** amendment 11 said a host with a hole gets "the unresolved-base rules"; the unit checked `host_dynamic` and the path, but nothing set the base unknown, so the stitcher matched the path exactly across every service (`https://${tenant}.zendesk.com/…`).
+- **Rule:** when a record names the consequence of a rule (suffix only, capped, external), the test asserts that consequence at the stage that applies it (the stitcher's bucket and `match`), from source in every form the record lists.
+
+## 2026-10-06: growth tests count operations, they do not time them
+- **Mistake:** four ratio tests compared two wall-clock runs of tens of milliseconds; a load step covering one of them gave 2.5–3.4× (7 of 20 runs of one test failed under intermittent load), and best-of-N did not help.
+- **Rule:** a complexity claim is tested by counting the elements the measured loops examine (a test-only counter) at n and 4n and bounding the ratio (5× for linear); show it bites by making one loop quadratic. Keep wall-clock only as a coarse bound on a pathological input.

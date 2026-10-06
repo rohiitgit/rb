@@ -9,6 +9,31 @@ pub mod code;
 pub mod path;
 mod query;
 
+/// Operation counts for the growth tests (contract M4a invariant 11; amendment 12, Q4): the
+/// measured loops call [`work::tick`] with the elements they examine, and a test compares the
+/// counts for an input and one four times as large, which no machine load can change. The
+/// counter exists only in test builds; elsewhere `tick` is empty.
+pub(crate) mod work {
+    #[cfg(test)]
+    thread_local! {
+        static COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts `n` elements examined by a measured loop.
+    #[inline(always)]
+    pub(crate) fn tick(n: usize) {
+        #[cfg(test)]
+        COUNT.with(|c| c.set(c.get() + n as u64));
+        let _ = n;
+    }
+
+    /// The count since the last call, on this thread.
+    #[cfg(test)]
+    pub(crate) fn take() -> u64 {
+        COUNT.with(|c| c.replace(0))
+    }
+}
+
 use anyhow::{Context, bail};
 use postgres::binary_copy::BinaryCopyInWriter;
 use postgres::types::Type;

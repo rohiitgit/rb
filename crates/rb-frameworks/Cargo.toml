@@ -10,5 +10,9 @@ publish.workspace = true
 rb-sql.workspace = true
 rb-syntax.workspace = true
 
+[features]
+# The growth tests' operation counter (`work`), for dependants' tests (contract M4a amendment 12).
+work-count = []
+
 [lints]
 workspace = true

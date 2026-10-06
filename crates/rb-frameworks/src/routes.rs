@@ -209,6 +209,7 @@ impl<'f> FileScope<'f> {
             .get(name)?
             .iter()
             .copied()
+            .inspect(|_| crate::work::tick(1))
             .filter(|&i| {
                 let v = self.facts.bindings[i].visible;
                 before([v[0], v[1], 0, 0], at) && before(at, [v[2], v[3], 0, 0])
@@ -227,16 +228,24 @@ impl<'f> FileScope<'f> {
 
     /// The member bindings named `name`, in source order.
     pub fn members(&self, name: &str) -> &[usize] {
-        self.members_by_name.get(name).map_or(&[], Vec::as_slice)
+        let found = self
+            .members_by_name
+            .get(name)
+            .map_or(&[][..], Vec::as_slice);
+        crate::work::tick(found.len());
+        found
     }
 
     /// The definitions directly inside `parent`, in source order.
     pub fn children(&self, parent: usize) -> &[usize] {
-        self.children_of.get(&parent).map_or(&[], Vec::as_slice)
+        let found = self.children_of.get(&parent).map_or(&[][..], Vec::as_slice);
+        crate::work::tick(found.len());
+        found
     }
 
     /// The chain recorded at `span`.
     pub fn chain_at(&self, span: Span) -> Option<&'f CallChain> {
+        crate::work::tick(1);
         self.chain_by_span
             .get(&span)
             .map(|&i| &self.facts.chains[i])
@@ -1212,9 +1221,10 @@ public class AuthController {
         assert_eq!(got[1], "GET /s/s/s/shallow root name h");
     }
 
-    /// The packs index each file once (`FileScope`): doubling a file of routers, mounts and
-    /// client instances costs at most 2.5 times as much (best of three; a ratio, not a
-    /// wall-clock bound). A scan per lookup made this quadratic.
+    /// The packs index each file once (`FileScope`): four times the routers, mounts and client
+    /// instances of a file make at most five times the lookups' work (linear is four; a scan per
+    /// lookup, which made this quadratic, gives sixteen). The work is counted, not timed, so
+    /// machine load cannot fail it (contract M4a amendment 12, Q4).
     #[test]
     fn packs_grow_linearly() {
         let source = |n: usize| {
@@ -1235,22 +1245,16 @@ public class AuthController {
             }
             src
         };
-        let time = |n: usize| {
+        let work = |n: usize| {
             let facts = extract(Language::TypeScript, source(n).as_bytes()).unwrap();
-            (0..3)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    let r = routes(Language::TypeScript, &facts);
-                    let c = crate::clients::clients(Language::TypeScript, &facts);
-                    assert_eq!((r.routes.len(), c.calls.len()), (n - 1, n - 1));
-                    start.elapsed()
-                })
-                .min()
-                .unwrap()
+            crate::work::take();
+            let r = routes(Language::TypeScript, &facts);
+            let c = crate::clients::clients(Language::TypeScript, &facts);
+            assert_eq!((r.routes.len(), c.calls.len()), (n - 1, n - 1));
+            crate::work::take()
         };
-        let (small, large) = (time(2000), time(4000));
-        let ratio = large.as_secs_f64() / small.as_secs_f64();
-        assert!(ratio < 2.5, "{small:?} → {large:?} ({ratio:.2}×)");
+        let (small, large) = (work(500), work(2000));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
     #[test]

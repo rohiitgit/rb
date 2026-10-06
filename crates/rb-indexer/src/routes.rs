@@ -104,6 +104,7 @@ impl<'a> Composer<'a> {
 
     /// The prefixes of `r`, and whether the result is clean (no guard or cap was hit).
     fn prefixes(&mut self, r: RouterId<'a>, depth: usize) -> (Prefixes, bool) {
+        rb_frameworks::work::tick(1);
         if let Some(done) = self.memo.get(&r) {
             return (done.clone(), true);
         }
@@ -119,6 +120,7 @@ impl<'a> Composer<'a> {
         let mut out = Prefixes::default();
         let mut clean = true;
         let mounts = self.mounts_into.get(&r).cloned().unwrap_or_default();
+        rb_frameworks::work::tick(mounts.len());
         if mounts.is_empty() {
             match self.kinds.get(&r) {
                 Some(RouterKind::App) => {
@@ -189,6 +191,7 @@ fn mount_targets<'a>(
                         .routers
                         .iter()
                         .enumerate()
+                        .inspect(|_| rb_frameworks::work::tick(1))
                         .filter(|(_, r)| r.top_level && r.name == exported)
                         .map(|(i, _)| (target, i)),
                 );
@@ -270,6 +273,7 @@ pub(crate) fn add_endpoints(
             format!("{path}#{}", binding_identity(facts, binding))
         };
         for r in &file.routes {
+            rb_frameworks::work::tick(1);
             // Full paths with their certainty, and the router when the prefix is unknown (the
             // path is then the tail below that router).
             let mut paths: Vec<(String, Certainty, Option<String>)> = Vec::new();
@@ -854,12 +858,13 @@ mod tests {
         );
     }
 
-    /// Composition (the route pack and the endpoint stage) is linear in the mount chain:
-    /// doubling it costs at most 2.5 times as much (best of three; a ratio, not a wall-clock
-    /// bound). Parsing and the M3a index are built outside the timed part.
+    /// Composition (the route pack and the endpoint stage) is linear in the mount chain: four
+    /// times the chain makes at most five times the work (linear is four, quadratic sixteen).
+    /// Parsing and the M3a index are built outside the counted part; the work is counted, not
+    /// timed, so machine load cannot fail it (contract M4a amendment 12, Q4).
     #[test]
     fn composition_grows_linearly() {
-        let time = |n: usize| {
+        let work = |n: usize| {
             let src = mount_chain(n);
             let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
             let by_path = BTreeMap::from([("svc/r.ts", (Language::TypeScript, &facts))]);
@@ -868,41 +873,36 @@ mod tests {
             let index = Index::new(&by_path, &go, &keys);
             let service_of = |_: &str| "svc".to_owned();
             let (exact, context, unread) = (BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
-            (0..3)
-                .map(|_| {
-                    let mut b = GraphBuilder::new();
-                    b.add_node(NodeKey::new(NodeKind::Service, "svc"), "svc", Attrs::new())
-                        .unwrap();
-                    b.add_node(
-                        NodeKey::new(NodeKind::File, "svc/r.ts"),
-                        "r.ts",
-                        Attrs::new(),
-                    )
-                    .unwrap();
-                    let start = std::time::Instant::now();
-                    let routes = BTreeMap::from([(
-                        "svc/r.ts",
-                        rb_frameworks::routes::routes(Language::TypeScript, &facts),
-                    )]);
-                    let inputs = Inputs {
-                        files: &by_path,
-                        routes: &routes,
-                        keys: &keys,
-                        index: &index,
-                        exact_handlers: &exact,
-                        service_of: &service_of,
-                        context_paths: &context,
-                        config_unread: &unread,
-                    };
-                    add_endpoints(&mut b, &inputs).unwrap();
-                    start.elapsed()
-                })
-                .min()
-                .unwrap()
+            let mut b = GraphBuilder::new();
+            b.add_node(NodeKey::new(NodeKind::Service, "svc"), "svc", Attrs::new())
+                .unwrap();
+            b.add_node(
+                NodeKey::new(NodeKind::File, "svc/r.ts"),
+                "r.ts",
+                Attrs::new(),
+            )
+            .unwrap();
+            rb_frameworks::work::take();
+            let routes = BTreeMap::from([(
+                "svc/r.ts",
+                rb_frameworks::routes::routes(Language::TypeScript, &facts),
+            )]);
+            let inputs = Inputs {
+                files: &by_path,
+                routes: &routes,
+                keys: &keys,
+                index: &index,
+                exact_handlers: &exact,
+                service_of: &service_of,
+                context_paths: &context,
+                config_unread: &unread,
+            };
+            let (_, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
+            assert_eq!(endpoints.len(), 2);
+            rb_frameworks::work::take()
         };
-        let (small, large) = (time(2000), time(4000));
-        let ratio = large.as_secs_f64() / small.as_secs_f64();
-        assert!(ratio < 2.5, "{small:?} → {large:?} ({ratio:.2}×)");
+        let (small, large) = (work(1000), work(4000));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
     /// S8: a handler name resolves as a call at its position, never by bare name across the

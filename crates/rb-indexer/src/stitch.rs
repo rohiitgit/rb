@@ -101,6 +101,8 @@ pub(crate) struct Site {
     /// (a profile, YAML or bootstrap file), so the folded value may not be the deployed one
     /// (evaluator pass 1, P7).
     pub config_overridden: bool,
+    /// The base was read from a `@Bean` method taken as the injected instance (amendment 12).
+    pub base_from_bean: bool,
 }
 
 /// A service as the host rule (D6) sees it.
@@ -291,12 +293,17 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
         let service = (inputs.service_of)(path);
         for call in &file_clients.calls {
             folding.take_asked();
+            // A base stated at the call (axios request config) replaces the instance's
+            // (amendment 12).
+            let stated = call.base.clone().map(|b| (file, b));
             let base = match &call.instance {
                 Some(name) => match imported_instance(inputs, &clients, path, facts, name) {
-                    Some((target, base)) => base.map(|b| (folding.ids[target], b)),
+                    Some((target, base)) => {
+                        stated.or_else(|| base.map(|b| (folding.ids[target], b)))
+                    }
                     None => continue,
                 },
-                None => call.base.clone().map(|b| (file, b)),
+                None => stated,
             };
             let url = folding.value(file, &call.url).map(|url| match &base {
                 Some((base_file, b)) => join(folding.value(*base_file, b), url),
@@ -317,6 +324,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 method: call.method.clone(),
                 url,
                 config_overridden: folding.take_asked(),
+                base_from_bean: call.base_from_bean,
             });
         }
     }
@@ -453,6 +461,7 @@ impl EndpointIndex {
         let mut out: Vec<(usize, PathMatch)> = lists
             .into_iter()
             .flatten()
+            .inspect(|_| rb_frameworks::work::tick(1))
             .filter_map(|&i| match_path(client, suffix, &self.segments[i]).map(|m| (i, m)))
             .collect();
         out.sort_unstable_by_key(|(i, _)| *i);
@@ -508,6 +517,10 @@ impl<'e> Stitcher<'e> {
             return Outcome::bucket(Bucket::Dynamic);
         };
         let url = client_url(&folded.pieces);
+        // A host hole next to an FQDN fragment names no service (amendment 12, Q2).
+        if url.host_external.is_some() {
+            return Outcome::bucket(Bucket::External);
+        }
         let mut scope = Scope::Any;
         if let Some(host) = &url.host {
             if LOOPBACK.contains(&host.as_str()) {
@@ -614,6 +627,7 @@ impl<'e> Stitcher<'e> {
             && !url.flags.wildcard_not_last
             && !url.flags.opaque_tail
             && !site.config_overridden
+            && !site.base_from_bean
             && !e.prefix_unknown
             && !e.prefix_maybe_incomplete;
         let certainty = if synthetic {
@@ -713,7 +727,8 @@ pub(crate) fn add_consumes(
             let mut detail = json!({ "client": site.client.as_str() });
             if let Some(url) = &site.url {
                 detail["url"] = render(url).into();
-                if let Some(host) = client_url(&url.pieces).host {
+                let u = client_url(&url.pieces);
+                if let Some(host) = u.host.or(u.host_external) {
                     detail["host"] = host.into();
                 }
             }
@@ -867,6 +882,7 @@ mod tests {
             method: method.map(str::to_owned),
             url: url.map(|(t, o)| folded(t, o)),
             config_overridden: false,
+            base_from_bean: false,
         }
     }
 
@@ -1020,6 +1036,15 @@ mod tests {
         );
         overridden.config_overridden = true;
         lowered(overridden, &eps);
+        // A base read from a `@Bean` method, taken as the injected instance (amendment 12).
+        let mut bean = site(
+            AUTH,
+            Some("POST"),
+            Some(("http://notification/internal/mfa/email", Literal)),
+            1,
+        );
+        bean.base_from_bean = true;
+        lowered(bean, &eps);
         // An endpoint `{*}`.
         let mut wild = eps.clone();
         wild.push(ep("GET", "/static/*", NOTIFICATION));
@@ -1203,6 +1228,33 @@ mod tests {
             .0,
             Bucket::OwnService
         );
+        // A host naming the caller's own service when that service exposes nothing: still
+        // `self`, never a gateway path-matched across services (evaluator pass 2, Q5, M23).
+        assert_eq!(
+            one(
+                &eps,
+                &site(
+                    WEB,
+                    Some("POST"),
+                    Some(("http://web/api/v1/login", Literal)),
+                    1
+                )
+            ),
+            (Bucket::OwnService, vec![])
+        );
+        // A bracketed IPv6 loopback followed directly by a hole (Q5, M02).
+        assert_eq!(
+            one(
+                &eps,
+                &site(
+                    NOTIFICATION,
+                    Some("POST"),
+                    Some(("http://[::1]{?}/internal/mfa/email", Literal)),
+                    1
+                )
+            ),
+            (Bucket::OwnService, vec![])
+        );
         // Candidates only in the own service.
         assert_eq!(
             one(
@@ -1334,6 +1386,10 @@ mod tests {
             (ORDERS, "http://users:{?}/users/me", Bucket::Synthetic),
             // Only a hole in the host itself restricts nothing.
             (ORDERS, "http://{?}:8080/users/me", Bucket::Heuristic),
+            // A hole glued to a literal port keeps the host; the rest is a suffix restricted to
+            // that host's service (amendment 12, Q6).
+            (WEB, "http://orders:3000{?}/orders/1", Bucket::Heuristic),
+            (WEB, "http://users:3000{?}/orders/1", Bucket::Unmatched),
         ] {
             assert_eq!(
                 one(&eps, &site(service, Some("GET"), Some((url, Literal)), 1)).0,
@@ -1341,6 +1397,71 @@ mod tests {
                 "{service} {url}"
             );
         }
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q2 and Q6, folded URLs): a hole next to
+    /// literal host text holding a dot is external; any other host hole leaves the base unknown,
+    /// so the path is matched by suffix only, `heuristic` at most; a hole glued to a literal
+    /// port is a suffix within that host's service.
+    #[test]
+    fn partial_hosts_are_external_or_matched_by_suffix() {
+        const ORDERS: &str = "services/orders";
+        const USERS: &str = "services/users";
+        let eps = vec![
+            ep("GET", "/orders/{id}", ORDERS),
+            ep("POST", "/charges", ORDERS),
+            ep("GET", "/api/v2/tickets", ORDERS),
+            ep("GET", "/v1/orders/{id}", USERS),
+        ];
+        for (method, url, want) in [
+            (
+                "GET",
+                "https://{?}.zendesk.com/api/v2/tickets",
+                Bucket::External,
+            ),
+            (
+                "POST",
+                "https://api.stripe.com{?}/charges",
+                Bucket::External,
+            ),
+            ("GET", "http://api.{?}/orders/1", Bucket::External),
+            ("GET", "http://{?}/{?}", Bucket::Dynamic),
+        ] {
+            assert_eq!(
+                one(&eps, &site(WEB, Some(method), Some((url, Literal)), 1)),
+                (want, vec![]),
+                "{url}"
+            );
+        }
+        // Host unknown: suffix only, so both services' `…/orders/{}` are candidates and the
+        // matched tail decides; never an exact match.
+        for url in [
+            "http://{?}/orders/1",
+            "http://orders-{?}/orders/1",
+            "http://localhost{?}/orders/1",
+        ] {
+            let (bucket, links) = one(&eps, &site(WEB, Some("GET"), Some((url, Literal)), 1));
+            assert_eq!(bucket, Bucket::Ambiguous, "{url}");
+            assert!(
+                links.iter().all(|l| l.contains("\"match\":\"suffix\"")),
+                "{url} {links:?}"
+            );
+        }
+        let (bucket, links) = one(
+            &eps,
+            &site(
+                WEB,
+                Some("GET"),
+                Some(("http://orders:3000{?}/orders/1", Literal)),
+                1,
+            ),
+        );
+        assert_eq!(bucket, Bucket::Heuristic);
+        assert!(
+            links[0].starts_with("HTTP GET /orders/{} @services/orders [heuristic]")
+                && links[0].contains("\"match\":\"suffix\""),
+            "{links:?}"
+        );
     }
 
     /// Evaluator pass 1, P8: an endpoint registered with a Go `ServeMux` host pattern is matched
@@ -1797,41 +1918,33 @@ mod tests {
         (eps, sites, services)
     }
 
-    fn time_stitch(
+    /// The candidates the stitcher examined for every site of `sites`, with the buckets.
+    fn stitch_work(
         eps: &[EndpointRef],
         sites: &[Site],
         services: &[ServiceRef],
-    ) -> (std::time::Duration, Vec<Bucket>) {
-        let mut buckets = Vec::new();
-        let time = (0..5)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                for _ in 0..4 {
-                    let stitcher = Stitcher::new(eps, services);
-                    buckets = sites.iter().map(|s| stitcher.site(s).bucket).collect();
-                }
-                start.elapsed()
-            })
-            .min()
-            .unwrap();
-        (time, buckets)
+    ) -> (u64, Vec<Bucket>) {
+        rb_frameworks::work::take();
+        let stitcher = Stitcher::new(eps, services);
+        let buckets = sites.iter().map(|s| stitcher.site(s).bucket).collect();
+        (rb_frameworks::work::take(), buckets)
     }
 
-    /// Invariant 11: doubling endpoints and sites with distinct prefixes costs at most 2.5 times
-    /// as much (best of five timings of four runs each, so a timing is well above scheduling
-    /// noise under the parallel test run; a ratio, not a wall-clock bound).
+    /// Invariant 11: four times the endpoints and sites with distinct prefixes make at most
+    /// five times the candidate confirmations (linear is four; a scan of every endpoint per site
+    /// gives sixteen). Counted, not timed, so machine load cannot fail it (contract M4a
+    /// amendment 12, Q4).
     #[test]
     fn the_stitcher_grows_linearly() {
-        let (e1, s1, v1) = wide(1000);
+        let (e1, s1, v1) = wide(500);
         let (e2, s2, v2) = wide(2000);
-        let (small, buckets) = time_stitch(&e1, &s1, &v1);
+        let (small, buckets) = stitch_work(&e1, &s1, &v1);
         assert!(
             buckets.iter().all(|b| *b == Bucket::Heuristic),
             "{buckets:?}"
         );
-        let (large, _) = time_stitch(&e2, &s2, &v2);
-        let ratio = large.as_secs_f64() / small.as_secs_f64();
-        assert!(ratio < 2.5, "{small:?} → {large:?} ({ratio:.2}×)");
+        let (large, _) = stitch_work(&e2, &s2, &v2);
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
     /// S19's pathological input: 2,000 endpoints of 16 parameters each, in 2,000 services,
@@ -2001,6 +2114,111 @@ mod tests {
                 "web/src/a.ts 4 unmatched",
                 "web/src/a.ts 5 synthetic -> HTTP GET /users/me @users",
                 "web/src/a.ts 6 heuristic -> HTTP GET /users/me @users",
+            ]
+        );
+    }
+
+    /// The bucket (and targets) of every site of `files`, as `path line bucket [-> key]`, against
+    /// `eps` in the services named by `services` (key = name).
+    fn stitched(
+        files: &[(&str, Language, &str)],
+        eps: &[EndpointRef],
+        services: &[&str],
+    ) -> Vec<String> {
+        let sites = collect_sites(files, &[], &[], &[]);
+        let services: Vec<ServiceRef> = services
+            .iter()
+            .map(|s| ServiceRef {
+                key: (*s).to_owned(),
+                name: (*s).to_owned(),
+            })
+            .collect();
+        let stitcher = Stitcher::new(eps, &services);
+        sites
+            .iter()
+            .map(|s| {
+                let o = stitcher.site(s);
+                let to = o
+                    .links
+                    .iter()
+                    .map(|l| format!(" -> {} [{}]", eps[l.endpoint].key, l.certainty.as_str()))
+                    .collect::<String>();
+                format!("{} {} {}{to}", s.at.path, s.at.span[0], o.bucket.as_str())
+            })
+            .collect()
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q2) from source: a hole next to a literal
+    /// host fragment with a dot, as a template literal, a concatenation, Java `String.format`
+    /// and `+`, and Go `fmt.Sprintf` and `+`, is external whatever path follows; a bare host
+    /// hole is matched by suffix, `heuristic`.
+    #[test]
+    fn partial_hosts_in_every_source_form() {
+        let ts = "export async function f(tenant: string, ver: string, domain: string, h: string) {\n  await fetch(`https://${tenant}.zendesk.com/api/v2/tickets`);\n  await fetch(\"https://\" + tenant + \".zendesk.com/api/v2/tickets\");\n  await fetch(`https://api.stripe.com${ver}/charges`, { method: \"POST\" });\n  await fetch(`http://api.${domain}/orders/1`);\n  await fetch(`http://${h}/orders/1`);\n}\n";
+        let java = "package p;\nimport org.springframework.web.client.RestTemplate;\nclass C {\n  RestTemplate rest;\n  void a(String tenant, String ver) {\n    rest.getForObject(String.format(\"https://%s.zendesk.com/api/v2/tickets\", tenant), String.class);\n    rest.postForObject(\"https://api.stripe.com\" + ver + \"/charges\", null, String.class);\n  }\n}\n";
+        let go = "package main\nimport (\n\t\"fmt\"\n\t\"net/http\"\n)\nfunc f(t, ver string) {\n\thttp.Get(fmt.Sprintf(\"https://%s.zendesk.com/api/v2/tickets\", t))\n\thttp.Post(\"https://api.stripe.com\"+ver+\"/charges\", \"application/json\", nil)\n}\n";
+        let eps = vec![
+            ep("GET", "/orders/{id}", "orders"),
+            ep("POST", "/charges", "orders"),
+            ep("GET", "/api/v2/tickets", "orders"),
+        ];
+        assert_eq!(
+            stitched(
+                &[
+                    ("web/src/a.ts", Language::TypeScript, ts),
+                    ("pay/src/main/java/p/C.java", Language::Java, java),
+                    ("pay/cmd/main.go", Language::Go, go),
+                ],
+                &eps,
+                &["web", "pay", "orders"],
+            ),
+            [
+                "pay/cmd/main.go 6 external",
+                "pay/cmd/main.go 7 external",
+                "pay/src/main/java/p/C.java 5 external",
+                "pay/src/main/java/p/C.java 6 external",
+                "web/src/a.ts 1 external",
+                "web/src/a.ts 2 external",
+                "web/src/a.ts 3 external",
+                "web/src/a.ts 4 external",
+                "web/src/a.ts 5 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q1) from source: a base stated in the
+    /// call's request config, or configured on a Spring client instance, decides the host; an
+    /// external one is never path-matched, and a call overriding an instance's base never
+    /// relies on that instance's base (the evaluator's false `synthetic`).
+    #[test]
+    fn bases_stated_at_the_call_or_on_the_instance_decide_the_host() {
+        let calls = "import axios from \"axios\";\nimport { shared } from \"./http\";\nexport const api = axios.create({ baseURL: \"http://orders\" });\nexport async function f(body: unknown, cfg: object) {\n  await api.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.post(\"/charges\", body, { baseURL: \"https://api.stripe.com\" });\n  await api.get(\"/orders/1\");\n  await api.get(\"/orders/1\", cfg);\n  await shared.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/orders/1\");\n}\n";
+        let http = "import axios from \"axios\";\nexport const shared = axios.create({ baseURL: \"http://orders\" });\n";
+        let java = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass C {\n  private final RestTemplate rootRt = new RestTemplateBuilder().rootUri(\"https://api.stripe.com\").build();\n  private final WebClient web;\n  C(WebClient.Builder b) { this.web = b.baseUrl(\"https://api.stripe.com\").build(); }\n  void m() {\n    rootRt.postForObject(\"/charges\", null, String.class);\n    web.get().uri(\"/orders/1\").retrieve();\n  }\n}\n";
+        let eps = vec![
+            ep("GET", "/orders/{id}", "orders"),
+            ep("POST", "/charges", "orders"),
+        ];
+        assert_eq!(
+            stitched(
+                &[
+                    ("web/src/calls.ts", Language::TypeScript, calls),
+                    ("web/src/http.ts", Language::TypeScript, http),
+                    ("pay/src/main/java/p/C.java", Language::Java, java),
+                ],
+                &eps,
+                &["web", "pay", "orders"],
+            ),
+            [
+                "pay/src/main/java/p/C.java 9 external",
+                "pay/src/main/java/p/C.java 10 external",
+                "web/src/calls.ts 4 external",
+                "web/src/calls.ts 5 external",
+                "web/src/calls.ts 6 external",
+                "web/src/calls.ts 7 synthetic -> HTTP GET /orders/{} @orders [synthetic]",
+                "web/src/calls.ts 8 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
+                "web/src/calls.ts 9 external",
+                "web/src/calls.ts 10 synthetic -> HTTP GET /orders/{} @orders [synthetic]",
             ]
         );
     }

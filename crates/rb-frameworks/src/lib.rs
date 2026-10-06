@@ -10,6 +10,32 @@ pub mod endpoint;
 pub mod fold;
 pub mod routes;
 
+/// Operation counts for the growth tests (contract M4a invariant 11; amendment 12, Q4): the
+/// measured loops call [`work::tick`] with the elements they examine, and a test compares the
+/// counts for an input and one four times as large, which no machine load can change. The
+/// counter exists only in test builds (this crate's, or a dependant's through the `work-count`
+/// feature its dev-dependency enables); elsewhere `tick` is empty.
+pub mod work {
+    #[cfg(any(test, feature = "work-count"))]
+    thread_local! {
+        static COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts `n` elements examined by a measured loop.
+    #[inline(always)]
+    pub fn tick(n: usize) {
+        #[cfg(any(test, feature = "work-count"))]
+        COUNT.with(|c| c.set(c.get() + n as u64));
+        let _ = n;
+    }
+
+    /// The count since the last call, on this thread.
+    #[cfg(any(test, feature = "work-count"))]
+    pub fn take() -> u64 {
+        COUNT.with(|c| c.replace(0))
+    }
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rb_sql::Op;

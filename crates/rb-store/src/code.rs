@@ -68,6 +68,7 @@ impl<'g> View<'g> {
             .into_iter()
             .flatten()
             .copied()
+            .inspect(|_| crate::work::tick(1))
             .filter(move |e| e.kind == kind && e.certainty >= min)
     }
 
@@ -77,6 +78,7 @@ impl<'g> View<'g> {
             .into_iter()
             .flatten()
             .copied()
+            .inspect(|_| crate::work::tick(1))
             .filter(move |e| e.kind == kind)
     }
 

@@ -206,7 +206,9 @@ pub enum Piece {
 /// A client URL split and normalised (contract M4a S3).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClientUrl {
-    /// The template starts with an unresolved hole: the base is unknown (S12).
+    /// The part before the path is unknown, so the path is matched by suffix: the template
+    /// starts with an unresolved hole (S12), the host has a hole and is not external, or a hole
+    /// follows a complete authority directly (`http://orders:3000${p}/x`; amendment 12).
     pub base_unknown: bool,
     pub scheme: Option<String>,
     /// Lower-cased, without the port. `None` for a relative URL or a host with a hole.
@@ -214,6 +216,10 @@ pub struct ClientUrl {
     pub port: Option<String>,
     /// An absolute URL whose host has a hole.
     pub host_dynamic: bool,
+    /// A host with a hole next to literal host text holding a `.` (`{?}.zendesk.com`,
+    /// `api.{?}`): an FQDN that names no service (D6), so the site is external (amendment 12).
+    /// The host as written, lower-cased, `{?}` for each hole.
+    pub host_external: Option<String>,
     /// The normalised path.
     pub path: String,
     pub flags: Flags,
@@ -269,9 +275,23 @@ pub fn client_url(pieces: &[Piece]) -> ClientUrl {
                         out.host = Some(host.to_ascii_lowercase());
                         out.port = port.map(str::to_owned);
                         pieces.remove(0);
+                        // The hole glued to the authority may continue the port or hold a path
+                        // prefix: an unknown prefix, so the rest is matched by suffix (Q6).
+                        while pieces.first() == Some(&Piece::Hole) {
+                            pieces.remove(0);
+                            out.base_unknown = true;
+                        }
                     }
                     AuthorityEnd::InHost => {
                         out.host_dynamic = true;
+                        let host = host_with_holes(authority, &pieces[1..]);
+                        // A literal part with a dot is an FQDN fragment: external. Otherwise the
+                        // host is unknown and the unresolved-base rules apply (Q2).
+                        if host.split(HOLE).any(|part| part.contains('.')) {
+                            out.host_external = Some(host);
+                        } else {
+                            out.base_unknown = true;
+                        }
                         pieces.remove(0);
                         skip_authority(&mut pieces);
                     }
@@ -391,6 +411,35 @@ fn authority_before_hole(authority: &str) -> AuthorityEnd<'_> {
         (host, Some(port)) if !host.is_empty() && !port.is_empty() => AuthorityEnd::Complete,
         _ => AuthorityEnd::InHost,
     }
+}
+
+/// How a hole is written in [`ClientUrl::host_external`].
+const HOLE: &str = "{?}";
+
+/// The host of an authority that continues past a hole: `authority` (the literal text before
+/// the first hole) and the following pieces up to the first `/`, `?` or `#`, holes written
+/// [`HOLE`], lower-cased; user information (up to the last `@`) and the port are dropped.
+fn host_with_holes(authority: &str, rest: &[Piece]) -> String {
+    let mut text = authority.to_owned();
+    for p in rest {
+        match p {
+            Piece::Hole => text.push_str(HOLE),
+            Piece::Lit(l) => match l.find(['/', '?', '#']) {
+                Some(i) => {
+                    text.push_str(&l[..i]);
+                    break;
+                }
+                None => text.push_str(l),
+            },
+        }
+    }
+    let host = text.rsplit('@').next().unwrap_or(&text);
+    let host = if host.starts_with('[') {
+        host.find(']').map_or(host, |i| &host[..=i])
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    host.to_ascii_lowercase()
 }
 
 /// Whether an `@` appears in the authority's remaining literal text (before the first `/`, `?`
@@ -706,7 +755,7 @@ mod tests {
         assert!(u.flags.partial);
 
         let u = client_url(&[lit("http://"), Piece::Hole, lit(":8080/x/y")]);
-        assert!(u.host_dynamic && u.host.is_none());
+        assert!(u.host_dynamic && u.host.is_none() && u.base_unknown);
         assert_eq!(u.path, "/x/y");
 
         let u = client_url(&[lit("https://status.example.com")]);
@@ -770,7 +819,8 @@ mod tests {
             ]),
             (Some("users".to_owned()), None, false, "/x".to_owned())
         );
-        // A literal port and a hole after the authority: the host is known.
+        // A literal port and a hole after the authority: the host is known (the hole is an
+        // unknown prefix, amendment 12).
         let u = client_url(&[lit("http://users:3000"), Piece::Hole, lit("/x")]);
         assert_eq!(
             (u.host.as_deref(), u.port.as_deref(), u.host_dynamic),
@@ -783,16 +833,109 @@ mod tests {
             assert_eq!(u.path, "/x", "{rest}");
         }
         // A hole inside the host: unknown.
-        for first in [
-            "http://",
-            "http://api.",
-            "http://localhost",
-            "http://users-",
-        ] {
+        for first in ["http://", "http://localhost", "http://users-"] {
             let u = client_url(&[lit(first), Piece::Hole, lit("/x")]);
             assert!(u.host_dynamic && u.host.is_none(), "{first}");
             assert_eq!(u.path, "/x", "{first}");
         }
+        // A bracketed IPv6 literal followed directly by a hole keeps its host (evaluator pass
+        // 2, Q5, M02).
+        let u = client_url(&[lit("http://[::1]"), Piece::Hole, lit("/x")]);
+        assert_eq!(
+            (
+                u.host.as_deref(),
+                u.host_dynamic,
+                u.host_external.as_deref()
+            ),
+            (Some("[::1]"), false, None)
+        );
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q2): a hole next to literal host text. When
+    /// a literal part of the host holds a `.` (an FQDN fragment: `.zendesk.com`, `api.`,
+    /// `api.stripe.com`) the host names no service and the site is external; otherwise the host
+    /// is unknown and the base is unknown, so the path is matched by suffix only. Never an exact
+    /// match across services.
+    #[test]
+    fn a_hole_next_to_literal_host_text() {
+        let read = |pieces: &[Piece]| {
+            let u = client_url(pieces);
+            (u.host_external, u.base_unknown, u.host, u.path)
+        };
+        let external = |h: &str, p: &str| (Some(h.to_owned()), false, None, p.to_owned());
+        let unknown = |p: &str| (None, true, None, p.to_owned());
+        for (pieces, want) in [
+            // `https://${tenant}.zendesk.com/api/v2/tickets`, Java `String.format` and Go
+            // `Sprintf` give the same pieces.
+            (
+                vec![
+                    lit("https://"),
+                    Piece::Hole,
+                    lit(".zendesk.com/api/v2/tickets"),
+                ],
+                external("{?}.zendesk.com", "/api/v2/tickets"),
+            ),
+            // `https://api.stripe.com${v}/charges`, Go `"https://api.stripe.com" + v + …`.
+            (
+                vec![lit("https://api.stripe.com"), Piece::Hole, lit("/charges")],
+                external("api.stripe.com{?}", "/charges"),
+            ),
+            (
+                vec![lit("http://api."), Piece::Hole, lit("/orders/1")],
+                external("api.{?}", "/orders/1"),
+            ),
+            (
+                vec![lit("http://10.0."), Piece::Hole, lit(".5:8080/x")],
+                external("10.0.{?}.5", "/x"),
+            ),
+            (
+                vec![lit("http://admin:"), Piece::Hole, lit("@api.stripe.com/x")],
+                external("api.stripe.com", "/x"),
+            ),
+            // No dot in the literal host text: unknown.
+            (
+                vec![lit("http://"), Piece::Hole, lit("/orders/1")],
+                unknown("/orders/1"),
+            ),
+            (
+                vec![lit("http://"), Piece::Hole, lit(":8080/x/y")],
+                unknown("/x/y"),
+            ),
+            (
+                vec![lit("http://localhost"), Piece::Hole, lit("/x")],
+                unknown("/x"),
+            ),
+            (
+                vec![lit("http://orders-"), Piece::Hole, lit("/x")],
+                unknown("/x"),
+            ),
+            (
+                vec![lit("http://admin:"), Piece::Hole, lit("@users:3000/x")],
+                unknown("/x"),
+            ),
+        ] {
+            assert_eq!(read(&pieces), want, "{pieces:?}");
+        }
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q6): a hole glued to a complete authority
+    /// (`http://orders:3000${p}/orders/1`) keeps the host; the path after the hole is matched by
+    /// suffix (the hole may continue the port or hold a path prefix).
+    #[test]
+    fn a_hole_after_a_literal_port_is_an_unknown_prefix() {
+        let u = client_url(&[lit("http://orders:3000"), Piece::Hole, lit("/orders/1")]);
+        assert_eq!(
+            (
+                u.host.as_deref(),
+                u.port.as_deref(),
+                u.base_unknown,
+                u.path.as_str()
+            ),
+            (Some("orders"), Some("3000"), true, "/orders/1")
+        );
+        // A hole after a `/` is a path segment as before.
+        let u = client_url(&[lit("http://orders:3000/"), Piece::Hole, lit("/x")]);
+        assert_eq!((u.base_unknown, u.path.as_str()), (false, "/{}/x"));
     }
 
     /// Evaluator pass 1, P3: a hole that ends the URL glued to literal text is an opaque tail

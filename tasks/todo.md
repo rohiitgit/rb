@@ -405,4 +405,16 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
 - [x] Records: contract, design §10, CHANGELOG, IMPLEMENT.md, lessons.
 - [x] Verification loop (fmt, clippy, 437 unit tests, e2e twice, stub scan); clean-up of `fx4a1_*` and `var/fix-m4a-1/`.
 - Found while fixing: the P4 drop also happens upstream (a file reached from two inline handlers); config *servers* first read as config clients; a hole in user information (`http://u:${p}@h`) would have been read as a port hole. Each fixed test-first.
-- [ ] Evaluator pass 2.
+- [x] Evaluator pass 2 (`tasks/eval-m4a-pass2.md`, VERDICT FAIL on `7d12001`): fixed below.
+
+## Review (M4a evaluator pass 2)
+- [x] Plan (orchestrator's decisions, contract amendment 12): Q1 bases stated at the call or on the instance; Q2 partial hosts; Q3 `config_unread` forms; Q4 counted growth tests; Q5 biting tests (M02, M21, M23); Q6 a hole after a literal port; Q7 called registrars in `rb path`; Q8 `node-fetch` and honest open items; `PIPELINE` `m4a-http-6`.
+- [x] Facts (`rb-syntax`): spreads in object literals, Java `new` arguments (`Arg::New`), assignment targets (`CallChain.assigned`); unit first.
+- [x] Q1, Q8 (`clients.rs`), Q2, Q6 (`endpoint.rs`), the stitcher (`stitch.rs`: instance override, external partial hosts, `base_from_bean` cap), test-first.
+- [x] Q3 (`fold.rs::yaml_entries`, `lib.rs`), Q7 and M21 (`rb-store/src/path.rs`), M02/M23 rows, test-first.
+- [x] Q4: `work::tick` counters (`rb-frameworks` with the `work-count` feature for rb-indexer's tests, `rb-store` `cfg(test)`); five growth tests counted; 30 runs of each of three crate suites under background load: 0 failures.
+- [x] Mutations: 23 mutants (every new rule, the three Q5 survivors, four quadratic loops), all killed.
+- [x] Public repositories against a `7d12001` build: four byte-identical, ftgo +4 `dynamic` sites; fresh == cached == second name; the evaluator's TS and Java repros end to end.
+- [x] Records: contract (amendment 12, amendment-11 correction, invariant 11, open items 11, 13–20), CHANGELOG, IMPLEMENT.md, lessons.
+- [x] Verification loop; clean-up of `fx4a2_*` and `var/fix-m4a-2/`.
+- [ ] Evaluator pass 3.

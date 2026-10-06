@@ -300,6 +300,7 @@ impl<'a> Locals<'a> {
             .partition_point(|b| (b.visible[0], b.visible[1]) <= pos);
         let mut cur = i.checked_sub(1);
         while let Some(k) = cur {
+            rb_frameworks::work::tick(1);
             let b = self.bindings[k];
             if (b.visible[2], b.visible[3]) >= pos && accept(b) {
                 return Some(b);
@@ -2057,55 +2058,69 @@ func (s *Server) helper() {}
     }
 
     /// The resolution of `n` declarations of one name grows linearly: four times the sites
-    /// take well under eight times as long (a quadratic lookup takes sixteen). A ratio of the
-    /// best of three runs, not a wall-clock bound, so host load cannot fail it (contract M3b
-    /// amendment 67).
+    /// examine at most five times the declarations (linear is four, a quadratic lookup
+    /// sixteen). Counted, not timed, so host load cannot fail it (contract M3b amendment 67;
+    /// counted since contract M4a amendment 12, Q4).
     #[test]
     fn many_declarations_of_one_name_stay_fast() {
-        let resolve = |n: usize| {
-            let mut src = String::from("class A:\n    def f(self):\n        pass\n\ndef run():\n");
-            for _ in 0..n {
-                src.push_str("    x = A()\n    x.f()\n");
+        // Rebindings in one function; then closed sibling scopes, each with its own `x`, before
+        // module-level calls whose `x` is the enclosing declaration (the walk must skip the
+        // siblings through the parent links, not one by one).
+        let resolve = |n: usize, siblings: bool| {
+            let mut src = String::from("class A:\n    def f(self):\n        pass\n\n");
+            if siblings {
+                src.push_str("x = A()\n");
+                for i in 0..n {
+                    src.push_str(&format!("def g{i}():\n    x = A()\n    x.f()\n"));
+                }
+                for _ in 0..n {
+                    src.push_str("x.f()\n");
+                }
+            } else {
+                src.push_str("def run():\n");
+                for _ in 0..n {
+                    src.push_str("    x = A()\n    x.f()\n");
+                }
             }
-            // Parsing is not under test: time the resolution alone.
+            // Parsing is not under test: count the resolution alone.
             let facts = rb_syntax::extract(PY, src.as_bytes()).unwrap();
             let by_path: BTreeMap<&str, (Language, &FileFacts)> =
                 BTreeMap::from([("app/many.py", (PY, &facts))]);
             let keys =
                 BTreeMap::from([("app/many.py", rb_syntax::symbol_keys("app/many.py", &facts))]);
-            let mut best = std::time::Duration::MAX;
-            let mut calls = 0;
-            for _ in 0..3 {
-                let mut b = GraphBuilder::new();
-                b.add_node(
-                    NodeKey::new(NodeKind::File, "app/many.py"),
-                    "app/many.py",
-                    Attrs::new(),
-                )
+            let mut b = GraphBuilder::new();
+            b.add_node(
+                NodeKey::new(NodeKind::File, "app/many.py"),
+                "app/many.py",
+                Attrs::new(),
+            )
+            .unwrap();
+            crate::syntax::add_symbols(&mut b, "app/many.py", &facts, &keys["app/many.py"])
                 .unwrap();
-                crate::syntax::add_symbols(&mut b, "app/many.py", &facts, &keys["app/many.py"])
-                    .unwrap();
-                let started = std::time::Instant::now();
-                let go = BTreeMap::new();
-                let index = Index::new(&by_path, &go, &keys);
-                add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
-                best = best.min(started.elapsed());
-                calls = b
-                    .finish()
-                    .unwrap()
-                    .edges()
-                    .iter()
-                    .filter(|e| e.kind == EdgeKind::Calls)
-                    .count();
-            }
-            // Every `x.f()` site resolves to the one method, so the edges aggregate into one.
-            assert_eq!(calls, 1);
-            best
+            rb_frameworks::work::take();
+            let go = BTreeMap::new();
+            let index = Index::new(&by_path, &go, &keys);
+            add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
+            let work = rb_frameworks::work::take();
+            let calls = b
+                .finish()
+                .unwrap()
+                .edges()
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .count();
+            // Every `x.f()` site resolves to the one method, so the edges aggregate into one per
+            // caller.
+            assert_eq!(calls, if siblings { n + 1 } else { 1 });
+            work
         };
-        let small = resolve(5_000);
-        let large = resolve(20_000);
-        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
-        assert!(ratio < 8.0, "{small:?} → {large:?}: ×{ratio:.1}");
+        for (small, large) in [(5_000, 20_000), (1_000, 4_000)]
+            .into_iter()
+            .zip([false, true])
+            .map(|((a, b), siblings)| (resolve(a, siblings), resolve(b, siblings)))
+        {
+            assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+        }
     }
 
     #[test]

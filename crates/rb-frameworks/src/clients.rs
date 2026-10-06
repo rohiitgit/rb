@@ -96,6 +96,10 @@ pub struct ClientCall {
     pub span: Span,
     /// The definition the call is made from (for Feign, the interface method).
     pub source: Option<usize>,
+    /// The base was read from a `@Bean` method of the file that builds a client of this kind,
+    /// taken as the injected instance (dependency injection is M4b), so the site never reaches
+    /// `synthetic` (contract M4a amendment 12).
+    pub base_from_bean: bool,
 }
 
 /// An axios instance bound to a name: `const api = axios.create({ baseURL })`.
@@ -122,8 +126,9 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
             axios(facts, &mut out);
         }
         Language::Java => {
-            rest_template(facts, &mut out);
-            web_client(facts, &mut out);
+            let bases = SpringBases::new(facts);
+            rest_template(facts, &mut out, &bases);
+            web_client(facts, &mut out, &bases);
             feign(facts, &mut out);
         }
         Language::Go => go_http(facts, &mut out),
@@ -151,25 +156,40 @@ fn method_entry(config: Option<&Arg>) -> Option<Option<String>> {
 // fetch (S9)
 
 fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
-    // An import or a top-level definition named `fetch` shadows it everywhere in the file.
-    let file_wide =
-        facts.imports.iter().any(|i| {
-            i.alias.as_deref() == Some("fetch") || i.names.iter().any(|n| n.local == "fetch")
-        }) || facts
-            .definitions
-            .iter()
-            .any(|d| d.name == "fetch" && d.parent.is_none());
-    let shadowed = |at: Span| file_wide || facts.binding_at("fetch", at).is_some();
+    // `node-fetch` under any local name is `fetch` (contract M4a amendment 12, Q8).
+    let (node_fetch, requires) = module_names(facts, "node-fetch", &["default", "fetch"], false);
+    // An import from another module or a top-level definition named `fetch` shadows the global
+    // one everywhere in the file.
+    let file_wide = facts.imports.iter().any(|i| {
+        i.module != "node-fetch"
+            && (i.alias.as_deref() == Some("fetch") || i.names.iter().any(|n| n.local == "fetch"))
+    }) || facts
+        .definitions
+        .iter()
+        .any(|d| d.name == "fetch" && d.parent.is_none());
+    // `name` at `at` is `fetch`: a `node-fetch` name not shadowed by a parameter or variable
+    // (its `require` binding is the module), or the global `fetch` not shadowed at all.
+    let is_fetch = |name: &str, at: Span| {
+        if node_fetch.iter().any(|n| n == name) {
+            facts
+                .binding_index_at(name, at)
+                .is_none_or(|bi| requires.contains(&bi))
+        } else {
+            name == "fetch" && !file_wide && facts.binding_at("fetch", at).is_none()
+        }
+    };
     for chain in &facts.chains {
-        let global = match chain.root.as_deref() {
-            None => true,
-            Some("window" | "globalThis" | "self") => true,
-            Some(_) => false,
-        };
-        let Some(link) = chain.links.first().filter(|l| l.name == "fetch") else {
+        let Some(link) = chain.links.first() else {
             continue;
         };
-        if !global || link.args.is_empty() || shadowed(chain.span) {
+        let found = match chain.root.as_deref() {
+            None => is_fetch(&link.name, chain.span),
+            Some("window" | "globalThis" | "self") => {
+                link.name == "fetch" && is_fetch("fetch", chain.span)
+            }
+            Some(_) => false,
+        };
+        if !found || link.args.is_empty() {
             continue;
         }
         let init = link.args.get(1);
@@ -186,6 +206,7 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
             instance: None,
             span: chain.span,
             source: chain.enclosing,
+            base_from_bean: false,
         });
     }
 }
@@ -195,19 +216,25 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
 
 const AXIOS_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
 
-/// Local names of the `axios` module: default or namespace import, or a top-level
-/// `require("axios")`; plus the indices of those `require` bindings.
-fn axios_names(facts: &FileFacts) -> (Vec<String>, HashSet<usize>) {
+/// Local names of a module's exports `exported` (`default` for a default import), plus its
+/// namespace import when `namespace`, or a top-level `require(module)`; plus the indices of those
+/// `require` bindings.
+fn module_names(
+    facts: &FileFacts,
+    module: &str,
+    exported: &[&str],
+    namespace: bool,
+) -> (Vec<String>, HashSet<usize>) {
     let mut requires = HashSet::new();
     let mut names: Vec<String> = facts
         .imports
         .iter()
-        .filter(|i| i.module == "axios")
+        .filter(|i| i.module == module)
         .flat_map(|i| {
-            i.alias.iter().cloned().chain(
+            i.alias.iter().filter(|_| namespace).cloned().chain(
                 i.names
                     .iter()
-                    .filter(|n| n.name == "default")
+                    .filter(|n| exported.contains(&n.name.as_str()))
                     .map(|n| n.local.clone()),
             )
         })
@@ -222,7 +249,7 @@ fn axios_names(facts: &FileFacts) -> (Vec<String>, HashSet<usize>) {
             && c.root.is_none()
             && c.links.len() == 1
             && c.links[0].name == "require"
-            && c.links[0].args.first().and_then(literal).as_deref() == Some("axios")
+            && c.links[0].args.first().and_then(literal).as_deref() == Some(module)
         {
             names.push(b.name.clone());
             requires.insert(i);
@@ -239,7 +266,7 @@ fn init_chain<'f>(facts: &'f FileFacts, b: &Binding) -> Option<&'f CallChain> {
 }
 
 fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
-    let (names, requires) = axios_names(facts);
+    let (names, requires) = module_names(facts, "axios", &["default"], true);
     // `name` at `at` is the axios module: one of its local names, not shadowed by a parameter
     // or variable in effect there (evaluator pass 1, P6); the `require` binding is the module.
     let is_axios = |name: &str, at: Span| {
@@ -277,16 +304,14 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
         let Some(first) = chain.links.first() else {
             continue;
         };
-        // `axios(url | config)`.
+        // `axios(url | config)`, `axios(url, config)`.
         if chain.root.is_none() {
             if is_axios(&first.name, chain.span) && !first.args.is_empty() {
-                out.calls.push(axios_call(
-                    chain,
-                    None,
-                    None,
-                    first.args.first(),
-                    first.args.get(1),
-                ));
+                let call = match first.args.first() {
+                    Some(config @ Arg::Object { .. }) => config_call(chain, None, None, config),
+                    url => axios_call(chain, None, None, url, None, first.args.get(1)),
+                };
+                out.calls.push(call);
             }
             continue;
         }
@@ -303,44 +328,101 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
         };
         let verb = first.name.as_str();
         if AXIOS_VERBS.contains(&verb) && !first.args.is_empty() {
-            let mut call = axios_call(chain, base, instance, None, None);
-            call.method = Some(norm_method(verb));
-            call.url = UrlValue::of(first.args.first());
-            out.calls.push(call);
+            // `get/delete/head/options(url, config)`, `post/put/patch(url, data, config)`.
+            let config = if matches!(verb, "post" | "put" | "patch") {
+                first.args.get(2)
+            } else {
+                first.args.get(1)
+            };
+            let method = Some(norm_method(verb));
+            out.calls.push(axios_call(
+                chain,
+                base,
+                instance,
+                first.args.first(),
+                method,
+                config,
+            ));
         } else if verb == "request" && !first.args.is_empty() {
-            out.calls
-                .push(axios_call(chain, base, instance, first.args.first(), None));
+            let call = match first.args.first() {
+                Some(config @ Arg::Object { .. }) => config_call(chain, base, instance, config),
+                // A config that cannot be read: no URL, method or base.
+                _ => ClientCall {
+                    method: None,
+                    url: UrlValue::Unknown,
+                    base: Some(UrlValue::Unknown),
+                    ..axios_call(chain, base, instance, None, None, None)
+                },
+            };
+            out.calls.push(call);
         }
     }
 }
 
-/// `axios(url, config?)`, `axios(config)` or `request(config)`: the URL and method come from the
-/// first argument or the config's `url` and `method` (default GET).
+/// The base a request config states (contract M4a amendment 12, Q1): `None` when the call has
+/// no config, or a config object without a `baseURL` after its last spread, so the instance's
+/// base applies; otherwise the stated base, [`UrlValue::Unknown`] when it cannot be read (a
+/// config that is not an object literal, a spread that may set it, a `baseURL` that is not a
+/// string or a name).
+fn config_base(config: Option<&Arg>) -> Option<UrlValue> {
+    match config? {
+        Arg::Object { entries, .. } => {
+            match entries
+                .iter()
+                .rev()
+                .find(|e| e.key == "baseURL" || e.key == "...")
+            {
+                Some(e) if e.key == "baseURL" => Some(UrlValue::of(Some(&e.value))),
+                Some(_) => Some(UrlValue::Unknown),
+                None => None,
+            }
+        }
+        _ => Some(UrlValue::Unknown),
+    }
+}
+
+/// An axios call with its URL argument (`url`), its method (`None`: from the config, default
+/// GET) and its request config: a base the config states replaces the instance's `base`.
 fn axios_call(
     chain: &CallChain,
     base: Option<UrlValue>,
     instance: Option<String>,
-    first: Option<&Arg>,
-    second: Option<&Arg>,
+    url: Option<&Arg>,
+    method: Option<String>,
+    config: Option<&Arg>,
 ) -> ClientCall {
-    let (url, config) = match first {
-        Some(config @ Arg::Object { .. }) => {
-            (UrlValue::of(entry(Some(config), "url")), Some(config))
-        }
-        other => (UrlValue::of(other), second),
-    };
-    let base = entry(config, "baseURL")
-        .map(|a| UrlValue::of(Some(a)))
-        .or(base);
+    let method = method.or_else(|| match config {
+        None => Some("GET".to_owned()),
+        Some(Arg::Object { .. }) => method_entry(config).unwrap_or(Some("GET".to_owned())),
+        Some(_) => None,
+    });
     ClientCall {
         kind: ClientKind::Axios,
-        method: method_entry(config).unwrap_or(Some("GET".to_owned())),
-        url,
-        base,
+        method,
+        url: UrlValue::of(url),
+        base: config_base(config).or(base),
         instance,
         span: chain.span,
         source: chain.enclosing,
+        base_from_bean: false,
     }
+}
+
+/// `axios(config)` or `request(config)` with an object literal: the URL comes from its `url`.
+fn config_call(
+    chain: &CallChain,
+    base: Option<UrlValue>,
+    instance: Option<String>,
+    config: &Arg,
+) -> ClientCall {
+    axios_call(
+        chain,
+        base,
+        instance,
+        entry(Some(config), "url"),
+        None,
+        Some(config),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -360,11 +442,6 @@ fn java_type_is(facts: &FileFacts, type_name: &str, package: &str, simple: &str)
             }))
 }
 
-/// The binding a Java receiver (`x`, `this.x`) names at `at`.
-fn java_receiver<'f>(facts: &FileScope<'f>, root: &str, at: Span) -> Option<&'f Binding> {
-    local_binding(facts, Language::Java, root, at).map(|i| &facts.facts.bindings[i])
-}
-
 // ---------------------------------------------------------------------------------------------
 // RestTemplate (S10)
 
@@ -379,7 +456,7 @@ const REST_TEMPLATE_METHODS: &[(&str, &str)] = &[
     ("patchForObject", "PATCH"),
 ];
 
-fn rest_template(facts: &FileScope<'_>, out: &mut FileClients) {
+fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases) {
     for chain in &facts.chains {
         let (Some(root), Some(first)) = (chain.root.as_deref(), chain.links.first()) else {
             continue;
@@ -391,26 +468,29 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients) {
             }
             None => continue,
         };
-        let is_client = java_receiver(facts, root, chain.span).is_some_and(|b| {
+        let receiver = local_binding(facts, Language::Java, root, chain.span);
+        let is_client = receiver.is_some_and(|bi| {
             java_type_is(
                 facts,
-                &b.type_name,
-                "org.springframework.web.client",
+                &facts.bindings[bi].type_name,
+                BLOCKING,
                 "RestTemplate",
             )
         });
         if !is_client || first.args.is_empty() {
             continue;
         }
+        // The root URI configured on the instance; a relative URL needs one (amendment 12).
+        let (base, base_from_bean) = bases.of(receiver, ClientKind::RestTemplate);
         out.calls.push(ClientCall {
             kind: ClientKind::RestTemplate,
             method,
             url: java_url(facts, first.args.first()),
-            // No root URI in sight: unknown, as for `WebClient` (a relative URL needs one).
-            base: Some(UrlValue::Unknown),
+            base: Some(base),
             instance: None,
             span: chain.span,
             source: chain.enclosing,
+            base_from_bean,
         });
     }
 }
@@ -457,23 +537,232 @@ fn fluent_kind(facts: &FileFacts, type_name: &str) -> Option<ClientKind> {
     }
 }
 
-/// A base from a `baseUrl(x)` or `create(x)` link.
-fn fluent_base(chain: &CallChain, upto: usize) -> Option<UrlValue> {
-    chain.links[..upto]
-        .iter()
-        .rev()
-        .find(|l| matches!(l.name.as_str(), "baseUrl" | "create") && !l.args.is_empty())
-        .map(|l| UrlValue::of(l.args.first()))
+/// What a chain that builds or configures a Spring client says about its base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BaseFact {
+    /// A base-setting link (`baseUrl(x)`, `rootUri(x)`, `create(x)`, a URI template handler or
+    /// builder factory): its value, [`UrlValue::Unknown`] when it cannot be read.
+    Stated(UrlValue),
+    /// A fresh client or builder with no base (`new RestTemplateBuilder().build()`,
+    /// `WebClient.builder().build()`).
+    Fresh,
+    /// Built from something not in sight (an injected builder, another instance).
+    Unreadable,
 }
 
-fn web_client(facts: &FileScope<'_>, out: &mut FileClients) {
+/// The base a chain's links before `upto` set: the last base-setting link wins.
+fn chain_base(facts: &FileScope<'_>, chain: &CallChain, upto: usize) -> BaseFact {
+    for l in chain.links[..upto].iter().rev() {
+        match l.name.as_str() {
+            "baseUrl" | "rootUri" | "create" if !l.args.is_empty() => {
+                return BaseFact::Stated(java_url(facts, l.args.first()));
+            }
+            "uriTemplateHandler" | "setUriTemplateHandler" | "uriBuilderFactory" => {
+                return BaseFact::Stated(factory_base(l.args.first()));
+            }
+            _ => {}
+        }
+    }
+    if fresh_root(facts, chain) {
+        BaseFact::Fresh
+    } else {
+        BaseFact::Unreadable
+    }
+}
+
+/// The base of `new DefaultUriBuilderFactory(base)`; anything else cannot be read.
+fn factory_base(arg: Option<&Arg>) -> UrlValue {
+    match arg {
+        Some(Arg::New {
+            type_name, args, ..
+        }) if type_name.rsplit('.').next() == Some("DefaultUriBuilderFactory")
+            && !args.is_empty() =>
+        {
+            UrlValue::of(args.first())
+        }
+        _ => UrlValue::Unknown,
+    }
+}
+
+/// A chain starting from a new client or builder: `new RestTemplate…()`, or a static
+/// `WebClient`/`RestClient` `create()`/`builder()`.
+fn fresh_root(facts: &FileFacts, chain: &CallChain) -> bool {
+    let Some(root) = chain.root.as_deref() else {
+        return false;
+    };
+    if let Some(created) = root.strip_prefix("new ") {
+        let simple = created.split(['(', '<']).next().unwrap_or("").trim();
+        let simple = simple.rsplit('.').next().unwrap_or(simple);
+        return matches!(simple, "RestTemplate" | "RestTemplateBuilder");
+    }
+    fluent_kind(facts, root).is_some()
+        && chain
+            .links
+            .first()
+            .is_some_and(|l| matches!(l.name.as_str(), "create" | "builder"))
+}
+
+/// The client kind a chain builds or configures: from its root's type (a binding, a static
+/// `WebClient`/`RestClient`, or a `new RestTemplate…()`).
+fn chain_kind(facts: &FileScope<'_>, chain: &CallChain) -> Option<ClientKind> {
+    let root = chain.root.as_deref()?;
+    let type_name = match root.strip_prefix("new ") {
+        Some(created) => created
+            .split(['(', '<'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_owned(),
+        None => match local_binding(facts, Language::Java, root, chain.span) {
+            Some(bi) => facts.bindings[bi].type_name.clone(),
+            None => root.to_owned(),
+        },
+    };
+    let rest = |simple: &str, package: &str| java_type_is(facts, &type_name, package, simple);
+    if rest("RestTemplate", BLOCKING) || rest("RestTemplateBuilder", BOOT_CLIENT) {
+        Some(ClientKind::RestTemplate)
+    } else {
+        fluent_kind(facts, &type_name)
+    }
+}
+
+const BOOT_CLIENT: &str = "org.springframework.boot.web.client";
+const SPRING_CONTEXT: &str = "org.springframework.context.annotation";
+
+/// What configures each Spring client instance of one file, indexed once (contract M4a
+/// amendment 12, Q1): per binding, the chains assigned to it (`this.rt = b.rootUri(…).build()`)
+/// or calling a URI template handler setter on it; and the base facts of the file's `@Bean`
+/// methods per client kind, for an instance injected from them.
+struct SpringBases<'s, 'f> {
+    facts: &'s FileScope<'f>,
+    configured: HashMap<usize, Vec<&'f CallChain>>,
+    beans: HashMap<ClientKind, Vec<BaseFact>>,
+}
+
+impl<'s, 'f> SpringBases<'s, 'f> {
+    fn new(facts: &'s FileScope<'f>) -> Self {
+        let in_bean: HashSet<usize> = facts
+            .definitions
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                d.kind == DefKind::Method
+                    && d.decorations
+                        .iter()
+                        .any(|a| is_annotation(facts, a, SPRING_CONTEXT, "Bean"))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let mut configured: HashMap<usize, Vec<&'f CallChain>> = HashMap::new();
+        let mut beans: HashMap<ClientKind, Vec<BaseFact>> = HashMap::new();
+        for chain in &facts.facts.chains {
+            let target = match (&chain.assigned, chain.links.first()) {
+                (Some(left), _) => Some(left.as_str()),
+                (None, Some(l)) if l.name == "setUriTemplateHandler" => chain.root.as_deref(),
+                _ => None,
+            };
+            if let Some(bi) =
+                target.and_then(|t| local_binding(facts, Language::Java, t, chain.span))
+            {
+                configured.entry(bi).or_default().push(chain);
+            }
+            // A chain in a `@Bean` method (or a lambda inside one) that sets a base.
+            let mut def = chain.enclosing;
+            let mut seen = 0;
+            while let Some(d) = def.filter(|d| !in_bean.contains(d) && seen < 64) {
+                def = facts.definitions[d].parent;
+                seen += 1;
+            }
+            if def.is_some()
+                && let BaseFact::Stated(v) = chain_base(facts, chain, chain.links.len())
+                && let Some(kind) = chain_kind(facts, chain)
+            {
+                beans.entry(kind).or_default().push(BaseFact::Stated(v));
+            }
+        }
+        SpringBases {
+            facts,
+            configured,
+            beans,
+        }
+    }
+
+    /// The base of a `kind` client bound at `receiver`, and whether it came from a `@Bean`
+    /// method: one stated base when everything that configures the instance agrees, else
+    /// unknown. An instance nothing in the file configures is injected: the file's `@Bean`
+    /// methods for that kind decide, the same way.
+    fn of(&self, receiver: Option<usize>, kind: ClientKind) -> (UrlValue, bool) {
+        let Some(bi) = receiver else {
+            return (UrlValue::Unknown, false);
+        };
+        let b = &self.facts.bindings[bi];
+        let mut facts: Vec<BaseFact> = Vec::new();
+        match &b.init {
+            Some(Init::Call { chain }) => {
+                if let Some(c) = self.facts.chains.get(*chain) {
+                    facts.push(chain_base(self.facts, c, c.links.len()));
+                }
+            }
+            Some(_) => facts.push(BaseFact::Unreadable),
+            None => {}
+        }
+        for c in self.configured.get(&bi).into_iter().flatten() {
+            facts.push(chain_base(self.facts, c, c.links.len()));
+        }
+        if facts.is_empty() {
+            let beans = self.beans.get(&kind).map_or(&[][..], Vec::as_slice);
+            return match agreed(beans) {
+                Some(v) => (v, true),
+                None => (UrlValue::Unknown, false),
+            };
+        }
+        (agreed(&facts).unwrap_or(UrlValue::Unknown), false)
+    }
+}
+
+/// The one base all `facts` state (fresh clients state none), when none is unreadable and at
+/// least one states it; two different values, or a value that cannot be read, give `None`.
+fn agreed(facts: &[BaseFact]) -> Option<UrlValue> {
+    let mut found: Option<&UrlValue> = None;
+    for f in facts {
+        match f {
+            BaseFact::Unreadable | BaseFact::Stated(UrlValue::Unknown) => return None,
+            BaseFact::Fresh => {}
+            BaseFact::Stated(v) => match found {
+                Some(prev) if !same_value(prev, v) => return None,
+                _ => found = Some(v),
+            },
+        }
+    }
+    found.cloned()
+}
+
+/// Two URL values with the same text (spans aside).
+fn same_value(a: &UrlValue, b: &UrlValue) -> bool {
+    match (a, b) {
+        (UrlValue::Template(x), UrlValue::Template(y)) => {
+            x.parts.len() == y.parts.len()
+                && x.parts.iter().zip(&y.parts).all(|p| match p {
+                    (TemplatePart::Lit { text: s }, TemplatePart::Lit { text: t }) => s == t,
+                    (TemplatePart::Hole { expr: s, .. }, TemplatePart::Hole { expr: t, .. }) => {
+                        s == t
+                    }
+                    _ => false,
+                })
+        }
+        (UrlValue::Name { text: x, .. }, UrlValue::Name { text: y, .. }) => x == y,
+        _ => false,
+    }
+}
+
+fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases) {
     for chain in &facts.chains {
         let Some(root) = chain.root.as_deref() else {
             continue;
         };
-        let receiver = java_receiver(facts, root, chain.span);
+        let receiver = local_binding(facts, Language::Java, root, chain.span);
         let kind = match receiver {
-            Some(b) => fluent_kind(facts, &b.type_name),
+            Some(bi) => fluent_kind(facts, &facts.bindings[bi].type_name),
             // `WebClient.create(…)`, `RestClient.builder()…`.
             None => fluent_kind(facts, root),
         };
@@ -499,23 +788,23 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients) {
                 || UrlValue::lit("", chain.span),
                 |l| java_url(facts, l.args.first()),
             );
-        // A server-side client has no origin of its own, so with no `baseUrl` in sight (one set
-        // in a constructor, say) the base is unknown, never empty: a relative URI is then
-        // matched by suffix (evaluator pass 1, suspected item 1).
-        let base = fluent_base(chain, verb)
-            .or_else(|| {
-                let init = receiver.and_then(|b| init_chain(facts, b))?;
-                fluent_base(init, init.links.len())
-            })
-            .or(Some(UrlValue::Unknown));
+        // A base stated in the call's own chain wins; otherwise the instance's (amendment 12).
+        // A server-side client has no origin of its own, so with no base in sight the base is
+        // unknown, never empty: a relative URI is then matched by suffix (evaluator pass 1).
+        let (base, base_from_bean) = match chain_base(facts, chain, verb) {
+            BaseFact::Stated(v) => (v, false),
+            BaseFact::Fresh => (UrlValue::Unknown, false),
+            BaseFact::Unreadable => bases.of(receiver, kind),
+        };
         out.calls.push(ClientCall {
             kind,
             method,
             url,
-            base,
+            base: Some(base),
             instance: None,
             span: chain.span,
             source: chain.enclosing,
+            base_from_bean,
         });
     }
 }
@@ -645,6 +934,7 @@ fn feign(facts: &FileScope<'_>, out: &mut FileClients) {
                     instance: None,
                     span: d.span,
                     source: Some(m),
+                    base_from_bean: false,
                 });
             }
         }
@@ -712,6 +1002,7 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             instance: None,
             span: chain.span,
             source: chain.enclosing,
+            base_from_bean: false,
         });
     }
 }
@@ -813,6 +1104,9 @@ mod tests {
                 if let Some(i) = &c.instance {
                     s.push_str(&format!(" instance={i}"));
                 }
+                if c.base_from_bean {
+                    s.push_str(" from_bean");
+                }
                 s
             })
             .collect()
@@ -832,7 +1126,8 @@ mod tests {
                 "fetch GET '/e'",
             ]
         );
-        let imported = "import fetch from \"node-fetch\";\nfetch(\"/x\");\n";
+        // Another module's `fetch` shadows the global one.
+        let imported = "import fetch from \"./my-fetch\";\nfetch(\"/x\");\n";
         assert!(calls(Language::TypeScript, imported).is_empty());
         let defined = "function fetch(u) {}\nfetch(\"/x\");\n";
         assert!(calls(Language::JavaScript, defined).is_empty());
@@ -906,15 +1201,16 @@ mod tests {
                 "web_client GET '' base='http://x'",
             ]
         );
-        // A server-side client has no origin of its own: with no `baseUrl` in sight (one set in
-        // a constructor, say) the base is unknown, so a relative URI is matched by suffix
-        // (evaluator pass 1, suspected item). `String.format` is a template (P1's Java form).
+        // A server-side client has no origin of its own: with no base in sight the base is
+        // unknown, so a relative URI is matched by suffix (evaluator pass 1, suspected item); a
+        // base set in a constructor is in sight (amendment 12). `String.format` is a template
+        // (P1's Java form).
         let ctor = "package p;\nimport org.springframework.web.reactive.function.client.WebClient;\nimport org.springframework.web.client.RestTemplate;\nclass C {\n  private final WebClient client;\n  RestTemplate rest;\n  C(WebClient.Builder b) { this.client = b.baseUrl(\"http://customers\").build(); }\n  void m(int port, String id) {\n    client.get().uri(\"/owners\").retrieve();\n    rest.getForObject(String.format(\"http://localhost:%d/x/%s\", port, id), String.class);\n  }\n}\n";
         assert_eq!(
             calls(Language::Java, ctor),
             [
                 "rest_template GET 'http://localhost:{port}/x/{id}' base=?",
-                "web_client GET '/owners' base=?",
+                "web_client GET '/owners' base='http://customers'",
             ]
         );
         // Same short names from another package are not clients.
@@ -957,6 +1253,106 @@ mod tests {
             "",
         );
         assert!(calls(Language::Java, &plain).is_empty());
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q8): `node-fetch`, by default import, a
+    /// `fetch` import or a top-level `require`, under any local name, is `fetch`.
+    #[test]
+    fn node_fetch_is_fetch() {
+        let src = "import fetch from \"node-fetch\";\nimport nf from \"node-fetch\";\nexport async function f(u) {\n  await fetch(`${u}/orders/1`);\n  await nf(\"/charges\", { method: \"POST\" });\n}\nfunction g(fetch) { fetch(\"/shadowed\"); }\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            ["fetch GET '{u}/orders/1'", "fetch POST '/charges'"]
+        );
+        let named = "import { fetch as get } from \"node-fetch\";\nget(\"/n\");\n";
+        assert_eq!(calls(Language::TypeScript, named), ["fetch GET '/n'"]);
+        // The ftgo GraphQL gateway's form.
+        let cjs = "const fetch = require(\"node-fetch\");\nclass P { find(id) { return fetch(`${this.url}/orders/${id}`); } }\n";
+        assert_eq!(
+            calls(Language::JavaScript, cjs),
+            ["fetch GET '{this.url}/orders/{id}'"]
+        );
+        // A local named like the import shadows it.
+        let local =
+            "import nf from \"node-fetch\";\nfunction h() { const nf = mk(); nf(\"/no\"); }\n";
+        assert!(calls(Language::TypeScript, local).is_empty());
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q1): a base stated in the call's request
+    /// config replaces the instance's; a config that cannot be read, or a `baseURL` that is not
+    /// a string or a name, leaves the base unknown; the instance's base applies only when the
+    /// call has no config or its config has no `baseURL` (axios merges the request config over
+    /// the instance defaults).
+    #[test]
+    fn axios_request_configs_state_the_base() {
+        let src = "import axios from \"axios\";\nimport { api as shared } from \"./http\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nexport async function f(body, cfg) {\n  await api.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.post(\"/charges\", body, { baseURL: \"https://api.stripe.com\" });\n  await api.post(\"/charges\", body);\n  await api.get(\"/a\", { params: { q: 1 } });\n  await api.get(\"/b\", cfg);\n  await api.get(\"/c\", { ...cfg });\n  await api.get(\"/d\", { ...cfg, baseURL: \"https://x.io\" });\n  await api.get(\"/e\", { baseURL: mk() });\n  await api.get(\"/f\", { baseURL: B });\n  await axios.post(\"/h\", cfg);\n  await axios.put(\"/i\", body, cfg);\n  await axios.request(cfg);\n  await axios(\"/j\", cfg);\n  await axios(\"/k\", { method: \"delete\", baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/l\", { baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/m\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios GET '/orders/1' base='https://api.stripe.com'",
+                "axios GET '/orders/1' base='https://api.stripe.com'",
+                "axios POST '/charges' base='https://api.stripe.com'",
+                "axios POST '/charges' base='http://orders'",
+                "axios GET '/a' base='http://orders'",
+                "axios GET '/b' base=?",
+                "axios GET '/c' base=?",
+                "axios GET '/d' base='https://x.io'",
+                "axios GET '/e' base=?",
+                "axios GET '/f' base=B",
+                "axios POST '/h'",
+                "axios PUT '/i' base=?",
+                "axios ? ? base=?",
+                "axios ? '/j' base=?",
+                "axios DELETE '/k' base='https://api.stripe.com'",
+                "axios GET '/l' base='https://api.stripe.com' instance=shared",
+                "axios GET '/m' instance=shared",
+            ]
+        );
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q1): a Spring client's base is read from
+    /// what configures the instance in the file: the call's own chain, the field or variable
+    /// initialiser, an assignment (a constructor), a `setUriTemplateHandler` call, or, for an
+    /// injected instance, the file's `@Bean` methods building one (marked, never `synthetic`).
+    /// Several different bases, or one that cannot be read, leave it unknown.
+    #[test]
+    fn spring_client_bases_visible_on_the_instance() {
+        let src = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C {\n  private final RestTemplate rootRt = new RestTemplateBuilder().rootUri(\"https://api.stripe.com\").build();\n  private final RestTemplate ctorRt;\n  private RestTemplate handlerRt = new RestTemplate();\n  private final RestTemplate injected;\n  private final RestTemplate built;\n  private final WebClient ctorWeb;\n  private WebClient twoWeb;\n  C(RestTemplateBuilder b, RestTemplate injected, WebClient.Builder wb) {\n    this.ctorRt = b.rootUri(\"http://orders\").build();\n    handlerRt.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://api.github.com\"));\n    this.injected = injected;\n    this.built = b.build();\n    this.ctorWeb = wb.baseUrl(\"https://api.stripe.com\").build();\n    this.twoWeb = wb.baseUrl(\"http://a\").build();\n  }\n  void other(WebClient.Builder wb) { twoWeb = wb.baseUrl(\"http://b\").build(); }\n  void m() {\n    rootRt.postForObject(\"/charges\", null, String.class);\n    ctorRt.getForObject(\"/orders/1\", String.class);\n    handlerRt.getForObject(\"/repos\", String.class);\n    injected.getForObject(\"/x\", String.class);\n    built.getForObject(\"/y\", String.class);\n    ctorWeb.get().uri(\"/v1/charges\").retrieve();\n    twoWeb.get().uri(\"/z\").retrieve();\n    ctorWeb.mutate().baseUrl(\"http://users\").build().get().uri(\"/u\").retrieve();\n    RestTemplate local = new RestTemplateBuilder().uriTemplateHandler(new DefaultUriBuilderFactory(\"http://visits\")).build();\n    local.getForObject(\"/v\", String.class);\n  }\n}\n";
+        assert_eq!(
+            calls(Language::Java, src),
+            [
+                "rest_template POST '/charges' base='https://api.stripe.com'",
+                "rest_template GET '/orders/1' base='http://orders'",
+                "rest_template GET '/repos' base='https://api.github.com'",
+                "rest_template GET '/x' base=?",
+                "rest_template GET '/y' base=?",
+                "rest_template GET '/v' base='http://visits'",
+                "web_client GET '/v1/charges' base='https://api.stripe.com'",
+                "web_client GET '/z' base=?",
+                "web_client GET '/u' base='http://users'",
+            ]
+        );
+        // An injected instance: the file's `@Bean` method that builds one states its base.
+        let bean = "package p;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nclass Cfg {\n  @Bean RestTemplate stripe(RestTemplateBuilder b) { return b.rootUri(\"https://api.stripe.com\").build(); }\n}\nclass Pay {\n  private final RestTemplate rt;\n  Pay(RestTemplate rt) { this.rt = rt; }\n  void charge() { rt.postForObject(\"/charges\", null, String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, bean),
+            ["rest_template POST '/charges' base='https://api.stripe.com' from_bean"]
+        );
+        // Two beans with different bases: unknown.
+        let two = bean.replace(
+            "  @Bean RestTemplate stripe",
+            "  @Bean RestTemplate gh(RestTemplateBuilder b) { return b.rootUri(\"https://api.github.com\").build(); }\n  @Bean RestTemplate stripe",
+        );
+        assert_eq!(
+            calls(Language::Java, &two),
+            ["rest_template POST '/charges' base=?"]
+        );
+        // Without the `@Bean` import it is just a method.
+        let plain = bean.replace("import org.springframework.context.annotation.Bean;\n", "");
+        assert_eq!(
+            calls(Language::Java, &plain),
+            ["rest_template POST '/charges' base=?"]
+        );
     }
 
     #[test]

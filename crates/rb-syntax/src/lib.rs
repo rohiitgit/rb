@@ -277,6 +277,11 @@ pub struct CallChain {
     pub span: Span,
     /// Index into `FileFacts::definitions` of the innermost definition containing the call.
     pub enclosing: Option<usize>,
+    /// The target as written when the call is the right side of an assignment (`this.rt`,
+    /// `web`), so a pack can see what an instance is configured with in a constructor (contract
+    /// M4a amendment 12). Declarations are bindings with an initialiser instead.
+    #[serde(default)]
+    pub assigned: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,10 +304,18 @@ pub enum Arg {
     Name { text: String, span: Span },
     /// An inline function (arrow, function expression, lambda, Go func literal).
     Function { span: Span },
-    /// An object literal, one level deep (nested objects are `Other`).
+    /// An object literal, one level deep (nested objects are `Other`). A spread (`...cfg`) is
+    /// an entry with the key `...`, in source order.
     Object {
         span: Span,
         entries: Vec<ObjectEntry>,
+    },
+    /// A Java object creation (`new DefaultUriBuilderFactory("http://x")`): the type as written
+    /// and its arguments, one level deep (nested ones are `Other`).
+    New {
+        type_name: String,
+        span: Span,
+        args: Vec<Arg>,
     },
     /// Anything else (a call, a number, an array, …).
     Other { span: Span },
@@ -315,6 +328,7 @@ impl Arg {
             Arg::Name { span, .. }
             | Arg::Function { span }
             | Arg::Object { span, .. }
+            | Arg::New { span, .. }
             | Arg::Other { span } => *span,
         }
     }
@@ -560,6 +574,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             span: span(c.node),
             enclosing: enclosing(c.node.start_byte(), &starts, &ends, &lexical_parent)
                 .map(|i| nearest_kept(i, &kept, &lexical_parent)),
+            assigned: c.assigned,
         })
         .collect();
 

@@ -13,6 +13,8 @@ pub(crate) struct RawChain<'t> {
     pub node: Node<'t>,
     pub root: Option<String>,
     pub links: Vec<CallLink>,
+    /// The left side as written when the chain is the right side of an assignment.
+    pub assigned: Option<String>,
 }
 
 /// Node kinds of one grammar that make up calls and their arguments.
@@ -173,7 +175,27 @@ fn chain<'t>(language: Language, syn: &Syntax, outer: Node<'t>, source: &[u8]) -
         node: outer,
         root,
         links,
+        assigned: assignment_target(outer, source),
     }
+}
+
+/// The left side of the assignment whose right side is `call` (parentheses looked through):
+/// `this.rt = b.build()`, `web = WebClient.create(…)` (TS/JS and Java `assignment_expression`).
+fn assignment_target(call: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut node = call;
+    let mut parent = node.parent()?;
+    while parent.kind() == "parenthesized_expression" {
+        node = parent;
+        parent = node.parent()?;
+    }
+    if parent.kind() != "assignment_expression"
+        || parent.child_by_field_name("right").map(|r| r.id()) != Some(node.id())
+    {
+        return None;
+    }
+    parent
+        .child_by_field_name("left")
+        .map(|l| capped(text(l, source)))
 }
 
 fn args(language: Language, syn: &Syntax, arguments: Node<'_>, source: &[u8]) -> Vec<Arg> {
@@ -243,12 +265,46 @@ fn summary(language: Language, syn: &Syntax, node: Node<'_>, source: &[u8], dept
                         .unwrap_or_default(),
                     value: Arg::Function { span: span(e) },
                 }),
+                // `...cfg`: it may set any key, so it is kept (contract M4a amendment 12).
+                "spread_element" => Some(ObjectEntry {
+                    key: "...".into(),
+                    value: e.named_child(0).map_or(Arg::Other { span: span(e) }, |v| {
+                        summary(language, syn, v, source, depth + 1)
+                    }),
+                }),
                 _ => None,
             })
             .collect();
         return Arg::Object {
             span: span(node),
             entries,
+        };
+    }
+    if language == Language::Java && node.kind() == "object_creation_expression" && depth == 0 {
+        let type_name = node
+            .child_by_field_name("type")
+            .map(|t| {
+                // Without type arguments: `Factory<X>` is `Factory`.
+                let t = match t.kind() {
+                    "generic_type" => t.named_child(0).unwrap_or(t),
+                    _ => t,
+                };
+                capped(text(t, source))
+            })
+            .unwrap_or_default();
+        let args = node
+            .child_by_field_name("arguments")
+            .map_or_else(Vec::new, |a| {
+                let mut c = a.walk();
+                a.named_children(&mut c)
+                    .filter(|a| !matches!(a.kind(), "line_comment" | "block_comment"))
+                    .map(|a| summary(language, syn, a, source, depth + 1))
+                    .collect()
+            });
+        return Arg::New {
+            type_name,
+            span: span(node),
+            args,
         };
     }
     Arg::Other { span: span(node) }
@@ -407,6 +463,12 @@ mod tests {
                     .collect();
                 format!("{{{}}}", e.join(", "))
             }
+            Arg::New {
+                type_name, args, ..
+            } => {
+                let a: Vec<String> = args.iter().map(short).collect();
+                format!("new {type_name}({})", a.join(", "))
+            }
             Arg::Other { .. } => "?".into(),
         }
     }
@@ -507,6 +569,49 @@ mod tests {
                 expr: "id".into(),
                 span: within(src, "+ id,", "id")
             }
+        );
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q1): what can set a client's base is in the
+    /// facts. An object literal keeps its spreads (key `...`), in order; a Java object creation
+    /// argument keeps its type and arguments; a call assigned to a name keeps the name.
+    #[test]
+    fn spreads_object_creations_and_assignment_targets() {
+        let ts = "axios.get(u, { ...defaults, baseURL: B, ...more });\nthis.api = axios.create({ baseURL: B });\nx = f(1);\nconst y = g();\n";
+        assert_eq!(
+            outline(Language::TypeScript, ts),
+            [
+                "axios.get(u, {...: defaults, baseURL: B, ...: more})",
+                "axios.create({baseURL: B})",
+                "f(?)",
+                "g()",
+            ]
+        );
+        let assigned: Vec<Option<String>> = chains(Language::TypeScript, ts)
+            .into_iter()
+            .map(|c| c.assigned)
+            .collect();
+        assert_eq!(
+            assigned,
+            [None, Some("this.api".into()), Some("x".into()), None]
+        );
+        let java = "class C {\n  RestTemplate rt;\n  WebClient web;\n  C(RestTemplateBuilder b) {\n    this.rt = b.rootUri(\"http://a\").build();\n    web = (WebClient.create(\"http://w\"));\n    rt.setUriTemplateHandler(new org.springframework.web.util.DefaultUriBuilderFactory(\"http://h\"));\n    rt.setUriTemplateHandler(new Factory<X>(base, new Inner(\"deep\")));\n  }\n}\n";
+        assert_eq!(
+            outline(Language::Java, java),
+            [
+                "b.rootUri('http://a').build()",
+                "WebClient.create('http://w')",
+                "rt.setUriTemplateHandler(new org.springframework.web.util.DefaultUriBuilderFactory('http://h'))",
+                "rt.setUriTemplateHandler(new Factory(base, ?))",
+            ]
+        );
+        let assigned: Vec<Option<String>> = chains(Language::Java, java)
+            .into_iter()
+            .map(|c| c.assigned)
+            .collect();
+        assert_eq!(
+            assigned,
+            [Some("this.rt".into()), Some("web".into()), None, None]
         );
     }
 

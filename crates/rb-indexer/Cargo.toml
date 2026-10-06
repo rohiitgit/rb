@@ -17,6 +17,8 @@ rb-syntax.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The growth tests count operations in the packs and here (`rb_frameworks::work`).
+rb-frameworks = { workspace = true, features = ["work-count"] }
 # Encoding real `index.scip` bytes in the join's tests, so they run through `rb_scip::decode`
 # (contract M3b amendment 59); the same pins as `rb-scip`.
 protobuf.workspace = true

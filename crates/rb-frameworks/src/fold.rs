@@ -379,12 +379,20 @@ pub fn parse_properties(text: &str) -> BTreeMap<String, String> {
 
 /// The dotted keys a Spring YAML file sets (`spring:` then `  cloud:` gives `spring` and
 /// `spring.cloud`), read by indentation: comments, document markers and list items are skipped
-/// and quotes around a key dropped. Not a YAML parser (none is a dependency): it answers only
-/// whether a file sets a key, for the `config_unread` caps (evaluator pass 1, P7).
+/// and quotes around a key dropped; flow mappings (`stripe: { url: x }`) are read too. Not a
+/// YAML parser (none is a dependency): it answers only whether a file sets a key, for the
+/// `config_unread` caps (evaluator pass 1, P7; amendment 12).
 pub fn yaml_keys(text: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+    yaml_entries(text).into_keys().collect()
+}
+
+/// [`yaml_keys`] with each key's scalar value, unquoted (`""` for a mapping, a sequence's text
+/// as written), for the few keys whose value decides something (`spring.cloud.config.enabled`).
+pub fn yaml_entries(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
     let mut stack: Vec<(usize, String)> = Vec::new();
-    for line in text.lines() {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
             if trimmed.starts_with("---") {
@@ -392,38 +400,159 @@ pub fn yaml_keys(text: &str) -> BTreeSet<String> {
             }
             continue;
         }
-        let Some(key) = yaml_key(trimmed) else {
-            continue;
-        };
         let indent = line.len() - trimmed.len();
         while stack.last().is_some_and(|(i, _)| *i >= indent) {
             stack.pop();
         }
-        let full = stack
+        let prefix = stack
             .iter()
             .map(|(_, k)| k.as_str())
-            .chain([key])
             .collect::<Vec<_>>()
             .join(".");
-        out.insert(full);
+        // A document or block that is one flow mapping.
+        if trimmed.starts_with('{') {
+            flow_entries(&flow_text(trimmed, &mut lines), &prefix, &mut out);
+            continue;
+        }
+        let Some((key, value)) = yaml_key(trimmed) else {
+            continue;
+        };
+        let full = dotted(&prefix, key);
+        let value = value.trim();
+        if value.starts_with('{') {
+            out.insert(full.clone(), String::new());
+            flow_entries(&flow_text(value, &mut lines), &full, &mut out);
+        } else {
+            out.insert(full, scalar(value, true));
+        }
         stack.push((indent, key.to_owned()));
     }
     out
 }
 
-/// The key of a `key: value` or `key:` line, unquoted.
-fn yaml_key(line: &str) -> Option<&str> {
-    let colon = line
-        .char_indices()
-        .find(|&(i, c)| c == ':' && line[i + 1..].chars().next().is_none_or(char::is_whitespace))
-        .map(|(i, _)| i)?;
+fn dotted(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// A flow collection starting at `start`, continued over the next lines until its brackets
+/// close (outside quotes).
+fn flow_text<'t>(start: &str, lines: &mut impl Iterator<Item = &'t str>) -> String {
+    let mut text = start.to_owned();
+    while flow_depth(&text) > 0 {
+        let Some(next) = lines.next() else { break };
+        text.push('\n');
+        text.push_str(next);
+    }
+    text
+}
+
+/// The bracket depth at the end of `text`, quotes skipped.
+fn flow_depth(text: &str) -> usize {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for c in text.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '{' | '[') => depth += 1,
+            (None, '}' | ']') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// The entries of the flow mapping `text` (`{a: 1, b: {c: 2}}`) under `prefix`, nested
+/// mappings included.
+fn flow_entries(text: &str, prefix: &str, out: &mut BTreeMap<String, String>) {
+    let Some(inner) = text.trim().strip_prefix('{') else {
+        return;
+    };
+    // The entries at depth 0 up to the closing brace, split at commas outside quotes.
+    let mut entries = vec![String::new()];
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for c in inner.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '{' | '[') => depth += 1,
+            (None, '}' | ']') if depth == 0 => break,
+            (None, '}' | ']') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                entries.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        entries.last_mut().expect("never empty").push(c);
+    }
+    for entry in entries {
+        let Some((key, value)) = yaml_key(entry.trim()) else {
+            continue;
+        };
+        let full = dotted(prefix, key);
+        let value = value.trim();
+        if value.starts_with('{') {
+            out.insert(full.clone(), String::new());
+            flow_entries(value, &full, out);
+        } else {
+            out.insert(full, scalar(value, false));
+        }
+    }
+}
+
+/// A scalar as written: unquoted, and in block style without a trailing comment.
+fn scalar(value: &str, block: bool) -> String {
+    for q in ['"', '\''] {
+        if let Some(rest) = value.strip_prefix(q) {
+            return rest.split(q).next().unwrap_or(rest).to_owned();
+        }
+    }
+    let value = if block {
+        value.split(" #").next().unwrap_or(value)
+    } else {
+        value
+    };
+    value.trim().to_owned()
+}
+
+/// The key of a `key: value` or `key:` entry, unquoted, and the text after the colon. The
+/// colon is the first one outside quotes followed by whitespace or the end (or right after a
+/// quoted key, as in `{"a":1}`).
+fn yaml_key(line: &str) -> Option<(&str, &str)> {
+    let mut quote: Option<char> = None;
+    let mut colon = None;
+    for (i, c) in line.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') if i == 0 => quote = Some(c),
+            (None, ':') => {
+                let next = line[i + 1..].chars().next();
+                let after_quote = i > 0 && line[..i].ends_with(['"', '\'']);
+                if next.is_none_or(char::is_whitespace) || after_quote {
+                    colon = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let colon = colon?;
     let key = line[..colon].trim();
     let key = key
         .strip_prefix('\'')
         .and_then(|k| k.strip_suffix('\''))
         .or_else(|| key.strip_prefix('"').and_then(|k| k.strip_suffix('"')))
         .unwrap_or(key);
-    (!key.is_empty() && !key.contains(char::is_whitespace)).then_some(key)
+    (!key.is_empty() && !key.contains(char::is_whitespace)).then_some((key, &line[colon + 1..]))
 }
 
 /// Splits at the first unescaped `=`, `:` or whitespace (with surrounding whitespace).
@@ -852,6 +981,43 @@ mod tests {
                 "users.url",
             ]
         );
+    }
+
+    /// Contract M4a amendment 12 (evaluator pass 2, Q3): flow mappings (`stripe: { url: x }`,
+    /// nested, over several lines, and a document that is one) set their dotted keys too, and
+    /// scalar values are kept for the keys that need one (`spring.cloud.config.enabled`).
+    #[test]
+    fn yaml_flow_mappings_and_values() {
+        let text = "stripe: { url: \"https://api.stripe.com\", 'timeout': 3 }\nspring: {cloud: {config: {enabled: false, uri: \"http://c:8888\"}}}\nlist: [a, b]\nmulti: {\n  a: {b: 1},\n  c: \"x, y: z\"\n}\nplain:\n  key: \"v\" # comment\n---\n{server: {port: 1}}\n";
+        let entries = yaml_entries(text);
+        let keys: Vec<&str> = entries.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "list",
+                "multi",
+                "multi.a",
+                "multi.a.b",
+                "multi.c",
+                "plain",
+                "plain.key",
+                "server",
+                "server.port",
+                "spring",
+                "spring.cloud",
+                "spring.cloud.config",
+                "spring.cloud.config.enabled",
+                "spring.cloud.config.uri",
+                "stripe",
+                "stripe.timeout",
+                "stripe.url",
+            ]
+        );
+        assert_eq!(entries["spring.cloud.config.enabled"], "false");
+        assert_eq!(entries["stripe.url"], "https://api.stripe.com");
+        assert_eq!(entries["plain.key"], "v");
+        assert_eq!(entries["multi.c"], "x, y: z");
+        assert_eq!(yaml_keys(text), entries.into_keys().collect());
     }
 
     #[test]
