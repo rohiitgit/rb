@@ -104,10 +104,12 @@ pub(crate) struct Site {
     pub config_overridden: bool,
     /// The base was read from a `@Bean` method taken as the injected instance (amendment 12).
     pub base_from_bean: bool,
-    /// Gate A (amendments 13 and 14): the call is on an instance whose base comes from its
-    /// construction, and the conservative token scan proves that base unchanged (`Some(true)`)
-    /// or does not (`Some(false)`: the host still restricts, the site is never `synthetic`, and
-    /// its edge says `base: unverified`); `None` for a call on no such instance.
+    /// Gate A (amendments 13–15) on what carries the request: `Some(false)` when the carrier
+    /// (an instance that fails the token scan, a field, an imported instance, a non-plain link,
+    /// a non-plain request config, a module client the repository reconfigures) is not provably
+    /// plain, whatever the URL's source: the host still restricts, the site is never
+    /// `synthetic`, and its edge says `base: unverified`. Otherwise `Some(true)` for a verified
+    /// base read from the carrier's construction, `None` for a plain carrier with no such base.
     pub base_verified: Option<bool>,
 }
 
@@ -292,6 +294,12 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
         .iter()
         .map(|(path, (language, facts))| (*path, rb_frameworks::clients::clients(*language, facts)))
         .collect();
+    // The module clients some file reconfigures for the whole process (amendment 15).
+    let hooked: BTreeSet<ClientKind> = inputs
+        .files
+        .values()
+        .flat_map(|(language, facts)| rb_frameworks::clients::global_hooks(*language, facts))
+        .collect();
     let mut out = Vec::new();
     for (&path, file_clients) in &clients {
         let file = folding.ids[path];
@@ -302,14 +310,21 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
             // A base stated at the call (axios request config) replaces the instance's
             // (amendment 12).
             let stated = call.base.clone().map(|b| (file, b));
-            let mut base_verified = call.base_verified;
+            let mut base_verified = match call.base_verified {
+                None if call.module_call && hooked.contains(&call.kind) => Some(false),
+                v => v,
+            };
             let base = match &call.instance {
                 Some(name) => match imported_instance(inputs, &clients, path, facts, name) {
                     Some((target, instance)) => {
-                        // An imported instance is exported, so never verified (Gate A,
-                        // amendment 14); `verified` says so.
-                        if instance.base.is_some() {
-                            base_verified = Some(instance.verified);
+                        // An imported instance is exported, so never a plain carrier (Gate A,
+                        // amendments 14 and 15); `verified` says so.
+                        if base_verified.is_none() {
+                            base_verified = if instance.verified {
+                                instance.base.is_some().then_some(true)
+                            } else {
+                                Some(false)
+                            };
                         }
                         stated.or_else(|| instance.base.clone().map(|b| (folding.ids[target], b)))
                     }
@@ -808,7 +823,8 @@ pub(crate) fn add_consumes(
         for (bucket, n) in counts {
             detail.insert(bucket.as_str().into(), Value::from(n));
         }
-        // Sites on an instance whose base comes from its construction, by Gate A.
+        // Gate A (amendments 13–15): sites with a verified base read from their carrier's
+        // construction, and sites whose carrier is not provably plain (capped).
         let bases = |v: bool| sites.iter().filter(|s| s.base_verified == Some(v)).count();
         detail.insert(
             "bases".into(),
@@ -2110,7 +2126,9 @@ mod tests {
     #[test]
     fn port_holes_keep_the_host_in_every_source_form() {
         let ts = "export async function f(port: number) {\n  await fetch(`http://localhost:${port}/orders/1`);\n  await fetch(\"http://localhost:\" + port + \"/orders/1\");\n  await fetch(`https://status.example.com:${port}/orders/1`);\n  await fetch(`http://users:${port}/orders/1`);\n  await fetch(`http://users:${port}/users/me`);\n  await fetch(`http://${host}:${port}/users/me`);\n}\n";
-        let java = "package p;\nimport org.springframework.web.client.RestTemplate;\nclass C {\n  RestTemplate rest;\n  void a(int port) {\n    rest.getForObject(\"http://localhost:\" + port + \"/orders/1\", String.class);\n    rest.getForObject(String.format(\"http://localhost:%d/orders/1\", port), String.class);\n    rest.getForObject(String.format(\"http://users:%d/users/me\", port), String.class);\n  }\n}\n";
+        // A method-local `new RestTemplate()` used only for requests: a plain carrier, so the
+        // row still tests the host (a field never is, amendment 15).
+        let java = "package p;\nimport org.springframework.web.client.RestTemplate;\nclass C {\n  void a(int port) {\n    RestTemplate rest = new RestTemplate();\n    rest.getForObject(\"http://localhost:\" + port + \"/orders/1\", String.class);\n    rest.getForObject(String.format(\"http://localhost:%d/orders/1\", port), String.class);\n    rest.getForObject(String.format(\"http://users:%d/users/me\", port), String.class);\n  }\n}\n";
         let go = "package main\nimport (\n\t\"fmt\"\n\t\"net/http\"\n)\nfunc f(port int) {\n\thttp.Get(fmt.Sprintf(\"http://localhost:%d/orders/1\", port))\n\thttp.Get(fmt.Sprintf(\"https://status.example.com:%d/orders/1\", port))\n\thttp.Get(fmt.Sprintf(\"http://users:%d/users/me\", port))\n}\n";
         let sites = collect_sites(
             &[
@@ -2426,6 +2444,114 @@ mod tests {
             unverified
                 .iter()
                 .all(|s| stitcher.site(s).bucket != Bucket::Synthetic)
+        );
+    }
+
+    /// Contract M4a amendment 15 (evaluator pass 5), from source: every evaluator repro (`q03`,
+    /// `q04`, `q05`: a request through `x.mutate()…` with `apply`, a filter or an interceptor;
+    /// `p17`, `p18`: an axios instance with an interceptor, with and without a base; `p09`: an
+    /// `adapter`; `q09b`, `q12`, `q13`, `q14`: a filter or interceptor on an inline instance, a
+    /// local, a field) keeps its host but is never `synthetic`, whatever the URL's source;
+    /// a bare module client is capped when another file of the repository reconfigures the
+    /// module (`globalThis.fetch = …`, `axios.interceptors…`, `http.DefaultTransport = …`).
+    /// The controls stay `synthetic`: an unexported module `const` (`t00`), a function local, an
+    /// inline `axios.create(…).get(…)`, a Store-style local `WebClient`, a Feign interface, and
+    /// bare `fetch`, `axios` and Go `http` calls in a repository that does not reconfigure them.
+    #[test]
+    fn every_carrier_is_gated_whatever_the_url() {
+        let imports = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.web.client.RestClient;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nimport org.springframework.web.reactive.function.client.ExchangeFilterFunction;\n";
+        let q = format!(
+            "{imports}class Q {{\n  static final ExchangeFilterFunction REWRITE = ExchangeFilterFunction.ofRequestProcessor(rq -> Mono.just(ClientRequest.from(rq).url(URI.create(\"https://api.stripe.com/v1\")).build()));\n  private final WebClient q13 = WebClient.builder().filter(REWRITE).build();\n  private final RestTemplate q14 = new RestTemplateBuilder().additionalInterceptors(i).build();\n  void q03() {{\n    WebClient w = WebClient.create(\"http://orders\");\n    w.mutate().apply(b -> b.baseUrl(\"https://api.stripe.com\")).build().get().uri(\"/orders/1\").retrieve();\n  }}\n  void q04() {{\n    WebClient w = WebClient.create(\"http://orders\");\n    w.mutate().filter(REWRITE).build().get().uri(\"/orders/1\").retrieve();\n  }}\n  void q05() {{\n    RestClient r = RestClient.create(\"http://orders\");\n    r.mutate().requestInterceptor(i).build().get().uri(\"/orders/1\").retrieve();\n  }}\n  void q09b() {{ WebClient.builder().filter(REWRITE).build().get().uri(\"http://orders/orders/1\").retrieve(); }}\n  void q12() {{\n    WebClient w = WebClient.builder().filter(REWRITE).build();\n    w.get().uri(\"http://orders/orders/1\").retrieve();\n  }}\n  void q13() {{ q13.get().uri(\"http://orders/orders/1\").retrieve(); }}\n  void q14() {{ q14.getForObject(\"http://orders/orders/1\", String.class); }}\n}}\n"
+        );
+        let p = "import axios from \"axios\";\nconst p17api = axios.create({ timeout: 5 });\np17api.interceptors.request.use((c) => { c.url = \"https://api.stripe.com/v1/charges\"; return c; });\nconst p18api = axios.create({ baseURL: \"http://orders\" });\np18api.interceptors.request.use((c) => { c.url = \"https://api.stripe.com/v1/charges\"; return c; });\nexport function p17() { return p17api.get(\"http://orders/orders/1\"); }\nexport function p18() { return p18api.get(\"http://orders/orders/1\"); }\nexport function p09() {\n  const a = axios.create({ baseURL: \"http://orders\", adapter: myAdapter });\n  return a.get(\"/orders/1\");\n}\nexport function bare() {\n  fetch(\"http://orders/orders/1\");\n  axios.get(\"http://orders/orders/1\");\n  axios(\"http://orders/orders/1\");\n}\n";
+        let hook_fetch =
+            "globalThis.fetch = (u: string) => realFetch(\"https://api.stripe.com/v1\");\n";
+        let hook_axios = "import axios from \"axios\";\naxios.interceptors.request.use((c) => { c.url = \"https://api.stripe.com/v1\"; return c; });\n";
+        let go = "package main\nimport \"net/http\"\nfunc bare() {\n\thttp.Get(\"http://orders/orders/1\")\n}\n";
+        let hook_go = "package main\nimport \"net/http\"\nfunc init() {\n\thttp.DefaultTransport = rewriting{}\n}\n";
+        let eps = vec![ep("GET", "/orders/{id}", "orders")];
+        let to = "HTTP GET /orders/{} @orders";
+        let unverified = format!("heuristic -> {to} [heuristic] base=unverified match=exact");
+        let synthetic = format!("synthetic -> {to} [synthetic] base=literal match=exact");
+        let services = ["web", "pay", "orders"];
+        let tainted = [
+            ("pay/src/main/java/p/Q.java", Language::Java, q.as_str()),
+            ("web/src/p.ts", Language::TypeScript, p),
+            ("web/src/hook_fetch.ts", Language::TypeScript, hook_fetch),
+            ("web/src/hook_axios.ts", Language::TypeScript, hook_axios),
+            ("pay/cmd/main.go", Language::Go, go),
+            ("pay/cmd/hook.go", Language::Go, hook_go),
+        ];
+        assert_eq!(
+            stitched_bases(&tainted, &eps, &services),
+            [
+                format!("pay/cmd/main.go 3 {unverified}"),
+                // `q14` (a `RestTemplate` field), then `q03`, `q04`, `q05`, `q09b`, `q12`, `q13`.
+                format!("pay/src/main/java/p/Q.java 28 {unverified}"),
+                format!("pay/src/main/java/p/Q.java 12 {unverified}"),
+                format!("pay/src/main/java/p/Q.java 16 {unverified}"),
+                format!("pay/src/main/java/p/Q.java 20 {unverified}"),
+                format!("pay/src/main/java/p/Q.java 22 {unverified}"),
+                format!("pay/src/main/java/p/Q.java 25 {unverified}"),
+                format!("pay/src/main/java/p/Q.java 27 {unverified}"),
+                // Bare `fetch` (hooked), then `p17`, `p18`, `p09` and bare `axios` (hooked).
+                format!("web/src/p.ts 12 {unverified}"),
+                format!("web/src/p.ts 5 {unverified}"),
+                format!("web/src/p.ts 6 {unverified}"),
+                format!("web/src/p.ts 9 {unverified}"),
+                format!("web/src/p.ts 13 {unverified}"),
+                format!("web/src/p.ts 14 {unverified}"),
+            ]
+        );
+        // Guard: no site of the tainted repository is `synthetic`.
+        let services_ref: Vec<ServiceRef> = services
+            .iter()
+            .map(|s| ServiceRef {
+                key: (*s).to_owned(),
+                name: (*s).to_owned(),
+            })
+            .collect();
+        let stitcher = Stitcher::new(&eps, &services_ref);
+        assert!(
+            collect_sites(&tainted, &[], &[], &[])
+                .iter()
+                .all(|s| stitcher.site(s).bucket != Bucket::Synthetic)
+        );
+        // The controls, in a repository that reconfigures no module client.
+        let t = "import axios from \"axios\";\nconst t00 = axios.create({ baseURL: \"http://orders\" });\nexport function f() { return t00.get(\"/orders/1\"); }\nexport function fl() {\n  const c = axios.create({ baseURL: \"http://orders\" });\n  return c.get(\"/orders/1\");\n}\nexport function inl() { return axios.create({ baseURL: \"http://orders\" }).get(\"/orders/1\"); }\nexport function bare() {\n  fetch(\"http://orders/orders/1\");\n  axios.get(\"http://orders/orders/1\");\n}\n";
+        let store = format!(
+            "{imports}public class Store {{\n  void s01() {{\n    WebClient webClient = WebClient.builder().baseUrl(\"http://orders\").build();\n    webClient.get().uri(\"/orders/1\").retrieve();\n  }}\n}}\n"
+        );
+        let feign = "package p;\nimport org.springframework.cloud.openfeign.FeignClient;\nimport org.springframework.web.bind.annotation.GetMapping;\n@FeignClient(name = \"orders\", url = \"http://orders\")\npublic interface OrdersClient {\n  @GetMapping(\"/orders/1\")\n  String one();\n}\n";
+        assert_eq!(
+            stitched_bases(
+                &[
+                    (
+                        "pay/src/main/java/p/Store.java",
+                        Language::Java,
+                        store.as_str()
+                    ),
+                    (
+                        "pay/src/main/java/p/OrdersClient.java",
+                        Language::Java,
+                        feign
+                    ),
+                    ("pay/cmd/main.go", Language::Go, go),
+                    ("web/src/t.ts", Language::TypeScript, t),
+                ],
+                &eps,
+                &services,
+            ),
+            [
+                format!("pay/cmd/main.go 3 {synthetic}"),
+                format!("pay/src/main/java/p/OrdersClient.java 5 {synthetic}"),
+                format!("pay/src/main/java/p/Store.java 9 {synthetic}"),
+                format!("web/src/t.ts 9 {synthetic}"),
+                format!("web/src/t.ts 2 {synthetic}"),
+                format!("web/src/t.ts 5 {synthetic}"),
+                format!("web/src/t.ts 7 {synthetic}"),
+                format!("web/src/t.ts 10 {synthetic}"),
+            ]
         );
     }
 

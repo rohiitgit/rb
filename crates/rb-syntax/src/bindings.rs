@@ -1024,6 +1024,7 @@ mod tests {
                         )
                     }
                     Some(crate::Init::Name { text, .. }) => format!("name {text}"),
+                    Some(crate::Init::New { type_name, args }) => format!("new {type_name}/{args}"),
                     Some(crate::Init::Fallback { primary, default }) => {
                         format!("{primary} ?? {}", template(default))
                     }

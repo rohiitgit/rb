@@ -443,4 +443,16 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
 - [x] Records: contract (amendment 14, correction in 13, open items 14 and 22), CHANGELOG, IMPLEMENT.md, lessons (rewritten).
 - [x] Verification loop; clean-up of `fx4a4_*` and `var/fix-m4a-4/`.
 - Found while fixing: once the scan is name-based, several guards were redundant with the declaration role (a member check, a function-kind check on the scope, a Java/TS switch for top-level constants: none can fire without the role already failing), and excluding fields from the recorded names made the role's field rule unbitten (mutant M9 survived). All four were deleted, so the declaration role is the one guard that keeps fields, parameters, `var`s and exported bindings unverified, and M9 now kills it. An aliased import of another module's export with the instance's name (`import { api as shared }`) is a token of the name, so it unverifies the local `api`: by design (the scan is name-based).
-- [ ] Evaluator pass 5.
+- [x] Evaluator pass 5 (`tasks/eval-m4a-pass5.md`, VERDICT FAIL on `2a20746`): fixed below.
+
+## Review (M4a evaluator pass 5)
+- [x] Plan (orchestrator's decision, contract amendment 15): the gate covers every request — a `synthetic` stitch needs a provably plain carrier (verified instance, bare module client with no global hook, Feign, inline fresh construction with plain links), whatever the URL's source (U1, U2); axios transport keys are not plain (U3); `fresh_root` pinned in `chain_base` (M9); bk8 ruled; `PIPELINE` `m4a-http-9`.
+- [x] Baseline: `2a20746` release binary built from `git archive` in its own target directory before any change.
+- [x] Facts (`rb-syntax`): `TokenRole::Member`, tokens of module objects (TS/JS package default/namespace imports, Go imports) and JS global objects, `Init::New` for Java object creations; units first.
+- [x] Carriers (`clients.rs`: `verdict`, `plain_config`, `SpringBases::carrier`, `plain_links`, `ClientCall.module_call`, `global_hooks`; `stitch.rs`: hooked module clients capped, imported instances never plain), test-first: `every_carrier_is_gated_whatever_the_url` failed on the `2a20746` tree (13 of 14 repro sites `synthetic`).
+- [x] Mutations: 40 mutants, one per new condition plus M9, all killed (see CHANGELOG).
+- [x] Public repositories against `2a20746`; fresh == cached; scratch repositories end to end.
+- [x] Records: contract (amendment 15, corrections in 13 and 14, open item 22 with the M5 follow-up), CHANGELOG, IMPLEMENT.md, lessons.
+- [x] Verification loop; clean-up of `fx4a5_*` and `var/fix-m4a-5/`.
+- Found while fixing: a method-local `RestTemplate rt = new RestTemplate()` had no initialiser fact (a Java `new` is no call chain), so the scan could not see it and it would have been capped; `Init::New` makes it a verifiable carrier (it also stops a same-file `@Bean` base from being taken for such a local). Removing `mutate` from the request calls and judging the request chain's links each stop U1 alone, so each has its own biting row (`m1`, `l9`). On node-express-realworld the e2e setup's `axios.defaults.baseURL` is a real global hook: its one bare `axios.get` is now capped.
+- [ ] Evaluator pass 5 re-check.

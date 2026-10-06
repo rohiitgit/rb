@@ -239,7 +239,7 @@ impl<'l> Folder<'l> {
                 let (f, clean) = self.name(file, primary, b.span, depth);
                 (relabel(f, Origin::Constant), clean)
             }
-            Some(Init::Call { .. }) | None => (Folded::hole(), true),
+            Some(Init::Call { .. } | Init::New { .. }) | None => (Folded::hole(), true),
         }
     }
 }

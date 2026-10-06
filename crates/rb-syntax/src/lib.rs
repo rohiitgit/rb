@@ -354,6 +354,13 @@ pub enum Init {
     Call {
         chain: usize,
     },
+    /// A Java object creation that is not a call chain's root (`new RestTemplate()`): the type
+    /// as written, without type arguments, and its number of arguments (contract M4a amendment
+    /// 15: a client built by a bare constructor is a carrier Gate A can verify).
+    New {
+        type_name: String,
+        args: usize,
+    },
     Name {
         text: String,
         span: Span,
@@ -397,10 +404,11 @@ pub struct FileFacts {
     pub name_tokens: Vec<NameToken>,
 }
 
-/// One token of a name that may hold a configured object (contract M4a amendment 14): a name a
-/// binding initialises with a call, or the simple target of an assignment from a
-/// call. Every identifier token of such a name in the file is recorded, wherever it is.
-/// TypeScript, JavaScript and Java only.
+/// One token of a name that may hold a configured object (contract M4a amendments 14 and 15): a
+/// name a binding initialises with a call, or the simple target of an assignment from a call
+/// (TypeScript, JavaScript, Java); a module object (a TS/JS default or namespace import of a
+/// package, a Go import) or a JavaScript global object. Every identifier token of such a name
+/// in the file is recorded, wherever it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameToken {
     pub name: String,
@@ -417,8 +425,12 @@ pub enum TokenRole {
     Declaration,
     /// The receiver of a member call, `name.call(…)`, without optional chaining.
     Receiver { call: String },
-    /// Anything else: an export, a member read or write, optional chaining, an argument, an
-    /// assignment target, a parameter, a field, a `var` or another declaration.
+    /// TS/JS and Go: the object of a member access that is not called, `name.m` read or
+    /// written, also continued (`name.m.n = …`, `name.m.f(…)`), without optional chaining
+    /// (contract M4a amendment 15).
+    Member { name: String },
+    /// Anything else: an export, a Java member read or write, optional chaining, an argument,
+    /// an assignment target, a parameter, a field, a `var` or another declaration.
     Other,
 }
 
@@ -613,7 +625,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         language,
         root,
         source,
-        &tokens::candidates(language, &bindings, &chains),
+        &tokens::candidates(language, &bindings, &chains, &imports),
     );
 
     Ok(FileFacts {

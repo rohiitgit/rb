@@ -3,33 +3,67 @@
 //! to appears anywhere in the file, as its declaration, as the receiver of a member call, or
 //! otherwise. Name-based and scope-insensitive on purpose: a pack scans every token of the name
 //! in a range (an enclosing function, or the whole file) and proves nothing a shadowing name
-//! could break. Nothing here knows a framework.
+//! could break. Module objects and the JavaScript global objects are recorded too, so a pack can
+//! see a process-wide hook (`axios.defaults…`, `globalThis.fetch = …`, Go's
+//! `http.DefaultTransport = …`; contract M4a amendment 15). Nothing here knows a framework.
 
 use std::collections::HashSet;
 
 use tree_sitter::Node;
 
-use crate::{Binding, CallChain, Language, NameToken, TokenRole, span, text};
+use crate::{Binding, CallChain, Import, Language, NameToken, TokenRole, span, text};
+
+/// The JavaScript global objects, whose members are process-wide (amendment 15).
+const GLOBAL_OBJECTS: &[&str] = &["globalThis", "window", "global", "self"];
 
 /// The names whose tokens are recorded: names a binding (a field or member too) initialises
-/// with a call, and simple targets of an assignment from a call. TypeScript, JavaScript and
-/// Java only.
+/// with a call or a Java `new`, and simple targets of an assignment from a call (TypeScript, JavaScript and
+/// Java); the local names of TS/JS default and namespace imports of a package (not a relative
+/// path) and the global objects (TypeScript, JavaScript); the local names of Go imports.
 pub(crate) fn candidates(
     language: Language,
     bindings: &[Binding],
     chains: &[CallChain],
+    imports: &[Import],
 ) -> HashSet<String> {
     let mut out = HashSet::new();
     if !records(language) {
         return out;
     }
     let mut add = |name: &str| {
-        if !name.is_empty() && !name.contains(['.', '(', ' ']) {
+        if !name.is_empty() && !name.contains(['.', '(', ' ', '/']) {
             out.insert(name.to_owned());
         }
     };
+    if language == Language::Go {
+        for i in imports {
+            // A blank import binds no name (`.` is rejected by `add`).
+            match i.alias.as_deref() {
+                Some("_") => {}
+                Some(a) => add(a),
+                None => add(i.module.rsplit('/').next().unwrap_or_default()),
+            }
+        }
+        return out;
+    }
+    if language != Language::Java {
+        for name in GLOBAL_OBJECTS {
+            add(name);
+        }
+        for i in imports.iter().filter(|i| !i.module.starts_with(['.', '/'])) {
+            if let Some(a) = &i.alias {
+                add(a);
+            }
+            for n in i.names.iter().filter(|n| n.name == "default") {
+                add(&n.local);
+            }
+        }
+    }
     for b in bindings {
-        if matches!(b.init, Some(crate::Init::Call { .. })) {
+        if matches!(
+            b.init,
+            Some(crate::Init::Call { .. } | crate::Init::New { .. })
+        ) {
             add(&b.name);
         }
     }
@@ -42,7 +76,7 @@ pub(crate) fn candidates(
 fn records(language: Language) -> bool {
     matches!(
         language,
-        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Java
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Java | Language::Go
     )
 }
 
@@ -57,7 +91,6 @@ pub(crate) fn tokens(
     if candidates.is_empty() || !records(language) {
         return out;
     }
-    let java = language == Language::Java;
     let mut stack = vec![root];
     let mut cursor = root.walk();
     while let Some(node) = stack.pop() {
@@ -70,7 +103,7 @@ pub(crate) fn tokens(
             let name = text(node, source);
             if candidates.contains(&name) {
                 out.push(NameToken {
-                    role: role(java, node, source),
+                    role: role(language, node, source),
                     name,
                     span: span(node),
                 });
@@ -89,12 +122,31 @@ fn is_field(parent: Node<'_>, field: &str, node: Node<'_>) -> bool {
 }
 
 /// What one token is: the name of a TS/JS `const`/`let` declarator that is not exported, or of
-/// a Java local variable declarator; the receiver of a member call (no optional chaining);
-/// anything else.
-fn role(java: bool, node: Node<'_>, source: &[u8]) -> TokenRole {
+/// a Java local variable declarator; the receiver of a member call (no optional chaining); the
+/// object of a member access that is not called (TS/JS `x.m`, Go `x.M`, read or written, also
+/// continued: `x.m.n = …`); anything else.
+fn role(language: Language, node: Node<'_>, source: &[u8]) -> TokenRole {
     let Some(parent) = node.parent() else {
         return TokenRole::Other;
     };
+    let java = language == Language::Java;
+    if language == Language::Go {
+        if parent.kind() != "selector_expression" || !is_field(parent, "operand", node) {
+            return TokenRole::Other;
+        }
+        let Some(field) = parent.child_by_field_name("field") else {
+            return TokenRole::Other;
+        };
+        let called = parent
+            .parent()
+            .is_some_and(|c| c.kind() == "call_expression" && is_field(c, "function", parent));
+        let name = text(field, source);
+        return if called {
+            TokenRole::Receiver { call: name }
+        } else {
+            TokenRole::Member { name }
+        };
+    }
     if parent.kind() == "variable_declarator" && is_field(parent, "name", node) {
         let declaration = parent.parent();
         let declared = if java {
@@ -121,17 +173,27 @@ fn role(java: bool, node: Node<'_>, source: &[u8]) -> TokenRole {
             n.children(&mut cursor)
                 .any(|c| matches!(c.kind(), "optional_chain" | "?."))
         };
-        parent
+        if parent.kind() != "member_expression"
+            || !is_field(parent, "object", node)
+            || optional(parent)
+        {
+            return TokenRole::Other;
+        }
+        let Some(property) = parent.child_by_field_name("property") else {
+            return TokenRole::Other;
+        };
+        match parent
             .parent()
-            .filter(|call| {
-                parent.kind() == "member_expression"
-                    && is_field(parent, "object", node)
-                    && !optional(parent)
-                    && call.kind() == "call_expression"
-                    && is_field(*call, "function", parent)
-                    && !optional(*call)
-            })
-            .and_then(|_| parent.child_by_field_name("property"))
+            .filter(|c| c.kind() == "call_expression" && is_field(*c, "function", parent))
+        {
+            Some(call) if optional(call) => None,
+            Some(_) => Some(property),
+            None => {
+                return TokenRole::Member {
+                    name: text(property, source),
+                };
+            }
+        }
     };
     match call {
         Some(name) => TokenRole::Receiver {
@@ -155,6 +217,7 @@ mod tests {
                 let role = match &t.role {
                     TokenRole::Declaration => "decl".to_owned(),
                     TokenRole::Receiver { call } => format!(".{call}"),
+                    TokenRole::Member { name } => format!("~{name}"),
                     TokenRole::Other => "other".to_owned(),
                 };
                 format!("{}@{} {role}", t.name, t.span[0])
@@ -172,18 +235,25 @@ mod tests {
         let ts = "import axios from \"axios\";\nfunction setup() { api.defaults.baseURL = \"x\"; }\nconst api = axios.create({ baseURL: \"http://orders\" });\napi.get(\"/a\");\napi?.get(\"/b\");\napi.get?.(\"/c\");\napi(\"/d\");\nexport { api as ordersApi };\nexport const ex = axios.create();\nlet lv = axios.create();\nlv = other;\nvar vv = axios.create();\nmodule.exports = { api };\nconst { api: a2 } = x;\nfunction f(api) { return api[\"defaults\"]; }\nconst plain = 1;\nuse(plain);\n";
         assert_eq!(
             tokens(Language::TypeScript, ts),
+            // The `axios` import is a module object (amendment 15); a member write is a
+            // `member` token.
             [
-                "api@1 other",
+                "axios@0 other",
+                "api@1 ~defaults",
                 "api@2 decl",
+                "axios@2 .create",
                 "api@3 .get",
                 "api@4 other",
                 "api@5 other",
                 "api@6 other",
                 "api@7 other",
                 "ex@8 other",
+                "axios@8 .create",
                 "lv@9 decl",
+                "axios@9 .create",
                 "lv@10 other",
                 "vv@11 other",
+                "axios@11 .create",
                 "api@12 other",
                 "api@14 other",
                 "api@14 other",
@@ -206,13 +276,54 @@ mod tests {
                 "c@11 other",
             ]
         );
-        // Go and Python record nothing.
+        // Python records nothing; Go records only its imports' names (below).
         assert!(
             tokens(
                 Language::Go,
                 "package m\nvar c = mk()\nfunc f() { use(c) }\n"
             )
             .is_empty()
+        );
+        assert!(tokens(Language::Python, "import requests\nc = requests.get(u)\n").is_empty());
+    }
+
+    /// Contract M4a amendment 15: the tokens of module objects (a TS/JS default or namespace
+    /// import of a package, never of a relative path; a Go import) and of the JavaScript global
+    /// objects are recorded, and a member access that is not called is a `member` token naming
+    /// its first member, so a pack can see a process-wide hook (`axios.defaults.baseURL = …`,
+    /// `axios.interceptors.request.use(…)`, `globalThis.fetch = …`, `http.DefaultTransport =
+    /// …`) and tell it from a request (`axios.get(…)`, `window.fetch(…)`, `http.Get(…)`).
+    #[test]
+    fn module_and_global_object_tokens() {
+        let ts = "import axios from \"axios\";\nimport * as ns from \"ky\";\nimport local from \"./local\";\nimport { named } from \"pkg\";\naxios.defaults.baseURL = \"x\";\naxios.interceptors.request.use(f);\naxios.get(\"/a\");\naxios(\"/b\");\nglobalThis.fetch = f;\nwindow.fetch(\"/c\");\nglobal.fetch.bind(null);\nself?.fetch;\nns.x;\nlocal.y;\nnamed.z;\n";
+        assert_eq!(
+            tokens(Language::TypeScript, ts),
+            [
+                "axios@0 other",
+                "ns@1 other",
+                "axios@4 ~defaults",
+                "axios@5 ~interceptors",
+                "axios@6 .get",
+                "axios@7 other",
+                "globalThis@8 ~fetch",
+                "window@9 .fetch",
+                "global@10 ~fetch",
+                "self@11 other",
+                "ns@12 ~x",
+            ]
+        );
+        let go = "package main\nimport (\n\t\"net/http\"\n\tf \"fmt\"\n\t_ \"embed\"\n)\nfunc main() {\n\thttp.DefaultTransport = t\n\thttp.DefaultClient.Transport = t\n\thttp.DefaultClient.Do(req)\n\thttp.Get(\"/a\")\n\tf.Println(http.StatusOK)\n\t_ = f.Sprint()\n}\n";
+        assert_eq!(
+            tokens(Language::Go, go),
+            [
+                "http@7 ~DefaultTransport",
+                "http@8 ~DefaultClient",
+                "http@9 ~DefaultClient",
+                "http@10 .Get",
+                "f@11 .Println",
+                "http@11 ~StatusOK",
+                "f@12 .Sprint",
+            ]
         );
     }
 }

@@ -331,6 +331,22 @@ pub(crate) fn init(
     if let Some(&chain) = chains.get(&node.id()) {
         return Some(Init::Call { chain });
     }
+    if language == Language::Java && node.kind() == "object_creation_expression" {
+        let type_name = node.child_by_field_name("type").map(|t| {
+            let t = match t.kind() {
+                "generic_type" => t.named_child(0).unwrap_or(t),
+                _ => t,
+            };
+            capped(text(t, source))
+        })?;
+        let args = node.child_by_field_name("arguments").map_or(0, |a| {
+            let mut c = a.walk();
+            a.named_children(&mut c)
+                .filter(|a| !matches!(a.kind(), "line_comment" | "block_comment"))
+                .count()
+        });
+        return Some(Init::New { type_name, args });
+    }
     if is_name(&syn, node) {
         return Some(Init::Name {
             text: capped(text(node, source)),

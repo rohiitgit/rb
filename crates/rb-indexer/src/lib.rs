@@ -55,8 +55,10 @@ use serde_json::{Value, json};
 /// matched by suffix, the config client turned off only by a base document, `cross-fetch` and
 /// inline client instances), `m4a-http-8` evaluator pass 4's (M4a amendment 14: a conservative
 /// token scan verifies instance bases, a `uriBuilderFactory` overrides `baseUrl`, any
-/// `spring.config.activate.*` document is conditional).
-pub const PIPELINE: &str = "m4a-http-8";
+/// `spring.config.activate.*` document is conditional), `m4a-http-9` evaluator pass 5's (M4a
+/// amendment 15: every carrier gated, whatever the URL's source; global hooks cap bare module
+/// clients).
+pub const PIPELINE: &str = "m4a-http-9";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

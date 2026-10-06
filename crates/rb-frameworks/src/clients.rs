@@ -101,12 +101,18 @@ pub struct ClientCall {
     /// taken as the injected instance (dependency injection is M4b), so the site never reaches
     /// `synthetic` (contract M4a amendment 12).
     pub base_from_bean: bool,
-    /// Gate A (contract M4a amendments 13 and 14): for a call on a client instance whose base
-    /// comes from its construction, whether that base is provably unchanged ([`Gate`]); `None`
-    /// when the call is on no such instance. An unverified base still restricts by host, but
-    /// the site never reaches `synthetic`. For an imported instance the indexer decides (it is
-    /// exported, so never verified).
+    /// Gate A (contract M4a amendments 13–15) on what carries the request: `Some(false)` when
+    /// the carrier (the instance, builder or copy the request is sent through) or the request
+    /// itself is not provably plain, whatever the URL's source, so the site never reaches
+    /// `synthetic` (its host still restricts); otherwise `Some(true)` when the base comes from
+    /// the carrier's construction and `None` when it does not. For an imported axios instance
+    /// the indexer decides (it is exported, so never verified); for a [`Self::module_call`] the
+    /// indexer caps it when the repository reconfigures that module ([`global_hooks`]).
     pub base_verified: Option<bool>,
+    /// The call is on a client module itself: global `fetch` (or `node-fetch`/`cross-fetch`),
+    /// the axios default export, Go's `net/http` package or `http.DefaultClient` (amendment
+    /// 15, a bare module client).
+    pub module_call: bool,
 }
 
 /// An axios instance bound to a name: `const api = axios.create({ baseURL })`.
@@ -117,7 +123,7 @@ pub struct AxiosInstance {
     pub top_level: bool,
     /// Gate A ([`Gate`]): a function local or an unexported module-level `const` whose every
     /// token is its declaration or the receiver of a request call, and whose `create` config
-    /// has no spread after its `baseURL`.
+    /// is plain ([`plain_config`]): a provably plain carrier (amendment 15).
     pub verified: bool,
 }
 
@@ -218,11 +224,143 @@ impl<'f> Gate<'f> {
             match &t.role {
                 TokenRole::Declaration => declarations += 1,
                 TokenRole::Receiver { call } => calls.push(call.as_str()),
-                TokenRole::Other => return None,
+                TokenRole::Member { .. } | TokenRole::Other => return None,
             }
         }
         (declarations == 1).then_some(calls)
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Global hooks: a bare module client is plain only while nothing reconfigures the module
+// (contract M4a amendment 15)
+
+/// The JavaScript global objects whose `fetch` member is the global `fetch`.
+const GLOBAL_OBJECTS: &[&str] = &["globalThis", "window", "global", "self"];
+
+/// The axios module's members that send a request or build an instance, and its pure helpers.
+const AXIOS_MODULE_CALLS: &[&str] = &[
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "head",
+    "options",
+    "request",
+    "create",
+    "isAxiosError",
+    "isCancel",
+];
+
+/// A Go `http.Client`'s methods.
+const GO_CLIENT_METHODS: &[&str] = &[
+    "Do",
+    "Get",
+    "Head",
+    "Post",
+    "PostForm",
+    "CloseIdleConnections",
+];
+
+/// The module clients this file may reconfigure for the whole process (contract M4a amendment
+/// 15), from its name tokens, name-based and scope-insensitive like [`Gate`]:
+/// - `fetch`: the `fetch` member of a global object written, read or passed on without being
+///   called (`globalThis.fetch = …`, `window.fetch = …`, `const f = global.fetch`);
+/// - axios: any token of the axios module's local name other than its import or `require`
+///   declaration, a call of it (`axios(…)`), or a request, `create` or helper call on it, so
+///   `axios.defaults…`, `axios.interceptors…`, aliasing it, exporting it or passing it on;
+/// - Go `net/http`: `http.DefaultTransport` in any use, and `http.DefaultClient` in any use but
+///   as the receiver of a client method (`http.DefaultClient = …`, `….Transport = …`, `c :=
+///   http.DefaultClient`).
+///
+/// The indexer caps every [`ClientCall::module_call`] of a kind any file of the repository
+/// reconfigures.
+pub fn global_hooks(language: Language, facts: &FileFacts) -> Vec<ClientKind> {
+    let mut out = Vec::new();
+    let within = |inner: Span, outer: Span| {
+        (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
+    };
+    match language {
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            if facts.name_tokens.iter().any(|t| {
+                crate::work::tick(1);
+                GLOBAL_OBJECTS.contains(&t.name.as_str())
+                    && matches!(&t.role, TokenRole::Member { name } if name == "fetch")
+            }) {
+                out.push(ClientKind::Fetch);
+            }
+            let (names, requires) = module_names(facts, "axios", &["default"], true);
+            let callees: HashSet<(i32, i32)> = facts
+                .chains
+                .iter()
+                .filter(|c| c.root.is_none())
+                .filter_map(|c| c.links.first())
+                .map(|l| (l.span[0], l.span[1]))
+                .collect();
+            let declared = |t: &rb_syntax::NameToken| {
+                facts.imports.iter().any(|i| within(t.span, i.span))
+                    || requires
+                        .iter()
+                        .any(|&bi| within(t.span, facts.bindings[bi].span))
+            };
+            if facts.name_tokens.iter().any(|t| {
+                crate::work::tick(1);
+                names.contains(&t.name)
+                    && !match &t.role {
+                        TokenRole::Declaration => true,
+                        TokenRole::Receiver { call } => AXIOS_MODULE_CALLS.contains(&call.as_str()),
+                        TokenRole::Member { .. } => false,
+                        TokenRole::Other => {
+                            callees.contains(&(t.span[0], t.span[1])) || declared(t)
+                        }
+                    }
+            }) {
+                out.push(ClientKind::Axios);
+            }
+        }
+        Language::Go => {
+            let Some(http) = facts
+                .imports
+                .iter()
+                .find(|i| i.module == "net/http")
+                .and_then(|i| match i.alias.as_deref() {
+                    Some("_" | ".") => None,
+                    Some(a) => Some(a.to_owned()),
+                    None => Some("http".to_owned()),
+                })
+            else {
+                return out;
+            };
+            let default_client = format!("{http}.DefaultClient");
+            let requests: HashSet<(i32, i32)> = facts
+                .chains
+                .iter()
+                .filter(|c| {
+                    c.root.as_deref() == Some(default_client.as_str())
+                        && c.links
+                            .first()
+                            .is_some_and(|l| GO_CLIENT_METHODS.contains(&l.name.as_str()))
+                })
+                .map(|c| (c.span[0], c.span[1]))
+                .collect();
+            if facts.name_tokens.iter().any(|t| {
+                crate::work::tick(1);
+                t.name == http
+                    && match &t.role {
+                        TokenRole::Member { name } if name == "DefaultTransport" => true,
+                        TokenRole::Member { name } if name == "DefaultClient" => {
+                            !requests.contains(&(t.span[0], t.span[1]))
+                        }
+                        _ => false,
+                    }
+            }) {
+                out.push(ClientKind::GoHttp);
+            }
+        }
+        Language::Java | Language::Python => {}
+    }
+    out
 }
 
 fn entry<'a>(arg: Option<&'a Arg>, key: &str) -> Option<&'a Arg> {
@@ -305,6 +443,7 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
             source: chain.enclosing,
             base_from_bean: false,
             base_verified: None,
+            module_call: true,
         });
     }
 }
@@ -368,6 +507,62 @@ const AXIOS_REQUESTS: &[&str] = &[
     "get", "post", "put", "delete", "patch", "head", "options", "request",
 ];
 
+/// The axios config keys that leave where a request goes to `baseURL` and `url` (Gate A,
+/// contract M4a amendment 15). Anything else (`adapter`, `transformRequest`,
+/// `transformResponse`, `httpAgent`, `httpsAgent`, `proxy`, `lookup`, `socketPath`,
+/// `beforeRedirect`, …) may replace the transport or rewrite the request.
+const PLAIN_AXIOS_KEYS: &[&str] = &[
+    "baseURL",
+    "url",
+    "method",
+    "headers",
+    "params",
+    "paramsSerializer",
+    "data",
+    "timeout",
+    "timeoutErrorMessage",
+    "withCredentials",
+    "auth",
+    "responseType",
+    "responseEncoding",
+    "xsrfCookieName",
+    "xsrfHeaderName",
+    "withXSRFToken",
+    "onUploadProgress",
+    "onDownloadProgress",
+    "maxContentLength",
+    "maxBodyLength",
+    "maxRedirects",
+    "validateStatus",
+    "decompress",
+    "signal",
+    "cancelToken",
+    "transitional",
+];
+
+/// An axios `create` or request config Gate A can certify (amendment 15): none, or an object
+/// literal whose every key is in [`PLAIN_AXIOS_KEYS`] (a spread may hold anything).
+fn plain_config(config: Option<&Arg>) -> bool {
+    match config {
+        None => true,
+        Some(Arg::Object { entries, .. }) => entries
+            .iter()
+            .all(|e| PLAIN_AXIOS_KEYS.contains(&e.key.as_str())),
+        Some(_) => false,
+    }
+}
+
+/// Gate A's verdict on a call (amendment 15): `Some(false)` when its carrier or request is not
+/// provably plain; else `Some(true)` when the base comes from the carrier's construction,
+/// `None` when it does not.
+fn verdict(plain: bool, base_from_carrier: bool) -> Option<bool> {
+    if plain {
+        base_from_carrier.then_some(true)
+    } else {
+        Some(false)
+    }
+}
+
 fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
     let (names, requires) = module_names(facts, "axios", &["default"], true);
     // `name` at `at` is the axios module: one of its local names, not shadowed by a parameter
@@ -388,8 +583,8 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
             && is_axios(root, c.span)
             && link.name == "create"
         {
-            let (base, spread) = create_base(link.args.first());
-            let verified = !spread && gate.unchanged(bi, AXIOS_REQUESTS);
+            let verified = plain_config(link.args.first()) && gate.unchanged(bi, AXIOS_REQUESTS);
+            let base = create_base(link.args.first());
             out.axios_instances.push(AxiosInstance {
                 name: b.name.clone(),
                 base: base.clone(),
@@ -417,10 +612,11 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
         // `axios(url | config)`, `axios(url, config)`.
         if chain.root.is_none() {
             if is_axios(&first.name, chain.span) && !first.args.is_empty() {
-                let call = match first.args.first() {
+                let mut call = match first.args.first() {
                     Some(config @ Arg::Object { .. }) => config_call(chain, None, None, config),
                     url => axios_call(chain, None, None, url, None, first.args.get(1)),
                 };
+                call.module_call = true;
                 out.calls.push(call);
             }
             continue;
@@ -428,30 +624,38 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
         let root = chain.root.as_deref().unwrap_or_default();
         let bound = facts.binding_index_at(root, chain.span);
         // An inline instance, `axios.create(config).get(…)`: no binding, so nothing changes
-        // it after its construction but a spread in its config (evaluator pass 3, R8).
+        // it after its construction (evaluator pass 3, R8); a plain carrier when its config is
+        // plain (amendment 15).
         if is_axios(root, chain.span)
             && first.name == "create"
             && let Some(link) = chain.links.get(1)
         {
-            let (base, spread) = create_base(first.args.first());
-            let verified = base.is_some().then_some(!spread);
+            let plain = plain_config(first.args.first());
+            let base = create_base(first.args.first());
+            let from_carrier = base.is_some();
             if let Some(mut call) = axios_request(chain, link, base, None) {
-                call.base_verified = verified;
+                call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
                 out.calls.push(call);
             }
             continue;
         }
-        let (base, instance, verified) = if is_axios(root, chain.span) {
+        // The module itself (a bare module client), a local instance (its Gate A verdict), or
+        // an imported name the indexer resolves.
+        let module = is_axios(root, chain.span);
+        let (base, instance, carrier) = if module {
             (None, None, None)
         } else if let Some((base, verified)) = bound.and_then(|bi| instances.get(&bi)) {
-            (base.clone(), None, base.is_some().then_some(*verified))
+            (base.clone(), None, Some((*verified, base.is_some())))
         } else if bound.is_none() && imported.contains(root) {
             (None, Some(root.to_owned()), None)
         } else {
             continue;
         };
         if let Some(mut call) = axios_request(chain, first, base, instance) {
-            call.base_verified = verified;
+            if let Some((plain, from_carrier)) = carrier {
+                call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
+            }
+            call.module_call = module;
             out.calls.push(call);
         }
     }
@@ -491,34 +695,29 @@ fn axios_request(
     }
     Some(match link.args.first() {
         Some(config @ Arg::Object { .. }) => config_call(chain, base, instance, config),
-        // A config that cannot be read: no URL, method or base.
+        // A config that cannot be read: no URL, method or base, and not plain.
         _ => ClientCall {
             method: None,
             url: UrlValue::Unknown,
             base: Some(UrlValue::Unknown),
+            base_verified: Some(false),
             ..axios_call(chain, base, instance, None, None, None)
         },
     })
 }
 
-/// The base an `axios.create(config)` states, and whether a spread after its `baseURL` (or
-/// with none before it) may replace it: the instance keeps the stated base, unverified (Gate
-/// A; spreads are never folded).
-fn create_base(config: Option<&Arg>) -> (Option<UrlValue>, bool) {
+/// The base an `axios.create(config)` states (its last `baseURL`). A spread anywhere in the
+/// config makes the instance's carrier not plain ([`plain_config`]; spreads are never folded),
+/// so a spread after `baseURL` that may replace it leaves the base unverified.
+fn create_base(config: Option<&Arg>) -> Option<UrlValue> {
     let Some(Arg::Object { entries, .. }) = config else {
-        return (None, false);
+        return None;
     };
-    let base = entries
+    entries
         .iter()
         .rev()
         .find(|e| e.key == "baseURL")
-        .map(|e| UrlValue::of(Some(&e.value)));
-    let spread_after = entries
-        .iter()
-        .rev()
-        .take_while(|e| e.key != "baseURL")
-        .any(|e| e.key == "...");
-    (base, spread_after)
+        .map(|e| UrlValue::of(Some(&e.value)))
 }
 
 /// The base a request config states (contract M4a amendment 12, Q1): `None` when the call has
@@ -567,7 +766,10 @@ fn axios_call(
         span: chain.span,
         source: chain.enclosing,
         base_from_bean: false,
-        base_verified: None,
+        // A request config that is not plain (an `adapter`, a spread, a variable) may send the
+        // request elsewhere whatever carries it (amendment 15).
+        base_verified: (!plain_config(config)).then_some(false),
+        module_call: false,
     }
 }
 
@@ -650,21 +852,20 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBas
             continue;
         }
         // The root URI configured on the instance; a relative URL needs one (amendment 12).
+        // The carrier is the instance (Gate A), or an inline `new RestTemplate()`, plain.
         let base = bases.of(receiver, ClientKind::RestTemplate);
-        let verified = match base.value {
-            UrlValue::Unknown => None,
-            _ => base.verified,
-        };
+        let plain = receiver.is_none_or(|bi| bases.carrier(bi));
         out.calls.push(ClientCall {
             kind: ClientKind::RestTemplate,
             method,
             url: java_url(facts, first.args.first()),
+            base_verified: verdict(plain, base.read),
             base: Some(base.value),
             instance: None,
             span: chain.span,
             source: chain.enclosing,
             base_from_bean: base.from_bean,
-            base_verified: verified,
+            module_call: false,
         });
     }
 }
@@ -793,10 +994,12 @@ const PLAIN_LINKS: &[&str] = &[
 /// (not from a builder or client binding, whose state is not read) and its links before `upto`
 /// are all [`PLAIN_LINKS`].
 fn plain_construction(facts: &FileFacts, chain: &CallChain, upto: usize) -> bool {
-    fresh_root(facts, chain)
-        && chain.links[..upto]
-            .iter()
-            .all(|l| PLAIN_LINKS.contains(&l.name.as_str()))
+    fresh_root(facts, chain) && plain_links(&chain.links[..upto])
+}
+
+/// Every link is one of [`PLAIN_LINKS`].
+fn plain_links(links: &[rb_syntax::CallLink]) -> bool {
+    links.iter().all(|l| PLAIN_LINKS.contains(&l.name.as_str()))
 }
 
 /// The base of `new DefaultUriBuilderFactory(base)`; anything else cannot be read.
@@ -874,12 +1077,13 @@ struct SpringBases<'s, 'f> {
 struct SpringBase {
     value: UrlValue,
     from_bean: bool,
-    /// Gate A: `None` when no base was read from the instance's construction.
-    verified: Option<bool>,
+    /// The base was read from the carrier's construction (not unknown, not a `@Bean`'s).
+    read: bool,
 }
 
 /// The calls on a Spring client or builder binding that leave its configuration as built
-/// (Gate A): requests, and `mutate()`, which copies.
+/// (Gate A): requests. Not `mutate()`: the copy it returns is configured by links the scan of
+/// the binding does not read (evaluator pass 5, U1).
 fn spring_requests(facts: &FileFacts, type_name: &str) -> &'static [&'static str] {
     const BUILD: &[&str] = &["build"];
     const REST_TEMPLATE: &[&str] = &[
@@ -895,7 +1099,7 @@ fn spring_requests(facts: &FileFacts, type_name: &str) -> &'static [&'static str
         "execute",
     ];
     const FLUENT: &[&str] = &[
-        "get", "post", "put", "delete", "patch", "head", "options", "method", "mutate",
+        "get", "post", "put", "delete", "patch", "head", "options", "method",
     ];
     if type_name.ends_with("Builder") {
         BUILD
@@ -955,38 +1159,70 @@ impl<'s, 'f> SpringBases<'s, 'f> {
         }
     }
 
+    /// Whether the binding `bi` is a provably plain carrier (Gate A, contract M4a amendments
+    /// 14 and 15): it passes the [`Gate`] scan, something in sight builds it, and every chain
+    /// that configures it is a [`plain_construction`]. A field, a parameter, an injected
+    /// instance and one configured by a non-plain link never are.
+    fn carrier(&self, bi: usize) -> bool {
+        let b = &self.facts.bindings[bi];
+        // A binding with no initialiser has no `declaration` token or is written to, so the
+        // scan below fails it.
+        let init = match &b.init {
+            Some(Init::Call { chain }) => Some(*chain),
+            // `new RestTemplate()`: a new client with no links (an argument may be a request
+            // factory, and a subclass may override anything, so neither is plain).
+            Some(Init::New { type_name, args }) => {
+                if *args > 0 || type_name.rsplit('.').next() != Some("RestTemplate") {
+                    return false;
+                }
+                None
+            }
+            Some(_) => return false,
+            None => None,
+        };
+        let chains: Vec<usize> = init
+            .into_iter()
+            .chain(self.configured.get(&bi).into_iter().flatten().copied())
+            .collect();
+        self.gate
+            .unchanged(bi, spring_requests(self.facts, &b.type_name))
+            && chains.iter().all(|&ci| {
+                self.facts
+                    .chains
+                    .get(ci)
+                    .is_some_and(|c| plain_construction(self.facts, c, c.links.len()))
+            })
+    }
+
     /// The base of a `kind` client bound at `receiver`: one stated base when everything that
     /// configures the instance agrees, else unknown. An instance nothing in the file
-    /// configures is injected: the file's `@Bean` methods for that kind decide, the same way,
-    /// and such a base is never verified. A base read from the instance is verified when the
-    /// binding passes the [`Gate`] and every chain that configures it is a
-    /// [`plain_construction`].
+    /// configures is injected: the file's `@Bean` methods for that kind decide, the same way
+    /// (such an instance is never a plain carrier, so its base is never verified).
     fn of(&self, receiver: Option<usize>, kind: ClientKind) -> SpringBase {
         let unknown = SpringBase {
             value: UrlValue::Unknown,
             from_bean: false,
-            verified: None,
+            read: false,
         };
         let Some(bi) = receiver else {
             return unknown;
         };
         let b = &self.facts.bindings[bi];
-        let mut chains: Vec<usize> = Vec::new();
         let mut facts: Vec<BaseFact> = Vec::new();
         match &b.init {
             Some(Init::Call { chain }) => {
                 if let Some(c) = self.facts.chains.get(*chain) {
                     facts.push(chain_base(self.facts, c, c.links.len()));
-                    chains.push(*chain);
                 }
             }
+            // A constructor argument (a request factory, converters) sets no root URI.
+            Some(Init::New { .. }) => facts.push(BaseFact::Fresh),
             Some(_) => facts.push(BaseFact::Unreadable),
             None => {}
         }
         for &ci in self.configured.get(&bi).into_iter().flatten() {
             let c = &self.facts.chains[ci];
             facts.push(chain_base(self.facts, c, c.links.len()));
-            chains.push(ci);
         }
         if facts.is_empty() {
             let beans = self.beans.get(&kind).map_or(&[][..], Vec::as_slice);
@@ -994,7 +1230,7 @@ impl<'s, 'f> SpringBases<'s, 'f> {
                 Some(value) => SpringBase {
                     value,
                     from_bean: true,
-                    verified: Some(false),
+                    read: false,
                 },
                 None => unknown,
             };
@@ -1002,17 +1238,10 @@ impl<'s, 'f> SpringBases<'s, 'f> {
         let Some(value) = agreed(&facts) else {
             return unknown;
         };
-        let verified = self
-            .gate
-            .unchanged(bi, spring_requests(self.facts, &b.type_name))
-            && chains.iter().all(|&ci| {
-                let c = &self.facts.chains[ci];
-                plain_construction(self.facts, c, c.links.len())
-            });
         SpringBase {
             value,
             from_bean: false,
-            verified: Some(verified),
+            read: true,
         }
     }
 }
@@ -1088,34 +1317,43 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases)
         // A base stated in the call's own chain wins; otherwise the instance's (amendment 12).
         // A server-side client has no origin of its own, so with no base in sight the base is
         // unknown, never empty: a relative URI is then matched by suffix (evaluator pass 1).
-        let base = match chain_base(facts, chain, verb) {
-            // Its own chain's base: verified when the chain is a plain construction (Gate A).
-            BaseFact::Stated(value) => SpringBase {
-                value,
-                from_bean: false,
-                verified: Some(plain_construction(facts, chain, verb)),
-            },
-            BaseFact::Fresh => SpringBase {
-                value: UrlValue::Unknown,
-                from_bean: false,
-                verified: None,
-            },
-            BaseFact::Unreadable => bases.of(receiver, kind),
-        };
-        let verified = match base.value {
-            UrlValue::Unknown => None,
-            _ => base.verified,
+        // The carrier (Gate A, amendments 14 and 15): a chain that builds its own client is
+        // plain when it is a [`plain_construction`]; a request on a binding is plain when the
+        // binding is a plain carrier and the request chain's own links before the verb are
+        // plain (`x.mutate().filter(…)…` is not: evaluator pass 5, U1).
+        let (base, plain) = match chain_base(facts, chain, verb) {
+            BaseFact::Stated(value) => (
+                SpringBase {
+                    value,
+                    from_bean: false,
+                    read: true,
+                },
+                plain_construction(facts, chain, verb),
+            ),
+            BaseFact::Fresh => (
+                SpringBase {
+                    value: UrlValue::Unknown,
+                    from_bean: false,
+                    read: false,
+                },
+                plain_construction(facts, chain, verb),
+            ),
+            BaseFact::Unreadable => (
+                bases.of(receiver, kind),
+                receiver.is_some_and(|bi| bases.carrier(bi)) && plain_links(&chain.links[..verb]),
+            ),
         };
         out.calls.push(ClientCall {
             kind,
             method,
             url,
+            base_verified: verdict(plain, base.read && base.value != UrlValue::Unknown),
             base: Some(base.value),
             instance: None,
             span: chain.span,
             source: chain.enclosing,
             base_from_bean: base.from_bean,
-            base_verified: verified,
+            module_call: false,
         });
     }
 }
@@ -1246,7 +1484,9 @@ fn feign(facts: &FileScope<'_>, out: &mut FileClients) {
                     span: d.span,
                     source: Some(m),
                     base_from_bean: false,
+                    // A declarative interface: no instance carries the request (amendment 15).
                     base_verified: None,
+                    module_call: false,
                 });
             }
         }
@@ -1277,8 +1517,9 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             continue;
         };
         let on_package = root == http;
+        let on_default = root == format!("{http}.DefaultClient");
         let on_client = !on_package
-            && (root == format!("{http}.DefaultClient")
+            && (on_default
                 || facts
                     .binding_at(root, chain.span)
                     .is_some_and(|b| b.type_name == format!("{http}.Client")));
@@ -1299,6 +1540,7 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             }
             _ => continue,
         };
+        let bare = on_default || on_package && !link.name.starts_with("NewRequest");
         let url = match url {
             Some(Arg::Other { span }) => fmt
                 .as_deref()
@@ -1315,7 +1557,12 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             span: chain.span,
             source: chain.enclosing,
             base_from_bean: false,
-            base_verified: None,
+            // The package's functions and `http.DefaultClient` are the bare module client
+            // (amendment 15); a `http.Client` binding is not provably plain (its `Transport`
+            // may reroute), nor is a request built by `NewRequest`, which whatever `Do`es it
+            // carries.
+            base_verified: (!bare).then_some(false),
+            module_call: bare,
         });
     }
 }
@@ -1509,13 +1756,14 @@ mod tests {
         assert_eq!(
             calls(Language::Java, src),
             [
-                "rest_template GET 'http://visits/owners/{id}' base=?",
-                "rest_template PUT '{BASE}/x' base=?",
-                "rest_template ? '/y' base=?",
-                // A field's base is never verified (amendment 14).
+                // A field is never a plain carrier, whatever the URL's source (amendments 14
+                // and 15).
+                "rest_template GET 'http://visits/owners/{id}' base=? unverified",
+                "rest_template PUT '{BASE}/x' base=? unverified",
+                "rest_template ? '/y' base=? unverified",
                 "web_client GET '/owners/{ownerId}' base='http://customers-service' unverified",
-                "web_client POST 'http://visits-service/pets/visits' base=?",
-                "rest_client DELETE '/r' base=?",
+                "web_client POST 'http://visits-service/pets/visits' base=? unverified",
+                "rest_client DELETE '/r' base=? unverified",
                 "web_client GET '' base='http://x'",
             ]
         );
@@ -1527,7 +1775,7 @@ mod tests {
         assert_eq!(
             calls(Language::Java, ctor),
             [
-                "rest_template GET 'http://localhost:{port}/x/{id}' base=?",
+                "rest_template GET 'http://localhost:{port}/x/{id}' base=? unverified",
                 "web_client GET '/owners' base='http://customers' unverified",
             ]
         );
@@ -1612,15 +1860,17 @@ mod tests {
                 "axios POST '/charges' base='https://api.stripe.com'",
                 "axios POST '/charges' base='http://orders'",
                 "axios GET '/a' base='http://orders'",
-                "axios GET '/b' base=?",
-                "axios GET '/c' base=?",
-                "axios GET '/d' base='https://x.io'",
+                // A request config that is not a plain object literal (a variable, a spread)
+                // may hold an `adapter`: not plain, whatever the base (amendment 15).
+                "axios GET '/b' base=? unverified",
+                "axios GET '/c' base=? unverified",
+                "axios GET '/d' base='https://x.io' unverified",
                 "axios GET '/e' base=?",
                 "axios GET '/f' base=B",
                 "axios POST '/h'",
-                "axios PUT '/i' base=?",
-                "axios ? ? base=?",
-                "axios ? '/j' base=?",
+                "axios PUT '/i' base=? unverified",
+                "axios ? ? base=? unverified",
+                "axios ? '/j' base=? unverified",
                 "axios DELETE '/k' base='https://api.stripe.com'",
                 "axios GET '/l' base='https://api.stripe.com' instance=shared",
                 "axios GET '/m' instance=shared",
@@ -1641,17 +1891,18 @@ mod tests {
         let src = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C {\n  private final RestTemplate rootRt = new RestTemplateBuilder().rootUri(\"https://api.stripe.com\").build();\n  private final RestTemplate ctorRt;\n  private RestTemplate handlerRt = new RestTemplate();\n  private final RestTemplate injected;\n  private final RestTemplate built;\n  private final WebClient ctorWeb;\n  private WebClient twoWeb;\n  C(RestTemplateBuilder b, RestTemplate injected, WebClient.Builder wb) {\n    this.ctorRt = b.rootUri(\"http://orders\").build();\n    handlerRt.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://api.github.com\"));\n    this.injected = injected;\n    this.built = b.build();\n    this.ctorWeb = wb.baseUrl(\"https://api.stripe.com\").build();\n    this.twoWeb = wb.baseUrl(\"http://a\").build();\n  }\n  void other(WebClient.Builder wb) { twoWeb = wb.baseUrl(\"http://b\").build(); }\n  void m() {\n    rootRt.postForObject(\"/charges\", null, String.class);\n    ctorRt.getForObject(\"/orders/1\", String.class);\n    handlerRt.getForObject(\"/repos\", String.class);\n    injected.getForObject(\"/x\", String.class);\n    built.getForObject(\"/y\", String.class);\n    ctorWeb.get().uri(\"/v1/charges\").retrieve();\n    twoWeb.get().uri(\"/z\").retrieve();\n    ctorWeb.mutate().baseUrl(\"http://users\").build().get().uri(\"/u\").retrieve();\n    RestTemplate local = new RestTemplateBuilder().uriTemplateHandler(new DefaultUriBuilderFactory(\"http://visits\")).build();\n    local.getForObject(\"/v\", String.class);\n  }\n}\n";
         assert_eq!(
             calls(Language::Java, src),
-            // Fields are never verified; the local `local` is configured by a URI template
-            // handler, and `ctorWeb.mutate()…` starts from a binding (amendment 14).
+            // Fields are never verified, nor plain carriers whatever their base (amendment
+            // 15); the local `local` is configured by a URI template handler, and
+            // `ctorWeb.mutate()…` starts from a binding (amendment 14).
             [
                 "rest_template POST '/charges' base='https://api.stripe.com' unverified",
                 "rest_template GET '/orders/1' base='http://orders' unverified",
                 "rest_template GET '/repos' base='https://api.github.com' unverified",
-                "rest_template GET '/x' base=?",
-                "rest_template GET '/y' base=?",
+                "rest_template GET '/x' base=? unverified",
+                "rest_template GET '/y' base=? unverified",
                 "rest_template GET '/v' base='http://visits' unverified",
                 "web_client GET '/v1/charges' base='https://api.stripe.com' unverified",
-                "web_client GET '/z' base=?",
+                "web_client GET '/z' base=? unverified",
                 "web_client GET '/u' base='http://users' unverified",
             ]
         );
@@ -1662,20 +1913,21 @@ mod tests {
             // A bean's base is never provably the injected one's: unverified (amendment 13).
             ["rest_template POST '/charges' base='https://api.stripe.com' from_bean unverified"]
         );
-        // Two beans with different bases: unknown.
+        // Two beans with different bases: unknown. An injected field is never a plain
+        // carrier (amendment 15).
         let two = bean.replace(
             "  @Bean RestTemplate stripe",
             "  @Bean RestTemplate gh(RestTemplateBuilder b) { return b.rootUri(\"https://api.github.com\").build(); }\n  @Bean RestTemplate stripe",
         );
         assert_eq!(
             calls(Language::Java, &two),
-            ["rest_template POST '/charges' base=?"]
+            ["rest_template POST '/charges' base=? unverified"]
         );
         // Without the `@Bean` import it is just a method.
         let plain = bean.replace("import org.springframework.context.annotation.Bean;\n", "");
         assert_eq!(
             calls(Language::Java, &plain),
-            ["rest_template POST '/charges' base=?"]
+            ["rest_template POST '/charges' base=? unverified"]
         );
     }
 
@@ -1704,7 +1956,8 @@ mod tests {
                 "api1 false",
                 "api2 false",
                 "api4 false",
-                "api5 true",
+                // A spread anywhere in the `create` config may hold an `adapter` (amendment 15).
+                "api5 false",
                 "api6 false",
                 "api7 false",
                 "a04 false",
@@ -1720,7 +1973,7 @@ mod tests {
                 "sv true",
             ]
         );
-        // The calls on them: `api`, `api5` and the locals `c`, `ar`, `sv` keep a verified base.
+        // The calls on them: `api` and the locals `c`, `ar`, `sv` keep a verified base.
         assert_eq!(
             calls(Language::TypeScript, src),
             [
@@ -1731,7 +1984,7 @@ mod tests {
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
-                "axios GET '/orders/1' base='http://orders'",
+                "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios POST '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
@@ -1833,6 +2086,207 @@ mod tests {
         );
     }
 
+    /// Contract M4a amendment 15 (evaluator pass 5, U1–U3): a site may reach `synthetic` only
+    /// when what carries the request is provably plain, whatever the URL's source (an absolute
+    /// literal, a configured property, a base). Not plain: a request sent through `x.mutate()…`
+    /// (U1); an instance with no base read but a filter or interceptor, a field, an injected
+    /// instance (U2); an axios config with a transport key or a spread (U3). Plain: a verified
+    /// local, an inline fresh construction with plain links, a bare module client, Feign.
+    #[test]
+    fn carriers_are_gated_whatever_the_url() {
+        let java = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.web.client.RestClient;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass Q {\n  private final WebClient q13 = WebClient.builder().filter(REWRITE).build();\n  private final RestTemplate q14 = new RestTemplateBuilder().additionalInterceptors(i).build();\n  private final RestTemplate bk8 = new RestTemplate();\n  void q03() {\n    WebClient w = WebClient.create(\"http://orders\");\n    w.mutate().apply(b -> b.baseUrl(\"https://api.stripe.com\")).build().get().uri(\"/orders/1\").retrieve();\n  }\n  void q04() {\n    WebClient w = WebClient.create(\"http://orders\");\n    w.mutate().filter(REWRITE).build().get().uri(\"/orders/1\").retrieve();\n  }\n  void q05() {\n    RestClient r = RestClient.create(\"http://orders\");\n    r.mutate().requestInterceptor(i).build().get().uri(\"/orders/1\").retrieve();\n  }\n  void q11() {\n    WebClient w = WebClient.create(\"http://orders\");\n    w.mutate().build().get().uri(\"/orders/1\").retrieve();\n  }\n  void q09b() { WebClient.builder().filter(REWRITE).build().get().uri(\"http://orders/orders/1\").retrieve(); }\n  void q12() {\n    WebClient w = WebClient.builder().filter(REWRITE).build();\n    w.get().uri(\"http://orders/orders/1\").retrieve();\n  }\n  void q13() { q13.get().uri(\"http://orders/orders/1\").retrieve(); }\n  void q14() { q14.getForObject(\"http://orders/orders/1\", String.class); }\n  void bk8() { bk8.getForObject(usersUrl + \"/users/me\", String.class); }\n  void f1() {\n    RestTemplate rf = new RestTemplate(factory);\n    rf.getForObject(\"http://orders/orders/1\", String.class);\n  }\n  void m1() {\n    WebClient w = WebClient.create(\"http://orders\");\n    WebClient copy = w.mutate().build();\n    w.get().uri(\"/orders/1\").retrieve();\n  }\n  void l9() {\n    WebClient.Builder b = WebClient.builder().baseUrl(\"http://orders\");\n    b.build().mutate().filter(REWRITE).build().get().uri(\"/orders/1\").retrieve();\n  }\n  void sub() {\n    RestTemplate cr = new MyTemplate();\n    cr.getForObject(\"http://orders/orders/1\", String.class);\n    RestTemplate h = new RestTemplate();\n    h.setUriTemplateHandler(new DefaultUriBuilderFactory(\"http://visits\"));\n    h.getForObject(\"/v\", String.class);\n  }\n  void ok() {\n    new RestTemplate().getForObject(\"http://orders/orders/1\", String.class);\n    RestTemplate rt = new RestTemplate();\n    rt.getForObject(\"http://orders/orders/1\", String.class);\n    WebClient.create(\"http://orders\").get().uri(\"/orders/1\").retrieve();\n    WebClient.builder().defaultHeader(\"a\", \"b\").build().get().uri(\"http://orders/orders/1\").retrieve();\n    WebClient s01 = WebClient.builder().baseUrl(\"http://orders\").build();\n    s01.get().uri(\"/orders/1\").retrieve();\n  }\n}\n";
+        assert_eq!(
+            calls(Language::Java, java),
+            [
+                "rest_template GET 'http://orders/orders/1' base=? unverified",
+                "rest_template GET '{usersUrl}/users/me' base=? unverified",
+                "rest_template GET 'http://orders/orders/1' base=? unverified",
+                // A subclass of `RestTemplate` may override anything; a `new RestTemplate()`
+                // states no root URI, so a handler set on it is its base (not plain).
+                "rest_template GET 'http://orders/orders/1' base=? unverified",
+                "rest_template GET '/v' base='http://visits' unverified",
+                "rest_template GET 'http://orders/orders/1' base=?",
+                "rest_template GET 'http://orders/orders/1' base=?",
+                "web_client GET '/orders/1' base='http://orders' unverified",
+                "web_client GET '/orders/1' base='http://orders' unverified",
+                "rest_client GET '/orders/1' base='http://orders' unverified",
+                "web_client GET '/orders/1' base='http://orders' unverified",
+                "web_client GET 'http://orders/orders/1' base=? unverified",
+                "web_client GET 'http://orders/orders/1' base=? unverified",
+                "web_client GET 'http://orders/orders/1' base=? unverified",
+                // `mutate()` is no request call, even when the copy is not used to send one;
+                // a builder used only for `build()` is plain, but the request chain's own
+                // links after it are not.
+                "web_client GET '/orders/1' base='http://orders' unverified",
+                "web_client GET '/orders/1' base='http://orders' unverified",
+                "web_client GET '/orders/1' base='http://orders'",
+                "web_client GET 'http://orders/orders/1' base=?",
+                "web_client GET '/orders/1' base='http://orders'",
+            ]
+        );
+        let ts = "import axios from \"axios\";\nconst p17api = axios.create({ timeout: 5 });\np17api.interceptors.request.use((c) => { c.url = \"https://api.stripe.com/v1/charges\"; return c; });\nconst p18api = axios.create({ baseURL: \"http://orders\" });\np18api.interceptors.request.use((c) => c);\nexport function p17() { return p17api.get(\"http://orders/orders/1\"); }\nexport function p18() { return p18api.get(\"http://orders/orders/1\"); }\nexport function p09() {\n  const a = axios.create({ baseURL: \"http://orders\", adapter: myAdapter });\n  const b = axios.create({ baseURL: \"http://orders\", transformRequest: [t] });\n  const c = axios.create({ baseURL: \"http://orders\", transformResponse: [t] });\n  const d = axios.create({ baseURL: \"http://orders\", httpAgent: ag });\n  const e = axios.create({ baseURL: \"http://orders\", httpsAgent: ag });\n  const g = axios.create({ baseURL: \"http://orders\", proxy: px });\n  const h = axios.create(cfg);\n  a.get(\"/orders/1\"); b.get(\"/orders/1\"); c.get(\"/orders/1\"); d.get(\"/orders/1\"); e.get(\"/orders/1\"); g.get(\"/orders/1\"); h.get(\"http://orders/orders/1\");\n  axios.get(\"http://orders/orders/1\", { adapter: myAdapter });\n  axios.create({ adapter: myAdapter }).get(\"http://orders/orders/1\");\n}\nexport function ok() {\n  const v = axios.create({ baseURL: \"http://orders\", timeout: 5, headers: { a: \"b\" } });\n  v.get(\"/orders/1\", { params: { q: 1 }, timeout: 2 });\n  v.get(\"/orders/1\", { adapter: myAdapter });\n  axios.create({ timeout: 5 }).get(\"http://orders/orders/1\", { adapter: myAdapter });\n  axios(\"http://orders/orders/1\");\n  axios.create({ timeout: 5 }).get(\"http://orders/orders/1\");\n  axios.get(\"http://orders/orders/1\");\n  fetch(\"http://orders/orders/1\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, ts),
+            [
+                "fetch GET 'http://orders/orders/1'",
+                "axios GET 'http://orders/orders/1' unverified",
+                "axios GET 'http://orders/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET 'http://orders/orders/1' unverified",
+                "axios GET 'http://orders/orders/1' unverified",
+                "axios GET 'http://orders/orders/1' unverified",
+                "axios GET '/orders/1' base='http://orders'",
+                // A request config with an `adapter` on a plain carrier is not plain either.
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET 'http://orders/orders/1' unverified",
+                "axios GET 'http://orders/orders/1'",
+                "axios GET 'http://orders/orders/1'",
+                "axios GET 'http://orders/orders/1'",
+            ]
+        );
+        // Only the module itself is a bare module client, which the indexer caps when the
+        // repository reconfigures it ([`global_hooks`]).
+        let facts = extract(Language::TypeScript, ts.as_bytes()).unwrap();
+        let modules: Vec<bool> = clients(Language::TypeScript, &facts)
+            .calls
+            .iter()
+            .map(|c| c.module_call)
+            .collect();
+        let mut expected = vec![false; 18];
+        for i in [0, 10, 15, 17] {
+            expected[i] = true;
+        }
+        assert_eq!(modules, expected);
+        let go = "package main\nimport \"net/http\"\nfunc f(c *http.Client) {\n\thttp.Get(\"http://orders/orders/1\")\n\thttp.DefaultClient.Get(\"http://orders/orders/1\")\n\tc.Get(\"http://orders/orders/1\")\n\thttp.NewRequest(\"GET\", \"http://orders/orders/1\", nil)\n}\n";
+        let facts = extract(Language::Go, go.as_bytes()).unwrap();
+        let modules: Vec<(bool, Option<bool>)> = clients(Language::Go, &facts)
+            .calls
+            .iter()
+            .map(|c| (c.module_call, c.base_verified))
+            .collect();
+        assert_eq!(
+            modules,
+            [
+                (true, None),
+                (true, None),
+                (false, Some(false)),
+                (false, Some(false))
+            ]
+        );
+    }
+
+    /// Contract M4a amendment 15: the module clients a file reconfigures for the whole process.
+    /// A request on the module, a call of it, `create` and its import are no hook; a member
+    /// read or write, an alias, an export, or passing it on is.
+    #[test]
+    fn global_hooks_of_module_clients() {
+        let hooks = |language: Language, src: &str| {
+            global_hooks(language, &extract(language, src.as_bytes()).unwrap())
+        };
+        let clean = "import axios from \"axios\";\nimport * as ax from \"axios\";\nconst api = axios.create({ baseURL: \"http://orders\" });\naxios.get(\"/a\");\naxios(\"/b\");\nax.post(\"/c\", 1);\nif (axios.isAxiosError(e)) {}\nwindow.fetch(\"/d\");\nfetch(\"/e\");\nglobalThis.location.href;\n";
+        assert!(hooks(Language::TypeScript, clean).is_empty());
+        for (src, kind) in [
+            ("globalThis.fetch = f;\n", ClientKind::Fetch),
+            ("window.fetch = f;\n", ClientKind::Fetch),
+            ("global.fetch = jest.fn();\n", ClientKind::Fetch),
+            ("self.fetch = f;\n", ClientKind::Fetch),
+            ("const f = window.fetch;\n", ClientKind::Fetch),
+            (
+                "import axios from \"axios\";\naxios.defaults.baseURL = \"https://api.stripe.com\";\n",
+                ClientKind::Axios,
+            ),
+            (
+                "import axios from \"axios\";\naxios.interceptors.request.use((c) => c);\n",
+                ClientKind::Axios,
+            ),
+            (
+                "import http from \"axios\";\nconst ax = http;\n",
+                ClientKind::Axios,
+            ),
+            (
+                "import axios from \"axios\";\nexport default axios;\n",
+                ClientKind::Axios,
+            ),
+            (
+                "import * as ax from \"axios\";\nsetup(ax);\n",
+                ClientKind::Axios,
+            ),
+            // A call on the module that is no request, `create` or helper.
+            (
+                "import axios from \"axios\";\naxios.use(plugin);\n",
+                ClientKind::Axios,
+            ),
+            (
+                "const axios = require(\"axios\");\naxios.defaults.adapter = a;\n",
+                ClientKind::Axios,
+            ),
+        ] {
+            assert_eq!(hooks(Language::TypeScript, src), [kind], "{src}");
+        }
+        // A `var` require is the module's declaration, not a hook.
+        assert!(
+            hooks(
+                Language::JavaScript,
+                "var axios = require(\"axios\");\naxios.get(\"/a\");\n"
+            )
+            .is_empty()
+        );
+        // Without the axios import, `axios` is another name.
+        assert!(hooks(Language::TypeScript, "axios.defaults.x = 1;\n").is_empty());
+        let go =
+            |body: &str| format!("package main\nimport \"net/http\"\nfunc f() {{\n{body}\n}}\n");
+        assert!(
+            hooks(
+                Language::Go,
+                &go("\thttp.Get(u)\n\thttp.DefaultClient.Do(req)\n\t_ = http.StatusOK")
+            )
+            .is_empty()
+        );
+        for body in [
+            "\thttp.DefaultTransport = t",
+            "\thttp.DefaultClient.Transport = t",
+            "\thttp.DefaultClient = &http.Client{}",
+            "\tc := http.DefaultClient",
+            "\tt := http.DefaultTransport.(*http.Transport).Clone()",
+        ] {
+            assert_eq!(
+                hooks(Language::Go, &go(body)),
+                [ClientKind::GoHttp],
+                "{body}"
+            );
+        }
+    }
+
+    /// Evaluator pass 5, M9: a chain whose base is not stated is `Fresh` only when it starts
+    /// from a new client or builder; one from a binding (an injected builder, another
+    /// instance) is unreadable, so the binding's configuration is never taken as empty.
+    #[test]
+    fn chain_base_reads_a_fresh_root() {
+        let src = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass C {\n  void m(RestTemplateBuilder b, WebClient w) {\n    RestTemplate a = b.build();\n    RestTemplate c = new RestTemplateBuilder().build();\n    WebClient d = w.mutate().build();\n    WebClient e = WebClient.builder().build();\n  }\n}\n";
+        let facts = extract(Language::Java, src.as_bytes()).unwrap();
+        let scope = FileScope::new(&facts);
+        let got: Vec<(String, BaseFact)> = facts
+            .bindings
+            .iter()
+            .filter_map(|b| Some((b.name.clone(), init_chain(&facts, b)?)))
+            .map(|(name, c)| (name, chain_base(&scope, c, c.links.len())))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a".to_owned(), BaseFact::Unreadable),
+                ("c".to_owned(), BaseFact::Fresh),
+                ("d".to_owned(), BaseFact::Unreadable),
+                ("e".to_owned(), BaseFact::Fresh),
+            ]
+        );
+    }
+
     #[test]
     fn go_clients_and_sprintf() {
         let src = "package main\nimport (\n\t\"fmt\"\n\t\"net/http\"\n)\nconst base = \"http://notification:3000\"\nfunc notifyPaid(c *http.Client, id int) {\n\thttp.Post(\"http://notification:3000/internal/mfa/email\", \"application/json\", nil)\n\thttp.Get(fmt.Sprintf(\"%s/invoices/%d?x=%%\", base, id))\n\treq, _ := http.NewRequest(http.MethodPut, base+\"/x\", nil)\n\thttp.NewRequestWithContext(ctx, \"DELETE\", \"/y\", nil)\n\tc.Head(\"/z\")\n\thttp.DefaultClient.PostForm(\"/f\", nil)\n\tother.Get(\"/no\")\n\t_ = req\n}\n";
@@ -1841,9 +2295,12 @@ mod tests {
             [
                 "net/http POST 'http://notification:3000/internal/mfa/email'",
                 "net/http GET '{base}/invoices/{id}?x=%'",
-                "net/http PUT '{base}/x'",
-                "net/http DELETE '/y'",
-                "net/http HEAD '/z'",
+                // A request built by `NewRequest` is carried by whatever `Do`es it, and a
+                // `http.Client` binding may carry any `Transport`: not provably plain
+                // (amendment 15). The package and `http.DefaultClient` are the module client.
+                "net/http PUT '{base}/x' unverified",
+                "net/http DELETE '/y' unverified",
+                "net/http HEAD '/z' unverified",
                 "net/http POST '/f'",
             ]
         );
