@@ -115,6 +115,10 @@ pub(crate) struct Site {
     /// service a host names to any instance: a host-by-name match (F1) is never `synthetic`,
     /// and its edge says `discovery: configured` (contract M4a amendment 17, W4).
     pub discovery: bool,
+    /// The values a contested base joined to the URL may take, folded (contract M5 S19 (f)):
+    /// one naming an external host makes the site external. Empty when the base is decided or
+    /// unknown with no stated value, or does not apply (an absolute URL).
+    pub base_candidates: Vec<Folded>,
 }
 
 /// A service as the host rule (D6) sees it.
@@ -249,7 +253,7 @@ impl<'a, 'i> Folding<'a, 'i> {
         match v {
             UrlValue::Template(t) => Some(fold::fold_template(self, file, t)),
             UrlValue::Name { text, span } => Some(fold::fold_name(self, file, text, *span)),
-            UrlValue::Unknown => None,
+            UrlValue::Unknown | UrlValue::Contested(_) => None,
         }
     }
 }
@@ -378,7 +382,17 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 },
                 None => stated,
             };
-            let url = folding.value(file, &call.url).map(|url| match &base {
+            let url = folding.value(file, &call.url);
+            let base_candidates = match (&base, &url) {
+                (Some((base_file, UrlValue::Contested(values))), Some(url)) if joins_base(url) => {
+                    values
+                        .iter()
+                        .filter_map(|v| folding.value(*base_file, v))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let url = url.map(|url| match &base {
                 Some((base_file, b)) => join(folding.value(*base_file, b), url),
                 None => url,
             });
@@ -400,6 +414,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 base_from_bean: from_bean.is_some(),
                 base_verified,
                 discovery,
+                base_candidates,
             });
         }
     }
@@ -469,17 +484,20 @@ fn imported_instance<'a, 'c>(
         })
 }
 
+/// Whether a client's base applies to `url` ([`join`]): not when the URL is absolute or starts
+/// with an unknown part.
+fn joins_base(url: &Folded) -> bool {
+    let u = client_url(&url.pieces);
+    !(u.host.is_some() || u.host_dynamic || url.pieces.first() == Some(&Piece::Hole))
+}
+
 /// A URL relative to a base: the base then the URL (with a `/` between unless one side has it),
 /// unless the URL is absolute. An unknown base is a hole. A URL that starts with an unknown
 /// part is not joined to any base (amendment 13, Gate B): that part may be absolute (axios and
 /// Spring then ignore the base) or a prefix, so it is the unknown base, and the path is matched
 /// by suffix only. The label is the weakest among the parts that resolved.
 fn join(base: Option<Folded>, url: Folded) -> Folded {
-    let absolute = {
-        let u = client_url(&url.pieces);
-        u.host.is_some() || u.host_dynamic
-    };
-    if absolute || url.pieces.first() == Some(&Piece::Hole) {
+    if !joins_base(&url) {
         return url;
     }
     let base = base.unwrap_or(Folded {
@@ -620,6 +638,16 @@ impl<'e> Stitcher<'e> {
         }
     }
 
+    /// Whether a folded base names a host that is no service and no loopback, or a host with a
+    /// hole next to an FQDN fragment.
+    fn external(&self, base: &Folded) -> bool {
+        let u = client_url(&base.pieces);
+        u.host_external.is_some()
+            || u.host
+                .as_ref()
+                .is_some_and(|h| !LOOPBACK.contains(&h.as_str()) && !self.hosts.contains_key(h))
+    }
+
     /// The bucket and edges of one site (S13, S14).
     fn site(&self, site: &Site) -> Outcome {
         let Some(folded) = &site.url else {
@@ -629,6 +657,14 @@ impl<'e> Stitcher<'e> {
         // A host hole next to an FQDN fragment names no service (amendment 12, Q2).
         if url.host_external.is_some() {
             return Outcome::bucket(Bucket::External);
+        }
+        // A contested base that may name an external host is external (contract M5 S19 (f)):
+        // the path is not matched by suffix across services.
+        if site.base_candidates.iter().any(|b| self.external(b)) {
+            return Outcome {
+                detail: Some("base_candidate_external"),
+                ..Outcome::bucket(Bucket::External)
+            };
         }
         let mut scope = Scope::Any;
         if let Some(host) = &url.host {
@@ -1043,6 +1079,7 @@ mod tests {
             base_from_bean: false,
             base_verified: None,
             discovery: false,
+            base_candidates: Vec::new(),
         }
     }
 
@@ -3171,7 +3208,7 @@ mod tests {
             ),
             // Over the byte cap: every kind a `.js` file is scanned for (not Go), and discovery.
             (vec![("web/src/vendor.js", None)], expect(d, u, u, u)),
-            // Prose, a plain dependency entry and an XML comment are inert.
+            // Prose and a plain dependency entry are inert.
             (
                 vec![
                     (
@@ -3185,15 +3222,29 @@ mod tests {
                         ),
                     ),
                     (
-                        "pay/pom.xml",
-                        Some("<project><!-- the fetch phase; feign.Client --></project>\n"),
-                    ),
-                    (
                         "web/package-lock.json",
                         Some("{ \"packages\": { \"node_modules/axios\": {} } }\n"),
                     ),
                 ],
                 expect(s, s, s, s),
+            ),
+            // An XML comment is read (contract M5 S19 (b)): it caps Feign and `fetch`.
+            (
+                vec![(
+                    "pay/pom.xml",
+                    Some("<project><!-- the fetch phase; feign.Client --></project>\n"),
+                )],
+                expect(s, u, u, s),
+            ),
+            // Discovery as nested JSON in a compose file (contract M5 S19 (a)).
+            (
+                vec![(
+                    "deploy/docker-compose.yml",
+                    Some(
+                        "services:\n  pay:\n    environment:\n      SPRING_APPLICATION_JSON: '{\"spring\":{\"cloud\":{\"discovery\":{\"client\":{\"simple\":{\"instances\":{\"orders\":[{\"uri\":\"https://api.stripe.com\"}]}}}}}}}'\n",
+                    ),
+                )],
+                expect(d, d, d, d),
             ),
             // A dependency aliased elsewhere is no plain entry.
             (
@@ -3263,6 +3314,52 @@ mod tests {
         assert_eq!(
             stitched_bases_raw(&with_balanced, &[], &RawScan::default(), &eps, &services),
             expect(s, s, s, s)
+        );
+    }
+
+    /// Contract M5 S19 (f) (M4a open item 21, part), from source: a stated base that cannot be
+    /// decided but names an external host among its candidates is external, whatever the path
+    /// (evaluator pass 3's `t10` with a resolvable spread, a `baseURL` before such a spread, a
+    /// nested spread, and `j07`'s two Spring bases); with only internal candidates, or none
+    /// (`t25`'s unreadable config, a spread of a parameter), the path is matched by suffix as
+    /// before. A URL that is absolute ignores the base and its candidates.
+    #[test]
+    fn contested_bases_with_an_external_candidate_are_external() {
+        let ts = "import axios from \"axios\";\nconst api10 = axios.create({ baseURL: \"http://orders\" });\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst nested = { ...stripeOpts, timeout: 1 };\nconst ordersOpts = { baseURL: \"http://orders\" };\nexport async function f(cfg) {\n  await api10.get(\"/orders/1\", { ...stripeOpts });\n  await api10.get(\"/orders/1\", cfg);\n  await api10.get(\"/orders/1\", { baseURL: \"http://orders\", ...stripeOpts });\n  await api10.get(\"/orders/1\", { ...nested });\n  await api10.get(\"/orders/1\", { ...ordersOpts });\n  await api10.get(\"/orders/1\", { ...cfg });\n  await api10.get(\"http://orders/orders/1\", { ...stripeOpts });\n}\n";
+        let java = |name: &str, other: &str| {
+            format!(
+                "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass {name} {{\n  private final RestTemplate rt = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  {name}() {{ rt.setUriTemplateHandler(new DefaultUriBuilderFactory(\"{other}\")); }}\n  String get() {{ return rt.getForObject(\"/orders/1\", String.class); }}\n}}\n"
+            )
+        };
+        let j07 = java("C7", "https://api.stripe.com");
+        let internal = java("C8", "http://billing");
+        let eps = vec![
+            ep("GET", "/orders/{id}", "orders"),
+            ep("GET", "/billing", "billing"),
+        ];
+        let suffix =
+            "heuristic -> HTTP GET /orders/{} @orders [heuristic] base=unresolved match=suffix";
+        assert_eq!(
+            stitched_bases(
+                &[
+                    ("pay/src/main/java/p/C7.java", Language::Java, &j07),
+                    ("pay/src/main/java/p/C8.java", Language::Java, &internal),
+                    ("web/src/t.ts", Language::TypeScript, ts),
+                ],
+                &eps,
+                &["web", "pay", "orders", "billing"]
+            ),
+            [
+                "pay/src/main/java/p/C7.java 7 external".to_owned(),
+                format!("pay/src/main/java/p/C8.java 7 {suffix}"),
+                "web/src/t.ts 6 external".to_owned(),
+                format!("web/src/t.ts 7 {suffix}"),
+                "web/src/t.ts 8 external".to_owned(),
+                "web/src/t.ts 9 external".to_owned(),
+                format!("web/src/t.ts 10 {suffix}"),
+                format!("web/src/t.ts 11 {suffix}"),
+                "web/src/t.ts 12 heuristic -> HTTP GET /orders/{} @orders [heuristic] base=unverified match=exact".to_owned(),
+            ]
         );
     }
 

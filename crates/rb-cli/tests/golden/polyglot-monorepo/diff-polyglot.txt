@@ -16,7 +16,7 @@ nodes: 2 added, 0 removed, 4 changed
   ~ file services/notification/src/server.ts: attrs {"blob":"ea51abb6b895eb6e3610cf6893dc84a4f820950b","lang":"typescript","size":662} → {"blob":"bc36789c07dbb35813b50a750875d6d16a2c9b23","lang":"typescript","size":659}
 edges: 4 added, 1 removed, 1 changed, 6 evidence only
   + DEFINED_IN rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck(). -> services/notification/src/selfcheck.ts (treesitter)  [exact]
-  + CONSUMES rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck(). -> HTTP GET /api/v1/login @services/auth (http_stitch)  [synthetic]
+  + CONSUMES rb-heuristic . . . `services/notification/src/selfcheck.ts`/loginCheck(). -> HTTP GET /api/v1/login @services/auth (http_stitch)  [heuristic]
   + EXPOSES services/notification -> HTTP POST /internal/mfa/push @services/notification (treesitter)  [exact]
   + HANDLED_BY HTTP POST /internal/mfa/push @services/notification -> services/notification/src/server.ts (treesitter)  [exact]
   - CALLS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login(). -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch(). (heuristic)  [heuristic]

@@ -311,7 +311,8 @@ fn summary(language: Language, syn: &Syntax, node: Node<'_>, source: &[u8], dept
 }
 
 /// A binding's initialiser: a string, a call (by its index in `chains`, keyed by node id), a
-/// name, or `name ?? 'lit'` / `name || 'lit'`. Parentheses and `await` are looked through.
+/// name, `name ?? 'lit'` / `name || 'lit'`, or a TS/JS object literal. Parentheses and
+/// `await` are looked through.
 pub(crate) fn init(
     language: Language,
     value: Node<'_>,
@@ -354,6 +355,11 @@ pub(crate) fn init(
             args,
             body,
         });
+    }
+    if syn.object == Some(node.kind())
+        && let Arg::Object { entries, .. } = summary(language, &syn, node, source, 0)
+    {
+        return Some(Init::Object { entries });
     }
     if is_name(&syn, node) {
         return Some(Init::Name {

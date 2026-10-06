@@ -53,6 +53,12 @@ pub enum UrlValue {
     },
     /// Not a string or a name (a call result, a lambda, …).
     Unknown,
+    /// A base that cannot be decided, with the values the file states it may take, in source
+    /// order (never empty): an axios request config whose last base-setting entry is a spread
+    /// of an object literal, a Spring client configured with several bases (contract M5 S19
+    /// (f)). It folds like [`UrlValue::Unknown`]; the stitcher makes the site external when a
+    /// candidate names an external host.
+    Contested(Vec<UrlValue>),
 }
 
 impl UrlValue {
@@ -522,16 +528,19 @@ const DISCOVERY_PREFIXES: &[&str] = &[
     "spring.cloud.consul.discovery",
 ];
 
-/// Whole words that configure discovery or load balancing in any file without token facts,
-/// matched in lower case with `_` read as `.` (so an environment variable such as
-/// `SPRING_CLOUD_DISCOVERY_CLIENT_SIMPLE_INSTANCES_ORDERS_0_URI` counts): the
-/// [`DISCOVERY_PREFIXES`] written out, Ribbon's keys (`<service>.ribbon.listOfServers`), and
-/// Spring Cloud LoadBalancer's and Ribbon's configuration types.
+/// Whole words that configure discovery or load balancing in the text of any file (parsed
+/// ones included since contract M5 S19 (a)), matched in lower case with `_` read as `.` (so an
+/// environment variable such as `SPRING_CLOUD_DISCOVERY_CLIENT_SIMPLE_INSTANCES_ORDERS_0_URI`
+/// counts): the [`DISCOVERY_PREFIXES`] written out, Ribbon's keys
+/// (`<service>.ribbon.listOfServers`), Spring Cloud LoadBalancer's and Ribbon's configuration
+/// types, and their packages (a fully qualified type of either, with no import or annotation).
 const DISCOVERY_WORDS: &[&str] = &[
     "spring.cloud.discovery",
     "spring.cloud.loadbalancer",
     "spring.cloud.kubernetes.discovery",
     "spring.cloud.consul.discovery",
+    "org.springframework.cloud.loadbalancer",
+    "org.springframework.cloud.netflix.ribbon",
     "ribbon",
     "listofservers",
     "loadbalancerclient",
@@ -585,7 +594,8 @@ const DEPENDENCY_FIELDS: &[&str] = &[
 
 /// The text of a file the scan reads: a `package.json` without its plain dependency entries
 /// (a registry version range, no `:` or `/`: not an alias, a path, a URL, a workspace or a
-/// GitHub package, which may stand in for the module), an `.xml` file without its comments.
+/// GitHub package, which may stand in for the module). XML comments are read like the rest
+/// (contract M5 S19 (b): a `<!--` inside CDATA used to hide what followed).
 fn scanned_text(path: &str, text: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
     if name == "package.json"
@@ -597,17 +607,6 @@ fn scanned_text(path: &str, text: &str) -> String {
             }
         }
         return json.to_string();
-    }
-    if name.to_ascii_lowercase().ends_with(".xml") {
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(start) = rest.find("<!--") {
-            out.push_str(&rest[..start]);
-            let comment = &rest[start + 4..];
-            rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
-        }
-        out.push_str(rest);
-        return out;
     }
     text.to_owned()
 }
@@ -622,6 +621,69 @@ fn has_word(text: &str, word: &str) -> bool {
         let end = i + word.len();
         (i == 0 || !ident(bytes[i - 1])) && (!tail || end == bytes.len() || !ident(bytes[end]))
     })
+}
+
+/// The key segments of every key-like word of `text` (contract M5 S19 (a)): a run of
+/// identifier characters (`[A-Za-z0-9_$.-]`) followed, after any quotes, backslashes and
+/// spaces, by a `:` that is not `::` — a JSON key (`"spring":`, `\"spring\":` inside another
+/// string), a JS or YAML key (`spring:`, `'load-balancer':`). Each is split on `.`,
+/// lower-cased, with `-` and `_` removed (Spring's relaxed binding). Neither strings nor
+/// braces are parsed, so no value (an unbalanced brace, a quote) can hide a key; the cost is
+/// that unrelated keys of one file may combine ([`json_discovery`]), which can only cap.
+fn json_key_segments(text: &str) -> HashSet<String> {
+    let bytes = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'$' | b'.');
+    let mut out = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !ident(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        let mut j = i;
+        while j < bytes.len() && matches!(bytes[j], b'"' | b'\'' | b'\\' | b' ' | b'\t') {
+            j += 1;
+        }
+        if bytes.get(j) == Some(&b':') && bytes.get(j + 1) != Some(&b':') {
+            for seg in text[start..i].split('.') {
+                let seg: String = seg
+                    .chars()
+                    .filter(|c| !matches!(c, '-' | '_'))
+                    .flat_map(char::to_lowercase)
+                    .collect();
+                if !seg.is_empty() {
+                    out.insert(seg);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether the JSON-style keys of `text` may spell a [`DISCOVERY_PREFIXES`] path: `spring`,
+/// `cloud` and `discovery` or `loadbalancer` all among its key segments (every prefix has
+/// them).
+fn json_discovery(text: &str) -> bool {
+    let keys = json_key_segments(text);
+    keys.contains("spring")
+        && keys.contains("cloud")
+        && (keys.contains("discovery") || keys.contains("loadbalancer"))
+}
+
+/// Whether the text of a file configures service discovery or load balancing (contract M4a
+/// amendment 17, W4; M5 S19 (a)): a [`DISCOVERY_WORDS`] whole word, or a JSON key path spelling
+/// a discovery key ([`json_discovery`]). Used for every non-binary file, parsed ones included;
+/// inert text ([`inert`]) is not read.
+pub fn discovery_text(path: &str, text: &str) -> bool {
+    if inert(path) {
+        return false;
+    }
+    let normalised = text.to_ascii_lowercase().replace('_', ".");
+    DISCOVERY_WORDS.iter().any(|w| has_word(&normalised, w)) || json_discovery(text)
 }
 
 /// The raw-text scan of one file without token facts (contract M4a amendment 17, evaluator
@@ -666,9 +728,7 @@ pub fn raw_scan(path: &str, text: Option<&str>) -> RawScan {
         Some("yml" | "yaml") => crate::fold::yaml_entries(&text),
         _ => Default::default(),
     };
-    let normalised = text.to_ascii_lowercase().replace('_', ".");
-    out.discovery = DISCOVERY_WORDS.iter().any(|w| has_word(&normalised, w))
-        || keys.keys().any(|k| discovery_key(k));
+    out.discovery = discovery_text(path, &text) || keys.keys().any(|k| discovery_key(k));
     out
 }
 
@@ -921,8 +981,10 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
         if chain.root.is_none() {
             if is_axios(&first.name, chain.span) && !first.args.is_empty() {
                 let call = match first.args.first() {
-                    Some(config @ Arg::Object { .. }) => config_call(chain, None, None, config),
-                    url => axios_call(chain, None, None, url, None, first.args.get(1)),
+                    Some(config @ Arg::Object { .. }) => {
+                        config_call(facts, chain, None, None, config)
+                    }
+                    url => axios_call(facts, chain, None, None, url, None, first.args.get(1)),
                 };
                 out.calls.push(call);
             }
@@ -940,7 +1002,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
             let plain = plain_config(first.args.first());
             let base = create_base(first.args.first());
             let from_carrier = base.is_some();
-            if let Some(mut call) = axios_request(chain, link, base, None) {
+            if let Some(mut call) = axios_request(facts, chain, link, base, None) {
                 call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
                 out.calls.push(call);
             }
@@ -958,7 +1020,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
         } else {
             continue;
         };
-        if let Some(mut call) = axios_request(chain, first, base, instance) {
+        if let Some(mut call) = axios_request(facts, chain, first, base, instance) {
             if let Some((plain, from_carrier)) = carrier {
                 call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
             }
@@ -970,6 +1032,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
 /// A request call `link` of `chain` on an instance with `base` (or on the module): the verbs
 /// with their URL and request config, and `request(config)`.
 fn axios_request(
+    facts: &FileScope<'_>,
     chain: &CallChain,
     link: &rb_syntax::CallLink,
     base: Option<UrlValue>,
@@ -988,6 +1051,7 @@ fn axios_request(
         };
         let method = Some(norm_method(verb));
         return Some(axios_call(
+            facts,
             chain,
             base,
             instance,
@@ -1000,14 +1064,14 @@ fn axios_request(
         return None;
     }
     Some(match link.args.first() {
-        Some(config @ Arg::Object { .. }) => config_call(chain, base, instance, config),
+        Some(config @ Arg::Object { .. }) => config_call(facts, chain, base, instance, config),
         // A config that cannot be read: no URL, method or base, and not plain.
         _ => ClientCall {
             method: None,
             url: UrlValue::Unknown,
             base: Some(UrlValue::Unknown),
             base_verified: Some(false),
-            ..axios_call(chain, base, instance, None, None, None)
+            ..axios_call(facts, chain, base, instance, None, None, None)
         },
     })
 }
@@ -1029,9 +1093,10 @@ fn create_base(config: Option<&Arg>) -> Option<UrlValue> {
 /// The base a request config states (contract M4a amendment 12, Q1): `None` when the call has
 /// no config, or a config object without a `baseURL` after its last spread, so the instance's
 /// base applies; otherwise the stated base, [`UrlValue::Unknown`] when it cannot be read (a
-/// config that is not an object literal, a spread that may set it, a `baseURL` that is not a
-/// string or a name).
-fn config_base(config: Option<&Arg>) -> Option<UrlValue> {
+/// config that is not an object literal, a `baseURL` that is not a string or a name), and
+/// [`UrlValue::Contested`] when a spread may set it and the file states values it may take
+/// (contract M5 S19 (f): [`object_base_candidates`]).
+fn config_base(facts: &FileScope<'_>, config: Option<&Arg>) -> Option<UrlValue> {
     match config? {
         Arg::Object { entries, .. } => {
             match entries
@@ -1040,7 +1105,15 @@ fn config_base(config: Option<&Arg>) -> Option<UrlValue> {
                 .find(|e| e.key == "baseURL" || e.key == "...")
             {
                 Some(e) if e.key == "baseURL" => Some(UrlValue::of(Some(&e.value))),
-                Some(_) => Some(UrlValue::Unknown),
+                Some(_) => {
+                    let mut candidates = Vec::new();
+                    object_base_candidates(facts, entries, &mut HashSet::new(), &mut candidates);
+                    Some(if candidates.is_empty() {
+                        UrlValue::Unknown
+                    } else {
+                        UrlValue::Contested(candidates)
+                    })
+                }
                 None => None,
             }
         }
@@ -1048,9 +1121,55 @@ fn config_base(config: Option<&Arg>) -> Option<UrlValue> {
     }
 }
 
+/// How many spread bindings [`object_base_candidates`] follows for one config.
+const MAX_SPREADS: usize = 4;
+
+/// The `baseURL` values an object literal's entries may leave in effect (contract M5 S19 (f)),
+/// added to `out` in source order without repeats: from the last `baseURL` entry on, that
+/// entry's value and, for each later spread naming a binding initialised with an object literal
+/// (`const stripeOpts = { baseURL: … }`), the values of that object, followed the same way
+/// through its own spreads (a visited set and [`MAX_SPREADS`] bound the walk). A spread
+/// of anything else (a parameter, a call) names no value. Only readable values (a string or a
+/// name) are candidates.
+fn object_base_candidates(
+    facts: &FileScope<'_>,
+    entries: &[rb_syntax::ObjectEntry],
+    seen: &mut HashSet<usize>,
+    out: &mut Vec<UrlValue>,
+) {
+    let from = entries
+        .iter()
+        .rposition(|e| e.key == "baseURL")
+        .unwrap_or(0);
+    for e in &entries[from..] {
+        if e.key == "baseURL" {
+            let value = UrlValue::of(Some(&e.value));
+            if value != UrlValue::Unknown && !out.iter().any(|v| same_value(v, &value)) {
+                out.push(value);
+            }
+            continue;
+        }
+        if e.key != "..." || seen.len() >= MAX_SPREADS {
+            continue;
+        }
+        let Arg::Name { text, span } = &e.value else {
+            continue;
+        };
+        let Some(bi) = facts.binding_index_at(text, *span) else {
+            continue;
+        };
+        if let Some(Init::Object { entries }) = &facts.bindings[bi].init
+            && seen.insert(bi)
+        {
+            object_base_candidates(facts, entries, seen, out);
+        }
+    }
+}
+
 /// An axios call with its URL argument (`url`), its method (`None`: from the config, default
 /// GET) and its request config: a base the config states replaces the instance's `base`.
 fn axios_call(
+    facts: &FileScope<'_>,
     chain: &CallChain,
     base: Option<UrlValue>,
     instance: Option<String>,
@@ -1067,7 +1186,7 @@ fn axios_call(
         kind: ClientKind::Axios,
         method,
         url: UrlValue::of(url),
-        base: config_base(config).or(base),
+        base: config_base(facts, config).or(base),
         instance,
         span: chain.span,
         source: chain.enclosing,
@@ -1080,12 +1199,14 @@ fn axios_call(
 
 /// `axios(config)` or `request(config)` with an object literal: the URL comes from its `url`.
 fn config_call(
+    facts: &FileScope<'_>,
     chain: &CallChain,
     base: Option<UrlValue>,
     instance: Option<String>,
     config: &Arg,
 ) -> ClientCall {
     axios_call(
+        facts,
         chain,
         base,
         instance,
@@ -1583,7 +1704,25 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             };
         }
         let Some(value) = agreed(&facts) else {
-            return unknown;
+            // Several bases, or one that cannot be read: the stated ones are the candidates
+            // (contract M5 S19 (f)).
+            let mut candidates: Vec<UrlValue> = Vec::new();
+            for f in &facts {
+                if let BaseFact::Stated(v) = f
+                    && *v != UrlValue::Unknown
+                    && !candidates.iter().any(|c| same_value(c, v))
+                {
+                    candidates.push(v.clone());
+                }
+            }
+            return SpringBase {
+                value: if candidates.is_empty() {
+                    UrlValue::Unknown
+                } else {
+                    UrlValue::Contested(candidates)
+                },
+                ..unknown
+            };
         };
         SpringBase {
             value,
@@ -1986,6 +2125,14 @@ mod tests {
             }
             UrlValue::Name { text, .. } => text.clone(),
             UrlValue::Unknown => "?".into(),
+            UrlValue::Contested(candidates) => format!(
+                "?[{}]",
+                candidates
+                    .iter()
+                    .map(show_value)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ),
         }
     }
 
@@ -2246,7 +2393,8 @@ mod tests {
                 "rest_template GET '/y' base=? unverified",
                 "rest_template GET '/v' base='http://visits' unverified",
                 "web_client GET '/v1/charges' base='https://api.stripe.com' unverified",
-                "web_client GET '/z' base=? unverified",
+                // Two bases: contested, with both as candidates (contract M5 S19 (f)).
+                "web_client GET '/z' base=?['http://a'|'http://b'] unverified",
                 "web_client GET '/u' base='http://users' unverified",
             ]
         );
@@ -2836,8 +2984,8 @@ mod tests {
 
     /// Contract M4a amendment 17 (evaluator pass 7, W1, W2, W4): the raw-text scan of a file
     /// without token facts. A surface name as a whole word taints its kind (Go's only in a
-    /// `.go` file); prose, npm lock files, plain dependency entries of a `package.json` and XML
-    /// comments are inert; a file over the byte cap taints every kind it is scanned for, and
+    /// `.go` file); prose, npm lock files and plain dependency entries of a `package.json` are
+    /// inert (XML comments are not since contract M5 S19 (b)); a file over the byte cap taints every kind it is scanned for, and
     /// discovery. Discovery: the listed keys in a settings file (nested YAML too) or as text,
     /// Spring Cloud LoadBalancer and Ribbon names; Eureka's own keys are not.
     #[test]
@@ -2882,7 +3030,12 @@ mod tests {
                 "{ \"dependencies\": { \"axios\": \"^1.7.7\", \"x\": \"1.0.0 - 2.x || >=3\" }, \"peerDependencies\": { \"node-fetch\": \"*\" } }",
                 vec![],
             ),
-            ("p/pom.xml", "<p><!-- fetch; feign.Client --></p>", vec![]),
+            // An XML comment is read like the rest of the file (contract M5 S19 (b)).
+            (
+                "p/pom.xml",
+                "<p><!-- fetch; feign.Client --></p>",
+                vec![Fetch, Feign],
+            ),
             // Not inert: an alias, another field, an XML element, an MDX page.
             (
                 "w/package.json",
@@ -2995,6 +3148,134 @@ mod tests {
         assert!(!discovery_package(
             "org.springframework.cloud.loadbalancerx"
         ));
+    }
+
+    /// Contract M5 S19 (a) (M4a open item 22 (a), (b)): the discovery and load-balancer
+    /// vocabulary is matched in the text of every file, parsed Java included (a fully qualified
+    /// type with no import or annotation), and in JSON key paths written inside any text
+    /// (`SPRING_APPLICATION_JSON` in a compose or `.env` file, a JSON file, escaped JSON in a
+    /// string, a script's object literal). Eureka's own keys, other Spring Cloud keys and a
+    /// discovery word as a value are not discovery.
+    #[test]
+    fn discovery_in_every_file_and_in_json_key_paths() {
+        for (path, text) in [
+            (
+                "p/src/main/java/p/Lb.java",
+                "class Lb {\n  @Bean org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier s() { return null; }\n}\n",
+            ),
+            (
+                "p/src/main/java/p/Lb.java",
+                "class Lb { org.springframework.cloud.loadbalancer.core.ReactorLoadBalancer<X> lb; }\n",
+            ),
+            (
+                "p/src/main/java/p/Rb.java",
+                "class Rb { org.springframework.cloud.netflix.ribbon.StaticServerList<X> l; }\n",
+            ),
+            (
+                "deploy/docker-compose.yml",
+                "services:\n  pay:\n    environment:\n      SPRING_APPLICATION_JSON: '{\"spring\":{\"cloud\":{\"discovery\":{\"client\":{\"simple\":{\"instances\":{\"orders\":[{\"uri\":\"https://api.stripe.com\"}]}}}}}}}'\n",
+            ),
+            (
+                "deploy/pay.env",
+                "SPRING_APPLICATION_JSON={\"spring\":{\"cloud\":{\"loadbalancer\":{\"x\":1}}}}\n",
+            ),
+            (
+                "deploy/config.json",
+                "{ \"spring.cloud\": { \"kubernetes\": { \"discovery\": { \"all-namespaces\": true } } } }",
+            ),
+            (
+                "deploy/k8s.json",
+                "{\"env\":[{\"name\":\"SPRING_APPLICATION_JSON\",\"value\":\"{\\\"spring\\\":{\\\"cloud\\\":{\\\"consul\\\":{\\\"discovery\\\":{}}}}}\"}]}",
+            ),
+            (
+                "web/src/env.ts",
+                "process.env.SPRING_APPLICATION_JSON = JSON.stringify({ spring: { cloud: { 'load-balancer': { x: 1 } } } });\n",
+            ),
+        ] {
+            assert!(discovery_text(path, text), "{path}: {text}");
+            assert!(raw_scan(path, Some(text)).discovery, "{path}: {text}");
+        }
+        for (path, text) in [
+            (
+                "deploy/config.json",
+                "{\"eureka\":{\"client\":{\"serviceUrl\":{\"defaultZone\":\"http://r/eureka\"}}}}",
+            ),
+            (
+                "deploy/config.json",
+                "{\"spring\":{\"cloud\":{\"config\":{\"uri\":\"http://config\"}}}}",
+            ),
+            (
+                "deploy/config.json",
+                "{\"spring\":{\"application\":{\"name\":\"discovery\"}},\"cloud\":\"aws\"}",
+            ),
+            (
+                "p/src/main/java/p/B.java",
+                "import org.springframework.cloud.client.loadbalancer.LoadBalanced;\nclass B { @LoadBalanced RestTemplate rt; }\n",
+            ),
+            ("README.md", "{\"spring\":{\"cloud\":{\"discovery\":{}}}}"),
+        ] {
+            assert!(!discovery_text(path, text), "{path}: {text}");
+        }
+    }
+
+    /// Contract M5 S19 (b) (M4a open item 22 (c)): XML comments are read, so a hook in a
+    /// comment taints, and so does one after a `<!--` inside CDATA (which used to hide it up to
+    /// the next `-->`).
+    #[test]
+    fn xml_comments_and_cdata_are_read() {
+        use ClientKind::{Feign, Fetch};
+        for (text, want) in [
+            (
+                "<beans><![CDATA[ <!-- ]]><bean class=\"feign.Client.Default\"/><!-- --></beans>",
+                vec![Feign],
+            ),
+            ("<project><!-- the fetch phase --></project>", vec![Fetch]),
+            ("<project><name>x</name></project>", vec![]),
+        ] {
+            let found: Vec<ClientKind> = raw_scan("p/pom.xml", Some(text))
+                .hooks
+                .into_iter()
+                .collect();
+            assert_eq!(found, want, "{text}");
+        }
+        assert!(
+            raw_scan(
+                "p/ctx.xml",
+                Some("<a><!-- <x>orders.ribbon.listOfServers=a</x> --></a>")
+            )
+            .discovery
+        );
+    }
+
+    /// Contract M5 S19 (f) (M4a open item 21, part): a base that cannot be decided names the
+    /// values the file states it may take. An axios request config whose last base-setting
+    /// entry is a spread: the spread's object literal (one held by a binding, followed through
+    /// nested spreads) and the `baseURL` before it; a Spring client configured with two
+    /// bases: both. An unreadable config (`cfg`, t25) or a spread of a parameter names none,
+    /// and a `baseURL` after the spread decides the base.
+    #[test]
+    fn contested_bases_name_their_candidates() {
+        let ts = "import axios from \"axios\";\nconst api10 = axios.create({ baseURL: \"http://orders\" });\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst nested = { ...stripeOpts, timeout: 1 };\nconst ordersOpts = { baseURL: \"http://orders\" };\nconst self = { ...self };\nexport async function f(cfg) {\n  await api10.get(\"/orders/1\", { ...stripeOpts });\n  await api10.get(\"/orders/1\", cfg);\n  await api10.get(\"/orders/1\", { baseURL: \"http://orders\", ...stripeOpts });\n  await api10.get(\"/orders/1\", { ...stripeOpts, baseURL: \"http://orders\" });\n  await api10.get(\"/orders/1\", { ...nested });\n  await api10.get(\"/orders/1\", { ...ordersOpts });\n  await api10.get(\"/orders/1\", { ...self });\n  await api10.get(\"/orders/1\", { ...cfg });\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, ts),
+            [
+                "axios GET '/orders/1' base=?['https://api.stripe.com'] unverified",
+                "axios GET '/orders/1' base=? unverified",
+                "axios GET '/orders/1' base=?['http://orders'|'https://api.stripe.com'] unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base=?['https://api.stripe.com'] unverified",
+                "axios GET '/orders/1' base=?['http://orders'] unverified",
+                "axios GET '/orders/1' base=? unverified",
+                "axios GET '/orders/1' base=? unverified",
+            ]
+        );
+        let j07 = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C7 {\n  private final RestTemplate rt7 = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  C7() { rt7.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://api.stripe.com\")); }\n  String j07() { return rt7.getForObject(\"/orders/1\", String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, j07),
+            [
+                "rest_template GET '/orders/1' base=?['http://orders'|'https://api.stripe.com'] unverified"
+            ]
+        );
     }
 
     /// Contract M4a amendment 16: Feign client configuration keys in any configuration file.

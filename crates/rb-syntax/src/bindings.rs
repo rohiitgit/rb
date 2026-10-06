@@ -1260,6 +1260,19 @@ mod tests {
                     Some(crate::Init::Fallback { primary, default }) => {
                         format!("{primary} ?? {}", template(default))
                     }
+                    Some(crate::Init::Object { entries }) => {
+                        let shown: Vec<String> = entries
+                            .iter()
+                            .map(|e| match &e.value {
+                                crate::Arg::Template { template: t } => {
+                                    format!("{}: {}", e.key, template(t))
+                                }
+                                crate::Arg::Name { text, .. } => format!("{}: name {text}", e.key),
+                                _ => format!("{}: other", e.key),
+                            })
+                            .collect();
+                        format!("object {{{}}}", shown.join(", "))
+                    }
                 };
                 let constant = if b.constant { " const" } else { "" };
                 format!("{} = {init}{constant}", b.name)
@@ -1269,7 +1282,7 @@ mod tests {
 
     #[test]
     fn typescript_initialisers_and_constants() {
-        let src = "const API = import.meta.env.VITE_API_URL ?? \"http://gateway\";\nconst BASE = process.env.BASE || 'http://x';\nexport const app = express();\nconst r = express.Router();\nlet u = `${API}/u`;\nconst n = API;\nconst api = await axios.create({ baseURL: API });\nconst { a } = mk();\nclass K { base = '/k'; constructor() { this.c = http.client(); } }\nconst x = 1 + f();\nconst y = API + BASE;\n";
+        let src = "const API = import.meta.env.VITE_API_URL ?? \"http://gateway\";\nconst BASE = process.env.BASE || 'http://x';\nexport const app = express();\nconst r = express.Router();\nlet u = `${API}/u`;\nconst n = API;\nconst api = await axios.create({ baseURL: API });\nconst { a } = mk();\nclass K { base = '/k'; constructor() { this.c = http.client(); } }\nconst x = 1 + f();\nconst y = API + BASE;\nconst opts = { baseURL: \"https://api.stripe.com\", ...more, timeout: 5 };\nlet o2 = ({ \"baseURL\": API });\n";
         assert_eq!(
             inits(Language::TypeScript, src),
             [
@@ -1287,6 +1300,10 @@ mod tests {
                 "x = - const",
                 // A concatenation of names is a template of holes (S12 folds it).
                 "y = '{API}{BASE}' const",
+                // An object literal, one level deep, spreads in source order (contract M5
+                // S19 (f): a spread naming it is resolved to its `baseURL`).
+                "opts = object {baseURL: 'https://api.stripe.com', ...: name more, timeout: other} const",
+                "o2 = object {baseURL: name API}",
             ]
         );
         // The call initialiser points at the chain recorded for that call.

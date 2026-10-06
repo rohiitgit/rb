@@ -386,6 +386,11 @@ pub enum Init {
         primary: String,
         default: StrTemplate,
     },
+    /// A TS/JS object literal, one level deep as [`Arg::Object`] (contract M5 S19 (f): a spread
+    /// naming the binding is read for the `baseURL` it may set).
+    Object {
+        entries: Vec<ObjectEntry>,
+    },
 }
 
 /// Everything extracted from one blob. Definitions are sorted by position (a Go method's parent
@@ -552,7 +557,8 @@ pub struct Binding {
     /// outside this extent means another declaration.
     #[serde(default)]
     pub visible: Span,
-    /// The initialiser, when it is a string, a call, a name or a `??`/`||` fallback.
+    /// The initialiser, when it is a string, a call, a name, a `??`/`||` fallback or an object
+    /// literal.
     #[serde(default)]
     pub init: Option<Init>,
     /// Declared constant: TS/JS `const`, a Java `final` variable or interface field, Go `const`.

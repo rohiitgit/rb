@@ -281,7 +281,7 @@
 ["D","codeowners_ignored","CODEOWNERS",null,{"used":".github/CODEOWNERS"}]
 ["D","codeowners_invalid_line",".github/CODEOWNERS",[10,0,10,53],{"error":"character ranges (`[...]`) are not supported"}]
 ["D","di_coverage",null,null,{"buckets":{"ambiguous":0,"capped":0,"external":1,"not_a_bean":0,"optional_absent":0,"plain":2,"test":0,"too_ambiguous":0,"unresolved":0},"gates":{},"points":3}]
-["D","http_coverage",null,null,{"ambiguous":1,"bases":{"unverified":0,"verified":0},"dynamic":1,"external":1,"heuristic":2,"self":2,"sites":9,"synthetic":2,"too_ambiguous":0,"unmatched":0}]
+["D","http_coverage",null,null,{"ambiguous":1,"bases":{"unverified":5,"verified":0},"dynamic":1,"external":1,"heuristic":2,"self":2,"sites":9,"synthetic":2,"too_ambiguous":0,"unmatched":0}]
 ["D","http_external","apps/web/src/api/http.ts",[7,9,7,57],{"client":"fetch","host":"status.example.com","url":"https://status.example.com/api/v1/login"}]
 ["D","http_self","services/notification/src/selfcheck.ts",[2,20,2,89],{"client":"fetch","host":"localhost","url":"http://localhost:3000/internal/mfa/email"}]
 ["D","http_self","services/notification/src/selfcheck.ts",[8,20,8,66],{"client":"fetch","url":"/internal/mfa/sms"}]

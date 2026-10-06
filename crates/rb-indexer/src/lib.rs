@@ -80,8 +80,10 @@ use serde_json::{Value, json};
 /// narrows a generic or annotated point by `@Primary`, reads `@Named`; duplicate Maven
 /// versions, npm aliases and `go.mod` replaces).
 /// `m5-1`: a `CONSUMES` edge matched by suffix because no host resolved says `base: unresolved`
-/// (contract M5 S18, M4a open item 6).
-pub const PIPELINE: &str = "m5-1";
+/// (contract M5 S18, M4a open item 6); `m5-2` the carrier review's fixes (S19 (a), (b), (f)):
+/// discovery words and JSON key paths in every file, parsed ones included; XML comments read;
+/// a contested base with an external candidate is external.
+pub const PIPELINE: &str = "m5-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

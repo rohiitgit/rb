@@ -80,7 +80,10 @@ pub(crate) const RAW_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 /// The raw-text scan ([`rb_frameworks::clients::raw_scan`]) of every file the plan does not
 /// parse — a language with no grammar, a generated file, one too large to parse — except
 /// binary blobs (a NUL byte in the first 8000, as Git decides); the blob is read as lossy
-/// UTF-8. Returns the merged findings and the number of files scanned.
+/// UTF-8. Parsed files are read for discovery only
+/// ([`rb_frameworks::clients::discovery_text`], contract M5 S19 (a)): their tokens decide the
+/// hooks, but a fully qualified load-balancer type or a JSON key path is no token. Returns the
+/// merged findings and the number of files scanned as text (parsed ones not counted).
 pub(crate) fn scan_unparsed(
     files: &[FileEntry],
     plan: &[(&FileEntry, Language)],
@@ -89,10 +92,17 @@ pub(crate) fn scan_unparsed(
     let parsed: BTreeSet<&str> = plan.iter().map(|(f, _)| f.path.as_str()).collect();
     let mut out = RawScan::default();
     let mut scanned = 0;
-    for f in files
-        .iter()
-        .filter(|f| !f.binary && !parsed.contains(f.path.as_str()))
-    {
+    for f in files.iter().filter(|f| !f.binary) {
+        if parsed.contains(f.path.as_str()) {
+            // Parsed files are under the parser's byte cap, far below the scan's.
+            if !out.discovery {
+                out.discovery = rb_frameworks::clients::discovery_text(
+                    &f.path,
+                    &String::from_utf8_lossy(&blob(&f.blob_sha)?),
+                );
+            }
+            continue;
+        }
         scanned += 1;
         let found = if f.size > RAW_SCAN_BYTES {
             raw_scan(&f.path, None)
@@ -372,6 +382,40 @@ mod tests {
         );
         assert!(found.discovery);
         assert_eq!(scanned, 4);
+    }
+
+    /// Contract M5 S19 (a): parsed files are read for the discovery vocabulary too (a fully
+    /// qualified Spring Cloud LoadBalancer type in Java needs no import or annotation), but are
+    /// not counted as scanned and give no hooks (their tokens decide those).
+    #[test]
+    fn parsed_files_are_read_for_discovery() {
+        let file = |path: &str| FileEntry {
+            blob_sha: path.into(),
+            ..entry(path, 10)
+        };
+        let blobs: HashMap<&str, &[u8]> = HashMap::from([
+            (
+                "p/Lb.java",
+                &b"class Lb { @Bean org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier s() { return null; } }\n"[..],
+            ),
+            ("p/A.java", b"class A { void fetch() {} }\n"),
+        ]);
+        let blob = |sha: &str| {
+            blobs
+                .get(sha)
+                .map(|b| b.to_vec())
+                .ok_or_else(|| anyhow::anyhow!("{sha} must not be read"))
+        };
+        let scan = |files: &[FileEntry]| {
+            let (plan, _) = parse_plan(files);
+            scan_unparsed(files, &plan, &blob).unwrap()
+        };
+        let (found, scanned) = scan(&[file("p/A.java")]);
+        assert!(!found.discovery && found.hooks.is_empty() && found.words.is_empty());
+        assert_eq!(scanned, 0);
+        let (found, scanned) = scan(&[file("p/A.java"), file("p/Lb.java")]);
+        assert!(found.discovery && found.hooks.is_empty() && found.words.is_empty());
+        assert_eq!(scanned, 0);
     }
 
     #[test]

@@ -93,13 +93,13 @@
           },
           {
             "attrs": {
-              "base": "literal",
+              "base": "unverified",
               "client": "fetch",
               "host": "auth-service",
               "match": "exact",
               "sites": 1
             },
-            "certainty": "synthetic",
+            "certainty": "heuristic",
             "dst_key": "HTTP GET /api/v1/login @services/auth",
             "dst_kind": "endpoint",
             "evidence": [
