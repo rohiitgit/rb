@@ -49,7 +49,34 @@ fn db_url() -> Option<Db> {
         return None;
     };
     let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    static CLEAN: std::sync::Once = std::sync::Once::new();
+    CLEAN.call_once(|| remove_leftover_test_repositories(&url));
     Some(Db { url, _guard: guard })
+}
+
+/// Contract M5 S8: once per run, before the first test touches the database, the `t_*`
+/// repositories that killed runs left behind are deleted (one graph per transaction) and any
+/// `rb_t_*` graph no live snapshot names is dropped, through `rb gc`'s code.
+fn remove_leftover_test_repositories(url: &str) {
+    let mut store = Store::connect(url).unwrap();
+    store.migrate().unwrap();
+    let leftover: Vec<String> = store
+        .repo_names()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.starts_with("t_"))
+        .collect();
+    for r in &leftover {
+        store.delete_repo(r).unwrap();
+    }
+    let plan = store.gc_plan("t_").unwrap();
+    let removed = store.gc_apply(&plan).unwrap();
+    eprintln!(
+        "e2e start-up: removed {} leftover test repositories, {} graphs and {} building rows",
+        leftover.len(),
+        removed.graphs.len(),
+        removed.building.len()
+    );
 }
 
 /// Materialises `fixtures/<name>` as a git repository with a fixed identity and date, from the
@@ -256,6 +283,8 @@ fn check_fixture(fixture: &str, tag: &str) {
             &a,
             "--cols",
             "service,files",
+            "--timeout-ms",
+            "30000",
         ],
     );
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
@@ -285,6 +314,8 @@ fn check_fixture(fixture: &str, tag: &str) {
             &a,
             "--cols",
             "src,kind,dst,certainty",
+            "--timeout-ms",
+            "30000",
         ],
     );
     let mut expected: Vec<String> = graph
@@ -313,7 +344,19 @@ fn check_fixture(fixture: &str, tag: &str) {
         .collect();
     endpoints.sort();
     let cypher = |query: &str, cols: &str| {
-        sorted_rows(&rb(&url, &["cypher", query, "--repo", &a, "--cols", cols]))
+        sorted_rows(&rb(
+            &url,
+            &[
+                "cypher",
+                query,
+                "--repo",
+                &a,
+                "--cols",
+                cols,
+                "--timeout-ms",
+                "30000",
+            ],
+        ))
     };
     assert_eq!(
         cypher("MATCH (e:Endpoint) RETURN e.key", "endpoint"),
@@ -1117,6 +1160,120 @@ fn warm_facts_cache_equals_cold_run() {
         rb(&url, &["dump", "--repo", &cold]),
         rb(&url, &["dump", "--repo", &warm])
     );
+}
+
+/// The stderr of a failing `rb` run with extra environment variables.
+fn rb_fails_env(url: &str, args: &[&str], env: &[(&str, &str)]) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rb"));
+    cmd.args(args).env("RB_DATABASE_URL", url);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success(), "rb {args:?} should have failed");
+    String::from_utf8(out.stderr).unwrap()
+}
+
+/// Contract M5 S7: Cypher's guard rails. A statement over its timeout is cancelled and the error
+/// names the limit (`--timeout-ms`, or `RB_CYPHER_TIMEOUT_MS`, 1 to 30,000); a write is refused
+/// by the read-only transaction; the role `rb_reader` cannot call superuser-only functions
+/// (`pg_read_file`, `pg_current_logfile`), which the compose superuser can; more than 10,000
+/// rows print the first 10,000 and `truncated: rows`, exactly 10,000 print no such line.
+#[test]
+fn cypher_guard_rails() {
+    let Some(url) = db_url() else { return };
+    let repo = fixture_repo("polyglot-monorepo");
+    let name = format!("t_cypher_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    rb(
+        &url,
+        &[
+            "index",
+            repo.path().to_str().unwrap(),
+            "--repo",
+            &name,
+            "--no-scip",
+        ],
+    );
+    // 105^5 rows on this fixture: the 4-way product counts in 0.9 s (phase 4), so this one
+    // cannot finish within 100 ms on any machine the suite runs on.
+    let product = "MATCH (a), (b), (c), (d), (e) RETURN count(*)";
+    // A coarse bound on each run: the 100 ms timeout, not the 30 s maximum, cancelled it.
+    let started = std::time::Instant::now();
+    let err = rb_fails(
+        &url,
+        &["cypher", product, "--repo", &name, "--timeout-ms", "100"],
+    );
+    assert!(
+        err.contains("statement timeout of 100 ms") && err.contains("--timeout-ms"),
+        "{err}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let started = std::time::Instant::now();
+    let err = rb_fails_env(
+        &url,
+        &["cypher", product, "--repo", &name],
+        &[("RB_CYPHER_TIMEOUT_MS", "100")],
+    );
+    assert!(err.contains("statement timeout of 100 ms"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    for bad in ["0", "30001"] {
+        let err = rb_fails(
+            &url,
+            &["cypher", "RETURN 1", "--repo", &name, "--timeout-ms", bad],
+        );
+        assert!(err.contains("--timeout-ms"), "{bad}: {err}");
+    }
+    let err = rb_fails(
+        &url,
+        &[
+            "cypher",
+            "CREATE (n:File {key: 'x'}) RETURN n",
+            "--repo",
+            &name,
+        ],
+    );
+    assert!(err.contains("read-only"), "{err}");
+    for (query, function) in [
+        (
+            "RETURN pg_catalog.pg_read_file('/etc/hostname'::pg_text)",
+            "pg_read_file",
+        ),
+        (
+            "RETURN pg_catalog.pg_current_logfile()",
+            "pg_current_logfile",
+        ),
+    ] {
+        let err = rb_fails(&url, &["cypher", query, "--repo", &name]);
+        assert!(
+            err.contains(&format!("permission denied for function {function}")),
+            "{err}"
+        );
+    }
+    let rows = |n: u32| {
+        rb(
+            &url,
+            &[
+                "cypher",
+                &format!("UNWIND range(1, {n}) AS x RETURN x"),
+                "--repo",
+                &name,
+                "--cols",
+                "x",
+            ],
+        )
+    };
+    let over = rows(10_001);
+    let lines: Vec<&str> = over.lines().collect();
+    assert_eq!(lines.len(), 1 + 10_000 + 1, "header, rows, truncated");
+    assert_eq!(lines[0], "x");
+    assert_eq!(*lines.last().unwrap(), "truncated: rows");
+    let at = rows(10_000);
+    assert_eq!(at.lines().count(), 1 + 10_000);
+    assert!(!at.contains("truncated"));
 }
 
 /// Contract M5 S5 (M4a open item 4): `rb index --no-cache` parses every file and still writes the

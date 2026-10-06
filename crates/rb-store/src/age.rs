@@ -76,6 +76,13 @@ fn write_and_load(
         )?;
     }
 
+    // Cypher runs as `rb_reader` (contract M5 D9): the new graph's schema is readable by it.
+    ensure!(is_graph_name(name), "invalid graph name {name:?}");
+    tx.batch_execute(&format!(
+        "GRANT USAGE ON SCHEMA {name} TO rb_reader; \
+         GRANT SELECT ON ALL TABLES IN SCHEMA {name} TO rb_reader"
+    ))?;
+
     let server_path = |file: &str| format!("{}/{name}/{file}", dir.server_rel);
 
     let mut vertices: BTreeMap<&str, csv::Writer<fs::File>> = BTreeMap::new();
@@ -175,7 +182,8 @@ pub(crate) fn drop_graph_if_exists(tx: &mut Transaction<'_>, name: &str) -> anyh
 /// Builds the SQL wrapper for an ad-hoc Cypher query. Each returned column is cast to text.
 ///
 /// The query is embedded with a dollar-quote tag it does not contain, so it cannot escape into SQL;
-/// the caller additionally runs it in a READ ONLY transaction with a statement timeout.
+/// the caller additionally runs it in a READ ONLY transaction with a statement timeout, as the
+/// role `rb_reader`, and appends its row cap.
 pub(crate) fn cypher_sql(graph: &str, query: &str, columns: &[String]) -> anyhow::Result<String> {
     ensure!(
         !columns.is_empty(),

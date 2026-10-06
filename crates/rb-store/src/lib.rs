@@ -144,6 +144,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0005_scip_index_phase",
         include_str!("../../../migrations/0005_scip_index_phase.sql"),
     ),
+    (
+        "0006_reader_role",
+        include_str!("../../../migrations/0006_reader_role.sql"),
+    ),
 ];
 
 /// Name of the newest embedded migration; recorded in each snapshot's `tool_versions`.
@@ -225,6 +229,84 @@ pub struct GcSnapshot {
 pub struct PruneReport {
     pub rows: i64,
     pub bytes: i64,
+}
+
+/// Default Cypher statement timeout (contract M5 D6: 2 s; `--timeout-ms`, `RB_CYPHER_TIMEOUT_MS`).
+pub const CYPHER_TIMEOUT_MS_DEFAULT: u64 = 2_000;
+/// The largest Cypher statement timeout a request may set.
+pub const CYPHER_TIMEOUT_MS_MAX: u64 = 30_000;
+/// Cypher rows returned at most; more are cut with `truncated: ["rows"]` (D6).
+pub const CYPHER_ROWS_MAX: usize = 10_000;
+
+/// The guard rails of one Cypher request (contract M5 S7).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CypherLimits {
+    pub timeout_ms: u64,
+    pub rows: usize,
+}
+
+impl Default for CypherLimits {
+    fn default() -> Self {
+        Self {
+            timeout_ms: CYPHER_TIMEOUT_MS_DEFAULT,
+            rows: CYPHER_ROWS_MAX,
+        }
+    }
+}
+
+/// A Cypher answer: the requested columns, the rows (agtype text), and the limits that cut it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CypherRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub truncated: Vec<&'static str>,
+}
+
+/// Why a Cypher query was refused (contract M5 D5: `cypher`, `cypher_timeout`; a retired
+/// snapshot is a parameter error, D17).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CypherError {
+    /// Only the live snapshot has an AGE graph (D10).
+    NoProjection { snapshot: i64 },
+    /// The statement timeout cancelled the query.
+    Timeout { limit_ms: u64 },
+    /// The database refused the query: syntax, a write in the read-only transaction, a
+    /// privilege `rb_reader` lacks.
+    Refused(String),
+}
+
+impl std::fmt::Display for CypherError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CypherError::NoProjection { snapshot } => write!(
+                f,
+                "snapshot {snapshot} has no AGE projection (only the live snapshot has one)"
+            ),
+            CypherError::Timeout { limit_ms } => write!(
+                f,
+                "cypher query cancelled by its statement timeout of {limit_ms} ms \
+                 (limit `timeout_ms`: --timeout-ms, at most {CYPHER_TIMEOUT_MS_MAX})"
+            ),
+            CypherError::Refused(message) => write!(f, "cypher: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for CypherError {}
+
+/// Classifies a database error from a Cypher query; anything that is not the server's answer
+/// (a broken connection) stays as it is.
+fn cypher_error(e: postgres::Error, limits: CypherLimits) -> anyhow::Error {
+    match e.as_db_error() {
+        Some(db) if *db.code() == postgres::error::SqlState::QUERY_CANCELED => {
+            CypherError::Timeout {
+                limit_ms: limits.timeout_ms,
+            }
+            .into()
+        }
+        Some(db) => CypherError::Refused(db.message().to_owned()).into(),
+        None => e.into(),
+    }
 }
 
 /// What a publish loads, in one transaction.
@@ -1070,39 +1152,83 @@ impl Store {
         Ok(out)
     }
 
-    /// Runs a read-only Cypher query against the snapshot's AGE graph. Returns a header row followed
-    /// by one row per result, each value rendered as agtype text.
+    /// Runs a read-only Cypher query against the snapshot's AGE graph (contract M5 S7, D9): in one
+    /// `REPEATABLE READ READ ONLY` transaction, under `limits.timeout_ms` as its statement
+    /// timeout, as the role `rb_reader`, fetching at most `limits.rows + 1` rows; more than
+    /// `limits.rows` returns the first `limits.rows` and `truncated: ["rows"]`. Each value is
+    /// rendered as agtype text. Refusals are [`CypherError`]s.
     pub fn cypher(
         &mut self,
         snapshot_id: i64,
         query: &str,
         columns: &[String],
-    ) -> anyhow::Result<Vec<Vec<String>>> {
+        limits: CypherLimits,
+    ) -> anyhow::Result<CypherRows> {
         anyhow::ensure!(
             !self.in_read,
             "cypher runs in its own read-only transaction"
         );
-        let snap = self.snapshot(snapshot_id)?;
-        let Some(graph) = snap.age_graph else {
-            bail!("snapshot {snapshot_id} has no AGE projection");
+        anyhow::ensure!(
+            (1..=CYPHER_TIMEOUT_MS_MAX).contains(&limits.timeout_ms),
+            "--timeout-ms must be between 1 and {CYPHER_TIMEOUT_MS_MAX}"
+        );
+        anyhow::ensure!(
+            (1..=CYPHER_ROWS_MAX).contains(&limits.rows),
+            "the Cypher row cap must be between 1 and {CYPHER_ROWS_MAX}"
+        );
+        let mut tx = self
+            .client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()?;
+        let row = tx
+            .query_opt(
+                "SELECT age_graph FROM rb.snapshot WHERE id = $1",
+                &[&snapshot_id],
+            )?
+            .with_context(|| format!("snapshot {snapshot_id} does not exist"))?;
+        let Some(graph) = row.get::<_, Option<String>>(0) else {
+            return Err(CypherError::NoProjection {
+                snapshot: snapshot_id,
+            }
+            .into());
         };
-        let sql = age::cypher_sql(&graph, query, columns)?;
-        let mut tx = self.client.build_transaction().read_only(true).start()?;
-        tx.batch_execute("SET LOCAL statement_timeout = '2s'")?;
-        let rows = tx.query(sql.as_str(), &[])?;
+        let sql = format!(
+            "{} LIMIT {}",
+            age::cypher_sql(&graph, query, columns)?,
+            limits.rows + 1
+        );
+        tx.batch_execute(&format!(
+            "SET LOCAL statement_timeout = {}; SET LOCAL ROLE rb_reader",
+            limits.timeout_ms
+        ))?;
+        let mut rows = tx
+            .query(sql.as_str(), &[])
+            .map_err(|e| cypher_error(e, limits))?;
         tx.commit()?;
-        let mut out = vec![columns.to_vec()];
-        for r in rows {
-            out.push(
+        let truncated = if rows.len() > limits.rows {
+            rows.truncate(limits.rows);
+            vec!["rows"]
+        } else {
+            vec![]
+        };
+        let rows = rows
+            .iter()
+            .map(|r| {
                 (0..columns.len())
                     .map(|i| {
                         r.get::<_, Option<String>>(i)
                             .unwrap_or_else(|| "null".into())
                     })
-                    .collect(),
-            );
-        }
-        Ok(out)
+                    .collect()
+            })
+            .collect();
+        Ok(CypherRows {
+            columns: columns.to_vec(),
+            rows,
+            truncated,
+        })
     }
 
     /// The live snapshot and its counts, read in one transaction (contract M5 S1).

@@ -240,6 +240,15 @@ enum Command {
         /// Comma-separated names for the RETURN columns, in order.
         #[arg(long, default_value = "result", value_delimiter = ',')]
         cols: Vec<String>,
+        /// Statement timeout in milliseconds (1-30000); a query over it is cancelled with an
+        /// error, never cut short. At most 10,000 rows are printed, then `truncated: rows`.
+        #[arg(
+            long,
+            env = "RB_CYPHER_TIMEOUT_MS",
+            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
+            value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
+        )]
+        timeout_ms: u64,
     },
 }
 
@@ -557,10 +566,24 @@ fn main() -> anyhow::Result<()> {
                 println!("scip: {verb} {} rows, {} bytes", r.rows, r.bytes);
             }
         }
-        Command::Cypher { query, repo, cols } => {
+        Command::Cypher {
+            query,
+            repo,
+            cols,
+            timeout_ms,
+        } => {
             let snap = live_snapshot(&mut store, repo)?;
-            for row in store.cypher(snap.id, &query, &cols)? {
+            let limits = rb_store::CypherLimits {
+                timeout_ms,
+                ..Default::default()
+            };
+            let out = store.cypher(snap.id, &query, &cols, limits)?;
+            println!("{}", out.columns.join("\t"));
+            for row in &out.rows {
                 println!("{}", row.join("\t"));
+            }
+            if !out.truncated.is_empty() {
+                println!("truncated: {}", out.truncated.join(", "));
             }
         }
     }

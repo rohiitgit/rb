@@ -901,3 +901,56 @@ fn cache_prune_keeps_the_current_rows() {
         "no current image: refuse"
     );
 }
+
+/// Contract M5 S7, D17: a retired snapshot has no AGE projection (D10), so a Cypher query on it
+/// is refused as such; the live one answers as the role `rb_reader`.
+#[test]
+fn cypher_on_a_retired_snapshot_is_refused() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("cyretired");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let first = store
+        .publish_snapshot(
+            &repo,
+            &"a".repeat(40),
+            &json!({}),
+            &sample_graph(2, 0),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"b".repeat(40),
+            &json!({}),
+            &sample_graph(3, 1),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let limits = crate::CypherLimits::default();
+    let err = store
+        .cypher(first.id, "MATCH (n) RETURN count(n)", &["n".into()], limits)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<crate::CypherError>(),
+            Some(crate::CypherError::NoProjection { snapshot }) if *snapshot == first.id
+        ),
+        "{err:#}"
+    );
+    let out = store
+        .cypher(live.id, "MATCH (n) RETURN count(n)", &["n".into()], limits)
+        .unwrap();
+    assert_eq!(
+        (out.rows, out.truncated),
+        (vec![vec!["6".to_owned()]], vec![])
+    );
+}
