@@ -568,7 +568,7 @@ Same rules as M4a:
   - *Invariants:* the greatest-fixpoint formulation (dead cycle orphaned; a cycle with an outside caller live); dispatch liveness; library services not computed; 5,000-deep chain; counted growth.
   - Files: `rb-store/src/code.rs`, `rb-store/src/path.rs` (header), `rb-cli/src/code.rs`, `rb-cli/src/main.rs`, `rb-cli/src/path.rs`.
   - **Verify:** units; e2e (impact and callers goldens re-blessed after classification).
-- [ ] **9. Q3 roll-up** (S14).
+- [x] **9. Q3 roll-up** (S14). Done: `rb-store/src/rollup.rs` (caller BFS with depth 25 and node cap, label propagation, per-service roll-up, API hops through `path::upstream_of`), `Store::table_deps` with `RollupOptions`, `rb table-deps --precision/--hops`, the text sections and JSON fields; amendment 12; 4 units, 12 mutants killed (four survivors of the first runs given rows or a ticking variant). Files: `rb-store/src/{rollup,lib,query,path,code}.rs` (code.rs: two visibility changes and `View::graph`), `rb-cli/src/main.rs`.
   - *Derived (query time):* callers up to entry points; per-service ops, direct or indirect, endpoints (span-scoped), entry kinds; "through APIs" up to `--hops`; JSON `services`, `through_apis`.
   - *Invariants:* default `cha`; visited sets on nodes and endpoints; `CONSUMES` A ↔ B cycle test; counted growth.
   - Files: `rb-store/src/query.rs`, `rb-store/src/code.rs` (shared walk), `rb-store/src/path.rs` (upstream continuation reused, not duplicated), `rb-cli/src/main.rs`.

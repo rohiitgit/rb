@@ -1,4 +1,5 @@
 public.users  (table users)
+precision=cha
 ├─ Migrations
 │    V1__init.sql  create  src/main/resources/db/migration/V1__init.sql:1  [exact, schema assumed]  (auth-service)
 ├─ Mapped by
@@ -7,4 +8,7 @@ public.users  (table users)
 │    auth-service (.)
 │      UserRepository#  read+insert+update+delete  src/main/java/com/acme/auth/UserRepository.java:6  [synthetic, schema assumed]
 │      UserRepository#findByEmail()  read  src/main/java/com/acme/auth/UserRepository.java:7  [synthetic, schema assumed]
-└─ Callers up to entry points arrive with call resolution (M3)
+├─ Services (callers up to entry points) (1)
+│    auth-service (.)  delete+insert+read+update  direct  [synthetic]
+│      endpoint POST /auth/api/v1/login  [heuristic]
+└─ Through APIs: none

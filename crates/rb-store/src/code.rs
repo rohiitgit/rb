@@ -112,6 +112,10 @@ impl<'g> View<'g> {
         self.precision
     }
 
+    pub(crate) fn graph(&self) -> &'g Graph {
+        self.graph
+    }
+
     pub(crate) fn node(&self, id: i64) -> &'g Node {
         &self.graph.nodes()[self.index[&id]]
     }
@@ -192,7 +196,7 @@ impl<'g> View<'g> {
     /// Who calls (or references) `n`: `(source, certainty of the step, via dispatch, via
     /// reference, the edge's evidence)`. Dispatch steps go through a method `n` overrides and
     /// are at most `dispatch` certain.
-    fn callers_of(
+    pub(crate) fn callers_of(
         &self,
         n: i64,
         include_references: bool,

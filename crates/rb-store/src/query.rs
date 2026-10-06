@@ -122,7 +122,8 @@ pub struct TableAccess {
     pub service_name: String,
 }
 
-/// Which code and migrations touch a table (design §9.4, symbol level until M3 adds callers).
+/// Which code and migrations touch a table, and which services depend on it (design §9.4,
+/// contract M4b S14).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TableDeps {
     pub key: String,
@@ -131,6 +132,9 @@ pub struct TableDeps {
     /// ORM classes and models mapped to the table (`MAPS_TO`).
     pub mappings: Vec<TableAccess>,
     pub accesses: Vec<TableAccess>,
+    /// Callers up to entry points per service, and the services reaching it through APIs.
+    #[serde(flatten)]
+    pub rollup: crate::rollup::TableRollup,
 }
 
 /// How many call and type references were resolved (design §12.4, contract M3a R8).
@@ -283,7 +287,12 @@ impl Store {
         })
     }
 
-    pub fn table_deps(&mut self, snapshot_id: i64, key: &str) -> anyhow::Result<TableDeps> {
+    pub fn table_deps(
+        &mut self,
+        snapshot_id: i64,
+        key: &str,
+        opts: crate::rollup::RollupOptions,
+    ) -> anyhow::Result<TableDeps> {
         let Some(table) = self.client.query_opt(
             "SELECT id, name FROM rb.node WHERE snapshot_id = $1 AND kind = 'table' AND key = $2",
             &[&snapshot_id, &key],
@@ -354,12 +363,22 @@ impl Store {
         migrations.sort_by(order);
         mappings.sort_by(order);
         accesses.sort_by(order);
+        let graph = self.load_graph(snapshot_id)?;
+        let Some(node) = graph
+            .nodes()
+            .iter()
+            .find(|n| n.kind == NodeKind::Table && n.key == key)
+        else {
+            bail!("no table with key {key:?} in the graph of snapshot {snapshot_id}");
+        };
+        let rollup = crate::rollup::table_rollup(&graph, node.id, opts);
         Ok(TableDeps {
             key: key.to_owned(),
             name: table.get(1),
             migrations,
             mappings,
             accesses,
+            rollup,
         })
     }
 

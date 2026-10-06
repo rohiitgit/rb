@@ -128,6 +128,14 @@ enum Command {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Dispatch expansion in the caller walk (as for `callers`); `cha` by default, since
+        /// under-reporting a table's dependents is the dangerous failure.
+        #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
+        precision: rb_store::code::Precision,
+        /// API hops followed through `CONSUMES` to services reaching the table only through
+        /// another service's endpoint (0-8).
+        #[arg(long, default_value_t = rb_store::rollup::DEFAULT_HOPS)]
+        hops: usize,
     },
     /// Show what calls a function or method (Q1), as a caller tree.
     Callers {
@@ -343,7 +351,18 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::TableDeps { table, repo, json } => {
+        Command::TableDeps {
+            table,
+            repo,
+            json,
+            precision,
+            hops,
+        } => {
+            ensure!(
+                hops <= rb_store::rollup::MAX_HOPS,
+                "--hops must be between 0 and {}",
+                rb_store::rollup::MAX_HOPS
+            );
             let snap = live_snapshot(&mut store, repo)?;
             let found = match store.resolve_table(snap.id, &table)? {
                 Resolved::One(n) => n,
@@ -359,7 +378,11 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             };
-            let deps = store.table_deps(snap.id, &found.key)?;
+            let deps = store.table_deps(
+                snap.id,
+                &found.key,
+                rb_store::rollup::RollupOptions { precision, hops },
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&deps)?);
             } else {
@@ -1165,6 +1188,9 @@ fn render_table_deps(d: &TableDeps) -> String {
         )
     };
     let mut out = format!("{}  (table {})\n", d.key, d.name);
+    if let Ok(p) = code::parse_precision(&d.rollup.precision) {
+        out += &code::precision_lines(p, d.rollup.pruned_by_rta);
+    }
     out += "├─ Migrations\n";
     if d.migrations.is_empty() {
         out += "│    none (not created by any .sql file in this repo)\n";
@@ -1190,8 +1216,73 @@ fn render_table_deps(d: &TableDeps) -> String {
         }
         out += &format!("│      {}\n", access_line(a));
     }
-    out += "└─ Callers up to entry points arrive with call resolution (M3)\n";
+    // Q3's roll-up (contract M4b S14): services by their code's reach, then the services that
+    // reach the table only through another service's API.
+    let r = &d.rollup;
+    let services = section(
+        "Services (callers up to entry points)",
+        r.services.iter().flat_map(service_reach_lines).collect(),
+    );
+    let apis = section(
+        "Through APIs",
+        r.through_apis
+            .iter()
+            .map(|a| {
+                let chain: Vec<String> = a
+                    .chain
+                    .iter()
+                    .map(|c| format!("{} of {}", c.display, c.service_name))
+                    .collect();
+                format!(
+                    "{} ({})  via {}  [{}]",
+                    a.name,
+                    a.key,
+                    chain.join(", then "),
+                    a.certainty
+                )
+            })
+            .collect(),
+    );
+    for (i, (head, lines)) in [services, apis].into_iter().enumerate() {
+        let (branch, rail) = if i == 1 { ("└", " ") } else { ("├", "│") };
+        out += &format!("{branch}─ {head}\n");
+        for l in lines {
+            out += &format!("{rail}    {l}\n");
+        }
+    }
+    if !r.truncated.is_empty() {
+        out += &format!("truncated: {}\n", r.truncated.join(", "));
+    }
     out
+}
+
+/// A service of Q3's roll-up: `name (key)  ops  direct|indirect via …  [certainty]`, then its
+/// endpoints and other entry points, indented.
+fn service_reach_lines(s: &rb_store::rollup::ServiceReach) -> Vec<String> {
+    let how = if s.direct {
+        "direct".to_owned()
+    } else {
+        format!("indirect via {}", s.via.join(", "))
+    };
+    let mut lines = vec![format!(
+        "{} ({})  {}  {how}  [{}]",
+        s.name,
+        s.key,
+        s.ops.join("+"),
+        s.certainty
+    )];
+    for e in &s.endpoints {
+        lines.push(format!("  endpoint {}  [{}]", e.display, e.certainty));
+    }
+    if !s.entry_points.is_empty() {
+        let kinds: Vec<String> = s
+            .entry_points
+            .iter()
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect();
+        lines.push(format!("  entry points: {}", kinds.join(", ")));
+    }
+    lines
 }
 
 /// A symbol's descriptors (e.g. `UserDao#emailOf()`), which carry its class; a file's name.

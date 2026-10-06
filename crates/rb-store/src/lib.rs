@@ -8,6 +8,7 @@ mod age;
 pub mod code;
 pub mod path;
 mod query;
+pub mod rollup;
 
 /// Operation counts for the growth tests (contract M4a invariant 11; amendment 12, Q4): the
 /// measured loops call [`work::tick`] with the elements they examine, and a test compares the

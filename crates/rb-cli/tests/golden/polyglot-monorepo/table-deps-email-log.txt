@@ -1,7 +1,15 @@
 public.email_log  (table email_log)
+precision=cha
 ├─ Migrations
 │    none (not created by any .sql file in this repo)
 ├─ Accessed by
 │    notification (services/notification)
 │      server.ts  insert  services/notification/src/server.ts:8  [exact, schema assumed]
-└─ Callers up to entry points arrive with call resolution (M3)
+├─ Services (callers up to entry points) (1)
+│    notification (services/notification)  insert  direct  [exact]
+│      endpoint POST /internal/mfa/email  [exact]
+│      entry points: top-level 1
+└─ Through APIs (3)
+     @acme/web (apps/web)  via POST /api/v1/login of auth-service, then POST /internal/mfa/email of notification  [heuristic]
+     auth-service (services/auth)  via POST /internal/mfa/email of notification  [synthetic]
+     billing (services/billing/cmd/billing)  via POST /internal/mfa/email of notification  [synthetic]

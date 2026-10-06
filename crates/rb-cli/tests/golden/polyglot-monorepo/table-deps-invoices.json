@@ -33,5 +33,23 @@
       "service_key": "services/billing",
       "service_name": "github.com/acme/billing"
     }
-  ]
+  ],
+  "precision": "cha",
+  "pruned_by_rta": 0,
+  "services": [
+    {
+      "key": "services/billing",
+      "name": "github.com/acme/billing",
+      "ops": [
+        "update"
+      ],
+      "direct": true,
+      "via": [],
+      "endpoints": [],
+      "entry_points": {},
+      "certainty": "exact"
+    }
+  ],
+  "through_apis": [],
+  "truncated": []
 }

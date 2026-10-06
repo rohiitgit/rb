@@ -1,4 +1,5 @@
 public.users  (table users)
+precision=cha
 ├─ Migrations
 │    none (not created by any .sql file in this repo)
 ├─ Mapped by
@@ -6,4 +7,8 @@ public.users  (table users)
 ├─ Accessed by
 │    auth-api (.)
 │      findUserByEmail()  read  src/db/users.ts:8  [synthetic, schema assumed]
-└─ Callers up to entry points arrive with call resolution (M3)
+├─ Services (callers up to entry points) (1)
+│    auth-api (.)  read  direct  [synthetic]
+│      endpoint POST /api/v1/login  [heuristic]
+│      entry points: top-level 1
+└─ Through APIs: none

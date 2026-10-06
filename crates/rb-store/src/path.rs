@@ -173,19 +173,8 @@ pub fn resolve_endpoints(graph: &Graph, input: &str, normalised: Option<&str>) -
 
 /// The request path through `endpoint` (S16–S18).
 pub fn request_path(graph: &Graph, endpoint: i64, opts: PathOptions) -> RequestPath {
-    let opts = PathOptions {
-        depth: opts.depth.clamp(1, MAX_DEPTH),
-        hops: opts.hops.min(MAX_HOPS),
-        ..opts
-    };
-    let mut w = Walk {
-        v: View::with_precision(graph, opts.precision),
-        opts,
-        items: Vec::new(),
-        truncated: BTreeSet::new(),
-        seen: HashSet::new(),
-        endpoints: HashSet::from([endpoint]),
-    };
+    let mut w = Walk::new(graph, endpoint, opts);
+    let opts = w.opts;
     let up = w.upstream(endpoint, 0, Certainty::Exact);
     w.seen.clear();
     w.endpoints = HashSet::from([endpoint]);
@@ -208,6 +197,27 @@ pub fn request_path(graph: &Graph, endpoint: i64, opts: PathOptions) -> RequestP
         histogram: counts.into_iter().map(|(c, n)| (c.0, n)).collect(),
         truncated: w.truncated,
         precision: opts.precision,
+        pruned_by_rta: w.v.pruned(),
+    }
+}
+
+/// The upstream half of a request path alone (S17): the client sites consuming `endpoint`,
+/// their callers, and the endpoints those handle, continued up to `opts.hops` (shared with
+/// `rb table-deps`' API hops, contract M4b D12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    pub nodes: Vec<PathNode>,
+    pub truncated: BTreeSet<Limit>,
+    pub pruned_by_rta: usize,
+}
+
+/// The upstream walk of [`request_path`] from `endpoint`, without the downstream one.
+pub fn upstream_of(graph: &Graph, endpoint: i64, opts: PathOptions) -> Upstream {
+    let mut w = Walk::new(graph, endpoint, opts);
+    let up = w.upstream(endpoint, 0, Certainty::Exact);
+    Upstream {
+        nodes: up.iter().map(|&i| w.tree(i, false).0).collect(),
+        truncated: w.truncated,
         pruned_by_rta: w.v.pruned(),
     }
 }
@@ -286,6 +296,23 @@ pub(crate) fn handler_spans(e: &Edge) -> Option<Vec<Span>> {
 }
 
 impl<'g> Walk<'g> {
+    /// A walk from `endpoint`, its options clamped to their caps.
+    fn new(graph: &'g Graph, endpoint: i64, opts: PathOptions) -> Self {
+        let opts = PathOptions {
+            depth: opts.depth.clamp(1, MAX_DEPTH),
+            hops: opts.hops.min(MAX_HOPS),
+            ..opts
+        };
+        Walk {
+            v: View::with_precision(graph, opts.precision),
+            opts,
+            items: Vec::new(),
+            truncated: BTreeSet::new(),
+            seen: HashSet::new(),
+            endpoints: HashSet::from([endpoint]),
+        }
+    }
+
     fn add(&mut self, c: &Candidate<'_>, branch: Certainty, keep: bool) -> Option<usize> {
         if self.items.len() >= NODE_CAP {
             self.truncated.insert(Limit::Nodes);

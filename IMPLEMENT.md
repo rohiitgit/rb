@@ -349,6 +349,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 7: entry kinds (`main`, `test`, `scheduled`, `listener`, `lifecycle`) and `orphan_eligible` as `Symbol` attributes, `orphan_coverage`; the whole-word scan of every non-binary file; `PIPELINE = m4b-di-4` (amendment 10).
 - [x] Phase 8a: `rb impact` lists orphans (greatest-fixpoint reachability in deployable services), impacted tests, each endpoint once (`(handler removed)`, routers of prefix-unknown endpoints), and gains `--json` (amendment 11).
 - [x] Phase 8b: `rb callers` marks entry points (`(entry: …)`: stored kinds, `endpoint <name>`, `top-level`) and keeps expanding past them; prefix-unknown endpoints show their router in the `rb path` header and the card.
+- [x] Phase 9: `rb table-deps` rolls up callers to entry points per service (ops, direct/indirect, endpoints, entry kinds, best certainty) and lists services reaching the table only through APIs, up to `--hops` (amendment 12).
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
