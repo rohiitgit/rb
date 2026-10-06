@@ -1,7 +1,9 @@
 package com.acme.auth;
 
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
 
+@Repository
 public class UserDao {
     private final JdbcTemplate jdbc;
 

@@ -4,8 +4,10 @@ precision=cha
 │    V1__users.sql  create  services/auth/src/main/resources/db/migration/V1__users.sql:1  [exact, schema assumed]  (auth-service)
 ├─ Accessed by
 │    auth-service (services/auth)
-│      UserDao#emailOf()  read  services/auth/src/main/java/com/acme/auth/UserDao.java:13  [exact, schema assumed]
-│      UserDao#touch()  update  services/auth/src/main/java/com/acme/auth/UserDao.java:17  [exact, schema assumed]
+│      UserDao#emailOf()  read  services/auth/src/main/java/com/acme/auth/UserDao.java:15  [exact, schema assumed]
+│      UserDao#touch()  update  services/auth/src/main/java/com/acme/auth/UserDao.java:19  [exact, schema assumed]
 ├─ Services (callers up to entry points) (1)
 │    auth-service (services/auth)  read+update  direct  [exact]
-└─ Through APIs: none
+│      endpoint POST /api/v1/login  [heuristic]
+└─ Through APIs (1)
+     @acme/web (apps/web)  via POST /api/v1/login of auth-service  [heuristic]

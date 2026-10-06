@@ -354,7 +354,8 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 11a: Express mounts of default imports (S19; node-express-realworld's layout needs more, amendment 14) and catch-all endpoints only for named hosts (S20); `PIPELINE = m4b-di-5`.
 - [x] Phase 11b: an injected Spring client's base comes from the `@Bean` method its injection point resolves to, any file (S21, `base_from_bean`, never `synthetic`); `PIPELINE = m4b-di-6` (amendment 15).
 - [x] Phase 12a: java-spring-jpa gains its Spring application, a `@Primary` hasher, profile issuers, a `@Bean` audit sink with the never-instantiated `KafkaAuditSink`, and two notifiers (amendment 16).
-- [x] Phase 12b: a Spring Data fragment, the non-Spring `@Service` decoy, and `AuthController`'s qualified field, collection constructor parameter and setter. Next: 12c–d.
+- [x] Phase 12b: a Spring Data fragment, the non-Spring `@Service` decoy, and `AuthController`'s qualified field, collection constructor parameter and setter.
+- [x] Phase 12c: `DefaultAuthService`'s `@Primary`, `@Bean` and name-fallback points; `LegacyAuth`'s not-a-bean field and orphan helper; polyglot auth's application, Feign and `@Repository` beans (login now reaches `public.users` and `audit.users`). Next: 12d.
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):

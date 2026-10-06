@@ -1,11 +1,11 @@
 auth-service  (path: services/auth, deployable)
 ├─ Detected by: maven
 ├─ Manifests: services/auth/pom.xml
-├─ Files: 6 (java 3, sql 2, other 1)
+├─ Files: 7 (java 4, sql 2, other 1)
 ├─ Owners: @acme/identity
 ├─ File ownership
-│    @acme/identity     4 files   67%
-│    @acme/data         2 files   33%
+│    @acme/identity     5 files   71%
+│    @acme/data         2 files   29%
 │    unowned            0 files    0%
 ├─ APIs (2)
 │    GET /api/v1/login  → com/acme/auth/AuthController#loginPage().  [exact]
@@ -16,24 +16,27 @@ auth-service  (path: services/auth, deployable)
 ├─ APIs called by (1)
 │    @acme/web  (apps/web)
 │      POST /api/v1/login  [heuristic]  1 site
-├─ Packages (7)
+├─ Packages (10)
 │    jdk 21  (scip)
+│    org.springframework.boot/spring-boot-autoconfigure 3.3.4  (scip)
 │    org.springframework.boot/spring-boot-starter-jdbc ?  [unresolved]
 │    org.springframework.boot/spring-boot-starter-web ?  [unresolved]
+│    org.springframework.boot/spring-boot 3.3.4  (scip)
 │    org.springframework.cloud/spring-cloud-openfeign-core 4.1.3  (scip)
 │    org.springframework.cloud/spring-cloud-starter-openfeign ?  [unresolved]
+│    org.springframework/spring-context 6.1.13  (scip)
 │    org.springframework/spring-jdbc 6.1.13  (scip)
 │    org.springframework/spring-web 6.1.13  (scip)
 ├─ Database tables (2)
 │    audit.users  insert  [exact]
 │    public.users  read, update  [exact]  (schema assumed)
-├─ Dependencies (1 service, 7 packages)
+├─ Dependencies (1 service, 10 packages)
 │    notification (services/notification)  via http  [synthetic]  POST /internal/mfa/email
-│    packages: 7
+│    packages: 10
 ├─ Depended on by (1)
 │    @acme/web (apps/web)  via http  [heuristic]  POST /api/v1/login
 ├─ Shares tables with: none
 └─ Call graph (edges within the service)
-     11 symbols · CALLS 1, IMPLEMENTS 0, INJECTS 0, REFERENCES 0
-     certainty: exact 100.0%
-     entry points: endpoint 2
+     13 symbols · CALLS 2, IMPLEMENTS 0, INJECTS 2, REFERENCES 0
+     certainty: exact 50.0%, heuristic 50.0%
+     entry points: endpoint 2, main 1

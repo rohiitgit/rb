@@ -64,12 +64,52 @@
           "service": "auth-service",
           "stitch": null,
           "via": "calls"
+        },
+        {
+          "branch": "heuristic",
+          "certainty": "heuristic",
+          "children": [
+            {
+              "branch": "heuristic",
+              "certainty": "exact",
+              "children": [],
+              "collapsed": 0,
+              "display": "audit.users",
+              "key": "audit.users",
+              "line": 0,
+              "path": "",
+              "service": "",
+              "stitch": null,
+              "via": "queries"
+            },
+            {
+              "branch": "heuristic",
+              "certainty": "exact",
+              "children": [],
+              "collapsed": 0,
+              "display": "public.users",
+              "key": "public.users",
+              "line": 0,
+              "path": "",
+              "service": "",
+              "stitch": null,
+              "via": "queries"
+            }
+          ],
+          "collapsed": 0,
+          "display": "UserDao#touch().",
+          "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch().",
+          "line": 18,
+          "path": "services/auth/src/main/java/com/acme/auth/UserDao.java",
+          "service": "auth-service",
+          "stitch": null,
+          "via": "calls"
         }
       ],
       "collapsed": 0,
       "display": "AuthController#login().",
       "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login().",
-      "line": 15,
+      "line": 17,
       "path": "services/auth/src/main/java/com/acme/auth/AuthController.java",
       "service": "auth-service",
       "stitch": null,
@@ -85,7 +125,7 @@
   "histogram": [
     {
       "certainty": "exact",
-      "count": 3
+      "count": 5
     },
     {
       "certainty": "synthetic",
@@ -93,7 +133,7 @@
     },
     {
       "certainty": "heuristic",
-      "count": 4
+      "count": 5
     }
   ],
   "precision": "rta",

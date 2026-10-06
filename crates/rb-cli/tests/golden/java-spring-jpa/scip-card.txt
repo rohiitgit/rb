@@ -27,6 +27,6 @@ auth-service  (path: ., deployable)
 ├─ Depended on by: none
 ├─ Shares tables with: none
 └─ Call graph (edges within the service)
-     52 symbols · CALLS 5, IMPLEMENTS 23, INJECTS 7, REFERENCES 0
-     certainty: exact 77.1%, heuristic 17.1%, ambiguous 5.7%
+     55 symbols · CALLS 7, IMPLEMENTS 23, INJECTS 10, REFERENCES 0
+     certainty: exact 72.5%, heuristic 22.5%, ambiguous 5.0%
      entry points: endpoint 1, lifecycle 1, main 1

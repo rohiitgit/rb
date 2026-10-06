@@ -1,4 +1,4 @@
 callers of com/acme/auth/MfaClient#sendCode().  services/auth/src/main/java/com/acme/auth/MfaClient.java:9  [auth-service]
 precision=rta
-  com/acme/auth/AuthController#login().  services/auth/src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  exact  (entry: endpoint POST /api/v1/login)
+  com/acme/auth/AuthController#login().  services/auth/src/main/java/com/acme/auth/AuthController.java:17  [auth-service]  exact  (entry: endpoint POST /api/v1/login)
 certainty: exact 1

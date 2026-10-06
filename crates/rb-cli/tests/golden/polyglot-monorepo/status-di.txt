@@ -1,1 +1,1 @@
-  di: 1 injection points: 1 unresolved
+  di: 3 injection points: 2 plain, 1 external

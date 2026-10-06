@@ -2,7 +2,7 @@ file	apps/web/src/api/auth.ts	auth.ts
 service	services/auth	auth-service
 symbol	rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#	AuthController
 symbol	rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#AuthController().	AuthController
+symbol	rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthApplication.java`/AuthApplication#	AuthApplication
 file	services/auth/src/main/java/com/acme/auth/AuthController.java	AuthController.java
+file	services/auth/src/main/java/com/acme/auth/AuthApplication.java	AuthApplication.java
 file	services/auth/src/main/resources/db/migration/V2__audit.sql	V2__audit.sql
-endpoint	HTTP GET /api/v1/login @services/auth	GET /api/v1/login
-endpoint	HTTP POST /api/v1/login @services/auth	POST /api/v1/login

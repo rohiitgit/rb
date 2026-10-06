@@ -1,4 +1,4 @@
-callers of LegacyAuth#authenticate().  src/main/java/com/acme/auth/LegacyAuth.java:14  [auth-service]
+callers of LegacyAuth#authenticate().  src/main/java/com/acme/auth/LegacyAuth.java:19  [auth-service]
 precision=rta
   (no callers found)
 certainty: -

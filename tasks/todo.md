@@ -589,7 +589,7 @@ Same rules as M4a:
   - **Verify:** e2e; predict every new `INJECTS`, `impl_instantiated` and coverage line before blessing.
 - [x] **12b. Fixtures: java-spring-jpa, part 2.** New `UserRepositoryCustomImpl.java`, `support/Service.java`, `support/ReportNotifier.java`; edits to `UserRepository.java` and `AuthController.java`. Done: qualifier, collection (capped by the decoy, `annotation_unread`), conditional ambiguous setter edges; fragment kept by RTA; eight goldens moved by the line shift, SCIP card and status re-blessed.
   - **Verify:** as 12a.
-- [ ] **12c. Fixtures: java-spring-jpa, part 3, and polyglot auth.** Edits to `DefaultAuthService.java` and `LegacyAuth.java`; polyglot new `AuthApplication.java`; edits to `UserDao.java` and `AuthController.java`.
+- [x] **12c. Fixtures: java-spring-jpa, part 3, and polyglot auth.** Edits to `DefaultAuthService.java` and `LegacyAuth.java`; polyglot new `AuthApplication.java`; edits to `UserDao.java` and `AuthController.java`. Done: `@Primary`, `@Bean` and name-fallback points; `LegacyDigest` helper for the orphan case (amendment 16); Feign and `@Repository` beans in polyglot; `rb path` login gains both `QUERIES`; 26 goldens classified.
   - **Verify:** as 12a; the `rb path` login goldens gain `QUERIES public.users`/`audit.users` (classified).
 - [ ] **12d. Fixtures: polyglot billing and notification, ts-express-prisma.** Edits to `services/billing/internal/invoice.go` and `services/notification/src/selfcheck.ts`; new `src/routes/health.ts`; edit to `src/app.ts`.
   - **Verify:** as 12a.

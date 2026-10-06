@@ -1,4 +1,4 @@
-removing com/acme/auth/DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:14  [auth-service]
+removing com/acme/auth/DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:21  [auth-service]
 precision=cha
 breaks: requiring edges into it (0):
 affects: reaches those through calls or references (1):

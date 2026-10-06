@@ -1,11 +1,11 @@
 auth-service  (path: services/auth, deployable)
 ├─ Detected by: maven
 ├─ Manifests: services/auth/pom.xml
-├─ Files: 6 (java 3, sql 2, other 1)
+├─ Files: 7 (java 4, sql 2, other 1)
 ├─ Owners: @acme/identity
 ├─ File ownership
-│    @acme/identity     4 files   67%
-│    @acme/data         2 files   33%
+│    @acme/identity     5 files   71%
+│    @acme/data         2 files   29%
 │    unowned            0 files    0%
 ├─ APIs (2)
 │    GET /api/v1/login  → AuthController#loginPage().  [exact]
@@ -30,6 +30,6 @@ auth-service  (path: services/auth, deployable)
 │    @acme/web (apps/web)  via http  [heuristic]  POST /api/v1/login
 ├─ Shares tables with: none
 └─ Call graph (edges within the service)
-     11 symbols · CALLS 1, IMPLEMENTS 0, INJECTS 0, REFERENCES 0
+     13 symbols · CALLS 2, IMPLEMENTS 0, INJECTS 2, REFERENCES 0
      certainty: heuristic 100.0%
-     entry points: endpoint 2
+     entry points: endpoint 2, main 1

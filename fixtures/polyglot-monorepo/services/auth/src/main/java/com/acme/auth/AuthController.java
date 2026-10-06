@@ -6,14 +6,17 @@ import org.springframework.web.bind.annotation.*;
 @RequestMapping("/api/v1")
 public class AuthController {
     private final MfaClient mfa;
+    private final UserDao users;
 
-    public AuthController(MfaClient mfa) {
+    public AuthController(MfaClient mfa, UserDao users) {
         this.mfa = mfa;
+        this.users = users;
     }
 
     @PostMapping("/login")
     public String login(@RequestBody String email) {
         mfa.sendCode(email);
+        users.touch(1L);
         return "token";
     }
 
