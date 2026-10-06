@@ -522,7 +522,7 @@ Same rules as M4a:
   - *Invariants:* facts stay neutral; fingerprint test; no golden change.
   - Files: `rb-frameworks/src/clients.rs` (the open-item-24 row only, shown killing mutant B), `rb-syntax/src/lib.rs`, `bindings.rs`, `decorations.rs`.
   - **Verify:** units per language (positions from `src.find`); e2e passes with **no** re-bless.
-- [ ] **1b. Default exports and mentions** (S1).
+- [x] **1b. Default exports and mentions** (S1). Done: `FileFacts.default_export`, `FileFacts.mentions` (`MentionRole`, 12 roles; amendment 5: aliased specifiers and JS heritage); 5 new units seen failing first (stub; `default_export` disabled); e2e 17/17, no golden change.
   - *State:* `FileFacts.default_export` and `FileFacts.mentions` (roles per name; no spans).
   - *Invariants:* one unit row per role, plus `getLogger(X.class)`, `@Import(X.class)`, a qualified name and a string; fingerprinted.
   - Files: `rb-syntax/src/lib.rs`, `imports.rs`, new `rb-syntax/src/mentions.rs`.

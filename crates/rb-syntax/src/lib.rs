@@ -9,11 +9,12 @@ mod calls;
 mod decorations;
 mod imports;
 mod keys;
+mod mentions;
 mod queries;
 mod strings;
 mod tokens;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,7 @@ fn fingerprint_input() -> String {
         include_str!("bindings.rs"),
         include_str!("calls.rs"),
         include_str!("tokens.rs"),
+        include_str!("mentions.rs"),
     ]
     .join("\n")
 }
@@ -416,6 +418,49 @@ pub struct FileFacts {
     /// amendment 14).
     #[serde(default)]
     pub name_tokens: Vec<NameToken>,
+    /// TS/JS: the local name a module's default export names (`export default x`), or the
+    /// class or function `export default class X`/`function f` declares (contract M4b S1).
+    #[serde(default)]
+    pub default_export: Option<String>,
+    /// Java and TS/JS: every identifier, type identifier and property-name token's text,
+    /// mapped to the roles it occurs in in this file, plus every whole word of a string
+    /// literal (contract M4b S1). No spans.
+    #[serde(default)]
+    pub mentions: BTreeMap<String, BTreeSet<MentionRole>>,
+}
+
+/// The role of one mention of a name (contract M4b S1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionRole {
+    /// The name of a definition being declared (class, interface, enum, record, constructor,
+    /// method, function, type alias).
+    Declaration,
+    /// An import or unaliased export specifier, an import's local name, or a package clause.
+    /// The source name of an aliased specifier (`{ T as U }`) is [`MentionRole::Other`].
+    Import,
+    /// The head of an `extends`/`implements` item (its qualifier included).
+    Supertype,
+    /// Any other type position, type arguments included.
+    Type,
+    /// The type of an object creation or anonymous class (Java), a `new` expression's
+    /// constructor (TS/JS; for `new m.T()`, `T`).
+    New,
+    /// Java `X.class` (not inside `getLogger(…)`).
+    ClassLiteral,
+    /// Java `X::m`, `X::new`.
+    MethodRef,
+    /// The qualifier of a member access or static call, `X.y`, `X.m()`.
+    Member,
+    /// The name of an annotation or decorator (the decorator's callee, qualifiers included).
+    Annotation,
+    /// Java: a class literal that is the only argument of a `getLogger(…)` call.
+    Logger,
+    /// A whole word inside a string literal.
+    String,
+    /// Anything else: a call's name, a variable, field or parameter name, an argument, an
+    /// export of a value, an aliased specifier's source name.
+    Other,
 }
 
 /// One token of a name that may hold a configured object (contract M4a amendments 14–16): a
@@ -664,6 +709,9 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         })
         .collect();
     let imports = imports::imports(language, root, source);
+    let declared: HashSet<std::ops::Range<usize>> =
+        raw_defs.iter().map(|d| d.name.byte_range()).collect();
+    let mentions = mentions::mentions(language, root, source, &declared);
     let name_tokens = tokens::tokens(
         language,
         root,
@@ -691,6 +739,8 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         bindings,
         chains,
         name_tokens,
+        default_export: imports::default_export(language, root, source),
+        mentions,
     })
 }
 

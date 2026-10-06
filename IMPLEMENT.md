@@ -338,6 +338,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 
 - [x] Phase 0 (preflight): primary-source checks, pins, invariant-1 baseline, gate matchers; contract amendments 1–3.
 - [x] Phase 1a: X1's HTML row; parameter positions, type arguments, array flag, return types and modifiers as facts (amendment 4); no golden change.
+- [x] Phase 1b: default exports and per-file mention roles as facts (amendment 5); no golden change.
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):

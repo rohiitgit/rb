@@ -45,6 +45,36 @@ pub(crate) fn package(language: Language, root: Node<'_>, source: &[u8]) -> Opti
     Some(text(name, source))
 }
 
+/// TS/JS: the name a module's default export names (contract M4b S1): the identifier of
+/// `export default x;`, or the name `export default class X`/`function f` declares. `None`
+/// for any other default export (an expression, an anonymous class) and other languages.
+pub(crate) fn default_export(language: Language, root: Node<'_>, source: &[u8]) -> Option<String> {
+    if !matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript
+    ) {
+        return None;
+    }
+    let mut c = root.walk();
+    root.named_children(&mut c)
+        .filter(|n| n.kind() == "export_statement")
+        .find(|n| {
+            let mut ec = n.walk();
+            n.children(&mut ec).any(|t| t.kind() == "default")
+        })
+        .and_then(|export| {
+            if let Some(declaration) = export.child_by_field_name("declaration") {
+                return declaration
+                    .child_by_field_name("name")
+                    .map(|n| text(n, source));
+            }
+            export
+                .child_by_field_name("value")
+                .filter(|v| v.kind() == "identifier")
+                .map(|v| text(v, source))
+        })
+}
+
 fn import(node: Node<'_>, module: String) -> Import {
     Import {
         module,
@@ -282,5 +312,35 @@ mod tests {
         );
         let facts = extract(Language::Go, src.as_bytes()).unwrap();
         assert_eq!(facts.package.as_deref(), Some("svc"));
+    }
+}
+
+/// Contract M4b S1: the name a TS/JS module's default export names.
+#[cfg(test)]
+mod default_export_tests {
+    use crate::{Language, extract};
+
+    #[test]
+    fn default_exports_by_form() {
+        let of = |language, src: &str| extract(language, src.as_bytes()).unwrap().default_export;
+        for (src, want) in [
+            (
+                "const health = Router();\nexport default health;\n",
+                Some("health"),
+            ),
+            ("export default class Svc {}\n", Some("Svc")),
+            ("export default function main() {}\n", Some("main")),
+            ("export default Router();\n", None),
+            ("export default class {}\n", None),
+            ("export const a = 1;\nexport { a as default };\n", None),
+            ("function f() { return 1; }\n", None),
+        ] {
+            assert_eq!(of(Language::TypeScript, src).as_deref(), want, "{src}");
+        }
+        assert_eq!(
+            of(Language::JavaScript, "const r = 1;\nexport default r;\n").as_deref(),
+            Some("r")
+        );
+        assert_eq!(of(Language::Java, "class K {}\n"), None);
     }
 }

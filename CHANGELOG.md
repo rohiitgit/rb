@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4b phase 1b: default exports and mentions
+- **New neutral facts** (`rb-syntax`; new module `mentions.rs`, fingerprinted; `imports.rs`):
+  - `FileFacts.default_export` (TS/JS): the identifier of `export default x;`, or the name `export default class X`/`function f` declares; `None` for an expression, an anonymous class or `export { a as default }`.
+  - `FileFacts.mentions` (Java, TS/JS): every identifier, type identifier and property-name token's text → its set of `MentionRole`s in the file (`declaration`, `import`, `supertype`, `type`, `new`, `class_literal`, `method_ref`, `member`, `annotation`, `logger`, `string`, `other`), plus every whole word of a string fragment. Roles come from the innermost structure a token sits in (a qualified name's segments share the position's role; a class literal that is the only argument of `getLogger(…)` is `logger`; a decorator's callee is `annotation`; `new m.T()` gives `T` `new` and `m` `member`). Comments are not mentions. Python and Go record none.
+  - **Amendment 5:** the source name of an aliased specifier (`{ T as U }`) and `export default T;` are `other`, since the class is then instantiated under another name; JavaScript's `class_heritage` head is `supertype`.
+- **Tests first:** `mentions::tests::{java_one_row_per_role, java_qualified_names_logger_and_two_roles, typescript_one_row_per_role}` failed against a stub returning nothing; `default_export_tests::default_exports_by_form` failed with the fact disabled (restored, bytes compared); `python_and_go_record_no_mentions` passes by construction. The JavaScript heritage row was added with its rule.
+- **Verification:** fmt, clippy clean; 486 unit tests (rb-syntax 88; others unchanged); e2e 17/17 with the database and containers, no golden changed; stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-syntax/src/{lib,mentions,imports}.rs`, `tasks/{contract-m4b,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-06] (wall clock) M4b phase 1a: X1 row; parameter, type and modifier facts
 - **M4a open item 24 (X1):** `raw_text_hooks_and_discovery_keys` gains the row `("w/public/index.html", "<script>document.write(\"<!--\"); window.fetch = f; // --></script>", [Fetch])`. Mutant B (an `.html` file stripped of `<!-- … -->` like XML) fails exactly that row (`test result: FAILED. 0 passed; 1 failed`); the file was restored, its bytes compared with the saved copy, and the test passes again.
 - **New neutral facts** (`rb-syntax`, fingerprinted through `lib.rs`, `bindings.rs`, `decorations.rs`):
