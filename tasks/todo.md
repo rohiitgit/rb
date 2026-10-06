@@ -649,7 +649,7 @@ Same rules as M4b:
 
 `PIPELINE` becomes `m5-1` at the first dump change (phase 12) and is bumped on each later one. `RECIPE` is bumped in phase 15.
 
-- [ ] **0. Preflight** (no code).
+- [x] **0. Preflight** (no code). Done 2026-10-07: contract "Checked in phase 0" and amendment 1. Baseline `var/m5/base/` (binary `rb-afae548`, three fixture dumps; the M4b repositories' dumps in `var/fix-m4b-1/dumps/`); reader-role grants confirmed; lock limit measured (40 graphs per transaction pass, 80 fail with `out of shared memory`); S2 not reproduced on `afae548`; axum 21 crates / +0.68 MiB (under D1's threshold); `--internal` network and DNS probed; tinyproxy sized; fetch hosts deferred to phase 15 and Maven duplicates to phase 14 (each needs that phase's tooling); benchmark pins by `git ls-remote` and the GitHub trees API (no clone).
   - Read the contract (soundness section first), the lessons, contract-m4a amendment 18 and contract-m4b amendment 22.
   - `df`, `docker context show`, `docker image inspect` for both indexer images.
   - Build `afae548` (scratch target directory) and dump the three fixtures (`--no-scip`, from `git ls-files` copies) and the four M4b closing repositories at their pins: the invariant-1 baseline.

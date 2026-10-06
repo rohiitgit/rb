@@ -396,9 +396,9 @@ This file traces decisions from conversation to code. The design lives in `docs/
   Each has a recommendation.
 - No new dependency and no migration are planned.
 
-## M5 Scale & API: contract written, not started
+## M5 Scale & API: in progress
 
-- **Contract:** `tasks/contract-m5.md` (2026-10-07), S1–S28 and invariants 1–11. Phases 0–20 are in `tasks/todo.md`. Nothing is built yet.
+- **Contract:** `tasks/contract-m5.md` (2026-10-07), S1–S28 and invariants 1–11. Phases 0–20 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
   - API bodies byte-identical to the matching `rb … --json` output (one request layer, `rb-api`);
   - no silently partial answer: every cap names itself in `truncated`, the per-request budget is a deterministic operation count, and a wall-clock deadline gives an error, never a body;
@@ -414,3 +414,5 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Not in M5:** `POST /v1/repos/{repo}/index`, the `RB_SERVER` thin client, authentication, partition-per-snapshot, edge-delta loading, move detection, and the precision items M4a 16/19/20 and M4b 5/6/7/19 (measured on the benchmark, changed in M6, fork F5).
 - **Forks for the orchestrator:** F1 HTTP crate (axum vs `tiny_http`), F2 egress in M5 vs M6, F3 drop retired snapshots' AGE graphs, F4 no move detection, F5 precision items to M6, F6 benchmark repositories (apache/shardingsphere and mattermost/mattermost recommended). Each has a recommendation.
 - **New dependencies planned:** the axum stack only (D1), with a measured threshold before phase 9. One migration (0006, a read-only role).
+- **Progress:**
+  - [x] Phase 0, preflight (contract "Checked in phase 0", amendment 1): the `afae548` binary and fixture dumps as the invariant-1 baseline; `cypher()` works as a reader role once the graph's schema is granted; 80 graphs in one drop transaction exhaust the lock table (40 do not); S2's lock crash not reproduced on `afae548` (0 in 120 concurrent publishes); axum adds 21 crates and 0.68 MiB; Docker Desktop's `--internal` network has no route out and no external DNS; tinyproxy 1.11.3 (144 KiB); benchmark pins recorded (mattermost ≈ 2.2 M lines by estimate).

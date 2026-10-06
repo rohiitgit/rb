@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M5 phase 0: preflight
+- Records only, no code change. Contract `tasks/contract-m5.md` gains "Checked in phase 0" and amendment 1 (benchmark pins). Scripts and outputs under `var/m5/` (not tracked).
+- **Invariant-1 baseline:** no code differs between `304fe4a`, `afae548` and `8b52aad`; the release build is kept as `var/m5/base/rb-afae548`; the three fixtures dumped `--no-scip` from `git ls-files` copies (polyglot's equals its golden `dump.jsonl`); the four M4b closing repositories' dumps at their pins are `var/fix-m4b-1/dumps/*-fresh.jsonl` (same code).
+- **Not-verified list checked:** `cypher()` under a `NOLOGIN` reader role needs `USAGE` and `SELECT` on the graph's own schema besides `rb`, `ag_catalog.ag_graph`/`ag_label`; the role denies `pg_read_file` and Cypher writes. Dropping 80 graphs of 24 labels in one transaction fails (`out of shared memory`, `max_locks_per_transaction` 64; about 348 locks per graph), 40 pass. S2's load (4 publishers × 10 rounds plus a Cypher reader, three runs) on the `afae548` binary: 0 lock crashes, 0 failures — not reproduced. axum with D1's features: 21 new crates (licences listed), +0.68 MiB release size. Docker Desktop `--internal` network: no route out (TCP, UDP, host gateway), external names `SERVFAIL`; `--dns 127.0.0.1` leaves Docker's embedded resolver in place. tinyproxy 1.11.3-r0 in Alpine 3.24 (144 KiB). Fetch hosts and Maven's duplicate rule deferred to phases 15 and 14.
+- **Benchmark (amendment 1):** apache/shardingsphere @ `b09dfffcf9e5` (Java ≈ 1.21 M lines, Maven, 446 poms) and mattermost/mattermost @ `b2ce71db9c18` (TS ≈ 1.15 M, Go ≈ 0.98 M lines), from the GitHub trees API without cloning; mattermost is about twice S23's size, kept per F6.
+- Scratch repositories `m5_*` and the probe graphs/networks/roles were removed (graphs one per transaction); the `fp3_*` repositories are untouched.
+- Files: `tasks/{contract-m5,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) Close M4b (evaluator pass 2: VERDICT PASS)
 - Records only, no code change. Evaluator pass 2 (`tasks/eval-m4b-pass2.md`, verification only, against `304fe4a`): Y1–Y15 hold end to end, each first reproduced on a `531e14e` build, with extra forms of the same mechanisms and unchanged controls; runtime confirmations with JDK 21 (RTA repros), a Spring 6.1.13 context (`Alerts -> sms`, `Catalog -> s`, `Encoder -> fast`, two primaries fail) and offline `go list -m` (`replace`).
 - 21 mutants of amendment 21's conditions from a clean build of `rb-syntax`, `rb-frameworks` and `rb-indexer`: 21 killed (R4, D2 and the default-precision mutant, the last by 5 e2e tests).
