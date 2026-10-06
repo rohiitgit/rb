@@ -1,3 +1,4 @@
 callers of com/acme/auth/DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:14  [auth-service]
+precision=rta
   com/acme/auth/AuthController#login().  src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  dispatch, via dispatch
 certainty: dispatch 1

@@ -148,6 +148,10 @@ enum Command {
         /// Choose among several matching symbols (1-based, as listed).
         #[arg(long)]
         pick: Option<usize>,
+        /// Dispatch expansion: `rta` skips (and counts) overriders whose type is never
+        /// instantiated, `cha` follows every overrider.
+        #[arg(long, default_value = "rta", value_parser = code::parse_precision)]
+        precision: rb_store::code::Precision,
     },
     /// Show what breaks if a symbol or table is removed (Q2).
     Impact {
@@ -159,6 +163,10 @@ enum Command {
         min_certainty: rb_model::Certainty,
         #[arg(long)]
         pick: Option<usize>,
+        /// Dispatch expansion (as for `callers`); `cha` by default, since under-reporting is
+        /// the dangerous failure here.
+        #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
+        precision: rb_store::code::Precision,
     },
     /// Show the request path through an endpoint (Q4): the client calls reaching it across
     /// services, and what its handler reaches (tables, other services' endpoints).
@@ -182,6 +190,9 @@ enum Command {
         /// Choose among several matching endpoints (1-based, as listed).
         #[arg(long)]
         pick: Option<usize>,
+        /// Dispatch expansion, both ways (as for `callers`).
+        #[arg(long, default_value = "rta", value_parser = code::parse_precision)]
+        precision: rb_store::code::Precision,
     },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
@@ -359,6 +370,7 @@ fn main() -> anyhow::Result<()> {
             include_references,
             min_certainty,
             pick,
+            precision,
         } => {
             ensure!(
                 (1..=rb_store::code::MAX_CALLER_DEPTH).contains(&depth),
@@ -375,6 +387,7 @@ fn main() -> anyhow::Result<()> {
                     depth,
                     include_references,
                     min_certainty,
+                    precision,
                 },
             );
             print!("{}", code::render_callers(&graph, &tree));
@@ -384,11 +397,12 @@ fn main() -> anyhow::Result<()> {
             repo,
             min_certainty,
             pick,
+            precision,
         } => {
             let snap = live_snapshot(&mut store, repo)?;
             let graph = store.load_graph(snap.id)?;
             let t = code::pick_target(&graph, &target, pick)?;
-            let impact = rb_store::code::impact(&graph, t, min_certainty);
+            let impact = rb_store::code::impact(&graph, t, min_certainty, precision);
             print!("{}", code::render_impact(&graph, &impact));
         }
         Command::Path {
@@ -399,6 +413,7 @@ fn main() -> anyhow::Result<()> {
             full,
             format,
             pick,
+            precision,
         } => {
             ensure!(
                 (1..=rb_store::path::MAX_DEPTH).contains(&depth),
@@ -416,7 +431,12 @@ fn main() -> anyhow::Result<()> {
             let request = rb_store::path::request_path(
                 &graph,
                 endpoint,
-                rb_store::path::PathOptions { depth, hops, full },
+                rb_store::path::PathOptions {
+                    depth,
+                    hops,
+                    full,
+                    precision,
+                },
             );
             match format {
                 Format::Text => print!("{}", path::render_text(&graph, &request)),

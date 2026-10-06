@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use anyhow::bail;
 use rb_model::{Certainty, Graph};
-use rb_store::code::{Caller, CallerTree, Describer, Impact, Impacted};
+use rb_store::code::{Caller, CallerTree, Describer, Impact, Impacted, Precision};
 
 pub(crate) fn parse_certainty(s: &str) -> Result<Certainty, String> {
     [
@@ -21,6 +21,27 @@ pub(crate) fn parse_certainty(s: &str) -> Result<Certainty, String> {
     .ok_or_else(|| {
         format!("unknown certainty {s:?} (ambiguous, heuristic, synthetic, dispatch, exact)")
     })
+}
+
+pub(crate) fn parse_precision(s: &str) -> Result<Precision, String> {
+    [Precision::Rta, Precision::Cha]
+        .into_iter()
+        .find(|p| p.as_str() == s)
+        .ok_or_else(|| format!("unknown precision {s:?} (rta, cha)"))
+}
+
+/// The header of an answer that expands dispatch (contract M4b S10): `precision=<p>`, and how
+/// many dispatch steps RTA skipped when it skipped any.
+pub(crate) fn precision_lines(precision: Precision, pruned: usize) -> String {
+    let mut out = format!("precision={}\n", precision.as_str());
+    if pruned > 0 {
+        let steps = if pruned == 1 { "step" } else { "steps" };
+        let _ = writeln!(
+            out,
+            "rta: {pruned} dispatch {steps} pruned (implementations never instantiated; --precision cha shows them)"
+        );
+    }
+    out
 }
 
 /// The node `input` names. Several candidates are listed, never picked silently, unless `pick`
@@ -106,6 +127,7 @@ fn histogram<'c>(certainties: impl Iterator<Item = &'c Certainty>) -> String {
 pub(crate) fn render_callers(graph: &Graph, tree: &CallerTree) -> String {
     let d = Describer::new(graph);
     let mut out = format!("callers of {}\n", line(&d, tree.target));
+    out.push_str(&precision_lines(tree.precision, tree.pruned_by_rta));
     fn walk(
         d: &Describer<'_>,
         cs: &[Caller],
@@ -145,6 +167,7 @@ pub(crate) fn render_impact(graph: &Graph, impact: &Impact) -> String {
     for &r in impact.removed.iter().skip(1) {
         let _ = writeln!(out, "  with {}", line(&d, r));
     }
+    out.push_str(&precision_lines(impact.precision, impact.pruned_by_rta));
     let section = |title: &str, xs: &[Impacted], out: &mut String| {
         let _ = writeln!(out, "{title} ({}):", xs.len());
         for x in xs {
@@ -228,4 +251,24 @@ pub(crate) fn render_impact(graph: &Graph, impact: &Impact) -> String {
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Contract M4b S10: every answer that expands dispatch states its precision, and the RTA
+    /// line appears exactly when steps were pruned.
+    #[test]
+    fn precision_header_counts_pruned_steps() {
+        assert_eq!(precision_lines(Precision::Cha, 0), "precision=cha\n");
+        assert_eq!(precision_lines(Precision::Rta, 0), "precision=rta\n");
+        assert_eq!(
+            precision_lines(Precision::Rta, 1),
+            "precision=rta\nrta: 1 dispatch step pruned (implementations never instantiated; --precision cha shows them)\n"
+        );
+        assert!(precision_lines(Precision::Rta, 3).contains("rta: 3 dispatch steps pruned"));
+        assert_eq!(parse_precision("cha"), Ok(Precision::Cha));
+        assert!(parse_precision("vta").is_err());
+    }
 }

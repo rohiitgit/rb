@@ -1,4 +1,5 @@
 removing public.users
+precision=cha
 breaks: requiring edges into it (3):
   1  User#  src/main/java/com/acme/auth/User.java:7  [auth-service]  exact
   1  UserRepository#  src/main/java/com/acme/auth/UserRepository.java:6  [auth-service]  synthetic

@@ -1,4 +1,5 @@
 Request path: POST /api/v1/login  [auth-service]
+precision=rta
 Statically possible paths from the call graph and HTTP stitching, not a trace of one request.
 UPSTREAM
   client login().  apps/web/src/api/auth.ts:6  [@acme/web]  [heuristic]  (via host gateway)

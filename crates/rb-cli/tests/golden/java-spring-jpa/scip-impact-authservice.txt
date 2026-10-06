@@ -1,4 +1,5 @@
 removing com/acme/auth/AuthService#authenticate().  src/main/java/com/acme/auth/AuthService.java:4  [auth-service]
+precision=cha
 breaks: requiring edges into it (2):
   1  com/acme/auth/AuthController#login().  src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  exact
   1  com/acme/auth/DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:14  [auth-service]  exact

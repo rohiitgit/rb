@@ -1,4 +1,5 @@
 removing login().  apps/web/src/api/auth.ts:6  [@acme/web]
+precision=cha
 breaks: requiring edges into it (1):
   1  LoginForm().onSubmit().  apps/web/src/pages/Login.tsx:4  [@acme/web]  heuristic
 affects: reaches those through calls or references (1):

@@ -1,8 +1,9 @@
 //! Code questions over a snapshot graph held in memory (design §9.1–§9.3): which node the user
 //! means, who calls it (Q1), and what breaks if it is removed (Q2). Pure functions of the graph.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use rb_model::{Certainty, Edge, EdgeKind, Graph, Node, NodeKind};
 
@@ -23,16 +24,52 @@ const REQUIRING: &[EdgeKind] = &[
     EdgeKind::HandledBy,
 ];
 
+/// How dispatch is expanded (design §6.2, contract M4b S10 and D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Precision {
+    /// Rapid type analysis: a dispatch step into a type proven never instantiated (its
+    /// `IMPLEMENTS` edge carries `impl_instantiated: false`, S9) is skipped and counted.
+    Rta,
+    /// Class hierarchy analysis: every overriding method is a dispatch target.
+    Cha,
+}
+
+impl Precision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Precision::Rta => "rta",
+            Precision::Cha => "cha",
+        }
+    }
+}
+
+/// Whether an `IMPLEMENTS` edge leaves a type RTA proved never instantiated (S9); the attribute
+/// is written only as `false`, absent meaning "not proven".
+fn never_instantiated(e: &Edge) -> bool {
+    e.attrs
+        .get("impl_instantiated")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+}
+
 /// Adjacency of a graph, built once per question (shared with `rb path`).
 pub(crate) struct View<'g> {
     graph: &'g Graph,
     index: HashMap<i64, usize>,
     inbound: HashMap<i64, Vec<&'g Edge>>,
     outbound: HashMap<i64, Vec<&'g Edge>>,
+    precision: Precision,
+    /// The dispatch steps `(implementing, implemented)` skipped under RTA, each once.
+    pruned: RefCell<BTreeSet<(i64, i64)>>,
 }
 
 impl<'g> View<'g> {
+    /// A view that expands dispatch by CHA.
     pub(crate) fn new(graph: &'g Graph) -> Self {
+        Self::with_precision(graph, Precision::Cha)
+    }
+
+    pub(crate) fn with_precision(graph: &'g Graph, precision: Precision) -> Self {
         let index = graph
             .nodes()
             .iter()
@@ -50,7 +87,29 @@ impl<'g> View<'g> {
             index,
             inbound,
             outbound,
+            precision,
+            pruned: RefCell::new(BTreeSet::new()),
         }
+    }
+
+    /// Whether a dispatch step along the `IMPLEMENTS` edge `e` is taken: always under CHA;
+    /// under RTA not when `e` leaves a type proven never instantiated, and then the step is
+    /// recorded as pruned (invariant 4: `rta` never under-reports silently).
+    pub(crate) fn dispatches(&self, e: &Edge) -> bool {
+        if self.precision == Precision::Rta && never_instantiated(e) {
+            self.pruned.borrow_mut().insert((e.src, e.dst));
+            return false;
+        }
+        true
+    }
+
+    /// The dispatch steps skipped so far.
+    pub(crate) fn pruned(&self) -> usize {
+        self.pruned.borrow().len()
+    }
+
+    pub(crate) fn precision(&self) -> Precision {
+        self.precision
     }
 
     pub(crate) fn node(&self, id: i64) -> &'g Node {
@@ -110,7 +169,7 @@ impl<'g> View<'g> {
     }
 
     /// Methods `id` implements or overrides, transitively (each once), with the weakest
-    /// `IMPLEMENTS` certainty on the way.
+    /// `IMPLEMENTS` certainty on the way; under RTA not through a pruned step.
     pub(crate) fn overridden(&self, id: i64, min: Certainty) -> Vec<(i64, Certainty)> {
         let mut seen = HashSet::from([id]);
         let mut out = Vec::new();
@@ -118,7 +177,7 @@ impl<'g> View<'g> {
         while let Some((n, c)) = stack.pop() {
             for e in self
                 .outbound(n, EdgeKind::Implements)
-                .filter(|e| e.certainty >= min)
+                .filter(|e| e.certainty >= min && self.dispatches(e))
             {
                 if seen.insert(e.dst) {
                     let c = c.min(e.certainty);
@@ -299,6 +358,9 @@ pub fn resolve_target(graph: &Graph, input: &str) -> Vec<i64> {
 pub struct CallerTree {
     pub target: i64,
     pub callers: Vec<Caller>,
+    pub precision: Precision,
+    /// Dispatch steps skipped because their implementing type is never instantiated (S10).
+    pub pruned_by_rta: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -318,12 +380,13 @@ pub struct CallerOptions {
     pub depth: usize,
     pub include_references: bool,
     pub min_certainty: Certainty,
+    pub precision: Precision,
 }
 
 /// Callers of `target` up to `depth` levels (§9.2): breadth-first, so each caller appears once,
 /// at its shortest distance, under the first node (in output order) that reached it.
 pub fn callers(graph: &Graph, target: i64, opts: CallerOptions) -> CallerTree {
-    let v = View::new(graph);
+    let v = View::with_precision(graph, opts.precision);
     let depth = opts.depth.clamp(1, MAX_CALLER_DEPTH);
     let mut seen = HashSet::from([target]);
     // node → (parent, certainty, dispatch, reference); children in discovery order.
@@ -379,6 +442,8 @@ pub fn callers(graph: &Graph, target: i64, opts: CallerOptions) -> CallerTree {
     CallerTree {
         target,
         callers: build(target, &children),
+        precision: v.precision(),
+        pruned_by_rta: v.pruned(),
     }
 }
 
@@ -399,6 +464,9 @@ pub struct Impact {
     /// the handler's certainty and its `HANDLED_BY`.
     pub endpoints: Vec<Impacted>,
     pub truncated: bool,
+    pub precision: Precision,
+    /// Dispatch steps skipped because their implementing type is never instantiated (S10).
+    pub pruned_by_rta: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -408,9 +476,14 @@ pub struct Impacted {
     pub distance: usize,
 }
 
-/// What removing `target` breaks (§9.3), CHA dispatch included.
-pub fn impact(graph: &Graph, target: i64, min_certainty: Certainty) -> Impact {
-    let v = View::new(graph);
+/// What removing `target` breaks (§9.3), dispatch included at `precision`.
+pub fn impact(
+    graph: &Graph,
+    target: i64,
+    min_certainty: Certainty,
+    precision: Precision,
+) -> Impact {
+    let v = View::with_precision(graph, precision);
     // The target plus everything it contains.
     let mut removed = vec![target];
     let mut in_removed = HashSet::from([target]);
@@ -534,6 +607,8 @@ pub fn impact(graph: &Graph, target: i64, min_certainty: Certainty) -> Impact {
         owners: owners.into_iter().collect(),
         endpoints,
         truncated,
+        precision,
+        pruned_by_rta: v.pruned(),
     }
 }
 
@@ -832,6 +907,7 @@ mod tests {
             depth,
             include_references: false,
             min_certainty: Certainty::Ambiguous,
+            precision: Precision::Rta,
         }
     }
 
@@ -924,7 +1000,7 @@ mod tests {
     fn impact_tiers_rollups_and_class_members() {
         let g = fixture();
         let t = id(&g, "Svc#run().");
-        let i = impact(&g, t, Certainty::Ambiguous);
+        let i = impact(&g, t, Certainty::Ambiguous, Precision::Cha);
         let names = |xs: &[Impacted]| -> Vec<String> {
             xs.iter()
                 .map(|x| {
@@ -961,7 +1037,7 @@ mod tests {
         assert!(!i.truncated);
 
         // Removing the class removes its members too.
-        let ctl = impact(&g, id(&g, "Ctl#"), Certainty::Ambiguous);
+        let ctl = impact(&g, id(&g, "Ctl#"), Certainty::Ambiguous, Precision::Cha);
         let removed: Vec<String> = ctl.removed.iter().map(|&n| desc(&g, n)).collect();
         assert_eq!(removed, ["Ctl#", "Ctl#handle()."]);
         assert_eq!(names(&ctl.breaks), ["1 page(). [heuristic]"]);
@@ -970,7 +1046,12 @@ mod tests {
     #[test]
     fn impact_on_an_implementation_includes_its_dispatch_callers() {
         let g = fixture();
-        let i = impact(&g, id(&g, "SvcImpl#run()."), Certainty::Ambiguous);
+        let i = impact(
+            &g,
+            id(&g, "SvcImpl#run()."),
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
         let names: Vec<String> = i
             .breaks
             .iter()
@@ -1062,8 +1143,95 @@ mod tests {
         let a = id(&g, "a().");
         let tree = callers(&g, a, opts(MAX_CALLER_DEPTH));
         assert!(flat(&g, &tree).len() <= 3, "{:?}", flat(&g, &tree));
-        let i = impact(&g, a, Certainty::Ambiguous);
+        let i = impact(&g, a, Certainty::Ambiguous, Precision::Cha);
         assert!(i.breaks.len() + i.affects.len() <= 2);
+    }
+
+    /// Contract M4b S10: one graph under both precisions. `A#m` and `B#m` implement `I#m`, which
+    /// `c` calls; `A`'s step carries `impl_instantiated: false` (S9 proved `A` never
+    /// instantiated), `B`'s does not (kept, say by an instantiated subtype). Under `rta` the
+    /// dispatch step into `A#m` is skipped and counted, under `cha` it is taken; `B#m` keeps its
+    /// dispatch caller under both.
+    #[test]
+    fn rta_prunes_flagged_dispatch_steps_and_counts_them() {
+        let mut b = GraphBuilder::new();
+        let file = NodeKey::new(NodeKind::File, "a.java");
+        b.add_node(file.clone(), "a.java", Attrs::new()).unwrap();
+        let s =
+            |n: &str| NodeKey::new(NodeKind::Symbol, format!("rb-heuristic . . . `a.java`/{n}"));
+        for (i, n) in ["I#m().", "A#m().", "B#m().", "c()."].iter().enumerate() {
+            b.add_node(s(n), *n, Attrs::new()).unwrap();
+            b.add_edge(
+                NewEdge::new(
+                    s(n),
+                    EdgeKind::DefinedIn,
+                    file.clone(),
+                    Provenance::Treesitter,
+                    Certainty::Exact,
+                )
+                .evidence(Evidence {
+                    path: "a.java".into(),
+                    span: [i as i32, 0, i as i32, 1],
+                }),
+            )
+            .unwrap();
+        }
+        let mut flagged = Attrs::new();
+        flagged.insert("impl_instantiated".into(), false.into());
+        for (src, attrs) in [("A#m().", flagged), ("B#m().", Attrs::new())] {
+            b.add_edge(
+                NewEdge::new(
+                    s(src),
+                    EdgeKind::Implements,
+                    s("I#m()."),
+                    Provenance::Heuristic,
+                    Certainty::Heuristic,
+                )
+                .attrs(attrs),
+            )
+            .unwrap();
+        }
+        b.add_edge(NewEdge::new(
+            s("c()."),
+            EdgeKind::Calls,
+            s("I#m()."),
+            Provenance::Heuristic,
+            Certainty::Heuristic,
+        ))
+        .unwrap();
+        let g = b.finish().unwrap();
+        let with = |precision| CallerOptions {
+            precision,
+            ..opts(2)
+        };
+        let a = id(&g, "A#m().");
+        let rta = callers(&g, a, with(Precision::Rta));
+        assert!(flat(&g, &rta).is_empty(), "{:?}", flat(&g, &rta));
+        assert_eq!((rta.precision, rta.pruned_by_rta), (Precision::Rta, 1));
+        let cha = callers(&g, a, with(Precision::Cha));
+        assert_eq!(flat(&g, &cha), ["1 c(). [heuristic] (dispatch)"]);
+        assert_eq!((cha.precision, cha.pruned_by_rta), (Precision::Cha, 0));
+        // The kept step is taken under `rta` too, and nothing is pruned.
+        let kept = callers(&g, id(&g, "B#m()."), with(Precision::Rta));
+        assert_eq!(flat(&g, &kept), ["1 c(). [heuristic] (dispatch)"]);
+        assert_eq!(kept.pruned_by_rta, 0);
+
+        // `rb impact` on `A#m()`: its dispatch caller is affected under `cha` only.
+        let affected = |p| -> (Vec<String>, usize) {
+            let i = impact(&g, a, Certainty::Ambiguous, p);
+            let names = i.affects.iter().map(|x| desc(&g, x.node)).collect();
+            (names, i.pruned_by_rta)
+        };
+        assert_eq!(affected(Precision::Cha), (vec!["c().".to_owned()], 0));
+        assert_eq!(affected(Precision::Rta), (Vec::new(), 1));
+        // Requiring edges are not dispatch: `A#m()` still breaks when `I#m()` is removed.
+        let i = impact(&g, id(&g, "I#m()."), Certainty::Ambiguous, Precision::Rta);
+        let breaks: Vec<String> = i.breaks.iter().map(|x| desc(&g, x.node)).collect();
+        assert_eq!(breaks, ["A#m().", "B#m().", "c()."]);
+        // The walk from the breaking `A#m()` skips its dispatch step and counts it, although
+        // that step's callers are in the answer anyway: the count is of steps skipped, an
+        // upper bound on what `cha` would add, never less.
+        assert_eq!(i.pruned_by_rta, 1);
     }
 
     /// Contract M4a S21: endpoints handled by the removed, breaking or affected nodes, one
@@ -1151,14 +1319,19 @@ mod tests {
         );
         let g = b.finish().unwrap();
         let rollup = |name: &str| -> Vec<String> {
-            impact(&g, id(&g, &format!("{name}().")), Certainty::Ambiguous)
-                .endpoints
-                .iter()
-                .map(|x| {
-                    let key = &g.nodes().iter().find(|n| n.id == x.node).unwrap().key;
-                    format!("{} {key} [{}]", x.distance, x.certainty.as_str())
-                })
-                .collect()
+            impact(
+                &g,
+                id(&g, &format!("{name}().")),
+                Certainty::Ambiguous,
+                Precision::Cha,
+            )
+            .endpoints
+            .iter()
+            .map(|x| {
+                let key = &g.nodes().iter().find(|n| n.id == x.node).unwrap().key;
+                format!("{} {key} [{}]", x.distance, x.certainty.as_str())
+            })
+            .collect()
         };
         assert_eq!(rollup("svc"), ["2 HTTP GET /inline @s [heuristic]"]);
         assert!(

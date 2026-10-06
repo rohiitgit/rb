@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use rb_model::{Certainty, Edge, EdgeKind, Graph, NodeKind, Span};
 
-use crate::code::{View, resolve_target};
+use crate::code::{Precision, View, resolve_target};
 
 /// Default and maximum call levels followed per hop (design §11.2).
 pub const DEFAULT_DEPTH: usize = 12;
@@ -102,6 +102,9 @@ pub struct RequestPath {
     /// Step certainties of the shown nodes, best first.
     pub histogram: Vec<(Certainty, usize)>,
     pub truncated: BTreeSet<Limit>,
+    pub precision: Precision,
+    /// Dispatch steps skipped because their implementing type is never instantiated (S10).
+    pub pruned_by_rta: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +113,8 @@ pub struct PathOptions {
     pub hops: usize,
     /// Show helper calls instead of collapsing them.
     pub full: bool,
+    /// How dispatch is expanded, both ways (contract M4b D5: `rta` for Q4).
+    pub precision: Precision,
 }
 
 impl Default for PathOptions {
@@ -118,6 +123,7 @@ impl Default for PathOptions {
             depth: DEFAULT_DEPTH,
             hops: DEFAULT_HOPS,
             full: false,
+            precision: Precision::Rta,
         }
     }
 }
@@ -170,10 +176,10 @@ pub fn request_path(graph: &Graph, endpoint: i64, opts: PathOptions) -> RequestP
     let opts = PathOptions {
         depth: opts.depth.clamp(1, MAX_DEPTH),
         hops: opts.hops.min(MAX_HOPS),
-        full: opts.full,
+        ..opts
     };
     let mut w = Walk {
-        v: View::new(graph),
+        v: View::with_precision(graph, opts.precision),
         opts,
         items: Vec::new(),
         truncated: BTreeSet::new(),
@@ -201,6 +207,8 @@ pub fn request_path(graph: &Graph, endpoint: i64, opts: PathOptions) -> RequestP
         downstream,
         histogram: counts.into_iter().map(|(c, n)| (c.0, n)).collect(),
         truncated: w.truncated,
+        precision: opts.precision,
+        pruned_by_rta: w.v.pruned(),
     }
 }
 
@@ -330,7 +338,7 @@ impl<'g> Walk<'g> {
     }
 
     /// Methods that implement or override `m`, transitively, each with the weakest
-    /// `IMPLEMENTS` certainty on the way (CHA).
+    /// `IMPLEMENTS` certainty on the way (CHA; under RTA not through a pruned step).
     fn implementations(&self, m: i64) -> Vec<(i64, Certainty)> {
         let mut seen = HashSet::from([m]);
         let mut out = Vec::new();
@@ -339,6 +347,7 @@ impl<'g> Walk<'g> {
             for e in self
                 .v
                 .inbound(n, EdgeKind::Implements, Certainty::Ambiguous)
+                .filter(|e| self.v.dispatches(e))
             {
                 if seen.insert(e.src) {
                     let c = c.min(e.certainty);
@@ -1163,6 +1172,7 @@ mod tests {
                 depth: MAX_DEPTH,
                 hops: MAX_HOPS,
                 full: true,
+                ..PathOptions::default()
             },
         );
         assert_eq!(
@@ -1215,6 +1225,83 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// Contract M4b S10: one graph under both precisions. The handler calls `I.m`, implemented
+    /// by `A.m` (its type proven never instantiated: `impl_instantiated: false`) and `B.m`.
+    /// Downstream, `rta` skips the dispatch into `A.m` and counts it; upstream from the
+    /// endpoint `A.m` consumes, the dispatch caller through `I.m` is skipped and counted.
+    #[test]
+    fn rta_prunes_dispatch_both_ways() {
+        let mut b = G::new(&[("s", "service"), ("t", "service")]);
+        let e = b.endpoint("GET /e", "s");
+        let h = b.sym("s/h.java", "h", 1);
+        let i = b.sym("s/i.java", "I.m", 1);
+        let a = b.sym("s/a.java", "A.m", 1);
+        let bm = b.sym("s/b.java", "B.m", 1);
+        b.edge(&e, HandledBy, &h, Exact, ("s/h.java", 0));
+        b.edge(&h, Calls, &i, Exact, ("s/h.java", 2));
+        let mut flagged = Attrs::new();
+        flagged.insert("impl_instantiated".into(), false.into());
+        b.edge_attrs(&a, Implements, &i, Exact, ("s/a.java", 1), flagged);
+        b.edge(&bm, Implements, &i, Exact, ("s/b.java", 1));
+        let ta = b.table("ta");
+        let tb = b.table("tb");
+        b.edge(&a, Queries, &ta, Exact, ("s/a.java", 2));
+        b.edge(&bm, Queries, &tb, Exact, ("s/b.java", 2));
+        let remote = b.endpoint("GET /r", "t");
+        b.edge(&a, Consumes, &remote, Heuristic, ("s/a.java", 3));
+        let g = b.finish();
+        let with = |precision| PathOptions {
+            precision,
+            ..PathOptions::default()
+        };
+        assert_eq!(PathOptions::default().precision, Precision::Rta, "D5");
+        let rta = request_path(&g, id(&g, &e), with(Precision::Rta));
+        assert_eq!(
+            lines(&g, &rta.downstream),
+            [
+                "handler h [exact]",
+                "  calls I.m [exact]",
+                "    dispatch B.m [dispatch]",
+                "      queries tb [exact] ~dispatch",
+            ]
+        );
+        assert_eq!((rta.precision, rta.pruned_by_rta), (Precision::Rta, 1));
+        let cha = request_path(&g, id(&g, &e), with(Precision::Cha));
+        assert_eq!(
+            lines(&g, &cha.downstream),
+            [
+                "handler h [exact]",
+                "  calls I.m [exact]",
+                "    dispatch A.m [dispatch]",
+                "      queries ta [exact] ~dispatch",
+                "      consumes HTTP GET /r @t [heuristic]",
+                "    dispatch B.m [dispatch]",
+                "      queries tb [exact] ~dispatch",
+            ]
+        );
+        assert_eq!((cha.precision, cha.pruned_by_rta), (Precision::Cha, 0));
+        // Upstream of `GET /r`: `A.m` consumes it, and `h` calls `I.m`, which `A.m` overrides.
+        let up = |p| {
+            let r = request_path(&g, id(&g, &remote), with(p));
+            (lines(&g, &r.upstream), r.pruned_by_rta)
+        };
+        assert_eq!(
+            up(Precision::Rta),
+            (vec!["consumes A.m [heuristic]".to_owned()], 1)
+        );
+        assert_eq!(
+            up(Precision::Cha),
+            (
+                vec![
+                    "consumes A.m [heuristic]".to_owned(),
+                    "  dispatch h [dispatch] ~heuristic".to_owned(),
+                    "    handles HTTP GET /e @s [exact] ~heuristic".to_owned(),
+                ],
+                0
+            )
+        );
+    }
+
     #[test]
     fn a_5000_deep_chain_is_cut_at_the_depth() {
         let (g, e) = chain(5000);
@@ -1226,6 +1313,7 @@ mod tests {
                     depth: d,
                     hops: 0,
                     full: true,
+                    ..PathOptions::default()
                 },
             );
             assert_eq!(depth(&p.downstream), d + 1, "the handler and {d} levels");
@@ -1341,6 +1429,7 @@ mod tests {
                     depth: MAX_DEPTH,
                     hops: MAX_HOPS,
                     full: false,
+                    ..PathOptions::default()
                 },
             );
             crate::work::take()

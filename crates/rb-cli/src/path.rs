@@ -273,6 +273,10 @@ pub(crate) fn render_text(graph: &Graph, path: &RequestPath) -> String {
     let e = ctx.node(path.endpoint);
     let service = ctx.endpoint_service(path.endpoint);
     let mut out = format!("Request path: {}  [{service}]\n", e.name);
+    out.push_str(&crate::code::precision_lines(
+        path.precision,
+        path.pruned_by_rta,
+    ));
     out.push_str(
         "Statically possible paths from the call graph and HTTP stitching, not a trace of one request.\n",
     );
@@ -330,7 +334,8 @@ fn json_nodes(ctx: &Ctx<'_>, parent: Option<i64>, nodes: &[PathNode], upstream: 
         .collect()
 }
 
-/// The S18 JSON: `{endpoint, upstream, downstream, histogram, truncated}`.
+/// The S18 JSON: `{endpoint, precision, pruned_by_rta, upstream, downstream, histogram,
+/// truncated}` (contract M4a S18, M4b S10).
 pub(crate) fn render_json(graph: &Graph, path: &RequestPath) -> Value {
     let ctx = Ctx::new(graph);
     let e = ctx.node(path.endpoint);
@@ -340,6 +345,8 @@ pub(crate) fn render_json(graph: &Graph, path: &RequestPath) -> Value {
             "name": e.name,
             "service": ctx.endpoint_service(path.endpoint),
         },
+        "precision": path.precision.as_str(),
+        "pruned_by_rta": path.pruned_by_rta,
         "upstream": json_nodes(&ctx, Some(path.endpoint), &path.upstream, true),
         "downstream": json_nodes(&ctx, None, &path.downstream, false),
         "histogram": path
@@ -528,6 +535,7 @@ mod tests {
             depth: rb_store::path::DEFAULT_DEPTH,
             hops: rb_store::path::DEFAULT_HOPS,
             full: false,
+            precision: rb_store::code::Precision::Rta,
         };
 
         let up = rb_store::path::request_path(&graph, id(x), opts);

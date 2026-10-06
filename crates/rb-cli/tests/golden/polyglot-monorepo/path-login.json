@@ -95,6 +95,8 @@
       "count": 4
     }
   ],
+  "precision": "rta",
+  "pruned_by_rta": 0,
   "truncated": [],
   "upstream": [
     {
