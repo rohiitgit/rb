@@ -16,14 +16,14 @@ use rb_model::{Certainty, Edge, EdgeKind, NodeKind, Span};
 
 use crate::code::{Precision, SnapshotIndex, View, resolve_target};
 
-/// Default and maximum call levels followed per hop (design §11.2).
-pub const DEFAULT_DEPTH: usize = 12;
-pub const MAX_DEPTH: usize = 25;
+/// Default and maximum call levels followed per hop (design §11.2; contract M5 D6).
+pub const DEFAULT_DEPTH: usize = crate::limits::PATH_DEPTH_DEFAULT;
+pub const MAX_DEPTH: usize = crate::limits::PATH_DEPTH_MAX;
 /// Default and maximum service hops (`CONSUMES` followed into another endpoint).
-pub const DEFAULT_HOPS: usize = 4;
-pub const MAX_HOPS: usize = 8;
-/// Nodes in one answer at most (design §11.2).
-pub const NODE_CAP: usize = 5_000;
+pub const DEFAULT_HOPS: usize = crate::limits::HOPS_DEFAULT;
+pub const MAX_HOPS: usize = crate::limits::HOPS_MAX;
+
+pub use crate::limits::{Caps, Limit};
 
 /// How a tree node was reached from its parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,24 +63,6 @@ impl Via {
     }
 }
 
-/// A limit that cut the answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Limit {
-    Depth,
-    Hops,
-    Nodes,
-}
-
-impl Limit {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Limit::Depth => "depth",
-            Limit::Hops => "hops",
-            Limit::Nodes => "nodes",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathNode {
     pub node: i64,
@@ -101,10 +83,13 @@ pub struct RequestPath {
     pub downstream: Vec<PathNode>,
     /// Step certainties of the shown nodes, best first.
     pub histogram: Vec<(Certainty, usize)>,
+    /// The limits that cut the answer: `depth`, `hops`, `tree` (nodes in the answer), `work`.
     pub truncated: BTreeSet<Limit>,
     pub precision: Precision,
     /// Dispatch steps skipped because their implementing type is never instantiated (S10).
     pub pruned_by_rta: usize,
+    /// Counted operations the question spent (contract M5 D6).
+    pub work: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +100,8 @@ pub struct PathOptions {
     pub full: bool,
     /// How dispatch is expanded, both ways (contract M4b D5: `rta` for Q4).
     pub precision: Precision,
+    /// `tree` (nodes in the answer) and `work` apply (contract M5 D6).
+    pub caps: Caps,
 }
 
 impl Default for PathOptions {
@@ -124,6 +111,7 @@ impl Default for PathOptions {
             hops: DEFAULT_HOPS,
             full: false,
             precision: Precision::Rta,
+            caps: Caps::default(),
         }
     }
 }
@@ -172,8 +160,18 @@ pub fn resolve_endpoints(ix: &SnapshotIndex, input: &str, normalised: Option<&st
     found.into_iter().map(|(_, id)| id).collect()
 }
 
-/// The request path through `endpoint` (S16–S18).
+/// The request path through `endpoint` (S16–S18), under `opts.caps.work` (contract M5 S10).
 pub fn request_path(ix: &SnapshotIndex, endpoint: i64, opts: PathOptions) -> RequestPath {
+    let (mut path, spent) =
+        crate::work::metered(opts.caps.work, || request_path_walk(ix, endpoint, opts));
+    if spent.refused {
+        path.truncated.insert(Limit::Work);
+    }
+    path.work = spent.work;
+    path
+}
+
+fn request_path_walk(ix: &SnapshotIndex, endpoint: i64, opts: PathOptions) -> RequestPath {
     let mut w = Walk::new(ix, endpoint, opts);
     let opts = w.opts;
     let up = w.upstream(endpoint, 0, Certainty::Exact);
@@ -199,6 +197,7 @@ pub fn request_path(ix: &SnapshotIndex, endpoint: i64, opts: PathOptions) -> Req
         truncated: w.truncated,
         precision: opts.precision,
         pruned_by_rta: w.v.pruned(),
+        work: 0,
     }
 }
 
@@ -212,15 +211,22 @@ pub struct Upstream {
     pub pruned_by_rta: usize,
 }
 
-/// The upstream walk of [`request_path`] from `endpoint`, without the downstream one.
+/// The upstream walk of [`request_path`] from `endpoint`, without the downstream one; inside
+/// another question (Q3's API hops) it spends that question's budget.
 pub fn upstream_of(ix: &SnapshotIndex, endpoint: i64, opts: PathOptions) -> Upstream {
-    let mut w = Walk::new(ix, endpoint, opts);
-    let up = w.upstream(endpoint, 0, Certainty::Exact);
-    Upstream {
-        nodes: up.iter().map(|&i| w.tree(i, false).0).collect(),
-        truncated: w.truncated,
-        pruned_by_rta: w.v.pruned(),
+    let (mut up, spent) = crate::work::metered(opts.caps.work, || {
+        let mut w = Walk::new(ix, endpoint, opts);
+        let up = w.upstream(endpoint, 0, Certainty::Exact);
+        Upstream {
+            nodes: up.iter().map(|&i| w.tree(i, false).0).collect(),
+            truncated: w.truncated,
+            pruned_by_rta: w.v.pruned(),
+        }
+    });
+    if spent.refused {
+        up.truncated.insert(Limit::Work);
     }
+    up
 }
 
 /// One node of the answer while it is built.
@@ -315,8 +321,8 @@ impl<'g> Walk<'g> {
     }
 
     fn add(&mut self, c: &Candidate<'_>, branch: Certainty, keep: bool) -> Option<usize> {
-        if self.items.len() >= NODE_CAP {
-            self.truncated.insert(Limit::Nodes);
+        if self.items.len() >= self.opts.caps.tree {
+            self.truncated.insert(Limit::Tree);
             return None;
         }
         self.items.push(Item {
@@ -1412,7 +1418,8 @@ mod tests {
         );
         assert_eq!(hops_shown(&p), MAX_HOPS + 1, "--hops is capped at 8");
 
-        // 6,000 queries from one handler: 5,000 nodes and `nodes`.
+        // 6,000 queries from one handler: 5,000 nodes and `tree` (contract M5 D6: the answer's
+        // node cap is `tree`; `nodes` is reachability's).
         let mut b = G::new(&[("s", "service")]);
         let e = b.endpoint("GET /wide", "s");
         let h = b.sym("s/h.ts", "h", 0);
@@ -1424,8 +1431,21 @@ mod tests {
         let g = b.finish();
         let p = request_path(&ix(&g), id(&g, &e), PathOptions::default());
         let shown = 1 + p.downstream[0].children.len();
-        assert_eq!(shown, NODE_CAP);
-        assert_eq!(p.truncated, BTreeSet::from([Limit::Nodes]));
+        assert_eq!(shown, crate::limits::TREE);
+        assert_eq!(p.truncated, BTreeSet::from([Limit::Tree]));
+        // One below: a cap the walk's 6,001 nodes fit in cuts nothing; one less cuts.
+        let capped = |tree| {
+            let opts = PathOptions {
+                caps: Caps {
+                    tree,
+                    ..Caps::default()
+                },
+                ..PathOptions::default()
+            };
+            request_path(&ix(&g), id(&g, &e), opts).truncated
+        };
+        assert!(capped(6001).is_empty());
+        assert_eq!(capped(6000), BTreeSet::from([Limit::Tree]));
     }
 
     /// A handler fanning out to `n` helpers that each query a table, and `n` callers of one

@@ -443,7 +443,11 @@ fn main() -> anyhow::Result<()> {
                     snap.id,
                     &ix,
                     &found.key,
-                    rb_store::rollup::RollupOptions { precision, hops },
+                    rb_store::rollup::RollupOptions {
+                        precision,
+                        hops,
+                        caps: Default::default(),
+                    },
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&deps)?);
@@ -479,6 +483,7 @@ fn main() -> anyhow::Result<()> {
                     include_references,
                     min_certainty,
                     precision,
+                    caps: Default::default(),
                 },
             );
             print!("{}", code::render_callers(&ix, &tree));
@@ -537,6 +542,7 @@ fn main() -> anyhow::Result<()> {
                     hops,
                     full,
                     precision,
+                    caps: Default::default(),
                 },
             );
             match format {

@@ -1,7 +1,7 @@
 //! `rb callers` (Q1) and `rb impact` (Q2): choosing the target and rendering the answers
 //! (design §9.1–§9.3). The questions themselves live in `rb_store::code`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use anyhow::bail;
@@ -9,6 +9,7 @@ use rb_model::{Certainty, Graph};
 use rb_store::code::{
     Caller, CallerTree, Describer, Impact, Impacted, Orphans, Precision, SnapshotIndex,
 };
+use rb_store::limits::Limit;
 use serde_json::{Value, json};
 
 pub(crate) fn parse_certainty(s: &str) -> Result<Certainty, String> {
@@ -184,6 +185,7 @@ pub(crate) fn render_callers(ix: &SnapshotIndex, tree: &CallerTree) -> String {
         out.push_str("  (no callers found)\n");
     }
     out.push_str(&histogram(all.iter()));
+    out.push_str(&truncated_line(&tree.truncated));
     out
 }
 
@@ -275,7 +277,7 @@ pub(crate) fn impact_json(ix: &SnapshotIndex, impact: &Impact) -> Value {
             .iter()
             .map(|(o, n)| json!({"owner": o, "impacted": n}))
             .collect::<Vec<_>>(),
-        "truncated": impact.truncated,
+        "truncated": impact.truncated.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
     })
 }
 
@@ -392,14 +394,17 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
             .chain(&impact.affects)
             .map(|x| &x.certainty),
     ));
-    if impact.truncated {
-        let _ = writeln!(
-            out,
-            "truncated: stopped after {} nodes",
-            rb_store::code::IMPACT_NODE_CAP
-        );
-    }
+    out.push_str(&truncated_line(&impact.truncated));
     out
+}
+
+/// `truncated: nodes, work` (contract M5 S10): the limits that cut an answer, or nothing.
+pub(crate) fn truncated_line(limits: &BTreeSet<Limit>) -> String {
+    if limits.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = limits.iter().map(|l| l.as_str()).collect();
+    format!("truncated: {}\n", names.join(", "))
 }
 
 #[cfg(test)]
@@ -408,6 +413,16 @@ mod tests {
 
     /// Contract M4b S10: every answer that expands dispatch states its precision, and the RTA
     /// line appears exactly when steps were pruned.
+    /// Contract M5 S10: the text names every limit that cut an answer, nothing when none did.
+    #[test]
+    fn truncated_lines_name_the_limits() {
+        assert_eq!(truncated_line(&BTreeSet::new()), "");
+        assert_eq!(
+            truncated_line(&BTreeSet::from([Limit::Work, Limit::Nodes])),
+            "truncated: nodes, work\n"
+        );
+    }
+
     #[test]
     fn precision_header_counts_pruned_steps() {
         assert_eq!(precision_lines(Precision::Cha, 0), "precision=cha\n");
@@ -533,6 +548,7 @@ mod tests {
                 include_references: false,
                 min_certainty: Certainty::Ambiguous,
                 precision: Precision::Rta,
+                caps: Default::default(),
             },
         );
         let callers = render_callers(&rb_store::code::SnapshotIndex::new(graph.clone()), &tree);

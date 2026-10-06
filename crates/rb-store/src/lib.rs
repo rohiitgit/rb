@@ -13,28 +13,200 @@ pub mod path;
 mod query;
 pub mod rollup;
 
-/// Operation counts for the growth tests (contract M4a invariant 11; amendment 12, Q4): the
-/// measured loops call [`work::tick`] with the elements they examine, and a test compares the
-/// counts for an input and one four times as large, which no machine load can change. The
-/// counter exists only in test builds; elsewhere `tick` is empty.
-pub(crate) mod work {
-    #[cfg(test)]
-    thread_local! {
-        static COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+/// Contract M5 D6: every limit of a question, in one table. Parameters above their maximum are
+/// refused by the caller (`invalid_param`), never clamped; caps that cut an answer name
+/// themselves in its `truncated` list ([`limits::Limit`]).
+pub mod limits {
+    /// Q1 caller levels: default and maximum.
+    pub const CALLER_DEPTH_DEFAULT: usize = 1;
+    pub const CALLER_DEPTH_MAX: usize = 25;
+    /// Q4 call levels per hop: default and maximum.
+    pub const PATH_DEPTH_DEFAULT: usize = 12;
+    pub const PATH_DEPTH_MAX: usize = 25;
+    /// Service hops through `CONSUMES` (Q4, Q3): default and maximum.
+    pub const HOPS_DEFAULT: usize = 4;
+    pub const HOPS_MAX: usize = 8;
+    /// Nodes a reachability walk visits (Q2, Q3).
+    pub const NODES: usize = 200_000;
+    /// Entries in a rendered tree (Q1 callers, Q4 path nodes).
+    pub const TREE: usize = 5_000;
+    /// Counted operations (adjacency elements examined) per request, every question: a
+    /// deterministic budget, so the same request truncates at the same element on any machine.
+    /// Calibrated in phase 6b (contract M5 amendment 4): the largest default-parameter question
+    /// on the fixtures costs under 1/10,000 of it; re-calibrated on the benchmark (S25).
+    pub const WORK: u64 = 20_000_000;
+    /// Cypher rows returned.
+    pub const ROWS: usize = 10_000;
+    /// Cypher statement timeout: default and maximum, in milliseconds.
+    pub const CYPHER_TIMEOUT_MS_DEFAULT: u64 = 2_000;
+    pub const CYPHER_TIMEOUT_MS_MAX: u64 = 30_000;
+
+    /// A limit that cut an answer, as named in its `truncated` list.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Limit {
+        Depth,
+        Hops,
+        Nodes,
+        Tree,
+        Work,
+        Rows,
     }
 
-    /// Counts `n` elements examined by a measured loop.
-    #[inline(always)]
+    impl Limit {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Limit::Depth => "depth",
+                Limit::Hops => "hops",
+                Limit::Nodes => "nodes",
+                Limit::Tree => "tree",
+                Limit::Work => "work",
+                Limit::Rows => "rows",
+            }
+        }
+    }
+
+    /// The caps a question runs under; the defaults are the table's. Tests (and the API's
+    /// test-only override, S14) lower them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Caps {
+        pub nodes: usize,
+        pub tree: usize,
+        pub work: u64,
+    }
+
+    impl Default for Caps {
+        fn default() -> Self {
+            Caps {
+                nodes: NODES,
+                tree: TREE,
+                work: WORK,
+            }
+        }
+    }
+}
+
+/// Counted operations (contract M5 S10, D6; M4a invariant 11): every adjacency element a
+/// question examines is spent from its request's budget ([`work::metered`]), in every build;
+/// once the budget is spent, further elements are refused and the request is truncated by
+/// `work`. The thread's running count ([`work::tick`]) also serves the growth tests, which
+/// compare counts for an input and one four times as large.
+pub(crate) mod work {
+    use std::cell::Cell;
+
+    #[derive(Debug, Clone, Copy)]
+    struct Meter {
+        spent: u64,
+        cap: u64,
+        refused: bool,
+    }
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+        static METER: Cell<Option<Meter>> = const { Cell::new(None) };
+    }
+
+    /// Counts `n` elements examined (an index build, a scan outside any request budget).
+    #[inline]
     pub(crate) fn tick(n: usize) {
-        #[cfg(test)]
         COUNT.with(|c| c.set(c.get() + n as u64));
-        let _ = n;
+    }
+
+    /// Spends `n` elements of the running request's budget; `false` (and the request marked
+    /// truncated by `work`) when they do not fit, the elements then not to be examined. Outside
+    /// a request, always `true`.
+    #[inline]
+    pub(crate) fn spend(n: usize) -> bool {
+        tick(n);
+        METER.with(|m| match m.get() {
+            Some(mut meter) => {
+                let n = n as u64;
+                let fits = meter.spent + n <= meter.cap;
+                if fits {
+                    meter.spent += n;
+                } else {
+                    meter.refused = true;
+                }
+                m.set(Some(meter));
+                fits
+            }
+            None => true,
+        })
+    }
+
+    /// What a request spent, and whether its budget refused an element.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Spent {
+        pub(crate) work: u64,
+        pub(crate) refused: bool,
+    }
+
+    /// Runs `f` as one request with a budget of `cap` elements; a call inside a running request
+    /// joins it (one budget for the whole answer). Returns what the request has spent so far.
+    pub(crate) fn metered<T>(cap: u64, f: impl FnOnce() -> T) -> (T, Spent) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                METER.with(|m| m.set(None));
+            }
+        }
+        let outer = METER.with(Cell::get).is_some();
+        let _reset = (!outer).then(|| {
+            METER.with(|m| {
+                m.set(Some(Meter {
+                    spent: 0,
+                    cap,
+                    refused: false,
+                }))
+            });
+            Reset
+        });
+        let out = f();
+        let meter = METER.with(Cell::get).expect("a request is running");
+        (
+            out,
+            Spent {
+                work: meter.spent,
+                refused: meter.refused,
+            },
+        )
     }
 
     /// The count since the last call, on this thread.
     #[cfg(test)]
     pub(crate) fn take() -> u64 {
         COUNT.with(|c| c.replace(0))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A budget of `n` admits exactly `n` elements; a nested request joins its caller's.
+        #[test]
+        fn a_budget_admits_exactly_its_cap() {
+            let ((), spent) = metered(3, || {
+                assert!(spend(1) && spend(2));
+                assert!(!spend(1), "the fourth element is refused");
+                let ((), inner) = metered(100, || assert!(!spend(1)));
+                assert!(inner.refused, "the nested call shares the budget");
+            });
+            assert_eq!(
+                spent,
+                Spent {
+                    work: 3,
+                    refused: true
+                }
+            );
+            let ((), spent) = metered(3, || assert!(spend(3)));
+            assert_eq!(
+                spent,
+                Spent {
+                    work: 3,
+                    refused: false
+                }
+            );
+            assert!(spend(1_000_000), "outside a request nothing is refused");
+        }
     }
 }
 
@@ -234,11 +406,11 @@ pub struct PruneReport {
 }
 
 /// Default Cypher statement timeout (contract M5 D6: 2 s; `--timeout-ms`, `RB_CYPHER_TIMEOUT_MS`).
-pub const CYPHER_TIMEOUT_MS_DEFAULT: u64 = 2_000;
+pub const CYPHER_TIMEOUT_MS_DEFAULT: u64 = limits::CYPHER_TIMEOUT_MS_DEFAULT;
 /// The largest Cypher statement timeout a request may set.
-pub const CYPHER_TIMEOUT_MS_MAX: u64 = 30_000;
+pub const CYPHER_TIMEOUT_MS_MAX: u64 = limits::CYPHER_TIMEOUT_MS_MAX;
 /// Cypher rows returned at most; more are cut with `truncated: ["rows"]` (D6).
-pub const CYPHER_ROWS_MAX: usize = 10_000;
+pub const CYPHER_ROWS_MAX: usize = limits::ROWS;
 
 /// The guard rails of one Cypher request (contract M5 S7).
 #[derive(Debug, Clone, Copy, PartialEq)]

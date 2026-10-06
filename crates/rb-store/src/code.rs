@@ -7,11 +7,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use rb_model::{Certainty, Edge, EdgeKind, Evidence, Graph, Node, NodeKind};
 
-/// Default and maximum caller depth (§9.2).
-pub const MAX_CALLER_DEPTH: usize = 25;
+use crate::limits::{Caps, Limit};
 
-/// Nodes reached by an impact walk before it stops and reports `truncated` (§9.3).
-pub const IMPACT_NODE_CAP: usize = 200_000;
+/// Maximum caller depth (§9.2; contract M5 D6).
+pub const MAX_CALLER_DEPTH: usize = crate::limits::CALLER_DEPTH_MAX;
+
+/// Nodes reached by an impact walk before it stops and reports `nodes` (§9.3; D6).
+pub const IMPACT_NODE_CAP: usize = crate::limits::NODES;
 
 /// Edges whose source stops working when their target is removed (§9.3, tier 1).
 const REQUIRING: &[EdgeKind] = &[
@@ -206,7 +208,7 @@ impl<'g> View<'g> {
     ) -> impl Iterator<Item = &'g Edge> + use<'g> {
         self.ix
             .edges_into(id)
-            .inspect(|_| crate::work::tick(1))
+            .take_while(|_| crate::work::spend(1))
             .filter(move |e| e.kind == kind && e.certainty >= min)
     }
 
@@ -217,7 +219,7 @@ impl<'g> View<'g> {
     ) -> impl Iterator<Item = &'g Edge> + use<'g> {
         self.ix
             .edges_out_of(id)
-            .inspect(|_| crate::work::tick(1))
+            .take_while(|_| crate::work::spend(1))
             .filter(move |e| e.kind == kind)
     }
 
@@ -480,6 +482,10 @@ pub struct CallerTree {
     pub precision: Precision,
     /// Dispatch steps skipped because their implementing type is never instantiated (S10).
     pub pruned_by_rta: usize,
+    /// The limits that cut the answer (contract M5 S10): `tree`, `work`.
+    pub truncated: BTreeSet<Limit>,
+    /// Counted operations the question spent (D6).
+    pub work: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -502,18 +508,33 @@ pub struct CallerOptions {
     pub include_references: bool,
     pub min_certainty: Certainty,
     pub precision: Precision,
+    /// `tree` (caller entries) and `work` apply (contract M5 D6).
+    pub caps: Caps,
 }
 
 /// Callers of `target` up to `depth` levels (§9.2): breadth-first, so each caller appears once,
 /// at its shortest distance, under the first node (in output order) that reached it.
+/// At most `opts.caps.tree` entries are listed; a caller beyond them, or an element beyond the
+/// `work` budget, stops the walk and names the limit in `truncated` (contract M5 S10).
 pub fn callers(ix: &SnapshotIndex, target: i64, opts: CallerOptions) -> CallerTree {
+    let (mut tree, spent) = crate::work::metered(opts.caps.work, || callers_walk(ix, target, opts));
+    if spent.refused {
+        tree.truncated.insert(Limit::Work);
+    }
+    tree.work = spent.work;
+    tree
+}
+
+fn callers_walk(ix: &SnapshotIndex, target: i64, opts: CallerOptions) -> CallerTree {
     let v = View::with_precision(ix, opts.precision);
     let depth = opts.depth.clamp(1, MAX_CALLER_DEPTH);
+    let mut truncated = BTreeSet::new();
+    let mut entries = 0usize;
     let mut seen = HashSet::from([target]);
     // node → its callers (without their own callers yet), in discovery order.
     let mut children: HashMap<i64, Vec<Caller>> = HashMap::new();
     let mut frontier = vec![(target, Certainty::Exact)];
-    for _ in 0..depth {
+    'levels: for _ in 0..depth {
         let mut next = Vec::new();
         for &(n, c) in &frontier {
             for (src, step, dispatch, reference, evidence) in
@@ -521,9 +542,15 @@ pub fn callers(ix: &SnapshotIndex, target: i64, opts: CallerOptions) -> CallerTr
             {
                 // A recursive target is its own direct caller (listed once, without children).
                 let recursive = src == target && n == target;
-                if !recursive && !seen.insert(src) {
+                if !recursive && seen.contains(&src) {
                     continue;
                 }
+                if entries == opts.caps.tree {
+                    truncated.insert(Limit::Tree);
+                    break 'levels;
+                }
+                entries += 1;
+                seen.insert(src);
                 let c = c.min(step);
                 children.entry(n).or_default().push(Caller {
                     node: src,
@@ -563,6 +590,8 @@ pub fn callers(ix: &SnapshotIndex, target: i64, opts: CallerOptions) -> CallerTr
         callers: build(target, &children),
         precision: v.precision(),
         pruned_by_rta: v.pruned(),
+        truncated,
+        work: 0,
     }
 }
 
@@ -587,7 +616,10 @@ pub struct Impact {
     pub orphans: Orphans,
     /// Impacted tests: nodes whose `entry` holds `test`, and files of test paths (§9.3).
     pub tests: Vec<Impacted>,
-    pub truncated: bool,
+    /// The limits that cut the answer (contract M5 S10): `nodes`, `work`.
+    pub truncated: BTreeSet<Limit>,
+    /// Counted operations the question spent (D6).
+    pub work: u64,
     pub precision: Precision,
     /// Dispatch steps skipped because their implementing type is never instantiated (S10).
     pub pruned_by_rta: usize,
@@ -628,7 +660,38 @@ pub fn impact(
     min_certainty: Certainty,
     precision: Precision,
 ) -> Impact {
+    impact_capped(ix, target, min_certainty, precision, Caps::default())
+}
+
+/// [`impact`] under `caps` (`nodes`, `work`; contract M5 S10). A walk stopped by `work` may have
+/// missed the edges that keep a candidate alive, so its orphans are not computed.
+pub fn impact_capped(
+    ix: &SnapshotIndex,
+    target: i64,
+    min_certainty: Certainty,
+    precision: Precision,
+    caps: Caps,
+) -> Impact {
+    let (mut impact, spent) = crate::work::metered(caps.work, || {
+        impact_walk(ix, target, min_certainty, precision, caps.nodes)
+    });
+    if spent.refused {
+        impact.truncated.insert(Limit::Work);
+        impact.orphans = Orphans::NotComputed("work cap reached");
+    }
+    impact.work = spent.work;
+    impact
+}
+
+fn impact_walk(
+    ix: &SnapshotIndex,
+    target: i64,
+    min_certainty: Certainty,
+    precision: Precision,
+    node_cap: usize,
+) -> Impact {
     let v = View::with_precision(ix, precision);
+    let mut truncated = BTreeSet::new();
     // The target plus everything it contains.
     let mut removed = vec![target];
     let mut in_removed = HashSet::from([target]);
@@ -642,14 +705,21 @@ pub fn impact(
         }
         i += 1;
     }
-    removed.sort_by_key(|&n| v.order_key(n));
+    // Keys read adjacency (counted work): each is computed once, so the count does not depend
+    // on the input order a comparison sort sees (the work cap is a function of the snapshot).
+    removed.sort_by_cached_key(|&n| v.order_key(n));
 
+    // Every node reached counts against `nodes`, wherever it is reached.
     let mut reached: HashMap<i64, (Certainty, usize)> = HashMap::new();
-    for &r in &removed {
+    'removed: for &r in &removed {
         for &kind in REQUIRING {
             for e in v.inbound(r, kind, min_certainty) {
                 if in_removed.contains(&e.src) {
                     continue;
+                }
+                if !reached.contains_key(&e.src) && reached.len() >= node_cap {
+                    truncated.insert(Limit::Nodes);
+                    break 'removed;
                 }
                 let entry = reached.entry(e.src).or_insert((e.certainty, 1));
                 entry.0 = entry.0.max(e.certainty);
@@ -664,20 +734,23 @@ pub fn impact(
             distance,
         })
         .collect();
-    breaks.sort_by_key(|x| v.order_key(x.node));
+    breaks.sort_by_cached_key(|x| v.order_key(x.node));
 
-    let mut truncated = false;
     let mut frontier: Vec<(i64, Certainty)> =
         breaks.iter().map(|x| (x.node, x.certainty)).collect();
     let mut affects = Vec::new();
     // Callers of a method a removed node overrides may dispatch into it (CHA): they keep
     // compiling but their behaviour changes, so they are affected at distance 1.
-    for &r in &removed {
+    'dispatch: for &r in &removed {
         for (m, via) in v.overridden(r, min_certainty) {
             for &kind in &[EdgeKind::Calls, EdgeKind::References] {
                 for e in v.inbound(m, kind, min_certainty) {
                     if in_removed.contains(&e.src) || reached.contains_key(&e.src) {
                         continue;
+                    }
+                    if reached.len() >= node_cap {
+                        truncated.insert(Limit::Nodes);
+                        break 'dispatch;
                     }
                     let c = via.min(Certainty::Dispatch).min(e.certainty);
                     reached.insert(e.src, (c, 1));
@@ -692,7 +765,7 @@ pub fn impact(
         }
     }
     let mut distance = 1;
-    while !frontier.is_empty() && !truncated {
+    while !frontier.is_empty() && truncated.is_empty() {
         distance += 1;
         let mut next = Vec::new();
         for &(n, c) in &frontier {
@@ -700,8 +773,8 @@ pub fn impact(
                 if in_removed.contains(&src) || reached.contains_key(&src) {
                     continue;
                 }
-                if reached.len() >= IMPACT_NODE_CAP {
-                    truncated = true;
+                if reached.len() >= node_cap {
+                    truncated.insert(Limit::Nodes);
                     break;
                 }
                 let c = c.min(step);
@@ -716,7 +789,7 @@ pub fn impact(
         }
         frontier = next;
     }
-    affects.sort_by_key(|x| (x.distance, v.order_key(x.node)));
+    affects.sort_by_cached_key(|x| (x.distance, v.order_key(x.node)));
 
     let service_of = |n: i64| -> Option<String> {
         let file = v.file_of(n)?;
@@ -727,15 +800,17 @@ pub fn impact(
     let endpoints = endpoint_rollup(&v, &removed, &breaks, &affects, min_certainty);
     // An endpoint is listed once, under `endpoints` (M4a open item 7).
     breaks.retain(|x| v.node(x.node).kind != NodeKind::Endpoint);
-    let (orphans, cut) = orphans(&v, target, &removed, &in_removed);
-    truncated |= cut;
+    let (orphans, cut) = orphans(&v, target, &removed, &in_removed, node_cap);
+    if cut {
+        truncated.insert(Limit::Nodes);
+    }
     let mut tests: Vec<Impacted> = breaks
         .iter()
         .chain(&affects)
         .filter(|x| is_test(&v, x.node))
         .cloned()
         .collect();
-    tests.sort_by_key(|x| (x.distance, v.order_key(x.node)));
+    tests.sort_by_cached_key(|x| (x.distance, v.order_key(x.node)));
     let own = service_of(target);
     let mut services: BTreeMap<String, usize> = BTreeMap::new();
     let mut owners: BTreeMap<String, usize> = BTreeMap::new();
@@ -765,6 +840,7 @@ pub fn impact(
         orphans,
         tests,
         truncated,
+        work: 0,
         precision,
         pruned_by_rta: v.pruned(),
     }
@@ -813,6 +889,7 @@ fn orphans(
     target: i64,
     removed: &[i64],
     in_removed: &HashSet<i64>,
+    node_cap: usize,
 ) -> (Orphans, bool) {
     if v.node(target).kind != NodeKind::Symbol {
         return (Orphans::NotComputed("not a symbol"), false);
@@ -858,7 +935,7 @@ fn orphans(
                 {
                     continue;
                 }
-                if candidates.len() >= IMPACT_NODE_CAP {
+                if candidates.len() >= node_cap {
                     cut = true;
                     break;
                 }
@@ -1212,6 +1289,7 @@ mod tests {
             include_references: false,
             min_certainty: Certainty::Ambiguous,
             precision: Precision::Rta,
+            caps: Caps::default(),
         }
     }
 
@@ -1338,7 +1416,7 @@ mod tests {
             ]
         );
         assert_eq!(i.owners, [("@api".to_owned(), 1), ("@core".to_owned(), 2)]);
-        assert!(!i.truncated);
+        assert!(i.truncated.is_empty());
 
         // Removing the class removes its members too.
         let ctl = impact(
@@ -2132,5 +2210,519 @@ mod tests {
         };
         let (small, large) = (count(200, 200), count(800, 800));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// A fixed-seed generator (xorshift64*), so a failing case is reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n as u64) as usize
+        }
+    }
+
+    /// A random snapshot graph over the real kinds: three services (one a library), files in
+    /// them, `n` symbols with random `CALLS`, `REFERENCES`, `IMPLEMENTS` (cycles and
+    /// self-loops included, mixed certainties, some `impl_instantiated: false`), endpoints
+    /// exposed and handled, client sites consuming them, and tables queried.
+    fn random_graph(seed: u64, n: usize) -> Graph {
+        let mut r = Rng(seed | 1);
+        let mut b = GraphBuilder::new();
+        let services = ["a", "b", "lib"];
+        for s in services {
+            let mut attrs = Attrs::new();
+            let role = if s == "lib" { "library" } else { "service" };
+            attrs.insert("role".into(), role.into());
+            b.add_node(NodeKey::new(NodeKind::Service, s), s, attrs)
+                .unwrap();
+        }
+        let files: Vec<String> = (0..6)
+            .map(|i| format!("{}/f{i}.ts", services[i % 3]))
+            .collect();
+        for f in &files {
+            b.add_node(
+                NodeKey::new(NodeKind::File, f.as_str()),
+                f.as_str(),
+                Attrs::new(),
+            )
+            .unwrap();
+            let s = NodeKey::new(NodeKind::Service, f.split('/').next().unwrap());
+            b.add_edge(NewEdge::new(
+                NodeKey::new(NodeKind::File, f.as_str()),
+                EdgeKind::InService,
+                s,
+                Provenance::Manifest,
+                Certainty::Exact,
+            ))
+            .unwrap();
+        }
+        let certainties = [
+            Certainty::Ambiguous,
+            Certainty::Heuristic,
+            Certainty::Synthetic,
+            Certainty::Dispatch,
+            Certainty::Exact,
+        ];
+        let sym = |i: usize| NodeKey::new(NodeKind::Symbol, format!("s{i:03}"));
+        for i in 0..n {
+            let mut attrs = Attrs::new();
+            if r.below(3) > 0 {
+                attrs.insert("orphan_eligible".into(), true.into());
+            }
+            b.add_node(sym(i), format!("s{i}"), attrs).unwrap();
+            let f = &files[r.below(files.len())];
+            b.add_edge(
+                NewEdge::new(
+                    sym(i),
+                    EdgeKind::DefinedIn,
+                    NodeKey::new(NodeKind::File, f.as_str()),
+                    Provenance::Treesitter,
+                    Certainty::Exact,
+                )
+                .evidence(Evidence {
+                    path: f.clone(),
+                    span: [i as i32, 0, i as i32, 1],
+                }),
+            )
+            .unwrap();
+        }
+        for _ in 0..n * 2 {
+            let (x, y) = (r.below(n), r.below(n));
+            let kind = [
+                EdgeKind::Calls,
+                EdgeKind::Calls,
+                EdgeKind::References,
+                EdgeKind::Implements,
+            ][r.below(4)];
+            let mut e = NewEdge::new(
+                sym(x),
+                kind,
+                sym(y),
+                Provenance::Heuristic,
+                certainties[r.below(5)],
+            );
+            if kind == EdgeKind::Implements && r.below(2) == 0 {
+                let mut attrs = Attrs::new();
+                attrs.insert("impl_instantiated".into(), false.into());
+                e = e.attrs(attrs);
+            }
+            let _ = b.add_edge(e);
+        }
+        for k in 0..3 {
+            let ep = NodeKey::new(
+                NodeKind::Endpoint,
+                format!("HTTP GET /e{k} @{}", services[k % 2]),
+            );
+            b.add_node(ep.clone(), format!("GET /e{k}"), Attrs::new())
+                .unwrap();
+            let svc = NodeKey::new(NodeKind::Service, services[k % 2]);
+            b.add_edge(NewEdge::new(
+                svc,
+                EdgeKind::Exposes,
+                ep.clone(),
+                Provenance::Heuristic,
+                Certainty::Exact,
+            ))
+            .unwrap();
+            b.add_edge(NewEdge::new(
+                ep.clone(),
+                EdgeKind::HandledBy,
+                sym(r.below(n)),
+                Provenance::Heuristic,
+                certainties[r.below(5)],
+            ))
+            .unwrap();
+            let _ = b.add_edge(NewEdge::new(
+                sym(r.below(n)),
+                EdgeKind::Consumes,
+                ep,
+                Provenance::HttpStitch,
+                certainties[r.below(3)],
+            ));
+        }
+        for t in 0..2 {
+            let table = NodeKey::new(NodeKind::Table, format!("public.t{t}"));
+            b.add_node(table.clone(), format!("t{t}"), Attrs::new())
+                .unwrap();
+            for _ in 0..3 {
+                let mut attrs = Attrs::new();
+                attrs.insert("ops".into(), serde_json::json!(["read"]));
+                let _ = b.add_edge(
+                    NewEdge::new(
+                        sym(r.below(n)),
+                        EdgeKind::Queries,
+                        table.clone(),
+                        Provenance::SqlLiteral,
+                        Certainty::Exact,
+                    )
+                    .attrs(attrs),
+                );
+            }
+        }
+        b.finish().unwrap()
+    }
+
+    /// Caps above anything a graph of this size can reach.
+    fn huge() -> Caps {
+        Caps {
+            nodes: usize::MAX,
+            tree: usize::MAX,
+            work: u64::MAX,
+        }
+    }
+
+    /// Caller entries in a tree.
+    fn entries(cs: &[Caller]) -> usize {
+        cs.iter().map(|c| 1 + entries(&c.callers)).sum()
+    }
+
+    /// Contract M5 S10 (property, invariant 3): on random graphs with cycles, for Q1, Q2, Q3 and
+    /// Q4, with caps above the graph's size the answer is untruncated and equals the run under
+    /// the default caps; with one cap lowered to any value, an answer that differs from the
+    /// uncapped one names that cap in `truncated`, and an untruncated answer equals it; `tree`
+    /// (Q1) and `work` (all) are strict: below the uncapped need they always name themselves,
+    /// at it never.
+    #[test]
+    fn capped_answers_name_every_cap_that_cut_them() {
+        let mut checked = [0usize; 4];
+        for seed in 0..40u64 {
+            let n = 4 + (seed as usize % 5) * 6;
+            let g = random_graph(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xabcd, n);
+            let ix = ix(&g);
+            let symbols: Vec<i64> = g
+                .nodes()
+                .iter()
+                .filter(|x| x.kind == NodeKind::Symbol)
+                .map(|x| x.id)
+                .collect();
+            let of_kind = |k| g.nodes().iter().filter(move |x| x.kind == k).map(|x| x.id);
+
+            // Q1: callers, depth 4 with references.
+            for &t in symbols.iter().take(6) {
+                let run = |caps| {
+                    callers(
+                        &ix,
+                        t,
+                        CallerOptions {
+                            depth: 4,
+                            include_references: true,
+                            caps,
+                            ..opts(1)
+                        },
+                    )
+                };
+                let full = run(huge());
+                assert!(full.truncated.is_empty());
+                let plain = |mut x: CallerTree| {
+                    x.truncated.clear();
+                    x.work = 0;
+                    x
+                };
+                assert_eq!(plain(run(Caps::default())), plain(full.clone()));
+                let need = entries(&full.callers);
+                for tree in 0..=need + 1 {
+                    let got = run(Caps { tree, ..huge() });
+                    assert_eq!(
+                        got.truncated.contains(&Limit::Tree),
+                        tree < need,
+                        "seed {seed} tree {tree}/{need}"
+                    );
+                    if got.truncated.is_empty() {
+                        assert_eq!(plain(got), plain(full.clone()));
+                    }
+                }
+                for work in [
+                    0,
+                    full.work / 2,
+                    full.work.saturating_sub(1),
+                    full.work,
+                    full.work + 1,
+                ] {
+                    let got = run(Caps { work, ..huge() });
+                    assert_eq!(
+                        got.truncated.contains(&Limit::Work),
+                        work < full.work,
+                        "seed {seed} work {work}/{}",
+                        full.work
+                    );
+                    if got.truncated.is_empty() {
+                        assert_eq!(plain(got), plain(full.clone()));
+                    }
+                }
+                checked[0] += 1;
+            }
+
+            // Q2: impact under both precisions.
+            for &t in symbols.iter().take(6) {
+                for precision in [Precision::Cha, Precision::Rta] {
+                    let run = |caps| impact_capped(&ix, t, Certainty::Ambiguous, precision, caps);
+                    let full = run(huge());
+                    assert!(full.truncated.is_empty());
+                    let plain = |mut x: Impact| {
+                        x.truncated.clear();
+                        x.work = 0;
+                        x
+                    };
+                    assert_eq!(plain(run(Caps::default())), plain(full.clone()));
+                    for nodes in 0..=g.nodes().len() {
+                        let got = run(Caps { nodes, ..huge() });
+                        if plain(got.clone()) != plain(full.clone()) {
+                            assert!(
+                                got.truncated.contains(&Limit::Nodes),
+                                "seed {seed} nodes {nodes}"
+                            );
+                        }
+                    }
+                    for work in [0, full.work / 2, full.work.saturating_sub(1), full.work] {
+                        let got = run(Caps { work, ..huge() });
+                        assert_eq!(
+                            got.truncated.contains(&Limit::Work),
+                            work < full.work,
+                            "seed {seed} work {work}"
+                        );
+                        if got.truncated.is_empty() {
+                            assert_eq!(plain(got), plain(full.clone()));
+                        }
+                    }
+                    checked[1] += 1;
+                }
+            }
+
+            // Q4: every endpoint's request path.
+            for e in of_kind(NodeKind::Endpoint) {
+                let run = |caps| {
+                    crate::path::request_path(
+                        &ix,
+                        e,
+                        crate::path::PathOptions {
+                            caps,
+                            ..Default::default()
+                        },
+                    )
+                };
+                let full = run(huge());
+                let plain = |mut x: crate::path::RequestPath| {
+                    x.truncated.clear();
+                    x.work = 0;
+                    x
+                };
+                assert!(
+                    !full.truncated.contains(&Limit::Tree)
+                        && !full.truncated.contains(&Limit::Work)
+                );
+                for tree in 0..=g.nodes().len() + 1 {
+                    let got = run(Caps { tree, ..huge() });
+                    if plain(got.clone()) != plain(full.clone()) {
+                        assert!(
+                            got.truncated.contains(&Limit::Tree),
+                            "seed {seed} tree {tree}"
+                        );
+                    }
+                }
+                for work in [0, full.work / 2, full.work.saturating_sub(1), full.work] {
+                    let got = run(Caps { work, ..huge() });
+                    assert_eq!(
+                        got.truncated.contains(&Limit::Work),
+                        work < full.work,
+                        "seed {seed} work {work}"
+                    );
+                    if got.truncated == full.truncated {
+                        assert_eq!(plain(got), plain(full.clone()));
+                    }
+                }
+                checked[2] += 1;
+            }
+
+            // Q3: every table's roll-up, with API hops.
+            for t in of_kind(NodeKind::Table) {
+                let run = |caps| {
+                    crate::rollup::table_rollup(
+                        &ix,
+                        t,
+                        crate::rollup::RollupOptions {
+                            precision: Precision::Cha,
+                            hops: 2,
+                            caps,
+                        },
+                    )
+                };
+                let full = run(huge());
+                let plain = |mut x: crate::rollup::TableRollup| {
+                    x.truncated.clear();
+                    x.work = 0;
+                    x
+                };
+                let named = |x: &crate::rollup::TableRollup, l: Limit| {
+                    x.truncated.iter().any(|n| n == l.as_str())
+                };
+                assert!(!named(&full, Limit::Nodes) && !named(&full, Limit::Work));
+                for nodes in 0..=g.nodes().len() {
+                    let got = run(Caps { nodes, ..huge() });
+                    if plain(got.clone()) != plain(full.clone()) {
+                        assert!(named(&got, Limit::Nodes), "seed {seed} nodes {nodes}");
+                    }
+                }
+                for work in [0, full.work / 2, full.work.saturating_sub(1), full.work] {
+                    let got = run(Caps { work, ..huge() });
+                    assert_eq!(
+                        named(&got, Limit::Work),
+                        work < full.work,
+                        "seed {seed} work {work}"
+                    );
+                    if got.truncated == full.truncated {
+                        assert_eq!(plain(got), plain(full.clone()));
+                    }
+                }
+                checked[3] += 1;
+            }
+        }
+        assert!(checked.iter().all(|&c| c >= 40), "{checked:?}");
+    }
+
+    /// Contract M5 D6: a question's work count is a function of the snapshot and its
+    /// parameters: repeated runs (fresh hash maps, so a different iteration order each time)
+    /// count the same, so a work cap truncates at the same element on every run.
+    #[test]
+    fn work_counts_are_deterministic() {
+        for seed in 0..10u64 {
+            let g = random_graph(seed ^ 0x5eed, 22);
+            let ix = ix(&g);
+            for t in g
+                .nodes()
+                .iter()
+                .filter(|n| n.kind == NodeKind::Symbol)
+                .map(|n| n.id)
+            {
+                let impact_work: BTreeSet<u64> = (0..5)
+                    .map(|_| impact(&ix, t, Certainty::Ambiguous, Precision::Cha).work)
+                    .collect();
+                assert_eq!(impact_work.len(), 1, "seed {seed}: {impact_work:?}");
+                let caller_work: BTreeSet<u64> = (0..5)
+                    .map(|_| {
+                        callers(
+                            &ix,
+                            t,
+                            CallerOptions {
+                                depth: 4,
+                                ..opts(1)
+                            },
+                        )
+                        .work
+                    })
+                    .collect();
+                assert_eq!(caller_work.len(), 1, "seed {seed}: {caller_work:?}");
+            }
+        }
+    }
+
+    /// Contract M5 S10 (units, D6): each cap has a row that hits it and one at the uncapped need
+    /// that does not. Q1 `tree`: a target with three callers; Q2 `nodes`: a chain of three
+    /// callers; `work` for both at the spent count.
+    #[test]
+    fn each_cap_hits_at_one_below_its_need() {
+        let (g, _) = chain_and_fan(3, 0);
+        let gi = ix(&g);
+        let n2 = g.nodes().iter().find(|n| n.name == "n2").unwrap().id;
+        let run = |caps| {
+            callers(
+                &gi,
+                n2,
+                CallerOptions {
+                    depth: 5,
+                    caps,
+                    ..opts(1)
+                },
+            )
+        };
+        let full = run(Caps::default());
+        assert_eq!(entries(&full.callers), 3, "n1, n0, T");
+        assert!(
+            run(Caps {
+                tree: 3,
+                ..Caps::default()
+            })
+            .truncated
+            .is_empty()
+        );
+        let cut = run(Caps {
+            tree: 2,
+            ..Caps::default()
+        });
+        assert_eq!(cut.truncated, BTreeSet::from([Limit::Tree]));
+        assert_eq!(entries(&cut.callers), 2);
+        assert!(
+            run(Caps {
+                work: full.work,
+                ..Caps::default()
+            })
+            .truncated
+            .is_empty()
+        );
+        assert_eq!(
+            run(Caps {
+                work: full.work - 1,
+                ..Caps::default()
+            })
+            .truncated,
+            BTreeSet::from([Limit::Work])
+        );
+
+        let impact_at = |caps| impact_capped(&gi, n2, Certainty::Ambiguous, Precision::Cha, caps);
+        let full = impact_at(Caps::default());
+        assert_eq!(full.breaks.len() + full.affects.len(), 3);
+        assert!(
+            impact_at(Caps {
+                nodes: 3,
+                ..Caps::default()
+            })
+            .truncated
+            .is_empty()
+        );
+        assert_eq!(
+            impact_at(Caps {
+                nodes: 2,
+                ..Caps::default()
+            })
+            .truncated,
+            BTreeSet::from([Limit::Nodes])
+        );
+        // `nodes` holds where the removed node's own dependants are reached too: three
+        // direct callers do not fit in two.
+        let mut b = B::new();
+        let target = b.sym("app/a.java", "T");
+        for k in 0..3 {
+            let caller = b.sym("app/a.java", &format!("c{k}"));
+            b.edge(&caller, EdgeKind::Calls, &target);
+        }
+        let fan_in = b.b.finish().unwrap();
+        let (fan_ix, t_in) = (ix(&fan_in), sym_id(&fan_in, &target));
+        let wide = |nodes| {
+            let caps = Caps {
+                nodes,
+                ..Caps::default()
+            };
+            impact_capped(&fan_ix, t_in, Certainty::Ambiguous, Precision::Cha, caps)
+        };
+        assert!(wide(3).truncated.is_empty() && wide(3).breaks.len() == 3);
+        let cut = wide(2);
+        assert_eq!(cut.truncated, BTreeSet::from([Limit::Nodes]));
+        assert_eq!(cut.breaks.len(), 2);
+        assert!(
+            impact_at(Caps {
+                work: full.work,
+                ..Caps::default()
+            })
+            .truncated
+            .is_empty()
+        );
+        let cut = impact_at(Caps {
+            work: full.work - 1,
+            ..Caps::default()
+        });
+        assert_eq!(cut.truncated, BTreeSet::from([Limit::Work]));
+        assert_eq!(cut.orphans, Orphans::NotComputed("work cap reached"));
     }
 }

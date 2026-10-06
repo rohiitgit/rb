@@ -1345,6 +1345,81 @@ fn cypher_guard_rails() {
     assert!(!at.contains("truncated"));
 }
 
+/// Contract M5 D6, amendment 4: the `work` cap's calibration. Every default-parameter question
+/// on the three fixtures (Q1 depth 1 and Q2 on every symbol and table, Q4 on every endpoint, Q3
+/// on every table; `cha`) spends under 1/10,000 of the cap and is never cut by it. Prints the
+/// largest count per question. No database: the fixtures are indexed in memory.
+#[test]
+fn work_cap_is_far_above_every_fixture_question() {
+    use rb_store::code::{CallerOptions, Precision, SnapshotIndex, callers, impact};
+    use rb_store::limits::{Caps, Limit, WORK};
+    let mut max = [0u64; 4];
+    for fixture in ["ts-express-prisma", "java-spring-jpa", "polyglot-monorepo"] {
+        let repo = fixture_repo(fixture);
+        let indexed = rb_indexer::index_commit(
+            repo.path(),
+            "HEAD",
+            &mut rb_indexer::NoCache,
+            &rb_indexer::ScipOptions::disabled(),
+            &mut rb_indexer::NoScipCache,
+        )
+        .unwrap();
+        let ix = SnapshotIndex::new(indexed.graph);
+        let ids = |kind: NodeKind| -> Vec<i64> {
+            ix.graph()
+                .nodes()
+                .iter()
+                .filter(|n| n.kind == kind)
+                .map(|n| n.id)
+                .collect()
+        };
+        for t in ids(NodeKind::Symbol)
+            .into_iter()
+            .chain(ids(NodeKind::Table))
+        {
+            let q1 = callers(
+                &ix,
+                t,
+                CallerOptions {
+                    depth: rb_store::limits::CALLER_DEPTH_DEFAULT,
+                    include_references: false,
+                    min_certainty: Certainty::Ambiguous,
+                    precision: Precision::Cha,
+                    caps: Caps::default(),
+                },
+            );
+            let q2 = impact(&ix, t, Certainty::Ambiguous, Precision::Cha);
+            assert!(!q1.truncated.contains(&Limit::Work) && !q2.truncated.contains(&Limit::Work));
+            max[0] = max[0].max(q1.work);
+            max[1] = max[1].max(q2.work);
+        }
+        for e in ids(NodeKind::Endpoint) {
+            let opts = rb_store::path::PathOptions {
+                precision: Precision::Cha,
+                ..Default::default()
+            };
+            let q4 = rb_store::path::request_path(&ix, e, opts);
+            assert!(!q4.truncated.contains(&Limit::Work));
+            max[2] = max[2].max(q4.work);
+        }
+        for t in ids(NodeKind::Table) {
+            let opts = rb_store::rollup::RollupOptions {
+                precision: Precision::Cha,
+                hops: rb_store::limits::HOPS_DEFAULT,
+                caps: Caps::default(),
+            };
+            let q3 = rb_store::rollup::table_rollup(&ix, t, opts);
+            assert!(!q3.truncated.iter().any(|l| l == "work"));
+            max[3] = max[3].max(q3.work);
+        }
+    }
+    eprintln!(
+        "largest work on the fixtures: Q1 depth 1 {}, Q2 {}, Q4 {}, Q3 {} (cap {WORK})",
+        max[0], max[1], max[2], max[3]
+    );
+    assert!(max.iter().all(|&w| w > 0 && w * 10_000 <= WORK), "{max:?}");
+}
+
 /// Contract M5 S5 (M4a open item 4): `rb index --no-cache` parses every file and still writes the
 /// facts it extracted, so a plain run afterwards parses nothing; both dump identically. The
 /// sources carry a per-run token so that no earlier run has cached their blobs.

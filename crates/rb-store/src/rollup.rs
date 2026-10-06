@@ -14,10 +14,9 @@ use rb_model::{Certainty, EdgeKind, Evidence, NodeKind};
 use serde::Serialize;
 
 use crate::code::{
-    IMPACT_NODE_CAP, MAX_CALLER_DEPTH, Precision, SnapshotIndex, View, endpoint_display,
-    entry_kinds,
+    MAX_CALLER_DEPTH, Precision, SnapshotIndex, View, endpoint_display, entry_kinds,
 };
-use crate::path::{self, Limit, PathNode, PathOptions, Via};
+use crate::path::{self, Caps, Limit, PathNode, PathOptions, Via};
 
 /// Default and maximum API hops (D12).
 pub const DEFAULT_HOPS: usize = path::DEFAULT_HOPS;
@@ -29,6 +28,8 @@ pub struct RollupOptions {
     pub precision: Precision,
     /// API hops followed through `CONSUMES` (0: none).
     pub hops: usize,
+    /// `nodes`, `work`, and `tree` for the API hops' walks (contract M5 D6).
+    pub caps: Caps,
 }
 
 /// A service whose code reaches the table.
@@ -83,8 +84,11 @@ pub struct TableRollup {
     pub pruned_by_rta: usize,
     pub services: Vec<ServiceReach>,
     pub through_apis: Vec<ApiReach>,
-    /// The limits that cut the answer (`depth`, `hops`, `nodes`).
+    /// The limits that cut the answer (`depth`, `hops`, `nodes`, `tree`, `work`).
     pub truncated: Vec<String>,
+    /// Counted operations the question spent (contract M5 D6); not part of the JSON.
+    #[serde(skip)]
+    pub work: u64,
 }
 
 /// What a node reaches of the table.
@@ -118,8 +122,18 @@ struct Step<'g> {
     evidence: &'g [Evidence],
 }
 
-/// Q3's roll-up for `table` (S14).
+/// Q3's roll-up for `table` (S14), under `opts.caps` (contract M5 S10).
 pub fn table_rollup(ix: &SnapshotIndex, table: i64, opts: RollupOptions) -> TableRollup {
+    let (mut rollup, spent) = crate::work::metered(opts.caps.work, || rollup_walk(ix, table, opts));
+    if spent.refused && !rollup.truncated.iter().any(|l| l == Limit::Work.as_str()) {
+        rollup.truncated.push(Limit::Work.as_str().to_owned());
+        rollup.truncated.sort();
+    }
+    rollup.work = spent.work;
+    rollup
+}
+
+fn rollup_walk(ix: &SnapshotIndex, table: i64, opts: RollupOptions) -> TableRollup {
     let v = View::with_precision(ix, opts.precision);
     let any = Certainty::Ambiguous;
     let mut truncated: BTreeSet<Limit> = BTreeSet::new();
@@ -166,7 +180,7 @@ pub fn table_rollup(ix: &SnapshotIndex, table: i64, opts: RollupOptions) -> Tabl
         'frontier: for &n in &frontier {
             for (src, certainty, _, _, evidence) in v.callers_of(n, true, any) {
                 if !reached.contains(&src) {
-                    if reached.len() >= IMPACT_NODE_CAP {
+                    if reached.len() >= opts.caps.nodes {
                         truncated.insert(Limit::Nodes);
                         break 'frontier;
                     }
@@ -190,12 +204,14 @@ pub fn table_rollup(ix: &SnapshotIndex, table: i64, opts: RollupOptions) -> Tabl
         callers_of.entry(s.dst).or_default().push(i);
     }
     let mut queue: VecDeque<i64> = accesses.iter().copied().collect();
-    while let Some(n) = queue.pop_front() {
+    'labels: while let Some(n) = queue.pop_front() {
         let Some(label) = labels.get(&n).cloned() else {
             continue;
         };
         for &i in callers_of.get(&n).into_iter().flatten() {
-            crate::work::tick(1);
+            if !crate::work::spend(1) {
+                break 'labels;
+            }
             let s = &steps[i];
             if labels.entry(s.src).or_default().absorb(&label, s.certainty) {
                 queue.push_back(s.src);
@@ -308,6 +324,7 @@ pub fn table_rollup(ix: &SnapshotIndex, table: i64, opts: RollupOptions) -> Tabl
             hops: opts.hops - 1,
             full: true,
             precision: opts.precision,
+            caps: opts.caps,
         };
         for (&e, &c) in &through_endpoints {
             let up = path::upstream_of(ix, e, path_opts);
@@ -325,6 +342,7 @@ pub fn table_rollup(ix: &SnapshotIndex, table: i64, opts: RollupOptions) -> Tabl
         services,
         through_apis: through.into_values().collect(),
         truncated: truncated.iter().map(|l| l.as_str().to_owned()).collect(),
+        work: 0,
     }
 }
 
@@ -368,7 +386,9 @@ fn collect_clients(
     out: &mut BTreeMap<String, ApiReach>,
 ) {
     for n in nodes {
-        crate::work::tick(1);
+        if !crate::work::spend(1) {
+            return;
+        }
         match n.via {
             Via::Consumes => {
                 if let Some(s) = service_of(v, n.node) {
@@ -579,6 +599,7 @@ mod tests {
             RollupOptions {
                 precision: Precision::Cha,
                 hops,
+                caps: Caps::default(),
             },
         )
     }
@@ -784,6 +805,51 @@ mod tests {
         assert_eq!(r.truncated, ["depth"]);
         let r = rollup(&chain_and_fan(MAX_CALLER_DEPTH, 0), DEFAULT_HOPS);
         assert!(r.truncated.is_empty(), "{:?}", r.truncated);
+    }
+
+    /// Contract M5 S10 (D6): Q3's `nodes` cap counts the access and every caller reached: an
+    /// access with three callers fits in four, not in three; `work` at the spent count holds,
+    /// one less cuts.
+    #[test]
+    fn rollup_caps_hit_at_one_below_their_need() {
+        let g = chain_and_fan(3, 0);
+        let t = g
+            .nodes()
+            .iter()
+            .find(|n| n.kind == NodeKind::Table)
+            .unwrap()
+            .id;
+        let run = |caps| {
+            table_rollup(
+                &ix(&g),
+                t,
+                RollupOptions {
+                    precision: Precision::Cha,
+                    hops: DEFAULT_HOPS,
+                    caps,
+                },
+            )
+        };
+        let full = run(Caps::default());
+        assert!(full.truncated.is_empty());
+        let nodes = |n| {
+            run(Caps {
+                nodes: n,
+                ..Caps::default()
+            })
+            .truncated
+        };
+        assert!(nodes(4).is_empty());
+        assert_eq!(nodes(3), ["nodes"]);
+        let work = |w| {
+            run(Caps {
+                work: w,
+                ..Caps::default()
+            })
+            .truncated
+        };
+        assert!(work(full.work).is_empty());
+        assert_eq!(work(full.work - 1), ["work"]);
     }
 
     /// Invariant 9: the roll-up grows linearly in chains and fans (counted, 4× → ≤ 5×).

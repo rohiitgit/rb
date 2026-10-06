@@ -587,6 +587,7 @@ mod tests {
             hops: rb_store::path::DEFAULT_HOPS,
             full: false,
             precision: rb_store::code::Precision::Rta,
+            caps: Default::default(),
         };
 
         let up = rb_store::path::request_path(
