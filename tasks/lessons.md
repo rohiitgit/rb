@@ -184,3 +184,7 @@
 ## 2026-10-06: growth tests count operations, they do not time them
 - **Mistake:** four ratio tests compared two wall-clock runs of tens of milliseconds; a load step covering one of them gave 2.5–3.4× (7 of 20 runs of one test failed under intermittent load), and best-of-N did not help.
 - **Rule:** a complexity claim is tested by counting the elements the measured loops examine (a test-only counter) at n and 4n and bounding the ratio (5× for linear); show it bites by making one loop quadratic. Keep wall-clock only as a coarse bound on a pathological input.
+
+## 2026-10-06: a value folded from a declaration is only as fixed as every later use of its binding
+- **Mistake:** M4a read a client's base from its construction (`axios.create({ baseURL })`, a builder's `baseUrl(…)`), and three evaluator passes each found more statements that change it afterwards (a request config, `defaults.baseURL`, an interceptor, a reassignment, a spread in the config, a mutated builder, a module importing the instance); every pass added per-form rules and the next pass found another form, each a false `synthetic`.
+- **Rule:** before a value read from a declaration supports the highest certainty, prove the binding cannot change it: declared constant (or never written) and every use one known to leave the value alone (here, request calls), checked from recorded use facts, in importers too. Anything else lowers the certainty and keeps the value; it does not drop it. Do this on the second form found, not the sixth.

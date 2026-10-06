@@ -100,6 +100,15 @@ pub struct ClientCall {
     /// taken as the injected instance (dependency injection is M4b), so the site never reaches
     /// `synthetic` (contract M4a amendment 12).
     pub base_from_bean: bool,
+    /// Gate A (contract M4a amendment 13): for a call on a client instance (or builder) whose
+    /// base comes from its construction, whether nothing in the file can change that base
+    /// afterwards; `None` when the call is on no such instance. An unverified base still
+    /// restricts by host, but the site never reaches `synthetic`. For an imported instance the
+    /// indexer decides.
+    pub base_verified: Option<bool>,
+    /// The name of the top-level axios instance the call is on, so the indexer can unverify
+    /// it when a file importing it uses it otherwise ([`FileClients::escaped_imports`]).
+    pub top_instance: Option<String>,
 }
 
 /// An axios instance bound to a name: `const api = axios.create({ baseURL })`.
@@ -108,12 +117,19 @@ pub struct AxiosInstance {
     pub name: String,
     pub base: Option<UrlValue>,
     pub top_level: bool,
+    /// Gate A within this file: a constant (or never reassigned) binding used only as the
+    /// receiver of request calls, whose `create` config has no spread after its `baseURL`.
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileClients {
     pub calls: Vec<ClientCall>,
     pub axios_instances: Vec<AxiosInstance>,
+    /// TS/JS: imported names (and namespace aliases) this file uses other than as the receiver
+    /// of a request call, sorted: an axios instance exported under such a name is unverified
+    /// (contract M4a amendment 13).
+    pub escaped_imports: Vec<String>,
 }
 
 /// Every client call site of one file, in source order per pack.
@@ -122,11 +138,12 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
     let mut out = FileClients::default();
     match language {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            let uses = Uses::new(facts, language);
             fetch(facts, &mut out);
-            axios(facts, &mut out);
+            axios(facts, &mut out, &uses);
         }
         Language::Java => {
-            let bases = SpringBases::new(facts);
+            let bases = SpringBases::new(facts, Uses::new(facts, language));
             rest_template(facts, &mut out, &bases);
             web_client(facts, &mut out, &bases);
             feign(facts, &mut out);
@@ -135,6 +152,106 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
         Language::Python => {}
     }
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gate A: what may change a configured instance after its construction (amendment 13)
+
+/// How each binding of a file is used after its declaration (from [`rb_syntax::NameUse`] facts
+/// and the call chains rooted at it), indexed once per file.
+struct Uses<'f> {
+    /// Bindings used other than as a call's receiver: passed on, a member read or written
+    /// (`api.defaults.baseURL = x`, `api.interceptors…`), spread, exported, returned.
+    escaped: HashSet<usize>,
+    /// Bindings assigned to after their declaration.
+    written: HashSet<usize>,
+    /// Per binding, the chains rooted at it: (chain index, first link's name).
+    receivers: HashMap<usize, Vec<(usize, &'f str)>>,
+    /// Names no binding declares (imports, TS/JS), used otherwise or as the receiver of a call
+    /// not in `allowed`: per name, the first links of the chains rooted at it.
+    unbound_escaped: HashSet<&'f str>,
+    unbound_receivers: HashMap<&'f str, Vec<&'f str>>,
+}
+
+impl<'f> Uses<'f> {
+    fn new(facts: &FileScope<'f>, language: Language) -> Self {
+        let mut uses = Uses {
+            escaped: HashSet::new(),
+            written: HashSet::new(),
+            receivers: HashMap::new(),
+            unbound_escaped: HashSet::new(),
+            unbound_receivers: HashMap::new(),
+        };
+        for u in &facts.facts.uses {
+            crate::work::tick(1);
+            match local_binding(facts, language, &u.name, u.span) {
+                Some(bi) if u.write => {
+                    uses.written.insert(bi);
+                }
+                Some(bi) => {
+                    uses.escaped.insert(bi);
+                }
+                None if !u.name.contains('.') => {
+                    uses.unbound_escaped.insert(&u.name);
+                }
+                None => {}
+            }
+        }
+        for (ci, c) in facts.chains.iter().enumerate() {
+            let (Some(root), Some(link)) = (c.root.as_deref(), c.links.first()) else {
+                continue;
+            };
+            let simple = root.strip_prefix("this.").unwrap_or(root);
+            if simple.contains(['.', '(', ' ']) {
+                continue;
+            }
+            match local_binding(facts, language, root, c.span) {
+                Some(bi) => uses
+                    .receivers
+                    .entry(bi)
+                    .or_default()
+                    .push((ci, link.name.as_str())),
+                None if root == simple => uses
+                    .unbound_receivers
+                    .entry(root)
+                    .or_default()
+                    .push(link.name.as_str()),
+                None => {}
+            }
+        }
+        uses
+    }
+
+    /// Gate A for binding `bi`: never reassigned (or declared constant: a Java `final` field
+    /// assigned in a constructor), never used other than as a receiver, and every call on it
+    /// one of `allowed` (or the chain `own`, the one being judged).
+    fn unchanged(
+        &self,
+        facts: &FileFacts,
+        bi: usize,
+        allowed: &[&str],
+        own: Option<usize>,
+    ) -> bool {
+        (facts.bindings[bi].constant || !self.written.contains(&bi))
+            && !self.escaped.contains(&bi)
+            && self
+                .receivers
+                .get(&bi)
+                .into_iter()
+                .flatten()
+                .all(|(ci, link)| Some(*ci) == own || allowed.contains(link))
+    }
+
+    /// Gate A for an imported name: used only as the receiver of `allowed` calls.
+    fn unbound_unchanged(&self, name: &str, allowed: &[&str]) -> bool {
+        !self.unbound_escaped.contains(name)
+            && self
+                .unbound_receivers
+                .get(name)
+                .into_iter()
+                .flatten()
+                .all(|link| allowed.contains(link))
+    }
 }
 
 fn entry<'a>(arg: Option<&'a Arg>, key: &str) -> Option<&'a Arg> {
@@ -155,13 +272,22 @@ fn method_entry(config: Option<&Arg>) -> Option<Option<String>> {
 // ---------------------------------------------------------------------------------------------
 // fetch (S9)
 
+/// Modules whose default export (or `fetch` export) is `fetch`.
+const FETCH_MODULES: &[&str] = &["node-fetch", "cross-fetch"];
+
 fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
-    // `node-fetch` under any local name is `fetch` (contract M4a amendment 12, Q8).
-    let (node_fetch, requires) = module_names(facts, "node-fetch", &["default", "fetch"], false);
+    // `node-fetch` and `cross-fetch` under any local name are `fetch` (contract M4a amendments
+    // 12 and 13).
+    let (mut node_fetch, mut requires) = (Vec::new(), HashSet::new());
+    for module in FETCH_MODULES {
+        let (names, required) = module_names(facts, module, &["default", "fetch"], false);
+        node_fetch.extend(names);
+        requires.extend(required);
+    }
     // An import from another module or a top-level definition named `fetch` shadows the global
     // one everywhere in the file.
     let file_wide = facts.imports.iter().any(|i| {
-        i.module != "node-fetch"
+        !FETCH_MODULES.contains(&i.module.as_str())
             && (i.alias.as_deref() == Some("fetch") || i.names.iter().any(|n| n.local == "fetch"))
     }) || facts
         .definitions
@@ -207,6 +333,8 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
             span: chain.span,
             source: chain.enclosing,
             base_from_bean: false,
+            base_verified: None,
+            top_instance: None,
         });
     }
 }
@@ -265,7 +393,12 @@ fn init_chain<'f>(facts: &'f FileFacts, b: &Binding) -> Option<&'f CallChain> {
     }
 }
 
-fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
+/// The calls of an axios instance that leave its configuration as created (Gate A).
+const AXIOS_REQUESTS: &[&str] = &[
+    "get", "post", "put", "delete", "patch", "head", "options", "request",
+];
+
+fn axios(facts: &FileScope<'_>, out: &mut FileClients, uses: &Uses<'_>) {
     let (names, requires) = module_names(facts, "axios", &["default"], true);
     // `name` at `at` is the axios module: one of its local names, not shadowed by a parameter
     // or variable in effect there (evaluator pass 1, P6); the `require` binding is the module.
@@ -275,8 +408,8 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
                 .binding_index_at(name, at)
                 .is_none_or(|bi| requires.contains(&bi))
     };
-    // Instances: `const api = axios.create({ baseURL })`.
-    let mut instances: HashMap<usize, Option<UrlValue>> = HashMap::new();
+    // Instances: `const api = axios.create({ baseURL })`, with Gate A (amendment 13).
+    let mut instances: HashMap<usize, (Option<UrlValue>, bool)> = HashMap::new();
     for (bi, b) in facts.bindings.iter().enumerate().filter(|(_, b)| !b.member) {
         let Some(c) = init_chain(facts, b) else {
             continue;
@@ -285,21 +418,35 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
             && is_axios(root, c.span)
             && link.name == "create"
         {
-            let base = entry(link.args.first(), "baseURL").map(|a| UrlValue::of(Some(a)));
+            let (base, spread) = create_base(link.args.first());
+            let verified = !spread && uses.unchanged(facts, bi, AXIOS_REQUESTS, None);
             out.axios_instances.push(AxiosInstance {
                 name: b.name.clone(),
                 base: base.clone(),
                 top_level: b.scope.is_none(),
+                verified,
             });
-            instances.insert(bi, base);
+            instances.insert(bi, (base, verified));
         }
     }
     let imported: HashSet<&str> = facts
         .imports
         .iter()
         .filter(|i| i.module != "axios")
-        .flat_map(|i| i.names.iter().map(|n| n.local.as_str()))
+        .flat_map(|i| {
+            i.names
+                .iter()
+                .map(|n| n.local.as_str())
+                .chain(i.alias.as_deref())
+        })
         .collect();
+    let mut escaped: Vec<String> = imported
+        .iter()
+        .filter(|n| !uses.unbound_unchanged(n, AXIOS_REQUESTS))
+        .map(|n| (*n).to_owned())
+        .collect();
+    escaped.sort();
+    out.escaped_imports = escaped;
     for chain in &facts.chains {
         let Some(first) = chain.links.first() else {
             continue;
@@ -317,46 +464,102 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
         }
         let root = chain.root.as_deref().unwrap_or_default();
         let bound = facts.binding_index_at(root, chain.span);
-        let (base, instance) = if is_axios(root, chain.span) {
-            (None, None)
-        } else if let Some(base) = bound.and_then(|bi| instances.get(&bi)) {
-            (base.clone(), None)
+        // An inline instance, `axios.create(config).get(…)`: no binding, so nothing changes
+        // it after its construction but a spread in its config (evaluator pass 3, R8).
+        if is_axios(root, chain.span)
+            && first.name == "create"
+            && let Some(link) = chain.links.get(1)
+        {
+            let (base, spread) = create_base(first.args.first());
+            let verified = base.is_some().then_some(!spread);
+            if let Some(mut call) = axios_request(chain, link, base, None) {
+                call.base_verified = verified;
+                out.calls.push(call);
+            }
+            continue;
+        }
+        let (base, instance, verified, top) = if is_axios(root, chain.span) {
+            (None, None, None, None)
+        } else if let Some((base, verified)) = bound.and_then(|bi| instances.get(&bi)) {
+            let top = bound
+                .filter(|&bi| facts.bindings[bi].scope.is_none())
+                .map(|_| root.to_owned());
+            (base.clone(), None, base.is_some().then_some(*verified), top)
         } else if bound.is_none() && imported.contains(root) {
-            (None, Some(root.to_owned()))
+            (None, Some(root.to_owned()), None, None)
         } else {
             continue;
         };
-        let verb = first.name.as_str();
-        if AXIOS_VERBS.contains(&verb) && !first.args.is_empty() {
-            // `get/delete/head/options(url, config)`, `post/put/patch(url, data, config)`.
-            let config = if matches!(verb, "post" | "put" | "patch") {
-                first.args.get(2)
-            } else {
-                first.args.get(1)
-            };
-            let method = Some(norm_method(verb));
-            out.calls.push(axios_call(
-                chain,
-                base,
-                instance,
-                first.args.first(),
-                method,
-                config,
-            ));
-        } else if verb == "request" && !first.args.is_empty() {
-            let call = match first.args.first() {
-                Some(config @ Arg::Object { .. }) => config_call(chain, base, instance, config),
-                // A config that cannot be read: no URL, method or base.
-                _ => ClientCall {
-                    method: None,
-                    url: UrlValue::Unknown,
-                    base: Some(UrlValue::Unknown),
-                    ..axios_call(chain, base, instance, None, None, None)
-                },
-            };
+        if let Some(mut call) = axios_request(chain, first, base, instance) {
+            call.base_verified = verified;
+            call.top_instance = top;
             out.calls.push(call);
         }
     }
+}
+
+/// A request call `link` of `chain` on an instance with `base` (or on the module): the verbs
+/// with their URL and request config, and `request(config)`.
+fn axios_request(
+    chain: &CallChain,
+    link: &rb_syntax::CallLink,
+    base: Option<UrlValue>,
+    instance: Option<String>,
+) -> Option<ClientCall> {
+    let verb = link.name.as_str();
+    if link.args.is_empty() {
+        return None;
+    }
+    if AXIOS_VERBS.contains(&verb) {
+        // `get/delete/head/options(url, config)`, `post/put/patch(url, data, config)`.
+        let config = if matches!(verb, "post" | "put" | "patch") {
+            link.args.get(2)
+        } else {
+            link.args.get(1)
+        };
+        let method = Some(norm_method(verb));
+        return Some(axios_call(
+            chain,
+            base,
+            instance,
+            link.args.first(),
+            method,
+            config,
+        ));
+    }
+    if verb != "request" {
+        return None;
+    }
+    Some(match link.args.first() {
+        Some(config @ Arg::Object { .. }) => config_call(chain, base, instance, config),
+        // A config that cannot be read: no URL, method or base.
+        _ => ClientCall {
+            method: None,
+            url: UrlValue::Unknown,
+            base: Some(UrlValue::Unknown),
+            ..axios_call(chain, base, instance, None, None, None)
+        },
+    })
+}
+
+/// The base an `axios.create(config)` states, and whether a spread after its `baseURL` (or
+/// with none before it) may replace it: the instance keeps the stated base, unverified (Gate
+/// A; spreads are never folded).
+fn create_base(config: Option<&Arg>) -> (Option<UrlValue>, bool) {
+    let Some(Arg::Object { entries, .. }) = config else {
+        return (None, false);
+    };
+    let base = entries
+        .iter()
+        .rev()
+        .find(|e| e.key == "baseURL")
+        .map(|e| UrlValue::of(Some(&e.value)));
+    let spread_after = entries
+        .iter()
+        .rev()
+        .take_while(|e| e.key != "baseURL")
+        .any(|e| e.key == "...");
+    (base, spread_after)
 }
 
 /// The base a request config states (contract M4a amendment 12, Q1): `None` when the call has
@@ -405,6 +608,8 @@ fn axios_call(
         span: chain.span,
         source: chain.enclosing,
         base_from_bean: false,
+        base_verified: None,
+        top_instance: None,
     }
 }
 
@@ -469,28 +674,40 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBas
             None => continue,
         };
         let receiver = local_binding(facts, Language::Java, root, chain.span);
-        let is_client = receiver.is_some_and(|bi| {
-            java_type_is(
+        let is_client = match receiver {
+            Some(bi) => java_type_is(
                 facts,
                 &facts.bindings[bi].type_name,
                 BLOCKING,
                 "RestTemplate",
-            )
-        });
+            ),
+            // `new RestTemplate().getForObject(…)` (evaluator pass 3, R8): no root URI.
+            None => {
+                root.starts_with("new ")
+                    && fresh_root(facts, chain)
+                    && chain_kind(facts, chain) == Some(ClientKind::RestTemplate)
+            }
+        };
         if !is_client || first.args.is_empty() {
             continue;
         }
         // The root URI configured on the instance; a relative URL needs one (amendment 12).
-        let (base, base_from_bean) = bases.of(receiver, ClientKind::RestTemplate);
+        let base = bases.of(receiver, ClientKind::RestTemplate);
+        let verified = match base.value {
+            UrlValue::Unknown => None,
+            _ => base.verified,
+        };
         out.calls.push(ClientCall {
             kind: ClientKind::RestTemplate,
             method,
             url: java_url(facts, first.args.first()),
-            base: Some(base),
+            base: Some(base.value),
             instance: None,
             span: chain.span,
             source: chain.enclosing,
-            base_from_bean,
+            base_from_bean: base.from_bean,
+            base_verified: verified,
+            top_instance: None,
         });
     }
 }
@@ -632,15 +849,54 @@ const SPRING_CONTEXT: &str = "org.springframework.context.annotation";
 /// What configures each Spring client instance of one file, indexed once (contract M4a
 /// amendment 12, Q1): per binding, the chains assigned to it (`this.rt = b.rootUri(…).build()`)
 /// or calling a URI template handler setter on it; and the base facts of the file's `@Bean`
-/// methods per client kind, for an instance injected from them.
+/// methods per client kind, for an instance injected from them. With the uses of every binding,
+/// for Gate A (amendment 13).
 struct SpringBases<'s, 'f> {
     facts: &'s FileScope<'f>,
-    configured: HashMap<usize, Vec<&'f CallChain>>,
+    /// Binding → indices of the chains that configure it.
+    configured: HashMap<usize, Vec<usize>>,
     beans: HashMap<ClientKind, Vec<BaseFact>>,
+    uses: Uses<'f>,
+}
+
+/// A Spring client's base as [`SpringBases::of`] reads it.
+struct SpringBase {
+    value: UrlValue,
+    from_bean: bool,
+    /// Gate A: `None` when no base was read from the instance's construction.
+    verified: Option<bool>,
+}
+
+/// The calls on a Spring client or builder binding that leave its configuration as built
+/// (Gate A): requests, and `mutate()`, which copies.
+fn spring_requests(facts: &FileFacts, type_name: &str) -> &'static [&'static str] {
+    const BUILD: &[&str] = &["build"];
+    const REST_TEMPLATE: &[&str] = &[
+        "getForObject",
+        "getForEntity",
+        "postForObject",
+        "postForEntity",
+        "postForLocation",
+        "put",
+        "delete",
+        "patchForObject",
+        "exchange",
+        "execute",
+    ];
+    const FLUENT: &[&str] = &[
+        "get", "post", "put", "delete", "patch", "head", "options", "method", "mutate",
+    ];
+    if type_name.ends_with("Builder") {
+        BUILD
+    } else if fluent_kind(facts, type_name).is_some() {
+        FLUENT
+    } else {
+        REST_TEMPLATE
+    }
 }
 
 impl<'s, 'f> SpringBases<'s, 'f> {
-    fn new(facts: &'s FileScope<'f>) -> Self {
+    fn new(facts: &'s FileScope<'f>, uses: Uses<'f>) -> Self {
         let in_bean: HashSet<usize> = facts
             .definitions
             .iter()
@@ -653,9 +909,9 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             })
             .map(|(i, _)| i)
             .collect();
-        let mut configured: HashMap<usize, Vec<&'f CallChain>> = HashMap::new();
+        let mut configured: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut beans: HashMap<ClientKind, Vec<BaseFact>> = HashMap::new();
-        for chain in &facts.facts.chains {
+        for (ci, chain) in facts.chains.iter().enumerate() {
             let target = match (&chain.assigned, chain.links.first()) {
                 (Some(left), _) => Some(left.as_str()),
                 (None, Some(l)) if l.name == "setUriTemplateHandler" => chain.root.as_deref(),
@@ -664,7 +920,7 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             if let Some(bi) =
                 target.and_then(|t| local_binding(facts, Language::Java, t, chain.span))
             {
-                configured.entry(bi).or_default().push(chain);
+                configured.entry(bi).or_default().push(ci);
             }
             // A chain in a `@Bean` method (or a lambda inside one) that sets a base.
             let mut def = chain.enclosing;
@@ -684,39 +940,85 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             facts,
             configured,
             beans,
+            uses,
         }
     }
 
-    /// The base of a `kind` client bound at `receiver`, and whether it came from a `@Bean`
-    /// method: one stated base when everything that configures the instance agrees, else
-    /// unknown. An instance nothing in the file configures is injected: the file's `@Bean`
-    /// methods for that kind decide, the same way.
-    fn of(&self, receiver: Option<usize>, kind: ClientKind) -> (UrlValue, bool) {
+    /// The base of a `kind` client bound at `receiver`: one stated base when everything that
+    /// configures the instance agrees, else unknown. An instance nothing in the file
+    /// configures is injected: the file's `@Bean` methods for that kind decide, the same way,
+    /// and such a base is never verified. A base read from the instance is verified when
+    /// neither the instance nor a mutable builder it was built from can change it (Gate A).
+    fn of(&self, receiver: Option<usize>, kind: ClientKind) -> SpringBase {
+        let unknown = SpringBase {
+            value: UrlValue::Unknown,
+            from_bean: false,
+            verified: None,
+        };
         let Some(bi) = receiver else {
-            return (UrlValue::Unknown, false);
+            return unknown;
         };
         let b = &self.facts.bindings[bi];
+        let mut chains: Vec<usize> = Vec::new();
         let mut facts: Vec<BaseFact> = Vec::new();
         match &b.init {
             Some(Init::Call { chain }) => {
                 if let Some(c) = self.facts.chains.get(*chain) {
                     facts.push(chain_base(self.facts, c, c.links.len()));
+                    chains.push(*chain);
                 }
             }
             Some(_) => facts.push(BaseFact::Unreadable),
             None => {}
         }
-        for c in self.configured.get(&bi).into_iter().flatten() {
+        for &ci in self.configured.get(&bi).into_iter().flatten() {
+            let c = &self.facts.chains[ci];
             facts.push(chain_base(self.facts, c, c.links.len()));
+            chains.push(ci);
         }
         if facts.is_empty() {
             let beans = self.beans.get(&kind).map_or(&[][..], Vec::as_slice);
             return match agreed(beans) {
-                Some(v) => (v, true),
-                None => (UrlValue::Unknown, false),
+                Some(value) => SpringBase {
+                    value,
+                    from_bean: true,
+                    verified: Some(false),
+                },
+                None => unknown,
             };
         }
-        (agreed(&facts).unwrap_or(UrlValue::Unknown), false)
+        let Some(value) = agreed(&facts) else {
+            return unknown;
+        };
+        let verified = self.uses.unchanged(
+            self.facts,
+            bi,
+            spring_requests(self.facts, &b.type_name),
+            None,
+        ) && chains.iter().all(|&ci| self.builder_unchanged(ci));
+        SpringBase {
+            value,
+            from_bean: false,
+            verified: Some(verified),
+        }
+    }
+
+    /// Gate A rule (3): when chain `ci` starts from a mutable builder binding
+    /// (`WebClient.Builder`, `RestClient.Builder`; a `RestTemplateBuilder` returns a new
+    /// builder from every call), that builder is used nowhere else but to `build()`.
+    fn builder_unchanged(&self, ci: usize) -> bool {
+        let c = &self.facts.chains[ci];
+        let Some(root) = c.root.as_deref() else {
+            return true;
+        };
+        let Some(rb) = local_binding(self.facts, Language::Java, root, c.span) else {
+            return true;
+        };
+        let type_name = &self.facts.bindings[rb].type_name;
+        if !(type_name.ends_with(".Builder") && fluent_kind(self.facts, type_name).is_some()) {
+            return true;
+        }
+        self.uses.unchanged(self.facts, rb, &["build"], Some(ci))
     }
 }
 
@@ -756,7 +1058,7 @@ fn same_value(a: &UrlValue, b: &UrlValue) -> bool {
 }
 
 fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases) {
-    for chain in &facts.chains {
+    for (ci, chain) in facts.chains.iter().enumerate() {
         let Some(root) = chain.root.as_deref() else {
             continue;
         };
@@ -791,20 +1093,36 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases)
         // A base stated in the call's own chain wins; otherwise the instance's (amendment 12).
         // A server-side client has no origin of its own, so with no base in sight the base is
         // unknown, never empty: a relative URI is then matched by suffix (evaluator pass 1).
-        let (base, base_from_bean) = match chain_base(facts, chain, verb) {
-            BaseFact::Stated(v) => (v, false),
-            BaseFact::Fresh => (UrlValue::Unknown, false),
+        let base = match chain_base(facts, chain, verb) {
+            // Its own chain's base: changed later only through a mutable builder it starts
+            // from (Gate A).
+            BaseFact::Stated(value) => SpringBase {
+                value,
+                from_bean: false,
+                verified: Some(bases.builder_unchanged(ci)),
+            },
+            BaseFact::Fresh => SpringBase {
+                value: UrlValue::Unknown,
+                from_bean: false,
+                verified: None,
+            },
             BaseFact::Unreadable => bases.of(receiver, kind),
+        };
+        let verified = match base.value {
+            UrlValue::Unknown => None,
+            _ => base.verified,
         };
         out.calls.push(ClientCall {
             kind,
             method,
             url,
-            base: Some(base),
+            base: Some(base.value),
             instance: None,
             span: chain.span,
             source: chain.enclosing,
-            base_from_bean,
+            base_from_bean: base.from_bean,
+            base_verified: verified,
+            top_instance: None,
         });
     }
 }
@@ -935,6 +1253,8 @@ fn feign(facts: &FileScope<'_>, out: &mut FileClients) {
                     span: d.span,
                     source: Some(m),
                     base_from_bean: false,
+                    base_verified: None,
+                    top_instance: None,
                 });
             }
         }
@@ -1003,6 +1323,8 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             span: chain.span,
             source: chain.enclosing,
             base_from_bean: false,
+            base_verified: None,
+            top_instance: None,
         });
     }
 }
@@ -1107,6 +1429,9 @@ mod tests {
                 if c.base_from_bean {
                     s.push_str(" from_bean");
                 }
+                if c.base_verified == Some(false) {
+                    s.push_str(" unverified");
+                }
                 s
             })
             .collect()
@@ -1162,6 +1487,7 @@ mod tests {
                     }
                 }),
                 top_level: true,
+                verified: true,
             }]
         );
         // A parameter or local named like the import shadows it: not axios (evaluator pass 1,
@@ -1285,7 +1611,7 @@ mod tests {
     /// the instance defaults).
     #[test]
     fn axios_request_configs_state_the_base() {
-        let src = "import axios from \"axios\";\nimport { api as shared } from \"./http\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nexport async function f(body, cfg) {\n  await api.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.post(\"/charges\", body, { baseURL: \"https://api.stripe.com\" });\n  await api.post(\"/charges\", body);\n  await api.get(\"/a\", { params: { q: 1 } });\n  await api.get(\"/b\", cfg);\n  await api.get(\"/c\", { ...cfg });\n  await api.get(\"/d\", { ...cfg, baseURL: \"https://x.io\" });\n  await api.get(\"/e\", { baseURL: mk() });\n  await api.get(\"/f\", { baseURL: B });\n  await axios.post(\"/h\", cfg);\n  await axios.put(\"/i\", body, cfg);\n  await axios.request(cfg);\n  await axios(\"/j\", cfg);\n  await axios(\"/k\", { method: \"delete\", baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/l\", { baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/m\");\n}\n";
+        let src = "import axios from \"axios\";\nimport { api as shared } from \"./http\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nexport async function f(body, cfg) {\n  await api.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.post(\"/charges\", body, { baseURL: \"https://api.stripe.com\" });\n  await api.post(\"/charges\", body);\n  await api.get(\"/a\", { params: { q: 1 } });\n  await api.get(\"/b\", cfg);\n  await api.get(\"/c\", { ...cfg });\n  await api.get(\"/d\", { ...cfg, baseURL: \"https://x.io\" });\n  await api.get(\"/e\", { baseURL: mk() });\n  await api.get(\"/f\", { baseURL: B });\n  await axios.post(\"/h\", cfg);\n  await axios.put(\"/i\", body, cfg);\n  await axios.request(cfg);\n  await axios(\"/j\", cfg);\n  await axios(\"/k\", { method: \"delete\", baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/l\", { baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/m\");\n  await api.patch(\"/n\", { baseURL: \"https://api.stripe.com\" });\n  await api.patch(\"/o\", body, { baseURL: \"https://api.stripe.com\" });\n}\n";
         assert_eq!(
             calls(Language::TypeScript, src),
             [
@@ -1306,6 +1632,9 @@ mod tests {
                 "axios DELETE '/k' base='https://api.stripe.com'",
                 "axios GET '/l' base='https://api.stripe.com' instance=shared",
                 "axios GET '/m' instance=shared",
+                // `patch(url, data, config)`: the second argument is data (evaluator pass 3, R7).
+                "axios PATCH '/n' base='http://orders'",
+                "axios PATCH '/o' base='https://api.stripe.com'",
             ]
         );
     }
@@ -1323,11 +1652,13 @@ mod tests {
             [
                 "rest_template POST '/charges' base='https://api.stripe.com'",
                 "rest_template GET '/orders/1' base='http://orders'",
-                "rest_template GET '/repos' base='https://api.github.com'",
+                // A setter call is no request: the base is read, unverified (amendment 13).
+                "rest_template GET '/repos' base='https://api.github.com' unverified",
                 "rest_template GET '/x' base=?",
                 "rest_template GET '/y' base=?",
                 "rest_template GET '/v' base='http://visits'",
-                "web_client GET '/v1/charges' base='https://api.stripe.com'",
+                // Built from `wb`, which builds `twoWeb` too (amendment 13, rule 3).
+                "web_client GET '/v1/charges' base='https://api.stripe.com' unverified",
                 "web_client GET '/z' base=?",
                 "web_client GET '/u' base='http://users'",
             ]
@@ -1336,7 +1667,8 @@ mod tests {
         let bean = "package p;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nclass Cfg {\n  @Bean RestTemplate stripe(RestTemplateBuilder b) { return b.rootUri(\"https://api.stripe.com\").build(); }\n}\nclass Pay {\n  private final RestTemplate rt;\n  Pay(RestTemplate rt) { this.rt = rt; }\n  void charge() { rt.postForObject(\"/charges\", null, String.class); }\n}\n";
         assert_eq!(
             calls(Language::Java, bean),
-            ["rest_template POST '/charges' base='https://api.stripe.com' from_bean"]
+            // A bean's base is never provably the injected one's: unverified (amendment 13).
+            ["rest_template POST '/charges' base='https://api.stripe.com' from_bean unverified"]
         );
         // Two beans with different bases: unknown.
         let two = bean.replace(
@@ -1352,6 +1684,112 @@ mod tests {
         assert_eq!(
             calls(Language::Java, &plain),
             ["rest_template POST '/charges' base=?"]
+        );
+    }
+
+    /// Contract M4a amendment 13, Gate A (evaluator pass 3, R1): an instance's base is
+    /// verified only when nothing in the file can change it after its construction: a
+    /// constant (or never reassigned) binding used only as the receiver of request calls. A
+    /// `defaults` write, an interceptor, a reassignment, a spread after `baseURL` in the
+    /// `create` config, or passing the instance on leaves the base in place but unverified.
+    #[test]
+    fn instance_bases_are_verified_only_when_unchanged() {
+        let src = "import axios from \"axios\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nconst api1 = axios.create({ baseURL: \"http://orders\" });\napi1.defaults.baseURL = \"https://api.stripe.com\";\nconst api2 = axios.create({ baseURL: \"http://orders\" });\napi2.interceptors.request.use((c) => { c.baseURL = \"https://api.stripe.com\"; return c; });\nlet api3 = axios.create({ baseURL: \"http://orders\" });\nexport function t03setup() { api3 = axios.create({ baseURL: \"https://api.stripe.com\" }); }\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst api4 = axios.create({ baseURL: \"http://orders\", ...stripeOpts });\nconst api5 = axios.create({ ...stripeOpts, baseURL: \"http://orders\" });\nconst api6 = axios.create({ baseURL: \"http://orders\" });\nconfigure(api6);\nlet api7 = axios.create({ baseURL: \"http://orders\" });\nexport async function f() {\n  await api.get(\"/orders/1\");\n  await api1.get(\"/orders/1\");\n  await api2.get(\"/orders/1\");\n  await api3.get(\"/orders/1\");\n  await api4.get(\"/orders/1\");\n  await api5.get(\"/orders/1\");\n  await api6.request({ url: \"/orders/1\" });\n  await api7.post(\"/orders/1\", {});\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios GET '/orders/1' base='http://orders'",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base='http://orders'",
+                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios POST '/orders/1' base='http://orders'",
+            ]
+        );
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let verified: Vec<(String, bool)> = clients(Language::TypeScript, &facts)
+            .axios_instances
+            .iter()
+            .map(|a| (a.name.clone(), a.verified))
+            .collect();
+        assert_eq!(
+            verified,
+            [
+                ("api".to_owned(), true),
+                ("api1".to_owned(), false),
+                ("api2".to_owned(), false),
+                ("api3".to_owned(), false),
+                ("api4".to_owned(), false),
+                ("api5".to_owned(), true),
+                ("api6".to_owned(), false),
+                ("api7".to_owned(), true),
+            ]
+        );
+        // An importing file reports the imported names it uses other than for requests, so the
+        // indexer can unverify the exporting module's instance.
+        let importer = "import { shared, shared2, shared3 } from \"./client\";\nimport * as ns from \"./ns\";\nshared.get(\"/a\");\nshared2.defaults.baseURL = \"https://api.stripe.com\";\nshared3.interceptors.request.use(f);\nns.api.get(\"/b\");\n";
+        let facts = extract(Language::TypeScript, importer.as_bytes()).unwrap();
+        assert_eq!(
+            clients(Language::TypeScript, &facts).escaped_imports,
+            ["ns", "shared2", "shared3"]
+        );
+    }
+
+    /// Gate A for Spring (evaluator pass 3, R1): a client or builder field changed by a later
+    /// statement, passed on, or reassigned, and an instance built from a mutable builder used
+    /// outside that one chain, keep their base unverified.
+    #[test]
+    fn spring_bases_are_verified_only_when_unchanged() {
+        let src = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass Clients {\n  private final WebClient.Builder b1 = WebClient.builder().baseUrl(\"http://orders\");\n  private final WebClient.Builder b2 = WebClient.builder().baseUrl(\"http://orders\");\n  private final WebClient w3 = WebClient.create(\"http://orders\");\n  private final RestTemplate rt4 = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  private final RestTemplate rt5 = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  private RestTemplate rt6 = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  private final WebClient w7;\n  private final WebClient w8;\n  Clients(WebClient.Builder wb, WebClient.Builder wb8) {\n    b1.baseUrl(\"https://api.stripe.com\");\n    this.w7 = wb.baseUrl(\"http://orders\").build();\n    wb.defaultHeader(\"x\", \"y\");\n    this.w8 = wb8.baseUrl(\"http://orders\").build();\n    register(rt5);\n    rt6 = null;\n  }\n  void m() {\n    b1.build().get().uri(\"/orders/1\").retrieve();\n    b2.build().get().uri(\"/orders/1\").retrieve();\n    w3.get().uri(\"/orders/1\").retrieve();\n    rt4.getForObject(\"/orders/1\", String.class);\n    rt5.getForObject(\"/orders/1\", String.class);\n    rt6.getForObject(\"/orders/1\", String.class);\n    w7.get().uri(\"/orders/1\").retrieve();\n    w8.get().uri(\"/orders/1\").retrieve();\n    w3.mutate().baseUrl(\"http://users\").build().get().uri(\"/u\").retrieve();\n  }\n}\n";
+        assert_eq!(
+            calls(Language::Java, src),
+            [
+                "rest_template GET '/orders/1' base='http://orders'",
+                "rest_template GET '/orders/1' base='http://orders' unverified",
+                "rest_template GET '/orders/1' base='http://orders' unverified",
+                "web_client GET '/orders/1' base='http://orders' unverified",
+                "web_client GET '/orders/1' base='http://orders'",
+                "web_client GET '/orders/1' base='http://orders'",
+                "web_client GET '/orders/1' base='http://orders' unverified",
+                "web_client GET '/orders/1' base='http://orders'",
+                "web_client GET '/u' base='http://users'",
+            ]
+        );
+        // A fresh initialiser states no base, so it agrees with the one a constructor
+        // assigns (evaluator pass 3, R7, mutant G); the reassignment leaves it unverified.
+        let fresh = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nclass C {\n  private RestTemplate rt = new RestTemplateBuilder().build();\n  C(RestTemplateBuilder b) { this.rt = b.rootUri(\"http://orders\").build(); }\n  void m() { rt.getForObject(\"/orders/1\", String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, fresh),
+            ["rest_template GET '/orders/1' base='http://orders' unverified"]
+        );
+    }
+
+    /// Evaluator pass 3, R8: an inline axios instance (no binding, so nothing can change it),
+    /// an inline `new RestTemplate()`, and `cross-fetch` are client sites.
+    #[test]
+    fn inline_instances_and_cross_fetch() {
+        let ts = "import axios from \"axios\";\nexport async function f() {\n  await axios.create({ baseURL: \"http://orders\" }).get(\"/orders/1\");\n  await axios.create({ baseURL: \"http://orders\", ...o }).post(\"/orders\", {});\n  await axios.create().request({ url: \"/r\" });\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, ts),
+            [
+                "axios GET '/orders/1' base='http://orders'",
+                "axios POST '/orders' base='http://orders' unverified",
+                "axios GET '/r'",
+            ]
+        );
+        let cross = "import fetch from \"cross-fetch\";\nimport { fetch as cf } from \"cross-fetch\";\nfetch(\"/a\");\ncf(\"/b\", { method: \"PUT\" });\n";
+        assert_eq!(
+            calls(Language::TypeScript, cross),
+            ["fetch GET '/a'", "fetch PUT '/b'"]
+        );
+        let cjs = "const fetch = require(\"cross-fetch\");\nfetch(\"/c\");\n";
+        assert_eq!(calls(Language::JavaScript, cjs), ["fetch GET '/c'"]);
+        let java = "package p;\nimport org.springframework.web.client.RestTemplate;\nclass C {\n  void m() {\n    new RestTemplate().getForObject(\"http://orders/orders/1\", String.class);\n    new Other().getForObject(\"/x\", String.class);\n  }\n}\n";
+        assert_eq!(
+            calls(Language::Java, java),
+            ["rest_template GET 'http://orders/orders/1' base=?"]
         );
     }
 

@@ -34,6 +34,58 @@ pub mod work {
     pub fn take() -> u64 {
         COUNT.with(|c| c.replace(0))
     }
+
+    /// A slice whose iteration counts every element it yields, so any scan over it is
+    /// measured, not only the helpers that tick explicitly (amendment 13; evaluator pass 3, R6:
+    /// an added scan of every binding per call, or of every endpoint per site, escaped the
+    /// counters). Indexing is O(1) and not counted.
+    #[derive(Debug)]
+    pub struct Counted<'a, T>(&'a [T]);
+
+    impl<T> Clone for Counted<'_, T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<T> Copy for Counted<'_, T> {}
+
+    impl<'a, T> Counted<'a, T> {
+        pub fn new(items: &'a [T]) -> Self {
+            Counted(items)
+        }
+
+        pub fn iter(&self) -> impl DoubleEndedIterator<Item = &'a T> + Clone + 'a {
+            self.0.iter().inspect(|_| tick(1))
+        }
+
+        pub fn get(&self, i: usize) -> Option<&'a T> {
+            self.0.get(i)
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+
+    impl<T> std::ops::Index<usize> for Counted<'_, T> {
+        type Output = T;
+        fn index(&self, i: usize) -> &T {
+            &self.0[i]
+        }
+    }
+
+    impl<'a, T> IntoIterator for &Counted<'a, T> {
+        type Item = &'a T;
+        type IntoIter = std::iter::Inspect<std::slice::Iter<'a, T>, fn(&&'a T)>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.0.iter().inspect(|_| tick(1))
+        }
+    }
 }
 
 use std::collections::{BTreeMap, BTreeSet};

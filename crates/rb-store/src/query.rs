@@ -370,6 +370,11 @@ impl Store {
         let mut sites = 0;
         if let Some(Value::Object(counts)) = detail {
             for (bucket, n) in counts {
+                // Gate A's counts of verified and unverified instance bases (contract M4a
+                // amendment 13) are not a bucket.
+                if bucket == "bases" {
+                    continue;
+                }
                 let n = n
                     .as_i64()
                     .ok_or_else(|| anyhow::anyhow!("http_coverage {bucket}: {n}"))?;

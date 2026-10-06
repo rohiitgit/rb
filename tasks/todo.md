@@ -417,4 +417,17 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
 - [x] Public repositories against a `7d12001` build: four byte-identical, ftgo +4 `dynamic` sites; fresh == cached == second name; the evaluator's TS and Java repros end to end.
 - [x] Records: contract (amendment 12, amendment-11 correction, invariant 11, open items 11, 13–20), CHANGELOG, IMPLEMENT.md, lessons.
 - [x] Verification loop; clean-up of `fx4a2_*` and `var/fix-m4a-2/`.
-- [ ] Evaluator pass 3.
+- [x] Evaluator pass 3 (`tasks/eval-m4a-pass3.md`, VERDICT FAIL on `e06e590`): fixed below.
+
+## Review (M4a evaluator pass 3)
+- [x] Plan (orchestrator's decisions, contract amendment 13): Gate A (verified instance bases, R1), Gate B (a path starts with a literal, R2, R4), R3 base-document disable, R5 upstream registrar, R6 counted scans, R7 biting tests (C, G), R8 client forms and README, R9 open item; `PIPELINE` `m4a-http-7`.
+- [x] Baseline: `e06e590` release binary built (own target directory) before any change.
+- [x] Facts (`rb-syntax/src/uses.rs`): `NameUse` uses of candidate names; unit first.
+- [x] Gate A in the packs (`clients.rs`: axios instances, inline instances, Spring bases, builders, imported names) and the stitcher (`stitch.rs`: importer taint, cap, `base: unverified`, coverage counts), test-first.
+- [x] Gate B (`stitch::join`, `endpoint::client_url` port holes), R3 (`fold.rs` documents, `lib.rs`), R5 (`rb-store/src/path.rs`), R8, test-first; R6 `work::Counted` with mutants T and U killed.
+- [x] Mutations: every new rule plus C and G (see CHANGELOG).
+- [x] Public repositories against `e06e590`: no edge changed; fresh == cached == second name; the evaluator's shapes end to end in a scratch repository.
+- [x] Records: contract (amendment 13, corrections in 12, invariant 11, open items 11, 14, 21–23), README, CHANGELOG, IMPLEMENT.md, lessons.
+- [x] Verification loop; clean-up of `fx4a3_*` and `var/fix-m4a-3/`.
+- Found while fixing: a namespace import used otherwise cannot be attributed to one export, so it unverifies every export of its module (recorded, open item 22); `resolve::tests::field_chains_binding_chains_and_big_packages_stay_fast` (an M3a wall-clock bound) fails under the machine's current load at `e06e590` and at this change alike (3.04 s and 3.1 s against 3 s).
+- [ ] Evaluator pass 4.

@@ -582,15 +582,18 @@ impl<'g> Walk<'g> {
                 let mut cs = Vec::new();
                 // The node handles another endpoint: the request entered there. An inline
                 // handler handles it only within its spans (invariant 8).
+                let mut inline: Vec<Span> = Vec::new();
                 for e in self
                     .v
                     .inbound(f.node, EdgeKind::HandledBy, Certainty::Ambiguous)
                 {
-                    let handles = handler_spans(e).is_none_or(|spans| {
+                    let spans = handler_spans(e);
+                    let handles = spans.as_ref().is_none_or(|spans| {
                         reached_by
                             .iter()
                             .any(|ev| spans.iter().any(|s| within(*ev, *s)))
                     });
+                    inline.extend(spans.into_iter().flatten());
                     if handles {
                         cs.push(Candidate {
                             via: Via::Handles,
@@ -601,8 +604,21 @@ impl<'g> Walk<'g> {
                     }
                 }
                 // Callers, and callers of the methods the node overrides (CHA, as `rb callers`).
-                let overridden = self.v.overridden(f.node, Certainty::Ambiguous);
-                for (m, via_c) in std::iter::once((f.node, None))
+                // Not when every row that reached the node lies in one of its inline handlers:
+                // that code runs only when the handler's endpoint is requested, and calling the
+                // node merely registers it (amendment 13, the upstream mirror of Q7).
+                let in_handlers = !reached_by.is_empty()
+                    && reached_by
+                        .iter()
+                        .all(|ev| inline.iter().any(|s| within(*ev, *s)));
+                let overridden = if in_handlers {
+                    Vec::new()
+                } else {
+                    self.v.overridden(f.node, Certainty::Ambiguous)
+                };
+                let callees = (!in_handlers).then_some((f.node, None));
+                for (m, via_c) in callees
+                    .into_iter()
                     .chain(overridden.into_iter().map(|(m, c)| (m, Some(c))))
                 {
                     for e in self.v.inbound(m, EdgeKind::Calls, Certainty::Ambiguous) {
@@ -1478,6 +1494,17 @@ mod tests {
             got.iter().any(|l| l.contains("queries b_log"))
                 && got.iter().any(|l| l.contains("consumes HTTP POST /login")),
             "{got:?}"
+        );
+        // Upstream, the mirror (amendment 13; evaluator pass 3, R5): the site inside `/b`'s
+        // inline handler is entered only at `GET /b`; `fa` calling `fb` registers `/b`, it does
+        // not run the call, so `fa` and `GET /a` are no entries.
+        let p = request_path(&g, id(&g, &login), PathOptions::default());
+        assert_eq!(
+            lines(&g, &p.upstream),
+            [
+                "consumes fb [heuristic]",
+                "  handles HTTP GET /b @loop [exact] ~heuristic",
+            ]
         );
     }
 

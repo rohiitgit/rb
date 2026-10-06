@@ -267,7 +267,14 @@ pub fn client_url(pieces: &[Piece]) -> ClientUrl {
                 match end {
                     AuthorityEnd::Port(host) => {
                         out.host = Some(host.to_ascii_lowercase());
-                        pieces.remove(0);
+                        // The literal, then the port hole. A further hole before the path's
+                        // first `/` may hold a path prefix: the path does not start with a
+                        // literal, so it is matched by suffix within the host (amendment 13,
+                        // Gate B; evaluator pass 3, R4).
+                        pieces.drain(..2);
+                        if pieces.first() == Some(&Piece::Hole) {
+                            out.base_unknown = true;
+                        }
                         skip_authority(&mut pieces);
                     }
                     AuthorityEnd::Complete => {
@@ -936,6 +943,32 @@ mod tests {
         // A hole after a `/` is a path segment as before.
         let u = client_url(&[lit("http://orders:3000/"), Piece::Hole, lit("/x")]);
         assert_eq!((u.base_unknown, u.path.as_str()), (false, "/{}/x"));
+    }
+
+    /// Contract M4a amendment 13, Gate B (evaluator pass 3, R4): a port hole is one hole;
+    /// another hole before the path's first `/` may hold a path prefix, so the path does not
+    /// start with a literal and is matched by suffix within the host.
+    #[test]
+    fn holes_after_a_port_hole_are_an_unknown_prefix() {
+        let u = client_url(&[lit("http://users:"), Piece::Hole, Piece::Hole, lit("/x")]);
+        assert_eq!(
+            (u.host.as_deref(), u.base_unknown, u.path.as_str()),
+            (Some("users"), true, "/x")
+        );
+        let u = client_url(&[
+            lit("http://users:"),
+            Piece::Hole,
+            Piece::Hole,
+            Piece::Hole,
+            lit("/a/b"),
+        ]);
+        assert_eq!((u.base_unknown, u.path.as_str()), (true, "/a/b"));
+        // One port hole: the path starts with its literal `/`, as before.
+        let u = client_url(&[lit("http://users:"), Piece::Hole, lit("/x")]);
+        assert_eq!(
+            (u.host.as_deref(), u.base_unknown, u.path.as_str()),
+            (Some("users"), false, "/x")
+        );
     }
 
     /// Evaluator pass 1, P3: a hole that ends the URL glued to literal text is an opaque tail

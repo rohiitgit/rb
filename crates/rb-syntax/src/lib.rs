@@ -11,6 +11,7 @@ mod imports;
 mod keys;
 mod queries;
 mod strings;
+mod uses;
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,6 +49,7 @@ fn fingerprint_input() -> String {
         include_str!("imports.rs"),
         include_str!("bindings.rs"),
         include_str!("calls.rs"),
+        include_str!("uses.rs"),
     ]
     .join("\n")
 }
@@ -389,6 +391,26 @@ pub struct FileFacts {
     /// Outermost call expressions with their chained calls, in source order.
     #[serde(default)]
     pub chains: Vec<CallChain>,
+    /// Uses of names that may hold a configured object, other than as a call's receiver or
+    /// callee, in source order (contract M4a amendment 13).
+    #[serde(default)]
+    pub uses: Vec<NameUse>,
+}
+
+/// One use of a name that may hold a configured object (contract M4a amendment 13): a name a
+/// binding initialises with a call, the target of an assignment from a call, the receiver of
+/// such a call, or (TS/JS) an imported name. Recorded only where the name is neither the
+/// receiver of a call (`api.get(…)`, a call chain's root), nor a callee (`api(…)`), nor declared
+/// (a declarator, parameter or import): an argument, an operand, a member read or written
+/// (`api.defaults.baseURL = x`), a spread, an export, or the target of an assignment. TypeScript,
+/// JavaScript and Java only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameUse {
+    /// As written: `api`, or `this.rt` for a member of the enclosing object.
+    pub name: String,
+    pub span: Span,
+    /// The name is assigned to (`api = …`, `api++`, a destructuring target).
+    pub write: bool,
 }
 
 /// One import statement (or one spec of a Go import block).
@@ -566,7 +588,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             }
         })
         .collect();
-    let chains = raw_chains
+    let chains: Vec<CallChain> = raw_chains
         .into_iter()
         .map(|c| CallChain {
             root: c.root,
@@ -577,6 +599,13 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             assigned: c.assigned,
         })
         .collect();
+    let imports = imports::imports(language, root, source);
+    let uses = uses::uses(
+        language,
+        root,
+        source,
+        &uses::candidates(language, &bindings, &chains, &imports),
+    );
 
     Ok(FileFacts {
         definitions,
@@ -593,10 +622,11 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                 text: c.text,
             })
             .collect(),
-        imports: imports::imports(language, root, source),
+        imports,
         package: imports::package(language, root, source),
         bindings,
         chains,
+        uses,
     })
 }
 

@@ -50,8 +50,11 @@ use serde_json::{Value, json};
 /// past a port hole, suffix evidence and own-service ranking, opaque tails, `config_unread`,
 /// `ServeMux` hosts, unknown bases of server-side Java clients), `m4a-http-6` evaluator pass
 /// 2's (M4a amendment 12: bases stated at the call or on the instance, partial hosts, a hole
-/// after a literal port, more Spring configuration counted, `node-fetch`).
-pub const PIPELINE: &str = "m4a-http-6";
+/// after a literal port, more Spring configuration counted, `node-fetch`), `m4a-http-7`
+/// evaluator pass 3's (M4a amendment 13: verified instance bases, paths that start with a hole
+/// matched by suffix, the config client turned off only by a base document, `cross-fetch` and
+/// inline client instances).
+pub const PIPELINE: &str = "m4a-http-7";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -308,7 +311,8 @@ fn is_config_client_key(key: &str) -> bool {
             && !key.starts_with("spring.cloud.config.server."))
 }
 
-/// `false` turns the config client off, whatever else configures it (amendment 12).
+/// `false` in a base document turns the config client off, whatever else configures it
+/// (amendments 12 and 13).
 const CONFIG_CLIENT_ENABLED: &str = "spring.cloud.config.enabled";
 
 /// One configuration file as read: path, text, kind, service, and its keys with their values.
@@ -345,15 +349,41 @@ fn spring_config(
         };
         read.push((path, text, kind, service_of(path), entries));
     }
-    let disabled: BTreeSet<&str> = read
-        .iter()
-        .filter(|(.., entries)| {
-            entries
-                .get(CONFIG_CLIENT_ENABLED)
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"))
-        })
-        .map(|(_, _, _, service, _)| service.as_str())
-        .collect();
+    // `false` turns the client off only in a base (non-profile) document of
+    // `application.properties`/`application.yml`, and only when no file or document sets it
+    // back to `true`: a profile's switch applies to that profile alone (amendment 13; evaluator
+    // pass 3, R3).
+    let (mut off, mut on): (BTreeSet<&str>, BTreeSet<&str>) = Default::default();
+    for (path, text, kind, service, _) in &read {
+        if *kind == ConfigFile::Build {
+            continue;
+        }
+        let documents = if path.ends_with(".properties") {
+            rb_frameworks::fold::properties_documents(text)
+        } else {
+            rb_frameworks::fold::yaml_documents(text)
+        };
+        let base_file = matches!(
+            kind,
+            ConfigFile::Read | ConfigFile::ConfigDir | ConfigFile::Yaml
+        );
+        for doc in &documents {
+            match doc.get(CONFIG_CLIENT_ENABLED).map(|v| v.trim()) {
+                Some(v) if v.eq_ignore_ascii_case("true") => {
+                    on.insert(service);
+                }
+                Some(v)
+                    if v.eq_ignore_ascii_case("false")
+                        && base_file
+                        && !rb_frameworks::fold::profile_document(doc) =>
+                {
+                    off.insert(service);
+                }
+                _ => {}
+            }
+        }
+    }
+    let disabled: BTreeSet<&str> = off.difference(&on).copied().collect();
     // Service → (reasons, files).
     let mut unread: BTreeMap<String, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
     for (path, text, kind, service, entries) in &read {
@@ -1485,7 +1515,8 @@ mod tests {
     /// Contract M4a amendment 12 (evaluator pass 2, Q3): Spring Boot's `classpath:/config/`
     /// location counts (its `application.properties` is not read either, so it is counted with
     /// the reason `config_dir`); a flow mapping's keys are overrides; a service that turns the
-    /// config client off (`spring.cloud.config.enabled=false`, in any file) is no client.
+    /// config client off (`spring.cloud.config.enabled=false` in its base document; amendment
+    /// 13) is no client.
     #[test]
     fn config_directories_flow_mappings_and_disabled_clients() {
         let res = "src/main/resources";
@@ -1568,6 +1599,91 @@ mod tests {
                 .get("c")
                 .is_some_and(|p| p.contains_key("users.url"))
         );
+    }
+
+    /// Contract M4a amendment 13 (evaluator pass 3, R3): `spring.cloud.config.enabled=false`
+    /// turns the config client off only in the base (non-profile) `application.properties` or
+    /// `application.yml` document, and only when no profile file or document sets it back to
+    /// `true`. A profile file (`application-local.properties`), a profile `bootstrap` file, a
+    /// profile document of `application.yml` (`on-profile` or the legacy `spring.profiles`) or
+    /// of a multi-document `application.properties` (`#---`) never turns it off.
+    #[test]
+    fn only_the_base_document_turns_the_config_client_off() {
+        let res = "src/main/resources";
+        let pom = "<artifactId>spring-cloud-starter-config</artifactId>";
+        let files: Vec<(String, &str)> = vec![
+            ("h/pom.xml".to_owned(), pom),
+            (
+                format!("h/{res}/application.properties"),
+                "users.url=http://users\n",
+            ),
+            (
+                format!("h/{res}/application-local.properties"),
+                "spring.cloud.config.enabled=false\n",
+            ),
+            ("i/pom.xml".to_owned(), pom),
+            (
+                format!("i/{res}/bootstrap-local.yml"),
+                "spring:\n  config:\n    activate:\n      on-profile: local\n  cloud:\n    config:\n      enabled: false\n",
+            ),
+            ("j/pom.xml".to_owned(), pom),
+            (
+                format!("j/{res}/application.yml"),
+                "users:\n  url: http://users\n---\nspring:\n  config:\n    activate:\n      on-profile: test\n  cloud:\n    config:\n      enabled: false\n",
+            ),
+            ("k/pom.xml".to_owned(), pom),
+            (
+                format!("k/{res}/application.properties"),
+                "spring.cloud.config.enabled=false\n",
+            ),
+            (
+                format!("k/{res}/application-prod.properties"),
+                "spring.cloud.config.enabled=true\n",
+            ),
+            ("l/pom.xml".to_owned(), pom),
+            (
+                format!("l/{res}/application.properties"),
+                "users.url=http://users\n#---\nspring.config.activate.on-profile=local\nspring.cloud.config.enabled=false\n",
+            ),
+            ("m/pom.xml".to_owned(), pom),
+            (
+                format!("m/{res}/application.yml"),
+                "users.url: http://users\n---\nspring.profiles: test\nspring.cloud.config.enabled: false\n",
+            ),
+            // The base document does turn it off.
+            ("n/pom.xml".to_owned(), pom),
+            (
+                format!("n/{res}/application.yml"),
+                "spring:\n  cloud:\n    config:\n      enabled: false\n---\nspring:\n  config:\n    activate:\n      on-profile: test\nusers:\n  url: http://users\n",
+            ),
+        ];
+        let config: BTreeMap<&str, String> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), (*t).to_owned()))
+            .collect();
+        let service_of = |p: &str| p.split('/').next().unwrap().to_owned();
+        let (spring, diagnostics) = spring_config(&config, &service_of);
+        let unread: Vec<String> = diagnostics
+            .iter()
+            .filter(|d| d.kind == "config_unread")
+            .map(|d| format!("{} {}", d.detail["service"], d.detail["reasons"]))
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                "\"h\" [\"config_client\",\"profile\"]",
+                "\"i\" [\"bootstrap\",\"config_client\"]",
+                "\"j\" [\"config_client\",\"yaml\"]",
+                "\"k\" [\"config_client\",\"profile\"]",
+                "\"l\" [\"config_client\"]",
+                "\"m\" [\"config_client\",\"yaml\"]",
+                "\"n\" [\"yaml\"]",
+            ]
+        );
+        for service in ["h", "i", "j", "k", "l", "m"] {
+            assert!(spring.overrides[service].all, "{service}");
+        }
+        assert!(!spring.overrides["n"].all);
     }
 
     #[test]

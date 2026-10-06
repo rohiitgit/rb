@@ -10,12 +10,13 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use rb_frameworks::clients::{ClientKind, FileClients, UrlValue};
+use rb_frameworks::clients::{AxiosInstance, ClientKind, FileClients, UrlValue};
 use rb_frameworks::endpoint::{
     ANY, PathMatch, Piece, Segment, client_url, literal_segments, match_path, methods_match,
     segments,
 };
 use rb_frameworks::fold::{self, Folded, Lookup, Origin};
+use rb_frameworks::work::Counted;
 use rb_model::{
     Attrs, Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
     Provenance, Span,
@@ -103,6 +104,11 @@ pub(crate) struct Site {
     pub config_overridden: bool,
     /// The base was read from a `@Bean` method taken as the injected instance (amendment 12).
     pub base_from_bean: bool,
+    /// Gate A (amendment 13): the call is on an instance whose base comes from its construction,
+    /// and nothing can change that base afterwards (`Some(true)`) or something may
+    /// (`Some(false)`: the host still restricts, the site is never `synthetic`, and its edge
+    /// says `base: unverified`); `None` for a call on no such instance.
+    pub base_verified: Option<bool>,
 }
 
 /// A service as the host rule (D6) sees it.
@@ -286,6 +292,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
         .iter()
         .map(|(path, (language, facts))| (*path, rb_frameworks::clients::clients(*language, facts)))
         .collect();
+    let tainted = escaped_instances(inputs, &clients);
     let mut out = Vec::new();
     for (&path, file_clients) in &clients {
         let file = folding.ids[path];
@@ -296,10 +303,26 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
             // A base stated at the call (axios request config) replaces the instance's
             // (amendment 12).
             let stated = call.base.clone().map(|b| (file, b));
+            // Gate A across files (amendment 13): a top-level instance a file importing it
+            // uses otherwise is unverified.
+            let unverify = |target: &str, name: &str| {
+                tainted.contains(&(target, name)) || tainted.contains(&(target, "*"))
+            };
+            let mut base_verified = call.base_verified;
+            if let (Some(true), Some(name)) = (base_verified, &call.top_instance)
+                && unverify(path, name)
+            {
+                base_verified = Some(false);
+            }
             let base = match &call.instance {
                 Some(name) => match imported_instance(inputs, &clients, path, facts, name) {
-                    Some((target, base)) => {
-                        stated.or_else(|| base.map(|b| (folding.ids[target], b)))
+                    Some((target, instance)) => {
+                        if instance.base.is_some() {
+                            base_verified = Some(
+                                instance.verified && !unverify(target, instance.name.as_str()),
+                            );
+                        }
+                        stated.or_else(|| instance.base.clone().map(|b| (folding.ids[target], b)))
                     }
                     None => continue,
                 },
@@ -325,7 +348,42 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 url,
                 config_overridden: folding.take_asked(),
                 base_from_bean: call.base_from_bean,
+                base_verified,
             });
+        }
+    }
+    out
+}
+
+/// Gate A across files (contract M4a amendment 13): `(file, exported name)` for every name a
+/// file imports and uses other than as the receiver of a request call
+/// ([`FileClients::escaped_imports`]), resolved through M3a module resolution; `(file, "*")`
+/// for a namespace import used so, which may reach any of the module's exports.
+fn escaped_instances<'a>(
+    inputs: &Inputs<'a, '_>,
+    clients: &BTreeMap<&'a str, FileClients>,
+) -> HashSet<(&'a str, &'a str)> {
+    let mut out = HashSet::new();
+    for (&path, fc) in clients {
+        if fc.escaped_imports.is_empty() {
+            continue;
+        }
+        let facts = inputs.files[path].1;
+        let escaped = |name: &str| {
+            fc.escaped_imports
+                .binary_search_by(|e| e.as_str().cmp(name))
+                .is_ok()
+        };
+        for (import, files) in facts.imports.iter().zip(inputs.index.import_targets(path)) {
+            for &f in files {
+                rb_frameworks::work::tick(1);
+                for n in import.names.iter().filter(|n| escaped(&n.local)) {
+                    out.insert((f, n.name.as_str()));
+                }
+                if import.alias.as_deref().is_some_and(escaped) {
+                    out.insert((f, "*"));
+                }
+            }
         }
     }
     out
@@ -333,13 +391,13 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
 
 /// The axios instance an imported name is, with its file: the first resolved target (in path
 /// order) binding an instance of the exported name at top level.
-fn imported_instance<'a>(
+fn imported_instance<'a, 'c>(
     inputs: &Inputs<'a, '_>,
-    clients: &BTreeMap<&'a str, FileClients>,
+    clients: &'c BTreeMap<&'a str, FileClients>,
     path: &str,
     facts: &FileFacts,
     local: &str,
-) -> Option<(&'a str, Option<UrlValue>)> {
+) -> Option<(&'a str, &'c AxiosInstance)> {
     let targets = inputs.index.import_targets(path);
     facts
         .imports
@@ -358,20 +416,21 @@ fn imported_instance<'a>(
                 .axios_instances
                 .iter()
                 .find(|a| a.top_level && a.name == exported)
-                .map(|a| (target, a.base.clone()))
+                .map(|a| (target, a))
         })
 }
 
 /// A URL relative to a base: the base then the URL (with a `/` between unless one side has it),
-/// unless the URL is absolute. An unknown base is a hole (none is added before a URL that starts
-/// with one). The label is the weakest among the parts that resolved.
+/// unless the URL is absolute. An unknown base is a hole. A URL that starts with an unknown
+/// part is not joined to any base (amendment 13, Gate B): that part may be absolute (axios and
+/// Spring then ignore the base) or a prefix, so it is the unknown base, and the path is matched
+/// by suffix only. The label is the weakest among the parts that resolved.
 fn join(base: Option<Folded>, url: Folded) -> Folded {
     let absolute = {
         let u = client_url(&url.pieces);
         u.host.is_some() || u.host_dynamic
     };
-    // An unknown base before a URL that already starts with an unknown part adds nothing.
-    if absolute || (base.is_none() && url.pieces.first() == Some(&Piece::Hole)) {
+    if absolute || url.pieces.first() == Some(&Piece::Hole) {
         return url;
     }
     let base = base.unwrap_or(Folded {
@@ -482,7 +541,8 @@ enum Scope<'s> {
 
 /// The stitching context of a snapshot: endpoints, their index, and the services hosts name.
 struct Stitcher<'e> {
-    endpoints: &'e [EndpointRef],
+    /// Counted when scanned, so a scan per site is measured (amendment 13; R6).
+    endpoints: Counted<'e, EndpointRef>,
     index: EndpointIndex,
     /// Host form (a service's name, lower-cased, or the last segment of its key) → service keys.
     hosts: HashMap<String, BTreeSet<&'e str>>,
@@ -504,7 +564,7 @@ impl<'e> Stitcher<'e> {
                 .insert(&s.key);
         }
         Stitcher {
-            endpoints,
+            endpoints: Counted::new(endpoints),
             index: EndpointIndex::new(endpoints),
             hosts,
             exposing: endpoints.iter().map(|e| e.service.as_str()).collect(),
@@ -591,7 +651,16 @@ impl<'e> Stitcher<'e> {
             if m.suffix { "suffix" } else { "exact" }.into(),
         );
         attrs.insert("client".into(), site.client.as_str().into());
-        attrs.insert("base".into(), folded.origin.as_str().into());
+        let unverified = site.base_verified == Some(false);
+        attrs.insert(
+            "base".into(),
+            if unverified {
+                "unverified"
+            } else {
+                folded.origin.as_str()
+            }
+            .into(),
+        );
         if let Some(host) = &url.host {
             let key = if matches!(scope, Scope::Proxy) {
                 "via_host"
@@ -628,6 +697,7 @@ impl<'e> Stitcher<'e> {
             && !url.flags.opaque_tail
             && !site.config_overridden
             && !site.base_from_bean
+            && !unverified
             && !e.prefix_unknown
             && !e.prefix_maybe_incomplete;
         let certainty = if synthetic {
@@ -783,6 +853,12 @@ pub(crate) fn add_consumes(
         for (bucket, n) in counts {
             detail.insert(bucket.as_str().into(), Value::from(n));
         }
+        // Sites on an instance whose base comes from its construction, by Gate A.
+        let bases = |v: bool| sites.iter().filter(|s| s.base_verified == Some(v)).count();
+        detail.insert(
+            "bases".into(),
+            json!({ "verified": bases(true), "unverified": bases(false) }),
+        );
         diagnostics.push(Diagnostic {
             kind: "http_coverage".into(),
             path: None,
@@ -883,6 +959,7 @@ mod tests {
             url: url.map(|(t, o)| folded(t, o)),
             config_overridden: false,
             base_from_bean: false,
+            base_verified: None,
         }
     }
 
@@ -1045,6 +1122,16 @@ mod tests {
         );
         bean.base_from_bean = true;
         lowered(bean, &eps);
+        // A base its instance's file may change after construction (amendment 13, Gate A).
+        let mut unverified = site(
+            AUTH,
+            Some("POST"),
+            Some(("http://notification/internal/mfa/email", Literal)),
+            1,
+        );
+        unverified.base_verified = Some(false);
+        let shown = lowered(unverified, &eps);
+        assert!(shown.contains("\"base\":\"unverified\""), "{shown}");
         // An endpoint `{*}`.
         let mut wild = eps.clone();
         wild.push(ep("GET", "/static/*", NOTIFICATION));
@@ -1741,10 +1828,14 @@ mod tests {
         );
         b.src = a.src.clone();
         a.client = ClientKind::Axios;
+        // Gate A counts (amendment 13): one unverified and one verified instance base.
+        a.base_verified = Some(false);
+        let mut c = site(WEB, Some("POST"), Some(("/internal/mfa/email", Literal)), 3);
+        c.base_verified = Some(true);
         let sites = vec![
             a,
             b,
-            site(WEB, Some("POST"), Some(("/internal/mfa/email", Literal)), 3),
+            c,
             site(WEB, Some("GET"), None, 4),
             site(
                 WEB,
@@ -1816,7 +1907,8 @@ mod tests {
         assert_eq!(
             coverage.detail,
             json!({"sites": 8, "synthetic": 1, "heuristic": 2, "ambiguous": 1, "too_ambiguous": 0,
-                   "unmatched": 1, "self": 1, "external": 1, "dynamic": 1})
+                   "unmatched": 1, "self": 1, "external": 1, "dynamic": 1,
+                   "bases": {"verified": 1, "unverified": 1}})
         );
         let total: u64 = Bucket::ALL
             .iter()
@@ -2219,6 +2311,143 @@ mod tests {
                 "web/src/calls.ts 8 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
                 "web/src/calls.ts 9 external",
                 "web/src/calls.ts 10 synthetic -> HTTP GET /orders/{} @orders [synthetic]",
+            ]
+        );
+    }
+
+    /// `path line bucket [-> key [certainty] base=<base attr>]` per site.
+    fn stitched_bases(
+        files: &[(&str, Language, &str)],
+        eps: &[EndpointRef],
+        services: &[&str],
+    ) -> Vec<String> {
+        let sites = collect_sites(files, &[], &[], &[]);
+        let services: Vec<ServiceRef> = services
+            .iter()
+            .map(|s| ServiceRef {
+                key: (*s).to_owned(),
+                name: (*s).to_owned(),
+            })
+            .collect();
+        let stitcher = Stitcher::new(eps, &services);
+        sites
+            .iter()
+            .map(|s| {
+                let o = stitcher.site(s);
+                let to = o
+                    .links
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            " -> {} [{}] base={} match={}",
+                            eps[l.endpoint].key,
+                            l.certainty.as_str(),
+                            l.attrs["base"].as_str().unwrap_or("?"),
+                            l.attrs["match"].as_str().unwrap_or("?"),
+                        )
+                    })
+                    .collect::<String>();
+                format!("{} {} {}{to}", s.at.path, s.at.span[0], o.bucket.as_str())
+            })
+            .collect()
+    }
+
+    /// Contract M4a amendment 13, Gate A (evaluator pass 3, R1), from source: an instance whose
+    /// base its file (or a file importing it) can change after construction keeps its host but
+    /// never reaches `synthetic`, and says `base: unverified`; an unchanged one still does.
+    #[test]
+    fn a_base_reaches_synthetic_only_when_the_instance_is_unchanged() {
+        let calls = "import axios from \"axios\";\nimport { shared2, shared4, shared5 } from \"./client\";\nimport { shared6 } from \"./client2\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nconst api1 = axios.create({ baseURL: \"http://orders\" });\napi1.defaults.baseURL = \"https://api.stripe.com\";\nconst api2 = axios.create({ baseURL: \"http://orders\" });\napi2.interceptors.request.use((c) => { c.baseURL = \"https://api.stripe.com\"; return c; });\nlet api3 = axios.create({ baseURL: \"http://orders\" });\nexport function t03setup() { api3 = axios.create({ baseURL: \"https://api.stripe.com\" }); }\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst api4 = axios.create({ baseURL: \"http://orders\", ...stripeOpts });\nexport async function f() {\n  await api.get(\"/orders/1\");\n  await api1.get(\"/orders/1\");\n  await api2.get(\"/orders/1\");\n  await api3.get(\"/orders/1\");\n  await api4.get(\"/orders/1\");\n  await shared2.get(\"/orders/1\");\n  await shared4.get(\"/orders/1\");\n  await shared5.get(\"/orders/1\");\n  await shared6.get(\"/orders/1\");\n}\n";
+        // `shared2` is changed by its own module, `shared4` by a module importing it (and its
+        // own module calls it too), `shared6` through a namespace import (which reaches every
+        // export of `client2`: a namespace member is not told apart).
+        let client = "import axios from \"axios\";\nexport const shared2 = axios.create({ baseURL: \"http://orders\" });\nshared2.defaults.baseURL = \"https://api.stripe.com\";\nexport const shared4 = axios.create({ baseURL: \"http://orders\" });\nexport const shared5 = axios.create({ baseURL: \"http://orders\" });\nexport async function own() { await shared4.get(\"/orders/1\"); }\n";
+        let client2 = "import axios from \"axios\";\nexport const shared6 = axios.create({ baseURL: \"http://orders\" });\n";
+        let setup = "import { shared4 } from \"./client\";\nimport * as c from \"./client2\";\nshared4.interceptors.request.use(rewrite);\nc.shared6.defaults.baseURL = \"https://api.stripe.com\";\n";
+        let java = "package p;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass Clients {\n  private final WebClient.Builder b1 = WebClient.builder().baseUrl(\"http://orders\");\n  private final WebClient w3 = WebClient.create(\"http://orders\");\n  Clients() { b1.baseUrl(\"https://api.stripe.com\"); }\n  void j01() { b1.build().get().uri(\"/orders/1\").retrieve(); }\n  void j03() { w3.get().uri(\"/orders/1\").retrieve(); }\n}\n";
+        let files = [
+            ("web/src/calls.ts", Language::TypeScript, calls),
+            ("web/src/client.ts", Language::TypeScript, client),
+            ("web/src/client2.ts", Language::TypeScript, client2),
+            ("web/src/setup.ts", Language::TypeScript, setup),
+            ("pay/src/main/java/p/Clients.java", Language::Java, java),
+        ];
+        let eps = vec![ep("GET", "/orders/{id}", "orders")];
+        let got = stitched_bases(&files, &eps, &["web", "pay", "orders"]);
+        let to = "HTTP GET /orders/{} @orders";
+        let synthetic = format!("synthetic -> {to} [synthetic] base=literal match=exact");
+        let unverified = format!("heuristic -> {to} [heuristic] base=unverified match=exact");
+        assert_eq!(
+            got,
+            [
+                format!("pay/src/main/java/p/Clients.java 6 {unverified}"),
+                format!("pay/src/main/java/p/Clients.java 7 {synthetic}"),
+                format!("web/src/calls.ts 13 {synthetic}"),
+                format!("web/src/calls.ts 14 {unverified}"),
+                format!("web/src/calls.ts 15 {unverified}"),
+                format!("web/src/calls.ts 16 {unverified}"),
+                format!("web/src/calls.ts 17 {unverified}"),
+                format!("web/src/calls.ts 18 {unverified}"),
+                format!("web/src/calls.ts 19 {unverified}"),
+                format!("web/src/calls.ts 20 {synthetic}"),
+                format!("web/src/calls.ts 21 {unverified}"),
+                format!("web/src/client.ts 5 {unverified}"),
+            ]
+        );
+        // Guard: a site whose base is unverified is never `synthetic`.
+        let services: Vec<ServiceRef> = ["web", "pay", "orders"]
+            .iter()
+            .map(|s| ServiceRef {
+                key: (*s).to_owned(),
+                name: (*s).to_owned(),
+            })
+            .collect();
+        let stitcher = Stitcher::new(&eps, &services);
+        let sites = collect_sites(&files, &[], &[], &[]);
+        assert_eq!(
+            sites
+                .iter()
+                .filter(|s| s.base_verified == Some(false))
+                .count(),
+            9
+        );
+        assert!(
+            sites
+                .iter()
+                .filter(|s| s.base_verified == Some(false))
+                .all(|s| stitcher.site(s).bucket != Bucket::Synthetic)
+        );
+    }
+
+    /// Contract M4a amendment 13, Gate B (evaluator pass 3, R2, R4), from source: a URL whose
+    /// path does not start with a literal (a leading hole under a client's base, or a second
+    /// hole after a port hole) leaves its prefix unknown: it is matched by suffix only,
+    /// `heuristic` at most, and an instance's base is not prepended to it.
+    #[test]
+    fn a_path_must_start_with_a_literal() {
+        let ts = "import axios from \"axios\";\nconst orders = axios.create({ baseURL: \"http://orders\" });\nexport async function l(base: string, id: string, p: string, q: string) {\n  await orders.get(`${process.env.STRIPE_URL}/reports/1`);\n  await orders.get(base + \"/reports/1\");\n  await orders.get(`/${id}/reports/1`);\n  await fetch(`http://orders:${p}${q}/t1/reports/1`);\n  await fetch(`http://orders:${p}/t1/reports/1`);\n}\n";
+        let java = "package p;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass C {\n  private final WebClient wc10 = WebClient.create(\"http://orders\");\n  void j19() { wc10.get().uri(System.getenv(\"X\") + \"/reports/1\").retrieve(); }\n}\n";
+        let eps = vec![ep("GET", "/{tenant}/reports/{id}", "orders")];
+        let to = "HTTP GET /{}/reports/{} @orders";
+        assert_eq!(
+            stitched_bases(
+                &[
+                    ("web/src/l.ts", Language::TypeScript, ts),
+                    ("pay/src/main/java/p/C.java", Language::Java, java),
+                ],
+                &eps,
+                &["web", "pay", "orders"],
+            ),
+            [
+                format!(
+                    "pay/src/main/java/p/C.java 4 heuristic -> {to} [heuristic] base=literal match=suffix"
+                ),
+                // `fetch` sites first, then axios (pack order within a file).
+                format!("web/src/l.ts 6 heuristic -> {to} [heuristic] base=literal match=suffix"),
+                format!("web/src/l.ts 7 synthetic -> {to} [synthetic] base=literal match=exact"),
+                format!("web/src/l.ts 3 heuristic -> {to} [heuristic] base=literal match=suffix"),
+                format!("web/src/l.ts 4 heuristic -> {to} [heuristic] base=literal match=suffix"),
+                format!("web/src/l.ts 5 synthetic -> {to} [synthetic] base=literal match=exact"),
             ]
         );
     }

@@ -14,6 +14,7 @@ use rb_syntax::{
 };
 
 use crate::endpoint::{ANY, norm_method};
+use crate::work::Counted;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Framework {
@@ -165,6 +166,10 @@ fn before(a: Span, b: Span) -> bool {
 /// It dereferences to the facts.
 pub struct FileScope<'f> {
     pub facts: &'f FileFacts,
+    /// The file's bindings and call chains, counted when scanned (they shadow the
+    /// [`FileFacts`] fields, so every scan a pack makes through its scope is measured; R6).
+    pub bindings: Counted<'f, Binding>,
+    pub chains: Counted<'f, CallChain>,
     /// Non-member bindings by name.
     locals_by_name: HashMap<&'f str, Vec<usize>>,
     /// Member bindings by name.
@@ -195,6 +200,8 @@ impl<'f> FileScope<'f> {
         }
         FileScope {
             facts,
+            bindings: Counted::new(&facts.bindings),
+            chains: Counted::new(&facts.chains),
             locals_by_name: locals,
             members_by_name: members,
             chain_by_span,

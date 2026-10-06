@@ -388,15 +388,23 @@ pub fn yaml_keys(text: &str) -> BTreeSet<String> {
 
 /// [`yaml_keys`] with each key's scalar value, unquoted (`""` for a mapping, a sequence's text
 /// as written), for the few keys whose value decides something (`spring.cloud.config.enabled`).
+/// Every document's entries, a later document's value winning.
 pub fn yaml_entries(text: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
+    yaml_documents(text).into_iter().flatten().collect()
+}
+
+/// [`yaml_entries`] per document (`---` separates them), in order.
+pub fn yaml_documents(text: &str) -> Vec<BTreeMap<String, String>> {
+    let mut docs = vec![BTreeMap::new()];
     let mut stack: Vec<(usize, String)> = Vec::new();
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
+        let out = docs.last_mut().expect("never empty");
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
             if trimmed.starts_with("---") {
                 stack.clear();
+                docs.push(BTreeMap::new());
             }
             continue;
         }
@@ -411,7 +419,7 @@ pub fn yaml_entries(text: &str) -> BTreeMap<String, String> {
             .join(".");
         // A document or block that is one flow mapping.
         if trimmed.starts_with('{') {
-            flow_entries(&flow_text(trimmed, &mut lines), &prefix, &mut out);
+            flow_entries(&flow_text(trimmed, &mut lines), &prefix, out);
             continue;
         }
         let Some((key, value)) = yaml_key(trimmed) else {
@@ -421,13 +429,37 @@ pub fn yaml_entries(text: &str) -> BTreeMap<String, String> {
         let value = value.trim();
         if value.starts_with('{') {
             out.insert(full.clone(), String::new());
-            flow_entries(&flow_text(value, &mut lines), &full, &mut out);
+            flow_entries(&flow_text(value, &mut lines), &full, out);
         } else {
             out.insert(full, scalar(value, true));
         }
         stack.push((indent, key.to_owned()));
     }
-    out
+    docs
+}
+
+/// A `.properties` file's documents (Spring Boot separates them with a `#---` or `!---` line),
+/// each parsed by [`parse_properties`], in order.
+pub fn properties_documents(text: &str) -> Vec<BTreeMap<String, String>> {
+    let mut docs = vec![String::new()];
+    for line in text.lines() {
+        if matches!(line.trim_end(), "#---" | "!---") {
+            docs.push(String::new());
+        } else {
+            let doc = docs.last_mut().expect("never empty");
+            doc.push_str(line);
+            doc.push('\n');
+        }
+    }
+    docs.iter().map(|d| parse_properties(d)).collect()
+}
+
+/// Whether a configuration document applies only to some profiles: it sets
+/// `spring.config.activate.on-profile`, or the legacy `spring.profiles`, to a value.
+pub fn profile_document(doc: &BTreeMap<String, String>) -> bool {
+    ["spring.config.activate.on-profile", "spring.profiles"]
+        .iter()
+        .any(|k| doc.get(*k).is_some_and(|v| !v.trim().is_empty()))
 }
 
 fn dotted(prefix: &str, key: &str) -> String {
