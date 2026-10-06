@@ -334,7 +334,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - No new dependency and no migration.
 - **Forks for the orchestrator:** F1 (may a name-matched host reach `synthetic`? decided yes), F2 (Python in M6, decided as recommended) and F3 (identity of a prefix-unknown endpoint, raised by the gin measurement; decided: the router's identity in the key, amendment 10).
 
-## M4b DI and dispatch: in progress
+## M4b DI and dispatch: built, pending the evaluator passes
 
 - [x] Phase 0 (preflight): primary-source checks, pins, invariant-1 baseline, gate matchers; contract amendments 1–3.
 - [x] Phase 1a: X1's HTML row; parameter positions, type arguments, array flag, return types and modifiers as facts (amendment 4); no golden change.
@@ -359,11 +359,12 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 12d: billing shares `public.users` with auth, notification's relative `smsCheck` stays unstitched (`self`), ts-express-prisma mounts a default-imported router (`GET /ops/health`).
 - [x] Phase 13: precision guards and dump checks for `INJECTS`, `DEPENDS_ON` and `impl_instantiated`, each bitten by a recorded mutation; DI/RTA/orphan goldens; S22 settled (amendment 17).
 - [x] Phase 14: SCIP mode end to end: `scip-injects.txt` (amendment 18).
-- [x] Phase 15: eight public repositories measured (contract measurement section; amendments 19–20: a by-simple-name `@Bean` match fixed, `PIPELINE = m4b-di-7`). Next: phase 16 (records).
+- [x] Phase 15: eight public repositories measured (contract measurement section; amendments 19–20: a by-simple-name `@Bean` match fixed, `PIPELINE = m4b-di-7`).
+- [x] Phase 16 (records): contract measurement section and Open items (15, each with its milestone, plus the weaker false results still possible); design, README, todo and changelog synced. Next: evaluator pass 1 (full review), then pass 2 (verification only). M4b is not done until the evaluator decides.
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
-  - `INJECTS` never above `synthetic`, and `synthetic` only through SCIP-resolved types and allow-listed gates;
+  - `INJECTS` never above `synthetic` as drafted; the orchestrator capped it at `heuristic` (F2), with the narrowing in `resolution` and the failed gates in `capped_by`;
   - RTA prunes only by a proof of absence, and every pruned step is counted;
   - orphans only for symbols every mention of which is accounted for;
   - `manifest` versions only from a lockfile or a literal.

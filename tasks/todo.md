@@ -326,7 +326,7 @@ Findings from the research step (2026-09-29):
 # M4 Frameworks (split into M4a and M4b; design §13)
 
 - **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). **Closed 2026-10-06** (contract amendment 18) after eight evaluator passes; pass 8 (`tasks/eval-m4a-pass8.md`, verification only) VERDICT PASS.
-- **M4b, DI and dispatch** (Spring DI, Spring Data beans, RTA, entry points, orphans, Q3 roll-up, package versions and service dependencies, full Service Card): contract `tasks/contract-m4b.md` (S1–S28, soundness claims and closing bar up front, forks F1–F6) written 2026-10-06; not started. Of the M4a open items it takes 1, 5, 7, 9, 15 and 24; item 2 moves to M6.
+- **M4b, DI and dispatch** (Spring DI, Spring Data beans, RTA, entry points, orphans, Q3 roll-up, package versions and service dependencies, full Service Card): contract `tasks/contract-m4b.md` (S1–S28, soundness claims and closing bar up front, forks F1–F6) written 2026-10-06; built 2026-10-06 (phases 0–15 and 16's records), pending the evaluator passes. Of the M4a open items it takes 1, 5, 7, 9, 15 and 24; item 2 moves to M6.
 
 ## M4a phases
 
@@ -613,8 +613,8 @@ Same rules as M4a:
   - Record the wall time and facts-cache size against `28e47ba`.
   - **Verify:** numbers recorded in the contract's measurement section, computed by a tool; clones and `m4b_*` repositories removed afterwards.
 - [ ] **16. Records and review** (S28).
-  - Records: contract amendments, measurement and open items; design §5.5/§6.2/§6.4/§8.5/§9.2–§9.5/§10.3/§13; README; IMPLEMENT.md; CHANGELOG; lessons.
-  - Full verification loop and the stub scan.
-  - Evaluator pass 1 (full review); fix its findings test-first, one amendment each.
-  - Evaluator pass 2 (verification only, per the contract's closing bar); new attack forms in residue classes go to M5's adversarial review, not the verdict.
+  - [x] Records: contract amendments (16–20), measurement and open items (15, with milestones); design §5.5/§6.2/§6.4/§8.5/§9.2–§9.5/§10.3/§13 (M4b: built, pending the evaluator); README (status, `--precision`, the `di:`/`rta:` lines, orphans, Q3's roll-up, the card's sections); IMPLEMENT.md; CHANGELOG; lessons.
+  - [x] Full verification loop and the stub scan.
+  - [ ] Evaluator pass 1 (full review); fix its findings test-first, one amendment each.
+  - [ ] Evaluator pass 2 (verification only, per the contract's closing bar); new attack forms in residue classes go to M5's adversarial review, not the verdict.
   - Commit after each verified phase.

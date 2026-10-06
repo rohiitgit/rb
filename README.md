@@ -3,7 +3,7 @@
 A deterministic, LLM-free code-intelligence graph for Git repositories. It is built with Rust, Postgres and Apache AGE.
 The design is in [docs/repository-brain-design.md](docs/repository-brain-design.md).
 
-**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution), M3b (SCIP) and M4a (endpoints and request paths) are done; M4b (DI and dispatch) is next.** `rb` indexes a commit into a snapshot containing:
+**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution), M3b (SCIP) and M4a (endpoints and request paths) are done; M4b (DI and dispatch) is built and awaits its evaluator passes (contract `tasks/contract-m4b.md`).** `rb` indexes a commit into a snapshot containing:
 
 - one `File` node per blob, with its blob SHA, size, language and binary/generated flags;
 - one `Service` per detected project (package.json, Maven, Gradle, go.mod / `package main`, Cargo, pyproject, Dockerfile, `rb.toml`), marked deployable or library;
@@ -11,7 +11,9 @@ The design is in [docs/repository-brain-design.md](docs/repository-brain-design.
 - `Symbol` nodes for the definitions Tree-sitter finds in TypeScript/TSX/JavaScript, Java, Python and Go files, with `DEFINED_IN` (pointing at the name) and `CONTAINS` edges. Parse results are cached per blob, so a re-index only parses changed files.
 - `Table` nodes from SQL parsed with the real Postgres parser. `MIGRATES` edges come from `.sql` files, `QUERIES` edges from SQL strings in code (exact when passed to a known database call) and from ORM calls, and `MAPS_TO` edges from ORM entity mappings (JPA, Prisma, TypeORM, SQLAlchemy, Django).
 - `CALLS`, `REFERENCES` and `IMPLEMENTS` edges between symbols: exact (provenance `scip`) where a SCIP indexer ran for the project in a container, heuristic otherwise (resolved from imports, packages and typed bindings, never by bare name across the repository).
-- `Package` nodes and `DEPENDS_ON` edges from the external symbols a SCIP index names.
+- `Package` nodes and `DEPENDS_ON` edges from the external symbols a SCIP index names (provenance `scip`) and from manifests (provenance `manifest`: `package.json` with `package-lock.json` v2/v3, `go.mod`, `pom.xml` literals and same-pom properties; `@?` when the version cannot be read), plus Service → Service `DEPENDS_ON` (`via: package`) when a manifest names another service of the repository.
+- `INJECTS` edges (provenance `di`, never above `heuristic`) from Spring dependency injection: constructor (Lombok-generated included), field, setter and `@Bean`-parameter points to the stereotype class, `@Bean` method, Spring Data repository or Feign client they resolve to, narrowed by `@Qualifier`, `@Primary` and the parameter name, with `resolution`, `origin`, `via` and `capped_by` attributes; several candidates give `ambiguous` edges.
+- `impl_instantiated: false` on `IMPLEMENTS` edges out of a type proven never instantiated (RTA), and the `Symbol` attributes `entry` (`main`, `test`, `scheduled`, `listener`, `lifecycle`) and `orphan_eligible`.
 - `Endpoint` nodes from Spring MVC, Express, gin and Go `net/http` routes, with `EXPOSES` (service → endpoint) and `HANDLED_BY` (endpoint → handler); `CONSUMES` edges (provenance `http_stitch`, never above `synthetic`) from `fetch` (with `node-fetch` and `cross-fetch`), axios, Feign, `RestTemplate`, `WebClient`/`RestClient` and Go `net/http` client calls to other services' endpoints (contract `tasks/contract-m4a.md`). An endpoint key is `HTTP <METHOD> <path> @<service>`; when a route's prefix cannot be composed it is flagged `prefix_unknown` and its key ends in ` ?router=<file>#<binding>`.
 - `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests, syntax errors, oversized files, unresolved references, one `scip_status` per build root, route diagnostics and one bucket per HTTP client call that was not stitched).
 
@@ -28,9 +30,9 @@ target/debug/rb status
 target/debug/rb dump > snapshot.jsonl  # canonical, id-independent dump
 target/debug/rb service                # list services; `rb service <dir|name>` shows a card
 target/debug/rb find login --kind symbol  # search nodes by key or name
-target/debug/rb table-deps users         # migrations and code touching a table
+target/debug/rb table-deps users         # migrations, code and callers up to entry points per service (Q3)
 target/debug/rb callers AuthService.login --depth 2   # what calls a function or method (Q1)
-target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2), with the endpoints it handles
+target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2): endpoints, orphans, tests; --json
 target/debug/rb path "POST /api/v1/login"             # the request path through an endpoint (Q4); --format json, --pick N
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
 ```
@@ -49,13 +51,14 @@ If 55432 is taken, start the database on another port with `RB_DB_PORT=55433 doc
 `rb status` prints an `http:` line for each repository: endpoints, the services exposing them, and every client call site counted in exactly one bucket (zero buckets omitted):
 
 ```
-  http: 7 routes in 3 services; 8 client calls: 2 synthetic, 2 heuristic, 1 ambiguous, 1 external, 1 dynamic, 1 self
+  http: 7 routes in 3 services; 9 client calls: 2 synthetic, 2 heuristic, 1 ambiguous, 1 external, 1 dynamic, 2 self
 ```
 
 `rb path <query>` takes an endpoint key, `<METHOD> <path>` (normalised as routes are), part of an endpoint name, or a handler or client symbol. Several matching endpoints are listed, never picked silently; `--pick N` chooses one (a prefix-unknown endpoint's line names its router). The output joins the upstream tree (client calls in other services and their callers) and the downstream tree (the handler's calls within its service and library services, ending in `QUERIES` tables and `CONSUMES` endpoints, which continue into the next service up to `--hops`, default 4). Each step shows file:line, service and certainty, and how a `CONSUMES` step was stitched (`via host gateway`, `host notification`, `suffix match`, `n candidates`). Helper calls that reach no table or endpoint collapse into `+ k helper calls` unless `--full`. These are statically possible paths, not a trace of one request.
 
 ```
 Request path: POST /api/v1/login  [auth-service]
+precision=rta
 Statically possible paths from the call graph and HTTP stitching, not a trace of one request.
 UPSTREAM
   client login().  apps/web/src/api/auth.ts:6  [@acme/web]  [heuristic]  (via host gateway)
@@ -63,15 +66,47 @@ UPSTREAM
       ← LoginForm().  apps/web/src/pages/Login.tsx:3  [@acme/web]  [heuristic]
 ENDPOINT  POST /api/v1/login  [auth-service]
 DOWNSTREAM
-  AuthController#login().  services/auth/src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  [exact]
+  AuthController#login().  services/auth/src/main/java/com/acme/auth/AuthController.java:17  [auth-service]  [exact]
     → MfaClient#sendCode().  services/auth/src/main/java/com/acme/auth/MfaClient.java:9  [auth-service]  [heuristic]
       → CONSUMES POST /internal/mfa/email  [notification]  [synthetic, branch heuristic]  (host notification)
         ⇒ services/notification/src/server.ts (top-level code)  [notification]  [exact, branch heuristic]
           → QUERIES public.email_log (insert)  [exact, branch heuristic]
-certainty: exact 3, synthetic 1, heuristic 4
+    → UserDao#touch().  services/auth/src/main/java/com/acme/auth/UserDao.java:18  [auth-service]  [heuristic]
+      → QUERIES audit.users (insert)  [exact, branch heuristic]
+      → QUERIES public.users (update)  [exact, branch heuristic]
+certainty: exact 5, synthetic 1, heuristic 5
 ```
 
 The Service Card (`rb service <name>`) gains `APIs` (each endpoint with its handler and certainty, `(prefix unknown)` when flagged), `Calls APIs of` and `APIs called by` (grouped by service, with sites), and `HTTP client calls not stitched: k (rb status)`. `rb impact` lists the endpoints handled by the removed or impacted code under `endpoints:`.
+
+### Dependency injection, dispatch precision, orphans and dependencies
+
+`rb status` prints a `di:` line (every Spring injection point in exactly one bucket: `plain` one bean reached without a capping gate, `capped`, `ambiguous`, `too ambiguous`, `external`, `unresolved`, `optional absent`, `not a bean`, `test`) and an `rta:` line (implementing types proven never instantiated, and the dispatch edges that makes prunable):
+
+```
+  di: 9 injection points: 5 plain, 2 capped, 1 ambiguous, 1 not a bean
+  rta: 1 of 12 implementing types never instantiated (2 dispatch edges prunable)
+```
+
+`rb callers`, `rb path`, `rb impact` and `rb table-deps` take `--precision rta|cha`. Under `rta` (the default for `callers` and `path`) a dispatch step into an implementation proven never instantiated is skipped and counted (`rta: k dispatch steps pruned (…; --precision cha shows them)`, JSON `pruned_by_rta`); `cha` (the default for `impact` and `table-deps`, where under-reporting is the dangerous failure) keeps every step. Every answer prints its `precision=` header. `rb callers` marks entry points (`(entry: main)`, `endpoint POST /login`, `top-level`, …) and keeps expanding past them.
+
+`rb impact` lists each endpoint once under `endpoints:` (`(handler removed)` at distance 1), `orphans: may become dead code (n)` — symbols of the target's deployable service whose every use is in the removed region, by a reachability computation over the requiring edges with a whole-word mention scan of every file keeping anything else alive — and `tests (n)`; `--json` gives the same. `rb table-deps` rolls the table's accessors up to entry points per service (operations, `direct` or `indirect via`, endpoints, other entry kinds, best certainty) and lists the services that reach the table only through another service's API (`Through APIs`, up to `--hops`, default 4).
+
+The Service Card adds `Packages` (version and where it came from: `[lockfile]`, `[literal]`, `[property]`, `[go_mod]`, `[unresolved]`, `(scip)`), `Database tables`, `Dependencies` and `Depended on by` (other services `via calls`, `via http` or `via package`, derived from stored edges), `Shares tables with` (coupling, kept apart from dependencies) and a `Call graph` summary with entry points by kind:
+
+```
+├─ Dependencies (1 service, 3 packages)
+│    notification (services/notification)  via http  [synthetic]  POST /internal/mfa/email
+│    packages: 3
+├─ Depended on by (1)
+│    @acme/web (apps/web)  via http  [heuristic]  POST /api/v1/login
+├─ Shares tables with (1)
+│    github.com/acme/billing (services/billing)  public.users
+└─ Call graph (edges within the service)
+     13 symbols · CALLS 2, IMPLEMENTS 0, INJECTS 2, REFERENCES 0
+     certainty: heuristic 100.0%
+     entry points: endpoint 2, main 1
+```
 
 ### SCIP indexers
 
@@ -118,10 +153,10 @@ Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e
 | `crates/rb-git` | commit → manifest (gitoxide), CODEOWNERS, glob matcher, boundary detection |
 | `crates/rb-syntax` | Tree-sitter extraction (definitions, references, SQL candidates) and heuristic symbol keys |
 | `crates/rb-sql` | SQL statements → tables and operations (pg_query parse-tree walk) |
-| `crates/rb-frameworks` | ORM packs (JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django); route and HTTP-client packs, endpoint normalisation, URL constant folding |
+| `crates/rb-frameworks` | ORM packs (JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django); route and HTTP-client packs, endpoint normalisation, URL constant folding; Spring DI facts (beans, injection points, scan roots) |
 | `crates/rb-scip` | SCIP: project detection, container jobs (fetch + offline index), index cache key, `index.scip` decoding, symbol parsing |
-| `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → SCIP jobs (cached) → join → endpoints and HTTP stitching → snapshot graph + diagnostics |
-| `crates/rb-store` | migrations, snapshot publish/retention, evidence, AGE projection, read-only Cypher, find/service queries, `callers`/`impact`/`path` walks |
+| `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → manifest packages → SCIP jobs (cached) → join → endpoints and HTTP stitching → DI resolution, RTA, entry kinds and orphan eligibility → snapshot graph + diagnostics |
+| `crates/rb-store` | migrations, snapshot publish/retention, evidence, AGE projection, read-only Cypher, find/service queries and the card's derived sections, `callers`/`impact`/`path` walks with precision and orphans, Q3's roll-up |
 | `crates/rb-cli` | the `rb` binary |
 | `docker/scip-java/` | the slim scip-java image |
 | `migrations/` | SQL schema, embedded into the binary |

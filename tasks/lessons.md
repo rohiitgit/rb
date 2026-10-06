@@ -212,3 +212,15 @@
 ## 2026-10-06: state the soundness bar before adversarial review starts, and close on verification
 - **Mistake:** M4a's carrier soundness had no stated bar until amendment 16 ("no false `synthetic` from any form a repository-wide name-token scan can see"). Evaluator passes 3–7 each found new reconfiguration forms, 16 blockers in all, because "never a false `synthetic`" admits an unbounded supply of constructed code, and each fix invited the next probe. The milestone converged only once the bar was named, the residue was listed, and amendment 17 made the closing pass verification-only, with open-ended probing moved to M5's adversarial carrier review.
 - **Rule:** when a guarantee is adversarial ("never false X"), write its bar in the contract before the first evaluator pass: which forms are in scope and which residue is out by construction. Then decide up front how the milestone closes: a verification-only re-check of the listed findings, with new attack forms recorded for a named hardening item and not for the verdict.
+
+## 2026-10-06: a fixture plan is code; check it against the language before the fixture phase
+- **Mistake (caught at the first edit):** the M4b fixture plan put `public interface PasswordHasher` in `Hashing.java` and `public interface Notifier` (implemented from another package) in `Notifiers.java`; javac rejects a public top-level type outside its own file, so the SCIP fixture would have failed its build.
+- **Rule:** when a contract specifies fixture files, read each against the language's file and visibility rules (and the indexer that must compile it) before writing them; record the deviation as an amendment, not as a silent rename.
+
+## 2026-10-06: a match by simple name needs every part of the written name to agree
+- **Mistake:** amendment 8 matched an external injected type to a repository `@Bean` method by simple name, so `ChatClient.Builder` resolved to a `WebClient.Builder` factory on a public repository: a false `heuristic` edge no fixture showed (the fixtures have no nested external types).
+- **Rule:** whenever a rule compares type names as written, compare as much of the name as both sides wrote (a dot-separated suffix), test nested types with the same simple name, and sample the public repositories' edges of that origin before closing.
+
+## 2026-10-06: a mutation log that de-duplicates lines across tests can hide a bite
+- **Mistake (caught before recording):** the e2e harness printed each failing guard line once per mutant, so `INJECTS * -> * [synthetic]` failing in two fixtures appeared once; it looked as if only one fixture's guard had bitten.
+- **Rule:** when a harness summarises failures, key the de-duplication by test (or fixture) and line, and confirm a guard shared by several fixtures from the raw log before writing which ones bit.
