@@ -1964,6 +1964,165 @@ fn flat_lists_page_by_limit_and_offset() {
     assert_eq!(err, "", "the whole list fits one page");
 }
 
+/// A running `rb serve` on an ephemeral loopback port; stopped with SIGINT when dropped (and
+/// killed if it does not stop), so a failed assertion leaves no server behind.
+struct Served {
+    child: std::process::Child,
+    addr: String,
+}
+
+impl Served {
+    fn start(url: &str, extra: &[&str]) -> Served {
+        use std::io::BufRead;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rb"))
+            .args([&["serve", "--bind", "127.0.0.1:0"][..], extra].concat())
+            .env("RB_DATABASE_URL", url)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let addr = line
+            .trim()
+            .strip_prefix("rb serve: listening on http://")
+            .unwrap_or_else(|| panic!("unexpected first line {line:?}"))
+            .to_owned();
+        Served { child, addr }
+    }
+
+    /// One request with `Connection: close`; the status and the body.
+    fn call(&self, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(&self.addr).unwrap();
+        let body = body.unwrap_or("");
+        let ct = if method == "POST" {
+            "Content-Type: application/json\r\n"
+        } else {
+            ""
+        };
+        write!(
+            s,
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n{ct}Content-Length: {}\r\n\r\n{body}",
+            self.addr,
+            body.len()
+        )
+        .unwrap();
+        let mut text = String::new();
+        s.read_to_string(&mut text).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        (status, body.to_owned())
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-INT", &self.child.id().to_string()])
+            .status();
+        for _ in 0..50 {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Contract M5 S13 against the database: `rb serve` answers with the body `rb … --json` prints;
+/// when the live pointer moves between two requests, the second is answered from the new
+/// snapshot; a write through Cypher is refused (read-only); SIGINT stops it cleanly.
+#[test]
+fn serve_answers_from_the_live_snapshot() {
+    let Some(url) = db_url() else { return };
+    let repo = repo_from(&[(
+        "src/a.ts",
+        "export function b(): number { return 1; }\nexport function a(): number { return b(); }\n",
+    )]);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_serve_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    let mut server = Served::start(&url, &[]);
+    let callers = format!("/v1/repos/{name}/callers?target=b");
+    let (status, body) = server.call("GET", &callers, None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, rb(&url, &["callers", "b", "--repo", &name, "--json"]));
+    let first: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // A new commit with a second caller; the pointer moves under the running server.
+    std::fs::write(
+        repo.path().join("src/c.ts"),
+        "import { b } from \"./a\";\nexport function c(): number { return b(); }\n",
+    )
+    .unwrap();
+    for args in [&["add", "-A"][..], &["commit", "-q", "-m", "second"]] {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .env("GIT_AUTHOR_NAME", "rb")
+            .env("GIT_AUTHOR_EMAIL", "rb@example.invalid")
+            .env("GIT_COMMITTER_NAME", "rb")
+            .env("GIT_COMMITTER_EMAIL", "rb@example.invalid")
+            .env("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    let (status, body) = server.call("GET", &callers, None);
+    assert_eq!(status, 200, "{body}");
+    let second: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        second["snapshot"]["id"].as_i64(),
+        Some(live_id(&url, &name))
+    );
+    assert_ne!(second["snapshot"]["id"], first["snapshot"]["id"]);
+    let caller_names = |v: &serde_json::Value| -> Vec<String> {
+        v["result"]["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["display"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(caller_names(&first).len(), 1);
+    assert_eq!(caller_names(&second).len(), 2, "{body}");
+    assert_eq!(body, rb(&url, &["callers", "b", "--repo", &name, "--json"]));
+
+    // Writes are refused: the Cypher transaction is read-only (and runs as `rb_reader`).
+    let (status, body) = server.call(
+        "POST",
+        &format!("/v1/repos/{name}/cypher"),
+        Some(r#"{"query": "CREATE (n:File {key: 'x'}) RETURN n"}"#),
+    );
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body.contains("\"kind\": \"cypher\"") && body.contains("read-only"),
+        "{body}"
+    );
+    let (status, body) = server.call("GET", "/v1/repos", None);
+    assert_eq!(status, 200);
+    assert!(body.contains(&format!("\"name\": \"{name}\"")), "{body}");
+
+    // SIGINT: a clean exit.
+    let _ = Command::new("kill")
+        .args(["-INT", &server.child.id().to_string()])
+        .status();
+    let exit = server.child.wait().unwrap();
+    assert!(exit.success(), "{exit:?}");
+}
+
 /// Contract M3a R9-R11: `rb callers` and `rb impact` goldens on every fixture, including the
 /// must-not-exist cases (a same-named method in an unrelated class).
 #[test]

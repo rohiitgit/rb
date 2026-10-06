@@ -19,6 +19,7 @@ rb-git.workspace = true
 rb-indexer.workspace = true
 rb-model.workspace = true
 rb-scip.workspace = true
+rb-server.workspace = true
 rb-syntax.workspace = true
 rb-store.workspace = true
 serde_json.workspace = true

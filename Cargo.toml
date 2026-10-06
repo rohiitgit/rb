@@ -38,12 +38,18 @@ rb-syntax = { path = "crates/rb-syntax" }
 rb-sql = { path = "crates/rb-sql" }
 rb-frameworks = { path = "crates/rb-frameworks" }
 rb-scip = { path = "crates/rb-scip" }
+rb-server = { path = "crates/rb-server" }
 # SCIP index decoding (design §5.1). `scip` pins `protobuf = "=3.7.2"`; the same pin is needed
 # here to name the `protobuf::Message` trait.
 scip = "0.10"
 protobuf = "=3.7.2"
 # Content-addressed cache keys for SCIP indexes (design §5.2) must be collision-resistant.
 sha2 = "0.10"
+# `rb serve` (contract M5 D1, fork F1): HTTP/1.1 only, minimal features; `tokio` is already in the
+# tree through `postgres`. The crate count and binary size were measured in phase 0 and again in
+# phase 9 (CHANGELOG).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "time", "sync"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

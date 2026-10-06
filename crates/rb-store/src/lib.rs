@@ -529,6 +529,26 @@ impl Store {
         })
     }
 
+    /// A connection whose every transaction is read-only (contract M5 D8, S13, invariant 7: the
+    /// server's pool): `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`, so the database
+    /// refuses a write whatever statement issues it.
+    pub fn connect_read_only(url: &str) -> anyhow::Result<Self> {
+        let mut store = Self::connect(url)?;
+        store
+            .client
+            .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")?;
+        Ok(store)
+    }
+
+    /// This session's `default_transaction_read_only`.
+    pub fn session_read_only(&mut self) -> anyhow::Result<bool> {
+        let value: String = self
+            .client
+            .query_one("SHOW default_transaction_read_only", &[])?
+            .get(0);
+        Ok(value == "on")
+    }
+
     /// Sets how many retired snapshots retention keeps per repository (0 to
     /// [`MAX_KEEP_RETIRED`]; default [`KEEP_RETIRED`]).
     pub fn set_keep_retired(&mut self, keep: i64) -> anyhow::Result<()> {

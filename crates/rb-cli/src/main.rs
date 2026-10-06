@@ -275,6 +275,32 @@ enum Command {
         #[arg(long)]
         precision: Option<String>,
     },
+    /// Serve the REST API (design §11.2) on a loopback address until SIGINT or SIGTERM: the same
+    /// answers as `rb … --json`, read-only, at most `--workers` at once and `--queue` waiting.
+    Serve {
+        /// Loopback address and port (`127.0.0.1:0` picks a free port); any other address is
+        /// refused, since the server has no authentication.
+        #[arg(long, default_value = rb_server::DEFAULT_BIND)]
+        bind: std::net::SocketAddr,
+        /// Requests answered at once, each on its own read-only connection (1-64).
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=64))]
+        workers: u16,
+        /// Requests that may wait for a worker; one more gets `503 busy` (0-1024).
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(0..=1024))]
+        queue: u16,
+        /// Milliseconds a request may take, queue included, before `503 deadline_exceeded`.
+        #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..=3_600_000))]
+        deadline_ms: u64,
+        /// The default Cypher statement timeout in milliseconds (a request may set its own,
+        /// 1-30000).
+        #[arg(
+            long,
+            env = "RB_CYPHER_TIMEOUT_MS",
+            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
+            value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
+        )]
+        cypher_timeout_ms: u64,
+    },
     /// Remove what interrupted or older runs left behind: AGE graphs named `rb_*` that are not a
     /// live snapshot's, and `building` snapshot rows. Never runs implicitly.
     Gc {
@@ -346,6 +372,39 @@ fn main() -> ExitCode {
 }
 
 fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
+    if let Command::Serve {
+        bind,
+        workers,
+        queue,
+        deadline_ms,
+        cypher_timeout_ms,
+    } = cli.command
+    {
+        let config = rb_server::Config {
+            bind,
+            database_url: cli.database_url,
+            workers: usize::from(workers),
+            queue: usize::from(queue),
+            deadline: Duration::from_millis(deadline_ms),
+            settings: rb_api::Settings {
+                cypher_timeout_ms,
+                ..settings()?
+            },
+            hold: match std::env::var("RB_TEST_HOLD_MS") {
+                Ok(ms) => Duration::from_millis(ms.parse().context("RB_TEST_HOLD_MS")?),
+                Err(_) => Duration::ZERO,
+            },
+        };
+        rb_server::serve(
+            config,
+            |addr| {
+                println!("rb serve: listening on http://{addr}");
+                let _ = std::io::stdout().flush();
+            },
+            rb_server::Shutdown::Signal,
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut store = Store::connect(&cli.database_url)?;
     match cli.command {
         Command::Migrate => {
@@ -582,6 +641,7 @@ fn asked(command: Command) -> Option<Asked> {
         }
         Command::Migrate
         | Command::Index(_)
+        | Command::Serve { .. }
         | Command::Dump { .. }
         | Command::Gc { .. }
         | Command::Cache { .. } => return None,
@@ -592,12 +652,7 @@ fn asked(command: Command) -> Option<Asked> {
 /// code the server uses, and prints it; a refused request prints its message and exits with
 /// D5's code.
 fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Result<ExitCode> {
-    let settings = match std::env::var(rb_api::Settings::TEST_CAPS_VAR) {
-        Ok(spec) => rb_api::Settings::default()
-            .with_test_caps(&spec)
-            .map_err(anyhow::Error::msg)?,
-        Err(_) => rb_api::Settings::default(),
-    };
+    let settings = settings()?;
     let answered = rb_api::parse(endpoint, repo.as_deref(), &params, &settings)
         .and_then(|req| rb_api::run(store, &mut rb_api::LoadEach, &req, &settings));
     match answered {
@@ -622,6 +677,16 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
             }
             Ok(ExitCode::from(e.kind.exit_code()))
         }
+    }
+}
+
+/// The request layer's settings: D6's caps, lowered by `RB_TEST_CAPS` in tests (contract M5 S14).
+fn settings() -> anyhow::Result<rb_api::Settings> {
+    match std::env::var(rb_api::Settings::TEST_CAPS_VAR) {
+        Ok(spec) => rb_api::Settings::default()
+            .with_test_caps(&spec)
+            .map_err(anyhow::Error::msg),
+        Err(_) => Ok(rb_api::Settings::default()),
     }
 }
 

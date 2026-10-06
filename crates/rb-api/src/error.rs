@@ -29,10 +29,16 @@ pub enum ErrorKind {
     DeadlineExceeded,
     /// Anything else (a broken connection, corrupt rows).
     Internal,
+    /// Server only: the `Host` header is not the server's loopback address (DNS rebinding).
+    MisdirectedRequest,
+    /// Server only: a method the endpoint does not take (`OPTIONS` included: no CORS).
+    MethodNotAllowed,
+    /// Server only: a `POST` body that is not `application/json`.
+    UnsupportedMediaType,
 }
 
 impl ErrorKind {
-    pub const ALL: [ErrorKind; 10] = [
+    pub const ALL: [ErrorKind; 13] = [
         ErrorKind::InvalidParam,
         ErrorKind::NotFound,
         ErrorKind::Ambiguous,
@@ -43,6 +49,9 @@ impl ErrorKind {
         ErrorKind::Busy,
         ErrorKind::DeadlineExceeded,
         ErrorKind::Internal,
+        ErrorKind::MisdirectedRequest,
+        ErrorKind::MethodNotAllowed,
+        ErrorKind::UnsupportedMediaType,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -57,17 +66,26 @@ impl ErrorKind {
             ErrorKind::Busy => "busy",
             ErrorKind::DeadlineExceeded => "deadline_exceeded",
             ErrorKind::Internal => "internal",
+            ErrorKind::MisdirectedRequest => "misdirected_request",
+            ErrorKind::MethodNotAllowed => "method_not_allowed",
+            ErrorKind::UnsupportedMediaType => "unsupported_media_type",
         }
     }
 
-    /// The CLI's exit code (D5). `busy` and `deadline_exceeded` only occur in the server.
+    /// The CLI's exit code (D5). `busy`, `deadline_exceeded` and the three transport kinds only
+    /// occur in the server.
     pub fn exit_code(self) -> u8 {
         match self {
             ErrorKind::InvalidParam => 2,
             ErrorKind::NotFound | ErrorKind::NoLiveSnapshot | ErrorKind::SnapshotNotRetained => 3,
             ErrorKind::Ambiguous => 4,
             ErrorKind::Cypher | ErrorKind::CypherTimeout => 5,
-            ErrorKind::Busy | ErrorKind::DeadlineExceeded | ErrorKind::Internal => 1,
+            ErrorKind::Busy
+            | ErrorKind::DeadlineExceeded
+            | ErrorKind::Internal
+            | ErrorKind::MisdirectedRequest
+            | ErrorKind::MethodNotAllowed
+            | ErrorKind::UnsupportedMediaType => 1,
         }
     }
 
@@ -81,6 +99,9 @@ impl ErrorKind {
             ErrorKind::Cypher | ErrorKind::CypherTimeout => 422,
             ErrorKind::Busy | ErrorKind::DeadlineExceeded => 503,
             ErrorKind::Internal => 500,
+            ErrorKind::MisdirectedRequest => 421,
+            ErrorKind::MethodNotAllowed => 405,
+            ErrorKind::UnsupportedMediaType => 415,
         }
     }
 }
@@ -229,6 +250,9 @@ mod tests {
                 ("busy", 1, 503),
                 ("deadline_exceeded", 1, 503),
                 ("internal", 1, 500),
+                ("misdirected_request", 1, 421),
+                ("method_not_allowed", 1, 405),
+                ("unsupported_media_type", 1, 415),
             ]
         );
     }

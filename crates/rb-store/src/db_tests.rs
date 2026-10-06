@@ -1001,3 +1001,27 @@ fn find_pages_concatenate_to_the_whole_list() {
         .unwrap();
     assert_eq!(kinds.total, 23);
 }
+
+/// Contract M5 S13, invariant 7: a read-only session refuses writes in the database and reads as
+/// usual; a plain session is not read-only.
+#[test]
+fn read_only_sessions_refuse_writes() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("readonly");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut plain = Store::connect(&db.url).unwrap();
+    assert!(!plain.session_read_only().unwrap());
+    let mut ro = Store::connect_read_only(&db.url).unwrap();
+    assert!(ro.session_read_only().unwrap());
+    let err = ro.ensure_repo(&repo, None).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("read-only transaction"),
+        "{err:#}"
+    );
+    assert!(ro.repo_names().unwrap().iter().all(|r| r != &repo));
+    // Reads, including a read transaction, work as before.
+    ro.read_tx(|s| s.repo_names()).unwrap();
+}
