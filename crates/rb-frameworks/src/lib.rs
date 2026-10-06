@@ -5,6 +5,9 @@
 //! Packs never touch the graph; the indexer resolves entity and model names across files and
 //! turns the results into `MAPS_TO` and `QUERIES` edges.
 
+pub mod endpoint;
+pub mod routes;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use rb_sql::Op;
