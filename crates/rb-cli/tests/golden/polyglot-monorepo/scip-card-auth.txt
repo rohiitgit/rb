@@ -12,7 +12,8 @@ auth-service  (path: services/auth, deployable)
 │    maven/org.springframework.cloud/spring-cloud-openfeign-core@4.1.3
 │    maven/org.springframework/spring-jdbc@6.1.13
 │    maven/org.springframework/spring-web@6.1.13
-├─ APIs (1)
+├─ APIs (2)
+│    GET /api/v1/login  → com/acme/auth/AuthController#loginPage().  [exact]
 │    POST /api/v1/login  → com/acme/auth/AuthController#login().  [exact]
 ├─ Calls APIs of (1)
 │    notification  (services/notification)

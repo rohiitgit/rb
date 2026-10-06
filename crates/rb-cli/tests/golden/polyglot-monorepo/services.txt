@@ -6,4 +6,4 @@ services/auth	auth-service	service	6 files
 services/billing	github.com/acme/billing	library	3 files
 services/billing/cmd/billing	billing	service	1 file
 services/broken	broken	library	2 files
-services/notification	notification	service	4 files
+services/notification	notification	service	5 files
