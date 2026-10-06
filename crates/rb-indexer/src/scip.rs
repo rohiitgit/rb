@@ -620,6 +620,45 @@ pub(crate) fn join(
     out
 }
 
+/// The project definition an accepted document's reference occurrence at `span` names, when the
+/// token there is that definition's name (contract M4a S8): its SCIP symbol, which is its graph
+/// key. `None` for a file the join did not accept, a local or external symbol, a symbol whose
+/// definition has no node, or more than one such symbol at the span.
+pub(crate) fn definition_at(
+    index: &ScipIndex,
+    root: &str,
+    joined: &Joined,
+    path: &str,
+    span: Span,
+    token: &str,
+) -> Option<String> {
+    if !joined.documented.contains(path) {
+        return None;
+    }
+    let doc_path = if root.is_empty() {
+        path
+    } else {
+        path.strip_prefix(root)?.strip_prefix('/')?
+    };
+    let doc = index.documents.iter().find(|d| d.path == doc_path)?;
+    let nodes: BTreeSet<&str> = joined
+        .keys
+        .values()
+        .flat_map(|r| r.values().map(String::as_str))
+        .collect();
+    let found: BTreeSet<&str> = doc
+        .occurrences
+        .iter()
+        .filter(|o| o.span == span && !o.is_definition())
+        .map(|o| o.symbol.as_str())
+        .filter(|s| nodes.contains(s) && rb_scip::last_descriptor_name(s).as_deref() == Some(token))
+        .collect();
+    match found.into_iter().collect::<Vec<_>>().as_slice() {
+        [one] => Some((*one).to_owned()),
+        _ => None,
+    }
+}
+
 /// One document's Tree-sitter definitions anchored to the index's definition occurrences: the
 /// name's range is a definition occurrence of a global symbol. The matched symbols are the
 /// only targets an edge may have, since only they get `Symbol` nodes. A definition occurrence
@@ -1188,6 +1227,62 @@ mod tests {
     use rb_syntax::Language;
 
     use super::*;
+
+    /// Contract M4a S8: a handler name in an accepted document resolves through the index's
+    /// reference occurrence at its span, and only to a matched definition named like the token.
+    #[test]
+    fn a_handler_resolves_through_the_occurrence_at_its_span() {
+        let login = "scip-typescript npm p 1.0.0 src/`auth.ts`/login().";
+        let other = "scip-typescript npm p 1.0.0 src/`auth.ts`/other().";
+        let occ = |span: Span, symbol: &str, roles: i32| Occurrence {
+            span,
+            symbol: symbol.into(),
+            roles,
+            enclosing: None,
+        };
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "src/app.ts".into(),
+                occurrences: vec![
+                    occ([3, 26, 3, 31], login, 0),
+                    occ([4, 20, 4, 25], other, 0),
+                    occ([5, 20, 5, 25], "local 1", 0),
+                    occ(
+                        [6, 20, 6, 25],
+                        "scip-typescript npm express 4.0.0 `index.d.ts`/json().",
+                        0,
+                    ),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut joined = Joined::default();
+        joined.documented.insert("svc/src/app.ts".into());
+        joined.keys.insert(
+            "svc/src/auth.ts".into(),
+            BTreeMap::from([(0, login.to_owned()), (1, other.to_owned())]),
+        );
+        let at = |span, token| definition_at(&index, "svc", &joined, "svc/src/app.ts", span, token);
+        assert_eq!(at([3, 26, 3, 31], "login").as_deref(), Some(login));
+        // The token must be the definition's name; locals and externals give nothing.
+        assert_eq!(at([4, 20, 4, 25], "login"), None);
+        assert_eq!(at([5, 20, 5, 25], "login"), None);
+        assert_eq!(at([6, 20, 6, 25], "json"), None);
+        assert_eq!(at([9, 0, 9, 5], "login"), None);
+        // A file the join did not accept is never exact.
+        assert_eq!(
+            definition_at(
+                &index,
+                "svc",
+                &joined,
+                "svc/src/other.ts",
+                [3, 26, 3, 31],
+                "login"
+            ),
+            None
+        );
+    }
 
     const JAVA: &str = "package p;\nclass Animal { void sound() {} }\nclass Dog extends Animal {\n  void sound() { helper(); ext(); local(); }\n  void helper() {}\n}\n";
 

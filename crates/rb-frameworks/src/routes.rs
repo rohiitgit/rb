@@ -5,7 +5,8 @@
 //! A framework is recognised only through import facts (or a qualified name), never by a bare
 //! short name (contract invariant 6).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 
 use rb_syntax::{
     Arg, Binding, CallChain, Decoration, DecorationArg, DefKind, FileFacts, Init, Language, Span,
@@ -126,6 +127,7 @@ pub struct FileRoutes {
 
 /// Every route fact of one file.
 pub fn routes(language: Language, facts: &FileFacts) -> FileRoutes {
+    let facts = &FileScope::new(facts);
     let mut out = FileRoutes::default();
     match language {
         Language::Java => spring(facts, &mut out),
@@ -150,17 +152,95 @@ fn before(a: Span, b: Span) -> bool {
     (a[0], a[1]) <= (b[0], b[1])
 }
 
-/// The non-member binding of `name` in effect at `at`: the innermost one whose extent holds it.
-pub fn binding_at<'f>(facts: &'f FileFacts, name: &str, at: Span) -> Option<&'f Binding> {
-    facts
-        .bindings
-        .iter()
-        .filter(|b| !b.member && b.name == name)
-        .filter(|b| {
-            let v = b.visible;
-            before([v[0], v[1], 0, 0], at) && before(at, [v[2], v[3], 0, 0])
-        })
-        .max_by_key(|b| (b.visible[0], b.visible[1]))
+/// One file's facts with the lookups the packs and the folder make, indexed once, so a lookup
+/// costs the number of same-named bindings rather than the size of the file (a scan per call
+/// made route and client extraction quadratic in the file; `composition_grows_linearly`).
+/// It dereferences to the facts.
+pub struct FileScope<'f> {
+    pub facts: &'f FileFacts,
+    /// Non-member bindings by name.
+    locals_by_name: HashMap<&'f str, Vec<usize>>,
+    /// Member bindings by name.
+    members_by_name: HashMap<&'f str, Vec<usize>>,
+    /// The chain recorded at each span (the first, if several share one).
+    chain_by_span: HashMap<Span, usize>,
+    /// Definitions by parent, in source order.
+    children_of: HashMap<usize, Vec<usize>>,
+}
+
+impl<'f> FileScope<'f> {
+    pub fn new(facts: &'f FileFacts) -> Self {
+        let mut locals: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut members: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, b) in facts.bindings.iter().enumerate() {
+            let table = if b.member { &mut members } else { &mut locals };
+            table.entry(b.name.as_str()).or_default().push(i);
+        }
+        let mut chain_by_span = HashMap::new();
+        for (i, c) in facts.chains.iter().enumerate() {
+            chain_by_span.entry(c.span).or_insert(i);
+        }
+        let mut children_of: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, d) in facts.definitions.iter().enumerate() {
+            if let Some(p) = d.parent {
+                children_of.entry(p).or_default().push(i);
+            }
+        }
+        FileScope {
+            facts,
+            locals_by_name: locals,
+            members_by_name: members,
+            chain_by_span,
+            children_of,
+        }
+    }
+
+    /// The index of the non-member binding of `name` in effect at `at`: the innermost one
+    /// whose extent holds it.
+    pub fn binding_index_at(&self, name: &str, at: Span) -> Option<usize> {
+        self.locals_by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let v = self.facts.bindings[i].visible;
+                before([v[0], v[1], 0, 0], at) && before(at, [v[2], v[3], 0, 0])
+            })
+            .max_by_key(|&i| {
+                let v = self.facts.bindings[i].visible;
+                (v[0], v[1])
+            })
+    }
+
+    /// The non-member binding of `name` in effect at `at`.
+    pub fn binding_at(&self, name: &str, at: Span) -> Option<&'f Binding> {
+        self.binding_index_at(name, at)
+            .map(|i| &self.facts.bindings[i])
+    }
+
+    /// The member bindings named `name`, in source order.
+    pub fn members(&self, name: &str) -> &[usize] {
+        self.members_by_name.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// The definitions directly inside `parent`, in source order.
+    pub fn children(&self, parent: usize) -> &[usize] {
+        self.children_of.get(&parent).map_or(&[], Vec::as_slice)
+    }
+
+    /// The chain recorded at `span`.
+    pub fn chain_at(&self, span: Span) -> Option<&'f CallChain> {
+        self.chain_by_span
+            .get(&span)
+            .map(|&i| &self.facts.chains[i])
+    }
+}
+
+impl Deref for FileScope<'_> {
+    type Target = FileFacts;
+    fn deref(&self) -> &FileFacts {
+        self.facts
+    }
 }
 
 /// The chain a binding is initialised with.
@@ -186,7 +266,7 @@ pub(crate) fn literal(arg: &Arg) -> Option<String> {
 /// The handler among a registration's arguments: the last function-like one (an inline
 /// function or a name), looking through one wrapper call (`asyncHandler(fn)`,
 /// `http.HandlerFunc(f)`).
-fn handler(facts: &FileFacts, args: &[Arg]) -> Handler {
+fn handler(facts: &FileScope<'_>, args: &[Arg]) -> Handler {
     let Some(last) = args.last() else {
         return Handler::Unknown([0; 4]);
     };
@@ -199,9 +279,8 @@ fn handler(facts: &FileFacts, args: &[Arg]) -> Handler {
         other => {
             let span = other.span();
             let wrapped = facts
-                .chains
-                .iter()
-                .find(|c| c.span == span && c.links.len() == 1)
+                .chain_at(span)
+                .filter(|c| c.links.len() == 1)
                 .and_then(|c| c.links[0].args.last());
             match wrapped {
                 Some(Arg::Function { span }) => Handler::Inline(*span),
@@ -318,11 +397,14 @@ fn mapping_methods(d: &Decoration) -> Vec<String> {
     methods
 }
 
-fn spring(facts: &FileFacts, out: &mut FileRoutes) {
+fn spring(facts: &FileScope<'_>, out: &mut FileRoutes) {
     let defs = &facts.definitions;
     for (class, def) in defs.iter().enumerate() {
-        let methods: Vec<usize> = (0..defs.len())
-            .filter(|&m| defs[m].parent == Some(class) && defs[m].kind == DefKind::Method)
+        let methods: Vec<usize> = facts
+            .children(class)
+            .iter()
+            .copied()
+            .filter(|&m| defs[m].kind == DefKind::Method)
             .collect();
         match def.kind {
             DefKind::Interface => {
@@ -469,18 +551,18 @@ fn router_kind(names: &ExpressNames, chain: &CallChain) -> Option<RouterKind> {
     }
 }
 
-fn express(facts: &FileFacts, out: &mut FileRoutes) {
+fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
     let names = express_names(facts);
     if names.module.is_empty() && names.router.is_empty() {
         return;
     }
-    let mut binding_router: Vec<(usize, usize)> = Vec::new(); // (binding index, router index)
+    let mut binding_router: HashMap<usize, usize> = HashMap::new(); // binding → router
     for (bi, b) in facts.bindings.iter().enumerate() {
         if b.member {
             continue;
         }
         if let Some(kind) = init_chain(facts, b).and_then(|c| router_kind(&names, c)) {
-            binding_router.push((bi, out.routers.len()));
+            binding_router.insert(bi, out.routers.len());
             out.routers.push(RouterDecl {
                 name: b.name.clone(),
                 kind,
@@ -494,12 +576,8 @@ fn express(facts: &FileFacts, out: &mut FileRoutes) {
         if !router_names.contains(name) {
             return None;
         }
-        let b = binding_at(facts, name, at)?;
-        let bi = facts.bindings.iter().position(|x| std::ptr::eq(x, b))?;
-        binding_router
-            .iter()
-            .find(|(i, _)| *i == bi)
-            .map(|(_, r)| *r)
+        let bi = facts.binding_index_at(name, at)?;
+        binding_router.get(&bi).copied()
     };
     for chain in &facts.chains {
         let Some(root) = chain.root.as_deref() else {
@@ -590,13 +668,13 @@ fn go_import_name(facts: &FileFacts, module: &str) -> Option<String> {
 /// The prefix a gin receiver stands for: `Some(Some(p))` known, `Some(None)` a gin group whose
 /// prefix is unknown (a parameter), `None` not gin.
 fn gin_prefix(
-    facts: &FileFacts,
+    facts: &FileScope<'_>,
     gin: &str,
     name: &str,
     at: Span,
     seen: &mut HashSet<Span>,
 ) -> Option<Option<String>> {
-    let b = binding_at(facts, name, at)?;
+    let b = facts.binding_at(name, at)?;
     if seen.len() >= MAX_GROUP_DEPTH || !seen.insert(b.span) {
         return Some(None);
     }
@@ -620,7 +698,7 @@ fn gin_prefix(
 /// The prefix of a gin chain's receiver composed with its first `upto` links, which must all be
 /// `Group(prefix)` (or `Default()`/`New()` on the gin package).
 fn gin_chain_prefix(
-    facts: &FileFacts,
+    facts: &FileScope<'_>,
     gin: &str,
     chain: &CallChain,
     upto: usize,
@@ -649,7 +727,7 @@ fn gin_chain_prefix(
     Some(prefix)
 }
 
-fn gin(facts: &FileFacts, out: &mut FileRoutes) {
+fn gin(facts: &FileScope<'_>, out: &mut FileRoutes) {
     let Some(gin) = go_import_name(facts, "github.com/gin-gonic/gin") else {
         return;
     };
@@ -706,7 +784,7 @@ pub(crate) fn go_method(arg: &Arg) -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 // Go: net/http (S6)
 
-fn net_http(facts: &FileFacts, out: &mut FileRoutes) {
+fn net_http(facts: &FileScope<'_>, out: &mut FileRoutes) {
     let Some(http) = go_import_name(facts, "net/http") else {
         return;
     };
@@ -721,7 +799,7 @@ fn net_http(facts: &FileFacts, out: &mut FileRoutes) {
             continue;
         };
         let is_mux = root == http
-            || binding_at(facts, root, chain.span).is_some_and(|b| {
+            || facts.binding_at(root, chain.span).is_some_and(|b| {
                 b.type_name == format!("{http}.ServeMux")
                     || init_chain(facts, b).is_some_and(|c| {
                         c.root.as_deref() == Some(http.as_str())
@@ -1053,6 +1131,47 @@ public class AuthController {
         let got = summary(Language::Go, &src);
         assert_eq!(got[0], "GET /deep unknown name h");
         assert_eq!(got[1], "GET /s/s/s/shallow root name h");
+    }
+
+    /// The packs index each file once (`FileScope`): doubling a file of routers, mounts and
+    /// client instances costs at most 2.5 times as much (best of three; a ratio, not a
+    /// wall-clock bound). A scan per lookup made this quadratic.
+    #[test]
+    fn packs_grow_linearly() {
+        let source = |n: usize| {
+            let mut src = String::from(
+                "import express, { Router } from \"express\";\nimport axios from \"axios\";\nconst app = express();\n",
+            );
+            for i in 1..=n {
+                src.push_str(&format!(
+                    "const r{i} = Router();\nconst c{i} = axios.create({{ baseURL: \"http://s{i}\" }});\n"
+                ));
+            }
+            src.push_str("app.use(\"/s\", r1);\n");
+            for i in 1..n {
+                src.push_str(&format!(
+                    "r{i}.use(\"/s\", r{});\nr{i}.get(\"/x\", h);\nc{i}.get(\"/y\");\n",
+                    i + 1
+                ));
+            }
+            src
+        };
+        let time = |n: usize| {
+            let facts = extract(Language::TypeScript, source(n).as_bytes()).unwrap();
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let r = routes(Language::TypeScript, &facts);
+                    let c = crate::clients::clients(Language::TypeScript, &facts);
+                    assert_eq!((r.routes.len(), c.calls.len()), (n - 1, n - 1));
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let (small, large) = (time(2000), time(4000));
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(ratio < 2.5, "{small:?} → {large:?} ({ratio:.2}×)");
     }
 
     #[test]

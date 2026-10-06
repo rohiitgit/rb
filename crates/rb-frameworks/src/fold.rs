@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use rb_syntax::{Binding, DefKind, FileFacts, Init, Language, Span, StrTemplate, TemplatePart};
 
 use crate::endpoint::Piece;
-use crate::routes::binding_at;
+use crate::routes::FileScope;
 
 /// Nested resolutions followed at most.
 pub const MAX_FOLD_DEPTH: usize = 16;
@@ -112,6 +112,8 @@ pub fn is_env(name: &str) -> bool {
 
 struct Folder<'l> {
     lookup: &'l dyn Lookup,
+    /// Each file's lookup indexes, built on first use.
+    scopes: HashMap<usize, FileScope<'l>>,
     on_path: HashSet<(usize, Span)>,
     memo: HashMap<(usize, Span), Folded>,
     steps: usize,
@@ -124,6 +126,7 @@ impl<'l> Folder<'l> {
     fn new(lookup: &'l dyn Lookup) -> Self {
         Folder {
             lookup,
+            scopes: HashMap::new(),
             on_path: HashSet::new(),
             memo: HashMap::new(),
             steps: 0,
@@ -172,11 +175,15 @@ impl<'l> Folder<'l> {
         if is_env(name) {
             return (Folded::hole(), true);
         }
-        let facts = self.lookup.facts(file);
-        let language = self.lookup.language(file);
-        let local = local_binding(facts, language, name, at)
+        let lookup = self.lookup;
+        let language = lookup.language(file);
+        let scope = self
+            .scopes
+            .entry(file)
+            .or_insert_with(|| FileScope::new(lookup.facts(file)));
+        let local = local_binding(scope, language, name, at)
             .map(|b| (file, b))
-            .or_else(|| self.lookup.external(file, name));
+            .or_else(|| lookup.external(file, name));
         match local {
             Some((f, b)) => self.binding(f, b, depth + 1),
             None => (Folded::hole(), true),
@@ -254,16 +261,15 @@ fn relabel(mut f: Folded, at_best: Origin) -> Folded {
 /// (`this.x`, a Java field by its bare name) of an enclosing type, or `Type.CONST` of a type
 /// declared in the file. Returns its index in `facts.bindings`.
 pub(crate) fn local_binding(
-    facts: &FileFacts,
+    facts: &FileScope<'_>,
     language: Language,
     name: &str,
     at: Span,
 ) -> Option<usize> {
-    let index = |b: &Binding| facts.bindings.iter().position(|x| std::ptr::eq(x, b));
     if !name.contains('.')
-        && let Some(b) = binding_at(facts, name, at)
+        && let Some(i) = facts.binding_index_at(name, at)
     {
-        return index(b);
+        return Some(i);
     }
     let (owner, member) = match name.strip_prefix("this.") {
         Some(member) if !member.contains('.') => (None, member),
@@ -276,10 +282,9 @@ pub(crate) fn local_binding(
     let contains =
         |span: Span| (span[0], span[1]) <= (at[0], at[1]) && (at[2], at[3]) <= (span[2], span[3]);
     facts
-        .bindings
+        .members(member)
         .iter()
-        .enumerate()
-        .filter(|(_, b)| b.member && b.name == member)
+        .map(|&i| (i, &facts.bindings[i]))
         .filter(|(_, b)| {
             let Some(scope) = b.scope.map(|s| &facts.definitions[s]) else {
                 return false;

@@ -19,21 +19,18 @@ type Sym<'a> = (&'a str, usize);
 /// Inheritance levels searched for a member; deeper hierarchies stay unresolved.
 const MAX_INHERITANCE_DEPTH: usize = 64;
 
-/// Adds the resolved edges for every file; returns one `unresolved_references` diagnostic per file
-/// that has unresolved call or type references. `keys` holds each file's symbol keys, parallel to
-/// its definitions. Files in `excluded` (those an exact SCIP index covers) get no edges and no
-/// diagnostic, but their definitions still resolve references from other files.
+/// Adds the resolved edges for every file of `index`; returns one `unresolved_references`
+/// diagnostic per file that has unresolved call or type references. Files in `excluded` (those an
+/// exact SCIP index covers) get no edges and no diagnostic, but their definitions still resolve
+/// references from other files.
 pub(crate) fn add_edges(
     b: &mut GraphBuilder,
-    files: &BTreeMap<&str, (Language, &FileFacts)>,
-    go_modules: &BTreeMap<String, String>,
-    keys: &BTreeMap<&str, Vec<String>>,
+    index: &Index<'_>,
     excluded: &BTreeSet<&str>,
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    let index = Index::new(files, go_modules, keys);
     let mut edges = Edges::default();
     let mut diagnostics = Vec::new();
-    for (&path, (language, facts)) in files {
+    for (&path, (language, facts)) in index.files {
         if excluded.contains(path) {
             continue;
         }
@@ -98,7 +95,7 @@ pub(crate) fn add_edges(
                 }
                 continue;
             }
-            edges.record_all(source(r.enclosing), &found, &index, &at);
+            edges.record_all(source(r.enclosing), &found, index, &at);
         }
         if calls + types + external > 0 {
             diagnostics.push(Diagnostic {
@@ -236,7 +233,9 @@ enum Container<'a> {
     Module(Vec<&'a str>),
 }
 
-struct Index<'a> {
+/// The Tier B resolver over a snapshot's files (design §5.4); built once per snapshot and shared
+/// by `CALLS` resolution and the route packs' handler names (contract M4a S8).
+pub(crate) struct Index<'a> {
     files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
     modules: Modules<'a>,
     keys: &'a BTreeMap<&'a str, Vec<String>>,
@@ -351,7 +350,7 @@ fn is_callable(kind: DefKind) -> bool {
 }
 
 impl<'a> Index<'a> {
-    fn new(
+    pub(crate) fn new(
         files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
         go_modules: &'a BTreeMap<String, String>,
         keys: &'a BTreeMap<&'a str, Vec<String>>,
@@ -442,6 +441,34 @@ impl<'a> Index<'a> {
 
     fn language(&self, path: &str) -> Language {
         self.files[path].0
+    }
+
+    /// The keys of the functions a handler name (`login`, `ctrl.login`, `h.Pay`) written at `at`
+    /// in `path` resolves to, as a call of that name and qualifier at that position (contract
+    /// M4a S8): never by bare name across the repository. Sorted, without repeats.
+    pub(crate) fn handler_targets(
+        &self,
+        path: &'a str,
+        scope: Option<usize>,
+        text: &str,
+        at: rb_model::Span,
+    ) -> Vec<String> {
+        let (qualifier, name) = match text.rsplit_once('.') {
+            Some((q, n)) => (Some(q), n),
+            None => (None, text),
+        };
+        dedup(
+            self.call(path, scope, name, qualifier, Some(at))
+                .into_iter()
+                .filter(|(kind, _)| *kind == EdgeKind::Calls)
+                .map(|(_, s)| self.key(s).to_owned())
+                .collect(),
+        )
+    }
+
+    /// The files each import of `path` refers to, parallel to its `FileFacts::imports`.
+    pub(crate) fn import_targets(&self, path: &str) -> &[Vec<&'a str>] {
+        self.imports.get(path).map_or(&[], Vec::as_slice)
     }
 
     fn facts(&self, path: &str) -> &'a FileFacts {
@@ -1164,7 +1191,8 @@ mod tests {
                 .unwrap();
             crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
         }
-        let diagnostics = add_edges(&mut b, &by_path, &go, &keys, &BTreeSet::new()).unwrap();
+        let index = Index::new(&by_path, &go, &keys);
+        let diagnostics = add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
         Built {
             graph: b.finish().unwrap(),
             diagnostics,
@@ -2007,7 +2035,9 @@ func (s *Server) helper() {}
                 crate::syntax::add_symbols(&mut b, "app/many.py", &facts, &keys["app/many.py"])
                     .unwrap();
                 let started = std::time::Instant::now();
-                add_edges(&mut b, &by_path, &BTreeMap::new(), &keys, &BTreeSet::new()).unwrap();
+                let go = BTreeMap::new();
+                let index = Index::new(&by_path, &go, &keys);
+                add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
                 best = best.min(started.elapsed());
                 calls = b
                     .finish()

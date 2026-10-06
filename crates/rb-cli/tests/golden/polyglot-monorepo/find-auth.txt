@@ -4,5 +4,5 @@ symbol	rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthControl
 symbol	rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#AuthController().	AuthController
 file	services/auth/src/main/java/com/acme/auth/AuthController.java	AuthController.java
 file	services/auth/src/main/resources/db/migration/V2__audit.sql	V2__audit.sql
+endpoint	HTTP POST /api/v1/login @services/auth	POST /api/v1/login
 file	services/auth/pom.xml	pom.xml
-file	services/auth/src/main/java/com/acme/auth/UserDao.java	UserDao.java

@@ -6,6 +6,8 @@
 //! Every client is recognised through an import (or a qualified name), never by a bare short
 //! name (contract invariant 6).
 
+use std::collections::{HashMap, HashSet};
+
 use rb_syntax::{
     Arg, Binding, CallChain, Decoration, DefKind, FileFacts, Init, Language, Span, StrTemplate,
     TemplatePart,
@@ -13,7 +15,7 @@ use rb_syntax::{
 
 use crate::endpoint::norm_method;
 use crate::fold::local_binding;
-use crate::routes::{binding_at, go_method, is_annotation, literal};
+use crate::routes::{FileScope, go_method, is_annotation, literal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClientKind {
@@ -112,6 +114,7 @@ pub struct FileClients {
 
 /// Every client call site of one file, in source order per pack.
 pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
+    let facts = &FileScope::new(facts);
     let mut out = FileClients::default();
     match language {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
@@ -147,17 +150,16 @@ fn method_entry(config: Option<&Arg>) -> Option<Option<String>> {
 // ---------------------------------------------------------------------------------------------
 // fetch (S9)
 
-fn fetch(facts: &FileFacts, out: &mut FileClients) {
-    let shadowed = |at: Span| {
-        binding_at(facts, "fetch", at).is_some()
-            || facts.imports.iter().any(|i| {
-                i.alias.as_deref() == Some("fetch") || i.names.iter().any(|n| n.local == "fetch")
-            })
-            || facts
-                .definitions
-                .iter()
-                .any(|d| d.name == "fetch" && d.parent.is_none())
-    };
+fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
+    // An import or a top-level definition named `fetch` shadows it everywhere in the file.
+    let file_wide =
+        facts.imports.iter().any(|i| {
+            i.alias.as_deref() == Some("fetch") || i.names.iter().any(|n| n.local == "fetch")
+        }) || facts
+            .definitions
+            .iter()
+            .any(|d| d.name == "fetch" && d.parent.is_none());
+    let shadowed = |at: Span| file_wide || facts.binding_at("fetch", at).is_some();
     for chain in &facts.chains {
         let global = match chain.root.as_deref() {
             None => true,
@@ -233,11 +235,11 @@ fn init_chain<'f>(facts: &'f FileFacts, b: &Binding) -> Option<&'f CallChain> {
     }
 }
 
-fn axios(facts: &FileFacts, out: &mut FileClients) {
+fn axios(facts: &FileScope<'_>, out: &mut FileClients) {
     let names = axios_names(facts);
     // Instances: `const api = axios.create({ baseURL })`.
-    let mut instances: Vec<(&Binding, Option<UrlValue>)> = Vec::new();
-    for b in facts.bindings.iter().filter(|b| !b.member) {
+    let mut instances: HashMap<usize, Option<UrlValue>> = HashMap::new();
+    for (bi, b) in facts.bindings.iter().enumerate().filter(|(_, b)| !b.member) {
         let Some(c) = init_chain(facts, b) else {
             continue;
         };
@@ -251,16 +253,15 @@ fn axios(facts: &FileFacts, out: &mut FileClients) {
                 base: base.clone(),
                 top_level: b.scope.is_none(),
             });
-            instances.push((b, base));
+            instances.insert(bi, base);
         }
     }
-    let imported = |name: &str| {
-        facts
-            .imports
-            .iter()
-            .filter(|i| i.module != "axios")
-            .any(|i| i.names.iter().any(|n| n.local == name))
-    };
+    let imported: HashSet<&str> = facts
+        .imports
+        .iter()
+        .filter(|i| i.module != "axios")
+        .flat_map(|i| i.names.iter().map(|n| n.local.as_str()))
+        .collect();
     for chain in &facts.chains {
         let Some(first) = chain.links.first() else {
             continue;
@@ -279,13 +280,12 @@ fn axios(facts: &FileFacts, out: &mut FileClients) {
             continue;
         }
         let root = chain.root.as_deref().unwrap_or_default();
+        let bound = facts.binding_index_at(root, chain.span);
         let (base, instance) = if names.iter().any(|n| n == root) {
             (None, None)
-        } else if let Some((_, base)) = binding_at(facts, root, chain.span)
-            .and_then(|b| instances.iter().find(|(i, _)| std::ptr::eq(*i, b)))
-        {
+        } else if let Some(base) = bound.and_then(|bi| instances.get(&bi)) {
             (base.clone(), None)
-        } else if binding_at(facts, root, chain.span).is_none() && imported(root) {
+        } else if bound.is_none() && imported.contains(root) {
             (None, Some(root.to_owned()))
         } else {
             continue;
@@ -350,8 +350,8 @@ fn java_type_is(facts: &FileFacts, type_name: &str, package: &str, simple: &str)
 }
 
 /// The binding a Java receiver (`x`, `this.x`) names at `at`.
-fn java_receiver<'f>(facts: &'f FileFacts, root: &str, at: Span) -> Option<&'f Binding> {
-    local_binding(facts, Language::Java, root, at).map(|i| &facts.bindings[i])
+fn java_receiver<'f>(facts: &FileScope<'f>, root: &str, at: Span) -> Option<&'f Binding> {
+    local_binding(facts, Language::Java, root, at).map(|i| &facts.facts.bindings[i])
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -368,7 +368,7 @@ const REST_TEMPLATE_METHODS: &[(&str, &str)] = &[
     ("patchForObject", "PATCH"),
 ];
 
-fn rest_template(facts: &FileFacts, out: &mut FileClients) {
+fn rest_template(facts: &FileScope<'_>, out: &mut FileClients) {
     for chain in &facts.chains {
         let (Some(root), Some(first)) = (chain.root.as_deref(), chain.links.first()) else {
             continue;
@@ -442,7 +442,7 @@ fn fluent_base(chain: &CallChain, upto: usize) -> Option<UrlValue> {
         .map(|l| UrlValue::of(l.args.first()))
 }
 
-fn web_client(facts: &FileFacts, out: &mut FileClients) {
+fn web_client(facts: &FileScope<'_>, out: &mut FileClients) {
     for chain in &facts.chains {
         let Some(root) = chain.root.as_deref() else {
             continue;
@@ -529,7 +529,7 @@ fn keyed<'d>(d: &'d Decoration, keys: &[&str]) -> Option<&'d rb_syntax::Decorati
         .find_map(|k| d.args.iter().find(|a| a.key.as_deref() == Some(k)))
 }
 
-fn feign(facts: &FileFacts, out: &mut FileClients) {
+fn feign(facts: &FileScope<'_>, out: &mut FileClients) {
     let defs = &facts.definitions;
     for (iface, def) in defs.iter().enumerate() {
         if def.kind != DefKind::Interface {
@@ -568,8 +568,9 @@ fn feign(facts: &FileFacts, out: &mut FileClients) {
             .iter()
             .find(|d| is_annotation(facts, d, SPRING_WEB, "RequestMapping"))
             .map(single_path);
-        for (m, method_def) in defs.iter().enumerate() {
-            if method_def.parent != Some(iface) || method_def.kind != DefKind::Method {
+        for &m in facts.children(iface) {
+            let method_def = &defs[m];
+            if method_def.kind != DefKind::Method {
                 continue;
             }
             for d in &method_def.decorations {
@@ -624,7 +625,7 @@ fn feign(facts: &FileFacts, out: &mut FileClients) {
 // ---------------------------------------------------------------------------------------------
 // Go net/http (S11)
 
-fn go_http(facts: &FileFacts, out: &mut FileClients) {
+fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
     let import_name = |module: &str| {
         facts
             .imports
@@ -647,7 +648,8 @@ fn go_http(facts: &FileFacts, out: &mut FileClients) {
         let on_package = root == http;
         let on_client = !on_package
             && (root == format!("{http}.DefaultClient")
-                || binding_at(facts, root, chain.span)
+                || facts
+                    .binding_at(root, chain.span)
                     .is_some_and(|b| b.type_name == format!("{http}.Client")));
         let (method, url) = match link.name.as_str() {
             "Get" | "Head" | "Post" | "PostForm" if on_package || on_client => {
@@ -687,8 +689,8 @@ fn go_http(facts: &FileFacts, out: &mut FileClients) {
 
 /// `fmt.Sprintf(lit, args…)` at `span` as a template whose verbs are holes naming their
 /// arguments (`%s %d %v %q` and the rest; `%%` is a literal `%`).
-fn sprintf(facts: &FileFacts, fmt: &str, span: Span) -> Option<StrTemplate> {
-    let chain = facts.chains.iter().find(|c| c.span == span)?;
+fn sprintf(facts: &FileScope<'_>, fmt: &str, span: Span) -> Option<StrTemplate> {
+    let chain = facts.chain_at(span)?;
     let [link] = chain.links.as_slice() else {
         return None;
     };

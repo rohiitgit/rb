@@ -10,6 +10,7 @@ mod modules;
 mod orm;
 mod projects;
 mod resolve;
+mod routes;
 mod scip;
 mod sql;
 mod syntax;
@@ -40,7 +41,8 @@ use serde_json::{Value, json};
 /// constructors as definitions (amendment 75), `m3b-scip-7` the `structural_escape` reason and
 /// supertypes confirmed by the index (amendments 77 and 78), `m3b-scip-8` an escaped backslash
 /// as a structural escape (amendment 80).
-pub const PIPELINE: &str = "m3b-scip-8";
+/// `m4a-http-1` adds endpoints, `EXPOSES`, `HANDLED_BY` and route diagnostics (contract M4a).
+pub const PIPELINE: &str = "m4a-http-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -139,12 +141,19 @@ pub fn index_commit(
         scip,
         scip_cache,
     )?;
+    let config = manifest
+        .files
+        .iter()
+        .filter(|f| is_spring_config(&f.path))
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<_>>()?;
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
         prisma: texts("prisma")?,
         go_modules,
         scip: scip_projects,
+        config,
     };
 
     let (graph, assembly_diagnostics) =
@@ -210,6 +219,19 @@ pub struct Content<'a> {
     pub go_modules: BTreeMap<String, String>,
     /// The commit's SCIP jobs and their outcomes.
     pub scip: Vec<ScipProject>,
+    /// Spring configuration read by path (contract M4a D5): `src/main/resources/application.properties`
+    /// and `application*.yml`/`.yaml` beside it.
+    pub config: BTreeMap<&'a str, String>,
+}
+
+/// A Spring Boot configuration file the endpoint stage reads (`application.properties`) or
+/// reports as unread (`application*.yml`, `application*.yaml`), under `src/main/resources/`.
+fn is_spring_config(path: &str) -> bool {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    (dir == "src/main/resources" || dir.ends_with("/src/main/resources"))
+        && (name == "application.properties"
+            || (name.starts_with("application")
+                && (name.ends_with(".yml") || name.ends_with(".yaml"))))
 }
 
 /// Builds the snapshot graph from the structural, syntax, SQL and ORM facts; returns the
@@ -299,6 +321,13 @@ pub fn assemble(
         |path: &str| projects::owner_root(path, content.scip.iter().map(|p| p.root.as_str()));
     let mut scip_edges = Vec::new();
     let mut exact_files: BTreeSet<&str> = BTreeSet::new();
+    // Route facts per file (contract M4a), so an exact index can resolve handler names.
+    let file_routes: BTreeMap<&str, rb_frameworks::routes::FileRoutes> = content
+        .facts
+        .iter()
+        .map(|(path, (language, facts))| (*path, rb_frameworks::routes::routes(*language, facts)))
+        .collect();
+    let mut exact_handlers: BTreeMap<(&str, rb_model::Span), String> = BTreeMap::new();
     // `Service -DEPENDS_ON-> Package` (design §5.5): per service and package, the first site of
     // the service's files that names the package is the one evidence.
     let mut packages: BTreeMap<(NodeKey, String), (rb_scip::Package, Evidence)> = BTreeMap::new();
@@ -309,45 +338,58 @@ pub fn assemble(
             .filter(|(path, _)| owner_of(path) == Some(project.root.as_str()))
             .map(|(path, (language, facts))| (*path, (*language, *facts)))
             .collect();
-        let coverage =
-            match (&project.status, &project.index) {
-                (rb_scip::RunStatus::Ok, Some(index)) => {
-                    let joined = scip::join(
-                        index,
-                        &project.root,
-                        &files,
-                        &keys,
-                        scip::indexed_languages(project.indexer),
-                    );
-                    for (path, replaced) in joined.keys {
-                        let file_keys = keys
-                            .get_mut(path.as_str())
-                            .expect("the join only returns files it was given");
-                        for (i, key) in replaced {
-                            file_keys[i] = key;
+        let coverage = match (&project.status, &project.index) {
+            (rb_scip::RunStatus::Ok, Some(index)) => {
+                let joined = scip::join(
+                    index,
+                    &project.root,
+                    &files,
+                    &keys,
+                    scip::indexed_languages(project.indexer),
+                );
+                for (path, routes) in &file_routes {
+                    for r in &routes.routes {
+                        if let rb_frameworks::routes::Handler::Name { text, span } = &r.handler {
+                            let (token, at) = routes::handler_token(text, *span);
+                            if let Some(symbol) =
+                                scip::definition_at(index, &project.root, &joined, path, at, token)
+                            {
+                                exact_handlers.insert((path, at), symbol);
+                            }
                         }
                     }
-                    scip_edges.extend(joined.edges);
-                    exact_files.extend(joined.documented.iter().filter_map(|path| {
-                        files.get_key_value(path.as_str()).map(|(path, _)| *path)
-                    }));
-                    for u in joined.packages {
-                        let service = boundaries
-                            .project_for(&u.at.path)
-                            .map_or_else(|| unassigned.clone(), |p| service_key(&p.dir));
-                        packages
-                            .entry((service, u.package.key()))
-                            .and_modify(|(_, at)| {
-                                if u.at < *at {
-                                    *at = u.at.clone();
-                                }
-                            })
-                            .or_insert((u.package, u.at));
-                    }
-                    Some(joined.coverage)
                 }
-                _ => None,
-            };
+                for (path, replaced) in joined.keys {
+                    let file_keys = keys
+                        .get_mut(path.as_str())
+                        .expect("the join only returns files it was given");
+                    for (i, key) in replaced {
+                        file_keys[i] = key;
+                    }
+                }
+                scip_edges.extend(joined.edges);
+                exact_files.extend(
+                    joined.documented.iter().filter_map(|path| {
+                        files.get_key_value(path.as_str()).map(|(path, _)| *path)
+                    }),
+                );
+                for u in joined.packages {
+                    let service = boundaries
+                        .project_for(&u.at.path)
+                        .map_or_else(|| unassigned.clone(), |p| service_key(&p.dir));
+                    packages
+                        .entry((service, u.package.key()))
+                        .and_modify(|(_, at)| {
+                            if u.at < *at {
+                                *at = u.at.clone();
+                            }
+                        })
+                        .or_insert((u.package, u.at));
+                }
+                Some(joined.coverage)
+            }
+            _ => None,
+        };
         diagnostics.push(scip_status(project, coverage.as_ref()));
     }
     for ((service, key), (package, at)) in packages {
@@ -408,12 +450,44 @@ pub fn assemble(
         .iter()
         .map(|(path, text)| (*path, text.as_str()))
         .collect();
-    diagnostics.extend(resolve::add_edges(
+    let index = resolve::Index::new(&content.facts, &content.go_modules, &keys);
+    diagnostics.extend(resolve::add_edges(&mut b, &index, &exact_files)?);
+    // Endpoints (contract M4a S4–S8): Spring's context path from each service's
+    // `application.properties`; a YAML file that sets one is counted as unread.
+    let service_of = |path: &str| {
+        boundaries
+            .project_for(path)
+            .map_or_else(|| boundaries::ROOT_DIR.to_owned(), |p| p.dir.clone())
+    };
+    let mut context_paths: BTreeMap<String, String> = BTreeMap::new();
+    for (path, text) in &content.config {
+        if path.ends_with(".properties") {
+            if let Some(ctx) = rb_frameworks::fold::parse_properties(text)
+                .get("server.servlet.context-path")
+                .filter(|c| !c.trim().is_empty())
+            {
+                context_paths.insert(service_of(path), ctx.trim().to_owned());
+            }
+        } else if text.contains("context-path") {
+            diagnostics.push(Diagnostic {
+                kind: "spring_config_unread".into(),
+                path: Some((*path).to_owned()),
+                span: None,
+                detail: json!({ "key": "server.servlet.context-path" }),
+            });
+        }
+    }
+    diagnostics.extend(routes::add_endpoints(
         &mut b,
-        &content.facts,
-        &content.go_modules,
-        &keys,
-        &exact_files,
+        &routes::Inputs {
+            files: &content.facts,
+            routes: &file_routes,
+            keys: &keys,
+            index: &index,
+            exact_handlers: &exact_handlers,
+            service_of: &service_of,
+            context_paths: &context_paths,
+        },
     )?);
     let (orm_index, orm_diagnostics) = orm::add_mappings(&mut b, &files, &prisma, &keys)?;
     diagnostics.extend(orm_diagnostics);
