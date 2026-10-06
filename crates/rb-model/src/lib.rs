@@ -3,6 +3,7 @@
 //! Identity is always the natural key `(NodeKind, key)`. Dense numeric ids are assigned only when a
 //! [`GraphBuilder`] is finished, in sorted key order, so they are deterministic for a given input.
 
+pub mod diff;
 mod graph;
 mod manifest;
 

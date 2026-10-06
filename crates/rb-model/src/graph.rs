@@ -352,61 +352,20 @@ pub fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
 /// `(src key, kind, dst key, provenance)` with their evidence, then diagnostics in canonical order.
 /// Two snapshots of the same inputs must dump byte-identically.
 pub fn canonical_dump(commit_sha: &str, graph: &Graph, diagnostics: &[Diagnostic]) -> String {
-    let by_id: HashMap<i64, &Node> = graph.nodes.iter().map(|n| (n.id, n)).collect();
     let mut out = String::new();
-    let mut line = |v: Value| {
-        // `Value`'s Display is compact JSON and cannot fail.
-        let _ = writeln!(out, "{v}");
-    };
-
-    line(json!(["rb-dump", 2, commit_sha]));
-
-    let mut nodes: Vec<&Node> = graph.nodes.iter().collect();
-    nodes.sort_by(|a, b| (a.kind, &a.key).cmp(&(b.kind, &b.key)));
-    for n in nodes {
-        line(json!(["N", n.kind.as_str(), n.key, n.name, n.attrs]));
+    // `Value`'s Display is compact JSON and cannot fail.
+    let _ = writeln!(out, "{}", json!(["rb-dump", 2, commit_sha]));
+    // The rows and their lines are `rb diff`'s (contract M5 S16): one rendering of each row.
+    for n in crate::diff::node_rows(graph) {
+        let _ = writeln!(out, "{}", n.line());
     }
-
-    let mut edges: Vec<(&Node, &Edge, &Node)> = graph
-        .edges
-        .iter()
-        .map(|e| (by_id[&e.src], e, by_id[&e.dst]))
-        .collect();
-    edges.sort_by(|(s1, e1, d1), (s2, e2, d2)| {
-        (s1.kind, &s1.key, e1.kind, d1.kind, &d1.key, e1.provenance).cmp(&(
-            s2.kind,
-            &s2.key,
-            e2.kind,
-            d2.kind,
-            &d2.key,
-            e2.provenance,
-        ))
-    });
-    for (s, e, d) in edges {
-        let mut evidence: Vec<&Evidence> = e.evidence.iter().collect();
-        evidence.sort();
-        let evidence: Vec<Value> = evidence
-            .iter()
-            .map(|ev| json!([ev.path, ev.span]))
-            .collect();
-        line(json!([
-            "E",
-            s.kind.as_str(),
-            s.key,
-            e.kind.as_str(),
-            d.kind.as_str(),
-            d.key,
-            e.provenance.as_str(),
-            e.certainty.rank(),
-            e.attrs,
-            evidence
-        ]));
+    for e in crate::diff::edge_rows(graph) {
+        let _ = writeln!(out, "{}", e.line());
     }
-
     let mut diagnostics = diagnostics.to_vec();
     sort_diagnostics(&mut diagnostics);
-    for d in diagnostics {
-        line(json!(["D", d.kind, d.path, d.span, d.detail]));
+    for d in &diagnostics {
+        let _ = writeln!(out, "{}", crate::diff::diagnostic_line(d));
     }
     out
 }

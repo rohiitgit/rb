@@ -719,7 +719,7 @@ Same rules as M4b:
   - *Invariants:* 2 (byte identity), 8 (two servers, same bodies).
   - Files: new `crates/rb-cli/tests/api.rs` (shares the e2e helpers through a small `tests/common/mod.rs`), new `crates/rb-cli/tests/common/mod.rs`, `rb-cli/tests/e2e.rs` (helpers moved).
   - **Verify:** byte equality per endpoint × fixture × parameter set; status ↔ exit-code table; the server-only renderer mutation fails the test.
-- [ ] **11. `rb diff`: exact sections** (S16).
+- [x] **11. `rb diff`: exact sections** (S16). Done 2026-10-07: `rb_model::diff` (`NodeRow`/`EdgeRow` with the dump's identities and lines, `diff` by merge-join, `GraphDiff` with nodes added/removed/changed and edges added/removed/changed/evidence-only, `invert`, `apply` over dump lines with conflict checks, `diagnostics_diff` as a multiset of `D` lines with counts per kind); `canonical_dump` renders through the same rows (dumps byte-identical). Properties on 200 seeded random graph pairs (every node and edge kind, self-loops, cycles, duplicate names; every section exercised); counted growth 5,916 → 23,770 steps for 3,549 → 14,227 rows (4.0×). Mutations 5/5 killed.
   - *Derived:* `rb_model::diff` (`GraphDiff`, `apply`, `invert`), canonical order.
   - Files: new `rb-model/src/diff.rs`, `rb-model/src/lib.rs`.
   - **Verify:** units per section; the apply, self-empty and inverse properties on generated graphs; counted growth.
