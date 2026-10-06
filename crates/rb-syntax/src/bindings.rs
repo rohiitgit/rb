@@ -1036,7 +1036,7 @@ mod tests {
 
     #[test]
     fn typescript_initialisers_and_constants() {
-        let src = "const API = import.meta.env.VITE_API_URL ?? \"http://gateway\";\nconst BASE = process.env.BASE || 'http://x';\nexport const app = express();\nconst r = express.Router();\nlet u = `${API}/u`;\nconst n = API;\nconst api = await axios.create({ baseURL: API });\nconst { a } = mk();\nclass K { base = '/k'; constructor() { this.c = http.client(); } }\nconst x = 1 + f();\n";
+        let src = "const API = import.meta.env.VITE_API_URL ?? \"http://gateway\";\nconst BASE = process.env.BASE || 'http://x';\nexport const app = express();\nconst r = express.Router();\nlet u = `${API}/u`;\nconst n = API;\nconst api = await axios.create({ baseURL: API });\nconst { a } = mk();\nclass K { base = '/k'; constructor() { this.c = http.client(); } }\nconst x = 1 + f();\nconst y = API + BASE;\n";
         assert_eq!(
             inits(Language::TypeScript, src),
             [
@@ -1052,6 +1052,8 @@ mod tests {
                 "base = '/k'",
                 "c = call http.client",
                 "x = - const",
+                // A concatenation of names is a template of holes (S12 folds it).
+                "y = '{API}{BASE}' const",
             ]
         );
         // The call initialiser points at the chain recorded for that call.

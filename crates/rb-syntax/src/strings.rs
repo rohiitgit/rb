@@ -123,11 +123,11 @@ pub(crate) fn string_template(
     while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
         node = node.named_child(0)?;
     }
-    if !is_string_expr(node, &syn) {
+    if !is_string_expr(node, &syn) && !is_name_concat(node, &syn) {
         return None;
     }
     let mut parts: Vec<TemplatePart> = Vec::new();
-    for part in parts_of(node, &syn, source) {
+    for part in parts_of(node, &syn, source, true) {
         match (parts.last_mut(), part) {
             (Some(TemplatePart::Lit { text }), TemplatePart::Lit { text: more }) => {
                 text.push_str(&more);
@@ -174,6 +174,31 @@ pub(crate) fn sql_candidates<'t>(
     out
 }
 
+/// Leaves of a `+` concatenation that name a value (`BASE + PATH`, `cfg.Base + suffix`).
+const NAME_LEAVES: &[&str] = &[
+    "identifier",
+    "member_expression",
+    "field_access",
+    "selector_expression",
+    "attribute",
+];
+
+/// A `+` concatenation of names (and string expressions) only: a template of holes for URLs,
+/// never an SQL candidate.
+fn is_name_concat(node: Node<'_>, syn: &Syntax) -> bool {
+    is_plus(node, syn)
+        && [
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ]
+        .into_iter()
+        .all(|operand| {
+            operand.is_some_and(|o| {
+                NAME_LEAVES.contains(&o.kind()) || is_string_expr(o, syn) || is_name_concat(o, syn)
+            })
+        })
+}
+
 fn is_plus(node: Node<'_>, syn: &Syntax) -> bool {
     syn.concat.contains(&node.kind())
         && node
@@ -198,7 +223,7 @@ fn is_string_expr(node: Node<'_>, syn: &Syntax) -> bool {
 
 /// The normalised text of a string expression; non-literal parts become `$n`.
 fn flatten(node: Node<'_>, syn: &Syntax, source: &[u8], holes: &mut usize) -> String {
-    parts_of(node, syn, source)
+    parts_of(node, syn, source, false)
         .into_iter()
         .map(|p| match p {
             TemplatePart::Lit { text } => text,
@@ -210,8 +235,9 @@ fn flatten(node: Node<'_>, syn: &Syntax, source: &[u8], holes: &mut usize) -> St
         .collect()
 }
 
-/// A string expression's literal parts and holes, in order (not merged).
-fn parts_of(node: Node<'_>, syn: &Syntax, source: &[u8]) -> Vec<TemplatePart> {
+/// A string expression's literal parts and holes, in order (not merged). With `names`, a nested
+/// concatenation of names is opened up into its parts (templates) instead of being one hole (SQL).
+fn parts_of(node: Node<'_>, syn: &Syntax, source: &[u8], names: bool) -> Vec<TemplatePart> {
     let kind = node.kind();
     if syn.literals.contains(&kind) {
         return literal_parts(node, syn, source);
@@ -221,7 +247,7 @@ fn parts_of(node: Node<'_>, syn: &Syntax, source: &[u8]) -> Vec<TemplatePart> {
         let parts: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         return parts
             .into_iter()
-            .flat_map(|p| parts_of(p, syn, source))
+            .flat_map(|p| parts_of(p, syn, source, names))
             .collect();
     }
     if is_plus(node, syn) {
@@ -233,8 +259,8 @@ fn parts_of(node: Node<'_>, syn: &Syntax, source: &[u8]) -> Vec<TemplatePart> {
             .into_iter()
             .flatten()
             .flat_map(|operand| {
-                if is_string_expr(operand, syn) {
-                    parts_of(operand, syn, source)
+                if is_string_expr(operand, syn) || (names && is_name_concat(operand, syn)) {
+                    parts_of(operand, syn, source, names)
                 } else {
                     vec![hole(operand, source)]
                 }

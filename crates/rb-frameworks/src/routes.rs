@@ -172,7 +172,7 @@ fn init_chain<'f>(facts: &'f FileFacts, b: &Binding) -> Option<&'f CallChain> {
 }
 
 /// A template with no hole, as its text.
-fn literal(arg: &Arg) -> Option<String> {
+pub(crate) fn literal(arg: &Arg) -> Option<String> {
     match arg {
         Arg::Template { template } => match template.parts.as_slice() {
             [] => Some(String::new()),
@@ -693,7 +693,7 @@ fn gin(facts: &FileFacts, out: &mut FileRoutes) {
 }
 
 /// A method argument: a string, or `http.MethodX`.
-fn go_method(arg: &Arg) -> Option<String> {
+pub(crate) fn go_method(arg: &Arg) -> Option<String> {
     if let Some(m) = literal(arg) {
         return Some(norm_method(&m));
     }
