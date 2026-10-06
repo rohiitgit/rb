@@ -343,6 +343,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 3: manifest packages with versions (npm lockfile, go.mod, pom) and Service → Service `via=package`; `PIPELINE = m4b-di-1` (amendment 7).
 - [x] Phase 4a: Spring DI resolution, `INJECTS` (never above `heuristic`, F2), `di_*` diagnostics and `di_coverage`; `PIPELINE = m4b-di-2` (amendment 8).
 - [x] Phase 4b: the `rb status` `di:` line and `status-di.txt`.
+- [x] Phase 5a: RTA proof of absence, `impl_instantiated: false` on `IMPLEMENTS`, `rta_coverage`; `PIPELINE = m4b-di-3` (amendment 9).
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):

@@ -1,0 +1,718 @@
+//! RTA as a proof of absence (contract M4b S9, D4): a Java or TS/JS type is proven never
+//! instantiated only when every mention of its name, in every file, is in a role that cannot
+//! create one, and every type naming it as a supertype is proven too. Its `IMPLEMENTS` edges
+//! (and those of the methods it contains) then carry `impl_instantiated: false`; nothing else
+//! changes. Every rule that fails keeps the type, and the first one is counted.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use rb_frameworks::clients::RawScan;
+use rb_frameworks::work;
+use rb_model::{Diagnostic, EdgeKind, GraphBuilder, NodeKey, NodeKind};
+use rb_syntax::{DefKind, FileFacts, Language, MentionRole};
+use serde_json::{Value, json};
+
+use crate::di::is_test_path;
+
+type Sym<'a> = (&'a str, usize);
+
+/// The first failing rule of a kept type (S9), in the order they are checked.
+pub(crate) const RULES: &[&str] = &[
+    "language",
+    "test",
+    "library",
+    "surface",
+    "mention",
+    "string",
+    "annotation",
+    "default_export",
+    "fragment",
+    "subtype",
+];
+
+/// What the proof reads.
+pub(crate) struct Inputs<'a> {
+    pub files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
+    pub service_of: &'a dyn Fn(&str) -> String,
+    /// Deployable services (`role = service`).
+    pub deployable: &'a BTreeSet<String>,
+    pub unparsed: &'a RawScan,
+    /// The interfaces Spring Data repositories extend, by simple name (fragments, D3).
+    pub fragments: &'a BTreeSet<String>,
+}
+
+/// The proof over a snapshot: the types considered, each with its first failing rule or
+/// `None` when proven.
+#[derive(Debug, Default)]
+pub(crate) struct Proof<'a> {
+    pub types: BTreeMap<Sym<'a>, Option<&'static str>>,
+}
+
+fn simple(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// The roles that cannot create an instance (S9 (c)): a declaration (of the type or a
+/// same-named one, or of its constructors), an import, a supertype head.
+const ALLOWED: &[MentionRole] = &[
+    MentionRole::Declaration,
+    MentionRole::Import,
+    MentionRole::Supertype,
+];
+
+fn is_type(kind: DefKind) -> bool {
+    matches!(kind, DefKind::Class | DefKind::Interface)
+}
+
+fn parsed_by_rta(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Java | Language::TypeScript | Language::Tsx | Language::JavaScript
+    )
+}
+
+/// Proves or keeps each type in `considered` (S9 (a)–(i)).
+pub(crate) fn prove<'a>(inputs: &Inputs<'a>, considered: &BTreeSet<Sym<'a>>) -> Proof<'a> {
+    // Every mention role of every name in the parsed Java/TS/JS files.
+    let mut roles: BTreeMap<&str, BTreeSet<MentionRole>> = BTreeMap::new();
+    // Static imports name a class whose members may be used unqualified (enum constants).
+    let mut static_imported: BTreeSet<&str> = BTreeSet::new();
+    // (g): an unnamed-instantiation surface anywhere.
+    let mut surface = inputs
+        .unparsed
+        .di_surface
+        .iter()
+        .any(|(_, what)| what == "beans.xml");
+    for (language, facts) in inputs.files.values() {
+        if !parsed_by_rta(*language) {
+            continue;
+        }
+        for (name, r) in &facts.mentions {
+            work::tick(1);
+            roles.entry(name.as_str()).or_default().extend(r);
+        }
+        for i in &facts.imports {
+            if i.is_static {
+                static_imported.insert(simple(&i.module));
+            }
+            if i.module.starts_with("org.reflections")
+                || i.module.starts_with("io.github.classgraph")
+            {
+                surface = true;
+            }
+        }
+        surface |= facts
+            .mentions
+            .contains_key("ClassPathScanningCandidateComponentProvider")
+            || facts.definitions.iter().any(|d| {
+                d.decorations.iter().any(|x| {
+                    x.args
+                        .iter()
+                        .any(|a| a.key.as_deref() == Some("includeFilters"))
+                })
+            });
+    }
+    let unparsed_word =
+        |name: &str| inputs.unparsed.words_unread || inputs.unparsed.words.contains(name);
+
+    let mut types: BTreeMap<Sym<'a>, Option<&'static str>> = BTreeMap::new();
+    for &t in considered {
+        work::tick(1);
+        types.insert(
+            t,
+            own_rule(inputs, t, &roles, &static_imported, surface, &unparsed_word),
+        );
+    }
+
+    // (i): "instantiated" flows from a type to the types it names as supertypes, by simple
+    // name, over every type of every parsed file; a breadth-first walk with a visited set, so a
+    // cycle terminates and a chain of any length is kept whole.
+    let mut by_name: BTreeMap<&str, Vec<Sym<'a>>> = BTreeMap::new();
+    let mut supers: BTreeMap<Sym<'a>, Vec<&str>> = BTreeMap::new();
+    for (&path, (_, facts)) in inputs.files {
+        for (i, d) in facts.definitions.iter().enumerate() {
+            if !is_type(d.kind) {
+                continue;
+            }
+            work::tick(1);
+            by_name.entry(d.name.as_str()).or_default().push((path, i));
+            supers.insert(
+                (path, i),
+                d.supertypes.iter().map(|s| simple(&s.name)).collect(),
+            );
+        }
+    }
+    // Every type is instantiated unless considered and proven by its own rules.
+    let mut queue: VecDeque<Sym<'a>> = supers
+        .keys()
+        .copied()
+        .filter(|t| types.get(t).is_none_or(Option::is_some))
+        .collect();
+    let mut seen: BTreeSet<Sym<'a>> = queue.iter().copied().collect();
+    while let Some(u) = queue.pop_front() {
+        for name in supers.get(&u).into_iter().flatten() {
+            for &t in by_name.get(name).into_iter().flatten() {
+                work::tick(1);
+                if seen.insert(t) {
+                    if let Some(rule @ None) = types.get_mut(&t) {
+                        *rule = Some("subtype");
+                    }
+                    queue.push_back(t);
+                }
+            }
+        }
+    }
+    Proof { types }
+}
+
+/// The first of rules (a)–(h) that keeps `t`, or `None`.
+fn own_rule(
+    inputs: &Inputs<'_>,
+    (path, i): Sym<'_>,
+    roles: &BTreeMap<&str, BTreeSet<MentionRole>>,
+    static_imported: &BTreeSet<&str>,
+    surface: bool,
+    unparsed_word: &dyn Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let (language, facts) = inputs.files[path];
+    let def = &facts.definitions[i];
+    if !parsed_by_rta(language) {
+        return Some("language");
+    }
+    if is_test_path(path) {
+        return Some("test");
+    }
+    if !inputs.deployable.contains(&(inputs.service_of)(path)) {
+        return Some("library");
+    }
+    if surface {
+        return Some("surface");
+    }
+    let name = def.name.as_str();
+    let mentioned = roles.get(name);
+    if mentioned.is_some_and(|r| {
+        r.iter()
+            .any(|x| *x != MentionRole::String && !ALLOWED.contains(x))
+    }) || static_imported.contains(name)
+    {
+        return Some("mention");
+    }
+    if mentioned.is_some_and(|r| r.contains(&MentionRole::String)) || unparsed_word(name) {
+        return Some("string");
+    }
+    let inert = |d: &rb_syntax::Decoration| rb_frameworks::di::is_inert(facts, d);
+    let members_decorated = facts
+        .definitions
+        .iter()
+        .filter(|m| m.parent == Some(i))
+        .flat_map(|m| &m.decorations)
+        .chain(
+            facts
+                .bindings
+                .iter()
+                .filter(|b| b.member && b.scope == Some(i))
+                .flat_map(|b| &b.decorations),
+        )
+        .any(|d| !inert(d));
+    if def.decorations.iter().any(|d| !inert(d)) || members_decorated {
+        return Some("annotation");
+    }
+    if def.parent.is_none() && facts.default_export.as_deref() == Some(name) {
+        return Some("default_export");
+    }
+    if def
+        .supertypes
+        .iter()
+        .any(|s| inputs.fragments.contains(simple(&s.name)))
+    {
+        return Some("fragment");
+    }
+    None
+}
+
+/// The types an `IMPLEMENTS` source key stands for: the type itself, or the type containing a
+/// method.
+pub(crate) fn implementing_types<'a>(
+    sources: &BTreeSet<&NodeKey>,
+    files: &BTreeMap<&'a str, (Language, &'a FileFacts)>,
+    keys: &BTreeMap<&'a str, Vec<String>>,
+) -> BTreeSet<Sym<'a>> {
+    let mut by_key: BTreeMap<&str, Sym<'a>> = BTreeMap::new();
+    for (&path, file_keys) in keys {
+        for (i, k) in file_keys.iter().enumerate() {
+            by_key.entry(k.as_str()).or_insert((path, i));
+        }
+    }
+    sources
+        .iter()
+        .filter(|k| k.kind == NodeKind::Symbol)
+        .filter_map(|k| by_key.get(k.key.as_str()).copied())
+        .filter_map(|(path, i)| {
+            let defs = &files.get(path)?.1.definitions;
+            if is_type(defs[i].kind) {
+                Some((path, i))
+            } else {
+                defs[i]
+                    .parent
+                    .filter(|&p| is_type(defs[p].kind))
+                    .map(|p| (path, p))
+            }
+        })
+        .collect()
+}
+
+/// Marks the `IMPLEMENTS` edges of every proven type and of the methods it contains with
+/// `impl_instantiated: false`; returns the `rta_coverage` diagnostic.
+pub(crate) fn apply(
+    b: &mut GraphBuilder,
+    proof: &Proof<'_>,
+    files: &BTreeMap<&str, (Language, &FileFacts)>,
+    keys: &BTreeMap<&str, Vec<String>>,
+) -> Diagnostic {
+    let mut sources: BTreeSet<NodeKey> = BTreeSet::new();
+    for (&(path, t), rule) in &proof.types {
+        if rule.is_some() {
+            continue;
+        }
+        let defs = &files[path].1.definitions;
+        sources.insert(NodeKey::new(NodeKind::Symbol, keys[path][t].clone()));
+        for (m, d) in defs.iter().enumerate() {
+            if d.parent == Some(t) && matches!(d.kind, DefKind::Method | DefKind::Function) {
+                sources.insert(NodeKey::new(NodeKind::Symbol, keys[path][m].clone()));
+            }
+        }
+    }
+    let prunable = b.set_edge_attr(
+        EdgeKind::Implements,
+        &sources,
+        "impl_instantiated",
+        Value::Bool(false),
+    );
+    let mut kept: BTreeMap<&str, usize> = RULES.iter().map(|r| (*r, 0)).collect();
+    for rule in proof.types.values().flatten() {
+        *kept.get_mut(rule).expect("a listed rule") += 1;
+    }
+    let proven = proof.types.values().filter(|r| r.is_none()).count();
+    Diagnostic {
+        kind: "rta_coverage".into(),
+        path: None,
+        span: None,
+        detail: json!({
+            "types": proof.types.len(),
+            "proven": proven,
+            "kept": kept,
+            "prunable_edges": prunable,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rb_model::{Attrs, Graph};
+
+    use super::*;
+    use crate::resolve::Index;
+
+    struct Run {
+        /// `Type: rule` (or `proven`) per considered type, by name.
+        types: Vec<String>,
+        graph: Graph,
+        coverage: Value,
+    }
+
+    fn language_of(path: &str) -> Language {
+        match path.rsplit('.').next() {
+            Some("java") => Language::Java,
+            Some("ts") => Language::TypeScript,
+            Some("js") => Language::JavaScript,
+            Some("py") => Language::Python,
+            Some("go") => Language::Go,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Indexes `files` (paths under `svc/` are a deployable service, under `lib/` a library),
+    /// with `unparsed` as the raw scan of the files without facts.
+    fn run_with(files: &[(&str, &str)], unparsed: RawScan) -> Run {
+        let facts: Vec<(String, Language, FileFacts)> = files
+            .iter()
+            .map(|(p, src)| {
+                let l = language_of(p);
+                (
+                    (*p).to_owned(),
+                    l,
+                    rb_syntax::extract(l, src.as_bytes()).unwrap(),
+                )
+            })
+            .collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
+            .iter()
+            .map(|(p, l, f)| (p.as_str(), (*l, f)))
+            .collect();
+        let keys: BTreeMap<&str, Vec<String>> = by_path
+            .iter()
+            .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+            .collect();
+        let go = BTreeMap::new();
+        let index = Index::new(&by_path, &go, &keys);
+        let mut b = GraphBuilder::new();
+        for (path, (_, f)) in &by_path {
+            b.add_node(NodeKey::new(NodeKind::File, *path), *path, Attrs::new())
+                .unwrap();
+            crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
+        }
+        crate::resolve::add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
+        let service_of = |p: &str| p.split('/').next().unwrap_or_default().to_owned();
+        let deployable = BTreeSet::from(["svc".to_owned()]);
+        let depends = BTreeMap::new();
+        let resolution = crate::di::resolve(&crate::di::Inputs {
+            files: &by_path,
+            keys: &keys,
+            index: &index,
+            service_of: &service_of,
+            deployable: &deployable,
+            depends: &depends,
+            unparsed: &unparsed,
+        });
+        let considered = implementing_types(&b.edge_sources(EdgeKind::Implements), &by_path, &keys);
+        let proof = prove(
+            &Inputs {
+                files: &by_path,
+                service_of: &service_of,
+                deployable: &deployable,
+                unparsed: &unparsed,
+                fragments: &resolution.fragments,
+            },
+            &considered,
+        );
+        let types = proof
+            .types
+            .iter()
+            .map(|(&(p, i), rule)| {
+                format!(
+                    "{}: {}",
+                    by_path[p].1.definitions[i].name,
+                    rule.unwrap_or("proven")
+                )
+            })
+            .collect();
+        let coverage = apply(&mut b, &proof, &by_path, &keys).detail;
+        Run {
+            types,
+            graph: b.finish().unwrap(),
+            coverage,
+        }
+    }
+
+    fn run(files: &[(&str, &str)]) -> Run {
+        run_with(files, RawScan::default())
+    }
+
+    /// `src -> dst` of the `IMPLEMENTS` edges flagged `impl_instantiated: false`.
+    fn flagged(r: &Run) -> Vec<String> {
+        let g = &r.graph;
+        let short = |id: i64| {
+            let k = &g.nodes().iter().find(|n| n.id == id).unwrap().key;
+            k.rsplit_once("`/").map_or(k.clone(), |(_, d)| d.to_owned())
+        };
+        g.edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Implements)
+            .filter(|e| e.attrs.get("impl_instantiated") == Some(&Value::Bool(false)))
+            .map(|e| format!("{} -> {}", short(e.src), short(e.dst)))
+            .collect()
+    }
+
+    const SINKS: &str = "package com.acme;\ninterface AuditSink { void record(String e); }\nclass LogAuditSink implements AuditSink { public void record(String e) {} }\nclass KafkaAuditSink implements AuditSink { public void record(String e) {} }\nclass Use { AuditSink s = new LogAuditSink(); }\n";
+
+    /// The proving row (the fixture's `KafkaAuditSink`) and its kept neighbour.
+    #[test]
+    fn a_never_mentioned_implementation_is_proven() {
+        let r = run(&[("svc/src/main/java/com/acme/Sinks.java", SINKS)]);
+        assert_eq!(r.types, ["LogAuditSink: mention", "KafkaAuditSink: proven"]);
+        assert_eq!(
+            flagged(&r),
+            [
+                "KafkaAuditSink# -> AuditSink#",
+                "KafkaAuditSink#record(). -> AuditSink#record()."
+            ]
+        );
+        assert_eq!(r.coverage["proven"], 1);
+        assert_eq!(r.coverage["prunable_edges"], 2);
+    }
+
+    /// One keeping row per rule (S9).
+    #[test]
+    fn one_keeping_row_per_rule() {
+        let kafka = |extra: &str| format!("{SINKS}{extra}");
+        let rule_of = |files: &[(&str, &str)], raw: RawScan| -> String {
+            run_with(files, raw)
+                .types
+                .into_iter()
+                .find(|t| t.starts_with("KafkaAuditSink"))
+                .unwrap()
+        };
+        let main = "svc/src/main/java/com/acme/Sinks.java";
+        for (extra, want) in [
+            ("class U { Object o = new KafkaAuditSink(); }\n", "mention"),
+            ("class U { Object o = KafkaAuditSink::new; }\n", "mention"),
+            ("class U { Object o = KafkaAuditSink.class; }\n", "mention"),
+            ("class U { KafkaAuditSink k; }\n", "mention"),
+            ("class U { Object o = KafkaAuditSink.make(); }\n", "mention"),
+            (
+                "class U { String s = \"com.acme.KafkaAuditSink\"; }\n",
+                "string",
+            ),
+            (
+                "@org.springframework.stereotype.Component class KafkaAuditSink2 {}\n",
+                "proven",
+            ),
+        ] {
+            let src = kafka(extra);
+            assert_eq!(
+                rule_of(&[(main, &src)], RawScan::default()),
+                format!("KafkaAuditSink: {want}"),
+                "{extra}"
+            );
+        }
+        // Annotations on the type or a member; inert ones do not keep it.
+        let annotated = SINKS.replace(
+            "class KafkaAuditSink",
+            "@org.springframework.stereotype.Component class KafkaAuditSink",
+        );
+        assert_eq!(
+            rule_of(&[(main, &annotated)], RawScan::default()),
+            "KafkaAuditSink: annotation"
+        );
+        let member = SINKS.replace("class KafkaAuditSink implements AuditSink { public void record", "class KafkaAuditSink implements AuditSink { @org.junit.jupiter.api.Test public void record");
+        assert_eq!(
+            rule_of(&[(main, &member)], RawScan::default()),
+            "KafkaAuditSink: annotation"
+        );
+        let inert = SINKS.replace(
+            "class KafkaAuditSink implements AuditSink { public void record",
+            "class KafkaAuditSink implements AuditSink { @Override public void record",
+        );
+        assert_eq!(
+            rule_of(&[(main, &inert)], RawScan::default()),
+            "KafkaAuditSink: proven"
+        );
+        // A name in a file without facts (a `.kt` file), or one over the byte cap.
+        let raw = RawScan {
+            words: BTreeSet::from(["KafkaAuditSink".to_owned()]),
+            ..RawScan::default()
+        };
+        assert_eq!(rule_of(&[(main, SINKS)], raw), "KafkaAuditSink: string");
+        let over = RawScan {
+            words_unread: true,
+            ..RawScan::default()
+        };
+        assert_eq!(rule_of(&[(main, SINKS)], over), "KafkaAuditSink: string");
+        // A CDI `beans.xml`.
+        let beans = RawScan {
+            di_surface: vec![(
+                "svc/src/main/resources/META-INF/beans.xml".into(),
+                "beans.xml".into(),
+            )],
+            ..RawScan::default()
+        };
+        assert_eq!(rule_of(&[(main, SINKS)], beans), "KafkaAuditSink: surface");
+        // `includeFilters` anywhere, a classpath scanner import.
+        let filters =
+            format!("{SINKS}@ComponentScan(includeFilters = @Filter(Foo.class)) class Cfg {{}}\n");
+        assert_eq!(
+            rule_of(&[(main, &filters)], RawScan::default()),
+            "KafkaAuditSink: surface"
+        );
+        let scanner = format!(
+            "import org.reflections.Reflections;\n{}",
+            SINKS.replace("package com.acme;\n", "")
+        );
+        assert_eq!(
+            rule_of(
+                &[(main, &format!("package com.acme;\n{scanner}"))],
+                RawScan::default()
+            ),
+            "KafkaAuditSink: surface"
+        );
+        let provider = format!(
+            "{SINKS}class P {{ Object p = new ClassPathScanningCandidateComponentProvider(false); }}\n"
+        );
+        assert_eq!(
+            rule_of(&[(main, &provider)], RawScan::default()),
+            "KafkaAuditSink: surface"
+        );
+        // A test path; a library service.
+        assert_eq!(
+            rule_of(
+                &[("svc/src/test/java/com/acme/Sinks.java", SINKS)],
+                RawScan::default()
+            ),
+            "KafkaAuditSink: test"
+        );
+        assert_eq!(
+            rule_of(
+                &[("lib/src/main/java/com/acme/Sinks.java", SINKS)],
+                RawScan::default()
+            ),
+            "KafkaAuditSink: library"
+        );
+        // A static import of the type (enum constants used unqualified).
+        let other = "package com.other;\nimport static com.acme.KafkaAuditSink.A;\nclass V {}\n";
+        assert_eq!(
+            rule_of(
+                &[(main, SINKS), ("svc/src/main/java/com/other/V.java", other)],
+                RawScan::default()
+            ),
+            "KafkaAuditSink: mention"
+        );
+        // A Spring Data fragment implementation.
+        let fragment = "package com.acme;\ninterface UserRepositoryCustom { void touch(long id); }\ninterface UserRepository extends org.springframework.data.jpa.repository.JpaRepository<User, Long>, UserRepositoryCustom {}\nclass UserRepositoryCustomImpl implements UserRepositoryCustom { public void touch(long id) {} }\n";
+        let r = run(&[("svc/src/main/java/com/acme/R.java", fragment)]);
+        assert!(
+            r.types
+                .contains(&"UserRepositoryCustomImpl: fragment".to_owned()),
+            "{:?}",
+            r.types
+        );
+        // TS: a default export; a language never proven.
+        let ts = "interface Sink { record(): void }\nexport default class KafkaAuditSink implements Sink { record() {} }\n";
+        assert_eq!(
+            run(&[("svc/src/sink.ts", ts)]).types,
+            ["KafkaAuditSink: default_export"]
+        );
+        // A named export used nowhere is proven: an importer would mention it (or alias it).
+        let ts_plain = "interface Sink { record(): void }\nexport class KafkaAuditSink implements Sink { record() {} }\n";
+        assert_eq!(
+            run(&[("svc/src/sink.ts", ts_plain)]).types,
+            ["KafkaAuditSink: proven"]
+        );
+        let importer = "import { KafkaAuditSink as K } from './sink';\nexport const k = new K();\n";
+        assert_eq!(
+            run(&[("svc/src/sink.ts", ts_plain), ("svc/src/use.ts", importer)]).types,
+            ["KafkaAuditSink: mention"]
+        );
+        let ts_local = "interface Sink { record(): void }\nclass KafkaAuditSink implements Sink { record() {} }\n";
+        assert_eq!(
+            run(&[("svc/src/sink.ts", ts_local)]).types,
+            ["KafkaAuditSink: proven"]
+        );
+        let py =
+            "class Base:\n    def run(self): pass\nclass Impl(Base):\n    def run(self): pass\n";
+        assert_eq!(run(&[("svc/a.py", py)]).types, ["Impl: language"]);
+    }
+
+    /// (i): an instantiated subtype keeps its supertypes at depth 1 and 2; the reverse keeps
+    /// nothing; a supertype cycle terminates; a long chain is kept whole.
+    #[test]
+    fn instantiated_subtypes_keep_their_supertypes() {
+        let main = "svc/src/main/java/com/acme/H.java";
+        let chain = "package com.acme;\ninterface I { void m(); }\nclass A implements I { public void m() {} }\nclass B extends A { public void m() {} }\nclass C extends B { public void m() {} }\n";
+        // Nothing instantiated: all proven.
+        assert_eq!(
+            run(&[(main, chain)]).types,
+            ["A: proven", "B: proven", "C: proven"]
+        );
+        // `new B()` keeps B and A (depth 1), not C (reverse).
+        let r = run(&[(main, &format!("{chain}class U {{ Object o = new B(); }}\n"))]);
+        assert_eq!(r.types, ["A: subtype", "B: mention", "C: proven"]);
+        // `new C()` keeps B (depth 1) and A (depth 2).
+        let r = run(&[(main, &format!("{chain}class U {{ Object o = new C(); }}\n"))]);
+        assert_eq!(r.types, ["A: subtype", "B: subtype", "C: mention"]);
+        // A subtype in a test source is instantiated too.
+        let t = "package com.acme;\nclass Fake extends C { }\n";
+        let r = run(&[(main, chain), ("svc/src/test/java/com/acme/Fake.java", t)]);
+        assert_eq!(
+            r.types,
+            ["A: subtype", "B: subtype", "C: subtype", "Fake: test"]
+        );
+        // A cycle (`A extends B`, `B extends A`) terminates.
+        let cycle = "package com.acme;\ninterface I { void m(); }\nclass A extends B implements I { public void m() {} }\nclass B extends A { public void m() {} }\nclass U { Object o = new A(); }\n";
+        let r = run(&[(main, cycle)]);
+        assert_eq!(r.types, ["A: mention", "B: subtype"]);
+        // A 5,000-deep chain with an instance at the bottom is kept whole.
+        let mut deep = String::from(
+            "package com.acme;\ninterface I { void m(); }\nclass T0 implements I { public void m() {} }\n",
+        );
+        for i in 1..5000 {
+            deep += &format!("class T{i} extends T{} {{}}\n", i - 1);
+        }
+        deep += "class U { Object o = new T4999(); }\n";
+        let r = run(&[(main, &deep)]);
+        assert!(
+            r.types.iter().all(|t| !t.ends_with("proven")),
+            "{:?}",
+            &r.types[..3]
+        );
+    }
+
+    /// Invariant 11: every considered type is proven or kept by exactly one rule.
+    #[test]
+    fn rta_buckets_sum_to_the_types() {
+        let r = run(&[
+            ("svc/src/main/java/com/acme/Sinks.java", SINKS),
+            (
+                "lib/src/main/java/com/acme/L.java",
+                "package com.acme;\ninterface Q {}\nclass LQ implements Q {}\n",
+            ),
+        ]);
+        let kept: u64 = r.coverage["kept"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v.as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            kept + r.coverage["proven"].as_u64().unwrap(),
+            r.coverage["types"].as_u64().unwrap()
+        );
+        assert_eq!(r.coverage["types"], 3);
+    }
+
+    fn work_for(n: usize) -> u64 {
+        let mut src = String::from("package com.acme;\n");
+        for i in 0..n {
+            src += &format!(
+                "interface I{i} {{ void m(); }}\nclass A{i} implements I{i} {{ public void m() {{}} }}\nclass B{i} extends A{i} {{}}\nclass U{i} {{ Object o = new B{i}(); }}\n"
+            );
+        }
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> =
+            BTreeMap::from([("svc/src/main/java/A.java", (Language::Java, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> = by_path
+            .iter()
+            .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+            .collect();
+        let considered: BTreeSet<Sym<'_>> = facts
+            .definitions
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.kind == DefKind::Class && !d.supertypes.is_empty())
+            .map(|(i, _)| ("svc/src/main/java/A.java", i))
+            .collect();
+        let service_of = |_: &str| "svc".to_owned();
+        let deployable = BTreeSet::from(["svc".to_owned()]);
+        let (raw, fragments) = (RawScan::default(), BTreeSet::new());
+        let _ = keys;
+        work::take();
+        let proof = prove(
+            &Inputs {
+                files: &by_path,
+                service_of: &service_of,
+                deployable: &deployable,
+                unparsed: &raw,
+                fragments: &fragments,
+            },
+            &considered,
+        );
+        assert_eq!(proof.types.len(), 2 * n);
+        work::take()
+    }
+
+    /// Invariant 9: the proof grows linearly in types and mentions (counted, 4× → ≤ 5×).
+    #[test]
+    fn the_proof_grows_linearly() {
+        let (small, large) = (work_for(200), work_for(800));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+}

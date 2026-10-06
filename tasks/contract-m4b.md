@@ -590,6 +590,14 @@ Environment: `df` 10 GiB free; `docker context show` = `desktop-linux`; `rb-scip
    - **Gate inputs from files without facts:** `RawScan` (M4a amendment 17's selection) also carries gate D's text findings (`di_surface`), the whole words of non-inert files with XML comments kept (`words`, for gate M and S9 (d)), and `words_unread` for a file over the byte cap (every name then counts as mentioned).
    - **Deterministic merge:** one edge per `(owner, bean)`: the best site's certainty, then the first site by path and span, gives the attributes; every site is evidence and `sites = n`.
    - **Phase split:** phase 4 is done as 4a (resolution, edges, diagnostics, `di_coverage`) and 4b (the `di:` status line and its golden), to keep each phase within five hand-edited files.
+9. **RTA, as built (phase 5a, S9, D4).**
+   - **The flag is set by one builder call** (`GraphBuilder::set_edge_attr`, D4's second option): after every `IMPLEMENTS` producer (SCIP, then Tier B) has run, `IMPLEMENTS` edges whose source is a proven type or a method it contains get `impl_instantiated: false`. No producer runs after it; a re-add would conflict, which a unit shows.
+   - **Considered types** are those (any language) that are the source of an `IMPLEMENTS` edge, or contain a method that is. Python, Go and other languages are bucket `language`.
+   - **Rules are checked in a fixed order**, and the first failing one is counted: `language`, `test`, `library`, `surface`, `mention`, `string`, `annotation`, `default_export`, `fragment`, `subtype`. (g) is repository-wide, test sources included, since a test context does instantiate main types (amendment 3).
+   - **(f) enum constants:** the facts do not mark enums. An enum's constants are reached only through a mention of its name in a role (c) rejects (`E.A`, an `E`-typed variable, `E.class`), or through a static import of its members. So any static import naming the type (`import static a.E.A`, or `a.E.*`) also fails (c) (`mention`).
+   - **(i) is a breadth-first walk over the name-supertype graph with a visited set, with no depth cap.** It is linear in the supertype names, terminates on cycles, and keeps a chain of any length whole. That is the conservative result a depth-64 cut would also give (types beyond the cut stay instantiated).
+   - **Exported TS/JS classes:** a named export that no file imports is proven, since every importer mentions the name, or aliases it (`other`, amendment 5).
+   - **Phase split:** 5a (the proof, the flag, `rta_coverage`) and 5b (the `rta:` status line).
 
 ## Orchestrator decisions on the forks (2026-10-06)
 

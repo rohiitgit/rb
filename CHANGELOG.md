@@ -1,5 +1,22 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4b phase 5a: RTA proof
+- **`rb-indexer/src/rta.rs`** (new; S9, D4): every Java or TS/JS type that is (or contains) the source of an `IMPLEMENTS` edge is proven never instantiated only when, in order:
+  - it is in a deployable service and not in a test source;
+  - the repository has no unnamed-instantiation surface (a `beans.xml`, `includeFilters`, an `org.reflections`/`io.github.classgraph` import, `ClassPathScanningCandidateComponentProvider`);
+  - every mention of its name is a declaration, an import or a supertype head, and no static import names it;
+  - no string literal and no unparsed non-inert file holds the name (or a file was over the cap);
+  - neither it nor a member carries an annotation or decorator outside the inert list;
+  - it is not default-exported and does not implement a Spring Data fragment interface by name;
+  - no type naming it as a supertype (by simple name, any file, tests included) is instantiated (breadth-first propagation over names with a visited set).
+  - The proven types' `IMPLEMENTS` edges, and their methods', get `impl_instantiated: false` through `GraphBuilder::set_edge_attr` once every producer has run (`edge_sources` lists the sources). One `rta_coverage` per snapshot holds `types`, `proven`, `kept` (first failing rule, zeros included) and `prunable_edges`. `rb_indexer::PIPELINE` is `m4b-di-3`. Amendment 9.
+- **Tests first** (new module and builder methods; did not compile before): `a_never_mentioned_implementation_is_proven` (the fixture's `KafkaAuditSink` shape, its two flagged edges); `one_keeping_row_per_rule` (`new`, `::new`, `.class`, a type position, a member, a string, a `.kt` word, over the cap, `@Component` on the type, `@Test` on a member, `@Override` inert, `beans.xml`, `includeFilters`, an `org.reflections` import, `ClassPathScanningCandidateComponentProvider`, a test path, a library, a static import, a fragment, a TS default export, an aliased TS import, Python); `instantiated_subtypes_keep_their_supertypes` (depth 1 and 2, reverse, a test subtype, a cycle, a 5,000-deep chain); `rta_buckets_sum_to_the_types`; `the_proof_grows_linearly` (counted, 200 vs 800); `graph::tests::edge_attributes_set_by_kind_and_source`.
+- **Mutations** (same harness): 20 mutants (every rule removed alone, member annotations ignored, nothing inert, unparsed words ignored, subtype propagation off, each surface form off, a quadratic name lookup), **all killed**. One first attempt at the growth mutant did not compile and was replaced by a compilable one.
+- **Invariant 1:** fixture dumps vs the `1f81c8f` baseline only add lines; no `IMPLEMENTS` row changes, since no fixture type is proven yet (java-spring-jpa's one considered type, `DefaultAuthService`, is kept by `annotation`).
+- **Golden re-blessed:** `polyglot-monorepo/dump.jsonl` +1 line (`rta_coverage`, 0 types).
+- **Verification:** fmt, clippy clean; 520 unit tests (rb-indexer 190, rb-model 12); e2e 17/17 with the database and containers; stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-indexer/src/{rta,lib,di}.rs`, `crates/rb-model/src/graph.rs`, the golden above, `tasks/{contract-m4b,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-06] (wall clock) M4b phase 4b: the `di:` status line
 - **`rb_store::Store::di_coverage`** reads the `di_coverage` diagnostic (points, buckets, gates; empty for a snapshot indexed before DI). **`rb status`** prints `di: <p> injection points: <n> plain, <n> capped, <n> ambiguous, <n> too ambiguous, <n> external, <n> unresolved, <n> optional absent, <n> not a bean, <n> test` (zero buckets omitted, order fixed; amendment 2's bucket names).
 - **Tests:** `di_line_orders_buckets_and_omits_zeros` (written with the function); new golden `polyglot-monorepo/status-di.txt`: `di: 1 injection points: 1 unresolved`. Its one member: `AuthController(MfaClient)` in `services/auth`, `di_unresolved` `no_bean`, since no `@EnableFeignClients` exists before phase 12c.

@@ -98,6 +98,9 @@ pub(crate) struct Resolution {
     /// Gate → points it capped.
     pub gates: BTreeMap<&'static str, usize>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The interfaces Spring Data repositories extend, by simple name, in every Java file
+    /// (fragment interfaces for RTA's rule (h), D3).
+    pub fragments: BTreeSet<String>,
 }
 
 /// A bean with where it is.
@@ -320,7 +323,15 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
         }
     }
 
-    let mut out = Resolution::default();
+    let mut out = Resolution {
+        fragments: per_file
+            .iter()
+            .flat_map(|(_, _, d)| &d.beans)
+            .filter(|b| b.origin == Origin::SpringData)
+            .flat_map(|b| b.extends.iter().cloned())
+            .collect(),
+        ..Resolution::default()
+    };
     for b in BUCKETS {
         out.buckets.insert(b, 0);
     }

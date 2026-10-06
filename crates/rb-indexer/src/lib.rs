@@ -13,6 +13,7 @@ mod packages;
 mod projects;
 mod resolve;
 mod routes;
+mod rta;
 mod scip;
 mod sql;
 mod stitch;
@@ -66,8 +67,9 @@ use serde_json::{Value, json};
 /// `synthetic`).
 /// `m4b-di-1` adds manifest dependencies: `Package` versions from lockfiles, `go.mod` and poms,
 /// and Service → Service `DEPENDS_ON` `via=package` (contract M4b S15, S16); `m4b-di-2` Spring
-/// DI's `INJECTS` edges, `di_*` diagnostics and `di_coverage` (S4–S8).
-pub const PIPELINE: &str = "m4b-di-2";
+/// DI's `INJECTS` edges, `di_*` diagnostics and `di_coverage` (S4–S8); `m4b-di-3` RTA's
+/// `impl_instantiated: false` on `IMPLEMENTS` and `rta_coverage` (S9).
+pub const PIPELINE: &str = "m4b-di-3";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -763,7 +765,22 @@ pub fn assemble(
         depends: &depends,
         unparsed: &content.unparsed,
     });
+    let fragments = resolution.fragments.clone();
     diagnostics.extend(di::add_injects(&mut b, resolution)?);
+    // RTA (contract M4b S9, D4): after every `IMPLEMENTS` producer (SCIP, Tier B).
+    let considered =
+        rta::implementing_types(&b.edge_sources(EdgeKind::Implements), &content.facts, &keys);
+    let proof = rta::prove(
+        &rta::Inputs {
+            files: &content.facts,
+            service_of: &service_of,
+            deployable: &deployable,
+            unparsed: &content.unparsed,
+            fragments: &fragments,
+        },
+        &considered,
+    );
+    diagnostics.push(rta::apply(&mut b, &proof, &content.facts, &keys));
     let (route_diagnostics, endpoints) = routes::add_endpoints(
         &mut b,
         &routes::Inputs {

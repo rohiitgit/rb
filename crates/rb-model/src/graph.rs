@@ -211,6 +211,37 @@ impl GraphBuilder {
         Ok(())
     }
 
+    /// The sources of the edges of `kind` added so far.
+    pub fn edge_sources(&self, kind: EdgeKind) -> BTreeSet<&NodeKey> {
+        self.edges
+            .keys()
+            .filter(|(_, k, _, _)| *k == kind)
+            .map(|(src, _, _, _)| src)
+            .collect()
+    }
+
+    /// Sets attribute `name` to `value` on every edge of `kind` added so far whose source is in
+    /// `sources`; returns how many edges it set (contract M4b D4: RTA's
+    /// `impl_instantiated: false` on `IMPLEMENTS`, set once every producer has run). An edge
+    /// re-added afterwards with its former attributes is then a conflict, so callers run this
+    /// after the edge kind's last producer.
+    pub fn set_edge_attr(
+        &mut self,
+        kind: EdgeKind,
+        sources: &BTreeSet<NodeKey>,
+        name: &str,
+        value: Value,
+    ) -> usize {
+        let mut n = 0;
+        for ((src, k, _, _), (_, attrs, _)) in &mut self.edges {
+            if *k == kind && sources.contains(src) {
+                attrs.insert(name.to_owned(), value.clone());
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Assigns dense ids in key order and resolves edges. Fails on dangling edge endpoints and on
     /// evidence that does not point at a `File` node.
     pub fn finish(self) -> anyhow::Result<Graph> {
@@ -504,6 +535,56 @@ mod tests {
         let mut heuristic = in_root("a");
         heuristic.certainty = Certainty::Heuristic;
         assert!(b.add_edge(heuristic).is_err());
+    }
+
+    /// Contract M4b D4: an attribute set on the existing edges of one kind and source set;
+    /// other kinds and sources are untouched, and a later re-add with the old attributes
+    /// conflicts (the producers must run first).
+    #[test]
+    fn edge_attributes_set_by_kind_and_source() {
+        let mut b = GraphBuilder::new();
+        b.add_node(svc(), "(root)", Attrs::new()).unwrap();
+        for p in ["a", "b"] {
+            b.add_node(file(p), p, Attrs::new()).unwrap();
+            b.add_edge(in_root(p)).unwrap();
+        }
+        b.add_edge(NewEdge::new(
+            file("a"),
+            EdgeKind::Contains,
+            file("b"),
+            Provenance::Manifest,
+            Certainty::Exact,
+        ))
+        .unwrap();
+        assert_eq!(
+            b.edge_sources(EdgeKind::InService)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [file("a"), file("b")]
+        );
+        let n = b.set_edge_attr(
+            EdgeKind::InService,
+            &BTreeSet::from([file("a")]),
+            "flag",
+            Value::Bool(false),
+        );
+        assert_eq!(n, 1);
+        assert!(b.add_edge(in_root("a")).is_err());
+        let g = b.finish().unwrap();
+        let flagged: Vec<(EdgeKind, bool)> = g
+            .edges()
+            .iter()
+            .map(|e| (e.kind, e.attrs.contains_key("flag")))
+            .collect();
+        assert_eq!(
+            flagged,
+            [
+                (EdgeKind::InService, true),
+                (EdgeKind::Contains, false),
+                (EdgeKind::InService, false)
+            ]
+        );
     }
 
     #[test]

@@ -270,6 +270,7 @@
 ["D","http_external","apps/web/src/api/http.ts",[7,9,7,57],{"client":"fetch","host":"status.example.com","url":"https://status.example.com/api/v1/login"}]
 ["D","http_self","services/notification/src/selfcheck.ts",[2,20,2,89],{"client":"fetch","host":"localhost","url":"http://localhost:3000/internal/mfa/email"}]
 ["D","http_url_dynamic","apps/web/src/api/http.ts",[2,9,2,19],{"client":"fetch","url":"{?}"}]
+["D","rta_coverage",null,null,{"kept":{"annotation":0,"default_export":0,"fragment":0,"language":0,"library":0,"mention":0,"string":0,"subtype":0,"surface":0,"test":0},"proven":0,"prunable_edges":0,"types":0}]
 ["D","scip_status","apps/web",null,{"indexer":"scip-typescript","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":true}]
 ["D","scip_status","packages/shared",null,{"indexer":"scip-typescript","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":true}]
 ["D","scip_status","services/auth",null,{"indexer":"scip-java","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":false}]

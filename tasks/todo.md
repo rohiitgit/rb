@@ -544,7 +544,9 @@ Same rules as M4a:
   - *Invariants:* never `exact`; the minimum over resolution, path and rule; merge per edge; buckets sum (unit); each gate has its own biting row; counted growth test.
   - Files: new `rb-indexer/src/di.rs`, `rb-indexer/src/lib.rs`, `rb-indexer/src/resolve.rs` (type resolution exposed), `rb-store/src/query.rs` (coverage read), `rb-cli/src/main.rs` (status line).
   - **Verify:** units including S5's table and the S6 mutations; e2e churn classified (current fixtures: `java-spring-jpa`'s two points capped by `scan_roots_unknown`; polyglot `MfaClient` `unresolved` until `@EnableFeignClients` arrives in 12c).
-- [ ] **5. RTA proof at index time** (S9).
+- [x] **5a. RTA proof at index time** (S9). Done: `rb-indexer/src/rta.rs`, `GraphBuilder::{edge_sources, set_edge_attr}`, fragment names from DI; `PIPELINE = m4b-di-3`; amendment 9; 5 + 1 units, 20 mutants all killed; fixture dumps only add `rta_coverage` (no type proven before the fixture phases; java-spring-jpa's one considered type `DefaultAuthService` kept by `annotation`).
+- [ ] **5b. `rta:` status line** (S9): `Store::rta_coverage`, `rb status` line, golden.
+- (original phase 5 entry, split as above) **5. RTA proof at index time** (S9).
   - *Derived:* proven types; `impl_instantiated: false` on their `IMPLEMENTS` edges; `rta_coverage`; the `rta:` line.
   - *Invariants:* the edge set and certainties are unchanged (dump diff against the phase-0 baseline shows attributes only); one keeping row per rule; subtype propagation tested at depth 1/2 and in reverse; a cycle test; counted growth test.
   - Files: new `rb-indexer/src/rta.rs`, `rb-indexer/src/lib.rs`, the `IMPLEMENTS` producers' attribute hook (`resolve.rs`/`scip.rs`, or one `GraphBuilder` call in `rb-model/src/graph.rs`: D4, the generator's choice recorded), `rb-cli/src/main.rs`.
