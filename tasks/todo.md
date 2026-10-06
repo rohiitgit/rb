@@ -585,7 +585,7 @@ Same rules as M4a:
   - *Invariants:* each can only lower or remove (`CONSUMES` diff against the baseline classified); M4a's `synthetic` bar untouched (the existing never-`synthetic` guards still green).
   - Files: `rb-frameworks/src/routes.rs`, `rb-indexer/src/routes.rs`, `rb-indexer/src/stitch.rs`, `rb-indexer/src/di.rs` (base lookup for S21).
   - **Verify:** units; e2e unchanged until the fixture phase.
-- [ ] **12a. Fixtures: java-spring-jpa, part 1.** New `AuthApplication.java`, `Hashing.java`, `Tokens.java`, `AuditConfig.java`, `Notifiers.java`; `git add`.
+- [x] **12a. Fixtures: java-spring-jpa, part 1.** New `AuthApplication.java`, `Hashing.java`, `Tokens.java`, `AuditConfig.java`, `Notifiers.java`; `git add`. Done: package-private types and `Notifier.java` (amendment 16); `INJECTS` lose `scan_roots_unknown` (`plain 2`), `KafkaAuditSink` proven (2 prunable edges), `main`/`lifecycle` entries; SCIP card and status re-blessed through container runs.
   - **Verify:** e2e; predict every new `INJECTS`, `impl_instantiated` and coverage line before blessing.
 - [ ] **12b. Fixtures: java-spring-jpa, part 2.** New `UserRepositoryCustomImpl.java`, `support/Service.java`, `support/ReportNotifier.java`; edits to `UserRepository.java` and `AuthController.java`.
   - **Verify:** as 12a.
