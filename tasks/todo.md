@@ -633,6 +633,115 @@ Same rules as M4a:
 - [x] Evaluator pass 2 (verification only, against `304fe4a`): Y1–Y15 repros and controls end to end with runtime confirmations, 21 mutants from a clean build (21 killed), four public repositories against `531e14e` (three byte-identical, jhipster's claimed 8 lines), fresh == cached, samples (`INJECTS` 20/20, orphans 9/9, versions 20/20), regression suite, invariant 1, docs vs code (N1, N2 doc notes).
 - [x] M4b closed 2026-10-07 (contract amendment 22: final S1–S28/invariant table, review history of passes 1–2, closing measurement, open items by milestone with the M5 adversarial-review list, item 23); design §13, README, IMPLEMENT.md, CHANGELOG updated.
 
-# M5 Scale & API (design §13)
+# M5 Scale & API (design §13; contract `tasks/contract-m5.md`)
 
-- [ ] Not started. Write its contract first; it inherits M4b open items 3, 5, 6, 7, 10, 11, 15, 18, 19, 20, 21 and 23 and M4a's adversarial carrier review.
+- [x] Contract written (2026-10-07): soundness claims and closing bar up front; S1–S28, invariants 1–11, D1–D18, forks F1–F6; every M3b/M4a/M4b item assigned to M5 dispositioned (D16). Not started.
+
+## M5 phases (contract `tasks/contract-m5.md`)
+
+Same rules as M4b:
+- Each phase has at most 5 hand-edited files. Blessed goldens and guard data are reviewed separately and listed in the changelog.
+- Each phase is test-first: the new units fail, or do not compile, before the change.
+- Each phase ends with its verification step: fmt, `clippy --workspace --all-targets -D warnings`, the touched crates' unit tests counted from a log holding both streams (`> log 2>&1`), and the e2e suite with `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb`.
+- Any golden that changes gets a classified line diff before `RB_BLESS=1`.
+- Mutation runs follow M4a's harness rules: fresh mtime, restored bytes checked, a `test result:` line per mutant, stopped with SIGINT.
+- Environment: never `npm`/`npx` on the host; Docker context `desktop-linux`; `df` before every build, clone and container step, floor 6 GiB for benchmark steps and 2 GiB otherwise; one-off builds (baselines, scratch crates) use a `CARGO_TARGET_DIR` under the scratchpad and are removed afterwards.
+
+`PIPELINE` becomes `m5-1` at the first dump change (phase 12) and is bumped on each later one. `RECIPE` is bumped in phase 15.
+
+- [ ] **0. Preflight** (no code).
+  - Read the contract (soundness section first), the lessons, contract-m4a amendment 18 and contract-m4b amendment 22.
+  - `df`, `docker context show`, `docker image inspect` for both indexer images.
+  - Build `afae548` (scratch target directory) and dump the three fixtures (`--no-scip`, from `git ls-files` copies) and the four M4b closing repositories at their pins: the invariant-1 baseline.
+  - Check the contract's "not verified" list, each with its command and output recorded: `cypher()` under `SET LOCAL ROLE rb_reader` with draft grants; dropping 10 graphs in one transaction (error text, `SHOW max_locks_per_transaction`); S2's concurrent-publisher load on the `afae548` binary (crash count); a scratch crate with D1's axum features (new crates in its lockfile, licences, release size delta); Docker Desktop `--internal` network: no route out, DNS behaviour, `--dns 127.0.0.1`; tinyproxy image size before building; the fixtures' fetch hosts from a proxy log; Maven's duplicate choice with the scip-java image (S20).
+  - Benchmark candidates (S23): GitHub API size, shallow fetch of a pinned commit into the scratchpad, line counts per language by script, build system and SCIP project detection read; choose and pin; remove the clones.
+  - **Verify:** the contract gains "Checked in phase 0" with every finding and its source; any deviation from a decision is an amendment before code; F1's threshold checked.
+- [ ] **1. Whole-snapshot reads and the AGE DDL lock** (S1, S2).
+  - *Derived:* `Store::read_snapshot` (one `REPEATABLE READ READ ONLY` transaction); `RB_AGE_DDL_LOCK` taken before `create_graph`/`drop_graph`.
+  - *Invariants:* 4, 5 (lock part).
+  - Files: `rb-store/src/lib.rs`, `rb-store/src/age.rs`, `rb-cli/tests/e2e.rs` (the two-connection test).
+  - **Verify:** the S1 test fails first (no edges read after the concurrent delete), then passes; S2's load measurement with the M5 binary (crash count recorded); e2e unchanged.
+- [ ] **2. Retention and the graph lifecycle** (S3).
+  - *State:* snapshot rows inserted inside the publish transaction; `age_graph` cleared at retirement.
+  - *Derived:* the previous live graph dropped after the flip, one per transaction; `--keep N` / `RB_KEEP_RETIRED`.
+  - *Invariants:* 5; the random-sequence property test with injected failures; a killed publisher leaves no row.
+  - Files: `rb-store/src/lib.rs`, `rb-store/src/age.rs`, `rb-cli/src/main.rs` (`--keep`, the status line's graph count), `rb-cli/tests/e2e.rs`.
+  - **Verify:** property test (database) and units; e2e (status goldens that print snapshot counts classified).
+- [ ] **3. `rb gc`, `rb cache prune`, `--no-cache` writes** (S4, S5).
+  - *Derived:* orphan graphs and stale `building` rows listed and removed; facts/SCIP rows of other versions pruned; `WriteOnlyFactsCache`.
+  - Files: `rb-store/src/lib.rs`, `rb-indexer/src/syntax.rs`, `rb-cli/src/main.rs`, `rb-cli/tests/e2e.rs`, `README.md`.
+  - **Verify:** the S5 test fails first (a plain run after `--no-cache` parses every file); planted orphan graph and stale row removed; a live graph never listed.
+- [ ] **4. Cypher guard rails and e2e robustness** (S7, S8).
+  - *State:* `migrations/0006_reader_role.sql`; the publish transaction's grants.
+  - *Derived:* `--timeout-ms`, row cap with `truncated: rows`, `SET LOCAL ROLE rb_reader`; the e2e start-up clean-up through `rb gc`'s code; parity queries with a 30 s timeout.
+  - Files: `migrations/0006_reader_role.sql`, `rb-store/src/lib.rs`, `rb-store/src/age.rs`, `rb-cli/src/main.rs`, `rb-cli/tests/e2e.rs`.
+  - **Verify:** timeout, read-only, permission-denied, row-cap and retired-snapshot rows; e2e three times under 8 CPU burners, graph counts before and after recorded.
+- [ ] **5. AGE projection parity and `op`** (S6).
+  - *Derived:* `op` on edges with `attrs.op`; per-label load times under `rb index --profile` (printed only).
+  - *Invariants:* 6: whole vertex set and edge multiset.
+  - Files: `rb-store/src/age.rs`, `rb-cli/src/main.rs` (`--profile`), `rb-cli/tests/e2e.rs`.
+  - **Verify:** parity on every fixture; mutations (a skipped label, `certainty` as text) fail it; no dump change.
+- [ ] **6a. Prebuilt snapshot index** (S9).
+  - *Derived:* `SnapshotIndex` (immutable, `Send + Sync`) and per-question state; every question, the card's sections and Q3's roll-up take it; `table_deps`/`service_card` stop reloading the graph.
+  - *Invariants:* every golden unchanged; counted test (depth-1 callers independent of graph size).
+  - Files: `rb-store/src/code.rs`, `rb-store/src/path.rs`, `rb-store/src/rollup.rs`, `rb-store/src/card.rs`, `rb-store/src/query.rs`.
+  - **Verify:** units; e2e with **no** re-bless.
+- [ ] **6b. Guard rails complete** (S10).
+  - *Derived:* Q1 `tree` cap; Q2's `truncated` as limit names; the `work` cap counted in every build; D6's limits as one table of constants.
+  - Files: `rb-store/src/lib.rs` (`work`), `rb-store/src/code.rs`, `rb-store/src/path.rs`, `rb-store/src/rollup.rs`, `rb-cli/src/code.rs` (rendering).
+  - **Verify:** the random-graph property test (caps lowered and lifted); a hit row and a one-below row per limit; e2e (impact goldens' `truncated` line only if any golden truncates: classified).
+- [ ] **7a. `rb-api`: envelope, errors, moved resolution and renderers** (S11, S12).
+  - *Derived:* request parameters from a string map; D4 envelope; D5 error table; `pick_target`, `pick_endpoint`, `impact_json`, `render_json` moved from `rb-cli`.
+  - Files: new `crates/rb-api/Cargo.toml`, new `crates/rb-api/src/lib.rs`, `rb-cli/src/code.rs`, `rb-cli/src/path.rs`, `rb-cli/src/main.rs`.
+  - **Verify:** rb-api units (bounds, error kinds, candidate order); e2e text goldens unchanged.
+- [ ] **7b. JSON everywhere and `--snapshot`** (S11, D17).
+  - *Derived:* `rb callers --json` (with `entry`), `rb status --json`, `rb find --json`, `rb snapshots`; existing JSON outputs inside the envelope; `--snapshot` on every question.
+  - Files: `crates/rb-api/src/lib.rs`, `rb-cli/src/main.rs`, `rb-store/src/query.rs` (status as data), `rb-cli/tests/e2e.rs`.
+  - **Verify:** new JSON goldens; existing JSON goldens re-blessed after a diff showing only the envelope (classified); a question on a retired snapshot and on a deleted one.
+- [ ] **8. Pagination** (S15, D18).
+  - Files: `crates/rb-api/src/lib.rs`, `rb-store/src/query.rs` (`find` count and offset), `rb-cli/src/main.rs` (`--limit`/`--offset` where listed), `rb-cli/tests/e2e.rs`.
+  - **Verify:** concatenated pages equal the full list at limits 1, 7 and the maximum; counted test.
+- [ ] **9. `rb serve`** (S13; D1, D3, D7, D8; after F1 is confirmed).
+  - *Derived:* axum binding; pool of read-only connections; semaphore and queue; deadline; Host allow-list; snapshot cache with live-pointer check; `Server-Timing`.
+  - Files: `Cargo.toml` (workspace dependencies), new `crates/rb-server/Cargo.toml`, new `crates/rb-server/src/lib.rs`, `rb-cli/Cargo.toml`, `rb-cli/src/main.rs` (`rb serve`).
+  - **Verify:** rb-server units per rule (non-loopback bind, foreign `Host` → 421, no CORS, `OPTIONS` → 405, `POST` without JSON → 415, unknown parameter, busy, deadline via a test hook, read-only sessions, live-pointer change); `Cargo.lock` delta and licences recorded.
+- [ ] **10. API ≡ CLI** (S14).
+  - Files: new `crates/rb-cli/tests/api.rs` (shares the e2e helpers through a small `tests/common/mod.rs`), new `crates/rb-cli/tests/common/mod.rs`, `rb-cli/tests/e2e.rs` (helpers moved).
+  - **Verify:** byte equality per endpoint × fixture × parameter set; status ↔ exit-code table; the server-only renderer mutation fails the test.
+- [ ] **11. `rb diff`: exact sections** (S16).
+  - *Derived:* `rb_model::diff` (`GraphDiff`, `apply`, `invert`), canonical order.
+  - Files: new `rb-model/src/diff.rs`, `rb-model/src/lib.rs`.
+  - **Verify:** units per section; the apply, self-empty and inverse properties on generated graphs; counted growth.
+- [ ] **12. `rb diff`: summaries, CLI and API; M4a item 6** (S17, S18).
+  - *Derived:* endpoint, table-access and service-dependency summaries from the index functions; `rb diff` text and JSON; `GET …/diff`; `base: unresolved` on suffix edges (`PIPELINE = m5-1`).
+  - Files: new `rb-store/src/diff.rs`, `crates/rb-api/src/lib.rs`, `rb-cli/src/main.rs`, `rb-indexer/src/stitch.rs`, `rb-cli/tests/e2e.rs`.
+  - **Verify:** the two-commit polyglot history in the test, each summary row predicted before blessing `diff-polyglot.{txt,json}`; apply property on every fixture pair; the `base` units fail first; invariant-1 diff shows only `base` on suffix edges (classified).
+- [ ] **13a. Review fixes: carriers** (S19 a, b, f).
+  - Files: `rb-frameworks/src/clients.rs`, `rb-indexer/src/stitch.rs`, `rb-indexer/src/lib.rs` (scan wiring, `PIPELINE` bump).
+  - **Verify:** each row fails first, its control stays, its mutation bites; cost on the fixtures and the four M4b repositories against the phase-0 baseline (classified).
+- [ ] **13b. Review fixes: orphans and DI** (S19 c, d, e, g).
+  - Files: `rb-indexer/src/liveness.rs`, `rb-indexer/src/di.rs`, `rb-indexer/src/rta.rs` (the shared fragment set), `rb-indexer/src/lib.rs` (`PIPELINE` bump).
+  - **Verify:** as 13a; depth and cycle rows for rule (e); `ambiguous` over the registrant and the scanned bean.
+- [ ] **14. Residue records** (S20). No code: M4b 18, 20 and M4a 22's residue under this contract; the Maven duplicate check from phase 0; new forms from 13a/13b listed as M6 items.
+  - **Verify:** each record names its example and the claim's residue class.
+- [ ] **15. Fetch-phase egress and per-repository caches** (S21, S22; only if F2 is "in").
+  - *State:* `RECIPE` bumped; `rb.toml` `[scip] registries`.
+  - *Derived:* internal network, proxy container, no DNS, proxy variables and a generated `settings.xml`; caches per repository; Develocity cache flags.
+  - Files: new `docker/egress-proxy/Dockerfile` (with its `tinyproxy.conf` generated by `rb`, so one hand-edited file), `rb-scip/src/runner.rs`, `rb-scip/src/orchestrate.rs`, `rb-scip/src/jobs.rs`, `README.md`.
+  - Before the run: `df`, the image sizes, `docker context show`.
+  - **Verify:** the probe suite from a real fetch container; SCIP e2e through the proxy, no `skipping:`; spring-retry's `files without a document` before and after; fresh == cached.
+- [ ] **16. Benchmark set-up** (S23). Clone the two pinned repositories shallowly under the scratchpad (or `var/m5/` if the orchestrator says so), after `df` and the measured sizes; `cargo clean` of stale worktree builds if needed; release build of the phase-15 code.
+  - **Verify:** pins, line counts and disk recorded in the contract.
+- [ ] **17. Benchmark: indexing and storage** (S24). Full `--no-scip` (fresh, cached), SCIP (fetch and index timed apart), two incremental commits, `--profile`, `/usr/bin/time -l`, database and facts-cache sizes, AGE load and parity, retention delete time, fresh == cached, empty self-diff; `/usr/bin/sample` for any stage over its target.
+  - **Verify:** every number computed by a script; hardware and load recorded; gaps written with their profile.
+- [ ] **18. Benchmark: latency** (S25). `rb serve` warm; D14's sampling rule; p50/p95/max from a script; two runs; CLI cold times; truncations by limit; the work cap re-calibrated as an amendment if a default question hits it.
+  - **Verify:** numbers recorded with load averages; any miss has a `sample` profile.
+- [ ] **19. Benchmark: precision and carried measurements** (S26). `CONSUMES` samples, port-hole and other form counts, Gate A's cost by carrier, DI/RTA/orphan counts and samples, TS interface-method `IMPLEMENTS`; S19's cost there. Then remove clones, `m5_*` repositories, SCIP work directories and run `VACUUM`.
+  - **Verify:** samples read in the source; counts by script; disk back above its starting level.
+- [ ] **20. Records and review** (S27, S28).
+  - [ ] Determinism and invariant 1 (fixtures and the four M4b repositories) against the phase-0 baseline, classified.
+  - [ ] Records: contract amendments, measurement section, open items with milestones (and the weaker false results still possible); design §8.3/§8.4/§11/§12.5/§13/§14; README (`rb serve`, `rb diff`, `rb gc`, `rb cache prune`, `--keep`, `--timeout-ms`, `--json` everywhere, egress); IMPLEMENT.md; CHANGELOG; lessons.
+  - [ ] Full verification loop and the stub scan.
+  - [ ] Evaluator pass 1 (full review), fixed test-first as an amendment.
+  - [ ] Evaluator pass 2 (verification only, per the contract's closing bar).
+  - Commit after each verified phase.

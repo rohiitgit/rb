@@ -396,6 +396,21 @@ This file traces decisions from conversation to code. The design lives in `docs/
   Each has a recommendation.
 - No new dependency and no migration are planned.
 
-## M5 Scale & API: next
+## M5 Scale & API: contract written, not started
 
-- Not started. Scope in design §13 (REST API with guard rails, bulk AGE loading, snapshot retention, `rb diff`, benchmark on two large repositories); its contract is written next. Carried in from M4b: open items 3, 5, 6, 7, 10, 11, 15, 18, 19, 20, 21 and 23 of `tasks/contract-m4b.md` (the adversarial review of DI, RTA and orphans among them), plus M4a's adversarial carrier review.
+- **Contract:** `tasks/contract-m5.md` (2026-10-07), S1–S28 and invariants 1–11. Phases 0–20 are in `tasks/todo.md`. Nothing is built yet.
+- **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
+  - API bodies byte-identical to the matching `rb … --json` output (one request layer, `rb-api`);
+  - no silently partial answer: every cap names itself in `truncated`, the per-request budget is a deterministic operation count, and a wall-clock deadline gives an error, never a body;
+  - every snapshot read is one `REPEATABLE READ READ ONLY` transaction (today `load_graph` is three separate statements);
+  - retention never removes the live snapshot, keeps the `N` newest retired ones, and leaves one AGE graph per repository;
+  - `rb diff` reproduces B's dump lines from A's;
+  - the AGE projection equals the relational rows (whole vertex set and edge multiset);
+  - the server is loopback-only, Host-checked, CORS-free and read-only, with Cypher as the role `rb_reader`;
+  - the fetch phase reaches only allow-listed registries (fork F2).
+
+  The residue is listed per claim. Pass 1 is a full review; pass 2 is verification-only; §12.5 misses with profiles do not block (design §13's exit criterion).
+- **Decided in the contract (D1–D18):** axum on the existing `tokio` (fork F1); `rb-api` and `rb-server` crates behind `rb serve`; one prebuilt index per live snapshot in the server; the D4 envelope and D5 error/status table; limits from design §11.2 plus `tree`, `work` and `rows`; loopback only, no authentication in M5; read-only pooled connections; Cypher as `rb_reader` (migration 0006); retention with the AGE graph for the live snapshot only, one graph drop per transaction under a database-wide DDL lock, snapshot rows written inside the publish transaction; `rb diff` by natural identity with no move inference and no re-indexing; `--no-cache` writes the facts it extracted, `rb cache prune` and `rb gc` explicit; the benchmark protocol (hardware of record: Apple M4, 10 cores; Docker VM 10 CPUs, 7.75 GiB); the egress proxy design; `?snapshot=` on every question; offset pagination over immutable snapshots.
+- **Not in M5:** `POST /v1/repos/{repo}/index`, the `RB_SERVER` thin client, authentication, partition-per-snapshot, edge-delta loading, move detection, and the precision items M4a 16/19/20 and M4b 5/6/7/19 (measured on the benchmark, changed in M6, fork F5).
+- **Forks for the orchestrator:** F1 HTTP crate (axum vs `tiny_http`), F2 egress in M5 vs M6, F3 drop retired snapshots' AGE graphs, F4 no move detection, F5 precision items to M6, F6 benchmark repositories (apache/shardingsphere and mattermost/mattermost recommended). Each has a recommendation.
+- **New dependencies planned:** the axum stack only (D1), with a measured threshold before phase 9. One migration (0006, a read-only role).
