@@ -422,6 +422,11 @@ pub struct FileFacts {
     /// class or function `export default class X`/`function f` declares (contract M4b S1).
     #[serde(default)]
     pub default_export: Option<String>,
+    /// TS/JS: the module specifiers whose whole module object the file takes, in source order:
+    /// `import * as m`, `export * from`, `export * as m from`, `require(…)` and `import(…)`;
+    /// `*` for a `require`/`import` whose argument is not a plain string (evaluator pass 1, Y7).
+    #[serde(default)]
+    pub module_objects: Vec<String>,
     /// Java and TS/JS: every identifier, type identifier and property-name token's text,
     /// mapped to the roles it occurs in in this file, plus every whole word of a string
     /// literal (contract M4b S1). No spans.
@@ -570,6 +575,11 @@ pub struct Binding {
     /// `type_name` is then empty, as before.
     #[serde(default)]
     pub array: bool,
+    /// A type argument, or an array's element, has type arguments of its own
+    /// (`List<Store<String>>`), which [`Binding::type_args`] does not keep (evaluator pass 1,
+    /// Y5).
+    #[serde(default)]
+    pub nested_type_args: bool,
     /// Java: the declaration's modifiers as written, sorted (as [`Definition::modifiers`]:
     /// `final`, `static`, `private`, …), for fields, locals and parameters (contract M4b
     /// amendment 6).
@@ -702,6 +712,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                 parameter: b.parameter.map(|p| u32::try_from(p).unwrap_or(u32::MAX)),
                 type_args: b.type_args,
                 array: b.array,
+                nested_type_args: b.nested_type_args,
                 modifiers: b.modifiers,
                 initialised: b.initialised,
             }
@@ -721,7 +732,13 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
     let imports = imports::imports(language, root, source);
     let declared: HashSet<std::ops::Range<usize>> =
         raw_defs.iter().map(|d| d.name.byte_range()).collect();
-    let mentions = mentions::mentions(language, root, source, &declared);
+    let defined: HashSet<std::ops::Range<usize>> = raw_defs
+        .iter()
+        .zip(&kept)
+        .filter(|(_, k)| k.is_some())
+        .map(|(d, _)| d.name.byte_range())
+        .collect();
+    let mentions = mentions::mentions(language, root, source, &declared, &defined);
     let name_tokens = tokens::tokens(
         language,
         root,
@@ -750,6 +767,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         chains,
         name_tokens,
         default_export: imports::default_export(language, root, source),
+        module_objects: imports::module_objects(language, root, source),
         mentions,
     })
 }

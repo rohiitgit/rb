@@ -1,4 +1,4 @@
 callers of com/acme/auth/DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:21  [auth-service]
-precision=rta
+precision=cha
   com/acme/auth/AuthController#login().  src/main/java/com/acme/auth/AuthController.java:31  [auth-service]  dispatch, via dispatch  (entry: endpoint POST /auth/api/v1/login)
 certainty: dispatch 1

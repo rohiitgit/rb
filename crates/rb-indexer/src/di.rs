@@ -336,6 +336,7 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
             unread_by_type.entry(t).or_default().push(service.as_str());
         }
     }
+    let registrants = registrants(index, &per_file);
 
     let mut out = Resolution {
         fragments: per_file
@@ -390,6 +391,7 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                 by_type: &by_type,
                 by_return: &by_return,
                 unread_by_type: &unread_by_type,
+                registrants: &registrants,
                 surface,
                 gate_m: &gate_m,
             };
@@ -424,6 +426,8 @@ struct PointContext<'c, 'a> {
     by_type: &'c BTreeMap<Sym<'a>, Vec<usize>>,
     by_return: &'c BTreeMap<&'c str, Vec<usize>>,
     unread_by_type: &'c BTreeMap<Sym<'a>, Vec<&'c str>>,
+    /// Per type: the names that can register a bean of it (S6 gate M, evaluator pass 1, Y4).
+    registrants: &'c BTreeMap<Sym<'a>, BTreeSet<&'a str>>,
     surface: bool,
     gate_m: &'c dyn Fn(&str) -> bool,
 }
@@ -435,6 +439,57 @@ fn site_diagnostic(kind: &str, path: &str, span: Span, ty: &str, detail: &str) -
         span: Some(span),
         detail: json!({ "type": ty, "detail": detail }),
     }
+}
+
+/// Per type, the names whose mention may register a bean of it although no scan root says so
+/// (S6 gate M; evaluator pass 1, Y4): every main-source class assignable to it, and the class
+/// declaring any main-source `@Bean` method whose return type, or a type its body creates, is
+/// assignable to it (an `@Import(X.class)` of a class outside the roots, of a configuration
+/// class, or of a class with lite `@Bean` methods).
+fn registrants<'a>(
+    index: &Index<'a>,
+    per_file: &[(&'a str, &'a FileFacts, FileDi)],
+) -> BTreeMap<Sym<'a>, BTreeSet<&'a str>> {
+    let mut out: BTreeMap<Sym<'a>, BTreeSet<&'a str>> = BTreeMap::new();
+    for &(path, facts, _) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+        let defs = &facts.definitions;
+        for (i, def) in defs.iter().enumerate() {
+            work::tick(1);
+            let (start, name): (Vec<Sym<'a>>, &'a str) = match def.kind {
+                rb_syntax::DefKind::Class => (vec![(path, i)], def.name.as_str()),
+                rb_syntax::DefKind::Method
+                    if def.decorations.iter().any(|d| {
+                        rb_frameworks::routes::is_annotation(
+                            facts,
+                            d,
+                            "org.springframework.context.annotation",
+                            "Bean",
+                        )
+                    }) =>
+                {
+                    let Some(class) = def.parent else { continue };
+                    let written = def.return_type.as_deref().unwrap_or_default();
+                    let head = written.split('<').next().unwrap_or_default().trim();
+                    let mut start = index.type_candidates(path, def.parent, head);
+                    start.extend(
+                        facts
+                            .references
+                            .iter()
+                            .filter(|r| {
+                                r.kind == rb_syntax::RefKind::Class && r.enclosing == Some(i)
+                            })
+                            .flat_map(|r| index.type_candidates(path, Some(i), &r.name)),
+                    );
+                    (start, defs[class].name.as_str())
+                }
+                _ => continue,
+            };
+            for t in assignable(index, &start) {
+                out.entry(t).or_default().insert(name);
+            }
+        }
+    }
+    out
 }
 
 /// The bean's class or interface name (gate M), or a `@Bean` method's return type.
@@ -585,6 +640,10 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         || candidates
             .iter()
             .any(|&i| (ctx.gate_m)(&bean_name_for_gate(&ctx.beans[i])))
+        || types
+            .iter()
+            .flat_map(|t| ctx.registrants.get(t).into_iter().flatten())
+            .any(|name| (ctx.gate_m)(name))
     {
         gates.insert("mention");
     }
@@ -605,6 +664,11 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         by_name = true;
     }
     let collection = p.wrapper == Some(Wrapper::Collection);
+    // `@Primary` and name fallback choose among the beans Spring's candidate filters let
+    // through; with type arguments it matches generically, and an unread annotation may be a
+    // qualifier, neither of which is modelled, so neither may pick one bean (evaluator pass 1,
+    // Y5, Y6).
+    let undecided = p.generic || !p.annotations.is_empty();
     if let Some(q) = &p.qualifier {
         chosen.retain(|&i| named(i, q) || ctx.beans[i].bean.qualifiers.iter().any(|x| x == q));
         qualifier = Some(q.clone());
@@ -621,7 +685,7 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             return;
         }
     }
-    if !collection && chosen.len() > 1 {
+    if !collection && !undecided && chosen.len() > 1 {
         let primaries: Vec<usize> = chosen
             .iter()
             .copied()
@@ -633,7 +697,7 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             resolution = "primary";
         }
     }
-    if !collection && chosen.len() > 1 {
+    if !collection && !undecided && chosen.len() > 1 {
         let hits: Vec<usize> = chosen
             .iter()
             .copied()
@@ -663,10 +727,13 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         }
         return;
     }
-    if collection {
-        resolution = "collection";
-    } else if chosen.len() > 1 {
+    // A collection of a generic element holds only the generically matching beans, which
+    // are not known: its candidates are ambiguous too.
+    let several = chosen.len() > 1 && (!collection || p.generic);
+    if several {
         resolution = "ambiguous";
+    } else if collection {
+        resolution = "collection";
     }
     if !collection && chosen.len() > MAX_CANDIDATES {
         bucket(out, "too_ambiguous");
@@ -681,7 +748,6 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
     // Conditionals among the consumer, the candidates and those narrowing removed.
     let conditional =
         consumer_conditional || candidates.iter().any(|&i| ctx.beans[i].bean.conditional);
-    let several = !collection && chosen.len() > 1;
     let certainty = if several {
         Certainty::Ambiguous
     } else {
@@ -1229,6 +1295,142 @@ mod tests {
                 r#"Svc# -> UserRepository# [heuristic] {"origin":"spring_data","resolution":"unique","sites":1,"via":"constructor"}"#,
             ]
         );
+    }
+
+    /// Evaluator pass 1, Y4: a class (or `@Bean` method) assignable to the injected type that
+    /// is no candidate but whose registration the scan roots cannot decide (named by a class
+    /// literal: `@Import`) caps the point by `mention`, never a plain `unique`.
+    #[test]
+    fn registrations_outside_the_candidates_cap_by_mention() {
+        let app = |import: &str| {
+            format!(
+                "package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.context.annotation.Import;\n@SpringBootApplication {import} public class App {{}}\n"
+            )
+        };
+        let main = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
+        );
+        let edge = |r: &Run| -> String {
+            assert_eq!(r.edges.len(), 1, "{:?}", r.edges);
+            r.edges[0].clone()
+        };
+        for (other, import) in [
+            (
+                "package com.other;\nimport org.springframework.context.annotation.Primary;\n@Primary public class SmsNotifier implements com.acme.Notifier {}\n",
+                "@Import(com.other.SmsNotifier.class)",
+            ),
+            (
+                "package com.other;\nimport org.springframework.stereotype.Component;\n@Component public class SmsNotifier implements com.acme.Notifier {}\n",
+                "@Import(com.other.SmsNotifier.class)",
+            ),
+            (
+                "package com.other;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.context.annotation.Primary;\n@Configuration public class SmsConfig { @Bean @Primary com.acme.Notifier sms() { return null; } }\n",
+                "@Import(com.other.SmsConfig.class)",
+            ),
+            (
+                "package com.other;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Primary;\npublic class SmsConfig { @Bean @Primary com.acme.Notifier sms() { return null; } }\n",
+                "@Import(com.other.SmsConfig.class)",
+            ),
+        ] {
+            let app = app(import);
+            let r = run(&[
+                ("src/main/java/com/acme/App.java", &app),
+                ("src/main/java/com/acme/A.java", &main),
+                ("src/main/java/com/other/S.java", other),
+            ]);
+            let e = edge(&r);
+            assert!(
+                e.contains("EmailNotifier#") && e.contains(r#""capped_by":["mention"]"#),
+                "{other}: {e}"
+            );
+            assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]), "{other}");
+        }
+        // Control: the same class, named nowhere, registers nothing.
+        let app = app("");
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app),
+            ("src/main/java/com/acme/A.java", &main),
+            (
+                "src/main/java/com/other/S.java",
+                "package com.other;\nimport org.springframework.context.annotation.Primary;\n@Primary public class SmsNotifier implements com.acme.Notifier {}\n",
+            ),
+        ]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]), "{:?}", r.edges);
+    }
+
+    /// Evaluator pass 1, Y5, Y6, Y13: generic points, JSR-330 `@Named`, unread point
+    /// annotations and two `@Primary` beans never let `@Primary` pick one bean.
+    #[test]
+    fn primary_never_decides_what_the_facts_cannot() {
+        let several = |r: &Run, n: usize| {
+            assert_eq!(r.edges.len(), n, "{:?}", r.edges);
+            assert!(
+                r.edges.iter().all(|e| e.contains("[ambiguous]")
+                    && e.contains(r#""resolution":"ambiguous""#)
+                    && !e.contains("primary")),
+                "{:?}",
+                r.edges
+            );
+        };
+        // Y5: generically distinct candidates.
+        let stores = "interface Store<T> {}\n@Component class StringStore implements Store<String> {}\n@Component @Primary class IntStore implements Store<Integer> {}\n";
+        let r = one(&format!(
+            "{stores}@Service class Catalog {{ Catalog(Store<String> store) {{}} }}\n"
+        ));
+        several(&r, 2);
+        assert!(
+            r.edges[0].contains(r#""capped_by":["generic"]"#),
+            "{:?}",
+            r.edges
+        );
+        // A wrapper whose element has type arguments of its own.
+        let r = one(&format!(
+            "{stores}@Service class Catalog {{ Catalog(Optional<Store<String>> store) {{}} }}\n"
+        ));
+        several(&r, 2);
+        let r = one(&format!(
+            "{stores}@Service class Catalog {{ Catalog(List<Store<String>> stores) {{}} }}\n"
+        ));
+        assert_eq!(
+            r.buckets,
+            BTreeMap::from([("ambiguous", 1)]),
+            "{:?}",
+            r.edges
+        );
+        assert!(
+            r.edges.iter().all(|e| e.contains("[ambiguous]")),
+            "{:?}",
+            r.edges
+        );
+        // Y6: `@Named` is a qualifier at the point, and names (and makes) the bean.
+        for inject in ["jakarta.inject", "javax.inject"] {
+            let codecs = format!(
+                "import {inject}.Named;\ninterface Codec {{}}\n@Component @Named(\"fast\") class FastCodec implements Codec {{}}\n@Component @Primary class SlowCodec implements Codec {{}}\n@Service class Encoder {{ Encoder(@Named(\"fast\") Codec codec) {{}} }}\n"
+            );
+            let r = one(&codecs);
+            assert_eq!(
+                r.edges,
+                [
+                    r#"Encoder# -> FastCodec# [heuristic] {"origin":"stereotype","qualifier":"fast","resolution":"qualifier","sites":1,"via":"constructor"}"#
+                ],
+                "{inject}"
+            );
+            let bare = codecs.replace("@Component @Named", "@Named");
+            let r = one(&bare);
+            assert_eq!(r.edges.len(), 1, "{:?}", r.edges);
+            assert!(r.edges[0].contains("FastCodec#"), "{:?}", r.edges);
+        }
+        // An unread annotation on the point (a custom qualifier, say) blocks `@Primary`.
+        let r = one(
+            "interface Codec {}\n@Component @Fast class FastCodec implements Codec {}\n@Component @Primary class SlowCodec implements Codec {}\n@Service class Encoder { Encoder(@Fast Codec codec) {} }\n",
+        );
+        several(&r, 2);
+        // Y13: two `@Primary` beans and a third: ambiguous over all three.
+        let r = one(
+            "interface H {}\n@Component @Primary class P1 implements H {}\n@Component @Primary class P2 implements H {}\n@Component class P3 implements H {}\n@Service class Svc { Svc(H h) {} }\n",
+        );
+        several(&r, 3);
+        assert!(r.edges.iter().all(|e| e.contains(r#""candidates":3"#)));
     }
 
     /// S8: repository and Feign roots; a stereotype outside the scan roots.

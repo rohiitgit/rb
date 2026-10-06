@@ -75,6 +75,62 @@ pub(crate) fn default_export(language: Language, root: Node<'_>, source: &[u8]) 
         })
 }
 
+/// TS/JS: the module specifiers whose module object is taken (evaluator pass 1, Y7): a
+/// namespace import, `export *` (with or without `as`), and `require`/`import()` calls, whose
+/// argument is recorded as `*` when it is not a plain string literal.
+pub(crate) fn module_objects(language: Language, root: Node<'_>, source: &[u8]) -> Vec<String> {
+    if !matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript
+    ) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut c = node.walk();
+        let children: Vec<Node<'_>> = node.children(&mut c).collect();
+        match node.kind() {
+            "import_statement" | "export_statement" => {
+                let star = children.iter().any(|n| {
+                    n.kind() == "*"
+                        || n.kind() == "namespace_export"
+                        || (n.kind() == "import_clause" && {
+                            let mut cc = n.walk();
+                            n.named_children(&mut cc)
+                                .any(|p| p.kind() == "namespace_import")
+                        })
+                });
+                if star && let Some(spec) = node.child_by_field_name("source") {
+                    out.push(unquote(spec, source));
+                }
+            }
+            "call_expression" => {
+                let callee = node.child_by_field_name("function");
+                let loads = callee.is_some_and(|f| {
+                    f.kind() == "import"
+                        || (f.kind() == "identifier" && text(f, source) == "require")
+                });
+                if loads {
+                    let first = node.child_by_field_name("arguments").and_then(|a| {
+                        let mut ac = a.walk();
+                        a.named_children(&mut ac)
+                            .find(|n| !matches!(n.kind(), "comment"))
+                    });
+                    let plain = first.filter(|a| {
+                        a.kind() == "string"
+                            || (a.kind() == "template_string" && a.named_child_count() == 0)
+                    });
+                    out.push(plain.map_or_else(|| "*".to_owned(), |a| unquote(a, source)));
+                }
+            }
+            _ => {}
+        }
+        stack.extend(children.into_iter().rev());
+    }
+    out
+}
+
 fn import(node: Node<'_>, module: String) -> Import {
     Import {
         module,
@@ -342,5 +398,45 @@ mod default_export_tests {
             Some("r")
         );
         assert_eq!(of(Language::Java, "class K {}\n"), None);
+    }
+}
+
+/// Evaluator pass 1, Y7: the TS/JS module specifiers whose whole module object a file takes.
+#[cfg(test)]
+mod module_object_tests {
+    use crate::{Language, extract};
+
+    #[test]
+    fn module_objects_by_form() {
+        let of = |language, src: &str| extract(language, src.as_bytes()).unwrap().module_objects;
+        for (src, want) in [
+            (
+                "import * as commands from './commands/index';\n",
+                vec!["./commands/index"],
+            ),
+            (
+                "export * from './a';\nexport * as b from './b';\n",
+                vec!["./a", "./b"],
+            ),
+            ("const c = require('./c');\n", vec!["./c"]),
+            (
+                "async function f() { const d = await import(\"./d\"); }\n",
+                vec!["./d"],
+            ),
+            ("const e = require(dir + '/e');\n", vec!["*"]),
+            ("const g = await import(`./${name}`);\n", vec!["*"]),
+            (
+                "import { a } from './a';\nimport b from './b';\nexport { c } from './c';\n",
+                vec![],
+            ),
+            ("const r = other('./x');\n", vec![]),
+        ] {
+            assert_eq!(of(Language::TypeScript, src), want, "{src}");
+        }
+        assert_eq!(
+            of(Language::JavaScript, "module.exports = require('./x');\n"),
+            ["./x"]
+        );
+        assert!(of(Language::Java, "class K { Object o = require(\"x\"); }\n").is_empty());
     }
 }

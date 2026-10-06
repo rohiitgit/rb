@@ -46,6 +46,10 @@ const STEREOTYPES: &[(&str, &str)] = &[
     (CONTEXT, "Configuration"),
     (BOOT_AUTOCONFIGURE, "SpringBootApplication"),
     (BOOT, "SpringBootConfiguration"),
+    // JSR-330: Spring's component scan includes `@Named` classes, named by its value
+    // (evaluator pass 1, Y6).
+    ("jakarta.inject", "Named"),
+    ("javax.inject", "Named"),
 ];
 
 /// Where a bean comes from (`INJECTS`' `origin`).
@@ -381,12 +385,18 @@ fn literals(d: &Decoration, keys: &[&str]) -> Result<Vec<String>, ()> {
     Ok(out)
 }
 
+/// The literal of `@Qualifier`, or of JSR-330's `@Named`, which Spring reads as a qualifier
+/// (evaluator pass 1, Y6).
 fn qualifier_of(facts: &FileFacts, decorations: &[Decoration]) -> Option<String> {
     decorations
         .iter()
-        .find(|d| is_annotation(facts, d, BEANS_ANNOTATION, "Qualifier"))
+        .find(|d| is_qualifier(facts, d))
         .and_then(|d| literals(d, &["value"]).ok())
         .and_then(|v| v.into_iter().next())
+}
+
+fn is_qualifier(facts: &FileFacts, d: &Decoration) -> bool {
+    is_annotation(facts, d, BEANS_ANNOTATION, "Qualifier") || is_any(facts, d, INJECT, "Named")
 }
 
 fn has(facts: &FileFacts, decorations: &[Decoration], package: &str, name: &str) -> bool {
@@ -787,7 +797,7 @@ fn point(
         .filter(|d| {
             !is_inert(facts, d)
                 && !has_any_inject(facts, std::slice::from_ref(*d))
-                && !is_annotation(facts, d, BEANS_ANNOTATION, "Qualifier")
+                && !is_qualifier(facts, d)
                 && !is_annotation(facts, d, CONTEXT, "Lazy")
         })
         .map(|d| d.name.clone())
@@ -812,11 +822,14 @@ const JAVA_UTIL: &[&str] = &["java.util"];
 
 /// The wrapper, injected type and `generic` flag of a binding's declared type (D9).
 fn unwrap(facts: &FileFacts, b: &Binding) -> Option<(Option<Wrapper>, String, bool)> {
+    // A wrapper's element with type arguments of its own is a generic point too (evaluator
+    // pass 1, Y5).
+    let nested = b.nested_type_args;
     if b.array {
         return Some((
             Some(Wrapper::Collection),
             b.type_args.first()?.clone(),
-            false,
+            nested,
         ));
     }
     let t = b.type_name.as_str();
@@ -826,14 +839,14 @@ fn unwrap(facts: &FileFacts, b: &Binding) -> Option<(Option<Wrapper>, String, bo
         .any(|n| is_type(facts, t, JAVA_UTIL, n))
     {
         return Some(match one() {
-            Some(e) => (Some(Wrapper::Collection), e, false),
+            Some(e) => (Some(Wrapper::Collection), e, nested),
             None => (None, t.to_owned(), true),
         });
     }
     if is_type(facts, t, JAVA_UTIL, "Map") {
         return Some(match b.type_args.as_slice() {
             [k, v] if is_scalar(k) && simple(k) == "String" => {
-                (Some(Wrapper::Collection), v.clone(), false)
+                (Some(Wrapper::Collection), v.clone(), nested)
             }
             _ => (None, t.to_owned(), true),
         });
@@ -844,7 +857,7 @@ fn unwrap(facts: &FileFacts, b: &Binding) -> Option<(Option<Wrapper>, String, bo
         || is_type(facts, t, INJECT, "Provider");
     if optional {
         return Some(match one() {
-            Some(e) => (Some(Wrapper::Optional), e, false),
+            Some(e) => (Some(Wrapper::Optional), e, nested),
             None => (None, t.to_owned(), true),
         });
     }

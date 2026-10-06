@@ -74,8 +74,12 @@ use serde_json::{Value, json};
 /// Express mounts of default imports (S19) and catch-all endpoints only for named hosts (S20);
 /// `m4b-di-6` injected Spring clients' bases from the `@Bean` method DI resolves (S21);
 /// `m4b-di-7` an external injected type matches a `@Bean` return type only when the names as
-/// written agree (amendment 19).
-pub const PIPELINE: &str = "m4b-di-7";
+/// written agree (amendment 19); `m4b-di-8` evaluator pass 1's (amendment 21: RTA reads binary
+/// names, every text file and module objects, a supertype of a non-definition keeps its base;
+/// orphan rule (e) walks the supertype chain; DI caps by every assignable registration, never
+/// narrows a generic or annotated point by `@Primary`, reads `@Named`; duplicate Maven
+/// versions, npm aliases and `go.mod` replaces).
+pub const PIPELINE: &str = "m4b-di-8";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -800,6 +804,7 @@ pub fn assemble(
             service_of: &service_of,
             deployable: &deployable,
             unparsed: &content.unparsed,
+            words: &content.words,
             fragments: &fragments,
         },
         &considered,

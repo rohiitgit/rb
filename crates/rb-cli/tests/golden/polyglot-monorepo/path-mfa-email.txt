@@ -1,5 +1,5 @@
 Request path: POST /internal/mfa/email  [notification]
-precision=rta
+precision=cha
 Statically possible paths from the call graph and HTTP stitching, not a trace of one request.
 UPSTREAM
   client MfaClient#sendCode().  services/auth/src/main/java/com/acme/auth/MfaClient.java:9  [auth-service]  [synthetic]  (host notification)

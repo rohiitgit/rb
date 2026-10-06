@@ -13,6 +13,7 @@ use rb_syntax::{DefKind, FileFacts, Language, MentionRole};
 use serde_json::{Value, json};
 
 use crate::di::is_test_path;
+use crate::liveness::Words;
 
 type Sym<'a> = (&'a str, usize);
 
@@ -37,6 +38,9 @@ pub(crate) struct Inputs<'a> {
     /// Deployable services (`role = service`).
     pub deployable: &'a BTreeSet<String>,
     pub unparsed: &'a RawScan,
+    /// The whole-word occurrences of the definitions' names in every non-binary file (S9 (d),
+    /// evaluator pass 1, Y14).
+    pub words: &'a Words,
     /// The interfaces Spring Data repositories extend, by simple name (fragments, D3).
     pub fragments: &'a BTreeSet<String>,
 }
@@ -112,15 +116,46 @@ pub(crate) fn prove<'a>(inputs: &Inputs<'a>, considered: &BTreeSet<Sym<'a>>) -> 
                 })
             });
     }
-    let unparsed_word =
-        |name: &str| inputs.unparsed.words_unread || inputs.unparsed.words.contains(name);
+    // (d): the name in a file without mention facts (an unparsed file, a Python or Go file,
+    // prose, a lock file), or anywhere when the word scan cannot tell.
+    let unparsed_word = |name: &str| {
+        inputs.unparsed.words_unread
+            || inputs.unparsed.words.contains(name)
+            || inputs.words.paths_of(name).is_none_or(|paths| {
+                paths.iter().any(|p| {
+                    inputs
+                        .files
+                        .get(p)
+                        .is_none_or(|(language, _)| !parsed_by_rta(*language))
+                })
+            })
+    };
+    // Module objects taken anywhere (Y7): `(importing file, specifier)`.
+    let module_objects: Vec<(&str, &str)> = inputs
+        .files
+        .iter()
+        .filter(|(_, (language, _))| parsed_by_rta(*language))
+        .flat_map(|(&path, (_, facts))| {
+            facts.module_objects.iter().map(move |m| (path, m.as_str()))
+        })
+        .collect();
 
     let mut types: BTreeMap<Sym<'a>, Option<&'static str>> = BTreeMap::new();
     for &t in considered {
         work::tick(1);
         types.insert(
             t,
-            own_rule(inputs, t, &roles, &static_imported, surface, &unparsed_word),
+            own_rule(
+                inputs,
+                t,
+                &Seen {
+                    roles: &roles,
+                    static_imported: &static_imported,
+                    module_objects: &module_objects,
+                    surface,
+                    unparsed_word: &unparsed_word,
+                },
+            ),
         );
     }
 
@@ -165,15 +200,66 @@ pub(crate) fn prove<'a>(inputs: &Inputs<'a>, considered: &BTreeSet<Sym<'a>>) -> 
     Proof { types }
 }
 
-/// The first of rules (a)–(h) that keeps `t`, or `None`.
-fn own_rule(
-    inputs: &Inputs<'_>,
-    (path, i): Sym<'_>,
-    roles: &BTreeMap<&str, BTreeSet<MentionRole>>,
-    static_imported: &BTreeSet<&str>,
+/// Whether the module specifier `spec`, written in `from`, may name the file `path` (Y7). A
+/// relative specifier is resolved as Node and TypeScript do, extensions and `index` included;
+/// any other (a package, a path alias) may name a file whose stem or any directory is its last
+/// segment; `*` (a computed `require`/`import()`) may name any file.
+fn module_may_name(from: &str, spec: &str, path: &str) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        ".d.ts", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
+    ];
+    let strip = |p: &str| -> String {
+        let p = p.trim_end_matches('/');
+        let p = EXTENSIONS
+            .iter()
+            .find_map(|e| p.strip_suffix(e))
+            .unwrap_or(p);
+        p.strip_suffix("/index").unwrap_or(p).to_owned()
+    };
+    if spec == "*" {
+        return true;
+    }
+    let target = strip(path);
+    if spec == "." || spec == ".." || spec.starts_with("./") || spec.starts_with("../") {
+        let mut parts: Vec<&str> = from.split('/').collect();
+        parts.pop();
+        for seg in spec.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return false;
+                    }
+                }
+                s => parts.push(s),
+            }
+        }
+        return strip(&parts.join("/")) == target;
+    }
+    let spec = strip(spec);
+    let last = spec.rsplit('/').next().unwrap_or(&spec);
+    !last.is_empty() && target.split('/').any(|segment| segment == last)
+}
+
+/// What the repository-wide scans found, for [`own_rule`].
+struct Seen<'s> {
+    roles: &'s BTreeMap<&'s str, BTreeSet<MentionRole>>,
+    static_imported: &'s BTreeSet<&'s str>,
+    /// `(importing file, specifier)` of every module object taken (Y7).
+    module_objects: &'s [(&'s str, &'s str)],
     surface: bool,
-    unparsed_word: &dyn Fn(&str) -> bool,
-) -> Option<&'static str> {
+    unparsed_word: &'s dyn Fn(&str) -> bool,
+}
+
+/// The first of rules (a)–(h) that keeps `t`, or `None`.
+fn own_rule(inputs: &Inputs<'_>, (path, i): Sym<'_>, seen: &Seen<'_>) -> Option<&'static str> {
+    let Seen {
+        roles,
+        static_imported,
+        module_objects,
+        surface,
+        unparsed_word,
+    } = seen;
     let (language, facts) = inputs.files[path];
     let def = &facts.definitions[i];
     if !parsed_by_rta(language) {
@@ -185,7 +271,7 @@ fn own_rule(
     if !inputs.deployable.contains(&(inputs.service_of)(path)) {
         return Some("library");
     }
-    if surface {
+    if *surface {
         return Some("surface");
     }
     let name = def.name.as_str();
@@ -194,6 +280,12 @@ fn own_rule(
         r.iter()
             .any(|x| *x != MentionRole::String && !ALLOWED.contains(x))
     }) || static_imported.contains(name)
+        // A TS/JS module whose whole object is taken: its exports are used under no name
+        // (`Object.values(ns)`), so every type it declares counts as mentioned (Y7).
+        || (language != Language::Java
+            && module_objects
+                .iter()
+                .any(|(from, spec)| module_may_name(from, spec, path)))
     {
         return Some("mention");
     }
@@ -334,6 +426,23 @@ mod tests {
     /// Indexes `files` (paths under `svc/` are a deployable service, under `lib/` a library),
     /// with `unparsed` as the raw scan of the files without facts.
     fn run_with(files: &[(&str, &str)], unparsed: RawScan) -> Run {
+        run_full(files, &[], unparsed)
+    }
+
+    /// As [`run_with`], with `texts` as further files without facts for the word scan.
+    fn run_full(files: &[(&str, &str)], texts: &[(&str, &str)], unparsed: RawScan) -> Run {
+        let names: std::collections::HashSet<&str> = files
+            .iter()
+            .flat_map(|(_, src)| src.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+            .filter(|w| !w.is_empty())
+            .collect();
+        let words = crate::liveness::scan_words(
+            files
+                .iter()
+                .chain(texts)
+                .map(|(p, t)| (*p, Some(t.as_bytes()))),
+            &names,
+        );
         let facts: Vec<(String, Language, FileFacts)> = files
             .iter()
             .map(|(p, src)| {
@@ -381,6 +490,7 @@ mod tests {
                 service_of: &service_of,
                 deployable: &deployable,
                 unparsed: &unparsed,
+                words: &words,
                 fragments: &resolution.fragments,
             },
             &considered,
@@ -406,6 +516,15 @@ mod tests {
 
     fn run(files: &[(&str, &str)]) -> Run {
         run_with(files, RawScan::default())
+    }
+
+    /// As [`run`], with `texts` as further files without facts (raw scan and word scan).
+    fn run_texts(files: &[(&str, &str)], texts: &[(&str, &str)]) -> Run {
+        let mut raw = RawScan::default();
+        for (path, text) in texts {
+            raw.merge(rb_frameworks::clients::raw_scan(path, Some(text)));
+        }
+        run_full(files, texts, raw)
     }
 
     /// `src -> dst` of the `IMPLEMENTS` edges flagged `impl_instantiated: false`.
@@ -646,6 +765,160 @@ mod tests {
         );
     }
 
+    /// Evaluator pass 1, Y1 and Y14: a nested class's binary name in a string or in a
+    /// `META-INF/services` file, and its name in any non-binary file that has no Java/TS/JS
+    /// mention facts (Python, Go, `.txt`, a lock file), keep it (`string`).
+    #[test]
+    fn binary_names_and_every_text_file_keep_a_type() {
+        let main = "svc/src/main/java/com/acme/Holder.java";
+        let holder = "package com.acme;\ninterface Greeter { String greet(); }\nclass Holder { static class LoadedImpl implements Greeter { public String greet() { return \"l\"; } } }\n";
+        let rule = |files: &[(&str, &str)], texts: &[(&str, &str)]| -> String {
+            run_texts(files, texts)
+                .types
+                .into_iter()
+                .find(|t| t.starts_with("LoadedImpl"))
+                .unwrap()
+        };
+        assert_eq!(rule(&[(main, holder)], &[]), "LoadedImpl: proven");
+        let forname =
+            "package com.acme;\nclass App { Object o = load(\"com.acme.Holder$LoadedImpl\"); }\n";
+        assert_eq!(
+            rule(
+                &[
+                    (main, holder),
+                    ("svc/src/main/java/com/acme/App.java", forname)
+                ],
+                &[]
+            ),
+            "LoadedImpl: string"
+        );
+        for (path, text) in [
+            (
+                "svc/src/main/resources/META-INF/services/com.acme.Greeter",
+                "com.acme.Holder$LoadedImpl\n",
+            ),
+            ("svc/plugins.txt", "Holder.LoadedImpl\n"),
+            ("svc/package-lock.json", "{\"LoadedImpl\": 1}"),
+            ("svc/tools/run.py", "cls = 'LoadedImpl'\n"),
+            ("svc/tools/main.go", "package main\n// LoadedImpl\n"),
+        ] {
+            assert_eq!(
+                rule(&[(main, holder)], &[(path, text)]),
+                "LoadedImpl: string",
+                "{path}"
+            );
+        }
+        // A Python or Go file is parsed, and still counts.
+        assert_eq!(
+            rule(
+                &[(main, holder), ("svc/tools/run.py", "x = 'LoadedImpl'\n")],
+                &[]
+            ),
+            "LoadedImpl: string"
+        );
+    }
+
+    /// Evaluator pass 1, Y2: a base whose only subclass is no definition (a Java local class
+    /// in a lambda or in an anonymous class body, a TS class expression) is kept.
+    #[test]
+    fn subclasses_that_are_no_definitions_keep_their_base() {
+        let base = "package com.acme;\ninterface Greeter { String greet(); }\nclass LambdaBase implements Greeter { public String greet() { return \"b\"; } }\n";
+        let main = "svc/src/main/java/com/acme/Base.java";
+        assert_eq!(run(&[(main, base)]).types, ["LambdaBase: proven"]);
+        for user in [
+            "package com.acme;\nclass App { Object s = (java.util.function.Supplier<Greeter>) () -> { class Local extends LambdaBase {} return new Local(); }; }\n",
+            "package com.acme;\nclass App { Object r = new Runnable() { public void run() { class Local extends LambdaBase {} new Local(); } }; }\n",
+        ] {
+            let r = run(&[(main, base), ("svc/src/main/java/com/acme/App.java", user)]);
+            assert!(
+                r.types.contains(&"LambdaBase: mention".to_owned()),
+                "{user}: {:?}",
+                r.types
+            );
+        }
+        let ts_base = "export interface Greeter { greet(): string }\nexport class ExprBase implements Greeter { greet(): string { return 'e'; } }\n";
+        assert_eq!(
+            run(&[("svc/src/base.ts", ts_base)]).types,
+            ["ExprBase: proven"]
+        );
+        let ts_main = "import { ExprBase } from './base';\nconst Derived = class extends ExprBase {};\nexport const d = new Derived();\n";
+        assert_eq!(
+            run(&[("svc/src/base.ts", ts_base), ("svc/src/main.ts", ts_main)]).types,
+            ["ExprBase: mention"]
+        );
+    }
+
+    /// Evaluator pass 1, Y7: a module whose whole object is taken (`import * as`, `export *`,
+    /// `require`, `import()`) keeps every type it declares; a namespace import of another
+    /// module does not.
+    #[test]
+    fn module_objects_keep_their_types() {
+        let commands = "export interface Command { run(): string }\nexport class DeployCommand implements Command { run(): string { return 'deploy'; } }\n";
+        let decl = "svc/src/commands/index.ts";
+        let rule = |user: (&str, &str)| -> String {
+            run(&[(decl, commands), user])
+                .types
+                .into_iter()
+                .find(|t| t.starts_with("DeployCommand"))
+                .unwrap()
+        };
+        for user in [
+            (
+                "svc/src/main.ts",
+                "import * as commands from './commands/index';\nexport const all = Object.values(commands);\n",
+            ),
+            (
+                "svc/src/main.ts",
+                "import * as commands from './commands';\nexport const all = Object.values(commands);\n",
+            ),
+            (
+                "svc/src/main.ts",
+                "import * as commands from './commands/index.js';\nexport const all = commands;\n",
+            ),
+            ("svc/src/all.ts", "export * from './commands';\n"),
+            (
+                "svc/src/main.js",
+                "const commands = require('./commands');\nmodule.exports = commands;\n",
+            ),
+            (
+                "svc/src/main.ts",
+                "export async function f(n: string) { return import('./commands/' + n); }\n",
+            ),
+            (
+                "svc/src/main.ts",
+                "import * as commands from '@app/commands';\nexport const all = commands;\n",
+            ),
+            // A package whose entry lives in a directory on the module's path.
+            (
+                "svc/src/main.ts",
+                "import * as svc from '@acme/src';\nexport const all = svc;\n",
+            ),
+        ] {
+            assert_eq!(rule(user), "DeployCommand: mention", "{}", user.1);
+        }
+        for user in [
+            (
+                "svc/src/main.ts",
+                "import * as path from 'path';\nexport const p = path;\n",
+            ),
+            (
+                "svc/src/main.ts",
+                "import * as other from './other';\nexport const o = other;\n",
+            ),
+        ] {
+            assert_eq!(rule(user), "DeployCommand: proven", "{}", user.1);
+        }
+    }
+
+    /// Evaluator pass 1, Y12 (mutant R4): an instantiated subtype that is no `IMPLEMENTS`
+    /// source itself (its head does not resolve) still keeps the type it names.
+    #[test]
+    fn an_unconsidered_instantiated_subtype_keeps_its_supertype() {
+        let main = "svc/src/main/java/com/acme/H.java";
+        let src = "package com.acme;\ninterface I { void m(); }\nclass A implements I { public void m() {} }\nclass B extends Lib.A {}\nclass U { Object o = new B(); }\n";
+        assert_eq!(run(&[(main, src)]).types, ["A: subtype"]);
+    }
+
     /// Invariant 11: every considered type is proven or kept by exactly one rule.
     #[test]
     fn rta_buckets_sum_to_the_types() {
@@ -694,6 +967,12 @@ mod tests {
         let deployable = BTreeSet::from(["svc".to_owned()]);
         let (raw, fragments) = (RawScan::default(), BTreeSet::new());
         let _ = keys;
+        let names: std::collections::HashSet<&str> =
+            facts.definitions.iter().map(|d| d.name.as_str()).collect();
+        let words = crate::liveness::scan_words(
+            [("svc/src/main/java/A.java", Some(src.as_bytes()))],
+            &names,
+        );
         work::take();
         let proof = prove(
             &Inputs {
@@ -701,6 +980,7 @@ mod tests {
                 service_of: &service_of,
                 deployable: &deployable,
                 unparsed: &raw,
+                words: &words,
                 fragments: &fragments,
             },
             &considered,

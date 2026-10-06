@@ -475,12 +475,20 @@ impl RawScan {
 }
 
 /// The whole words of a text: maximal runs of `[A-Za-z0-9_$]` and other alphanumeric
-/// characters.
+/// characters, and each `$`-separated segment of such a run, so a nested class's binary name
+/// (`Outer$Inner`) names `Inner` too (evaluator pass 1, Y1).
 pub fn text_words(text: &str) -> BTreeSet<String> {
-    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+    let mut out = BTreeSet::new();
+    for run in text
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .filter(|w| !w.is_empty())
-        .map(str::to_owned)
-        .collect()
+    {
+        if run.contains('$') {
+            out.extend(run.split('$').filter(|w| !w.is_empty()).map(str::to_owned));
+        }
+        out.insert(run.to_owned());
+    }
+    out
 }
 
 /// The names whose appearance as a whole word in a file without token facts taints a client
@@ -2795,6 +2803,14 @@ mod tests {
         );
         assert!(x.words.contains("KafkaAuditSink") && x.words.contains("CDATA"));
         assert!(!x.words_unread && x.di_surface.is_empty());
+        // A binary name names the nested class (evaluator pass 1, Y1).
+        let services = raw_scan(
+            "p/src/main/resources/META-INF/services/com.acme.Greeter",
+            Some("com.acme.Holder$LoadedImpl\n"),
+        );
+        for w in ["Holder$LoadedImpl", "Holder", "LoadedImpl", "acme"] {
+            assert!(services.words.contains(w), "{w}");
+        }
         let k = raw_scan("p/Cfg.kt", Some("@Configuration class Cfg"));
         assert_eq!(
             k.di_surface,

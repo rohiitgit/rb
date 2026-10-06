@@ -1336,12 +1336,23 @@ fn spring_di_rta_and_orphan_goldens() {
     );
 
     // The only caller of `KafkaAuditSink#record()` is a dispatch step from `AuditSink#record()`,
-    // whose implementation is never instantiated: pruned and counted under `rta` (the default),
-    // listed under `cha`.
-    let kafka = rb(&url, &["callers", "KafkaAuditSink.record", "--repo", &name]);
+    // whose implementation is never instantiated: pruned and counted under `rta` (opt-in,
+    // amendment 21), listed under `cha` (the default).
+    let kafka = rb(
+        &url,
+        &[
+            "callers",
+            "KafkaAuditSink.record",
+            "--precision",
+            "rta",
+            "--repo",
+            &name,
+        ],
+    );
     assert!(
         !kafka.contains("DefaultAuthService#authenticate()")
-            && kafka.contains("rta: 1 dispatch step"),
+            && kafka.contains("rta: 1 dispatch step")
+            && kafka.contains("precision=rta (opt-in"),
         "{kafka}"
     );
     golden(fixture, "callers-kafka-record.txt", &kafka);
@@ -1361,6 +1372,11 @@ fn spring_di_rta_and_orphan_goldens() {
         "{kafka_cha}"
     );
     golden(fixture, "callers-kafka-record-cha.txt", &kafka_cha);
+    // The default is `cha`.
+    assert_eq!(
+        rb(&url, &["callers", "KafkaAuditSink.record", "--repo", &name]),
+        kafka_cha
+    );
     // `LogAuditSink` is instantiated by the `@Bean` method: its dispatch caller stays under both.
     for precision in ["rta", "cha"] {
         let log = rb(

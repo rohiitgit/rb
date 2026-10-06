@@ -58,7 +58,7 @@ If 55432 is taken, start the database on another port with `RB_DB_PORT=55433 doc
 
 ```
 Request path: POST /api/v1/login  [auth-service]
-precision=rta
+precision=cha
 Statically possible paths from the call graph and HTTP stitching, not a trace of one request.
 UPSTREAM
   client login().  apps/web/src/api/auth.ts:6  [@acme/web]  [heuristic]  (via host gateway)
@@ -88,7 +88,7 @@ The Service Card (`rb service <name>`) gains `APIs` (each endpoint with its hand
   rta: 1 of 12 implementing types never instantiated (2 dispatch edges prunable)
 ```
 
-`rb callers`, `rb path`, `rb impact` and `rb table-deps` take `--precision rta|cha`. Under `rta` (the default for `callers` and `path`) a dispatch step into an implementation proven never instantiated is skipped and counted (`rta: k dispatch steps pruned (…; --precision cha shows them)`, JSON `pruned_by_rta`); `cha` (the default for `impact` and `table-deps`, where under-reporting is the dangerous failure) keeps every step. Every answer prints its `precision=` header. `rb callers` marks entry points (`(entry: main)`, `endpoint POST /login`, `top-level`, …) and keeps expanding past them.
+`rb callers`, `rb path`, `rb impact` and `rb table-deps` take `--precision rta|cha`. `cha`, the default for every question, keeps every dispatch step. `rta` is opt-in: a dispatch step into an implementation proven never instantiated is skipped and counted (`rta: k dispatch steps pruned (…; --precision cha shows them)`, JSON `pruned_by_rta`), and the header says `precision=rta (opt-in, may hide callers reached through forms the scan cannot see)`, since the proof cannot see instances created by reflection with computed names, deserialisation or code outside the repository. Every answer prints its `precision=` header. `rb callers` marks entry points (`(entry: main)`, `endpoint POST /login`, `top-level`, …) and keeps expanding past them.
 
 `rb impact` lists each endpoint once under `endpoints:` (`(handler removed)` at distance 1), `orphans: may become dead code (n)` — symbols of the target's deployable service whose every use is in the removed region, by a reachability computation over the requiring edges with a whole-word mention scan of every file keeping anything else alive — and `tests (n)`; `--json` gives the same. `rb table-deps` rolls the table's accessors up to entry points per service (operations, `direct` or `indirect via`, endpoints, other entry kinds, best certainty) and lists the services that reach the table only through another service's API (`Through APIs`, up to `--hops`, default 4).
 

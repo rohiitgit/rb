@@ -246,6 +246,16 @@ fn lockfile_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<Result<Stri
     None
 }
 
+/// The package an npm alias installs: `npm:bar@^1` → `bar`, `npm:@s/p@2` → `@s/p`.
+fn npm_alias(declared: &str) -> Option<&str> {
+    let spec = declared.trim().strip_prefix("npm:")?;
+    let name = match spec.rfind('@') {
+        Some(at) if at > 0 => &spec[..at],
+        _ => spec,
+    };
+    (!name.is_empty()).then_some(name)
+}
+
 /// An npm range under which a workspace dependency always resolves to the workspace (S16):
 /// `*`, empty, `workspace:…`, or `file:`/`link:` to `target`'s directory.
 fn npm_range_is_local(range: &str, service_dir: &str, target_dir: &str) -> bool {
@@ -260,12 +270,56 @@ fn npm_range_is_local(range: &str, service_dir: &str, target_dir: &str) -> bool 
         .is_some_and(|d| d == target_dir)
 }
 
-/// `go.mod`'s direct requirements (no `// indirect`) and its local `replace` targets
-/// (module → directory relative to the `go.mod`'s).
+/// `go.mod`'s direct requirements (no `// indirect`) and its `replace` directives.
 #[derive(Debug, Default)]
 struct GoMod {
     requires: Vec<(Dep, String)>,
-    replaces: BTreeMap<String, String>,
+    replaces: Vec<Replace>,
+}
+
+/// `replace <module> [<version>] => <target> [<version>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Replace {
+    module: String,
+    /// Only this required version is replaced; `None`: every version.
+    from_version: Option<String>,
+    /// A module path, or a directory (`./x`, `../x`, `/x`) relative to the `go.mod`'s.
+    target: String,
+    to_version: Option<String>,
+}
+
+impl Replace {
+    fn local(&self) -> bool {
+        self.target.starts_with("./")
+            || self.target.starts_with("../")
+            || self.target.starts_with('/')
+    }
+
+    /// As written after the arrow (`attrs.replaced`).
+    fn written(&self) -> String {
+        match &self.to_version {
+            Some(v) => format!("{} {v}", self.target),
+            None => self.target.clone(),
+        }
+    }
+}
+
+impl GoMod {
+    /// The `replace` that applies to `module` at `version`: one naming that version, else one
+    /// naming none (Go's rule).
+    fn replace_for(&self, module: &str, version: &str) -> Option<&Replace> {
+        let of = |r: &&Replace| r.module == module;
+        self.replaces
+            .iter()
+            .filter(of)
+            .find(|r| r.from_version.as_deref() == Some(version))
+            .or_else(|| {
+                self.replaces
+                    .iter()
+                    .filter(of)
+                    .find(|r| r.from_version.is_none())
+            })
+    }
 }
 
 fn go_mod(text: &str) -> GoMod {
@@ -320,12 +374,15 @@ fn go_mod(text: &str) -> GoMod {
             }
             "replace" => {
                 if let Some((from, to)) = rest.split_once("=>") {
-                    let module = from.split_whitespace().next().map(unquote);
-                    let target = to.split_whitespace().next().map(unquote);
-                    if let (Some(m), Some(t)) = (module, target)
-                        && (t.starts_with("./") || t.starts_with("../"))
-                    {
-                        out.replaces.insert(m, t);
+                    let mut from = from.split_whitespace().map(unquote);
+                    let mut to = to.split_whitespace().map(unquote);
+                    if let (Some(module), Some(target)) = (from.next(), to.next()) {
+                        out.replaces.push(Replace {
+                            module,
+                            from_version: from.next(),
+                            target,
+                            to_version: to.next(),
+                        });
                     }
                 }
             }
@@ -351,6 +408,18 @@ impl Element {
 
     fn text_of(&self, name: &str) -> Option<&str> {
         self.child(name).map(|c| c.text.trim())
+    }
+
+    /// The distinct texts of every child named `name`, in order.
+    fn texts_of(&self, name: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for c in self.children.iter().filter(|c| c.name == name) {
+            let t = c.text.trim();
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        out
     }
 }
 
@@ -430,19 +499,45 @@ struct Pom {
     artifact: String,
     version: String,
     /// Each dependency (named `<groupId>/<artifactId>`) with its version, empty when
-    /// unresolved, and the version's source (`literal`, `property` or `unresolved`).
-    deps: Vec<(Dep, String, &'static str)>,
+    /// unresolved, the version's source (`literal`, `property` or `unresolved`), and the
+    /// conflicting versions when the artifact is declared twice, or its property defined twice,
+    /// with different values (evaluator pass 1, Y8, Y11).
+    deps: Vec<(Dep, String, &'static str, Vec<String>)>,
+}
+
+/// A `${…}` reference in a pom, read.
+enum Prop<'a> {
+    Value(&'a str),
+    /// Defined more than once with different values.
+    Conflict(Vec<&'a str>),
+    Unknown,
 }
 
 /// The value of `${name}` in this pom: a `<properties>` literal, or `project.version`,
-/// `project.groupId`, `project.artifactId`.
-fn property<'a>(project: &'a Element, coords: [(&str, &'a str); 3], text: &str) -> Option<&'a str> {
-    let name = text.strip_prefix("${")?.strip_suffix('}')?;
+/// `project.groupId`, `project.artifactId`. A property defined twice with different values is
+/// a conflict (Y11).
+fn property<'a>(project: &'a Element, coords: [(&str, &'a str); 3], text: &str) -> Prop<'a> {
+    let Some(name) = text.strip_prefix("${").and_then(|t| t.strip_suffix('}')) else {
+        return Prop::Unknown;
+    };
+    let usable = |v: &str| !v.is_empty() && !v.contains("${");
     if let Some((_, v)) = coords.iter().find(|(k, _)| *k == name) {
-        return (!v.is_empty() && !v.contains("${")).then_some(*v);
+        return if usable(v) {
+            Prop::Value(v)
+        } else {
+            Prop::Unknown
+        };
     }
-    let value = project.child("properties")?.text_of(name)?;
-    (!value.is_empty() && !value.contains("${")).then_some(value)
+    let values = project
+        .child("properties")
+        .map(|p| p.texts_of(name))
+        .unwrap_or_default();
+    match values.as_slice() {
+        [] => Prop::Unknown,
+        [v] if usable(v) => Prop::Value(v),
+        [_] => Prop::Unknown,
+        _ => Prop::Conflict(values),
+    }
 }
 
 fn pom(text: &str) -> Option<Pom> {
@@ -474,10 +569,9 @@ fn pom(text: &str) -> Option<Pom> {
         .into_iter()
         .flat_map(|ds| ds.children.iter().filter(|c| c.name == "dependency"))
     {
-        let resolve = |raw: &str| {
-            property(&project, coords, raw)
-                .map_or(raw, |v| v)
-                .to_owned()
+        let resolve = |raw: &str| match property(&project, coords, raw) {
+            Prop::Value(v) => v.to_owned(),
+            Prop::Conflict(_) | Prop::Unknown => raw.to_owned(),
         };
         let group = resolve(d.text_of("groupId").unwrap_or_default());
         let artifact = resolve(d.text_of("artifactId").unwrap_or_default());
@@ -485,12 +579,17 @@ fn pom(text: &str) -> Option<Pom> {
             continue;
         }
         let declared = d.text_of("version").unwrap_or_default();
+        let mut conflict = Vec::new();
         let (version, from) = if declared.is_empty() {
             (String::new(), "unresolved")
         } else if declared.starts_with("${") {
             match property(&project, coords, declared) {
-                Some(v) => (v.to_owned(), "property"),
-                None => (String::new(), "unresolved"),
+                Prop::Value(v) => (v.to_owned(), "property"),
+                Prop::Conflict(vs) => {
+                    conflict = vs.into_iter().map(str::to_owned).collect();
+                    (String::new(), "unresolved")
+                }
+                Prop::Unknown => (String::new(), "unresolved"),
             }
         } else if declared.contains("${") || declared.starts_with(['[', '(']) {
             (String::new(), "unresolved")
@@ -514,7 +613,41 @@ fn pom(text: &str) -> Option<Pom> {
             },
             version,
             from,
+            conflict,
         ));
+    }
+    // An artifact declared twice: Maven keeps one declaration (and warns), so with different
+    // versions none is the stated one (Y8). The first declaration stays, unresolved, listing
+    // every version read.
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (dep, version, _, conflict) in &deps {
+        let read = if conflict.is_empty() {
+            vec![if !version.is_empty() {
+                version.clone()
+            } else if !dep.declared.is_empty() {
+                dep.declared.clone()
+            } else {
+                "?".to_owned()
+            }]
+        } else {
+            conflict.clone()
+        };
+        let seen = versions.entry(dep.name.clone()).or_default();
+        for v in read {
+            if !seen.contains(&v) {
+                seen.push(v);
+            }
+        }
+    }
+    let mut kept = BTreeSet::new();
+    deps.retain(|(dep, _, _, _)| kept.insert(dep.name.clone()));
+    for (dep, version, from, conflict) in &mut deps {
+        let read = &versions[&dep.name];
+        if read.len() > 1 {
+            version.clear();
+            *from = "unresolved";
+            conflict.clone_from(read);
+        }
     }
     Some(Pom {
         group: group.clone(),
@@ -638,7 +771,9 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                         None => None,
                     };
                     for dep in deps {
-                        if let Some(targets) = npm_names.get(&dep.name)
+                        // An alias (`"foo": "npm:bar@^1"`) installs `bar` under `foo` (Y9).
+                        let aliased = npm_alias(&dep.declared);
+                        if let Some(targets) = npm_names.get(aliased.unwrap_or(&dep.name))
                             && !targets.contains(&service)
                         {
                             let certainty = match targets.as_slice() {
@@ -665,6 +800,7 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             }
                             continue;
                         }
+                        let real = aliased.map(str::to_owned);
                         let (version, from) = match &lock {
                             Some((path, packages, rel)) => {
                                 match lock_version(packages, rel, &dep.name) {
@@ -682,15 +818,21 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             }
                             None => (String::new(), "unresolved"),
                         };
+                        let alias = if real.is_some() {
+                            dep.name.as_str()
+                        } else {
+                            ""
+                        };
                         edges.push(ManifestEdge {
                             service: service.to_owned(),
                             target: Target::Package(Package {
                                 manager: "npm",
-                                name: dep.name.clone(),
+                                name: real.unwrap_or_else(|| dep.name.clone()),
                                 version,
                             }),
                             certainty: Certainty::Exact,
                             attrs: attrs(&[
+                                ("alias", alias),
                                 ("declared", &dep.declared),
                                 ("scope", dep.scope),
                                 ("version_from", from),
@@ -701,11 +843,11 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                 }
                 "go.mod" => {
                     let parsed = go_mod(text);
-                    for (dep, version) in parsed.requires {
-                        let local = parsed
-                            .replaces
-                            .get(&dep.name)
-                            .and_then(|rel| join(&here, rel));
+                    for (dep, version) in &parsed.requires {
+                        let replace = parsed.replace_for(&dep.name, version);
+                        let local = replace
+                            .filter(|r| r.local())
+                            .and_then(|r| join(&here, &r.target));
                         let by_dir: Vec<&str> = local
                             .as_deref()
                             .map(|d| {
@@ -719,6 +861,10 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             .unwrap_or_default();
                         let (targets, certainty): (Vec<&str>, Certainty) = if by_dir.len() == 1 {
                             (by_dir, Certainty::Synthetic)
+                        } else if replace.is_some() {
+                            // Replaced by a directory that is no single service, or by another
+                            // module: not the module path's own package (Y10).
+                            (Vec::new(), Certainty::Heuristic)
                         } else {
                             match go_modules.get(&dep.name).map(Vec::as_slice) {
                                 Some([one]) => (vec![*one], Certainty::Heuristic),
@@ -744,6 +890,17 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             }
                             continue;
                         }
+                        // A replace by another version of the same module sets the version; by a
+                        // directory or another module, the version is unresolved (Y10).
+                        let (version, from, certainty) = match replace {
+                            None => (version.clone(), "go_mod", Certainty::Synthetic),
+                            Some(r) if !r.local() && r.target == dep.name => match &r.to_version {
+                                Some(v) => (v.clone(), "go_mod", Certainty::Synthetic),
+                                None => (String::new(), "unresolved", Certainty::Exact),
+                            },
+                            Some(_) => (String::new(), "unresolved", Certainty::Exact),
+                        };
+                        let replaced = replace.map(Replace::written).unwrap_or_default();
                         edges.push(ManifestEdge {
                             service: service.to_owned(),
                             target: Target::Package(Package {
@@ -751,11 +908,12 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                 name: dep.name.clone(),
                                 version,
                             }),
-                            certainty: Certainty::Synthetic,
+                            certainty,
                             attrs: attrs(&[
                                 ("declared", &dep.declared),
+                                ("replaced", &replaced),
                                 ("scope", dep.scope),
-                                ("version_from", "go_mod"),
+                                ("version_from", from),
                             ]),
                             evidence: evidence(dep.span),
                         });
@@ -765,7 +923,7 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                     let Some(pom) = poms.get(m.as_str()) else {
                         continue;
                     };
-                    for (dep, version, from) in &pom.deps {
+                    for (dep, version, from, conflict) in &pom.deps {
                         let (group, artifact) =
                             dep.name.split_once('/').unwrap_or((dep.name.as_str(), ""));
                         if let Some(modules) = maven.get(&(group.to_owned(), artifact.to_owned())) {
@@ -795,11 +953,21 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                 continue;
                             }
                         }
-                        let certainty = if *from == "property" {
+                        let certainty = if !conflict.is_empty() {
+                            Certainty::Heuristic
+                        } else if *from == "property" {
                             Certainty::Synthetic
                         } else {
                             Certainty::Exact
                         };
+                        let mut attrs = attrs(&[
+                            ("declared", &dep.declared),
+                            ("scope", dep.scope),
+                            ("version_from", from),
+                        ]);
+                        if !conflict.is_empty() {
+                            attrs.insert("versions".into(), json!(conflict));
+                        }
                         edges.push(ManifestEdge {
                             service: service.to_owned(),
                             target: Target::Package(Package {
@@ -808,11 +976,7 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                 version: version.clone(),
                             }),
                             certainty,
-                            attrs: attrs(&[
-                                ("declared", &dep.declared),
-                                ("scope", dep.scope),
-                                ("version_from", from),
-                            ]),
+                            attrs,
                             evidence: evidence(dep.span),
                         });
                     }
@@ -1168,6 +1332,106 @@ mod tests {
             ]
         );
         assert!(parse_xml("<project><a></project>").is_none());
+    }
+
+    /// Evaluator pass 1, Y8 and Y11: an artifact declared twice with different versions, or
+    /// a property defined twice with different values, has no exact version: one `heuristic`
+    /// edge to the `@?` key listing the versions. The same version twice stays exact.
+    #[test]
+    fn duplicate_declarations_and_properties_are_unresolved() {
+        let projects = [project("svc", &["svc/pom.xml"])];
+        let pom = |body: &str| -> String {
+            format!(
+                "<project><groupId>g</groupId><artifactId>svc</artifactId><version>1</version>{body}</project>"
+            )
+        };
+        let dep = |v: &str| {
+            format!(
+                "<dependency><groupId>org.example</groupId><artifactId>dup</artifactId><version>{v}</version></dependency>"
+            )
+        };
+        let twice = pom(&format!(
+            "<dependencies>{}{}</dependencies>",
+            dep("1.0"),
+            dep("2.0")
+        ));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &twice)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/dup@? [heuristic] {"declared":"1.0","scope":"runtime","version_from":"unresolved","versions":["1.0","2.0"]}"#
+            ]
+        );
+        let same = pom(&format!(
+            "<dependencies>{}{}</dependencies>",
+            dep("1.0"),
+            dep("1.0")
+        ));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &same)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/dup@1.0 [exact] {"declared":"1.0","scope":"runtime","version_from":"literal"}"#
+            ]
+        );
+        let props = pom(&format!(
+            "<properties><lib.version>1.0</lib.version><lib.version>2.0</lib.version></properties><dependencies>{}</dependencies>",
+            dep("${lib.version}")
+        ));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &props)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/dup@? [heuristic] {"declared":"${lib.version}","scope":"runtime","version_from":"unresolved","versions":["1.0","2.0"]}"#
+            ]
+        );
+    }
+
+    /// Evaluator pass 1, Y9: an npm alias (`"foo": "npm:bar@^1"`) installs `bar`: the key is
+    /// the real package with the lockfile's version, and the alias is an attribute.
+    #[test]
+    fn npm_aliases_key_the_real_package() {
+        let projects = [project("web", &["web/package.json"])];
+        let lock = r#"{ "lockfileVersion": 3, "packages": {
+            "": {},
+            "node_modules/foo": { "name": "bar", "version": "1.2.3" },
+            "node_modules/sc": { "name": "@s/pkg", "version": "2.0.0" }
+        } }"#;
+        let manifest = r#"{ "name": "web", "dependencies": { "foo": "npm:bar@^1.0.0", "sc": "npm:@s/pkg@^2", "nolock": "npm:real@1" } }"#;
+        let (edges, _) = run(
+            &projects,
+            &[
+                ("web/package.json", manifest),
+                ("web/package-lock.json", lock),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"web -> npm/bar@1.2.3 [exact] {"alias":"foo","declared":"npm:bar@^1.0.0","scope":"runtime","version_from":"lockfile"}"#,
+                r#"web -> npm/real@? [exact] {"alias":"nolock","declared":"npm:real@1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"web -> npm/@s/pkg@2.0.0 [exact] {"alias":"sc","declared":"npm:@s/pkg@^2","scope":"runtime","version_from":"lockfile"}"#,
+            ]
+        );
+    }
+
+    /// Evaluator pass 1, Y10: a `replace` to another version of the same module sets the
+    /// version; one to a local directory that is no service, or to another module, leaves it
+    /// unresolved; a replace pinned to another required version does not apply.
+    #[test]
+    fn go_replace_directives() {
+        let projects = [project("svc", &["svc/go.mod"])];
+        let go = "module example.com/svc\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.10.0\n\texample.com/a v1.0.0\n\texample.com/b v1.0.0\n\texample.com/c v1.0.0\n)\nreplace github.com/gin-gonic/gin => github.com/gin-gonic/gin v1.9.1\nreplace example.com/a => ./vendor/a\nreplace (\n\texample.com/b v1.0.0 => example.com/fork v1.1.0\n\texample.com/c v0.9.0 => example.com/c v0.9.1\n)\n";
+        let (edges, _) = run(&projects, &[("svc/go.mod", go)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> go/github.com/gin-gonic/gin@v1.9.1 [synthetic] {"declared":"v1.10.0","replaced":"github.com/gin-gonic/gin v1.9.1","scope":"runtime","version_from":"go_mod"}"#,
+                r#"svc -> go/example.com/a@? [exact] {"declared":"v1.0.0","replaced":"./vendor/a","scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> go/example.com/b@? [exact] {"declared":"v1.0.0","replaced":"example.com/fork v1.1.0","scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> go/example.com/c@v1.0.0 [synthetic] {"declared":"v1.0.0","scope":"runtime","version_from":"go_mod"}"#,
+            ]
+        );
     }
 
     /// D8: the classpath closure terminates on a cycle and follows edges transitively.

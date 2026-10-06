@@ -136,7 +136,7 @@
       "count": 5
     }
   ],
-  "precision": "rta",
+  "precision": "cha",
   "pruned_by_rta": 0,
   "truncated": [],
   "upstream": [

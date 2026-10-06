@@ -615,6 +615,16 @@ Same rules as M4a:
 - [ ] **16. Records and review** (S28).
   - [x] Records: contract amendments (16–20), measurement and open items (15, with milestones); design §5.5/§6.2/§6.4/§8.5/§9.2–§9.5/§10.3/§13 (M4b: built, pending the evaluator); README (status, `--precision`, the `di:`/`rta:` lines, orphans, Q3's roll-up, the card's sections); IMPLEMENT.md; CHANGELOG; lessons.
   - [x] Full verification loop and the stub scan.
-  - [ ] Evaluator pass 1 (full review); fix its findings test-first, one amendment each.
+  - [x] Evaluator pass 1 (full review, `tasks/eval-m4b-pass1.md`, VERDICT FAIL on `531e14e`: Y1–Y3 blockers, Y4–Y10 major, Y11–Y14 minor, Y15 doc); fixed test-first as amendment 21, below.
   - [ ] Evaluator pass 2 (verification only, per the contract's closing bar); new attack forms in residue classes go to M5's adversarial review, not the verdict.
   - Commit after each verified phase.
+
+## Review (M4b evaluator pass 1)
+- [x] RTA opt-in (D5, S10): every question defaults to `cha`; `--precision rta` says `(opt-in, may hide callers reached through forms the scan cannot see)`; 12 goldens change only their header, `callers-kafka-record.txt` passes `--precision rta`; the default equals `cha` (e2e row).
+- [x] Y1 binary names (`$` segments in string and text words), Y14 every non-binary file for S9 (d), Y2 supertype role only for definitions (local and expression classes `other`), Y7 TS/JS module objects (new fact `module_objects`), Y12 unconsidered instantiated subtype row.
+- [x] Y3 orphan rule (e) transitive through repository types (visited set, depth 64).
+- [x] Y4 gate M over every assignable class and `@Bean`-declaring class; Y5/Y6/Y13 no `@Primary`/name pick for generic (`nested_type_args`) or annotated points, `@Named` as qualifier and stereotype, two primaries ambiguous.
+- [x] Y8/Y11 Maven duplicates and duplicate properties → `@?` `heuristic` with `versions`; Y9 npm aliases keyed by the real package; Y10 `go.mod` `replace`.
+- [x] Y15 open items 16–22 and the weaker-false-results list; contract amendment 21, design, README.
+- [x] Verification: fmt, clippy, unit tests, e2e twice with the database and containers (no `skipping:`), stub scan; 33 mutants (31 killed, 2 equivalent with their code deleted); four public repositories against `531e14e` (three byte-identical, jhipster: one RTA proof withdrawn, orphan first-rule shift only), fresh == cached; the evaluator's repros end to end.
+- [ ] Evaluator pass 2 (verification only).

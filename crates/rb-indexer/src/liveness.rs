@@ -86,6 +86,22 @@ pub(crate) fn scan_words<'a>(
 }
 
 impl Words {
+    /// The files in which `name` occurs as a whole word, or `None` when that is unknown: a file
+    /// was not read, the name is crowded, or it cannot be matched whole (RTA's S9 (d)).
+    pub(crate) fn paths_of(&self, name: &str) -> Option<BTreeSet<&str>> {
+        if self.unread || !scannable(name) || self.crowded.contains(name) {
+            return None;
+        }
+        Some(
+            self.by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .map(|(file, _)| self.paths[*file].as_str())
+                .collect(),
+        )
+    }
+
     /// An empty scan, to which [`Words::scan`] adds files.
     pub(crate) fn scanned() -> Self {
         Words {
@@ -374,23 +390,46 @@ fn own_rule<'a>(inputs: &Inputs<'a>, path: &'a str, i: usize, entry: bool) -> Op
     if def.parent.is_none() && facts.default_export.as_deref() == Some(def.name.as_str()) {
         return Some("default_export");
     }
-    // (e): a declared supertype of the definition (a type) or of an enclosing type that does
-    // not resolve to a type of the repository: an override of a library method.
-    let external = chain.iter().any(|&j| {
-        let d = &facts.definitions[j];
-        is_type_kind(d.kind)
-            && d.supertypes.iter().any(|s| {
-                work::tick(1);
-                inputs
-                    .index
-                    .type_candidates(path, d.parent, &s.name)
-                    .is_empty()
-            })
-    });
-    if external {
+    // (e): a supertype of the definition (a type) or of an enclosing type, at any depth
+    // through the repository's types, that does not resolve to a type of the repository: an
+    // override of a library method (evaluator pass 1, Y3).
+    let types: Vec<(&str, usize)> = chain
+        .iter()
+        .filter(|&&j| is_type_kind(facts.definitions[j].kind))
+        .map(|&j| (path, j))
+        .collect();
+    if external_supertype(inputs, &types) {
         return Some("supertype");
     }
     None
+}
+
+/// Whether a declared supertype of `start`, or of any repository type they reach through
+/// their supertypes, resolves to no repository type. Breadth-first with a visited set, at
+/// most [`crate::di::MAX_SUPERTYPE_DEPTH`] levels; a chain longer than that counts as reaching
+/// an external type (conservative).
+fn external_supertype<'a>(inputs: &Inputs<'a>, start: &[(&'a str, usize)]) -> bool {
+    let mut seen: BTreeSet<(&'a str, usize)> = start.iter().copied().collect();
+    let mut level: Vec<(&'a str, usize)> = start.to_vec();
+    for _ in 0..crate::di::MAX_SUPERTYPE_DEPTH {
+        let mut next = Vec::new();
+        for (path, j) in level {
+            let d = &inputs.files[path].1.definitions[j];
+            for s in &d.supertypes {
+                work::tick(1);
+                let found = inputs.index.type_candidates(path, d.parent, &s.name);
+                if found.is_empty() {
+                    return true;
+                }
+                next.extend(found.into_iter().filter(|t| seen.insert(*t)));
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        level = next;
+    }
+    true
 }
 
 fn is_type_kind(kind: DefKind) -> bool {
@@ -860,6 +899,88 @@ public class Svc {
         let js = "function $helper() { return 1; }\nexport function go() { return $helper(); }\n";
         let r = run(&[("svc/a.js", js)]);
         assert_eq!(attrs(&r, "$helper()."), "");
+    }
+
+    /// Evaluator pass 1, Y3: rule (e) follows the supertype chain through repository types,
+    /// so an override of an external method through an in-repository base (depth 1 and 2), or
+    /// through an in-repository interface extending an external one, is kept; a chain that
+    /// stays in the repository keeps nothing.
+    #[test]
+    fn external_supertypes_through_repository_bases_keep_members() {
+        const PROBE: &str = "package com.acme;\nclass Probe { boolean probe(AuthInterceptor i) { return i.preHandle(null, null, null); } }\n";
+        let base = "package com.acme;\npublic abstract class BaseInterceptor implements org.springframework.web.servlet.HandlerInterceptor {}\n";
+        let auth = "package com.acme;\npublic class AuthInterceptor extends BaseInterceptor {\n  public boolean preHandle(Object a, Object b, Object c) { return tokenPresent(a); }\n  private boolean tokenPresent(Object r) { return r != null; }\n}\n";
+        fn files<'a>(base: &'a str, auth: &'a str) -> [(&'static str, &'a str); 3] {
+            [
+                ("svc/src/main/java/com/acme/BaseInterceptor.java", base),
+                ("svc/src/main/java/com/acme/AuthInterceptor.java", auth),
+                ("svc/src/main/java/com/acme/Probe.java", PROBE),
+            ]
+        }
+        let r = run(&files(base, auth));
+        assert_eq!(attrs(&r, "AuthInterceptor#preHandle()."), "");
+        assert_eq!(attrs(&r, "AuthInterceptor#tokenPresent()."), "");
+        // Depth 2: a middle class between.
+        let mid = "package com.acme;\npublic abstract class BaseInterceptor extends Middle {}\nabstract class Middle implements org.springframework.web.servlet.HandlerInterceptor {}\n";
+        let r = run(&files(mid, auth));
+        assert_eq!(attrs(&r, "AuthInterceptor#preHandle()."), "");
+        // An in-repository interface extending an external one.
+        let iface = "package com.acme;\npublic interface BaseInterceptor extends org.springframework.context.ApplicationListener<Object> {}\n";
+        let impl_ = "package com.acme;\npublic class AuthInterceptor implements BaseInterceptor {\n  public boolean preHandle(Object a, Object b, Object c) { return tokenPresent(a); }\n  private boolean tokenPresent(Object r) { return r != null; }\n}\n";
+        let r = run(&files(iface, impl_));
+        assert_eq!(attrs(&r, "AuthInterceptor#preHandle()."), "");
+        // Control: a chain inside the repository.
+        let local = "package com.acme;\npublic abstract class BaseInterceptor implements Local {}\ninterface Local {}\n";
+        let r = run(&files(local, auth));
+        assert_eq!(attrs(&r, "AuthInterceptor#tokenPresent()."), "eligible");
+        // A supertype cycle inside the repository terminates (and keeps nothing).
+        let cycle =
+            "package com.acme;\npublic abstract class BaseInterceptor extends AuthInterceptor {}\n";
+        let r = run(&files(cycle, auth));
+        assert_eq!(attrs(&r, "AuthInterceptor#tokenPresent()."), "eligible");
+        // A repository chain longer than the depth cap counts as external (conservative);
+        // one within it does not.
+        for (depth, want) in [(60, "eligible"), (70, "")] {
+            let mut chain = String::from(
+                "package com.acme;\npublic abstract class BaseInterceptor extends C1 {}\n",
+            );
+            for i in 1..depth {
+                chain += &format!("abstract class C{i} extends C{} {{}}\n", i + 1);
+            }
+            chain += &format!("abstract class C{depth} {{}}\n");
+            let r = run(&files(&chain, auth));
+            assert_eq!(
+                attrs(&r, "AuthInterceptor#tokenPresent()."),
+                want,
+                "{depth}"
+            );
+        }
+    }
+
+    /// Evaluator pass 1, Y1 and Y14: a nested class's binary name (`Outer$Inner`) in a
+    /// `META-INF/services` file, a string or a `.txt` file mentions the nested class.
+    #[test]
+    fn binary_names_and_text_files_are_mentions() {
+        let src =
+            "package com.acme;\npublic class Holder {\n  public static class LoadedImpl { }\n}\n";
+        let main = "svc/src/main/java/com/acme/Holder.java";
+        let r = run(&[(main, src)]);
+        assert_eq!(attrs(&r, "Holder#LoadedImpl#"), "eligible");
+        for (path, text) in [
+            (
+                "svc/src/main/resources/META-INF/services/com.acme.Greeter",
+                "com.acme.Holder$LoadedImpl\n",
+            ),
+            (
+                "svc/src/main/java/com/acme/App.java",
+                "package com.acme;\nclass App { Object o = load(\"com.acme.Holder$LoadedImpl\"); }\n",
+            ),
+            ("svc/plugins.txt", "Holder$LoadedImpl\n"),
+            ("svc/run.py", "x = 'LoadedImpl'\n"),
+        ] {
+            let r = run(&[(main, src), (path, text)]);
+            assert_eq!(attrs(&r, "Holder#LoadedImpl#"), "", "{path}");
+        }
     }
 
     /// Invariant 11: every symbol is eligible or kept by exactly one rule.

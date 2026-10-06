@@ -1,4 +1,4 @@
 callers of DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:21  [auth-service]
-precision=rta
+precision=cha
   AuthController#login().  src/main/java/com/acme/auth/AuthController.java:31  [auth-service]  heuristic, via dispatch  (entry: endpoint POST /auth/api/v1/login)
 certainty: heuristic 1

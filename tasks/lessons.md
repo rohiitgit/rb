@@ -224,3 +224,15 @@
 ## 2026-10-06: a mutation log that de-duplicates lines across tests can hide a bite
 - **Mistake (caught before recording):** the e2e harness printed each failing guard line once per mutant, so `INJECTS * -> * [synthetic]` failing in two fixtures appeared once; it looked as if only one fixture's guard had bitten.
 - **Rule:** when a harness summarises failures, key the de-duplication by test (or fixture) and line, and confirm a guard shared by several fixtures from the raw log before writing which ones bit.
+
+## 2026-10-07: a role allowed "because a later rule handles it" must be checked against what that rule actually sees
+- **Mistake:** RTA allowed a name's `supertype` mentions because rule (i) propagates instantiation from subtypes, but (i) walked only definitions of the facts; a local class in a lambda or a class expression mentions its base as a supertype and is no definition, so its instances never reached the base (M4b evaluator pass 1, Y2). The same pass found the orphan rule (e) reading only the declaring class's own supertypes while its stated reason ("an override of an external method") needs the whole chain (Y3).
+- **Rule:** when an allow-list admits a role on the grounds that another step covers it, enumerate every producer of that role and check that each one is an input of the covering step; give a row for a producer the step cannot see. A rule whose reason is transitive ("outside the repository", "instantiated") walks the chain, with a visited set and a conservative cap.
+
+## 2026-10-07: a tie-breaker never runs past a filter that is not modelled
+- **Mistake:** DI applied `@Primary` (and name fallback) after narrowing by the filters it modelled, but Spring applies generic type matching and custom qualifiers first; with those unmodelled, `@Primary` chose a bean Spring never considers (Y5, Y6, Y13), and the edge only carried `capped_by`.
+- **Rule:** a tie-breaker (primary, name, order) may only decide among the set the real resolver would have left; when any filter before it is unmodelled for the input at hand, keep every candidate (`ambiguous`) instead of picking one, and test the tie-breaker with two and with three candidates.
+
+## 2026-10-07: a name scan reads names as the runtime writes them
+- **Mistake:** RTA's word splitters treated `$` as a word character, so a nested class written as its binary name (`Holder$LoadedImpl` in `Class.forName` or `META-INF/services`) never mentioned `LoadedImpl` (Y1); and its text scan skipped Python, Go and `.txt` files (Y14).
+- **Rule:** before trusting a "never mentioned" scan, list how the runtime spells the name (binary, qualified, path, file-name forms) and split words so that each spelling yields the simple name, and read every file the runtime may read; when a precise mode's proof has a known gap, make the conservative mode the default (RTA became opt-in).

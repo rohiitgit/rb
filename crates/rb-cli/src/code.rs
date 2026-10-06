@@ -31,10 +31,15 @@ pub(crate) fn parse_precision(s: &str) -> Result<Precision, String> {
         .ok_or_else(|| format!("unknown precision {s:?} (rta, cha)"))
 }
 
-/// The header of an answer that expands dispatch (contract M4b S10): `precision=<p>`, and how
-/// many dispatch steps RTA skipped when it skipped any.
+/// The header of an answer that expands dispatch (contract M4b S10, amendment 21):
+/// `precision=<p>`, `rta` marked as opt-in, and how many dispatch steps RTA skipped when it
+/// skipped any.
 pub(crate) fn precision_lines(precision: Precision, pruned: usize) -> String {
-    let mut out = format!("precision={}\n", precision.as_str());
+    let mut out = format!("precision={}", precision.as_str());
+    if precision == Precision::Rta {
+        out.push_str(" (opt-in, may hide callers reached through forms the scan cannot see)");
+    }
+    out.push('\n');
     if pruned > 0 {
         let steps = if pruned == 1 { "step" } else { "steps" };
         let _ = writeln!(
@@ -398,10 +403,13 @@ mod tests {
     #[test]
     fn precision_header_counts_pruned_steps() {
         assert_eq!(precision_lines(Precision::Cha, 0), "precision=cha\n");
-        assert_eq!(precision_lines(Precision::Rta, 0), "precision=rta\n");
+        assert_eq!(
+            precision_lines(Precision::Rta, 0),
+            "precision=rta (opt-in, may hide callers reached through forms the scan cannot see)\n"
+        );
         assert_eq!(
             precision_lines(Precision::Rta, 1),
-            "precision=rta\nrta: 1 dispatch step pruned (implementations never instantiated; --precision cha shows them)\n"
+            "precision=rta (opt-in, may hide callers reached through forms the scan cannot see)\nrta: 1 dispatch step pruned (implementations never instantiated; --precision cha shows them)\n"
         );
         assert!(precision_lines(Precision::Rta, 3).contains("rta: 3 dispatch steps pruned"));
         assert_eq!(parse_precision("cha"), Ok(Precision::Cha));

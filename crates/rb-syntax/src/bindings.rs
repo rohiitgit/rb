@@ -29,6 +29,8 @@ pub(crate) struct RawBinding<'t> {
     pub type_args: Vec<String>,
     /// The declared type is an array.
     pub array: bool,
+    /// A type argument (or an array's element) has type arguments of its own.
+    pub nested_type_args: bool,
     /// Java: the declaration's modifiers (contract M4b amendment 6).
     pub modifiers: Vec<String>,
     /// Java: the declarator has an initialiser.
@@ -201,6 +203,7 @@ fn push<'t>(
             parameter: None,
             type_args: Vec::new(),
             array: false,
+            nested_type_args: false,
             modifiers: Vec::new(),
             initialised: false,
         });
@@ -219,6 +222,37 @@ fn positioned(out: &mut [RawBinding<'_>], pushed: bool, position: Option<usize>)
 fn with_type_args(out: &mut [RawBinding<'_>], pushed: bool, ty: Option<Node<'_>>, source: &[u8]) {
     if let (true, Some(b), Some(ty)) = (pushed, out.last_mut(), ty) {
         (b.type_args, b.array) = type_args(ty, source);
+        b.nested_type_args = nested_type_args(ty);
+    }
+}
+
+/// Whether a declared type's arguments (or an array's element) carry type arguments of their
+/// own (`List<Store<String>>`, `Store<String>[]`), which [`type_args`] does not keep
+/// (evaluator pass 1, Y5).
+fn nested_type_args(node: Node<'_>) -> bool {
+    fn has_arguments(node: Node<'_>) -> bool {
+        let mut c = node.walk();
+        node.kind() == "type_arguments" || node.named_children(&mut c).any(has_arguments)
+    }
+    let mut c = node.walk();
+    match node.kind() {
+        "type_annotation" | "annotated_type" | "parenthesized_type" => node
+            .named_children(&mut c)
+            .filter(|n| !is_annotation(*n))
+            .last()
+            .is_some_and(nested_type_args),
+        "generic_type" => node
+            .named_children(&mut c)
+            .filter(|n| n.kind() == "type_arguments")
+            .any(|a| {
+                let mut ac = a.walk();
+                a.named_children(&mut ac).any(has_arguments)
+            }),
+        "array_type" => node
+            .child_by_field_name("element")
+            .or_else(|| node.named_child(0))
+            .is_some_and(has_arguments),
+        _ => false,
     }
 }
 
@@ -1553,6 +1587,23 @@ mod parameter_tests {
         let facts = extract(Language::Java, src.as_bytes()).unwrap();
         let ns = facts.bindings.iter().find(|b| b.name == "ns").unwrap();
         assert_eq!(ns.type_name, "List");
+        // Evaluator pass 1, Y5: arguments with arguments of their own are marked.
+        let nested: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.nested_type_args)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(nested, ["o"]);
+        let src = "class K { K(List<Store<String>> a, Store<String>[] b, Store<String> c, List<Store> d) {} }";
+        let facts = extract(Language::Java, src.as_bytes()).unwrap();
+        let nested: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.nested_type_args)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(nested, ["a", "b"]);
     }
 
     /// Contract M4b amendment 6: a Java field's modifiers and whether it has an initialiser

@@ -361,6 +361,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 14: SCIP mode end to end: `scip-injects.txt` (amendment 18).
 - [x] Phase 15: eight public repositories measured (contract measurement section; amendments 19–20: a by-simple-name `@Bean` match fixed, `PIPELINE = m4b-di-7`).
 - [x] Phase 16 (records): contract measurement section and Open items (15, each with its milestone, plus the weaker false results still possible); design, README, todo and changelog synced. Next: evaluator pass 1 (full review), then pass 2 (verification only). M4b is not done until the evaluator decides.
+- [x] Evaluator pass 1 (`tasks/eval-m4b-pass1.md`, VERDICT FAIL, Y1–Y15) fixed as amendment 21 (`PIPELINE = m4b-di-8`): RTA opt-in (every question defaults to `cha`); RTA reads binary names, every text file and TS/JS module objects, and a supertype of a non-definition keeps its base; orphan rule (e) is transitive; gate M covers every assignable registration; `@Primary`/name never pick past generics or unread annotations; `@Named` read; Maven duplicates, npm aliases and `go.mod` replaces. Open items 16–22. Next: evaluator pass 2 (verification only).
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
@@ -374,7 +375,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - `INJECTS` goes from the injection point's owner to the bean definition (class, `@Bean` method, Spring Data or Feign interface).
   - Spring Data repositories are beans of their own interface type: no synthetic node.
   - RTA is stored as `impl_instantiated: false` only.
-  - Precision defaults are `rta` for Q1/Q4 and `cha` for Q2/Q3.
+  - Precision defaults were `rta` for Q1/Q4 and `cha` for Q2/Q3; amendment 21 made `cha` the default everywhere (`rta` opt-in).
   - Service → Service `via=calls`/`via=http` are derived at query time; `via=package` is stored with provenance `manifest`.
   - Package versions come from `package-lock.json`, `go.mod` and pom literals or properties, in M3b's key form, with `@?` when unresolved.
   - DI scope is the service's classpath and literal scan roots, main sources only.

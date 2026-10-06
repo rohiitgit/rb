@@ -1,6 +1,11 @@
 //! Mentions of names, by role (contract M4b S1): every identifier, type identifier and
 //! property-name token of a Java or TS/JS file, aggregated per name, plus the whole words of
 //! string literals. Consumers allow-list the roles a name may take (S6 gate M, S9 (c)).
+//!
+//! `declared` holds the name spans of every non-local definition (role `declaration`);
+//! `defined` those that are definitions of the facts (within the nesting cap). A supertype head
+//! is role `supertype` only when the type naming it is in `defined`, since only those reach
+//! RTA's subtype rule (evaluator pass 1, Y2).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
@@ -14,6 +19,7 @@ pub(crate) fn mentions(
     root: Node<'_>,
     source: &[u8],
     declared: &HashSet<Range<usize>>,
+    defined: &HashSet<Range<usize>>,
 ) -> BTreeMap<String, BTreeSet<MentionRole>> {
     let mut out: BTreeMap<String, BTreeSet<MentionRole>> = BTreeMap::new();
     let java = match language {
@@ -31,12 +37,17 @@ pub(crate) fn mentions(
             continue;
         }
         if TOKENS.contains(&kind) {
-            let role = if declared.contains(&node.byte_range()) {
+            // A class expression's own name is not how its instances are made (`const D =
+            // class Named …; new D()`), so it is no declaration (evaluator pass 1, Y2).
+            let expression_name = node.parent().is_some_and(|p| p.kind() == "class");
+            let role = if expression_name {
+                MentionRole::Other
+            } else if declared.contains(&node.byte_range()) {
                 MentionRole::Declaration
             } else if java {
-                java_role(node, source)
+                java_role(node, source, defined)
             } else {
-                es_role(node)
+                es_role(node, defined)
             };
             let name = String::from_utf8_lossy(&source[node.byte_range()]).into_owned();
             out.entry(name).or_default().insert(role);
@@ -58,13 +69,48 @@ const TOKENS: &[&str] = &[
     "private_property_identifier",
 ];
 
-/// The whole words of a string fragment: maximal runs of identifier characters.
+/// The whole words of a string fragment: maximal runs of identifier characters, and each
+/// `$`-separated segment of a run too, so a binary name (`Outer$Inner`, as `Class.forName` and
+/// `META-INF/services` write a nested class) mentions the nested type (evaluator pass 1, Y1).
 fn words(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes)
+    let mut out = Vec::new();
+    for run in String::from_utf8_lossy(bytes)
         .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .filter(|w| !w.is_empty())
-        .map(str::to_owned)
-        .collect()
+    {
+        if run.contains('$') {
+            out.extend(run.split('$').filter(|w| !w.is_empty()).map(str::to_owned));
+        }
+        out.push(run.to_owned());
+    }
+    out
+}
+
+/// The role of a supertype head: `supertype` when the type declaring it is a definition of the
+/// facts, else `other` (a local class in a lambda or an anonymous class body, a class
+/// expression: their instances reach no rule that would keep the supertype).
+fn supertype_role(clause: Node<'_>, defined: &HashSet<Range<usize>>) -> MentionRole {
+    const TYPES: &[&str] = &[
+        "class_declaration",
+        "abstract_class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "record_declaration",
+    ];
+    let mut cur = clause.parent();
+    while let Some(n) = cur {
+        if TYPES.contains(&n.kind()) {
+            return match n.child_by_field_name("name") {
+                Some(name) if defined.contains(&name.byte_range()) => MentionRole::Supertype,
+                _ => MentionRole::Other,
+            };
+        }
+        if !matches!(n.kind(), "class_heritage" | "extends_clause") {
+            break;
+        }
+        cur = n.parent();
+    }
+    MentionRole::Other
 }
 
 fn is_field(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
@@ -74,7 +120,7 @@ fn is_field(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
 }
 
 /// The role of a Java token, from the structures it sits in (innermost first).
-fn java_role(node: Node<'_>, source: &[u8]) -> MentionRole {
+fn java_role(node: Node<'_>, source: &[u8], defined: &HashSet<Range<usize>>) -> MentionRole {
     let mut child = node;
     let mut member = false;
     while let Some(parent) = child.parent() {
@@ -107,7 +153,7 @@ fn java_role(node: Node<'_>, source: &[u8]) -> MentionRole {
                 break;
             }
             "superclass" | "super_interfaces" | "extends_interfaces" => {
-                return MentionRole::Supertype;
+                return supertype_role(parent, defined);
             }
             "type_arguments" => return MentionRole::Type,
             "type_list"
@@ -154,7 +200,7 @@ fn is_logger_argument(literal: Node<'_>, source: &[u8]) -> bool {
 }
 
 /// The role of a TS/JS token, from the structures it sits in (innermost first).
-fn es_role(node: Node<'_>) -> MentionRole {
+fn es_role(node: Node<'_>, defined: &HashSet<Range<usize>>) -> MentionRole {
     let mut child = node;
     let mut member = false;
     while let Some(parent) = child.parent() {
@@ -173,13 +219,13 @@ fn es_role(node: Node<'_>) -> MentionRole {
             }
             "extends_clause" => {
                 if is_field(parent, "value", child) {
-                    return MentionRole::Supertype;
+                    return supertype_role(parent, defined);
                 }
                 break;
             }
             // JavaScript's heritage is `extends <expression>` with no clause node.
             "implements_clause" | "extends_type_clause" | "class_heritage" => {
-                return MentionRole::Supertype;
+                return supertype_role(parent, defined);
             }
             "type_arguments" => return MentionRole::Type,
             "new_expression" => {
@@ -349,6 +395,88 @@ mod tests {
         assert_eq!(
             roles(Language::JavaScript, "class K extends X {}", "X"),
             [Supertype]
+        );
+    }
+
+    /// Evaluator pass 1, Y1: a string's binary name `Outer$Inner` is the word itself and each
+    /// `$`-separated segment, so the nested type is mentioned.
+    #[test]
+    fn string_words_split_binary_names() {
+        let src = "class K { String s = \"com.acme.Holder2$ReflectImpl\"; }";
+        for word in ["Holder2$ReflectImpl", "Holder2", "ReflectImpl", "acme"] {
+            assert_eq!(roles(Language::Java, src, word), [String], "{word}");
+        }
+        let ts = "const s = 'a.Outer$T';";
+        assert_eq!(roles(Language::TypeScript, ts, "T"), [String]);
+    }
+
+    /// Evaluator pass 1, Y2: a supertype head belongs to role `supertype` only when the type
+    /// that names it is a definition of the facts (rule (i) then sees it); a local class in a
+    /// lambda or an anonymous class body, or a class expression, makes it `other`.
+    #[test]
+    fn supertype_of_a_type_that_is_no_definition_is_other() {
+        for (language, src, want) in [
+            (
+                Language::Java,
+                "class K { Object f = (java.util.function.Supplier<Object>) () -> { class L extends X {} return new L(); }; }",
+                vec![Other],
+            ),
+            (
+                Language::Java,
+                "class K { Object o = new Object() { void m() { class L implements X {} } }; }",
+                vec![Other],
+            ),
+            (
+                Language::Java,
+                "class K { void m() { class L extends X {} } }",
+                vec![Supertype],
+            ),
+            (
+                Language::Java,
+                "class K { void m() { interface J extends X {} } }",
+                vec![Supertype],
+            ),
+            (
+                Language::TypeScript,
+                "const D = class extends X {};",
+                vec![Other],
+            ),
+            (
+                Language::TypeScript,
+                "const D = class Named implements X {};",
+                vec![Other],
+            ),
+            (
+                Language::JavaScript,
+                "const D = class extends X {};",
+                vec![Other],
+            ),
+            (
+                Language::TypeScript,
+                "class K extends X {}",
+                vec![Supertype],
+            ),
+            (
+                Language::TypeScript,
+                "const f = () => { class L extends X {} };",
+                vec![Supertype],
+            ),
+            (
+                Language::TypeScript,
+                "items.map(() => { class L extends X {} return new L(); });",
+                vec![Other],
+            ),
+        ] {
+            assert_eq!(roles(language, src, "X"), want, "{src}");
+        }
+        // A named class expression's name is no declaration either.
+        assert_eq!(
+            roles(
+                Language::TypeScript,
+                "const D = class Named implements X {};",
+                "Named"
+            ),
+            [Other]
         );
     }
 

@@ -156,9 +156,10 @@ enum Command {
         /// Choose among several matching symbols (1-based, as listed).
         #[arg(long)]
         pick: Option<usize>,
-        /// Dispatch expansion: `rta` skips (and counts) overriders whose type is never
-        /// instantiated, `cha` follows every overrider.
-        #[arg(long, default_value = "rta", value_parser = code::parse_precision)]
+        /// Dispatch expansion: `cha` (the default) follows every overrider; `rta` (opt-in)
+        /// skips, and counts, overriders whose type is proven never instantiated, and may hide
+        /// callers reached through forms the scan cannot see.
+        #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
         precision: rb_store::code::Precision,
     },
     /// Show what breaks if a symbol or table is removed (Q2).
@@ -201,8 +202,8 @@ enum Command {
         /// Choose among several matching endpoints (1-based, as listed).
         #[arg(long)]
         pick: Option<usize>,
-        /// Dispatch expansion, both ways (as for `callers`).
-        #[arg(long, default_value = "rta", value_parser = code::parse_precision)]
+        /// Dispatch expansion, both ways (as for `callers`; `cha` by default).
+        #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
         precision: rb_store::code::Precision,
     },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
