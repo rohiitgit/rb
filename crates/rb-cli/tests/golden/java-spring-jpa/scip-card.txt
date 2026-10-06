@@ -1,10 +1,10 @@
 auth-service  (path: ., deployable)
 ├─ Detected by: maven
 ├─ Manifests: pom.xml
-├─ Files: 9 (java 6, other 1, python 1, sql 1)
+├─ Files: 10 (java 6, other 2, python 1, sql 1)
 ├─ Owners: none
 ├─ File ownership
-│    unowned     9 files  100%
+│    unowned    10 files  100%
 ├─ Packages (5)
 │    maven/jakarta.persistence/jakarta.persistence-api@3.1.0
 │    maven/jdk@21
@@ -12,6 +12,6 @@ auth-service  (path: ., deployable)
 │    maven/org.springframework/spring-context@6.1.13
 │    maven/org.springframework/spring-web@6.1.13
 ├─ APIs (1)
-│    POST /api/v1/login  → com/acme/auth/AuthController#login().  [exact]
+│    POST /auth/api/v1/login  → com/acme/auth/AuthController#login().  [synthetic]
 ├─ Calls APIs of: none
 └─ APIs called by: none

@@ -306,7 +306,8 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 5: stitching and coverage (`rb-indexer/src/stitch.rs`; `CONSUMES`, `http_*` diagnostics, `http_coverage`, the `rb status` `http:` line; `PIPELINE = m4a-http-2`; amendment 5)
 - [x] Phase 6: `rb path` (`rb-store/src/path.rs` walks, `rb-cli/src/path.rs` text and JSON, `--pick`, `--depth`, `--hops`, `--full`; amendment 6)
 - [x] Phase 7: Service Card `APIs` / `Calls APIs of` / `APIs called by` / unstitched count, `rb impact` endpoint roll-up (amendment 7).
-- [x] Phase 8a: fixture plan part 1 (auth `GET /login` and a commented route, notification `/sms` and a commented route, `selfcheck.ts` loopback client, billing gin service with a same-path decoy and a Go client). Next: 8b (web clients, Java context path), 8c (goldens and precision guards).
+- [x] Phase 8a: fixture plan part 1 (auth `GET /login` and a commented route, notification `/sms` and a commented route, `selfcheck.ts` loopback client, billing gin service with a same-path decoy and a Go client). 
+- [x] Phase 8b: fixture plan part 2 (web suffix, ambiguous, dynamic and external clients; Java context path `/auth`). Next: 8c (goldens and precision guards).
 
 - **Split (2026-10-06):** M4 becomes M4a (this entry) and M4b. M4b covers Spring DI and Spring Data synthesis, RTA, derived `DEPENDS_ON`, the full Service Card, Q3's roll-up and orphan detection; it is not started. Design §13 has both rows.
 - **Contract:** `tasks/contract-m4a.md`, S1–S28 and invariants 1–13. Phases are in `tasks/todo.md`.

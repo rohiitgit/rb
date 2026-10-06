@@ -7,7 +7,7 @@ affects: reaches those through calls or references (2):
   2  DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:14  [auth-service]  heuristic
   3  AuthController#login().  src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  heuristic
 endpoints: handled by the removed or impacted code (1):
-  4  POST /api/v1/login  [auth-service]  heuristic
+  4  POST /auth/api/v1/login  [auth-service]  heuristic
 services: auth-service 5
 owners: -
 certainty: exact 1, synthetic 2, heuristic 2
