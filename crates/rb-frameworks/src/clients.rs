@@ -101,18 +101,14 @@ pub struct ClientCall {
     /// taken as the injected instance (dependency injection is M4b), so the site never reaches
     /// `synthetic` (contract M4a amendment 12).
     pub base_from_bean: bool,
-    /// Gate A (contract M4a amendments 13–15) on what carries the request: `Some(false)` when
+    /// Gate A (contract M4a amendments 13–16) on what carries the request: `Some(false)` when
     /// the carrier (the instance, builder or copy the request is sent through) or the request
     /// itself is not provably plain, whatever the URL's source, so the site never reaches
     /// `synthetic` (its host still restricts); otherwise `Some(true)` when the base comes from
     /// the carrier's construction and `None` when it does not. For an imported axios instance
-    /// the indexer decides (it is exported, so never verified); for a [`Self::module_call`] the
-    /// indexer caps it when the repository reconfigures that module ([`global_hooks`]).
+    /// the indexer decides (it is exported, so never verified), and it caps every site of a
+    /// client kind the repository may reconfigure ([`global_hooks`], [`feign_config_key`]).
     pub base_verified: Option<bool>,
-    /// The call is on a client module itself: global `fetch` (or `node-fetch`/`cross-fetch`),
-    /// the axios default export, Go's `net/http` package or `http.DefaultClient` (amendment
-    /// 15, a bare module client).
-    pub module_call: bool,
 }
 
 /// An axios instance bound to a name: `const api = axios.create({ baseURL })`.
@@ -224,7 +220,7 @@ impl<'f> Gate<'f> {
             match &t.role {
                 TokenRole::Declaration => declarations += 1,
                 TokenRole::Receiver { call } => calls.push(call.as_str()),
-                TokenRole::Member { .. } | TokenRole::Other => return None,
+                TokenRole::Callee | TokenRole::Member { .. } | TokenRole::Other => return None,
             }
         }
         (declarations == 1).then_some(calls)
@@ -232,13 +228,11 @@ impl<'f> Gate<'f> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Global hooks: a bare module client is plain only while nothing reconfigures the module
-// (contract M4a amendment 15)
+// Global hooks: a module client is plain only while every token naming its process-wide
+// configuration is in an allow-listed role (contract M4a amendments 15 and 16)
 
-/// The JavaScript global objects whose `fetch` member is the global `fetch`.
-const GLOBAL_OBJECTS: &[&str] = &["globalThis", "window", "global", "self"];
-
-/// The axios module's members that send a request or build an instance, and its pure helpers.
+/// The axios module's members whose call leaves its configuration alone: the requests,
+/// `create`, and two pure predicates.
 const AXIOS_MODULE_CALLS: &[&str] = &[
     "get",
     "post",
@@ -253,114 +247,191 @@ const AXIOS_MODULE_CALLS: &[&str] = &[
     "isCancel",
 ];
 
-/// A Go `http.Client`'s methods.
-const GO_CLIENT_METHODS: &[&str] = &[
-    "Do",
-    "Get",
-    "Head",
-    "Post",
-    "PostForm",
-    "CloseIdleConnections",
-];
+/// A Go `http.Client`'s request methods.
+const GO_REQUESTS: &[&str] = &["Do", "Get", "Head", "Post", "PostForm"];
 
 /// The module clients this file may reconfigure for the whole process (contract M4a amendment
-/// 15), from its name tokens, name-based and scope-insensitive like [`Gate`]:
-/// - `fetch`: the `fetch` member of a global object written, read or passed on without being
-///   called (`globalThis.fetch = …`, `window.fetch = …`, `const f = global.fetch`);
-/// - axios: any token of the axios module's local name other than its import or `require`
-///   declaration, a call of it (`axios(…)`), or a request, `create` or helper call on it, so
-///   `axios.defaults…`, `axios.interceptors…`, aliasing it, exporting it or passing it on;
-/// - Go `net/http`: `http.DefaultTransport` in any use, and `http.DefaultClient` in any use but
-///   as the receiver of a client method (`http.DefaultClient = …`, `….Transport = …`, `c :=
-///   http.DefaultClient`).
+/// 16), from its name tokens, by allow-list: every token naming the module's configuration
+/// surface must be in an allowed role, any other role is a hook.
+/// - `fetch`: every `fetch` token (an identifier, a property, a shorthand) is a callee
+///   (`fetch(…)`, `window.fetch(…)`) or a `node-fetch`/`cross-fetch` import or `require`
+///   declaration, so `globalThis.fetch = …`, `(global as any).fetch = …`, `fetch = …`,
+///   `typeof fetch`, `{ fetch }` or a `fetch` method are hooks;
+/// - axios: every token of a module binding (a default, namespace or `default as` import, a
+///   `require("axios")` at any scope) is its import or `require` declaration, a callee
+///   (`axios(…)`), or the receiver of a request, `create` or helper call, so `axios.defaults…`,
+///   `axios.interceptors…`, `ax.default.defaults…`, aliasing, exporting or passing it are hooks;
+/// - Go `net/http`: a dot import, or a `DefaultTransport`/`DefaultClient` token other than the
+///   receiver of a request call (`http.DefaultClient.Get(…)`);
+/// - Feign: an import from the Feign library or Spring Cloud OpenFeign outside
+///   [`FEIGN_PLAIN_IMPORTS`] (a wildcard too), a token of a Feign extension point that may
+///   retarget a request (`RequestInterceptor`, `Capability`, `FeignBuilderCustomizer`,
+///   `Targeter`, `Feign`), a qualified `feign.…` use, a `configuration` on a `@FeignClient`, or
+///   a `defaultConfiguration` on `@EnableFeignClients`.
 ///
-/// The indexer caps every [`ClientCall::module_call`] of a kind any file of the repository
-/// reconfigures.
+/// The indexer caps every site of a kind any file of the repository hooks (bare calls and
+/// axios instances alike), and every Feign site when a configuration file sets a Feign client
+/// key ([`feign_config_key`]).
 pub fn global_hooks(language: Language, facts: &FileFacts) -> Vec<ClientKind> {
     let mut out = Vec::new();
     let within = |inner: Span, outer: Span| {
         (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
     };
+    let any_token = |hook: &dyn Fn(&rb_syntax::NameToken) -> bool| {
+        facts.name_tokens.iter().any(|t| {
+            crate::work::tick(1);
+            hook(t)
+        })
+    };
     match language {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
-            if facts.name_tokens.iter().any(|t| {
-                crate::work::tick(1);
-                GLOBAL_OBJECTS.contains(&t.name.as_str())
-                    && matches!(&t.role, TokenRole::Member { name } if name == "fetch")
+            // The `import`/`require` declarations of `modules`.
+            let declared =
+                |modules: &[&str], requires: &HashSet<usize>, t: &rb_syntax::NameToken| {
+                    facts.imports.iter().any(|i| {
+                        modules.iter().any(|m| is_module(&i.module, m)) && within(t.span, i.span)
+                    }) || requires
+                        .iter()
+                        .any(|&bi| within(t.span, facts.bindings[bi].span))
+                };
+            let fetch_requires: HashSet<usize> = FETCH_MODULES
+                .iter()
+                .flat_map(|m| module_names(facts, m, &[], false).1)
+                .collect();
+            if any_token(&|t| {
+                t.name == "fetch"
+                    && t.role != TokenRole::Callee
+                    && !declared(FETCH_MODULES, &fetch_requires, t)
             }) {
                 out.push(ClientKind::Fetch);
             }
             let (names, requires) = module_names(facts, "axios", &["default"], true);
-            let callees: HashSet<(i32, i32)> = facts
-                .chains
-                .iter()
-                .filter(|c| c.root.is_none())
-                .filter_map(|c| c.links.first())
-                .map(|l| (l.span[0], l.span[1]))
-                .collect();
-            let declared = |t: &rb_syntax::NameToken| {
-                facts.imports.iter().any(|i| within(t.span, i.span))
-                    || requires
-                        .iter()
-                        .any(|&bi| within(t.span, facts.bindings[bi].span))
-            };
-            if facts.name_tokens.iter().any(|t| {
-                crate::work::tick(1);
+            if any_token(&|t| {
                 names.contains(&t.name)
                     && !match &t.role {
-                        TokenRole::Declaration => true,
+                        TokenRole::Callee => true,
                         TokenRole::Receiver { call } => AXIOS_MODULE_CALLS.contains(&call.as_str()),
-                        TokenRole::Member { .. } => false,
-                        TokenRole::Other => {
-                            callees.contains(&(t.span[0], t.span[1])) || declared(t)
-                        }
+                        _ => declared(&["axios"], &requires, t),
                     }
             }) {
                 out.push(ClientKind::Axios);
             }
         }
         Language::Go => {
-            let Some(http) = facts
+            let dot = facts
                 .imports
                 .iter()
-                .find(|i| i.module == "net/http")
-                .and_then(|i| match i.alias.as_deref() {
-                    Some("_" | ".") => None,
-                    Some(a) => Some(a.to_owned()),
-                    None => Some("http".to_owned()),
+                .any(|i| i.module == "net/http" && i.alias.as_deref() == Some("."));
+            if dot
+                || any_token(&|t| {
+                    rb_syntax::surface_names(language).contains(&t.name.as_str())
+                        && !matches!(&t.role, TokenRole::Receiver { call } if GO_REQUESTS.contains(&call.as_str()))
                 })
-            else {
-                return out;
-            };
-            let default_client = format!("{http}.DefaultClient");
-            let requests: HashSet<(i32, i32)> = facts
-                .chains
-                .iter()
-                .filter(|c| {
-                    c.root.as_deref() == Some(default_client.as_str())
-                        && c.links
-                            .first()
-                            .is_some_and(|l| GO_CLIENT_METHODS.contains(&l.name.as_str()))
-                })
-                .map(|c| (c.span[0], c.span[1]))
-                .collect();
-            if facts.name_tokens.iter().any(|t| {
-                crate::work::tick(1);
-                t.name == http
-                    && match &t.role {
-                        TokenRole::Member { name } if name == "DefaultTransport" => true,
-                        TokenRole::Member { name } if name == "DefaultClient" => {
-                            !requests.contains(&(t.span[0], t.span[1]))
-                        }
-                        _ => false,
-                    }
-            }) {
+            {
                 out.push(ClientKind::GoHttp);
             }
         }
-        Language::Java | Language::Python => {}
+        Language::Java => {
+            let in_import =
+                |t: &rb_syntax::NameToken| facts.imports.iter().any(|i| within(t.span, i.span));
+            let configuring_import = facts.imports.iter().any(|i| {
+                FEIGN_MODULES.iter().any(|m| dotted_under(&i.module, m))
+                    && (i.wildcard
+                        || i.is_static
+                        || i.names.iter().any(|n| {
+                            !FEIGN_PLAIN_IMPORTS.contains(&(i.module.as_str(), n.name.as_str()))
+                        }))
+            });
+            let configured = |d: &Decoration| {
+                FEIGN_PACKAGES.iter().any(|p| {
+                    is_annotation(facts, d, p, "FeignClient")
+                        && keyed(d, &["configuration"]).is_some()
+                        || is_annotation(facts, d, p, "EnableFeignClients")
+                            && keyed(d, &["defaultConfiguration"]).is_some()
+                })
+            };
+            if configuring_import
+                || any_token(&|t| {
+                    rb_syntax::surface_names(language).contains(&t.name.as_str())
+                        && (t.name != "feign" || !in_import(t))
+                })
+                || facts
+                    .definitions
+                    .iter()
+                    .flat_map(|d| &d.decorations)
+                    .any(configured)
+            {
+                out.push(ClientKind::Feign);
+            }
+        }
+        Language::Python => {}
     }
     out
+}
+
+/// The Feign library and Spring Cloud OpenFeign packages (subpackages included).
+const FEIGN_MODULES: &[&str] = &[
+    "feign",
+    "org.springframework.cloud.openfeign",
+    "org.springframework.cloud.netflix.feign",
+];
+
+/// The Feign imports that configure no request (contract M4a amendment 16): the declarative
+/// annotations, exceptions, response decoding, logging and retries. Every other import from
+/// [`FEIGN_MODULES`] (an interceptor, a `RequestTemplate`, a `Client`, an `Encoder`, a
+/// `Capability`, a builder or customizer, a contract) may change where a request goes.
+const FEIGN_PLAIN_IMPORTS: &[(&str, &str)] = &[
+    ("feign", "FeignException"),
+    ("feign", "RetryableException"),
+    ("feign", "Response"),
+    ("feign", "Param"),
+    ("feign", "Headers"),
+    ("feign", "HeaderMap"),
+    ("feign", "QueryMap"),
+    ("feign", "RequestLine"),
+    ("feign", "Body"),
+    ("feign", "Logger"),
+    ("feign", "Retryer"),
+    ("feign.codec", "Decoder"),
+    ("feign.codec", "ErrorDecoder"),
+    ("feign.codec", "DecodeException"),
+    ("feign.hystrix", "FallbackFactory"),
+    ("org.springframework.cloud.openfeign", "FeignClient"),
+    ("org.springframework.cloud.openfeign", "EnableFeignClients"),
+    ("org.springframework.cloud.openfeign", "SpringQueryMap"),
+    ("org.springframework.cloud.openfeign", "FallbackFactory"),
+    ("org.springframework.cloud.openfeign", "CollectionFormat"),
+    ("org.springframework.cloud.netflix.feign", "FeignClient"),
+    (
+        "org.springframework.cloud.netflix.feign",
+        "EnableFeignClients",
+    ),
+];
+
+/// A TS/JS module specifier that is `module` or one of its subpaths
+/// (`axios/dist/node/axios.cjs`).
+fn is_module(spec: &str, module: &str) -> bool {
+    spec.strip_prefix(module)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// A dotted name that is `prefix` or below it: a Java package or one of its subpackages
+/// (`feign.codec`), a configuration key or one of its children.
+fn dotted_under(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// A configuration key that configures Feign clients (`feign.client.config…`,
+/// `spring.cloud.openfeign.client.config…`: interceptors, encoders, a URL; contract M4a
+/// amendment 16): any such key in any configuration file caps every Feign site.
+pub fn feign_config_key(key: &str) -> bool {
+    [
+        "feign.client.config",
+        "spring.cloud.openfeign.client.config",
+    ]
+    .iter()
+    .any(|p| dotted_under(key, p))
 }
 
 fn entry<'a>(arg: Option<&'a Arg>, key: &str) -> Option<&'a Arg> {
@@ -443,7 +514,6 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
             source: chain.enclosing,
             base_from_bean: false,
             base_verified: None,
-            module_call: true,
         });
     }
 }
@@ -454,8 +524,9 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
 const AXIOS_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
 
 /// Local names of a module's exports `exported` (`default` for a default import), plus its
-/// namespace import when `namespace`, or a top-level `require(module)`; plus the indices of those
-/// `require` bindings.
+/// namespace import when `namespace`, or a `require(module)` at any scope (evaluator pass 6,
+/// V4), the module's subpaths included (`axios/dist/node/axios.cjs`); plus the indices of
+/// those `require` bindings.
 fn module_names(
     facts: &FileFacts,
     module: &str,
@@ -466,7 +537,7 @@ fn module_names(
     let mut names: Vec<String> = facts
         .imports
         .iter()
-        .filter(|i| i.module == module)
+        .filter(|i| is_module(&i.module, module))
         .flat_map(|i| {
             i.alias.iter().filter(|_| namespace).cloned().chain(
                 i.names
@@ -476,17 +547,16 @@ fn module_names(
             )
         })
         .collect();
-    for (i, b) in facts
-        .bindings
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.scope.is_none() && !b.member)
-    {
+    for (i, b) in facts.bindings.iter().enumerate().filter(|(_, b)| !b.member) {
         if let Some(c) = init_chain(facts, b)
             && c.root.is_none()
             && c.links.len() == 1
             && c.links[0].name == "require"
-            && c.links[0].args.first().and_then(literal).as_deref() == Some(module)
+            && c.links[0]
+                .args
+                .first()
+                .and_then(literal)
+                .is_some_and(|m| is_module(&m, module))
         {
             names.push(b.name.clone());
             requires.insert(i);
@@ -597,7 +667,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
     let imported: HashSet<&str> = facts
         .imports
         .iter()
-        .filter(|i| i.module != "axios")
+        .filter(|i| !is_module(&i.module, "axios"))
         .flat_map(|i| {
             i.names
                 .iter()
@@ -612,11 +682,10 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
         // `axios(url | config)`, `axios(url, config)`.
         if chain.root.is_none() {
             if is_axios(&first.name, chain.span) && !first.args.is_empty() {
-                let mut call = match first.args.first() {
+                let call = match first.args.first() {
                     Some(config @ Arg::Object { .. }) => config_call(chain, None, None, config),
                     url => axios_call(chain, None, None, url, None, first.args.get(1)),
                 };
-                call.module_call = true;
                 out.calls.push(call);
             }
             continue;
@@ -655,7 +724,6 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
             if let Some((plain, from_carrier)) = carrier {
                 call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
             }
-            call.module_call = module;
             out.calls.push(call);
         }
     }
@@ -769,7 +837,6 @@ fn axios_call(
         // A request config that is not plain (an `adapter`, a spread, a variable) may send the
         // request elsewhere whatever carries it (amendment 15).
         base_verified: (!plain_config(config)).then_some(false),
-        module_call: false,
     }
 }
 
@@ -844,7 +911,6 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBas
             // `new RestTemplate().getForObject(…)` (evaluator pass 3, R8): no root URI.
             None => {
                 root.starts_with("new ")
-                    && fresh_root(facts, chain)
                     && chain_kind(facts, chain) == Some(ClientKind::RestTemplate)
             }
         };
@@ -852,9 +918,13 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBas
             continue;
         }
         // The root URI configured on the instance; a relative URL needs one (amendment 12).
-        // The carrier is the instance (Gate A), or an inline `new RestTemplate()`, plain.
+        // The carrier is the instance (Gate A), or an inline construction, plain only as a bare
+        // `new RestTemplate()` (amendment 16).
         let base = bases.of(receiver, ClientKind::RestTemplate);
-        let plain = receiver.is_none_or(|bi| bases.carrier(bi));
+        let plain = match receiver {
+            Some(bi) => bases.carrier(bi),
+            None => plain_construction(facts, chain, 0),
+        };
         out.calls.push(ClientCall {
             kind: ClientKind::RestTemplate,
             method,
@@ -865,7 +935,6 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBas
             span: chain.span,
             source: chain.enclosing,
             base_from_bean: base.from_bean,
-            module_call: false,
         });
     }
 }
@@ -955,21 +1024,19 @@ fn chain_base(facts: &FileScope<'_>, chain: &CallChain, upto: usize) -> BaseFact
     if let Some(value) = base {
         return BaseFact::Stated(value);
     }
-    if fresh_root(facts, chain) {
+    if fresh_root(facts, chain).is_some() {
         BaseFact::Fresh
     } else {
         BaseFact::Unreadable
     }
 }
 
-/// The links of a construction chain that leave its URI building to `baseUrl`/`rootUri` alone
-/// (Gate A, contract M4a amendment 14, rule 4): the fresh root's `builder`/`create`, the base
-/// itself, `build`, and settings no URI goes through. Anything else (`uriBuilderFactory`,
+/// The links after a fresh construction ([`fresh_root`]) that leave its URI building to
+/// `baseUrl`/`rootUri` alone (Gate A, contract M4a amendments 14 and 16): the base itself,
+/// `build`, and settings no URI goes through. Anything else (`uriBuilderFactory`,
 /// `uriTemplateHandler`, `defaultUriVariables`, filters, interceptors, customizers, `apply`, a
-/// connector or request factory) may change where a request goes.
+/// connector or request factory, a second `create`/`builder`) may change where a request goes.
 const PLAIN_LINKS: &[&str] = &[
-    "builder",
-    "create",
     "baseUrl",
     "rootUri",
     "build",
@@ -990,11 +1057,11 @@ const PLAIN_LINKS: &[&str] = &[
     "readTimeout",
 ];
 
-/// A construction chain whose base Gate A can certify: it starts from a new client or builder
-/// (not from a builder or client binding, whose state is not read) and its links before `upto`
-/// are all [`PLAIN_LINKS`].
-fn plain_construction(facts: &FileFacts, chain: &CallChain, upto: usize) -> bool {
-    fresh_root(facts, chain) && plain_links(&chain.links[..upto])
+/// A construction chain whose base Gate A can certify: it starts from a fresh construction
+/// ([`fresh_root`]; not from a builder or client binding, whose state is not read) and its
+/// links after it and before `upto` are all [`PLAIN_LINKS`].
+fn plain_construction(facts: &FileScope<'_>, chain: &CallChain, upto: usize) -> bool {
+    fresh_root(facts, chain).is_some_and(|n| n <= upto && plain_links(&chain.links[n..upto]))
 }
 
 /// Every link is one of [`PLAIN_LINKS`].
@@ -1016,22 +1083,47 @@ fn factory_base(arg: Option<&Arg>) -> UrlValue {
     }
 }
 
-/// A chain starting from a new client or builder: `new RestTemplate…()`, or a static
-/// `WebClient`/`RestClient` `create()`/`builder()`.
-fn fresh_root(facts: &FileFacts, chain: &CallChain) -> bool {
-    let Some(root) = chain.root.as_deref() else {
-        return false;
-    };
+/// The fresh construction a chain starts from, by allow-list (contract M4a amendment 16,
+/// evaluator pass 6, V1), with the number of its links that make it: `new RestTemplate()` or
+/// `new RestTemplateBuilder()` with no argument and no class body (0), or a static
+/// `WebClient`/`RestClient` `builder()`, `create()` or `create(<url>)` (1). Anything else (a
+/// constructor argument such as a request factory or a customizer, an anonymous subclass,
+/// `RestClient.create(restTemplate)`, `RestClient.builder(restTemplate)`) is `None`.
+fn fresh_root(facts: &FileScope<'_>, chain: &CallChain) -> Option<usize> {
+    let root = chain.root.as_deref()?;
     if let Some(created) = root.strip_prefix("new ") {
-        let simple = created.split(['(', '<']).next().unwrap_or("").trim();
+        // The root is the creation as written: `T()` and nothing after it.
+        let (type_name, rest) = created.split_once('(')?;
+        let simple = type_name.split('<').next().unwrap_or("").trim();
         let simple = simple.rsplit('.').next().unwrap_or(simple);
-        return matches!(simple, "RestTemplate" | "RestTemplateBuilder");
+        let bare = rest.trim() == ")";
+        return (bare && matches!(simple, "RestTemplate" | "RestTemplateBuilder")).then_some(0);
     }
-    fluent_kind(facts, root).is_some()
-        && chain
-            .links
-            .first()
-            .is_some_and(|l| matches!(l.name.as_str(), "create" | "builder"))
+    fluent_kind(facts, root)?;
+    let first = chain.links.first()?;
+    let fresh = match (first.name.as_str(), first.args.as_slice()) {
+        ("builder" | "create", []) => true,
+        ("create", [url]) => url_arg(facts, url),
+        _ => false,
+    };
+    fresh.then_some(1)
+}
+
+/// An argument that can only be a URL: a string, or a name the file binds to a `String` (a
+/// constant, a `@Value` field, a parameter). A name not resolved in the file may be a client.
+fn url_arg(facts: &FileScope<'_>, arg: &Arg) -> bool {
+    match arg {
+        Arg::Template { .. } => true,
+        Arg::Name { text, span } => {
+            local_binding(facts, Language::Java, text, *span).is_some_and(|bi| {
+                matches!(
+                    facts.bindings[bi].type_name.as_str(),
+                    "String" | "java.lang.String"
+                )
+            })
+        }
+        _ => false,
+    }
 }
 
 /// The client kind a chain builds or configures: from its root's type (a binding, a static
@@ -1160,9 +1252,11 @@ impl<'s, 'f> SpringBases<'s, 'f> {
     }
 
     /// Whether the binding `bi` is a provably plain carrier (Gate A, contract M4a amendments
-    /// 14 and 15): it passes the [`Gate`] scan, something in sight builds it, and every chain
-    /// that configures it is a [`plain_construction`]. A field, a parameter, an injected
-    /// instance and one configured by a non-plain link never are.
+    /// 14–16): it passes the [`Gate`] scan and its initialiser is a [`plain_construction`] or
+    /// a bare `new RestTemplate()`. A chain that configures it later names it as an assignment
+    /// target or a setter's receiver, which the scan already rejects (evaluator pass 6: a
+    /// separate check of those chains was redundant, its mutant survived); a field, a
+    /// parameter and an injected instance never pass the scan.
     fn carrier(&self, bi: usize) -> bool {
         let b = &self.facts.bindings[bi];
         // A binding with no initialiser has no `declaration` token or is written to, so the
@@ -1171,8 +1265,12 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             Some(Init::Call { chain }) => Some(*chain),
             // `new RestTemplate()`: a new client with no links (an argument may be a request
             // factory, and a subclass may override anything, so neither is plain).
-            Some(Init::New { type_name, args }) => {
-                if *args > 0 || type_name.rsplit('.').next() != Some("RestTemplate") {
+            Some(Init::New {
+                type_name,
+                args,
+                body,
+            }) => {
+                if *args > 0 || *body || type_name.rsplit('.').next() != Some("RestTemplate") {
                     return false;
                 }
                 None
@@ -1180,13 +1278,9 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             Some(_) => return false,
             None => None,
         };
-        let chains: Vec<usize> = init
-            .into_iter()
-            .chain(self.configured.get(&bi).into_iter().flatten().copied())
-            .collect();
         self.gate
             .unchanged(bi, spring_requests(self.facts, &b.type_name))
-            && chains.iter().all(|&ci| {
+            && init.is_none_or(|ci| {
                 self.facts
                     .chains
                     .get(ci)
@@ -1353,7 +1447,6 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases)
             span: chain.span,
             source: chain.enclosing,
             base_from_bean: base.from_bean,
-            module_call: false,
         });
     }
 }
@@ -1486,7 +1579,6 @@ fn feign(facts: &FileScope<'_>, out: &mut FileClients) {
                     base_from_bean: false,
                     // A declarative interface: no instance carries the request (amendment 15).
                     base_verified: None,
-                    module_call: false,
                 });
             }
         }
@@ -1562,7 +1654,6 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             // may reroute), nor is a request built by `NewRequest`, which whatever `Do`es it
             // carries.
             base_verified: (!bare).then_some(false),
-            module_call: bare,
         });
     }
 }
@@ -2149,53 +2240,94 @@ mod tests {
                 "axios GET 'http://orders/orders/1'",
             ]
         );
-        // Only the module itself is a bare module client, which the indexer caps when the
-        // repository reconfigures it ([`global_hooks`]).
-        let facts = extract(Language::TypeScript, ts.as_bytes()).unwrap();
-        let modules: Vec<bool> = clients(Language::TypeScript, &facts)
-            .calls
-            .iter()
-            .map(|c| c.module_call)
-            .collect();
-        let mut expected = vec![false; 18];
-        for i in [0, 10, 15, 17] {
-            expected[i] = true;
-        }
-        assert_eq!(modules, expected);
+        // A Go `http.Client` binding and a request built by `NewRequest` are not plain; the
+        // package and `http.DefaultClient` are the bare module client, which the indexer caps
+        // when the repository reconfigures it ([`global_hooks`]).
         let go = "package main\nimport \"net/http\"\nfunc f(c *http.Client) {\n\thttp.Get(\"http://orders/orders/1\")\n\thttp.DefaultClient.Get(\"http://orders/orders/1\")\n\tc.Get(\"http://orders/orders/1\")\n\thttp.NewRequest(\"GET\", \"http://orders/orders/1\", nil)\n}\n";
         let facts = extract(Language::Go, go.as_bytes()).unwrap();
-        let modules: Vec<(bool, Option<bool>)> = clients(Language::Go, &facts)
+        let verified: Vec<Option<bool>> = clients(Language::Go, &facts)
             .calls
             .iter()
-            .map(|c| (c.module_call, c.base_verified))
+            .map(|c| c.base_verified)
             .collect();
+        assert_eq!(verified, [None, None, Some(false), Some(false)]);
+    }
+
+    /// Contract M4a amendment 16 (evaluator pass 6, V1): a fresh construction is plain only
+    /// when it is exactly `new RestTemplate()` (no argument, no class body), a static
+    /// `WebClient`/`RestClient` `create()` or `create(<url>)` (a string, or a name the file
+    /// binds to a `String`: a constant, a `@Value` field, a parameter), or a no-argument
+    /// `builder()`/`new RestTemplateBuilder()` followed by plain links. A client, a customizer,
+    /// a request factory or a name not known to be a `String` as the argument, or a class body,
+    /// caps the site, inline and local alike.
+    #[test]
+    fn fresh_constructions_are_allow_listed() {
+        let src = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.web.client.RestClient;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass J {\n  static final String ORDERS = \"http://orders\";\n  @Value(\"${orders.url}\") private String ordersUrl;\n  void j1() {\n    RestTemplate rt = new RestTemplate();\n    RestClient.create(rt).get().uri(\"http://orders/orders/1\").retrieve();\n  }\n  void j2(RestTemplate injected) { RestClient.builder(injected).build().get().uri(\"http://orders/orders/1\").retrieve(); }\n  void j5(RestTemplate injected) {\n    RestClient c = RestClient.create(injected);\n    c.get().uri(\"http://orders/orders/1\").retrieve();\n  }\n  void j3(RestTemplateCustomizer cust) {\n    RestTemplate rt = new RestTemplateBuilder(cust).build();\n    rt.getForObject(\"http://orders/orders/1\", String.class);\n  }\n  void j4() { new RestTemplate(factory).getForObject(\"http://orders/orders/1\", String.class); }\n  void j10() {\n    RestTemplate rt = new RestTemplate() { };\n    rt.getForObject(\"http://orders/orders/1\", String.class);\n  }\n  void j10b() { new RestTemplate() { }.getForObject(\"http://orders/orders/1\", String.class); }\n  void ok(String base) {\n    WebClient.create(ORDERS).get().uri(\"/orders/1\").retrieve();\n    WebClient.create(ordersUrl).get().uri(\"/orders/1\").retrieve();\n    RestClient.create(base).get().uri(\"/orders/1\").retrieve();\n    RestClient.create().get().uri(\"http://orders/orders/1\").retrieve();\n    RestClient.builder().baseUrl(\"http://orders\").build().get().uri(\"/orders/1\").retrieve();\n    RestTemplate b = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n    b.getForObject(\"/orders/1\", String.class);\n    RestTemplate cb = new CustomBuilder().build();\n    cb.getForObject(\"http://orders/orders/1\", String.class);\n    WebClient.create(Urls.ORDERS).get().uri(\"/orders/1\").retrieve();\n  }\n}\n";
         assert_eq!(
-            modules,
+            calls(Language::Java, src),
             [
-                (true, None),
-                (true, None),
-                (false, Some(false)),
-                (false, Some(false))
+                // `j3`, `j4`, `j10`, `j10b`, then the control `b`.
+                "rest_template GET 'http://orders/orders/1' base=? unverified",
+                "rest_template GET 'http://orders/orders/1' base=? unverified",
+                "rest_template GET 'http://orders/orders/1' base=? unverified",
+                "rest_template GET 'http://orders/orders/1' base=? unverified",
+                "rest_template GET '/orders/1' base='http://orders'",
+                // A builder of another type is no fresh construction.
+                "rest_template GET 'http://orders/orders/1' base=? unverified",
+                // `j1`, `j2`, `j5`: built from a `RestTemplate`.
+                "rest_client GET 'http://orders/orders/1' base=rt unverified",
+                "rest_client GET 'http://orders/orders/1' base=? unverified",
+                "rest_client GET 'http://orders/orders/1' base=injected unverified",
+                // The controls; a constant of another file is not known to be a `String`.
+                "web_client GET '/orders/1' base=ORDERS",
+                "web_client GET '/orders/1' base=ordersUrl",
+                "rest_client GET '/orders/1' base=base",
+                "rest_client GET 'http://orders/orders/1' base=?",
+                "rest_client GET '/orders/1' base='http://orders'",
+                "web_client GET '/orders/1' base=Urls.ORDERS unverified",
             ]
         );
     }
 
-    /// Contract M4a amendment 15: the module clients a file reconfigures for the whole process.
-    /// A request on the module, a call of it, `create` and its import are no hook; a member
-    /// read or write, an alias, an export, or passing it on is.
+    /// Contract M4a amendments 15 and 16: the module clients a file may reconfigure for the
+    /// whole process, by allow-list. `fetch`: every `fetch` token is a callee or a
+    /// `node-fetch`/`cross-fetch` import or `require`. axios: every token of a module binding
+    /// (an import, a `require` at any scope) is its declaration, a callee, or the receiver of a
+    /// request, `create` or helper call. Go: no dot import of `net/http`, and every
+    /// `DefaultTransport`/`DefaultClient` token is the receiver of a request call. Feign: no
+    /// `RequestInterceptor` token, no `configuration =` on a `@FeignClient` (nor
+    /// `defaultConfiguration =` on `@EnableFeignClients`). Any other role is a hook.
     #[test]
     fn global_hooks_of_module_clients() {
         let hooks = |language: Language, src: &str| {
             global_hooks(language, &extract(language, src.as_bytes()).unwrap())
         };
-        let clean = "import axios from \"axios\";\nimport * as ax from \"axios\";\nconst api = axios.create({ baseURL: \"http://orders\" });\naxios.get(\"/a\");\naxios(\"/b\");\nax.post(\"/c\", 1);\nif (axios.isAxiosError(e)) {}\nwindow.fetch(\"/d\");\nfetch(\"/e\");\nglobalThis.location.href;\n";
-        assert!(hooks(Language::TypeScript, clean).is_empty());
+        for clean in [
+            "import axios from \"axios\";\nimport * as ax from \"axios\";\nconst api = axios.create({ baseURL: \"http://orders\" });\naxios.get(\"/a\");\naxios(\"/b\");\nax.post(\"/c\", 1);\nif (axios.isAxiosError(e)) {}\nwindow.fetch(\"/d\");\nfetch(\"/e\");\nglobalThis.location.href;\nthis.fetch(\"/f\");\n",
+            "import fetch from \"node-fetch\";\nfetch(\"/a\");\n",
+            "const fetch = require(\"cross-fetch\");\nfetch(\"/a\");\n",
+            "export function f() {\n  const axios = require(\"axios\");\n  return axios.get(\"/a\");\n}\n",
+        ] {
+            assert!(hooks(Language::TypeScript, clean).is_empty(), "{clean}");
+        }
         for (src, kind) in [
             ("globalThis.fetch = f;\n", ClientKind::Fetch),
             ("window.fetch = f;\n", ClientKind::Fetch),
             ("global.fetch = jest.fn();\n", ClientKind::Fetch),
             ("self.fetch = f;\n", ClientKind::Fetch),
             ("const f = window.fetch;\n", ClientKind::Fetch),
+            // Evaluator pass 6, V3: casts and a bare assignment.
+            ("(globalThis as any).fetch = f;\n", ClientKind::Fetch),
+            ("(window as any).fetch = f;\n", ClientKind::Fetch),
+            ("(global as any).fetch = jest.fn();\n", ClientKind::Fetch),
+            ("fetch = wrap(fetch);\n", ClientKind::Fetch),
+            (
+                "if (typeof fetch === \"undefined\") {}\n",
+                ClientKind::Fetch,
+            ),
+            ("Object.assign(globalThis, { fetch });\n", ClientKind::Fetch),
+            ("import { fetch } from \"undici\";\n", ClientKind::Fetch),
+            ("class A { fetch() {} }\n", ClientKind::Fetch),
             (
                 "import axios from \"axios\";\naxios.defaults.baseURL = \"https://api.stripe.com\";\n",
                 ClientKind::Axios,
@@ -2216,6 +2348,10 @@ mod tests {
                 "import * as ax from \"axios\";\nsetup(ax);\n",
                 ClientKind::Axios,
             ),
+            (
+                "import * as ax from \"axios\";\nax.default.defaults.adapter = a;\n",
+                ClientKind::Axios,
+            ),
             // A call on the module that is no request, `create` or helper.
             (
                 "import axios from \"axios\";\naxios.use(plugin);\n",
@@ -2223,6 +2359,16 @@ mod tests {
             ),
             (
                 "const axios = require(\"axios\");\naxios.defaults.adapter = a;\n",
+                ClientKind::Axios,
+            ),
+            // A subpath of the module is the module (the same `defaults`).
+            (
+                "import ax from \"axios/dist/node/axios.cjs\";\nax.defaults.adapter = a;\n",
+                ClientKind::Axios,
+            ),
+            // Evaluator pass 6, V4: a `require` in a function.
+            (
+                "export function setup() {\n  const axios = require(\"axios\");\n  axios.interceptors.request.use((c) => c);\n}\n",
                 ClientKind::Axios,
             ),
         ] {
@@ -2243,7 +2389,7 @@ mod tests {
         assert!(
             hooks(
                 Language::Go,
-                &go("\thttp.Get(u)\n\thttp.DefaultClient.Do(req)\n\t_ = http.StatusOK")
+                &go("\thttp.Get(u)\n\thttp.DefaultClient.Do(req)\n\thttp.DefaultClient.Get(u)\n\thttp.DefaultClient.Head(u)\n\thttp.DefaultClient.Post(u, t, b)\n\thttp.DefaultClient.PostForm(u, v)\n\t_ = http.StatusOK")
             )
             .is_empty()
         );
@@ -2253,12 +2399,75 @@ mod tests {
             "\thttp.DefaultClient = &http.Client{}",
             "\tc := http.DefaultClient",
             "\tt := http.DefaultTransport.(*http.Transport).Clone()",
+            "\thttp.DefaultClient.CloseIdleConnections()",
         ] {
             assert_eq!(
                 hooks(Language::Go, &go(body)),
                 [ClientKind::GoHttp],
                 "{body}"
             );
+        }
+        // Evaluator pass 6, V5: a dot import of `net/http`.
+        assert_eq!(
+            hooks(
+                Language::Go,
+                "package main\nimport . \"net/http\"\nfunc init() {\n\tGet(u)\n}\n"
+            ),
+            [ClientKind::GoHttp]
+        );
+        // Evaluator pass 6, V2: Feign.
+        let feign = |annotation: &str| {
+            format!(
+                "package p;\nimport org.springframework.cloud.openfeign.FeignClient;\nimport org.springframework.cloud.openfeign.EnableFeignClients;\n{annotation}\ninterface A {{}}\n"
+            )
+        };
+        assert!(
+            hooks(
+                Language::Java,
+                &feign("@FeignClient(name = \"a\", url = \"http://a\")")
+            )
+            .is_empty()
+        );
+        assert!(
+            hooks(
+                Language::Java,
+                "package p;\nimport feign.FeignException;\nimport feign.codec.ErrorDecoder;\nclass E implements ErrorDecoder {}\n"
+            )
+            .is_empty()
+        );
+        for src in [
+            feign("@FeignClient(name = \"a\", configuration = RewriteConfig.class)"),
+            feign("@EnableFeignClients(defaultConfiguration = RewriteConfig.class)"),
+            "package p;\nimport feign.RequestInterceptor;\nclass G {}\n".to_owned(),
+            "package p;\nimport feign.*;\nclass G {}\n".to_owned(),
+            "package p;\nclass G implements RequestInterceptor {}\n".to_owned(),
+            // Other extension points that may retarget every Feign client.
+            "package p;\nimport feign.Client;\nclass T { @Bean Client c() { return null; } }\n".to_owned(),
+            "package p;\nclass T { @Bean feign.Client c() { return null; } }\n".to_owned(),
+            "package p;\nclass T { @Bean Capability c() { return null; } }\n".to_owned(),
+            "package p;\nimport org.springframework.cloud.openfeign.FeignBuilderCustomizer;\nclass T {}\n".to_owned(),
+            "package p;\nclass T { @Bean Feign.Builder b() { return null; } }\n".to_owned(),
+        ] {
+            assert_eq!(hooks(Language::Java, &src), [ClientKind::Feign], "{src}");
+        }
+    }
+
+    /// Contract M4a amendment 16: Feign client configuration keys in any configuration file.
+    #[test]
+    fn feign_client_config_keys() {
+        for key in [
+            "feign.client.config",
+            "feign.client.config.default.request-interceptors[0]",
+            "spring.cloud.openfeign.client.config.orders.url",
+        ] {
+            assert!(feign_config_key(key), "{key}");
+        }
+        for key in [
+            "feign.hystrix.enabled",
+            "feign.client.configx",
+            "feign.client",
+        ] {
+            assert!(!feign_config_key(key), "{key}");
         }
     }
 
@@ -2267,7 +2476,7 @@ mod tests {
     /// instance) is unreadable, so the binding's configuration is never taken as empty.
     #[test]
     fn chain_base_reads_a_fresh_root() {
-        let src = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass C {\n  void m(RestTemplateBuilder b, WebClient w) {\n    RestTemplate a = b.build();\n    RestTemplate c = new RestTemplateBuilder().build();\n    WebClient d = w.mutate().build();\n    WebClient e = WebClient.builder().build();\n  }\n}\n";
+        let src = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.client.RestClient;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass C {\n  void m(RestTemplateBuilder b, WebClient w) {\n    RestTemplate a = b.build();\n    RestTemplate c = new RestTemplateBuilder().build();\n    WebClient d = w.mutate().build();\n    WebClient e = WebClient.builder().build();\n    RestTemplate f = new RestTemplateBuilder(cust).build();\n    RestClient g = RestClient.builder(rt).build();\n  }\n}\n";
         let facts = extract(Language::Java, src.as_bytes()).unwrap();
         let scope = FileScope::new(&facts);
         let got: Vec<(String, BaseFact)> = facts
@@ -2283,6 +2492,10 @@ mod tests {
                 ("c".to_owned(), BaseFact::Fresh),
                 ("d".to_owned(), BaseFact::Unreadable),
                 ("e".to_owned(), BaseFact::Fresh),
+                // A builder from a customizer or a client is no fresh construction (evaluator
+                // pass 6, V1).
+                ("f".to_owned(), BaseFact::Unreadable),
+                ("g".to_owned(), BaseFact::Unreadable),
             ]
         );
     }

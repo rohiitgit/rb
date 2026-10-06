@@ -3,9 +3,10 @@
 //! to appears anywhere in the file, as its declaration, as the receiver of a member call, or
 //! otherwise. Name-based and scope-insensitive on purpose: a pack scans every token of the name
 //! in a range (an enclosing function, or the whole file) and proves nothing a shadowing name
-//! could break. Module objects and the JavaScript global objects are recorded too, so a pack can
-//! see a process-wide hook (`axios.defaults…`, `globalThis.fetch = …`, Go's
-//! `http.DefaultTransport = …`; contract M4a amendment 15). Nothing here knows a framework.
+//! could break. Module objects and a few configuration-surface names are recorded too, so a pack
+//! can see a process-wide hook (`axios.defaults…`, `(globalThis as any).fetch = …`, Go's
+//! `http.DefaultTransport = …`, a Feign `RequestInterceptor`; contract M4a amendments 15 and
+//! 16). Beyond [`SURFACE_NAMES`], nothing here knows a framework.
 
 use std::collections::HashSet;
 
@@ -13,21 +14,48 @@ use tree_sitter::Node;
 
 use crate::{Binding, CallChain, Import, Language, NameToken, TokenRole, span, text};
 
-/// The JavaScript global objects, whose members are process-wide (amendment 15).
-const GLOBAL_OBJECTS: &[&str] = &["globalThis", "window", "global", "self"];
+/// The names through which a module client's process-wide configuration is reached (contract
+/// M4a amendment 16): recorded in every position, also as a property, field or type name, so
+/// a pack can require every one of them to be in an allow-listed role.
+pub fn surface_names(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::TypeScript | Language::Tsx | Language::JavaScript => SURFACE_NAMES[0],
+        Language::Go => SURFACE_NAMES[1],
+        Language::Java => SURFACE_NAMES[2],
+        Language::Python => &[],
+    }
+}
+
+/// [`surface_names`] per language: TS/JS, Go, Java (Feign's extension points that may
+/// retarget a request, and the `feign` package name of a qualified use).
+const SURFACE_NAMES: [&[&str]; 3] = [
+    &["fetch"],
+    &["DefaultTransport", "DefaultClient"],
+    &[
+        "RequestInterceptor",
+        "Capability",
+        "FeignBuilderCustomizer",
+        "Targeter",
+        "Feign",
+        "feign",
+    ],
+];
 
 /// The names whose tokens are recorded: names a binding (a field or member too) initialises
-/// with a call or a Java `new`, and simple targets of an assignment from a call (TypeScript, JavaScript and
-/// Java); the local names of TS/JS default and namespace imports of a package (not a relative
-/// path) and the global objects (TypeScript, JavaScript); the local names of Go imports.
+/// with a call or a Java `new`, and simple targets of an assignment from a call (TypeScript,
+/// JavaScript and Java); the local names of TS/JS default and namespace imports of a package
+/// (not a relative path); and the language's [`surface_names`].
 pub(crate) fn candidates(
     language: Language,
     bindings: &[Binding],
     chains: &[CallChain],
     imports: &[Import],
 ) -> HashSet<String> {
-    let mut out = HashSet::new();
-    if !records(language) {
+    let mut out: HashSet<String> = surface_names(language)
+        .iter()
+        .map(|n| (*n).to_owned())
+        .collect();
+    if !records(language) || language == Language::Go {
         return out;
     }
     let mut add = |name: &str| {
@@ -35,21 +63,7 @@ pub(crate) fn candidates(
             out.insert(name.to_owned());
         }
     };
-    if language == Language::Go {
-        for i in imports {
-            // A blank import binds no name (`.` is rejected by `add`).
-            match i.alias.as_deref() {
-                Some("_") => {}
-                Some(a) => add(a),
-                None => add(i.module.rsplit('/').next().unwrap_or_default()),
-            }
-        }
-        return out;
-    }
     if language != Language::Java {
-        for name in GLOBAL_OBJECTS {
-            add(name);
-        }
         for i in imports.iter().filter(|i| !i.module.starts_with(['.', '/'])) {
             if let Some(a) = &i.alias {
                 add(a);
@@ -91,17 +105,25 @@ pub(crate) fn tokens(
     if candidates.is_empty() || !records(language) {
         return out;
     }
+    let surface = surface_names(language);
     let mut stack = vec![root];
     let mut cursor = root.walk();
     while let Some(node) = stack.pop() {
-        if matches!(
-            node.kind(),
+        let kind = node.kind();
+        let named = matches!(
+            kind,
             "identifier"
                 | "shorthand_property_identifier"
                 | "shorthand_property_identifier_pattern"
-        ) {
+        );
+        // A surface name also as a property, field or type name (amendment 16).
+        let surface_only = matches!(
+            kind,
+            "property_identifier" | "field_identifier" | "type_identifier"
+        );
+        if named || surface_only {
             let name = text(node, source);
-            if candidates.contains(&name) {
+            if candidates.contains(&name) && (named || surface.contains(&name.as_str())) {
                 out.push(NameToken {
                     role: role(language, node, source),
                     name,
@@ -122,13 +144,28 @@ fn is_field(parent: Node<'_>, field: &str, node: Node<'_>) -> bool {
 }
 
 /// What one token is: the name of a TS/JS `const`/`let` declarator that is not exported, or of
-/// a Java local variable declarator; the receiver of a member call (no optional chaining); the
-/// object of a member access that is not called (TS/JS `x.m`, Go `x.M`, read or written, also
-/// continued: `x.m.n = …`); anything else.
+/// a Java local variable declarator; the callee of a TS/JS call; the receiver of a member call
+/// (no optional chaining); the object of a member access that is not called (TS/JS `x.m`, Go
+/// `x.M`, read or written, also continued: `x.m.n = …`); anything else. A property or field
+/// name is judged as the member access it names (`(globalThis as any).fetch = …` is an
+/// assignment target, `window.fetch(…)` a callee); a type name, or a property name that names
+/// no member access (an object key, a method definition), is anything else.
 fn role(language: Language, node: Node<'_>, source: &[u8]) -> TokenRole {
     let Some(parent) = node.parent() else {
         return TokenRole::Other;
     };
+    if matches!(node.kind(), "property_identifier" | "field_identifier") {
+        let named = matches!(parent.kind(), "member_expression" | "selector_expression")
+            && (is_field(parent, "property", node) || is_field(parent, "field", node));
+        return if named {
+            role(language, parent, source)
+        } else {
+            TokenRole::Other
+        };
+    }
+    if node.kind() == "type_identifier" {
+        return TokenRole::Other;
+    }
     let java = language == Language::Java;
     if language == Language::Go {
         if parent.kind() != "selector_expression" || !is_field(parent, "operand", node) {
@@ -173,6 +210,9 @@ fn role(language: Language, node: Node<'_>, source: &[u8]) -> TokenRole {
             n.children(&mut cursor)
                 .any(|c| matches!(c.kind(), "optional_chain" | "?."))
         };
+        if parent.kind() == "call_expression" && is_field(parent, "function", node) {
+            return TokenRole::Callee;
+        }
         if parent.kind() != "member_expression"
             || !is_field(parent, "object", node)
             || optional(parent)
@@ -216,6 +256,7 @@ mod tests {
             .map(|t| {
                 let role = match &t.role {
                     TokenRole::Declaration => "decl".to_owned(),
+                    TokenRole::Callee => "callee".to_owned(),
                     TokenRole::Receiver { call } => format!(".{call}"),
                     TokenRole::Member { name } => format!("~{name}"),
                     TokenRole::Other => "other".to_owned(),
@@ -228,8 +269,9 @@ mod tests {
     /// Contract M4a amendment 14: every token of a name a call initialises (or a call is
     /// assigned to) is recorded wherever it is, before its declaration and in nested functions
     /// too, as a declaration (a non-exported `const`/`let`, a Java local), the receiver of a
-    /// member call, or something else (an export, a member read, optional chaining, a write,
-    /// an argument, a shorthand property, a parameter, a field).
+    /// member call, a TS/JS callee (amendment 16), or something else (an export, a member
+    /// read, optional chaining, a write, an argument, a shorthand property, a parameter, a
+    /// field).
     #[test]
     fn name_tokens_of_configured_names() {
         let ts = "import axios from \"axios\";\nfunction setup() { api.defaults.baseURL = \"x\"; }\nconst api = axios.create({ baseURL: \"http://orders\" });\napi.get(\"/a\");\napi?.get(\"/b\");\napi.get?.(\"/c\");\napi(\"/d\");\nexport { api as ordersApi };\nexport const ex = axios.create();\nlet lv = axios.create();\nlv = other;\nvar vv = axios.create();\nmodule.exports = { api };\nconst { api: a2 } = x;\nfunction f(api) { return api[\"defaults\"]; }\nconst plain = 1;\nuse(plain);\n";
@@ -245,7 +287,7 @@ mod tests {
                 "api@3 .get",
                 "api@4 other",
                 "api@5 other",
-                "api@6 other",
+                "api@6 callee",
                 "api@7 other",
                 "ex@8 other",
                 "axios@8 .create",
@@ -287,15 +329,18 @@ mod tests {
         assert!(tokens(Language::Python, "import requests\nc = requests.get(u)\n").is_empty());
     }
 
-    /// Contract M4a amendment 15: the tokens of module objects (a TS/JS default or namespace
-    /// import of a package, never of a relative path; a Go import) and of the JavaScript global
-    /// objects are recorded, and a member access that is not called is a `member` token naming
-    /// its first member, so a pack can see a process-wide hook (`axios.defaults.baseURL = …`,
-    /// `axios.interceptors.request.use(…)`, `globalThis.fetch = …`, `http.DefaultTransport =
-    /// …`) and tell it from a request (`axios.get(…)`, `window.fetch(…)`, `http.Get(…)`).
+    /// Contract M4a amendments 15 and 16: the tokens of module objects (a TS/JS default or
+    /// namespace import of a package, never of a relative path) are recorded, and so are the
+    /// configuration-surface names ([`SURFACE_NAMES`]: `fetch`; Go's `DefaultTransport` and
+    /// `DefaultClient`; Feign's extension points and the `feign` package name) in every position, also as a property,
+    /// field or type name, which is judged as the member access it names. A member access that
+    /// is not called is a `member` token naming its first member, and a callee a `callee` token,
+    /// so a pack can tell a process-wide hook (`axios.defaults.baseURL = …`, `(globalThis as
+    /// any).fetch = …`, `fetch = wrap(fetch)`, `http.DefaultTransport = …`) from a request
+    /// (`axios.get(…)`, `axios(…)`, `window.fetch(…)`, `http.DefaultClient.Get(…)`).
     #[test]
-    fn module_and_global_object_tokens() {
-        let ts = "import axios from \"axios\";\nimport * as ns from \"ky\";\nimport local from \"./local\";\nimport { named } from \"pkg\";\naxios.defaults.baseURL = \"x\";\naxios.interceptors.request.use(f);\naxios.get(\"/a\");\naxios(\"/b\");\nglobalThis.fetch = f;\nwindow.fetch(\"/c\");\nglobal.fetch.bind(null);\nself?.fetch;\nns.x;\nlocal.y;\nnamed.z;\n";
+    fn module_and_surface_name_tokens() {
+        let ts = "import axios from \"axios\";\nimport * as ns from \"ky\";\nimport local from \"./local\";\nimport { named } from \"pkg\";\naxios.defaults.baseURL = \"x\";\naxios.interceptors.request.use(f);\naxios.get(\"/a\");\naxios(\"/b\");\nglobalThis.fetch = f;\nwindow.fetch(\"/c\");\nglobal.fetch.bind(null);\nself?.fetch;\nns.x;\nlocal.y;\nnamed.z;\n(globalThis as any).fetch = jest.fn();\nfetch = wrap(fetch);\nfetch(\"/d\");\nconst o = { fetch, k: typeof fetch };\nclass A { fetch() {} }\n";
         assert_eq!(
             tokens(Language::TypeScript, ts),
             [
@@ -304,25 +349,42 @@ mod tests {
                 "axios@4 ~defaults",
                 "axios@5 ~interceptors",
                 "axios@6 .get",
-                "axios@7 other",
-                "globalThis@8 ~fetch",
-                "window@9 .fetch",
-                "global@10 ~fetch",
-                "self@11 other",
+                "axios@7 callee",
+                "fetch@8 other",
+                "fetch@9 callee",
+                "fetch@10 .bind",
+                "fetch@11 other",
                 "ns@12 ~x",
+                "fetch@15 other",
+                "fetch@16 other",
+                "fetch@16 other",
+                "fetch@17 callee",
+                "fetch@18 other",
+                "fetch@18 other",
+                "fetch@19 other",
             ]
         );
-        let go = "package main\nimport (\n\t\"net/http\"\n\tf \"fmt\"\n\t_ \"embed\"\n)\nfunc main() {\n\thttp.DefaultTransport = t\n\thttp.DefaultClient.Transport = t\n\thttp.DefaultClient.Do(req)\n\thttp.Get(\"/a\")\n\tf.Println(http.StatusOK)\n\t_ = f.Sprint()\n}\n";
+        let go = "package main\nimport (\n\t\"net/http\"\n\tf \"fmt\"\n\t_ \"embed\"\n)\nfunc main() {\n\thttp.DefaultTransport = t\n\thttp.DefaultClient.Transport = t\n\thttp.DefaultClient.Do(req)\n\thttp.Get(\"/a\")\n\tf.Println(http.StatusOK)\n\t_ = f.Sprint()\n\tDefaultClient.Get(\"/b\")\n\tc := &http.DefaultClient\n}\n";
         assert_eq!(
             tokens(Language::Go, go),
             [
-                "http@7 ~DefaultTransport",
-                "http@8 ~DefaultClient",
-                "http@9 ~DefaultClient",
-                "http@10 .Get",
-                "f@11 .Println",
-                "http@11 ~StatusOK",
-                "f@12 .Sprint",
+                "DefaultTransport@7 other",
+                "DefaultClient@8 ~Transport",
+                "DefaultClient@9 .Do",
+                "DefaultClient@13 .Get",
+                "DefaultClient@14 other",
+            ]
+        );
+        let java = "package p;\nimport feign.RequestInterceptor;\nclass C {\n  @Bean RequestInterceptor rewrite() { return t -> t.target(\"x\"); }\n  static class R implements feign.RequestInterceptor {}\n  @Bean feign.Client client() { return null; }\n}\n";
+        assert_eq!(
+            tokens(Language::Java, java),
+            [
+                "feign@1 other",
+                "RequestInterceptor@1 other",
+                "RequestInterceptor@3 other",
+                "feign@4 other",
+                "RequestInterceptor@4 other",
+                "feign@5 other",
             ]
         );
     }

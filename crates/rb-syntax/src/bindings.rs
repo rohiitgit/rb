@@ -1024,7 +1024,11 @@ mod tests {
                         )
                     }
                     Some(crate::Init::Name { text, .. }) => format!("name {text}"),
-                    Some(crate::Init::New { type_name, args }) => format!("new {type_name}/{args}"),
+                    Some(crate::Init::New {
+                        type_name,
+                        args,
+                        body,
+                    }) => format!("new {type_name}/{args}{}", if *body { " { }" } else { "" }),
                     Some(crate::Init::Fallback { primary, default }) => {
                         format!("{primary} ?? {}", template(default))
                     }
@@ -1072,7 +1076,7 @@ mod tests {
 
     #[test]
     fn java_initialisers_constants_and_annotations() {
-        let src = "class K {\n  static final String BASE = \"/api\";\n  String mutable = \"/m\";\n  private final WebClient web = WebClient.builder().baseUrl(\"http://x\").build();\n  @Value(\"${auth.url:http://auth}\") private String authUrl;\n  K(@Value(\"${k}\") String k) { final String p = BASE + \"/x\"; }\n}\ninterface Paths { String ROOT = \"/r\"; }\n";
+        let src = "class K {\n  static final String BASE = \"/api\";\n  String mutable = \"/m\";\n  private final WebClient web = WebClient.builder().baseUrl(\"http://x\").build();\n  @Value(\"${auth.url:http://auth}\") private String authUrl;\n  K(@Value(\"${k}\") String k) { final String p = BASE + \"/x\"; }\n  void m() { RestTemplate a = new RestTemplate(); RestTemplate b = new RestTemplate(f) { }; }\n}\ninterface Paths { String ROOT = \"/r\"; }\n";
         assert_eq!(
             inits(Language::Java, src),
             [
@@ -1080,6 +1084,9 @@ mod tests {
                 "mutable = '/m'",
                 "web = call WebClient.builder.baseUrl.build const",
                 "p = '{BASE}/x' const",
+                // A class body (an anonymous subclass) is recorded (contract M4a amendment 16).
+                "a = new RestTemplate/0",
+                "b = new RestTemplate/1 { }",
                 "ROOT = '/r' const",
             ]
         );

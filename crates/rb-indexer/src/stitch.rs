@@ -177,6 +177,9 @@ pub(crate) struct Inputs<'a, 'i> {
     pub properties: &'i BTreeMap<String, BTreeMap<String, String>>,
     /// Service key → what unread configuration may set.
     pub overrides: &'i BTreeMap<String, Overrides>,
+    /// Some configuration file of the repository sets a Feign client key
+    /// ([`rb_frameworks::clients::feign_config_key`]; contract M4a amendment 16).
+    pub feign_configured: bool,
 }
 
 /// One file's top-level non-member bindings (`None`) and type members (`Some(type)`) by name.
@@ -294,12 +297,16 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
         .iter()
         .map(|(path, (language, facts))| (*path, rb_frameworks::clients::clients(*language, facts)))
         .collect();
-    // The module clients some file reconfigures for the whole process (amendment 15).
-    let hooked: BTreeSet<ClientKind> = inputs
+    // The clients some file or configuration key may reconfigure for the whole process: every
+    // site of those kinds is capped (amendments 15 and 16).
+    let mut hooked: BTreeSet<ClientKind> = inputs
         .files
         .values()
         .flat_map(|(language, facts)| rb_frameworks::clients::global_hooks(*language, facts))
         .collect();
+    if inputs.feign_configured {
+        hooked.insert(ClientKind::Feign);
+    }
     let mut out = Vec::new();
     for (&path, file_clients) in &clients {
         let file = folding.ids[path];
@@ -310,9 +317,10 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
             // A base stated at the call (axios request config) replaces the instance's
             // (amendment 12).
             let stated = call.base.clone().map(|b| (file, b));
-            let mut base_verified = match call.base_verified {
-                None if call.module_call && hooked.contains(&call.kind) => Some(false),
-                v => v,
+            let mut base_verified = if hooked.contains(&call.kind) {
+                Some(false)
+            } else {
+                call.base_verified
             };
             let base = match &call.instance {
                 Some(name) => match imported_instance(inputs, &clients, path, facts, name) {
@@ -2115,6 +2123,9 @@ mod tests {
             service_of: &service_of,
             properties: &props,
             overrides: &overrides,
+            feign_configured: properties
+                .iter()
+                .any(|(_, k, _)| rb_frameworks::clients::feign_config_key(k)),
         };
         sites(&inputs)
     }
@@ -2296,7 +2307,17 @@ mod tests {
         eps: &[EndpointRef],
         services: &[&str],
     ) -> Vec<String> {
-        let sites = collect_sites(files, &[], &[], &[]);
+        stitched_bases_with(files, &[], eps, services)
+    }
+
+    /// [`stitched_bases`] with `application.properties` entries `(service, key, value)`.
+    fn stitched_bases_with(
+        files: &[(&str, Language, &str)],
+        properties: &[(&str, &str, &str)],
+        eps: &[EndpointRef],
+        services: &[&str],
+    ) -> Vec<String> {
+        let sites = collect_sites(files, &[], properties, &[]);
         let services: Vec<ServiceRef> = services
             .iter()
             .map(|s| ServiceRef {
@@ -2553,6 +2574,199 @@ mod tests {
                 format!("web/src/t.ts 10 {synthetic}"),
             ]
         );
+    }
+
+    /// Contract M4a amendment 16 (evaluator pass 6, V1–V5), from source: a carrier is plain only
+    /// when every token naming its configuration surface, anywhere in the repository, is in an
+    /// allow-listed role. Every repro of the report keeps its host but never reaches
+    /// `synthetic`: Spring clients built from another client, a customizer, a constructor
+    /// argument or with a class body (`j1`–`j5`, `j10`); Feign under a `configuration =`
+    /// class, a global `RequestInterceptor` bean, or `feign.client.config` keys; `fetch`
+    /// replaced through a cast or a bare assignment; axios instances under an
+    /// `axios.defaults…` hook, and a hook through a function-local `require`; a Go dot import.
+    /// The controls stay `synthetic`.
+    #[test]
+    fn carriers_are_plain_only_by_allow_listed_roles() {
+        let eps = vec![ep("GET", "/orders/{id}", "orders")];
+        let services = ["web", "pay", "orders"];
+        let to = "HTTP GET /orders/{} @orders";
+        let unverified = format!("heuristic -> {to} [heuristic] base=unverified match=exact");
+        let synthetic = format!("synthetic -> {to} [synthetic] base=literal match=exact");
+        let imports = "package p;\nimport java.util.List;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.web.client.RestClient;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\n";
+        let j = format!(
+            "{imports}class J {{\n  void j1() {{\n    RestTemplate rt = new RestTemplate();\n    rt.getInterceptors().add(rewrite);\n    RestClient.create(rt).get().uri(\"http://orders/orders/1\").retrieve();\n  }}\n  void j2(RestTemplate injected) {{ RestClient.builder(injected).build().get().uri(\"http://orders/orders/1\").retrieve(); }}\n  void j5(RestTemplate injected) {{\n    RestClient c = RestClient.create(injected);\n    c.get().uri(\"http://orders/orders/1\").retrieve();\n  }}\n  void j3(RestTemplateCustomizer cust) {{\n    RestTemplate rt = new RestTemplateBuilder(cust).build();\n    rt.getForObject(\"http://orders/orders/1\", String.class);\n  }}\n  void j4() {{ new RestTemplate(new InterceptingClientHttpRequestFactory(new SimpleClientHttpRequestFactory(), List.of(rewrite))).getForObject(\"http://orders/orders/1\", String.class); }}\n  void j10() {{\n    RestTemplate rt = new org.springframework.web.client.RestTemplate() {{ }};\n    rt.getForObject(\"http://orders/orders/1\", String.class);\n  }}\n  void j10b() {{ new RestTemplate() {{ }}.getForObject(\"http://orders/orders/1\", String.class); }}\n}}\n"
+        );
+        assert_eq!(
+            stitched_bases(
+                &[("pay/src/main/java/p/J.java", Language::Java, j.as_str())],
+                &eps,
+                &services
+            ),
+            [
+                // `RestTemplate` sites (`j3`, `j4`, `j10`, `j10b`), then `RestClient` (`j1`,
+                // `j2`, `j5`).
+                format!("pay/src/main/java/p/J.java 19 {unverified}"),
+                format!("pay/src/main/java/p/J.java 21 {unverified}"),
+                format!("pay/src/main/java/p/J.java 24 {unverified}"),
+                format!("pay/src/main/java/p/J.java 26 {unverified}"),
+                format!("pay/src/main/java/p/J.java 10 {unverified}"),
+                format!("pay/src/main/java/p/J.java 12 {unverified}"),
+                format!("pay/src/main/java/p/J.java 15 {unverified}"),
+            ]
+        );
+        // The Java controls: fresh constructions with no argument or a URL argument (a string,
+        // a constant of the file, a `String` field), followed by plain links.
+        let ok = format!(
+            "{imports}class K {{\n  static final String ORDERS = \"http://orders\";\n  void k() {{\n    RestTemplate rt = new RestTemplate();\n    rt.getForObject(\"http://orders/orders/1\", String.class);\n    new RestTemplate().getForObject(\"http://orders/orders/1\", String.class);\n    WebClient w = WebClient.create(ORDERS);\n    w.get().uri(\"/orders/1\").retrieve();\n    RestClient.create(\"http://orders\").get().uri(\"/orders/1\").retrieve();\n    RestClient.create().get().uri(\"http://orders/orders/1\").retrieve();\n    WebClient s01 = WebClient.builder().baseUrl(\"http://orders\").build();\n    s01.get().uri(\"/orders/1\").retrieve();\n  }}\n}}\n"
+        );
+        assert_eq!(
+            stitched_bases(
+                &[("pay/src/main/java/p/K.java", Language::Java, ok.as_str())],
+                &eps,
+                &services
+            ),
+            [10, 11, 13, 14, 15, 17].map(|row| {
+                let base = if row == 13 { "constant" } else { "literal" };
+                format!(
+                    "pay/src/main/java/p/K.java {row} {}",
+                    synthetic.replace("literal", base)
+                )
+            })
+        );
+        // V2: a Feign interface is plain only while the repository has no `RequestInterceptor`
+        // token, no `configuration =` on a `@FeignClient`, and no Feign client config keys.
+        let feign = |extra: &str| {
+            format!(
+                "package p;\nimport org.springframework.cloud.openfeign.FeignClient;\nimport org.springframework.web.bind.annotation.GetMapping;\n@FeignClient(name = \"orders\", url = \"http://orders\"{extra})\npublic interface OrdersFeign {{\n  @GetMapping(\"/orders/1\")\n  String one();\n}}\n"
+            )
+        };
+        let plain = feign("");
+        let configured = feign(", configuration = RewriteConfig.class");
+        let interceptor = "package p;\nimport feign.RequestInterceptor;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\n@Configuration\nclass Global {\n  @Bean RequestInterceptor rewrite() { return t -> t.target(\"https://api.stripe.com\"); }\n}\n";
+        let transport = "package p;\nimport feign.Client;\nimport org.springframework.context.annotation.Bean;\n@Configuration\nclass Transport {\n  @Bean Client client() { return new Client.Default(null, null); }\n}\n";
+        let path = "pay/src/main/java/p/OrdersFeign.java";
+        let feign_site = |verdict: &str| vec![format!("{path} 5 {verdict}")];
+        let no_props: &[(&str, &str, &str)] = &[];
+        let config_key: &[(&str, &str, &str)] = &[(
+            "pay",
+            "feign.client.config.default.request-interceptors[0]",
+            "p.Rewrite",
+        )];
+        for (files, props, verdict) in [
+            (vec![(path, plain.as_str())], no_props, &synthetic),
+            (vec![(path, configured.as_str())], no_props, &unverified),
+            (
+                vec![
+                    (path, plain.as_str()),
+                    ("pay/src/main/java/p/Global.java", interceptor),
+                ],
+                no_props,
+                &unverified,
+            ),
+            (vec![(path, plain.as_str())], config_key, &unverified),
+            (
+                vec![
+                    (path, plain.as_str()),
+                    ("pay/src/main/java/p/Transport.java", transport),
+                ],
+                no_props,
+                &unverified,
+            ),
+        ] {
+            let files: Vec<(&str, Language, &str)> = files
+                .into_iter()
+                .map(|(p, src)| (p, Language::Java, src))
+                .collect();
+            assert_eq!(
+                stitched_bases_with(&files, props, &eps, &services),
+                feign_site(verdict),
+                "{files:?} {props:?}"
+            );
+        }
+        // V3, V4: one hook file next to the TS controls; the hooked client's sites are capped
+        // (instances too, for axios), the other client's stay `synthetic`.
+        let t = "import axios from \"axios\";\nconst t00 = axios.create({ baseURL: \"http://orders\" });\nexport function f() { return t00.get(\"/orders/1\"); }\nexport function fl() {\n  const c = axios.create({ baseURL: \"http://orders\" });\n  return c.get(\"/orders/1\");\n}\nexport function inl() { return axios.create({ baseURL: \"http://orders\" }).get(\"/orders/1\"); }\nexport function bare() {\n  fetch(\"http://orders/orders/1\");\n  axios.get(\"http://orders/orders/1\");\n}\n";
+        let ts_sites = |fetch: &str, axios: &str| {
+            [
+                format!("web/src/t.ts 9 {fetch}"),
+                format!("web/src/t.ts 2 {axios}"),
+                format!("web/src/t.ts 5 {axios}"),
+                format!("web/src/t.ts 7 {axios}"),
+                format!("web/src/t.ts 10 {axios}"),
+            ]
+        };
+        assert_eq!(
+            stitched_bases(
+                &[("web/src/t.ts", Language::TypeScript, t)],
+                &eps,
+                &services
+            ),
+            ts_sites(&synthetic, &synthetic)
+        );
+        for (hook, fetch, axios) in [
+            (
+                "(globalThis as any).fetch = (u: string) => realFetch(\"https://api.stripe.com/v1\");\n",
+                &unverified,
+                &synthetic,
+            ),
+            (
+                "(window as any).fetch = wrapped;\n",
+                &unverified,
+                &synthetic,
+            ),
+            (
+                "(global as any).fetch = jest.fn();\n",
+                &unverified,
+                &synthetic,
+            ),
+            (
+                "fetch = ((orig) => (u: any, i?: any) => orig(\"https://api.stripe.com/v1\", i))(fetch);\n",
+                &unverified,
+                &synthetic,
+            ),
+            (
+                "import axios from \"axios\";\naxios.defaults.adapter = reroutingAdapter;\n",
+                &synthetic,
+                &unverified,
+            ),
+            (
+                "export function setup() {\n  const axios = require(\"axios\");\n  axios.interceptors.request.use((c) => c);\n}\n",
+                &synthetic,
+                &unverified,
+            ),
+        ] {
+            assert_eq!(
+                stitched_bases(
+                    &[
+                        ("web/src/hook.ts", Language::TypeScript, hook),
+                        ("web/src/t.ts", Language::TypeScript, t),
+                    ],
+                    &eps,
+                    &services
+                ),
+                ts_sites(fetch, axios),
+                "{hook}"
+            );
+        }
+        // V5: a dot import of `net/http` caps every bare Go call.
+        let go = "package main\nimport \"net/http\"\nfunc bare() {\n\thttp.Get(\"http://orders/orders/1\")\n}\n";
+        let dot = "package main\nimport . \"net/http\"\nfunc init() {\n\tDefaultTransport = rewriting{}\n}\n";
+        for (files, verdict) in [
+            (vec![("pay/cmd/main.go", go)], &synthetic),
+            (
+                vec![("pay/cmd/hook.go", dot), ("pay/cmd/main.go", go)],
+                &unverified,
+            ),
+        ] {
+            let files: Vec<(&str, Language, &str)> = files
+                .into_iter()
+                .map(|(p, src)| (p, Language::Go, src))
+                .collect();
+            assert_eq!(
+                stitched_bases(&files, &eps, &services),
+                [format!("pay/cmd/main.go 3 {verdict}")]
+            );
+        }
     }
 
     /// Contract M4a amendment 13, Gate B (evaluator pass 3, R2, R4), from source: a URL whose

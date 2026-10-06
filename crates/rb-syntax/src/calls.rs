@@ -345,7 +345,15 @@ pub(crate) fn init(
                 .filter(|a| !matches!(a.kind(), "line_comment" | "block_comment"))
                 .count()
         });
-        return Some(Init::New { type_name, args });
+        let mut c = node.walk();
+        let body = node
+            .named_children(&mut c)
+            .any(|n| n.kind() == "class_body");
+        return Some(Init::New {
+            type_name,
+            args,
+            body,
+        });
     }
     if is_name(&syn, node) {
         return Some(Init::Name {

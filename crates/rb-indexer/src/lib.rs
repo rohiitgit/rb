@@ -57,8 +57,9 @@ use serde_json::{Value, json};
 /// token scan verifies instance bases, a `uriBuilderFactory` overrides `baseUrl`, any
 /// `spring.config.activate.*` document is conditional), `m4a-http-9` evaluator pass 5's (M4a
 /// amendment 15: every carrier gated, whatever the URL's source; global hooks cap bare module
-/// clients).
-pub const PIPELINE: &str = "m4a-http-9";
+/// clients), `m4a-http-10` evaluator pass 6's (M4a amendment 16: carriers plain only by
+/// allow-listed token roles; a hook caps every site of its client kind, Feign included).
+pub const PIPELINE: &str = "m4a-http-10";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -287,9 +288,35 @@ fn config_file(path: &str) -> Option<ConfigFile> {
 }
 
 /// A file the indexer reads as configuration: Spring's `application*`/`bootstrap*` files under
-/// `src/main/resources/` and its `config/` directory, and build files (contract M4a D5; evaluator pass 1, P7).
+/// `src/main/resources/` and its `config/` directory, and build files (contract M4a D5; evaluator pass 1, P7);
+/// and every other settings file, scanned only for Feign client keys (amendment 16).
 fn is_config_input(path: &str) -> bool {
-    config_file(path).is_some()
+    config_file(path).is_some() || is_settings_file(path)
+}
+
+/// Any `.properties`/`.yml`/`.yaml` file: a config server's shared files or a
+/// `@PropertySource` may configure Feign clients (contract M4a amendment 16).
+fn is_settings_file(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| matches!(ext, "properties" | "yml" | "yaml"))
+}
+
+/// Whether any settings file sets a Feign client key
+/// ([`rb_frameworks::clients::feign_config_key`]).
+fn feign_configured(config: &BTreeMap<&str, String>) -> bool {
+    config
+        .iter()
+        .filter(|(p, _)| is_settings_file(p))
+        .any(|(path, text)| {
+            let entries = if path.ends_with(".properties") {
+                rb_frameworks::fold::parse_properties(text)
+            } else {
+                rb_frameworks::fold::yaml_entries(text)
+            };
+            entries
+                .keys()
+                .any(|k| rb_frameworks::clients::feign_config_key(k))
+        })
 }
 
 /// Spring configuration per service.
@@ -706,6 +733,7 @@ pub fn assemble(
         service_of: &service_of,
         properties: &spring.properties,
         overrides: &spring.overrides,
+        feign_configured: feign_configured(&content.config),
     });
     let services: Vec<stitch::ServiceRef> = boundaries
         .projects()
@@ -1416,6 +1444,32 @@ mod tests {
         assert!(d.detail.get("budget_secs").is_none(), "{}", d.detail);
     }
 
+    /// Contract M4a amendment 16 (evaluator pass 6, V2): a Feign client key in any settings
+    /// file (a config server's shared file too) caps every Feign site; other Feign keys and
+    /// other files do not.
+    #[test]
+    fn feign_client_config_in_any_settings_file() {
+        let shared = "config/src/main/resources/shared/orders.yml";
+        assert!(is_config_input(shared));
+        let configured = |files: &[(&str, &str)]| {
+            let config: BTreeMap<&str, String> =
+                files.iter().map(|(p, t)| (*p, (*t).to_owned())).collect();
+            feign_configured(&config)
+        };
+        assert!(configured(&[(
+            shared,
+            "feign:\n  client:\n    config:\n      default:\n        requestInterceptors:\n          - p.Rewrite\n"
+        )]));
+        assert!(configured(&[(
+            "a/src/main/resources/application.properties",
+            "spring.cloud.openfeign.client.config.orders.url=https://api.stripe.com\n"
+        )]));
+        assert!(!configured(&[
+            (shared, "feign:\n  hystrix:\n    enabled: true\n"),
+            ("a/pom.xml", "<x>feign.client.config.default.url=y</x>\n"),
+        ]));
+    }
+
     /// Evaluator pass 1, P7: a service with Spring configuration M4a does not read (profile
     /// files, YAML, `bootstrap*`, or a Spring Cloud Config client by dependency or by key) gets
     /// one `config_unread` diagnostic; the keys those files set are overrides, all keys for a
@@ -1476,7 +1530,9 @@ mod tests {
             "every file is read"
         );
         assert!(!is_config_input("a/src/main/resources/db/migration/V1.sql"));
-        assert!(!is_config_input("a/src/main/resources/messages.properties"));
+        // Read only for Feign client keys (amendment 16), not as Spring configuration.
+        assert!(is_config_input("a/src/main/resources/messages.properties"));
+        assert!(config_file("a/src/main/resources/messages.properties").is_none());
         let service_of = |p: &str| p.split('/').next().unwrap().to_owned();
         let (spring, diagnostics) = spring_config(&config, &service_of);
         let unread: Vec<String> = diagnostics
@@ -1563,12 +1619,8 @@ mod tests {
             ),
         ];
         assert!(files.iter().all(|(p, _)| is_config_input(p)));
-        assert!(!is_config_input(
-            "a/src/main/resources/config/messages.properties"
-        ));
-        assert!(!is_config_input(
-            "a/src/main/resources/config/x/application.yml"
-        ));
+        assert!(config_file("a/src/main/resources/config/messages.properties").is_none());
+        assert!(config_file("a/src/main/resources/config/x/application.yml").is_none());
         let config: BTreeMap<&str, String> = files
             .iter()
             .map(|(p, t)| (p.as_str(), (*t).to_owned()))

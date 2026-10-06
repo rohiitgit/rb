@@ -455,4 +455,18 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
 - [x] Records: contract (amendment 15, corrections in 13 and 14, open item 22 with the M5 follow-up), CHANGELOG, IMPLEMENT.md, lessons.
 - [x] Verification loop; clean-up of `fx4a5_*` and `var/fix-m4a-5/`.
 - Found while fixing: a method-local `RestTemplate rt = new RestTemplate()` had no initialiser fact (a Java `new` is no call chain), so the scan could not see it and it would have been capped; `Init::New` makes it a verifiable carrier (it also stops a same-file `@Bean` base from being taken for such a local). Removing `mutate` from the request calls and judging the request chain's links each stop U1 alone, so each has its own biting row (`m1`, `l9`). On node-express-realworld the e2e setup's `axios.defaults.baseURL` is a real global hook: its one bare `axios.get` is now capped.
-- [ ] Evaluator pass 5 re-check.
+- [x] Evaluator pass 5 re-check: pass 6 (`tasks/eval-m4a-pass6.md`, VERDICT FAIL, V1–V5 blockers, V6 process).
+
+## Review (M4a evaluator pass 6)
+- [x] Plan (orchestrator's decision, contract amendment 16): replace every carrier deny-list by an allow-list of token roles (V1 Java fresh constructions, V2 Feign, V3 `fetch`, V4 axios, V5 Go), a tainted kind caps every site of the kind; fix the mutation harness (V6); write the closing bar; rewrite open item 22; `PIPELINE` `m4a-http-10`.
+- [x] Baseline: `d4010fa` release binary built from `git archive` in its own target directory before any change.
+- [x] Test first: `carriers_are_plain_only_by_allow_listed_roles` (rb-indexer) on the unchanged code: every V1–V5 repro `synthetic` (J 7/7, Feign 3/3 forms, `fetch` 4/4 hooks, axios instances under `defaults` and a function-local `require`, Go dot import).
+- [x] Facts (`rb-syntax`): surface names (`fetch`; `DefaultTransport`, `DefaultClient`; Feign extension points and `feign`) recorded as property, field and type names too, judged as the member access they name; `TokenRole::Callee`; `Init::New.body`; global-object and Go import tokens deleted.
+- [x] Carriers (`clients.rs`): `fresh_root`/`url_arg` allow-list, `PLAIN_LINKS` without `create`/`builder`, `global_hooks` by allow-list for all four kinds plus Feign, `feign_config_key`, `module_names` at any scope and subpaths; `ClientCall.module_call` deleted. Stitcher: a hooked kind caps every site; Feign keys in any `.properties`/`.yml`/`.yaml` file (`lib.rs`).
+- [x] Beyond the decision, same principle: Feign's other extension points (`Capability`, `FeignBuilderCustomizer`, `Targeter`, `Feign`, `feign.Client` and any non-plain Feign/OpenFeign import), `defaultConfiguration` on `@EnableFeignClients`, axios/fetch module subpaths.
+- [x] Mutations (V6): harness restores with a fresh mtime and checks bytes; full list of passes 5 and 6 plus amendment 16 on a clean build: 63/63 killed on the final code (CHANGELOG). The first run's two survivors were fixed first: P29 (a redundant check in `SpringBases::carrier`, deleted) and N02 (a builder of another type, row added).
+- [x] Public repositories against `d4010fa`; fresh == cached; scratch repositories end to end (12, both binaries).
+- [x] Records: contract (amendment 16, corrections in 14 and 15, items 14 and 22), CHANGELOG, IMPLEMENT.md, lessons (2 new).
+- [x] Verification loop; clean-up of `fx4a6_*` and `var/fix-m4a-6/`.
+- Found while fixing: ftgo's integration-test client hands `node-fetch` to Apollo as `{ fetch }`, which the allow-list counts as a taint (4 `dynamic` sites capped); the harness kill (lesson) — SIGTERM and a pattern that did not match left a mutant applied for a minute, restored and checked before any further edit.
+- [ ] Evaluator pass 6 re-check.

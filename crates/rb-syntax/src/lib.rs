@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser, QueryCursor, StreamingIterator};
 
 pub use keys::{symbol_keys, type_symbol_key};
+pub use tokens::surface_names;
 
 /// Grammar versions (checked against Cargo.lock by a test). Query text and the extractor's own
 /// source code are fingerprinted automatically by [`extractor_id`], so no manual bump is needed.
@@ -360,6 +361,10 @@ pub enum Init {
     New {
         type_name: String,
         args: usize,
+        /// A class body follows (an anonymous subclass, which may override anything; contract
+        /// M4a amendment 16).
+        #[serde(default)]
+        body: bool,
     },
     Name {
         text: String,
@@ -404,11 +409,12 @@ pub struct FileFacts {
     pub name_tokens: Vec<NameToken>,
 }
 
-/// One token of a name that may hold a configured object (contract M4a amendments 14 and 15): a
+/// One token of a name that may hold a configured object (contract M4a amendments 14–16): a
 /// name a binding initialises with a call, or the simple target of an assignment from a call
 /// (TypeScript, JavaScript, Java); a module object (a TS/JS default or namespace import of a
-/// package, a Go import) or a JavaScript global object. Every identifier token of such a name
-/// in the file is recorded, wherever it is.
+/// package); or a configuration-surface name (`fetch`; Go's `DefaultTransport`,
+/// `DefaultClient`; Java's `RequestInterceptor`), also as a property, field or type name. Every
+/// token of such a name in the file is recorded, wherever it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameToken {
     pub name: String,
@@ -423,6 +429,9 @@ pub enum TokenRole {
     /// The name of a TS/JS `const`/`let` declarator that is not exported (`export const` is
     /// [`TokenRole::Other`]), or of a Java local variable declarator.
     Declaration,
+    /// TS/JS: the callee of a call, `name(…)`, or of a member call when the token is the
+    /// member's name (`x.name(…)`; contract M4a amendment 16).
+    Callee,
     /// The receiver of a member call, `name.call(…)`, without optional chaining.
     Receiver { call: String },
     /// TS/JS and Go: the object of a member access that is not called, `name.m` read or
