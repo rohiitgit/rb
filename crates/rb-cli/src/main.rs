@@ -75,6 +75,15 @@ struct IndexArgs {
     /// over it is killed and recorded as `timeout`. Default: 600 for the fetch, 900 for the index.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     scip_timeout_secs: Option<u64>,
+    /// Retired snapshots kept per repository after this run, besides the live one (0-20); older
+    /// ones and every failed run's row are deleted, and only the live snapshot keeps an AGE graph.
+    #[arg(
+        long,
+        env = "RB_KEEP_RETIRED",
+        default_value_t = rb_store::KEEP_RETIRED,
+        value_parser = clap::value_parser!(i64).range(0..=rb_store::MAX_KEEP_RETIRED)
+    )]
+    keep: i64,
 }
 
 #[derive(Subcommand)]
@@ -503,6 +512,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         no_scip,
         scip_work_dir,
         scip_timeout_secs,
+        keep,
     } = args;
     let path = path
         .canonicalize()
@@ -609,7 +619,11 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
             &mut StoreCache(&cell),
         )?
     };
-    let snap = store.publish_snapshot(
+    store.set_keep_retired(keep)?;
+    let rb_store::Published {
+        snapshot: snap,
+        retention,
+    } = store.publish_snapshot(
         &repo,
         &commit_sha,
         &tools,
@@ -617,6 +631,11 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         &diagnostics,
         &LoadDir::new(load_dir),
     )?;
+    if let Some(id) = retention.live_marked_retired {
+        eprintln!(
+            "warning: {repo}'s live pointer names snapshot {id}, whose status is not `live`; retention kept it"
+        );
+    }
     println!(
         "{repo}: snapshot {} live @ {} — {} nodes, {} edges, {} diagnostics; AGE graph {}; parsed {parsed} source files; scanned {scanned} other files as text",
         snap.id,
@@ -1506,6 +1525,20 @@ mod tests {
         assert_eq!(files(0), "0 files");
         assert_eq!(files(1), "1 file");
         assert_eq!(files(12), "12 files");
+    }
+
+    /// Contract M5 S3: `--keep` is bounded at parse time (0-20).
+    #[test]
+    fn keep_is_validated_at_parse_time() {
+        for bad in ["-1", "21"] {
+            assert!(
+                Cli::try_parse_from(["rb", "index", ".", "--keep", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        for good in ["0", "20"] {
+            assert!(Cli::try_parse_from(["rb", "index", ".", "--keep", good]).is_ok());
+        }
     }
 
     #[test]

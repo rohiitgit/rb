@@ -62,6 +62,32 @@ pub(crate) mod hooks {
             hook();
         }
     }
+
+    type AfterCopy = Box<dyn FnMut(i32) -> anyhow::Result<()>>;
+
+    thread_local! {
+        static AFTER_COPY: RefCell<Option<AfterCopy>> = RefCell::new(None);
+    }
+
+    /// Runs `body` with `hook` armed to run inside the publish transaction after its COPYs, with
+    /// the publishing backend's pid; an error from it fails the publish (contract M5 S3).
+    pub(crate) fn with_after_copy<T>(
+        hook: impl FnMut(i32) -> anyhow::Result<()> + 'static,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        AFTER_COPY.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        let out = body();
+        AFTER_COPY.with(|h| *h.borrow_mut() = None);
+        out
+    }
+
+    pub(crate) fn after_copy(pid: i32) -> anyhow::Result<()> {
+        let hook = AFTER_COPY.with(|h| h.borrow_mut().take());
+        match hook {
+            Some(mut hook) => hook(pid),
+            None => Ok(()),
+        }
+    }
 }
 
 use anyhow::{Context, bail};
@@ -125,8 +151,12 @@ pub fn schema_version() -> &'static str {
     MIGRATIONS[MIGRATIONS.len() - 1].0
 }
 
-/// Retired snapshots kept per repo (plus the live one) before being dropped (design §8.3).
+/// Retired snapshots kept per repo (plus the live one) before being dropped (design §8.3;
+/// contract M5 D10: `--keep`, `RB_KEEP_RETIRED`).
 pub const KEEP_RETIRED: i64 = 2;
+
+/// The largest `--keep` (contract M5 S3).
+pub const MAX_KEEP_RETIRED: i64 = 20;
 
 /// Arbitrary constant for `pg_advisory_xact_lock` so concurrent `rb migrate` runs serialise.
 const MIGRATION_LOCK: i64 = 0x7262_6d69_6772;
@@ -147,6 +177,35 @@ pub struct SnapshotInfo {
     pub age_graph: Option<String>,
 }
 
+/// A published snapshot and what the retention run after it removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Published {
+    pub snapshot: SnapshotInfo,
+    pub retention: RetentionReport,
+}
+
+/// What one retention run did (contract M5 D10, S3).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RetentionReport {
+    /// AGE graphs dropped, one transaction each: every snapshot's but the live one's.
+    pub graphs_dropped: Vec<String>,
+    /// `failed` rows and `retired` rows beyond the newest `--keep`.
+    pub snapshots_deleted: Vec<i64>,
+    /// The live pointer names a row whose status is not `live`; the row was kept.
+    pub live_marked_retired: Option<i64>,
+}
+
+/// What a publish loads, in one transaction.
+struct Load<'a> {
+    repo_id: i64,
+    repo: &'a str,
+    commit_sha: &'a str,
+    tool_versions: &'a Value,
+    graph: &'a Graph,
+    diagnostics: &'a [Diagnostic],
+    load_dir: &'a LoadDir,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoStatus {
     pub name: String,
@@ -162,6 +221,8 @@ pub struct Store {
     /// Inside [`Store::read_tx`]: statements belong to its transaction, and nothing may open
     /// another one.
     in_read: bool,
+    /// Retired snapshots each publish keeps per repository.
+    keep_retired: i64,
 }
 
 impl Store {
@@ -173,7 +234,19 @@ impl Store {
         Ok(Self {
             client,
             in_read: false,
+            keep_retired: KEEP_RETIRED,
         })
+    }
+
+    /// Sets how many retired snapshots retention keeps per repository (0 to
+    /// [`MAX_KEEP_RETIRED`]; default [`KEEP_RETIRED`]).
+    pub fn set_keep_retired(&mut self, keep: i64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (0..=MAX_KEEP_RETIRED).contains(&keep),
+            "--keep must be between 0 and {MAX_KEEP_RETIRED}"
+        );
+        self.keep_retired = keep;
+        Ok(())
     }
 
     /// A read-write transaction; refused inside [`Store::read_tx`], whose transaction it would
@@ -235,7 +308,6 @@ impl Store {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    /// Deletes a repository, all its snapshots and their AGE graphs. Returns false if it did not exist.
     /// A cached SCIP index for `(input_hash, indexer_digest)`, if one was recorded.
     pub fn scip_index_get(
         &mut self,
@@ -283,26 +355,59 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes a repository, all its snapshots and their AGE graphs, one graph per transaction
+    /// (contract M5 D10). Returns false if it did not exist.
     pub fn delete_repo(&mut self, name: &str) -> anyhow::Result<bool> {
+        let Some(repo_id) = self
+            .client
+            .query_opt("SELECT id FROM rb.repo WHERE name = $1", &[&name])?
+            .map(|r| r.get::<_, i64>(0))
+        else {
+            return Ok(false);
+        };
+        while self.drop_one_graph(repo_id, true)?.is_some() {}
         let mut tx = self.begin()?;
-        // The repository row before the DDL lock, in the publishers' order.
-        tx.execute("SELECT 1 FROM rb.repo WHERE name = $1 FOR UPDATE", &[&name])?;
-        let graphs = tx.query(
-            "SELECT s.age_graph FROM rb.snapshot s JOIN rb.repo r ON r.id = s.repo_id
-             WHERE r.name = $1 AND s.age_graph IS NOT NULL",
-            &[&name],
-        )?;
-        for row in graphs {
-            age::drop_graph_if_exists(&mut tx, row.get(0))?;
-        }
         // Clear the live pointer first so snapshot rows can cascade away with the repo.
         tx.execute(
-            "UPDATE rb.repo SET live_snapshot_id = NULL WHERE name = $1",
-            &[&name],
+            "UPDATE rb.repo SET live_snapshot_id = NULL WHERE id = $1",
+            &[&repo_id],
         )?;
-        let deleted = tx.execute("DELETE FROM rb.repo WHERE name = $1", &[&name])? > 0;
+        let deleted = tx.execute("DELETE FROM rb.repo WHERE id = $1", &[&repo_id])? > 0;
         tx.commit()?;
         Ok(deleted)
+    }
+
+    /// Drops one AGE graph of the repository's snapshots in a transaction of its own, under the
+    /// repository row lock and then the DDL lock, and clears the snapshot's `age_graph`; the live
+    /// snapshot's only with `include_live`. Returns the graph's name, or `None` when none is left.
+    fn drop_one_graph(
+        &mut self,
+        repo_id: i64,
+        include_live: bool,
+    ) -> anyhow::Result<Option<String>> {
+        let mut tx = self.begin()?;
+        tx.execute(
+            "SELECT 1 FROM rb.repo WHERE id = $1 FOR UPDATE",
+            &[&repo_id],
+        )?;
+        let Some(row) = tx.query_opt(
+            "SELECT s.id, s.age_graph FROM rb.snapshot s JOIN rb.repo r ON r.id = s.repo_id
+             WHERE s.repo_id = $1 AND s.age_graph IS NOT NULL
+               AND ($2 OR (s.id IS DISTINCT FROM r.live_snapshot_id AND s.status <> 'live'))
+             ORDER BY s.id LIMIT 1",
+            &[&repo_id, &include_live],
+        )?
+        else {
+            return Ok(None);
+        };
+        let (id, graph): (i64, String) = (row.get(0), row.get(1));
+        age::drop_graph_if_exists(&mut tx, &graph)?;
+        tx.execute(
+            "UPDATE rb.snapshot SET age_graph = NULL WHERE id = $1",
+            &[&id],
+        )?;
+        tx.commit()?;
+        Ok(Some(graph))
     }
 
     pub fn live_snapshot(&mut self, repo: &str) -> anyhow::Result<Option<SnapshotInfo>> {
@@ -321,8 +426,11 @@ impl Store {
         Ok(snapshot_from_row(&row))
     }
 
-    /// Publishes `graph` as the repo's new live snapshot: rows + AGE projection + live flip in one
-    /// transaction, then retention. On failure the snapshot row is marked `failed`.
+    /// Publishes `graph` as the repo's new live snapshot: the snapshot row, its rows, the AGE
+    /// projection and the live flip in one transaction (contract M5 D10, S3), then retention
+    /// (the previous live snapshot's graph is dropped in a transaction of its own). A failed
+    /// publish leaves nothing of the attempt but a separate `failed` row written after the
+    /// rollback; a publisher that dies before its commit leaves no row at all.
     pub fn publish_snapshot(
         &mut self,
         repo: &str,
@@ -331,17 +439,63 @@ impl Store {
         graph: &Graph,
         diagnostics: &[Diagnostic],
         load_dir: &LoadDir,
-    ) -> anyhow::Result<SnapshotInfo> {
+    ) -> anyhow::Result<Published> {
         let repo_id = self.ensure_repo(repo, None)?;
-        let parent: Option<i64> = self
-            .client
+        let load = Load {
+            repo_id,
+            repo,
+            commit_sha,
+            tool_versions,
+            graph,
+            diagnostics,
+            load_dir,
+        };
+        let snapshot_id = match self.load_and_flip(&load) {
+            Ok(id) => id,
+            Err(err) => {
+                let recorded = self.client.query_one(
+                    "INSERT INTO rb.snapshot (repo_id, commit_sha, parent_id, status, tool_versions)
+                     SELECT id, $2, live_snapshot_id, 'failed', $3 FROM rb.repo WHERE id = $1
+                     RETURNING id",
+                    &[&repo_id, &commit_sha, tool_versions],
+                );
+                let what = match recorded {
+                    Ok(row) => format!("recorded as failed snapshot {}", row.get::<_, i64>(0)),
+                    Err(e) => format!("the failure could not be recorded: {e}"),
+                };
+                return Err(err.context(format!("publishing a snapshot of {repo} ({what})")));
+            }
+        };
+        let retention = self
+            .retain(repo_id)
+            .with_context(|| format!("snapshot {snapshot_id} is live; retention failed"))?;
+        Ok(Published {
+            snapshot: self.snapshot(snapshot_id)?,
+            retention,
+        })
+    }
+
+    /// Writes the snapshot row and its rows, projects it and flips the pointer, all in one
+    /// transaction; returns the new snapshot's id.
+    fn load_and_flip(&mut self, load: &Load<'_>) -> anyhow::Result<i64> {
+        let Load {
+            repo_id,
+            repo,
+            commit_sha,
+            tool_versions,
+            graph,
+            diagnostics,
+            load_dir,
+        } = *load;
+        let mut tx = self.begin()?;
+        // Serialise publishers of the same repo; the parent is read under the lock.
+        let parent: Option<i64> = tx
             .query_one(
-                "SELECT live_snapshot_id FROM rb.repo WHERE id = $1",
+                "SELECT live_snapshot_id FROM rb.repo WHERE id = $1 FOR UPDATE",
                 &[&repo_id],
             )?
             .get(0);
-        let snapshot_id: i64 = self
-            .client
+        let snapshot_id: i64 = tx
             .query_one(
                 "INSERT INTO rb.snapshot (repo_id, commit_sha, parent_id, status, tool_versions)
                  VALUES ($1, $2, $3, 'building', $4) RETURNING id",
@@ -349,43 +503,6 @@ impl Store {
             )?
             .get(0);
         let graph_name = graph_name(repo, snapshot_id);
-
-        if let Err(err) = self.load_and_flip(
-            repo_id,
-            snapshot_id,
-            &graph_name,
-            graph,
-            diagnostics,
-            load_dir,
-        ) {
-            // The transaction rolled back (rows and AGE graph); keep a record of the attempt.
-            self.client
-                .execute(
-                    "UPDATE rb.snapshot SET status = 'failed' WHERE id = $1",
-                    &[&snapshot_id],
-                )
-                .context("marking snapshot failed")?;
-            return Err(err.context(format!("publishing snapshot {snapshot_id}")));
-        }
-        self.apply_retention(repo_id)?;
-        self.snapshot(snapshot_id)
-    }
-
-    fn load_and_flip(
-        &mut self,
-        repo_id: i64,
-        snapshot_id: i64,
-        graph_name: &str,
-        graph: &Graph,
-        diagnostics: &[Diagnostic],
-        load_dir: &LoadDir,
-    ) -> anyhow::Result<()> {
-        let mut tx = self.begin()?;
-        // Serialise publishers of the same repo.
-        tx.execute(
-            "SELECT 1 FROM rb.repo WHERE id = $1 FOR UPDATE",
-            &[&repo_id],
-        )?;
 
         let sink = tx.copy_in(
             "COPY rb.node (snapshot_id, id, kind, key, name, attrs) FROM STDIN (FORMAT binary)",
@@ -503,8 +620,13 @@ impl Store {
             w.write(&[&snapshot_id, &d.kind, &d.path, &file_id, &span, &d.detail])?;
         }
         w.finish().context("copying diagnostics")?;
+        #[cfg(test)]
+        {
+            let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[])?.get(0);
+            hooks::after_copy(pid)?;
+        }
 
-        age::project(&mut tx, graph, graph_name, load_dir).with_context(|| {
+        age::project(&mut tx, graph, &graph_name, load_dir).with_context(|| {
             format!(
                 "projecting snapshot into AGE (the server must see {} as /tmp/age/{})",
                 load_dir.host.display(),
@@ -525,33 +647,64 @@ impl Store {
             &[&repo_id, &snapshot_id],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(snapshot_id)
     }
 
-    /// Drops snapshots beyond the live one plus [`KEEP_RETIRED`] retired ones, and all failed ones.
-    fn apply_retention(&mut self, repo_id: i64) -> anyhow::Result<()> {
-        let mut tx = self.begin()?;
-        tx.execute(
-            "SELECT 1 FROM rb.repo WHERE id = $1 FOR UPDATE",
-            &[&repo_id],
-        )?;
-        let doomed = tx.query(
-            "SELECT id, age_graph FROM rb.snapshot WHERE repo_id = $1 AND (
-               status = 'failed'
-               OR (status = 'retired' AND id NOT IN (
-                     SELECT id FROM rb.snapshot WHERE repo_id = $1 AND status = 'retired'
-                     ORDER BY id DESC LIMIT $2)))",
-            &[&repo_id, &KEEP_RETIRED],
-        )?;
-        for row in doomed {
-            let id: i64 = row.get(0);
-            if let Some(g) = row.get::<_, Option<String>>(1) {
-                age::drop_graph_if_exists(&mut tx, &g)?;
-            }
-            tx.execute("DELETE FROM rb.snapshot WHERE id = $1", &[&id])?;
+    /// Retention for one repository (contract M5 D10, S3): see [`Store::retain`].
+    pub fn apply_retention(&mut self, repo: &str) -> anyhow::Result<RetentionReport> {
+        let repo_id: i64 = self
+            .client
+            .query_opt("SELECT id FROM rb.repo WHERE name = $1", &[&repo])?
+            .with_context(|| format!("repository {repo:?} does not exist"))?
+            .get(0);
+        self.retain(repo_id)
+    }
+
+    /// Drops the AGE graph of every snapshot but the live one, one per transaction; then, in one
+    /// transaction, deletes the `failed` rows and the `retired` rows beyond the newest
+    /// `keep_retired`. The snapshot the repository's pointer names is never selected, whatever
+    /// its status (one marked otherwise is reported); a row whose graph could not be dropped is
+    /// left for the next run; `building` rows are left to `rb gc`.
+    fn retain(&mut self, repo_id: i64) -> anyhow::Result<RetentionReport> {
+        let mut report = RetentionReport::default();
+        while let Some(graph) = self.drop_one_graph(repo_id, false)? {
+            report.graphs_dropped.push(graph);
         }
+        let keep = self.keep_retired;
+        let mut tx = self.begin()?;
+        let pointer: Option<i64> = tx
+            .query_one(
+                "SELECT live_snapshot_id FROM rb.repo WHERE id = $1 FOR UPDATE",
+                &[&repo_id],
+            )?
+            .get(0);
+        if let Some(id) = pointer {
+            let status: String = tx
+                .query_one("SELECT status FROM rb.snapshot WHERE id = $1", &[&id])?
+                .get(0);
+            if status != "live" {
+                report.live_marked_retired = Some(id);
+            }
+        }
+        report.snapshots_deleted = tx
+            .query(
+                "DELETE FROM rb.snapshot WHERE id IN (
+                   SELECT id FROM rb.snapshot
+                   WHERE repo_id = $1 AND id IS DISTINCT FROM $2 AND age_graph IS NULL AND (
+                     status = 'failed'
+                     OR (status = 'retired' AND id NOT IN (
+                           SELECT id FROM rb.snapshot
+                           WHERE repo_id = $1 AND status = 'retired' AND id IS DISTINCT FROM $2
+                           ORDER BY id DESC LIMIT $3))))
+                 RETURNING id",
+                &[&repo_id, &pointer, &keep],
+            )?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        report.snapshots_deleted.sort_unstable();
         tx.commit()?;
-        Ok(())
+        Ok(report)
     }
 
     /// Cached syntax facts for `(blob, extractor)` rows; missing rows are simply absent.

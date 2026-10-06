@@ -53,6 +53,32 @@ impl Drop for Cleanup<'_> {
                 let _ = store.delete_repo(r);
             }
         }
+        // A test that failed half-way may leave a graph no row names any more.
+        if let Ok(mut c) = postgres::Client::connect(self.url, postgres::NoTls) {
+            for r in &self.repos {
+                let pattern = format!("^rb_{r}_[0-9]+$");
+                let Ok(rows) = c.query(
+                    "SELECT name::text FROM ag_catalog.ag_graph WHERE name::text ~ $1",
+                    &[&pattern],
+                ) else {
+                    continue;
+                };
+                for row in rows {
+                    let name: String = row.get(0);
+                    let _ = c.transaction().and_then(|mut tx| {
+                        tx.execute(
+                            "SELECT pg_advisory_xact_lock($1)",
+                            &[&crate::RB_AGE_DDL_LOCK],
+                        )?;
+                        tx.execute(
+                            "SELECT ag_catalog.drop_graph($1::text::name, true)",
+                            &[&name],
+                        )?;
+                        tx.commit()
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -141,7 +167,8 @@ fn a_snapshot_deleted_during_a_read_is_read_whole() {
             &diagnostics,
             &load_dir(),
         )
-        .unwrap();
+        .unwrap()
+        .snapshot;
     let expected = canonical_dump(&snap.commit_sha, &graph, &diagnostics);
     assert_eq!(dump_of(&mut writer, snap.id).unwrap(), expected);
 
@@ -194,7 +221,8 @@ fn a_read_transaction_is_one_snapshot_and_read_only() {
             &[],
             &load_dir(),
         )
-        .unwrap();
+        .unwrap()
+        .snapshot;
     let mut reader = Store::connect(&db.url).unwrap();
     let (live, nodes) = reader
         .read_tx(|s| {
@@ -209,7 +237,8 @@ fn a_read_transaction_is_one_snapshot_and_read_only() {
                     &[],
                     &load_dir(),
                 )
-                .unwrap();
+                .unwrap()
+                .snapshot;
             assert_ne!(second.id, live.id);
             let again = s.live_snapshot(&repo)?.unwrap();
             assert_eq!(
@@ -293,4 +322,362 @@ fn graph_ddl_waits_for_the_ddl_lock() {
             .unwrap();
         worker.join().unwrap().unwrap();
     }
+}
+
+/// The rows of `repo`'s snapshots by status, the pointer, and its `rb_<repo>_<n>` graphs.
+#[derive(Debug, PartialEq)]
+struct RepoState {
+    live_pointer: Option<i64>,
+    live: Vec<i64>,
+    retired: Vec<i64>,
+    failed: usize,
+    building: usize,
+    /// Snapshots other than the pointer's that still name a graph.
+    stray_age_graphs: Vec<i64>,
+    graphs: Vec<String>,
+}
+
+fn repo_state(c: &mut postgres::Client, repo: &str) -> RepoState {
+    let pointer: Option<i64> = c
+        .query_opt(
+            "SELECT live_snapshot_id FROM rb.repo WHERE name = $1",
+            &[&repo],
+        )
+        .unwrap()
+        .and_then(|r| r.get(0));
+    let rows = c
+        .query(
+            "SELECT s.id, s.status, s.age_graph FROM rb.snapshot s JOIN rb.repo r ON r.id = s.repo_id
+             WHERE r.name = $1 ORDER BY s.id",
+            &[&repo],
+        )
+        .unwrap();
+    let ids = |status: &str| -> Vec<i64> {
+        rows.iter()
+            .filter(|r| r.get::<_, String>(1) == status)
+            .map(|r| r.get(0))
+            .collect()
+    };
+    let pattern = format!("^rb_{repo}_[0-9]+$");
+    let graphs = c
+        .query(
+            "SELECT name::text FROM ag_catalog.ag_graph WHERE name::text ~ $1 ORDER BY 1",
+            &[&pattern],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    RepoState {
+        live_pointer: pointer,
+        live: ids("live"),
+        retired: ids("retired"),
+        failed: ids("failed").len(),
+        building: ids("building").len(),
+        stray_age_graphs: rows
+            .iter()
+            .filter(|r| Some(r.get::<_, i64>(0)) != pointer)
+            .filter(|r| r.get::<_, Option<String>>(2).is_some())
+            .map(|r| r.get(0))
+            .collect(),
+        graphs,
+    }
+}
+
+/// A fixed-seed generator (xorshift64*), so a failing sequence is reproducible.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+    }
+}
+
+/// Contract M5 S3 (property): random sequences of publishes, failed publishes (an error injected
+/// after the COPY) and `--keep` changes over two repositories. After every step, for each
+/// repository: the pointer's snapshot exists and is `live`, the retired rows are exactly the
+/// `N` newest (by the keep in force at the last publish), `failed` rows exist only since the last
+/// publish, no `building` row is visible, and `ag_catalog.ag_graph` holds exactly one
+/// `rb_<repo>_*` graph, the live snapshot's (no retired row names a graph).
+#[test]
+fn retention_holds_over_random_sequences() {
+    let Some(db) = db() else { return };
+    let repos = [repo_name("pa"), repo_name("pb")];
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: repos.to_vec(),
+    };
+    #[derive(Default)]
+    struct Model {
+        live: Option<i64>,
+        retired: Vec<i64>,
+        failed: usize,
+    }
+    let mut models = [Model::default(), Model::default()];
+    let mut store = Store::connect(&db.url).unwrap();
+    let mut probe = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    let mut rng = Rng(0x5eed_2026_1007);
+    let mut keep = crate::KEEP_RETIRED;
+    let mut ops = [0usize; 3];
+    for step in 0..48u32 {
+        let r = rng.below(2) as usize;
+        let repo = &repos[r];
+        let op = rng.below(4);
+        let graph = sample_graph(2 + (step % 3) as usize, step);
+        match op {
+            0 | 1 => {
+                let published = store
+                    .publish_snapshot(
+                        repo,
+                        &format!("{step:040}"),
+                        &json!({"step": step}),
+                        &graph,
+                        &[],
+                        &load_dir(),
+                    )
+                    .unwrap();
+                let m = &mut models[r];
+                m.retired.extend(m.live);
+                m.live = Some(published.snapshot.id);
+                let n = m.retired.len().saturating_sub(keep as usize);
+                m.retired.drain(..n);
+                m.failed = 0;
+                ops[0] += 1;
+            }
+            2 => {
+                let err = crate::hooks::with_after_copy(
+                    |_pid| anyhow::bail!("injected failure"),
+                    || {
+                        store.publish_snapshot(
+                            repo,
+                            &format!("{step:040}"),
+                            &json!({"step": step}),
+                            &graph,
+                            &[],
+                            &load_dir(),
+                        )
+                    },
+                )
+                .unwrap_err();
+                assert!(format!("{err:#}").contains("injected failure"), "{err:#}");
+                models[r].failed += 1;
+                ops[1] += 1;
+            }
+            _ => {
+                keep = rng.below(4) as i64;
+                store.set_keep_retired(keep).unwrap();
+                ops[2] += 1;
+            }
+        }
+        for (repo, m) in repos.iter().zip(&models) {
+            let state = repo_state(&mut probe, repo);
+            let expected = RepoState {
+                live_pointer: m.live,
+                live: m.live.into_iter().collect(),
+                retired: m.retired.clone(),
+                failed: m.failed,
+                building: 0,
+                stray_age_graphs: vec![],
+                graphs: m
+                    .live
+                    .map(|id| crate::graph_name(repo, id))
+                    .into_iter()
+                    .collect(),
+            };
+            assert_eq!(
+                state, expected,
+                "step {step} ({repo}, op {op}, keep {keep})"
+            );
+        }
+    }
+    assert!(
+        ops.iter().all(|&n| n >= 5),
+        "every operation exercised: {ops:?}"
+    );
+}
+
+/// Contract M5 S3: the snapshot row is written inside the publish transaction, so a publisher
+/// whose connection dies between the COPY and the commit leaves no row and no graph (before M5
+/// the `building` row was committed first and survived).
+#[test]
+fn a_publisher_killed_before_commit_leaves_no_row() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("crash");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let url = db.url.clone();
+    let err = crate::hooks::with_after_copy(
+        move |pid| {
+            let mut killer = postgres::Client::connect(&url, postgres::NoTls)?;
+            killer.execute("SELECT pg_terminate_backend($1)", &[&pid])?;
+            // Wait until the server has ended the backend (and rolled back its transaction).
+            while killer
+                .query_opt("SELECT 1 FROM pg_stat_activity WHERE pid = $1", &[&pid])?
+                .is_some()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(())
+        },
+        || {
+            store.publish_snapshot(
+                &repo,
+                &"c".repeat(40),
+                &json!({}),
+                &sample_graph(3, 0),
+                &[],
+                &load_dir(),
+            )
+        },
+    )
+    .unwrap_err();
+    let mut probe = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    let state = repo_state(&mut probe, &repo);
+    assert_eq!(
+        (
+            state.live.len(),
+            state.retired.len(),
+            state.failed,
+            state.building
+        ),
+        (0, 0, 0, 0),
+        "{state:?} after {err:#}"
+    );
+    assert!(state.graphs.is_empty(), "{state:?}");
+}
+
+/// Contract M5 S3: a failed publish leaves the live snapshot as it was and records one `failed`
+/// row with the attempt's commit and tools, written after the rollback; the next publish's
+/// retention removes it.
+#[test]
+fn a_failed_publish_records_a_failed_row() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("failed");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let first = store
+        .publish_snapshot(
+            &repo,
+            &"a".repeat(40),
+            &json!({"t": 1}),
+            &sample_graph(2, 0),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    crate::hooks::with_after_copy(
+        |_| anyhow::bail!("injected failure"),
+        || {
+            store.publish_snapshot(
+                &repo,
+                &"b".repeat(40),
+                &json!({"t": 2}),
+                &sample_graph(3, 1),
+                &[],
+                &load_dir(),
+            )
+        },
+    )
+    .unwrap_err();
+    let mut probe = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    let failed = probe
+        .query(
+            "SELECT s.commit_sha, s.tool_versions, s.parent_id, s.age_graph FROM rb.snapshot s
+             JOIN rb.repo r ON r.id = s.repo_id WHERE r.name = $1 AND s.status = 'failed'",
+            &[&repo],
+        )
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].get::<_, String>(0), "b".repeat(40));
+    assert_eq!(failed[0].get::<_, serde_json::Value>(1), json!({"t": 2}));
+    assert_eq!(failed[0].get::<_, Option<i64>>(2), Some(first.id));
+    assert_eq!(failed[0].get::<_, Option<String>>(3), None);
+    let state = repo_state(&mut probe, &repo);
+    assert_eq!(state.live, vec![first.id]);
+    assert_eq!(state.graphs, vec![crate::graph_name(&repo, first.id)]);
+    store
+        .publish_snapshot(
+            &repo,
+            &"c".repeat(40),
+            &json!({"t": 3}),
+            &sample_graph(2, 2),
+            &[],
+            &load_dir(),
+        )
+        .unwrap();
+    assert_eq!(repo_state(&mut probe, &repo).failed, 0);
+}
+
+/// Contract M5 S3: the snapshot the repository's pointer names is never selected, whatever its
+/// status says: a pointer to a row marked `retired` keeps the row and its graph, and retention
+/// reports it.
+#[test]
+fn retention_never_selects_the_live_snapshot() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("pointer");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    store.set_keep_retired(0).unwrap();
+    let mut last = None;
+    for i in 0..3u32 {
+        last = Some(
+            store
+                .publish_snapshot(
+                    &repo,
+                    &format!("{i:040}"),
+                    &json!({}),
+                    &sample_graph(2, i),
+                    &[],
+                    &load_dir(),
+                )
+                .unwrap()
+                .snapshot,
+        );
+    }
+    let live = last.unwrap();
+    let mut probe = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    probe
+        .execute(
+            "UPDATE rb.snapshot SET status = 'retired' WHERE id = $1",
+            &[&live.id],
+        )
+        .unwrap();
+    let report = store.apply_retention(&repo).unwrap();
+    assert_eq!(report.live_marked_retired, Some(live.id));
+    assert!(report.snapshots_deleted.is_empty() && report.graphs_dropped.is_empty());
+    let state = repo_state(&mut probe, &repo);
+    assert_eq!(state.live_pointer, Some(live.id));
+    assert_eq!(state.retired, vec![live.id]);
+    assert_eq!(state.graphs, vec![crate::graph_name(&repo, live.id)]);
+    // The row delete has its own guard: with no graph named, the row is still kept.
+    probe
+        .execute(
+            "UPDATE rb.snapshot SET age_graph = NULL WHERE id = $1",
+            &[&live.id],
+        )
+        .unwrap();
+    let report = store.apply_retention(&repo).unwrap();
+    assert_eq!(report.live_marked_retired, Some(live.id));
+    assert!(report.snapshots_deleted.is_empty(), "{report:?}");
+    probe
+        .execute(
+            "UPDATE rb.snapshot SET age_graph = $2 WHERE id = $1",
+            &[&live.id, &crate::graph_name(&repo, live.id)],
+        )
+        .unwrap();
+    assert!(store.set_keep_retired(21).is_err() && store.set_keep_retired(-1).is_err());
+    store.set_keep_retired(20).unwrap();
 }
