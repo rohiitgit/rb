@@ -182,7 +182,13 @@ New fixture files must be tracked (`git add`) before the e2e runs. `fixture_repo
 - The notification handler is an inline arrow at top level, and its `pg` insert is attributed to the `File` (`polyglot-monorepo/table-deps-email-log.txt`: `server.ts insert … server.ts:8`). This is the M3a/M3b attribution that invariant 8 builds on.
 - No dependency parses YAML or URLs (`Cargo.toml` workspace dependencies: `toml`, `roxmltree`, `serde_json` among others; `Cargo.lock` has `gix-url` only as a transitive dependency of gix).
 
-**Not verified (to check before coding the relevant step):** Spring 6's stereotype requirement (D12); the public candidates' current layout (S27); gin's and Go 1.22 `ServeMux`'s exact pattern grammar (S6, from their docs).
+**Checked in phase 0 (generator, 2026-10-06, primary sources):**
+- **D12 confirmed.** Spring Framework 6.0 release notes (github.com/spring-projects/spring-framework/wiki/Spring-Framework-6.0-Release-Notes): "Spring MVC and Spring WebFlux no longer detect controllers based solely on a type-level `@RequestMapping` annotation." Issue #29650 (6.0.2) shows the check is `AnnotatedElementUtils.hasAnnotation(beanType, Controller.class)`, so `@RestController` (meta-annotated `@Controller`) qualifies and a bare `@RequestMapping` class does not.
+- **gin (S6).** pkg.go.dev/github.com/gin-gonic/gin: `Default(opts ...OptionFunc) *Engine`, `New(opts ...OptionFunc) *Engine`; `Engine` embeds `RouterGroup`; `(*RouterGroup).Group(relativePath string, handlers ...HandlerFunc) *RouterGroup`; `GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS/Any(relativePath string, handlers ...HandlerFunc)`; `Handle(httpMethod, relativePath string, handlers ...HandlerFunc)`; `Match(methods []string, …)` exists and is not in M4a's list (no fixture uses it). Handlers are variadic, so the handler is the last argument (earlier ones are middleware), as for Express.
+- **Go 1.22 `ServeMux` (S6).** go.dev/blog/routing-enhancements and pkg.go.dev/net/http: Go 1.22 added method matching and wildcards; patterns are `[METHOD ][HOST]/[PATH]`; `{name}` matches one segment, `{name...}` the remaining segments (last segment only), `{$}` only the end of a path ending in a slash; a pattern without a method matches every method; the most specific pattern wins.
+- Environment: `docker context show` = `desktop-linux`; `rb-scip-java:0.13.1` (`sha256:cbd99634…`, 931 MB) and `sourcegraph/scip-typescript@sha256:028c0042…` (1.63 GB) present; 14 GiB free on `/`, `target/` 11 GiB.
+
+**Not verified (to check before coding the relevant step):** the public candidates' current layout (S27).
 
 ## Open questions
 

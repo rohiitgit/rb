@@ -296,7 +296,9 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - Follow-up: the e2e fixture copy should skip ignored files (an IDE's `target/` inside a fixture broke `orm_table_deps_goldens`).
 - **Restored on Docker Desktop (the user's choice, 2026-09-30 22:00 wall clock):** `compose.yaml` takes its host port from `RB_DB_PORT` (default 55432); the database runs on 55433 while the dead VM's forward holds 55432, freshly migrated (0001–0004). `--network none`, amd64 emulation and home-directory bind mounts were re-verified there.
 
-## M4a Endpoints and request paths: contract written, not started
+## M4a Endpoints and request paths: in progress
+
+- [x] Phase 0: preflight (D12 confirmed in the Spring 6.0 release notes; gin and Go 1.22 `ServeMux` grammars recorded in the contract)
 
 - **Split (2026-10-06):** M4 becomes M4a (this entry) and M4b. M4b covers Spring DI and Spring Data synthesis, RTA, derived `DEPENDS_ON`, the full Service Card, Q3's roll-up and orphan detection; it is not started. Design §13 has both rows.
 - **Contract:** `tasks/contract-m4a.md`, S1–S28 and invariants 1–13. Phases are in `tasks/todo.md`.

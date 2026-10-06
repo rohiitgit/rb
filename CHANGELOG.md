@@ -1,5 +1,8 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4a phase 0
+- Preflight, no code. Contract "Checked in phase 0": D12 confirmed (Spring Framework 6.0 release notes: type-level `@RequestMapping` alone no longer makes a controller; issue #29650 shows the `@Controller` check); gin's `Default`/`New`/`Group`/verb/`Handle` signatures (handlers variadic, so the last argument is the handler); Go 1.22 `ServeMux` patterns (`[METHOD ][HOST]/[PATH]`, `{name}`, `{name...}`, `{$}`, no method = every method). Docker context `desktop-linux`, both indexer images present, 14 GiB free.
+
 ## [2026-10-06 01:35] (wall clock)
 - M3b closed (contract amendment 81): final status per S1–S13 and invariants 1–6 (S5, S13 and invariant 2 PASS since `263a20f`), review history of evaluator passes 1–12, open items carried forward (effective source encoding, TypeScript restructurings Tree-sitter parses cleanly, TypeScript interface-method `IMPLEMENTS`, Gradle, spring-retry's test tree, M6 build recipes, workspace installs, tsconfig include/exclude, fetch-phase egress allow-list). The closing binary (sha1 `5946b89faeea`) reproduces all nine public repositories' numbers, including class-validator (398 / 2) and routing-controllers (169 / 38), with 0 documents rejected and fresh == cached. Design §13 marks M3b done; README, IMPLEMENT.md and `tasks/todo.md` list M4 as next (not started). Records only; no code change.
 

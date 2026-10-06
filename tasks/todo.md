@@ -325,14 +325,14 @@ Findings from the research step (2026-09-29):
 
 # M4 Frameworks (split into M4a and M4b; design §13)
 
-- **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). Contract written; not started.
+- **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). In progress (phases below).
 - **M4b, DI and dispatch** (Spring DI, Spring Data synthesis, RTA, derived `DEPENDS_ON`, full Service Card, Q3 roll-up, orphan detection): not started. Its contract is written after M4a closes.
 
 ## M4a phases
 
 Each phase has at most 5 hand-edited files (blessed goldens are reviewed separately and listed in the changelog), is test-first, and ends with its verification step. The checks run in every phase are fmt, `clippy --workspace --all-targets -D warnings` and the unit tests of the crates touched; the e2e suite runs with `RB_TEST_DATABASE_URL`. Any golden that changes gets a classified line diff before `RB_BLESS=1`.
 
-- [ ] **0. Preflight** (no code)
+- [x] **0. Preflight** (no code). Done 2026-10-06: findings under the contract's "Checked in phase 0".
   - Read the contract, the lessons and M3b amendment 81.
   - Run `df`, `docker context show` and `docker image inspect` for both indexer images.
   - Confirm from primary docs: Spring 6's stereotype requirement for handler detection (D12); gin's route and group API, and Go 1.22 `ServeMux` patterns (S6).
