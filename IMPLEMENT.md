@@ -308,7 +308,8 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 7: Service Card `APIs` / `Calls APIs of` / `APIs called by` / unstitched count, `rb impact` endpoint roll-up (amendment 7).
 - [x] Phase 8a: fixture plan part 1 (auth `GET /login` and a commented route, notification `/sms` and a commented route, `selfcheck.ts` loopback client, billing gin service with a same-path decoy and a Go client).
 - [x] Phase 8b: fixture plan part 2 (web suffix, ambiguous, dynamic and external clients; Java context path `/auth`). 
-- [x] Phase 8c: S22 path goldens (text, JSON, candidates), `status-http`, notification card, `impact-send-code`; precision guards for the three fixtures with a biting mutation per line; HTTP invariants and AGE endpoint parity on every fixture dump; `rb path` shows how each `CONSUMES` step was stitched (amendment 8). Next: 9 (SCIP mode), 10 (public repositories).
+- [x] Phase 8c: S22 path goldens (text, JSON, candidates), `status-http`, notification card, `impact-send-code`; precision guards for the three fixtures with a biting mutation per line; HTTP invariants and AGE endpoint parity on every fixture dump; `rb path` shows how each `CONSUMES` step was stitched (amendment 8). 
+- [x] Phase 9: SCIP mode (`scip-path-login.txt`: the controller → Feign hop `exact`; notification's named `health` handler `exact`). Next: 10 (public repositories).
 
 - **Split (2026-10-06):** M4 becomes M4a (this entry) and M4b. M4b covers Spring DI and Spring Data synthesis, RTA, derived `DEPENDS_ON`, the full Service Card, Q3's roll-up and orphan detection; it is not started. Design §13 has both rows.
 - **Contract:** `tasks/contract-m4a.md`, S1–S28 and invariants 1–13. Phases are in `tasks/todo.md`.

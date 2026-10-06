@@ -1838,6 +1838,27 @@ fn scip_polyglot_monorepo() {
         ),
     );
 
+    // Contract M4a S24: in SCIP mode the controller's call into the Feign client is exact, and
+    // an Express handler named by an identifier in a SCIP-owned file resolves exactly.
+    let login = rb(&url, &["path", "POST /api/v1/login", "--repo", &name]);
+    assert!(
+        login.lines().any(|l| l
+            .trim_start()
+            .starts_with("→ com/acme/auth/MfaClient#sendCode().")
+            && l.ends_with("[exact]")),
+        "{login}"
+    );
+    golden(fixture, "scip-path-login.txt", &login);
+    let health = dump.lines().any(|line| {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        row[0] == "E"
+            && row[2] == "HTTP GET /health @services/notification"
+            && row[3] == "HANDLED_BY"
+            && row[5] == "scip-typescript npm notification HEAD src/`server.ts`/health()."
+            && row[7] == i64::from(rb_model::Certainty::Exact.rank())
+    });
+    assert!(health, "no exact HANDLED_BY to health() in {dump}");
+
     let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
     assert!(
         second.contains("scip: services/auth scip-java ok (cached")

@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4a phase 9
+- SCIP mode (S24). No code change.
+  - **`rb-cli/tests/e2e.rs`** (`scip_polyglot_monorepo`): new golden `scip-path-login.txt` (real containers: scip-java for `services/auth`, scip-typescript for `services/notification`); asserts that the `→ com/acme/auth/MfaClient#sendCode()` step is `[exact]` and that `HTTP GET /health @services/notification` has an `exact` `HANDLED_BY` to `scip-typescript npm notification HEAD src/`server.ts`/health().` (an Express identifier handler in a SCIP-owned file).
+  - **Golden** (`scip-path-login.txt`, read line by line): the same tree as `path-login.txt` with SCIP keys for the Java steps; `AuthController#login() → MfaClient#sendCode()` `[exact]` (heuristic without SCIP), so the `CONSUMES` step is `[synthetic]` with no weaker branch and the notification steps read `branch synthetic`; histogram exact 4, synthetic 1, heuristic 3 (web stays heuristic: its SCIP job fails in the fetch phase). The SCIP goldens changed by the fixture plan were re-blessed in 8a–8c by real container runs (classified there); every M3b assertion of the SCIP tests still holds; cached and `--no-cache` dumps stay byte-identical (endpoints and `CONSUMES` included).
+  - **Mutation:** the join's exact-handler map ignored (`exact_handlers.get(…).filter(|_| false)`) → `no exact HANDLED_BY to health()`; restored and `cmp`-checked.
+  - **Preflight:** `df` 11 GiB free, context `desktop-linux`, `rb-scip-java:0.13.1` (`sha256:cbd99634…`) and `sourcegraph/scip-typescript@sha256:028c0042…` present.
+  - **Verification:** fmt and clippy clean; 414 unit tests; e2e with the database and containers 17/17 (48.1 s, no `skipping:`; scip-java fresh 7.1 s, polyglot fresh 16.1 s); stub scan: only `rb-sql/src/lib.rs:1111`.
+  - Files: `crates/rb-cli/tests/e2e.rs`; golden `polyglot-monorepo/scip-path-login.txt`.
+
 ## [2026-10-06] (wall clock) M4a phase 8c
 - Goldens and precision guards (S22, S23, S25, S26; contract amendment 8).
   - **`rb-cli/src/path.rs`:** a `CONSUMES` step ends in `(via host gateway)`, `(host …)`, `(suffix match)`, `(n candidates)`; JSON nodes gain `stitch`. Test-first: `consumes_steps_show_how_they_were_stitched` failed before the change (no note), passes after; mutations "upstream pair reversed" and "note dropped" each fail it.

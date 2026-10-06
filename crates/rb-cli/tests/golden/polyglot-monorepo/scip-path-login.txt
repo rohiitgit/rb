@@ -1,0 +1,14 @@
+Request path: POST /api/v1/login  [auth-service]
+Statically possible paths from the call graph and HTTP stitching, not a trace of one request.
+UPSTREAM
+  client login().  apps/web/src/api/auth.ts:6  [@acme/web]  [heuristic]  (via host gateway)
+    ← LoginForm().onSubmit().  apps/web/src/pages/Login.tsx:4  [@acme/web]  [heuristic]
+      ← LoginForm().  apps/web/src/pages/Login.tsx:3  [@acme/web]  [heuristic]
+ENDPOINT  POST /api/v1/login  [auth-service]
+DOWNSTREAM
+  com/acme/auth/AuthController#login().  services/auth/src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  [exact]
+    → com/acme/auth/MfaClient#sendCode().  services/auth/src/main/java/com/acme/auth/MfaClient.java:9  [auth-service]  [exact]
+      → CONSUMES POST /internal/mfa/email  [notification]  [synthetic]  (host notification)
+        ⇒ services/notification/src/server.ts (top-level code)  [notification]  [exact, branch synthetic]
+          → QUERIES public.email_log (insert)  [exact, branch synthetic]
+certainty: exact 4, synthetic 1, heuristic 3

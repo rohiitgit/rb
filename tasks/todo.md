@@ -375,7 +375,8 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
   - *State:* the guard files (data beside the goldens); two fixture lines (`LegacyAuth` mappings, notification `/health`). *Derived (query time):* `rb path` stitch notes (`stitch` in JSON). *Invariants:* every guard line is bitten by a recorded mutation; a must-not-exist source key must name a node (no vacuous line); guards and invariants 1, 3, 5, 12 are checked on every fixture dump in one collected assertion; AGE `Endpoint` vertices and 1-hop neighbours equal the relational ones. Files: `rb-cli/tests/e2e.rs` (path goldens, guard runner, dump invariants, AGE parity for the new kinds), plus new `must-exist.txt` and `must-not-exist.txt` for each of the three fixtures.
   - Mutations, each shown to fail a guard and then restored and checked with `cmp`: host restriction off, own-service exclusion off, Feign-route exclusion off, loopback rule off, external-host rule off.
   - **Verify:** e2e twice; determinism (two repos, forced rebuild, warm = cold).
-- [ ] **9. SCIP mode** (S24). Files: `rb-cli/tests/e2e.rs` (`scip-path-login.txt`), plus the re-blessed SCIP goldens.
+- [x] **9. SCIP mode** (S24). Done 2026-10-06.
+  - *State:* none. *Derived:* the SCIP-mode login path (golden). *Invariants:* the Java hop is `exact` only through scip-java's occurrences; the named Express handler is `exact` only through the join's exact-handler map (mutation shown); fresh = cached. Files: `rb-cli/tests/e2e.rs` (`scip-path-login.txt`), plus the re-blessed SCIP goldens.
   - Before the run: `df`, the images and the context (lessons 2026-10-01).
   - **Verify:** SCIP e2e with containers; no `skipping:`; fresh = cached.
 - [ ] **10. Public repositories** (S27).
