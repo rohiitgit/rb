@@ -1,37 +1,57 @@
 {
-  "affects": [],
-  "breaks": [],
-  "endpoints": [],
-  "orphans": {
-    "computed": true,
-    "nodes": [
-      {
-        "display": "LegacyDigest#legacyHash().",
-        "distance": 1,
-        "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyDigest#legacyHash().",
-        "line": 28,
-        "path": "src/main/java/com/acme/auth/LegacyAuth.java",
-        "service": "auth-service",
-        "via": {
-          "how": "calls",
-          "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth#authenticate()."
-        }
-      }
-    ]
+  "api": 1,
+  "repo": "<repo>",
+  "snapshot": {
+    "id": "<live>",
+    "commit_sha": "a8793734c56143155bfa6e9360058cd5a8b2619a"
   },
-  "owners": [],
-  "precision": "cha",
-  "pruned_by_rta": 0,
-  "removed": [
-    {
-      "display": "LegacyAuth#authenticate().",
-      "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth#authenticate().",
-      "line": 19,
-      "path": "src/main/java/com/acme/auth/LegacyAuth.java",
-      "service": "auth-service"
-    }
-  ],
-  "services": [],
-  "tests": [],
-  "truncated": []
+  "query": {
+    "min_certainty": "ambiguous",
+    "pick": null,
+    "precision": "cha",
+    "target": "LegacyAuth.authenticate"
+  },
+  "limits": {
+    "nodes": 200000,
+    "work": 20000000
+  },
+  "truncated": [],
+  "certainty": {},
+  "result": {
+    "affects": [],
+    "breaks": [],
+    "endpoints": [],
+    "orphans": {
+      "computed": true,
+      "nodes": [
+        {
+          "display": "LegacyDigest#legacyHash().",
+          "distance": 1,
+          "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyDigest#legacyHash().",
+          "line": 28,
+          "path": "src/main/java/com/acme/auth/LegacyAuth.java",
+          "service": "auth-service",
+          "via": {
+            "how": "calls",
+            "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth#authenticate()."
+          }
+        }
+      ]
+    },
+    "owners": [],
+    "precision": "cha",
+    "pruned_by_rta": 0,
+    "removed": [
+      {
+        "display": "LegacyAuth#authenticate().",
+        "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth#authenticate().",
+        "line": 19,
+        "path": "src/main/java/com/acme/auth/LegacyAuth.java",
+        "service": "auth-service"
+      }
+    ],
+    "services": [],
+    "tests": [],
+    "truncated": []
+  }
 }

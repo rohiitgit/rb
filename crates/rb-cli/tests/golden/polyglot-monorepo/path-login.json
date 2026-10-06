@@ -1,191 +1,217 @@
 {
-  "downstream": [
-    {
-      "branch": "exact",
-      "certainty": "exact",
-      "children": [
-        {
-          "branch": "heuristic",
-          "certainty": "heuristic",
-          "children": [
-            {
-              "branch": "heuristic",
-              "certainty": "synthetic",
-              "children": [
-                {
-                  "branch": "heuristic",
-                  "certainty": "exact",
-                  "children": [
-                    {
-                      "branch": "heuristic",
-                      "certainty": "exact",
-                      "children": [],
-                      "collapsed": 0,
-                      "display": "public.email_log",
-                      "key": "public.email_log",
-                      "line": 0,
-                      "path": "",
-                      "service": "",
-                      "stitch": null,
-                      "via": "queries"
-                    }
-                  ],
-                  "collapsed": 0,
-                  "display": "services/notification/src/server.ts",
-                  "key": "services/notification/src/server.ts",
-                  "line": 1,
-                  "path": "services/notification/src/server.ts",
-                  "service": "notification",
-                  "stitch": null,
-                  "via": "handler"
-                }
-              ],
-              "collapsed": 0,
-              "display": "POST /internal/mfa/email",
-              "key": "HTTP POST /internal/mfa/email @services/notification",
-              "line": 0,
-              "path": "",
-              "service": "notification",
-              "stitch": {
-                "base": "literal",
-                "client": "feign",
-                "host": "notification",
-                "match": "exact",
-                "sites": 1
-              },
-              "via": "consumes"
-            }
-          ],
-          "collapsed": 0,
-          "display": "MfaClient#sendCode().",
-          "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode().",
-          "line": 9,
-          "path": "services/auth/src/main/java/com/acme/auth/MfaClient.java",
-          "service": "auth-service",
-          "stitch": null,
-          "via": "calls"
-        },
-        {
-          "branch": "heuristic",
-          "certainty": "heuristic",
-          "children": [
-            {
-              "branch": "heuristic",
-              "certainty": "exact",
-              "children": [],
-              "collapsed": 0,
-              "display": "audit.users",
-              "key": "audit.users",
-              "line": 0,
-              "path": "",
-              "service": "",
-              "stitch": null,
-              "via": "queries"
-            },
-            {
-              "branch": "heuristic",
-              "certainty": "exact",
-              "children": [],
-              "collapsed": 0,
-              "display": "public.users",
-              "key": "public.users",
-              "line": 0,
-              "path": "",
-              "service": "",
-              "stitch": null,
-              "via": "queries"
-            }
-          ],
-          "collapsed": 0,
-          "display": "UserDao#touch().",
-          "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch().",
-          "line": 18,
-          "path": "services/auth/src/main/java/com/acme/auth/UserDao.java",
-          "service": "auth-service",
-          "stitch": null,
-          "via": "calls"
-        }
-      ],
-      "collapsed": 0,
-      "display": "AuthController#login().",
-      "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login().",
-      "line": 17,
-      "path": "services/auth/src/main/java/com/acme/auth/AuthController.java",
-      "service": "auth-service",
-      "stitch": null,
-      "via": "handler"
-    }
-  ],
-  "endpoint": {
-    "key": "HTTP POST /api/v1/login @services/auth",
-    "name": "POST /api/v1/login",
-    "router": null,
-    "service": "auth-service"
+  "api": 1,
+  "repo": "<repo>",
+  "snapshot": {
+    "id": "<live>",
+    "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223"
   },
-  "histogram": [
-    {
-      "certainty": "exact",
-      "count": 5
-    },
-    {
-      "certainty": "synthetic",
-      "count": 1
-    },
-    {
-      "certainty": "heuristic",
-      "count": 5
-    }
-  ],
-  "precision": "cha",
-  "pruned_by_rta": 0,
+  "query": {
+    "depth": 12,
+    "endpoint": "POST /api/v1/login",
+    "full": false,
+    "hops": 4,
+    "pick": null,
+    "precision": "cha"
+  },
+  "limits": {
+    "tree": 5000,
+    "work": 20000000
+  },
   "truncated": [],
-  "upstream": [
-    {
-      "branch": "heuristic",
-      "certainty": "heuristic",
-      "children": [
-        {
-          "branch": "heuristic",
-          "certainty": "heuristic",
-          "children": [
-            {
-              "branch": "heuristic",
-              "certainty": "heuristic",
-              "children": [],
-              "collapsed": 0,
-              "display": "LoginForm().",
-              "key": "rb-heuristic . . . `apps/web/src/pages/Login.tsx`/LoginForm().",
-              "line": 3,
-              "path": "apps/web/src/pages/Login.tsx",
-              "service": "@acme/web",
-              "stitch": null,
-              "via": "called_by"
-            }
-          ],
-          "collapsed": 0,
-          "display": "LoginForm().onSubmit().",
-          "key": "rb-heuristic . . . `apps/web/src/pages/Login.tsx`/LoginForm().onSubmit().",
-          "line": 4,
-          "path": "apps/web/src/pages/Login.tsx",
-          "service": "@acme/web",
-          "stitch": null,
-          "via": "called_by"
-        }
-      ],
-      "collapsed": 0,
-      "display": "login().",
-      "key": "rb-heuristic . . . `apps/web/src/api/auth.ts`/login().",
-      "line": 6,
-      "path": "apps/web/src/api/auth.ts",
-      "service": "@acme/web",
-      "stitch": {
-        "base": "env_default",
-        "client": "axios",
-        "match": "exact",
-        "sites": 1,
-        "via_host": "gateway"
+  "certainty": {
+    "exact": 5,
+    "heuristic": 5,
+    "synthetic": 1
+  },
+  "result": {
+    "downstream": [
+      {
+        "branch": "exact",
+        "certainty": "exact",
+        "children": [
+          {
+            "branch": "heuristic",
+            "certainty": "heuristic",
+            "children": [
+              {
+                "branch": "heuristic",
+                "certainty": "synthetic",
+                "children": [
+                  {
+                    "branch": "heuristic",
+                    "certainty": "exact",
+                    "children": [
+                      {
+                        "branch": "heuristic",
+                        "certainty": "exact",
+                        "children": [],
+                        "collapsed": 0,
+                        "display": "public.email_log",
+                        "key": "public.email_log",
+                        "line": 0,
+                        "path": "",
+                        "service": "",
+                        "stitch": null,
+                        "via": "queries"
+                      }
+                    ],
+                    "collapsed": 0,
+                    "display": "services/notification/src/server.ts",
+                    "key": "services/notification/src/server.ts",
+                    "line": 1,
+                    "path": "services/notification/src/server.ts",
+                    "service": "notification",
+                    "stitch": null,
+                    "via": "handler"
+                  }
+                ],
+                "collapsed": 0,
+                "display": "POST /internal/mfa/email",
+                "key": "HTTP POST /internal/mfa/email @services/notification",
+                "line": 0,
+                "path": "",
+                "service": "notification",
+                "stitch": {
+                  "base": "literal",
+                  "client": "feign",
+                  "host": "notification",
+                  "match": "exact",
+                  "sites": 1
+                },
+                "via": "consumes"
+              }
+            ],
+            "collapsed": 0,
+            "display": "MfaClient#sendCode().",
+            "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode().",
+            "line": 9,
+            "path": "services/auth/src/main/java/com/acme/auth/MfaClient.java",
+            "service": "auth-service",
+            "stitch": null,
+            "via": "calls"
+          },
+          {
+            "branch": "heuristic",
+            "certainty": "heuristic",
+            "children": [
+              {
+                "branch": "heuristic",
+                "certainty": "exact",
+                "children": [],
+                "collapsed": 0,
+                "display": "audit.users",
+                "key": "audit.users",
+                "line": 0,
+                "path": "",
+                "service": "",
+                "stitch": null,
+                "via": "queries"
+              },
+              {
+                "branch": "heuristic",
+                "certainty": "exact",
+                "children": [],
+                "collapsed": 0,
+                "display": "public.users",
+                "key": "public.users",
+                "line": 0,
+                "path": "",
+                "service": "",
+                "stitch": null,
+                "via": "queries"
+              }
+            ],
+            "collapsed": 0,
+            "display": "UserDao#touch().",
+            "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao#touch().",
+            "line": 18,
+            "path": "services/auth/src/main/java/com/acme/auth/UserDao.java",
+            "service": "auth-service",
+            "stitch": null,
+            "via": "calls"
+          }
+        ],
+        "collapsed": 0,
+        "display": "AuthController#login().",
+        "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login().",
+        "line": 17,
+        "path": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+        "service": "auth-service",
+        "stitch": null,
+        "via": "handler"
+      }
+    ],
+    "endpoint": {
+      "key": "HTTP POST /api/v1/login @services/auth",
+      "name": "POST /api/v1/login",
+      "router": null,
+      "service": "auth-service"
+    },
+    "histogram": [
+      {
+        "certainty": "exact",
+        "count": 5
       },
-      "via": "consumes"
-    }
-  ]
+      {
+        "certainty": "synthetic",
+        "count": 1
+      },
+      {
+        "certainty": "heuristic",
+        "count": 5
+      }
+    ],
+    "precision": "cha",
+    "pruned_by_rta": 0,
+    "truncated": [],
+    "upstream": [
+      {
+        "branch": "heuristic",
+        "certainty": "heuristic",
+        "children": [
+          {
+            "branch": "heuristic",
+            "certainty": "heuristic",
+            "children": [
+              {
+                "branch": "heuristic",
+                "certainty": "heuristic",
+                "children": [],
+                "collapsed": 0,
+                "display": "LoginForm().",
+                "key": "rb-heuristic . . . `apps/web/src/pages/Login.tsx`/LoginForm().",
+                "line": 3,
+                "path": "apps/web/src/pages/Login.tsx",
+                "service": "@acme/web",
+                "stitch": null,
+                "via": "called_by"
+              }
+            ],
+            "collapsed": 0,
+            "display": "LoginForm().onSubmit().",
+            "key": "rb-heuristic . . . `apps/web/src/pages/Login.tsx`/LoginForm().onSubmit().",
+            "line": 4,
+            "path": "apps/web/src/pages/Login.tsx",
+            "service": "@acme/web",
+            "stitch": null,
+            "via": "called_by"
+          }
+        ],
+        "collapsed": 0,
+        "display": "login().",
+        "key": "rb-heuristic . . . `apps/web/src/api/auth.ts`/login().",
+        "line": 6,
+        "path": "apps/web/src/api/auth.ts",
+        "service": "@acme/web",
+        "stitch": {
+          "base": "env_default",
+          "client": "axios",
+          "match": "exact",
+          "sites": 1,
+          "via_host": "gateway"
+        },
+        "via": "consumes"
+      }
+    ]
+  }
 }

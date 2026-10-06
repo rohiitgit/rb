@@ -121,8 +121,12 @@ pub fn card_sections(ix: &SnapshotIndex, key: &str) -> CardSections {
     let mut service_of_file: HashMap<i64, i64> = HashMap::new();
     let mut file_of: HashMap<i64, i64> = HashMap::new();
     let mut exposed_by: HashMap<i64, i64> = HashMap::new();
+    // Each element is spent from the request's budget (contract M5 D6, amendment 6): once it is
+    // refused the scans stop, and the caller names `work` in the answer's `truncated`.
     for e in graph.edges() {
-        crate::work::tick(1);
+        if !crate::work::spend(1) {
+            break;
+        }
         match e.kind {
             EdgeKind::InService => {
                 service_of_file.insert(e.src, e.dst);
@@ -181,7 +185,9 @@ pub fn card_sections(ix: &SnapshotIndex, key: &str) -> CardSections {
     let mut top_level: BTreeSet<i64> = BTreeSet::new();
     let attr_str = |e: &Edge, k: &str| e.attrs.get(k).and_then(|v| v.as_str()).map(str::to_owned);
     for e in graph.edges() {
-        crate::work::tick(1);
+        if !crate::work::spend(1) {
+            break;
+        }
         let (src_mine, dst_mine) = (mine(e.src), mine(e.dst));
         match e.kind {
             EdgeKind::DependsOn if e.src == me => match ix.node(e.dst).kind {
@@ -286,7 +292,9 @@ pub fn card_sections(ix: &SnapshotIndex, key: &str) -> CardSections {
     let mut symbols = 0;
     let mut entry_points: BTreeMap<String, usize> = BTreeMap::new();
     for n in graph.nodes() {
-        crate::work::tick(1);
+        if !crate::work::spend(1) {
+            break;
+        }
         if n.kind == NodeKind::Symbol && mine(n.id) {
             symbols += 1;
             for k in entry_kinds(n) {
@@ -722,5 +730,38 @@ mod tests {
         };
         let (small, large) = (count(200), count(800));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M5 D6, amendment 6: the card's scans spend from the request's budget; a budget of
+    /// exactly its need is not refused, one below it is, and a card cut early misses calls.
+    #[test]
+    fn card_scans_stop_at_the_work_cap() {
+        let mut g = G::new(&["a", "b"]);
+        let b1 = g.sym("b/y.ts", "b1", json!({}));
+        for i in 0..5 {
+            let s = g.sym("a/x.ts", &format!("s{i}"), json!({}));
+            g.edge(
+                &s,
+                EdgeKind::Calls,
+                &b1,
+                Provenance::Heuristic,
+                Certainty::Heuristic,
+                json!({}),
+                1,
+            );
+        }
+        let ix = crate::code::SnapshotIndex::new(g.b.finish().unwrap());
+        let (whole, spent) = crate::work::metered(u64::MAX, || card_sections(&ix, "a"));
+        assert!(!spent.refused && whole.dependencies[0].calls == 5);
+        // Every element of each scan is spent: the edges twice, the nodes once.
+        let (nodes, edges) = (ix.graph().nodes().len(), ix.graph().edges().len());
+        assert_eq!(spent.work, (2 * edges + nodes) as u64);
+        let (at, s) = crate::work::metered(spent.work, || card_sections(&ix, "a"));
+        assert!(!s.refused);
+        assert_eq!(at, whole);
+        let (_, s) = crate::work::metered(spent.work - 1, || card_sections(&ix, "a"));
+        assert!(s.refused);
+        let (cut, s) = crate::work::metered(1, || card_sections(&ix, "a"));
+        assert!(s.refused && cut.dependencies.is_empty(), "{cut:?}");
     }
 }

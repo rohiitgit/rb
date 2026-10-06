@@ -1,56 +1,71 @@
 {
-  "key": ".",
-  "name": "acme",
-  "role": "library",
-  "detected_by": [
-    "package.json"
-  ],
-  "manifests": [
-    "package.json"
-  ],
-  "files": 8,
-  "languages": [
-    [
-      "other",
-      7
-    ],
-    [
-      "javascript",
-      1
-    ]
-  ],
-  "owners": [
-    "@acme/platform"
-  ],
-  "file_owners": [
-    {
-      "owner": "@acme/platform",
-      "files": 5
-    },
-    {
-      "owner": "@acme/docs",
-      "files": 1
-    }
-  ],
-  "unowned_files": 2,
-  "apis": [],
-  "consumes": [],
-  "consumed_by": [],
-  "unstitched": 0,
-  "packages": [],
-  "tables": [],
-  "dependencies": [],
-  "depended_on_by": [],
-  "shares_tables": [],
-  "call_graph": {
-    "symbols": 0,
-    "edges": {
-      "CALLS": 0,
-      "IMPLEMENTS": 0,
-      "INJECTS": 0,
-      "REFERENCES": 0
-    },
-    "certainty": {}
+  "api": 1,
+  "repo": "<repo>",
+  "snapshot": {
+    "id": "<live>",
+    "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223"
   },
-  "entry_points": {}
+  "query": {
+    "name": "."
+  },
+  "limits": {
+    "work": 20000000
+  },
+  "truncated": [],
+  "result": {
+    "key": ".",
+    "name": "acme",
+    "role": "library",
+    "detected_by": [
+      "package.json"
+    ],
+    "manifests": [
+      "package.json"
+    ],
+    "files": 8,
+    "languages": [
+      [
+        "other",
+        7
+      ],
+      [
+        "javascript",
+        1
+      ]
+    ],
+    "owners": [
+      "@acme/platform"
+    ],
+    "file_owners": [
+      {
+        "owner": "@acme/platform",
+        "files": 5
+      },
+      {
+        "owner": "@acme/docs",
+        "files": 1
+      }
+    ],
+    "unowned_files": 2,
+    "apis": [],
+    "consumes": [],
+    "consumed_by": [],
+    "unstitched": 0,
+    "packages": [],
+    "tables": [],
+    "dependencies": [],
+    "depended_on_by": [],
+    "shares_tables": [],
+    "call_graph": {
+      "symbols": 0,
+      "edges": {
+        "CALLS": 0,
+        "IMPLEMENTS": 0,
+        "INJECTS": 0,
+        "REFERENCES": 0
+      },
+      "certainty": {}
+    },
+    "entry_points": {}
+  }
 }

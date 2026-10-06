@@ -90,7 +90,7 @@ pub mod limits {
 /// once the budget is spent, further elements are refused and the request is truncated by
 /// `work`. The thread's running count ([`work::tick`]) also serves the growth tests, which
 /// compare counts for an input and one four times as large.
-pub(crate) mod work {
+pub mod work {
     use std::cell::Cell;
 
     #[derive(Debug, Clone, Copy)]
@@ -135,14 +135,14 @@ pub(crate) mod work {
 
     /// What a request spent, and whether its budget refused an element.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) struct Spent {
-        pub(crate) work: u64,
-        pub(crate) refused: bool,
+    pub struct Spent {
+        pub work: u64,
+        pub refused: bool,
     }
 
     /// Runs `f` as one request with a budget of `cap` elements; a call inside a running request
     /// joins it (one budget for the whole answer). Returns what the request has spent so far.
-    pub(crate) fn metered<T>(cap: u64, f: impl FnOnce() -> T) -> (T, Spent) {
+    pub fn metered<T>(cap: u64, f: impl FnOnce() -> T) -> (T, Spent) {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -348,6 +348,9 @@ pub struct SnapshotInfo {
     pub id: i64,
     pub repo: String,
     pub commit_sha: String,
+    /// The repository's live snapshot when this one was published (contract M5 D11's default
+    /// `from` of `rb diff`); `NULL` once that row is deleted.
+    pub parent_id: Option<i64>,
     pub status: String,
     pub tool_versions: Value,
     pub age_graph: Option<String>,
@@ -707,11 +710,36 @@ impl Store {
     }
 
     pub fn snapshot(&mut self, id: i64) -> anyhow::Result<SnapshotInfo> {
+        self.snapshot_opt(id)?
+            .with_context(|| format!("snapshot {id} does not exist"))
+    }
+
+    /// The snapshot with id `id`, if its row exists.
+    pub fn snapshot_opt(&mut self, id: i64) -> anyhow::Result<Option<SnapshotInfo>> {
         let row = self
             .client
-            .query_opt(&format!("{SNAPSHOT_SELECT} WHERE s.id = $1"), &[&id])?
-            .with_context(|| format!("snapshot {id} does not exist"))?;
-        Ok(snapshot_from_row(&row))
+            .query_opt(&format!("{SNAPSHOT_SELECT} WHERE s.id = $1"), &[&id])?;
+        Ok(row.as_ref().map(snapshot_from_row))
+    }
+
+    /// The repository's snapshot rows (live, retired, failed), newest first.
+    pub fn snapshots(&mut self, repo: &str) -> anyhow::Result<Vec<SnapshotInfo>> {
+        let rows = self.client.query(
+            &format!("{SNAPSHOT_SELECT} WHERE r.name = $1 ORDER BY s.id DESC"),
+            &[&repo],
+        )?;
+        Ok(rows.iter().map(snapshot_from_row).collect())
+    }
+
+    /// Whether snapshot id `id` was ever issued (it is at most the id sequence's last value):
+    /// a missing row with such an id was deleted, by retention or with its repository
+    /// (contract M5 D17: `snapshot_not_retained` rather than `not_found`).
+    pub fn snapshot_issued(&mut self, id: i64) -> anyhow::Result<bool> {
+        let row = self.client.query_one(
+            "SELECT coalesce(pg_sequence_last_value('rb.snapshot_id_seq'), 0) >= $1",
+            &[&id],
+        )?;
+        Ok(row.get(0))
     }
 
     /// Publishes `graph` as the repo's new live snapshot: the snapshot row, its rows, the AGE
@@ -1443,7 +1471,7 @@ impl Store {
 }
 
 const SNAPSHOT_SELECT: &str =
-    "SELECT s.id, r.name, s.commit_sha, s.status, s.tool_versions, s.age_graph
+    "SELECT s.id, r.name, s.commit_sha, s.status, s.tool_versions, s.age_graph, s.parent_id
                                FROM rb.snapshot s JOIN rb.repo r ON r.id = s.repo_id";
 
 fn snapshot_from_row(r: &postgres::Row) -> SnapshotInfo {
@@ -1454,6 +1482,7 @@ fn snapshot_from_row(r: &postgres::Row) -> SnapshotInfo {
         status: r.get(3),
         tool_versions: r.get(4),
         age_graph: r.get(5),
+        parent_id: r.get(6),
     }
 }
 

@@ -1,0 +1,132 @@
+{
+  "api": 1,
+  "repo": "<repo>",
+  "snapshot": {
+    "id": "<live>",
+    "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223"
+  },
+  "query": {},
+  "limits": {},
+  "truncated": [],
+  "result": {
+    "name": "<repo>",
+    "live": {
+      "id": "<live>",
+      "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223",
+      "age_graph": "rb_<repo>_<live>"
+    },
+    "nodes": 105,
+    "edges": 174,
+    "diagnostics": 28,
+    "snapshots": 1,
+    "coverage": {
+      "sql": {
+        "query_sites": 6,
+        "migration_statements": 3,
+        "unparsed": 1,
+        "tables": 4
+      },
+      "code": {
+        "resolved": 5,
+        "ambiguous": 0,
+        "unresolved": 20,
+        "external": 26,
+        "exact_calls": 0
+      },
+      "http": {
+        "routes": 7,
+        "services": 3,
+        "sites": 9,
+        "buckets": {
+          "ambiguous": 1,
+          "dynamic": 1,
+          "external": 1,
+          "heuristic": 2,
+          "self": 2,
+          "synthetic": 2,
+          "too_ambiguous": 0,
+          "unmatched": 0
+        }
+      },
+      "di": {
+        "points": 3,
+        "buckets": {
+          "ambiguous": 0,
+          "capped": 0,
+          "external": 1,
+          "not_a_bean": 0,
+          "optional_absent": 0,
+          "plain": 2,
+          "test": 0,
+          "too_ambiguous": 0,
+          "unresolved": 0
+        },
+        "gates": {}
+      },
+      "rta": {
+        "types": 0,
+        "proven": 0,
+        "prunable_edges": 0,
+        "kept": {
+          "annotation": 0,
+          "default_export": 0,
+          "fragment": 0,
+          "language": 0,
+          "library": 0,
+          "mention": 0,
+          "string": 0,
+          "subtype": 0,
+          "surface": 0,
+          "test": 0
+        }
+      },
+      "scip": [
+        {
+          "detail": {
+            "indexer": "scip-typescript",
+            "reason": "SCIP disabled (--no-scip)",
+            "status": "skipped",
+            "unpinned": true
+          },
+          "path": "apps/web"
+        },
+        {
+          "detail": {
+            "indexer": "scip-typescript",
+            "reason": "SCIP disabled (--no-scip)",
+            "status": "skipped",
+            "unpinned": true
+          },
+          "path": "packages/shared"
+        },
+        {
+          "detail": {
+            "indexer": "scip-java",
+            "reason": "SCIP disabled (--no-scip)",
+            "status": "skipped",
+            "unpinned": false
+          },
+          "path": "services/auth"
+        },
+        {
+          "detail": {
+            "indexer": "scip-java",
+            "reason": "SCIP disabled (--no-scip)",
+            "status": "skipped",
+            "unpinned": false
+          },
+          "path": "services/broken"
+        },
+        {
+          "detail": {
+            "indexer": "scip-typescript",
+            "reason": "SCIP disabled (--no-scip)",
+            "status": "skipped",
+            "unpinned": true
+          },
+          "path": "services/notification"
+        }
+      ]
+    }
+  }
+}

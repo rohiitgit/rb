@@ -12,6 +12,7 @@ use std::process::Command;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use rb_api::Settings;
 use rb_model::{Certainty, EdgeKind, Graph, NodeKind, Provenance, canonical_dump};
 use rb_store::Store;
 
@@ -856,6 +857,52 @@ fn golden(fixture: &str, name: &str, actual: &str) {
     assert_eq!(actual, expected, "golden mismatch: {}", path.display());
 }
 
+/// The id of `repo`'s live snapshot.
+fn live_id(url: &str, repo: &str) -> i64 {
+    Store::connect(url)
+        .unwrap()
+        .live_snapshot(repo)
+        .unwrap()
+        .expect("a live snapshot")
+        .id
+}
+
+/// A `--json` body made stable for a golden (contract M5 S11): each run indexes a fresh
+/// `t_*_<pid>` repository, so its name and the snapshot id the database assigns differ per run.
+/// The envelope must name exactly `repo` and its snapshot `live`; then every quoted occurrence of
+/// the name, the snapshot's AGE graph name and every `"id": <live>` are replaced by placeholders.
+fn stable(body: &str, repo: &str, live: i64) -> String {
+    let head = format!(
+        "{{\n  \"api\": 1,\n  \"repo\": \"{repo}\",\n  \"snapshot\": {{\n    \"id\": {live},\n"
+    );
+    assert!(
+        body.starts_with(&head),
+        "envelope of {repo} @ {live}:\n{body}"
+    );
+    body.replace(&format!("rb_{repo}_{live}"), "rb_<repo>_<live>")
+        .replace(&format!("\"{repo}\""), "\"<repo>\"")
+        .replace(&format!("\"id\": {live},"), "\"id\": \"<live>\",")
+}
+
+/// `rb` with its exit code, stdout and stderr, whether it succeeds or not.
+fn rb_exit(url: &str, args: &[&str]) -> (i32, String, String) {
+    rb_exit_env(url, args, &[])
+}
+
+fn rb_exit_env(url: &str, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rb"));
+    cmd.args(args).env("RB_DATABASE_URL", url);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
 fn rb_fails(url: &str, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_rb"))
         .args(args)
@@ -910,10 +957,15 @@ fn polyglot_monorepo_structure_goldens() {
         "card-notification.txt",
         &rb(&url, &["service", "notification", "--repo", &name]),
     );
+    let live = live_id(&url, &name);
     golden(
         fixture,
         "card-root.json",
-        &rb(&url, &["service", ".", "--repo", &name, "--json"]),
+        &stable(
+            &rb(&url, &["service", ".", "--repo", &name, "--json"]),
+            &name,
+            live,
+        ),
     );
     golden(
         fixture,
@@ -962,7 +1014,11 @@ fn polyglot_monorepo_structure_goldens() {
     golden(
         fixture,
         "table-deps-invoices.json",
-        &rb(&url, &["table-deps", "invoices", "--repo", &name, "--json"]),
+        &stable(
+            &rb(&url, &["table-deps", "invoices", "--repo", &name, "--json"]),
+            &name,
+            live,
+        ),
     );
     golden(
         fixture,
@@ -1082,9 +1138,14 @@ fn request_path_goldens() {
             &name,
         ],
     );
-    golden(fixture, "path-login.json", &json);
+    golden(
+        fixture,
+        "path-login.json",
+        &stable(&json, &name, live_id(&url, &name)),
+    );
     // The login path spans three services and two languages (TypeScript → Java → TypeScript).
     let tree: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let tree = &tree["result"];
     let mut steps = Vec::new();
     path_steps(&tree["upstream"], &mut steps);
     path_steps(&tree["downstream"], &mut steps);
@@ -1142,7 +1203,7 @@ fn request_path_goldens() {
     );
     let tree: serde_json::Value = serde_json::from_str(&json).unwrap();
     let mut steps = Vec::new();
-    path_steps(&tree["upstream"], &mut steps);
+    path_steps(&tree["result"]["upstream"], &mut steps);
     assert_eq!(
         languages(&steps),
         HashSet::from(["ts".to_owned(), "java".to_owned(), "go".to_owned()])
@@ -1537,6 +1598,289 @@ fn orm_table_deps_goldens() {
     }
 }
 
+/// Contract M5 S11, D17, D5 (polyglot, `--no-scip`): the new JSON answers (`callers` with its
+/// entry marks, `find`, `status`) in the envelope; `rb snapshots`; `--snapshot` on a retired
+/// snapshot answers byte-for-byte as that snapshot did while live, Cypher on it is
+/// `invalid_param` (no projection), and a deleted, foreign or never-issued snapshot is
+/// `snapshot_not_retained` or `not_found`; each error kind exits with D5's code and prints its body
+/// with `--json` (its message on stderr without).
+#[test]
+fn json_answers_snapshots_and_error_codes() {
+    let Some(url) = db_url() else { return };
+    let fixture = "polyglot-monorepo";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let pid = std::process::id();
+    let (name, other) = (format!("t_api_{pid}"), format!("t_api_other_{pid}"));
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    let json = |s: &str| -> serde_json::Value { serde_json::from_str(s).unwrap() };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    let first = live_id(&url, &name);
+
+    let callers_args = [
+        "callers",
+        "MfaClient.sendCode",
+        "--depth",
+        "2",
+        "--repo",
+        &name,
+    ];
+    let callers = rb(&url, &[&callers_args[..], &["--json"]].concat());
+    golden(
+        fixture,
+        "callers-send-code.json",
+        &stable(&callers, &name, first),
+    );
+    let find = rb(
+        &url,
+        &["find", "auth", "--limit", "8", "--repo", &name, "--json"],
+    );
+    golden(fixture, "find-auth.json", &stable(&find, &name, first));
+    // The JSON lists what the text lists.
+    let listed: Vec<String> = json(&find)["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            format!(
+                "{}\t{}\t{}",
+                n["kind"].as_str().unwrap(),
+                n["key"].as_str().unwrap(),
+                n["name"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let text = rb(&url, &["find", "auth", "--limit", "8", "--repo", &name]);
+    assert_eq!(listed, text.lines().collect::<Vec<_>>());
+    golden(
+        fixture,
+        "status.json",
+        &stable(
+            &rb(&url, &["status", "--repo", &name, "--json"]),
+            &name,
+            first,
+        ),
+    );
+
+    // A second snapshot of the commit: the first is retired and kept, without a graph.
+    let live_text = rb(&url, &callers_args);
+    rb(
+        &url,
+        &["index", path, "--repo", &name, "--no-scip", "--force"],
+    );
+    let second = live_id(&url, &name);
+    let rows: Vec<(i64, String, Option<i64>, bool)> =
+        json(&rb(&url, &["snapshots", "--repo", &name, "--json"]))["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_i64().unwrap(),
+                    r["status"].as_str().unwrap().to_owned(),
+                    r["parent_id"].as_i64(),
+                    r["age_graph"].is_string(),
+                )
+            })
+            .collect();
+    assert_eq!(
+        rows,
+        [
+            (second, "live".to_owned(), Some(first), true),
+            (first, "retired".to_owned(), None, false)
+        ]
+    );
+    let old = first.to_string();
+    let on_old = rb(
+        &url,
+        &[&callers_args[..], &["--json", "--snapshot", &old]].concat(),
+    );
+    assert_eq!(
+        on_old, callers,
+        "the retired snapshot answers as it did while live"
+    );
+    assert_eq!(
+        rb(&url, &[&callers_args[..], &["--snapshot", &old]].concat()),
+        live_text
+    );
+    let (code, out, _) = rb_exit(
+        &url,
+        &[
+            "cypher",
+            "RETURN 1",
+            "--repo",
+            &name,
+            "--snapshot",
+            &old,
+            "--json",
+        ],
+    );
+    let e = json(&out);
+    assert_eq!(
+        (
+            code,
+            e["error"]["kind"].as_str(),
+            e["error"]["param"].as_str()
+        ),
+        (2, Some("invalid_param"), Some("snapshot")),
+        "{out}"
+    );
+
+    // Retention deletes it: no longer kept.
+    rb(
+        &url,
+        &[
+            "index",
+            path,
+            "--repo",
+            &name,
+            "--no-scip",
+            "--force",
+            "--keep",
+            "0",
+        ],
+    );
+    let (code, out, _) = rb_exit(
+        &url,
+        &[&callers_args[..], &["--json", "--snapshot", &old]].concat(),
+    );
+    assert_eq!(
+        (code, json(&out)["error"]["kind"].as_str()),
+        (3, Some("snapshot_not_retained")),
+        "{out}"
+    );
+    let (code, out, err) = rb_exit(&url, &[&callers_args[..], &["--snapshot", &old]].concat());
+    assert_eq!((code, out.as_str()), (3, ""));
+    assert!(
+        err.starts_with("Error: snapshot ") && err.contains("is no longer kept"),
+        "{err}"
+    );
+    // Another repository's snapshot, and an id never issued.
+    let small = repo_from(&[("README.md", "x")]);
+    rb(
+        &url,
+        &[
+            "index",
+            small.path().to_str().unwrap(),
+            "--repo",
+            &other,
+            "--no-scip",
+        ],
+    );
+    for (snapshot, message) in [
+        (live_id(&url, &other).to_string(), "is not a snapshot of"),
+        ("9000000000000000000".to_owned(), "does not exist"),
+    ] {
+        let (code, out, _) = rb_exit(
+            &url,
+            &[&callers_args[..], &["--json", "--snapshot", &snapshot]].concat(),
+        );
+        let e = json(&out);
+        assert_eq!(
+            (code, e["error"]["kind"].as_str()),
+            (3, Some("not_found")),
+            "{out}"
+        );
+        assert!(
+            e["error"]["message"].as_str().unwrap().contains(message),
+            "{out}"
+        );
+    }
+
+    // Every repository's status: no single repository or snapshot in the envelope.
+    let all = json(&rb(&url, &["status", "--json"]));
+    assert!(all["repo"].is_null() && all["snapshot"].is_null(), "{all}");
+    let names: Vec<&str> = all["result"]["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&name.as_str()) && names.contains(&other.as_str()),
+        "{names:?}"
+    );
+
+    // The card's derived sections run under the work budget (contract M5 amendment 4): cut by
+    // the test-only override, the answer names `work`, in JSON and in text; under the default
+    // cap it is not cut.
+    let caps = Settings::TEST_CAPS_VAR;
+    let card = |work: &str, json_flag: bool| {
+        let mut args = vec!["service", ".", "--repo", name.as_str()];
+        if json_flag {
+            args.push("--json");
+        }
+        let (code, out, err) = rb_exit_env(&url, &args, &[(caps, &format!("work={work}"))]);
+        assert_eq!(code, 0, "{err}");
+        out
+    };
+    let cut = json(&card("1", true));
+    assert_eq!(
+        (cut["truncated"].clone(), cut["limits"]["work"].clone()),
+        (serde_json::json!(["work"]), 1.into())
+    );
+    assert!(card("1", false).ends_with("truncated: work\n"));
+    let full = json(&rb(&url, &["service", ".", "--repo", &name, "--json"]));
+    assert_eq!(full["truncated"], serde_json::json!([]));
+
+    // D5: each kind's exit code, in both modes; JSON prints the error body on stdout.
+    let nope = format!("t_api_nope_{pid}");
+    for (args, code, kind) in [
+        (
+            vec![
+                "callers",
+                "MfaClient.sendCode",
+                "--depth",
+                "26",
+                "--repo",
+                &name,
+            ],
+            2,
+            "invalid_param",
+        ),
+        (
+            vec!["callers", "noSuchSymbolAnywhere", "--repo", &name],
+            3,
+            "not_found",
+        ),
+        (vec!["callers", "x", "--repo", &nope], 3, "not_found"),
+        (vec!["impact", "login", "--repo", &name], 4, "ambiguous"),
+        (
+            vec!["cypher", "MATCH (n RETURN n", "--repo", &name],
+            5,
+            "cypher",
+        ),
+    ] {
+        let (got, out, err) = rb_exit(&url, &[&args[..], &["--json"]].concat());
+        let e = json(&out);
+        assert_eq!(
+            (got, e["error"]["kind"].as_str()),
+            (code, Some(kind)),
+            "{args:?}: {out}{err}"
+        );
+        assert_eq!(err, "", "{args:?}");
+        let (got, out, err) = rb_exit(&url, &args);
+        assert_eq!((got, out.as_str()), (code, ""), "{args:?}");
+        assert!(err.starts_with("Error: "), "{args:?}: {err}");
+        if kind == "ambiguous" {
+            let keys: Vec<&str> = e["error"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["key"].as_str().unwrap())
+                .collect();
+            assert_eq!(keys.len(), 2, "{out}");
+            assert!(
+                keys[0].ends_with("login().") && keys[1].ends_with("AuthController#login()."),
+                "{keys:?}"
+            );
+        }
+    }
+}
+
 /// Contract M3a R9-R11: `rb callers` and `rb impact` goldens on every fixture, including the
 /// must-not-exist cases (a same-named method in an unrelated class).
 #[test]
@@ -1781,15 +2125,19 @@ fn spring_di_rta_and_orphan_goldens() {
     golden(
         fixture,
         "impact-legacy-orphans.json",
-        &rb(
-            &url,
-            &[
-                "impact",
-                "LegacyAuth.authenticate",
-                "--json",
-                "--repo",
-                &name,
-            ],
+        &stable(
+            &rb(
+                &url,
+                &[
+                    "impact",
+                    "LegacyAuth.authenticate",
+                    "--json",
+                    "--repo",
+                    &name,
+                ],
+            ),
+            &name,
+            live_id(&url, &name),
         ),
     );
 }

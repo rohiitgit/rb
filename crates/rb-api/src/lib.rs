@@ -16,8 +16,8 @@ use rb_store::code::{CallerTree, Impact, Precision, SnapshotIndex};
 use rb_store::limits::{self, Caps, Limit};
 use rb_store::path::RequestPath;
 use rb_store::{
-    CypherLimits, CypherRows, FoundNode, Resolved, ServiceCard, ServiceSummary, SnapshotInfo,
-    Store, TableDeps,
+    CypherLimits, CypherRows, DiCoverage, FoundNode, HttpCoverage, ResolutionCoverage, Resolved,
+    RtaCoverage, ServiceCard, ServiceSummary, SnapshotInfo, SqlCoverage, Store, TableDeps,
 };
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
@@ -35,6 +35,8 @@ pub const FIND_LIMIT_MAX: u64 = 1_000;
 /// What a request asks, as a path segment of `/v1/repos/{repo}/…` and a CLI command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Endpoint {
+    Status,
+    Snapshots,
     Find,
     Services,
     Service,
@@ -46,7 +48,9 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
-    pub const ALL: [Endpoint; 8] = [
+    pub const ALL: [Endpoint; 10] = [
+        Endpoint::Status,
+        Endpoint::Snapshots,
         Endpoint::Find,
         Endpoint::Services,
         Endpoint::Service,
@@ -59,6 +63,8 @@ impl Endpoint {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Endpoint::Status => "status",
+            Endpoint::Snapshots => "snapshots",
             Endpoint::Find => "find",
             Endpoint::Services => "services",
             Endpoint::Service => "service",
@@ -74,12 +80,14 @@ impl Endpoint {
         Endpoint::ALL.into_iter().find(|e| e.as_str() == s)
     }
 
-    /// The parameters it takes; any other is refused.
+    /// The parameters it takes; any other is refused. Every question takes `snapshot` (D17);
+    /// `status` and `snapshots` describe the repository, not one snapshot.
     pub fn params(self) -> &'static [&'static str] {
         match self {
-            Endpoint::Find => &["q", "kind", "limit"],
-            Endpoint::Services => &[],
-            Endpoint::Service => &["name"],
+            Endpoint::Status | Endpoint::Snapshots => &[],
+            Endpoint::Find => &["q", "kind", "limit", "snapshot"],
+            Endpoint::Services => &["snapshot"],
+            Endpoint::Service => &["name", "snapshot"],
             Endpoint::Callers => &[
                 "target",
                 "depth",
@@ -87,11 +95,20 @@ impl Endpoint {
                 "min_certainty",
                 "precision",
                 "pick",
+                "snapshot",
             ],
-            Endpoint::Impact => &["target", "min_certainty", "precision", "pick"],
-            Endpoint::TableDeps => &["table", "precision", "hops"],
-            Endpoint::Path => &["endpoint", "depth", "hops", "full", "precision", "pick"],
-            Endpoint::Cypher => &["query", "columns", "timeout_ms"],
+            Endpoint::Impact => &["target", "min_certainty", "precision", "pick", "snapshot"],
+            Endpoint::TableDeps => &["table", "precision", "hops", "snapshot"],
+            Endpoint::Path => &[
+                "endpoint",
+                "depth",
+                "hops",
+                "full",
+                "precision",
+                "pick",
+                "snapshot",
+            ],
+            Endpoint::Cypher => &["query", "columns", "timeout_ms", "snapshot"],
         }
     }
 }
@@ -113,17 +130,58 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// The environment variable holding the test-only cap override (contract M5 S14).
+    pub const TEST_CAPS_VAR: &'static str = "RB_TEST_CAPS";
+
+    /// Lowers caps for tests (contract M5 S14: "a truncating cap lowered by a test-only limit
+    /// override"): `nodes=N,tree=N,work=N`, each at most D6's value; raising one is refused. The
+    /// caps in force are in every envelope's `limits`, so an overridden answer says so.
+    pub fn with_test_caps(mut self, spec: &str) -> Result<Self, String> {
+        let var = Self::TEST_CAPS_VAR;
+        let defaults = Caps::default();
+        for part in spec.split(',').filter(|p| !p.is_empty()) {
+            let (name, value) = part
+                .split_once('=')
+                .ok_or_else(|| format!("{var}: expected name=value, got {part:?}"))?;
+            let n: u64 = value
+                .parse()
+                .map_err(|_| format!("{var}: {name} must be a number, got {value:?}"))?;
+            let max = match name {
+                "nodes" => defaults.nodes as u64,
+                "tree" => defaults.tree as u64,
+                "work" => defaults.work,
+                other => return Err(format!("{var}: unknown cap {other:?} (nodes, tree, work)")),
+            };
+            if n > max {
+                return Err(format!("{var}: {name} may only be lowered (at most {max})"));
+            }
+            let size = || usize::try_from(n).expect("at most a default");
+            match name {
+                "nodes" => self.caps.nodes = size(),
+                "tree" => self.caps.tree = size(),
+                _ => self.caps.work = n,
+            }
+        }
+        Ok(self)
+    }
+}
+
 /// A validated request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
-    /// `None`: the only repository (the CLI without `--repo`).
+    /// `None`: the only repository (the CLI without `--repo`); for `status`, every repository.
     pub repo: Option<String>,
+    /// A kept snapshot of the repository (D17); `None`: its live snapshot.
+    pub snapshot: Option<i64>,
     pub query: Query,
 }
 
 /// A request's parameters, typed, with every default filled in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
+    Status,
+    Snapshots,
     Find {
         q: String,
         kind: Option<NodeKind>,
@@ -183,6 +241,8 @@ pub fn parse(
     let pick =
         || -> Result<Option<usize>, ApiError> { Ok(p.int_opt("pick", 1, PICK_MAX)?.map(usize_of)) };
     let query = match endpoint {
+        Endpoint::Status => Query::Status,
+        Endpoint::Snapshots => Query::Snapshots,
         Endpoint::Find => Query::Find {
             q: p.text("q")?,
             kind: p.kind_opt("kind")?,
@@ -252,6 +312,9 @@ pub fn parse(
     };
     Ok(Request {
         repo: repo.map(str::to_owned),
+        snapshot: p
+            .int_opt("snapshot", 1, i64::MAX as u64)?
+            .map(|id| i64::try_from(id).expect("bounded")),
         query,
     })
 }
@@ -282,6 +345,8 @@ fn columns(p: &Params) -> Result<Vec<String>, ApiError> {
 impl Query {
     pub fn endpoint(&self) -> Endpoint {
         match self {
+            Query::Status => Endpoint::Status,
+            Query::Snapshots => Endpoint::Snapshots,
             Query::Find { .. } => Endpoint::Find,
             Query::Services => Endpoint::Services,
             Query::Service { .. } => Endpoint::Service,
@@ -296,6 +361,7 @@ impl Query {
     /// The envelope's `query`: every parameter, defaults filled in, typed (D4).
     pub fn normalised(&self) -> Value {
         match self {
+            Query::Status | Query::Snapshots => json!({}),
             Query::Find { q, kind, limit } => {
                 json!({"q": q, "kind": kind.map(NodeKind::as_str), "limit": limit})
             }
@@ -366,6 +432,12 @@ pub struct SnapshotRef {
 /// What a request computed, before rendering: the CLI renders it as text, and both surfaces
 /// serialise it as the envelope's `result`.
 pub enum Answer {
+    /// One repository's status, or every repository's (`all`).
+    Status {
+        all: bool,
+        reports: Vec<StatusReport>,
+    },
+    Snapshots(Vec<SnapshotInfo>),
     Find(Vec<FoundNode>),
     Services(Vec<ServiceSummary>),
     Card(Box<ServiceCard>),
@@ -388,6 +460,28 @@ pub enum Answer {
 impl Serialize for Answer {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Answer::Status { all: true, reports } => json!({ "repos": reports }).serialize(s),
+            Answer::Status {
+                all: false,
+                reports,
+            } => reports
+                .first()
+                .expect("one report per repository")
+                .serialize(s),
+            Answer::Snapshots(snapshots) => snapshots
+                .iter()
+                .map(|x| {
+                    json!({
+                        "id": x.id,
+                        "commit_sha": x.commit_sha,
+                        "status": x.status,
+                        "parent_id": x.parent_id,
+                        "age_graph": x.age_graph,
+                        "tool_versions": x.tool_versions,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .serialize(s),
             Answer::Find(found) => found.serialize(s),
             Answer::Services(services) => services.serialize(s),
             Answer::Card(card) => card.serialize(s),
@@ -444,11 +538,6 @@ impl Output {
             result: &self.answer,
         })
     }
-
-    /// The `result` alone, as the CLI's `--json` printed it before the envelope.
-    pub fn result_json(&self) -> String {
-        pretty(&self.answer)
-    }
 }
 
 fn pretty(v: &impl Serialize) -> String {
@@ -499,9 +588,9 @@ pub fn run(
         timeout_ms,
     } = &req.query
     {
-        let snap = store.read_tx(|s| {
+        let (snap, _) = store.read_tx(|s| {
             let repo = resolve_repo(s, req.repo.as_deref())?;
-            Ok(live_snapshot(s, &repo)?)
+            Ok(resolve_snapshot(s, &repo, req.snapshot)?)
         })?;
         let rows = store.cypher(
             snap.id,
@@ -522,13 +611,169 @@ pub fn run(
             answer: Answer::Cypher(rows),
         });
     }
-    Ok(store.read_tx(|s| {
-        let repo = resolve_repo(s, req.repo.as_deref())?;
-        let snap = live_snapshot(s, &repo)?;
-        s.read_snapshot(snap.id, |s| {
-            Ok(answer(s, indexes, &snap, true, &req.query, settings)?)
-        })
+    Ok(store.read_tx(|s| match &req.query {
+        Query::Status => Ok(status(s, req.repo.as_deref())?),
+        Query::Snapshots => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            let live = live_snapshot(s, &repo).ok();
+            if live.is_none() && !s.repo_names()?.contains(&repo) {
+                return Err(not_indexed(&repo).into());
+            }
+            Ok(Output {
+                repo: Some(repo.clone()),
+                snapshot: live.as_ref().map(snapshot_ref),
+                query: req.query.normalised(),
+                limits: BTreeMap::new(),
+                truncated: Vec::new(),
+                certainty: None,
+                answer: Answer::Snapshots(s.snapshots(&repo)?),
+            })
+        }
+        _ => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            let (snap, live) = resolve_snapshot(s, &repo, req.snapshot)?;
+            s.read_snapshot(snap.id, |s| {
+                Ok(answer(s, indexes, &snap, live, &req.query, settings)?)
+            })
+        }
     })?)
+}
+
+/// One repository's status (`rb status`, `GET /v1/repos/{repo}/status`): its live snapshot,
+/// counts, and the coverage lines as data.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatusReport {
+    pub name: String,
+    pub live: Option<LiveRef>,
+    pub nodes: i64,
+    pub edges: i64,
+    pub diagnostics: i64,
+    /// Snapshot rows kept (live, retired, failed).
+    pub snapshots: i64,
+    /// The live snapshot's coverage; absent without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Coverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LiveRef {
+    pub id: i64,
+    pub commit_sha: String,
+    pub age_graph: Option<String>,
+}
+
+/// `rb status`'s coverage lines (design §12.4) as data.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Coverage {
+    pub sql: SqlCoverage,
+    pub code: ResolutionCoverage,
+    pub http: HttpCoverage,
+    pub di: DiCoverage,
+    pub rta: RtaCoverage,
+    /// The `scip_status` diagnostics, one per project: `{path, detail}`.
+    #[serde(serialize_with = "scip_jobs")]
+    pub scip: Vec<rb_model::Diagnostic>,
+}
+
+fn scip_jobs<S: Serializer>(jobs: &[rb_model::Diagnostic], s: S) -> Result<S::Ok, S::Error> {
+    jobs.iter()
+        .map(|d| json!({"path": d.path, "detail": d.detail}))
+        .collect::<Vec<_>>()
+        .serialize(s)
+}
+
+/// The status of `repo`, or of every repository (inside the read transaction).
+fn status(store: &mut Store, repo: Option<&str>) -> Result<Output, ApiError> {
+    let names = match repo {
+        Some(r) => vec![r.to_owned()],
+        None => store.repo_names()?,
+    };
+    let mut reports = Vec::new();
+    for name in names {
+        let st = store.status(&name)?;
+        let coverage = match &st.live {
+            Some(live) => Some(Coverage {
+                sql: store.sql_coverage(live.id)?,
+                code: store.resolution_coverage(live.id)?,
+                http: store.http_coverage(live.id)?,
+                di: store.di_coverage(live.id)?,
+                rta: store.rta_coverage(live.id)?,
+                scip: store
+                    .load_diagnostics(live.id)?
+                    .into_iter()
+                    .filter(|d| d.kind == "scip_status")
+                    .collect(),
+            }),
+            None => None,
+        };
+        reports.push(StatusReport {
+            name: st.name,
+            live: st.live.as_ref().map(|l| LiveRef {
+                id: l.id,
+                commit_sha: l.commit_sha.clone(),
+                age_graph: l.age_graph.clone(),
+            }),
+            nodes: st.nodes,
+            edges: st.edges,
+            diagnostics: st.diagnostics,
+            snapshots: st.snapshots,
+            coverage,
+        });
+    }
+    let single = repo.and_then(|_| reports.first());
+    Ok(Output {
+        repo: repo.map(str::to_owned),
+        snapshot: single.and_then(|r| r.live.as_ref()).map(|l| SnapshotRef {
+            id: l.id,
+            commit_sha: l.commit_sha.clone(),
+        }),
+        query: Query::Status.normalised(),
+        limits: BTreeMap::new(),
+        truncated: Vec::new(),
+        certainty: None,
+        answer: Answer::Status {
+            all: repo.is_none(),
+            reports,
+        },
+    })
+}
+
+/// The snapshot a question reads (D17): the live one, or `requested`, which must be a kept
+/// (`live` or `retired`) snapshot of `repo`; a deleted one is `snapshot_not_retained`. Returns it
+/// and whether it is the live one.
+fn resolve_snapshot(
+    store: &mut Store,
+    repo: &str,
+    requested: Option<i64>,
+) -> Result<(SnapshotInfo, bool), ApiError> {
+    let Some(id) = requested else {
+        return Ok((live_snapshot(store, repo)?, true));
+    };
+    if !store.repo_names()?.iter().any(|r| r == repo) {
+        return Err(not_indexed(repo));
+    }
+    match store.snapshot_opt(id)? {
+        Some(snap) if snap.repo != repo => Err(ApiError::not_found(format!(
+            "snapshot {id} is not a snapshot of {repo:?}"
+        ))),
+        Some(snap) if snap.status == "live" || snap.status == "retired" => {
+            let live = store.live_snapshot(repo)?.is_some_and(|l| l.id == id);
+            Ok((snap, live))
+        }
+        Some(snap) => Err(ApiError::not_found(format!(
+            "snapshot {id} of {repo:?} is {} and holds no graph",
+            snap.status
+        ))),
+        None if store.snapshot_issued(id)? => Err(ApiError::new(
+            ErrorKind::SnapshotNotRetained,
+            format!("snapshot {id} is no longer kept (`rb snapshots` lists the kept ones)"),
+        )),
+        None => Err(ApiError::not_found(format!("snapshot {id} does not exist"))),
+    }
+}
+
+fn not_indexed(repo: &str) -> ApiError {
+    ApiError::not_found(format!("repository {repo:?} is not indexed"))
 }
 
 fn snapshot_ref(snap: &SnapshotInfo) -> SnapshotRef {
@@ -572,9 +817,7 @@ fn live_snapshot(store: &mut Store, repo: &str) -> Result<SnapshotInfo, ApiError
             format!("repository {repo:?} has no live snapshot"),
         ))
     } else {
-        Err(ApiError::not_found(format!(
-            "repository {repo:?} is not indexed"
-        )))
+        Err(not_indexed(repo))
     }
 }
 
@@ -641,7 +884,14 @@ fn answer(
                 }
             };
             let ix = indexes.index(store, snap, live)?;
-            Answer::Card(Box::new(store.service_card(snap.id, &ix, &found.key)?))
+            // The card's derived sections read adjacency: one budget for the card (amendment 4).
+            let (card, spent) =
+                rb_store::work::metered(caps.work, || store.service_card(snap.id, &ix, &found.key));
+            out.limits = limits_of(&[(Limit::Work, caps.work)]);
+            if spent.refused {
+                out.truncated = vec![Limit::Work.as_str().to_owned()];
+            }
+            Answer::Card(Box::new(card?))
         }
         Query::Callers {
             target,
@@ -776,7 +1026,9 @@ fn answer(
                 path: Box::new(path),
             }
         }
-        Query::Cypher { .. } => unreachable!("Cypher runs in its own transaction"),
+        Query::Status | Query::Snapshots | Query::Cypher { .. } => {
+            unreachable!("answered by `run` itself")
+        }
     };
     Ok(out)
 }
@@ -873,6 +1125,32 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.param.as_deref(), Some("columns"));
+    }
+
+    /// Contract M5 S14: the test-only override lowers caps and never raises them.
+    #[test]
+    fn test_caps_only_lower() {
+        let s = Settings::default()
+            .with_test_caps("tree=3,work=10")
+            .unwrap();
+        assert_eq!(
+            (s.caps.tree, s.caps.work, s.caps.nodes),
+            (3, 10, limits::NODES)
+        );
+        assert_eq!(
+            Settings::default().with_test_caps("").unwrap(),
+            Settings::default()
+        );
+        for bad in [
+            "work=20000001",
+            "nodes=200001",
+            "tree=5001",
+            "depth=1",
+            "work",
+            "work=x",
+        ] {
+            assert!(Settings::default().with_test_caps(bad).is_err(), "{bad}");
+        }
     }
 
     /// D4: the normalised query fills every default, so two spellings of one request have one

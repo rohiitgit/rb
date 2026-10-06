@@ -141,7 +141,7 @@ pub struct TableDeps {
 }
 
 /// How many call and type references were resolved (design §12.4, contract M3a R8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ResolutionCoverage {
     /// Distinct reference sites with exactly one target.
     pub resolved: i64,

@@ -1,0 +1,52 @@
+{
+  "api": 1,
+  "repo": "<repo>",
+  "snapshot": {
+    "id": "<live>",
+    "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223"
+  },
+  "query": {
+    "depth": 2,
+    "include_references": false,
+    "min_certainty": "ambiguous",
+    "pick": null,
+    "precision": "cha",
+    "target": "MfaClient.sendCode"
+  },
+  "limits": {
+    "tree": 5000,
+    "work": 20000000
+  },
+  "truncated": [],
+  "certainty": {
+    "heuristic": 1
+  },
+  "result": {
+    "callers": [
+      {
+        "callers": [],
+        "certainty": "heuristic",
+        "dispatch": false,
+        "display": "AuthController#login().",
+        "entry": [
+          "endpoint POST /api/v1/login"
+        ],
+        "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login().",
+        "line": 17,
+        "path": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+        "reference": false,
+        "service": "auth-service"
+      }
+    ],
+    "precision": "cha",
+    "pruned_by_rta": 0,
+    "target": {
+      "display": "MfaClient#sendCode().",
+      "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode().",
+      "line": 9,
+      "path": "services/auth/src/main/java/com/acme/auth/MfaClient.java",
+      "service": "auth-service"
+    },
+    "truncated": []
+  }
+}

@@ -103,6 +103,17 @@ enum Command {
     Status {
         #[arg(long)]
         repo: Option<String>,
+        /// Emit JSON (the API's envelope) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a repository's kept snapshots (live, retired, failed), newest first.
+    Snapshots {
+        #[arg(long)]
+        repo: Option<String>,
+        /// Emit JSON (the API's envelope) instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the canonical, id-independent dump of a snapshot.
     Dump {
@@ -126,6 +137,12 @@ enum Command {
         limit: Option<String>,
         #[arg(long)]
         repo: Option<String>,
+        /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Emit JSON (the API's envelope) instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// List services, or show one service's card (by directory or name).
     Service {
@@ -133,7 +150,10 @@ enum Command {
         service: Option<String>,
         #[arg(long)]
         repo: Option<String>,
-        /// Emit JSON instead of text.
+        /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -142,7 +162,10 @@ enum Command {
         table: String,
         #[arg(long)]
         repo: Option<String>,
-        /// Emit JSON instead of text.
+        /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
         json: bool,
         /// Dispatch expansion in the caller walk (as for `callers`); `cha` by default, since
@@ -161,6 +184,12 @@ enum Command {
         target: String,
         #[arg(long)]
         repo: Option<String>,
+        /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Emit JSON (the API's envelope) instead of text.
+        #[arg(long)]
+        json: bool,
         /// Levels of callers to follow (1-25; default 1).
         #[arg(long)]
         depth: Option<String>,
@@ -186,6 +215,9 @@ enum Command {
         target: String,
         #[arg(long)]
         repo: Option<String>,
+        /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
+        #[arg(long)]
+        snapshot: Option<String>,
         /// As for `callers`.
         #[arg(long)]
         min_certainty: Option<String>,
@@ -195,7 +227,7 @@ enum Command {
         /// the dangerous failure here.
         #[arg(long)]
         precision: Option<String>,
-        /// Emit JSON instead of text.
+        /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -207,6 +239,9 @@ enum Command {
         query: String,
         #[arg(long)]
         repo: Option<String>,
+        /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
+        #[arg(long)]
+        snapshot: Option<String>,
         /// Call levels followed per service hop (1-25; default 12).
         #[arg(long)]
         depth: Option<String>,
@@ -246,6 +281,12 @@ enum Command {
         query: String,
         #[arg(long)]
         repo: Option<String>,
+        /// Run against this snapshot (only the live one has an AGE graph).
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Emit JSON (the API's envelope) instead of text.
+        #[arg(long)]
+        json: bool,
         /// Comma-separated names for the RETURN columns, in order (default `result`).
         #[arg(long)]
         cols: Option<String>,
@@ -301,49 +342,6 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Index(args) => index(&mut store, &cli.age_load_dir, args)?,
-        Command::Status { repo } => store.read_tx(|store| {
-            let repos = match repo {
-                Some(r) => vec![r],
-                None => store.repo_names()?,
-            };
-            if repos.is_empty() {
-                println!("no repositories indexed yet");
-            }
-            for r in repos {
-                let s = store.status(&r)?;
-                match &s.live {
-                    Some(live) => println!(
-                        "{}: live snapshot {} @ {} — {} nodes, {} edges, {} diagnostics; AGE graph {}; {} snapshot(s) kept",
-                        s.name,
-                        live.id,
-                        short(&live.commit_sha),
-                        s.nodes,
-                        s.edges,
-                        s.diagnostics,
-                        live.age_graph.as_deref().unwrap_or("-"),
-                        s.snapshots
-                    ),
-                    None => println!("{}: no live snapshot", s.name),
-                }
-                if let Some(live) = &s.live {
-                    let c = store.sql_coverage(live.id)?;
-                    println!(
-                        "  sql: {} tables; {} code sites and {} migration statements touching them; {} unparsed",
-                        c.tables, c.query_sites, c.migration_statements, c.unparsed
-                    );
-                    println!("  {}", code_line(&store.resolution_coverage(live.id)?));
-                    println!("  {}", http_line(&store.http_coverage(live.id)?));
-                    println!("  {}", di_line(&store.di_coverage(live.id)?));
-                    println!("  {}", rta_line(&store.rta_coverage(live.id)?));
-                    for d in store.load_diagnostics(live.id)? {
-                        if d.kind == "scip_status" {
-                            println!("  {}", scip_status_line(&d));
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })?,
         Command::Dump {
             repo,
             snapshot,
@@ -390,11 +388,15 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             if scip {
                 // Rows of an image this run cannot identify are not provably stale: refuse.
-                rb_scip::docker_available()
-                    .map_err(|e| anyhow::anyhow!("{e}; the current scip-java image is unknown, nothing pruned"))?;
+                rb_scip::docker_available().map_err(|e| {
+                    anyhow::anyhow!("{e}; the current scip-java image is unknown, nothing pruned")
+                })?;
                 let images = rb_scip::Images::resolve(&rb_scip::DockerRunner::default());
-                let java = images.java.map_err(|e| anyhow::anyhow!("{e}; nothing pruned"))?;
-                let r = store.prune_scip(&[&java, rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE], dry_run)?;
+                let java = images
+                    .java
+                    .map_err(|e| anyhow::anyhow!("{e}; nothing pruned"))?;
+                let r =
+                    store.prune_scip(&[&java, rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE], dry_run)?;
                 println!("scip: {verb} {} rows, {} bytes", r.rows, r.bytes);
             }
         }
@@ -426,25 +428,31 @@ type Asked = (Endpoint, Option<String>, Params, Out);
 /// The question a command asks, its flags as the request layer's string parameters (contract M5
 /// S12: `rb-api` alone validates them); `None` for the commands that are not questions.
 fn asked(command: Command) -> Option<Asked> {
+    let mut p = Params::new();
     Some(match command {
+        Command::Status { repo, json } => (Endpoint::Status, repo, p, Out::json_if(json)),
+        Command::Snapshots { repo, json } => (Endpoint::Snapshots, repo, p, Out::json_if(json)),
         Command::Find {
             text,
             kind,
             limit,
             repo,
+            snapshot,
+            json,
         } => {
-            let mut p = Params::new();
             p.set("q", text)
                 .set_opt("kind", kind)
-                .set_opt("limit", limit);
-            (Endpoint::Find, repo, p, Out::Text)
+                .set_opt("limit", limit)
+                .set_opt("snapshot", snapshot);
+            (Endpoint::Find, repo, p, Out::json_if(json))
         }
         Command::Service {
             service,
             repo,
+            snapshot,
             json,
         } => {
-            let mut p = Params::new();
+            p.set_opt("snapshot", snapshot);
             let endpoint = match service {
                 Some(name) => {
                     p.set("name", name);
@@ -457,12 +465,13 @@ fn asked(command: Command) -> Option<Asked> {
         Command::TableDeps {
             table,
             repo,
+            snapshot,
             json,
             precision,
             hops,
         } => {
-            let mut p = Params::new();
             p.set("table", table)
+                .set_opt("snapshot", snapshot)
                 .set_opt("precision", precision)
                 .set_opt("hops", hops);
             (Endpoint::TableDeps, repo, p, Out::json_if(json))
@@ -470,31 +479,34 @@ fn asked(command: Command) -> Option<Asked> {
         Command::Callers {
             target,
             repo,
+            snapshot,
+            json,
             depth,
             include_references,
             min_certainty,
             pick,
             precision,
         } => {
-            let mut p = Params::new();
             p.set("target", target)
+                .set_opt("snapshot", snapshot)
                 .set_opt("depth", depth)
                 .set_flag("include_references", include_references)
                 .set_opt("min_certainty", min_certainty)
                 .set_opt("pick", pick)
                 .set_opt("precision", precision);
-            (Endpoint::Callers, repo, p, Out::Text)
+            (Endpoint::Callers, repo, p, Out::json_if(json))
         }
         Command::Impact {
             target,
             repo,
+            snapshot,
             min_certainty,
             pick,
             precision,
             json,
         } => {
-            let mut p = Params::new();
             p.set("target", target)
+                .set_opt("snapshot", snapshot)
                 .set_opt("min_certainty", min_certainty)
                 .set_opt("pick", pick)
                 .set_opt("precision", precision);
@@ -503,6 +515,7 @@ fn asked(command: Command) -> Option<Asked> {
         Command::Path {
             query,
             repo,
+            snapshot,
             depth,
             hops,
             full,
@@ -510,8 +523,8 @@ fn asked(command: Command) -> Option<Asked> {
             pick,
             precision,
         } => {
-            let mut p = Params::new();
             p.set("endpoint", query)
+                .set_opt("snapshot", snapshot)
                 .set_opt("depth", depth)
                 .set_opt("hops", hops)
                 .set_flag("full", full)
@@ -527,18 +540,19 @@ fn asked(command: Command) -> Option<Asked> {
         Command::Cypher {
             query,
             repo,
+            snapshot,
+            json,
             cols,
             timeout_ms,
         } => {
-            let mut p = Params::new();
             p.set("query", query)
+                .set_opt("snapshot", snapshot)
                 .set_opt("columns", cols)
                 .set_opt("timeout_ms", timeout_ms);
-            (Endpoint::Cypher, repo, p, Out::Text)
+            (Endpoint::Cypher, repo, p, Out::json_if(json))
         }
         Command::Migrate
         | Command::Index(_)
-        | Command::Status { .. }
         | Command::Dump { .. }
         | Command::Gc { .. }
         | Command::Cache { .. } => return None,
@@ -549,27 +563,51 @@ fn asked(command: Command) -> Option<Asked> {
 /// code the server uses, and prints it; a refused request prints its message and exits with
 /// D5's code.
 fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Result<ExitCode> {
-    let settings = rb_api::Settings::default();
+    let settings = match std::env::var(rb_api::Settings::TEST_CAPS_VAR) {
+        Ok(spec) => rb_api::Settings::default()
+            .with_test_caps(&spec)
+            .map_err(anyhow::Error::msg)?,
+        Err(_) => rb_api::Settings::default(),
+    };
     let answered = rb_api::parse(endpoint, repo.as_deref(), &params, &settings)
         .and_then(|req| rb_api::run(store, &mut rb_api::LoadEach, &req, &settings));
     match answered {
         Ok(output) => {
             match out {
-                Out::Json => print!("{}", output.result_json()),
-                Out::Text => print!("{}", render_text(&output.answer)),
+                Out::Json => print!("{}", output.body()),
+                Out::Text => print!("{}", render_text(&output)),
             }
             Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
-            eprintln!("Error: {}", e.cli_text());
+            match out {
+                // The error body the server sends for the same request (contract M5 S14).
+                Out::Json => print!("{}", e.body()),
+                Out::Text => eprintln!("Error: {}", e.cli_text()),
+            }
             Ok(ExitCode::from(e.kind.exit_code()))
         }
     }
 }
 
 /// The text rendering of an answer (the CLI's own; JSON is `rb-api`'s).
-fn render_text(answer: &Answer) -> String {
-    match answer {
+fn render_text(output: &rb_api::Output) -> String {
+    match &output.answer {
+        Answer::Status { all, reports } => status_text(*all, reports),
+        Answer::Snapshots(snapshots) => snapshots
+            .iter()
+            .map(|x| {
+                format!(
+                    "{}\t{}\t{}\tparent {}\tAGE graph {}\n",
+                    x.id,
+                    short(&x.commit_sha),
+                    x.status,
+                    x.parent_id
+                        .map_or_else(|| "-".to_owned(), |p| p.to_string()),
+                    x.age_graph.as_deref().unwrap_or("-")
+                )
+            })
+            .collect(),
         Answer::Find(found) => found
             .iter()
             .map(|n| format!("{}\t{}\t{}\n", n.kind, n.key, n.name))
@@ -578,7 +616,13 @@ fn render_text(answer: &Answer) -> String {
             .iter()
             .map(|s| format!("{}\t{}\t{}\t{}\n", s.key, s.name, s.role, files(s.files)))
             .collect(),
-        Answer::Card(card) => render_card(card),
+        Answer::Card(card) => {
+            let mut text = render_card(card);
+            if !output.truncated.is_empty() {
+                let _ = writeln!(text, "truncated: {}", output.truncated.join(", "));
+            }
+            text
+        }
         Answer::Callers { ix, tree } => code::render_callers(ix, tree),
         Answer::Impact { ix, impact } => code::render_impact(ix, impact),
         Answer::TableDeps(deps) => render_table_deps(deps),
@@ -1208,6 +1252,50 @@ fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value
             .into();
     }
     tools
+}
+
+/// `rb status`'s text: per repository its live snapshot and counts, then its coverage lines.
+fn status_text(all: bool, reports: &[rb_api::StatusReport]) -> String {
+    let mut out = String::new();
+    if all && reports.is_empty() {
+        out.push_str("no repositories indexed yet\n");
+    }
+    for r in reports {
+        match &r.live {
+            Some(live) => {
+                let _ = writeln!(
+                    out,
+                    "{}: live snapshot {} @ {} — {} nodes, {} edges, {} diagnostics; AGE graph {}; {} snapshot(s) kept",
+                    r.name,
+                    live.id,
+                    short(&live.commit_sha),
+                    r.nodes,
+                    r.edges,
+                    r.diagnostics,
+                    live.age_graph.as_deref().unwrap_or("-"),
+                    r.snapshots
+                );
+            }
+            None => {
+                let _ = writeln!(out, "{}: no live snapshot", r.name);
+            }
+        }
+        if let Some(c) = &r.coverage {
+            let _ = writeln!(
+                out,
+                "  sql: {} tables; {} code sites and {} migration statements touching them; {} unparsed",
+                c.sql.tables, c.sql.query_sites, c.sql.migration_statements, c.sql.unparsed
+            );
+            let _ = writeln!(out, "  {}", code_line(&c.code));
+            let _ = writeln!(out, "  {}", http_line(&c.http));
+            let _ = writeln!(out, "  {}", di_line(&c.di));
+            let _ = writeln!(out, "  {}", rta_line(&c.rta));
+            for d in &c.scip {
+                let _ = writeln!(out, "  {}", scip_status_line(d));
+            }
+        }
+    }
+    out
 }
 
 /// Text rendering of the Service Card's structure sections (design §9.5).
@@ -2237,6 +2325,7 @@ mod tests {
             id: 7,
             repo: "r".into(),
             commit_sha: "c".repeat(40),
+            parent_id: None,
             status: "live".into(),
             tool_versions: tools.clone(),
             age_graph: None,

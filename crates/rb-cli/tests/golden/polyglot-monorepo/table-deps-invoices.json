@@ -1,55 +1,77 @@
 {
-  "key": "billing.invoices",
-  "name": "invoices",
-  "migrations": [
-    {
-      "source_kind": "file",
-      "source_key": "services/billing/migrations/001_invoices.sql",
-      "source_name": "001_invoices.sql",
-      "ops": [
-        "create"
-      ],
-      "certainty": "exact",
-      "schema_assumed": false,
-      "file": "services/billing/migrations/001_invoices.sql",
-      "line": 3,
-      "service_key": "services/billing",
-      "service_name": "github.com/acme/billing"
-    }
-  ],
-  "mappings": [],
-  "accesses": [
-    {
-      "source_kind": "symbol",
-      "source_key": "rb-heuristic . . . `services/billing/internal/invoice.go`/MarkPaid().",
-      "source_name": "MarkPaid",
-      "ops": [
-        "update"
-      ],
-      "certainty": "exact",
-      "schema_assumed": false,
-      "file": "services/billing/internal/invoice.go",
-      "line": 16,
-      "service_key": "services/billing",
-      "service_name": "github.com/acme/billing"
-    }
-  ],
-  "precision": "cha",
-  "pruned_by_rta": 0,
-  "services": [
-    {
-      "key": "services/billing",
-      "name": "github.com/acme/billing",
-      "ops": [
-        "update"
-      ],
-      "direct": true,
-      "via": [],
-      "endpoints": [],
-      "entry_points": {},
-      "certainty": "exact"
-    }
-  ],
-  "through_apis": [],
-  "truncated": []
+  "api": 1,
+  "repo": "<repo>",
+  "snapshot": {
+    "id": "<live>",
+    "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223"
+  },
+  "query": {
+    "hops": 4,
+    "precision": "cha",
+    "table": "invoices"
+  },
+  "limits": {
+    "nodes": 200000,
+    "tree": 5000,
+    "work": 20000000
+  },
+  "truncated": [],
+  "certainty": {
+    "exact": 2
+  },
+  "result": {
+    "key": "billing.invoices",
+    "name": "invoices",
+    "migrations": [
+      {
+        "source_kind": "file",
+        "source_key": "services/billing/migrations/001_invoices.sql",
+        "source_name": "001_invoices.sql",
+        "ops": [
+          "create"
+        ],
+        "certainty": "exact",
+        "schema_assumed": false,
+        "file": "services/billing/migrations/001_invoices.sql",
+        "line": 3,
+        "service_key": "services/billing",
+        "service_name": "github.com/acme/billing"
+      }
+    ],
+    "mappings": [],
+    "accesses": [
+      {
+        "source_kind": "symbol",
+        "source_key": "rb-heuristic . . . `services/billing/internal/invoice.go`/MarkPaid().",
+        "source_name": "MarkPaid",
+        "ops": [
+          "update"
+        ],
+        "certainty": "exact",
+        "schema_assumed": false,
+        "file": "services/billing/internal/invoice.go",
+        "line": 16,
+        "service_key": "services/billing",
+        "service_name": "github.com/acme/billing"
+      }
+    ],
+    "precision": "cha",
+    "pruned_by_rta": 0,
+    "services": [
+      {
+        "key": "services/billing",
+        "name": "github.com/acme/billing",
+        "ops": [
+          "update"
+        ],
+        "direct": true,
+        "via": [],
+        "endpoints": [],
+        "entry_points": {},
+        "certainty": "exact"
+      }
+    ],
+    "through_apis": [],
+    "truncated": []
+  }
 }
