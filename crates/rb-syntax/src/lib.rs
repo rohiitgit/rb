@@ -413,8 +413,9 @@ pub struct FileFacts {
 /// name a binding initialises with a call, or the simple target of an assignment from a call
 /// (TypeScript, JavaScript, Java); a module object (a TS/JS default or namespace import of a
 /// package); or a configuration-surface name (`fetch`; Go's `DefaultTransport`,
-/// `DefaultClient`; Java's `RequestInterceptor`), also as a property, field or type name. Every
-/// token of such a name in the file is recorded, wherever it is.
+/// `DefaultClient`; Java's `RequestInterceptor`), also as a property, field or type name; or a
+/// TS/JS string literal naming `fetch` or the axios module ([`TokenRole::Literal`], amendment
+/// 17). Every token of such a name in the file is recorded, wherever it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameToken {
     pub name: String,
@@ -441,6 +442,11 @@ pub enum TokenRole {
     /// Anything else: an export, a Java member read or write, optional chaining, an argument,
     /// an assignment target, a parameter, a field, a `var` or another declaration.
     Other,
+    /// TS/JS: a string literal whose content is the token's name, `fetch`, `axios` or an
+    /// `axios/` subpath, wherever it is (an import or `require` source, `jest.spyOn(global,
+    /// "fetch")`, `globalThis["fetch"]`); never one naming an ambient module declaration
+    /// (contract M4a amendment 17).
+    Literal,
 }
 
 /// One import statement (or one spec of a Go import block).

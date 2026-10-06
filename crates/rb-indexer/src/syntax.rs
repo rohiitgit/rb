@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use rb_frameworks::clients::{RawScan, raw_scan};
 use rb_model::{
     Certainty, Diagnostic, EdgeKind, Evidence, FileEntry, GraphBuilder, NewEdge, NodeKey, NodeKind,
     Provenance,
@@ -69,6 +70,38 @@ pub(crate) fn parse_plan(files: &[FileEntry]) -> (Vec<(&FileEntry, Language)>, V
         plan.push((f, language));
     }
     (plan, diagnostics)
+}
+
+/// Bytes of a file without facts that the raw-text scan reads (contract M4a amendment 17): a
+/// larger file is not read and taints every kind it would be scanned for, so the cap can only
+/// over-taint.
+pub(crate) const RAW_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The raw-text scan ([`rb_frameworks::clients::raw_scan`]) of every file the plan does not
+/// parse — a language with no grammar, a generated file, one too large to parse — except
+/// binary blobs (a NUL byte in the first 8000, as Git decides); the blob is read as lossy
+/// UTF-8. Returns the merged findings and the number of files scanned.
+pub(crate) fn scan_unparsed(
+    files: &[FileEntry],
+    plan: &[(&FileEntry, Language)],
+    blob: &dyn Fn(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<(RawScan, usize)> {
+    let parsed: BTreeSet<&str> = plan.iter().map(|(f, _)| f.path.as_str()).collect();
+    let mut out = RawScan::default();
+    let mut scanned = 0;
+    for f in files
+        .iter()
+        .filter(|f| !f.binary && !parsed.contains(f.path.as_str()))
+    {
+        scanned += 1;
+        let found = if f.size > RAW_SCAN_BYTES {
+            raw_scan(&f.path, None)
+        } else {
+            raw_scan(&f.path, Some(&String::from_utf8_lossy(&blob(&f.blob_sha)?)))
+        };
+        out.merge(found);
+    }
+    Ok((out, scanned))
 }
 
 /// Parses every job, spreading work over `threads`. Output order equals input order.
@@ -230,6 +263,8 @@ fn object(v: serde_json::Value) -> rb_model::Attrs {
 
 #[cfg(test)]
 mod tests {
+    use rb_frameworks::clients::ClientKind;
+
     use super::*;
 
     fn entry(path: &str, size: u64) -> FileEntry {
@@ -269,6 +304,74 @@ mod tests {
         assert_eq!(diagnostics[0].kind, "extraction_skipped");
         assert_eq!(diagnostics[0].path.as_deref(), Some("huge.java"));
         assert_eq!(diagnostics[0].detail["reason"], "too_large");
+    }
+
+    /// Contract M4a amendment 17 (evaluator pass 7, W1, W2): every non-binary file the plan
+    /// does not parse (no grammar, generated, too large to parse) is scanned as text; parsed
+    /// and binary files are not; a file over the scan's byte cap is not read and taints every
+    /// kind it is scanned for, and discovery.
+    #[test]
+    fn files_without_facts_are_scanned_as_text() {
+        let file = |path: &str, size: u64| FileEntry {
+            blob_sha: path.into(),
+            ..entry(path, size)
+        };
+        let mut binary = file("img.png", 10);
+        binary.binary = true;
+        let mut generated = file("gen.go", 10);
+        generated.generated = true;
+        let mut files = vec![
+            file("a.ts", 10),
+            file("App.vue", 10),
+            binary,
+            file("big.ts", rb_syntax::MAX_PARSE_BYTES + 1),
+            generated,
+            file("x.py", 10),
+        ];
+        let blobs: HashMap<&str, &[u8]> = HashMap::from([
+            (
+                "a.ts",
+                &b"export const label = \"RequestInterceptor\";\n"[..],
+            ),
+            ("App.vue", b"<script>import axios from 'axios'</script>\n"),
+            ("img.png", b"\0RequestInterceptor fetch"),
+            ("big.ts", b"globalThis.fetch = f;\n"),
+            (
+                "gen.go",
+                b"package main\nfunc init() { http.DefaultTransport = nil }\n",
+            ),
+            ("x.py", b"RequestInterceptor = 1\n"),
+        ]);
+        let blob = |sha: &str| {
+            blobs
+                .get(sha)
+                .map(|b| b.to_vec())
+                .ok_or_else(|| anyhow::anyhow!("{sha} must not be read"))
+        };
+        let scan = |files: &[FileEntry]| {
+            let (plan, _) = parse_plan(files);
+            scan_unparsed(files, &plan, &blob).unwrap()
+        };
+        let (found, scanned) = scan(&files);
+        assert_eq!(
+            found.hooks,
+            BTreeSet::from([ClientKind::Fetch, ClientKind::Axios, ClientKind::GoHttp])
+        );
+        assert!(!found.discovery);
+        assert_eq!(scanned, 3);
+        files.push(file("vendor.js", RAW_SCAN_BYTES + 1));
+        let (found, scanned) = scan(&files);
+        assert_eq!(
+            found.hooks,
+            BTreeSet::from([
+                ClientKind::Fetch,
+                ClientKind::Axios,
+                ClientKind::Feign,
+                ClientKind::GoHttp
+            ])
+        );
+        assert!(found.discovery);
+        assert_eq!(scanned, 4);
     }
 
     #[test]

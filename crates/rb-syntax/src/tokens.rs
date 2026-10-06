@@ -6,7 +6,8 @@
 //! could break. Module objects and a few configuration-surface names are recorded too, so a pack
 //! can see a process-wide hook (`axios.defaults…`, `(globalThis as any).fetch = …`, Go's
 //! `http.DefaultTransport = …`, a Feign `RequestInterceptor`; contract M4a amendments 15 and
-//! 16). Beyond [`SURFACE_NAMES`], nothing here knows a framework.
+//! 16), and so are TS/JS string literals naming `fetch` or the axios module (amendment 17).
+//! Beyond [`SURFACE_NAMES`] and those literals, nothing here knows a framework.
 
 use std::collections::HashSet;
 
@@ -130,11 +131,40 @@ pub(crate) fn tokens(
                     span: span(node),
                 });
             }
+        } else if let Some(name) = module_literal(node, source) {
+            out.push(NameToken {
+                role: TokenRole::Literal,
+                name,
+                span: span(node),
+            });
         }
         let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
         stack.extend(children.into_iter().rev());
     }
     out
+}
+
+/// TS/JS: the content of a string or template literal, as written, that is exactly `fetch`,
+/// `axios` or starts with `axios/` (a subpath, also one with a substitution:
+/// `` import(`axios/${p}`) ``; contract M4a amendment 17), unless it names an ambient module
+/// declaration (`declare module "axios" { … }`, types only). Such a string may name the global
+/// (`jest.spyOn(global, "fetch")`, `globalThis["fetch"] = …`) or load the module
+/// (`require("axios")`, `import("axios")`, a re-export).
+///
+/// Only the TS/JS grammars name a string node `string` or `template_string` among the
+/// languages whose tokens are recorded (Java's is `string_literal`, Go's
+/// `interpreted_string_literal`/`raw_string_literal`; Python records none).
+fn module_literal(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if !matches!(node.kind(), "string" | "template_string") {
+        return None;
+    }
+    let quoted = text(node, source);
+    let content = quoted.get(1..quoted.len().checked_sub(1)?)?;
+    let named = content == "fetch" || content == "axios" || content.starts_with("axios/");
+    let ambient = node
+        .parent()
+        .is_some_and(|p| p.kind() == "module" && is_field(p, "name", node));
+    (named && !ambient).then(|| content.to_owned())
 }
 
 fn is_field(parent: Node<'_>, field: &str, node: Node<'_>) -> bool {
@@ -260,6 +290,7 @@ mod tests {
                     TokenRole::Receiver { call } => format!(".{call}"),
                     TokenRole::Member { name } => format!("~{name}"),
                     TokenRole::Other => "other".to_owned(),
+                    TokenRole::Literal => "literal".to_owned(),
                 };
                 format!("{}@{} {role}", t.name, t.span[0])
             })
@@ -281,6 +312,7 @@ mod tests {
             // `member` token.
             [
                 "axios@0 other",
+                "axios@0 literal",
                 "api@1 ~defaults",
                 "api@2 decl",
                 "axios@2 .create",
@@ -345,6 +377,7 @@ mod tests {
             tokens(Language::TypeScript, ts),
             [
                 "axios@0 other",
+                "axios@0 literal",
                 "ns@1 other",
                 "axios@4 ~defaults",
                 "axios@5 ~interceptors",
@@ -386,6 +419,34 @@ mod tests {
                 "RequestInterceptor@4 other",
                 "feign@5 other",
             ]
+        );
+    }
+
+    /// Contract M4a amendment 17 (evaluator pass 7, W3, W6): a TS/JS string or template
+    /// literal that is exactly `fetch` or `axios`, or starts with `axios/`, is a `literal`
+    /// token wherever it is; one naming an ambient module declaration is not, nor is any other
+    /// string.
+    #[test]
+    fn string_literals_naming_module_clients() {
+        let ts = "import axios = require(\"axios\");\nconst ax = require(\"axios\").default;\nimport(`axios/${p}`);\nexport { default as a } from 'axios';\njest.spyOn(global, \"fetch\");\nvi.stubGlobal(`fetch`, f);\n(globalThis as any)[\"fetch\"] = w;\ndeclare module \"axios\" { interface C { retry?: number } }\nconst o = [\"fetching\", \"axiosx\", `${p}fetch`, \"node-fetch\", \"Axios\"];\n";
+        assert_eq!(
+            tokens(Language::TypeScript, ts),
+            [
+                "axios@0 literal",
+                "axios@1 literal",
+                "axios/${p}@2 literal",
+                "axios@3 literal",
+                "fetch@4 literal",
+                "fetch@5 literal",
+                "fetch@6 literal",
+            ]
+        );
+        assert!(
+            tokens(
+                Language::Java,
+                "package p;\nclass C { String s = \"fetch\"; }\n"
+            )
+            .is_empty()
         );
     }
 }

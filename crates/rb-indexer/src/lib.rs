@@ -58,8 +58,11 @@ use serde_json::{Value, json};
 /// `spring.config.activate.*` document is conditional), `m4a-http-9` evaluator pass 5's (M4a
 /// amendment 15: every carrier gated, whatever the URL's source; global hooks cap bare module
 /// clients), `m4a-http-10` evaluator pass 6's (M4a amendment 16: carriers plain only by
-/// allow-listed token roles; a hook caps every site of its client kind, Feign included).
-pub const PIPELINE: &str = "m4a-http-10";
+/// allow-listed token roles; a hook caps every site of its client kind, Feign included),
+/// `m4a-http-11` evaluator pass 7's (M4a amendment 17: files without token facts scanned as
+/// text, string literals naming `fetch` or axios, discovery configuration caps host-by-name
+/// `synthetic`).
+pub const PIPELINE: &str = "m4a-http-11";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -73,6 +76,8 @@ pub struct Indexed {
     pub diagnostics: Vec<Diagnostic>,
     /// Blobs parsed in this run (cache misses); 0 on a fully warm cache.
     pub parsed: usize,
+    /// Files without facts scanned as text (contract M4a amendment 17).
+    pub scanned: usize,
     /// The SCIP jobs of the commit, in job order, with their decoded indexes dropped.
     pub scip: Vec<ScipProject>,
 }
@@ -109,6 +114,9 @@ pub fn index_commit(
 
     let (plan, skipped) = syntax::parse_plan(&manifest.files);
     diagnostics.extend(skipped);
+    // Files with no facts are scanned as text for hooks and discovery (amendment 17).
+    let (unparsed, scanned) =
+        syntax::scan_unparsed(&manifest.files, &plan, &|blob: &str| repo.blob(blob))?;
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let (facts, parsed) =
         syntax::load_or_parse(&|blob: &str| repo.blob(blob), &plan, cache, threads)?;
@@ -171,6 +179,7 @@ pub fn index_commit(
         go_modules,
         scip: scip_projects,
         config,
+        unparsed,
     };
 
     let (graph, assembly_diagnostics) =
@@ -186,6 +195,7 @@ pub fn index_commit(
         graph,
         diagnostics,
         parsed,
+        scanned,
         scip,
     })
 }
@@ -239,6 +249,8 @@ pub struct Content<'a> {
     /// Spring configuration read by path ([`is_config_input`]; contract M4a D5, evaluator
     /// pass 1, P7).
     pub config: BTreeMap<&'a str, String>,
+    /// What the raw-text scan of the files without facts found (contract M4a amendment 17).
+    pub unparsed: rb_frameworks::clients::RawScan,
 }
 
 /// What a configuration input is to the endpoint and stitching stages.
@@ -734,6 +746,7 @@ pub fn assemble(
         properties: &spring.properties,
         overrides: &spring.overrides,
         feign_configured: feign_configured(&content.config),
+        unparsed: &content.unparsed,
     });
     let services: Vec<stitch::ServiceRef> = boundaries
         .projects()
@@ -919,6 +932,8 @@ fn object(v: Value) -> Attrs {
 
 #[cfg(test)]
 mod tests {
+    use rb_frameworks::clients::RawScan;
+
     use super::*;
 
     fn entry(path: &str) -> FileEntry {
@@ -1013,6 +1028,84 @@ mod tests {
         assert_eq!(e.evidence[0].path, "CODEOWNERS");
         assert_eq!(e.evidence[0].span, [1, 0, 1, 29]);
         assert_eq!(e.attrs["pattern"], "/api/src/");
+    }
+
+    /// Contract M4a amendment 17: what the raw-text scan found ([`Content::unparsed`]) reaches
+    /// the stitcher: a hooked kind is capped (`base: unverified`), discovery caps a
+    /// host-by-name match (`discovery: configured`).
+    #[test]
+    fn the_raw_scan_reaches_the_stitcher() {
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: vec![
+                entry("orders/package.json"),
+                entry("orders/src/app.ts"),
+                entry("web/package.json"),
+                entry("web/src/t.ts"),
+            ],
+            skipped: vec![],
+        };
+        let boundaries = Boundaries::new(
+            vec![
+                project("orders", "orders/package.json"),
+                project("web", "web/package.json"),
+            ],
+            vec![],
+        );
+        let app = rb_syntax::extract(
+            rb_syntax::Language::TypeScript,
+            b"import express from \"express\";\nconst app = express();\napp.get(\"/orders/:id\", (req, res) => res.json({}));\n",
+        )
+        .unwrap();
+        let t = rb_syntax::extract(
+            rb_syntax::Language::TypeScript,
+            b"export function f() { return fetch(\"http://orders/orders/1\"); }\n",
+        )
+        .unwrap();
+        let consumes = |unparsed: RawScan| {
+            let content = Content {
+                facts: BTreeMap::from([
+                    ("orders/src/app.ts", (rb_syntax::Language::TypeScript, &app)),
+                    ("web/src/t.ts", (rb_syntax::Language::TypeScript, &t)),
+                ]),
+                unparsed,
+                ..Content::default()
+            };
+            let g = assemble(&manifest, None, &boundaries, &content).unwrap().0;
+            g.edges()
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Consumes)
+                .map(|e| {
+                    format!(
+                        "{} base={} discovery={}",
+                        e.certainty.as_str(),
+                        e.attrs["base"].as_str().unwrap_or("?"),
+                        e.attrs
+                            .get("discovery")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("-")
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            consumes(RawScan::default()),
+            ["synthetic base=literal discovery=-"]
+        );
+        assert_eq!(
+            consumes(RawScan {
+                hooks: BTreeSet::from([rb_frameworks::clients::ClientKind::Fetch]),
+                discovery: false,
+            }),
+            ["heuristic base=unverified discovery=-"]
+        );
+        assert_eq!(
+            consumes(RawScan {
+                hooks: BTreeSet::new(),
+                discovery: true,
+            }),
+            ["heuristic base=literal discovery=configured"]
+        );
     }
 
     #[test]

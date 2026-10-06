@@ -531,6 +531,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         graph,
         diagnostics,
         parsed,
+        scanned,
         scip: jobs,
     } = if no_cache {
         rb_indexer::index_commit(
@@ -558,7 +559,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         &LoadDir::new(load_dir),
     )?;
     println!(
-        "{repo}: snapshot {} live @ {} — {} nodes, {} edges, {} diagnostics; AGE graph {}; parsed {parsed} source files",
+        "{repo}: snapshot {} live @ {} — {} nodes, {} edges, {} diagnostics; AGE graph {}; parsed {parsed} source files; scanned {scanned} other files as text",
         snap.id,
         short(&snap.commit_sha),
         graph.nodes().len(),

@@ -7,7 +7,7 @@
 //! name (contract invariant 6).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rb_syntax::{
     Arg, Binding, CallChain, Decoration, DefKind, FileFacts, Init, Language, Span, StrTemplate,
@@ -220,6 +220,8 @@ impl<'f> Gate<'f> {
             match &t.role {
                 TokenRole::Declaration => declarations += 1,
                 TokenRole::Receiver { call } => calls.push(call.as_str()),
+                // A string names no binding (amendment 17).
+                TokenRole::Literal => {}
                 TokenRole::Callee | TokenRole::Member { .. } | TokenRole::Other => return None,
             }
         }
@@ -306,13 +308,18 @@ pub fn global_hooks(language: Language, facts: &FileFacts) -> Vec<ClientKind> {
                 out.push(ClientKind::Fetch);
             }
             let (names, requires) = module_names(facts, "axios", &["default"], true);
-            if any_token(&|t| {
-                names.contains(&t.name)
-                    && !match &t.role {
-                        TokenRole::Callee => true,
-                        TokenRole::Receiver { call } => AXIOS_MODULE_CALLS.contains(&call.as_str()),
-                        _ => declared(&["axios"], &requires, t),
-                    }
+            if any_token(&|t| match &t.role {
+                // The module named outside its import or `require` declarations (amendment
+                // 17): `import x = require(…)`, `require(…).default`, a destructured or bare
+                // `require`, `import(…)`, a re-export, `jest.mock(…)`.
+                TokenRole::Literal => {
+                    is_module(&t.name, "axios") && !declared(&["axios"], &requires, t)
+                }
+                TokenRole::Callee => false,
+                TokenRole::Receiver { call } => {
+                    names.contains(&t.name) && !AXIOS_MODULE_CALLS.contains(&call.as_str())
+                }
+                _ => names.contains(&t.name) && !declared(&["axios"], &requires, t),
             }) {
                 out.push(ClientKind::Axios);
             }
@@ -432,6 +439,197 @@ pub fn feign_config_key(key: &str) -> bool {
     ]
     .iter()
     .any(|p| dotted_under(key, p))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Files without token facts: a raw-text scan (contract M4a amendment 17)
+
+/// What the raw-text scan of the repository's files without token facts found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawScan {
+    /// The client kinds some such file may reconfigure: every site of them is capped.
+    pub hooks: BTreeSet<ClientKind>,
+    /// Some such file configures service discovery or load balancing, which may bind a
+    /// service name to any host: no host-by-name stitch (F1) is `synthetic`.
+    pub discovery: bool,
+}
+
+impl RawScan {
+    pub fn merge(&mut self, other: RawScan) {
+        self.hooks.extend(other.hooks);
+        self.discovery |= other.discovery;
+    }
+}
+
+/// The names whose appearance as a whole word in a file without token facts taints a client
+/// kind: the TS/JS module clients' names, Feign's extension points (as in
+/// [`rb_syntax::surface_names`]) and a qualified `feign.` use; Go's process-wide clients, in Go
+/// files only ([`raw_scan`]).
+const RAW_SURFACE: &[(ClientKind, &[&str])] = &[
+    (ClientKind::Fetch, &["fetch"]),
+    (ClientKind::Axios, &["axios"]),
+    (
+        ClientKind::Feign,
+        &[
+            "RequestInterceptor",
+            "Capability",
+            "FeignBuilderCustomizer",
+            "Targeter",
+            "Feign",
+            "feign.",
+        ],
+    ),
+    (ClientKind::GoHttp, &["DefaultTransport", "DefaultClient"]),
+];
+
+/// Configuration keys under which service discovery or a load balancer may bind a service
+/// name to any instance list (contract M4a amendment 17, W4). Eureka's own keys are not here:
+/// Eureka resolves a name to the instances registered under it, which is F1's convention.
+const DISCOVERY_PREFIXES: &[&str] = &[
+    "spring.cloud.discovery",
+    "spring.cloud.loadbalancer",
+    "spring.cloud.kubernetes.discovery",
+    "spring.cloud.consul.discovery",
+];
+
+/// Whole words that configure discovery or load balancing in any file without token facts,
+/// matched in lower case with `_` read as `.` (so an environment variable such as
+/// `SPRING_CLOUD_DISCOVERY_CLIENT_SIMPLE_INSTANCES_ORDERS_0_URI` counts): the
+/// [`DISCOVERY_PREFIXES`] written out, Ribbon's keys (`<service>.ribbon.listOfServers`), and
+/// Spring Cloud LoadBalancer's and Ribbon's configuration types.
+const DISCOVERY_WORDS: &[&str] = &[
+    "spring.cloud.discovery",
+    "spring.cloud.loadbalancer",
+    "spring.cloud.kubernetes.discovery",
+    "spring.cloud.consul.discovery",
+    "ribbon",
+    "listofservers",
+    "loadbalancerclient",
+    "loadbalancerclients",
+    "serviceinstancelistsupplier",
+    "ribbonclient",
+    "ribbonclients",
+];
+
+/// A configuration key under one of the [`DISCOVERY_PREFIXES`]: the parsed keys catch a
+/// prefix written as nested YAML; Ribbon's keys and static instance lists are whole words of
+/// the text ([`DISCOVERY_WORDS`]) in any spelling.
+fn discovery_key(key: &str) -> bool {
+    DISCOVERY_PREFIXES.iter().any(|p| dotted_under(key, p))
+}
+
+/// A Java package whose use (an import, a fully qualified annotation) configures
+/// discovery or load balancing: Spring Cloud LoadBalancer (`@LoadBalancerClient`,
+/// `ServiceInstanceListSupplier`) and Ribbon (`@RibbonClient`), subpackages included
+/// (contract M4a amendment 17, W4).
+pub fn discovery_package(package: &str) -> bool {
+    [
+        "org.springframework.cloud.loadbalancer",
+        "org.springframework.cloud.netflix.ribbon",
+    ]
+    .iter()
+    .any(|p| dotted_under(package, p))
+}
+
+/// Text no runtime executes or reads as configuration: prose and npm lock files (which only
+/// record what the `package.json` files declare).
+fn inert(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("md" | "markdown" | "txt" | "rst" | "adoc")
+    ) || matches!(
+        name,
+        "package-lock.json" | "npm-shrinkwrap.json" | "yarn.lock" | "pnpm-lock.yaml"
+    )
+}
+
+/// The `package.json` fields whose entries name registry packages.
+const DEPENDENCY_FIELDS: &[&str] = &[
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+];
+
+/// The text of a file the scan reads: a `package.json` without its plain dependency entries
+/// (a registry version range, no `:` or `/`: not an alias, a path, a URL, a workspace or a
+/// GitHub package, which may stand in for the module), an `.xml` file without its comments.
+fn scanned_text(path: &str, text: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name == "package.json"
+        && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text)
+    {
+        for field in DEPENDENCY_FIELDS {
+            if let Some(deps) = json.get_mut(*field).and_then(|d| d.as_object_mut()) {
+                deps.retain(|_, v| !v.as_str().is_some_and(|v| !v.contains([':', '/'])));
+            }
+        }
+        return json.to_string();
+    }
+    if name.to_ascii_lowercase().ends_with(".xml") {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find("<!--") {
+            out.push_str(&rest[..start]);
+            let comment = &rest[start + 4..];
+            rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
+        }
+        out.push_str(rest);
+        return out;
+    }
+    text.to_owned()
+}
+
+/// Whether `word` appears in `text` with no identifier character (`[A-Za-z0-9_]`) right
+/// before it or, when it ends with one, right after it.
+fn has_word(text: &str, word: &str) -> bool {
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let bytes = text.as_bytes();
+    let tail = word.as_bytes().last().is_some_and(|&c| ident(c));
+    text.match_indices(word).any(|(i, _)| {
+        let end = i + word.len();
+        (i == 0 || !ident(bytes[i - 1])) && (!tail || end == bytes.len() || !ident(bytes[end]))
+    })
+}
+
+/// The raw-text scan of one file without token facts (contract M4a amendment 17, evaluator
+/// pass 7, W1, W2, W4): a language M4a does not parse (Kotlin, Groovy, Scala, Vue, Svelte,
+/// HTML, …), a generated file, one too large to parse, or any other text. Each name of
+/// [`RAW_SURFACE`] found as a whole word taints its kind as a disallowed token would (Go's
+/// names only in a `.go` file); [`DISCOVERY_WORDS`], or a discovery key of a settings file
+/// (nested YAML too), sets `discovery`. `text` is `None` for a file over the caller's byte cap:
+/// it taints every kind it would be scanned for, and discovery, so the cap can only
+/// over-taint. Inert text ([`inert`]) is not scanned.
+pub fn raw_scan(path: &str, text: Option<&str>) -> RawScan {
+    let mut out = RawScan::default();
+    if inert(path) {
+        return out;
+    }
+    let go = path.to_ascii_lowercase().ends_with(".go");
+    let kinds = RAW_SURFACE
+        .iter()
+        .filter(|(kind, _)| go || *kind != ClientKind::GoHttp);
+    let Some(text) = text else {
+        out.hooks = kinds.map(|(kind, _)| *kind).collect();
+        out.discovery = true;
+        return out;
+    };
+    let text = scanned_text(path, text);
+    out.hooks = kinds
+        .filter(|(_, names)| names.iter().any(|n| has_word(&text, n)))
+        .map(|(kind, _)| *kind)
+        .collect();
+    let keys = match path.rsplit_once('.').map(|(_, e)| e) {
+        Some("properties") => crate::fold::parse_properties(&text),
+        Some("yml" | "yaml") => crate::fold::yaml_entries(&text),
+        _ => Default::default(),
+    };
+    let normalised = text.to_ascii_lowercase().replace('_', ".");
+    out.discovery = DISCOVERY_WORDS.iter().any(|w| has_word(&normalised, w))
+        || keys.keys().any(|k| discovery_key(k));
+    out
 }
 
 fn entry<'a>(arg: Option<&'a Arg>, key: &str) -> Option<&'a Arg> {
@@ -2091,6 +2289,13 @@ mod tests {
                 "axios GET '/orders/1' base='http://orders'",
             ]
         );
+        // The module's name in its import is a string, no token of an instance named after it
+        // (amendment 17).
+        let named = "import Axios from \"axios\";\nconst axios = Axios.create({ baseURL: \"http://orders\" });\nexport function g() { return axios.get(\"/orders/1\"); }\n";
+        assert_eq!(
+            calls(Language::TypeScript, named),
+            ["axios GET '/orders/1' base='http://orders'"]
+        );
     }
 
     /// Contract M4a amendment 14, Gate A for Spring (evaluator passes 3 and 4): a field is
@@ -2307,6 +2512,13 @@ mod tests {
             "import fetch from \"node-fetch\";\nfetch(\"/a\");\n",
             "const fetch = require(\"cross-fetch\");\nfetch(\"/a\");\n",
             "export function f() {\n  const axios = require(\"axios\");\n  return axios.get(\"/a\");\n}\n",
+            // Contract M4a amendment 17: the module named by an import (type-only too) or an
+            // ambient module declaration (types only) is no hook.
+            "import type { AxiosInstance } from \"axios\";\nimport { AxiosError } from \"axios\";\ndeclare module \"axios\" {\n  interface AxiosRequestConfig { retry?: number }\n}\n",
+            "const label = \"fetching\";\nconst m = \"axiosx\";\n",
+            // A subpath's `require` or import binding is the module's declaration (W5).
+            "const ax = require(\"axios/dist/node/axios.cjs\");\nax.get(\"/a\");\n",
+            "import ax from \"axios/dist/node/axios.cjs\";\nax.get(\"/a\");\n",
         ] {
             assert!(hooks(Language::TypeScript, clean).is_empty(), "{clean}");
         }
@@ -2371,6 +2583,50 @@ mod tests {
                 "export function setup() {\n  const axios = require(\"axios\");\n  axios.interceptors.request.use((c) => c);\n}\n",
                 ClientKind::Axios,
             ),
+            // Evaluator pass 7, W5: a `require` of a subpath is the module.
+            (
+                "const ax = require(\"axios/dist/node/axios.cjs\");\nax.defaults.adapter = a;\n",
+                ClientKind::Axios,
+            ),
+            // Evaluator pass 7, W3: module objects reached through a form that is no recognised
+            // binding (import-equals, a member or a destructuring after `require`, a dynamic
+            // import, a re-export) name the module in a string outside an import or `require`
+            // declaration: any of them caps every axios site.
+            (
+                "import axios = require(\"axios\");\naxios.defaults.adapter = a;\n",
+                ClientKind::Axios,
+            ),
+            (
+                "const ax = require(\"axios\").default;\nax.defaults.adapter = a;\n",
+                ClientKind::Axios,
+            ),
+            (
+                "const { default: ax } = require(\"axios\");\nax.defaults.adapter = a;\n",
+                ClientKind::Axios,
+            ),
+            (
+                "import(\"axios\").then((m) => { m.default.defaults.adapter = a; });\n",
+                ClientKind::Axios,
+            ),
+            (
+                "export { default as ax } from \"axios\";\n",
+                ClientKind::Axios,
+            ),
+            (
+                "jest.mock(\"axios/lib/adapters/http\");\n",
+                ClientKind::Axios,
+            ),
+            // Evaluator pass 7, W6: `fetch` named by a string (a spy, a stub, a subscript).
+            (
+                "jest.spyOn(global, \"fetch\").mockImplementation(f);\n",
+                ClientKind::Fetch,
+            ),
+            ("vi.stubGlobal(\"fetch\", vi.fn());\n", ClientKind::Fetch),
+            (
+                "(globalThis as any)[\"fetch\"] = wrapped;\n",
+                ClientKind::Fetch,
+            ),
+            ("globalThis[`fetch`] = wrapped;\n", ClientKind::Fetch),
         ] {
             assert_eq!(hooks(Language::TypeScript, src), [kind], "{src}");
         }
@@ -2450,6 +2706,163 @@ mod tests {
         ] {
             assert_eq!(hooks(Language::Java, &src), [ClientKind::Feign], "{src}");
         }
+    }
+
+    /// Contract M4a amendment 17 (evaluator pass 7, W1, W2, W4): the raw-text scan of a file
+    /// without token facts. A surface name as a whole word taints its kind (Go's only in a
+    /// `.go` file); prose, npm lock files, plain dependency entries of a `package.json` and XML
+    /// comments are inert; a file over the byte cap taints every kind it is scanned for, and
+    /// discovery. Discovery: the listed keys in a settings file (nested YAML too) or as text,
+    /// Spring Cloud LoadBalancer and Ribbon names; Eureka's own keys are not.
+    #[test]
+    fn raw_text_hooks_and_discovery_keys() {
+        use ClientKind::{Axios, Feign, Fetch, GoHttp};
+        let hooks = |path: &str, text: &str| -> Vec<ClientKind> {
+            raw_scan(path, Some(text)).hooks.into_iter().collect()
+        };
+        for (path, text, want) in [
+            ("w/src/App.vue", "axios.defaults.adapter = a;", vec![Axios]),
+            ("w/public/index.html", "window.fetch = f;", vec![Fetch]),
+            ("w/src/App.svelte", "$fetch(u)", vec![Fetch]),
+            ("p/G.kt", "import feign.RequestInterceptor", vec![Feign]),
+            ("p/G.groovy", "@Bean Feign.Builder b()", vec![Feign]),
+            ("p/G.scala", "new Capability {}", vec![Feign]),
+            ("p/G.kt", "fun t(): Targeter = x", vec![Feign]),
+            ("p/G.kt", "fun c(): FeignBuilderCustomizer = x", vec![Feign]),
+            ("p/a.properties", "feign.okhttp.enabled=true", vec![Feign]),
+            ("g/zz.go", "http.DefaultTransport = nil", vec![GoHttp]),
+            ("g/zz.go", "c := http.DefaultClient", vec![GoHttp]),
+            // Whole words only; Go's names only in Go files.
+            ("p/G.kt", "class Capabilityx; val prefetch = 1", vec![]),
+            ("p/a.yml", "batch_fetch_size: 3\nopenfeign: x\n", vec![]),
+            ("p/G.kt", "val c = DefaultClient", vec![]),
+            // Inert text.
+            (
+                "README.md",
+                "axios.defaults; fetch; RequestInterceptor",
+                vec![],
+            ),
+            ("docs/a.txt", "fetch", vec![]),
+            ("w/package-lock.json", "\"node_modules/axios\"", vec![]),
+            ("w/yarn.lock", "axios@^1.7.7:", vec![]),
+            (
+                "w/package.json",
+                "{ \"dependencies\": { \"axios\": \"^1.7.7\", \"x\": \"1.0.0 - 2.x || >=3\" }, \"peerDependencies\": { \"node-fetch\": \"*\" } }",
+                vec![],
+            ),
+            ("p/pom.xml", "<p><!-- fetch; feign.Client --></p>", vec![]),
+            // Not inert: an alias, another field, an XML element, an MDX page.
+            (
+                "w/package.json",
+                "{ \"dependencies\": { \"axios\": \"npm:fake-axios@1\" } }",
+                vec![Axios],
+            ),
+            (
+                "w/package.json",
+                "{ \"jest\": { \"moduleNameMapper\": { \"^axios$\": \"<rootDir>/m.js\" } } }",
+                vec![Axios],
+            ),
+            // Not JSON: scanned as text.
+            (
+                "w/package.json",
+                "{ \"dependencies\": { \"axios\": \"^1\" }",
+                vec![Axios],
+            ),
+            (
+                "p/beans.xml",
+                "<bean class=\"feign.Client.Default\"/>",
+                vec![Feign],
+            ),
+            (
+                "w/page.mdx",
+                "export const x = (window.fetch = f);",
+                vec![Fetch],
+            ),
+        ] {
+            let want: Vec<ClientKind> = want;
+            assert_eq!(hooks(path, text), want, "{path}: {text}");
+        }
+        let over = raw_scan("w/vendor.js", None);
+        assert_eq!(
+            over.hooks.into_iter().collect::<Vec<_>>(),
+            [Fetch, Axios, Feign]
+        );
+        assert!(over.discovery);
+        assert_eq!(
+            raw_scan("g/big.go", None)
+                .hooks
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [Fetch, Axios, Feign, GoHttp]
+        );
+        for (path, text) in [
+            (
+                "p/application.yml",
+                "spring:\n  cloud:\n    discovery:\n      client:\n        simple:\n          instances:\n            orders:\n              - uri: https://api.stripe.com\n",
+            ),
+            (
+                "p/application.properties",
+                "orders.ribbon.listOfServers=api.stripe.com:443\n",
+            ),
+            (
+                "p/application.yml",
+                "orders:\n  ribbon:\n    NIWSServerListClassName: x\n",
+            ),
+            (
+                "p/a.properties",
+                "spring.cloud.loadbalancer.cache.enabled=false\n",
+            ),
+            (
+                "p/a.yaml",
+                "spring.cloud.kubernetes.discovery.all-namespaces: true\n",
+            ),
+            (
+                "p/a.yaml",
+                "spring:\n  cloud:\n    consul:\n      discovery:\n        instance-id: x\n",
+            ),
+            (
+                "p/Lb.kt",
+                "@LoadBalancerClient(name = \"orders\", configuration = [X::class])",
+            ),
+            ("p/Lb.groovy", "ServiceInstanceListSupplier s() { x }"),
+            ("p/Rb.kt", "@RibbonClient(name = \"orders\")"),
+            ("p/x.json", "{ \"listOfServers\": \"a:1\" }"),
+            (
+                "deploy/docker-compose.yml",
+                "services:\n  pay:\n    environment:\n      - SPRING_CLOUD_DISCOVERY_CLIENT_SIMPLE_INSTANCES_ORDERS_0_URI=https://api.stripe.com\n",
+            ),
+            (
+                "deploy/pay.env",
+                "ORDERS_RIBBON_LISTOFSERVERS=api.stripe.com:443\n",
+            ),
+        ] {
+            assert!(raw_scan(path, Some(text)).discovery, "{path}: {text}");
+        }
+        for (path, text) in [
+            (
+                "p/application.yml",
+                "eureka:\n  client:\n    serviceUrl:\n      defaultZone: http://registry:8761/eureka/\n",
+            ),
+            ("p/a.properties", "spring.application.name=orders\n"),
+            (
+                "README.md",
+                "spring.cloud.discovery.client.simple.instances",
+            ),
+        ] {
+            assert!(!raw_scan(path, Some(text)).discovery, "{path}: {text}");
+        }
+        assert!(discovery_package(
+            "org.springframework.cloud.loadbalancer.annotation"
+        ));
+        assert!(discovery_package(
+            "org.springframework.cloud.netflix.ribbon"
+        ));
+        assert!(!discovery_package(
+            "org.springframework.cloud.client.loadbalancer"
+        ));
+        assert!(!discovery_package(
+            "org.springframework.cloud.loadbalancerx"
+        ));
     }
 
     /// Contract M4a amendment 16: Feign client configuration keys in any configuration file.

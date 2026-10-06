@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use rb_frameworks::clients::{AxiosInstance, ClientKind, FileClients, UrlValue};
+use rb_frameworks::clients::{AxiosInstance, ClientKind, FileClients, RawScan, UrlValue};
 use rb_frameworks::endpoint::{
     ANY, PathMatch, Piece, Segment, client_url, literal_segments, match_path, methods_match,
     segments,
@@ -111,6 +111,10 @@ pub(crate) struct Site {
     /// `synthetic`, and its edge says `base: unverified`. Otherwise `Some(true)` for a verified
     /// base read from the carrier's construction, `None` for a plain carrier with no such base.
     pub base_verified: Option<bool>,
+    /// The repository configures service discovery or a load balancer, which may bind the
+    /// service a host names to any instance: a host-by-name match (F1) is never `synthetic`,
+    /// and its edge says `discovery: configured` (contract M4a amendment 17, W4).
+    pub discovery: bool,
 }
 
 /// A service as the host rule (D6) sees it.
@@ -180,6 +184,8 @@ pub(crate) struct Inputs<'a, 'i> {
     /// Some configuration file of the repository sets a Feign client key
     /// ([`rb_frameworks::clients::feign_config_key`]; contract M4a amendment 16).
     pub feign_configured: bool,
+    /// What the raw-text scan of the files without facts found (contract M4a amendment 17).
+    pub unparsed: &'i RawScan,
 }
 
 /// One file's top-level non-member bindings (`None`) and type members (`Some(type)`) by name.
@@ -307,6 +313,25 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
     if inputs.feign_configured {
         hooked.insert(ClientKind::Feign);
     }
+    // A file without facts may hook a kind too, or configure discovery (amendment 17), as may
+    // Java code naming Spring Cloud LoadBalancer or Ribbon by an import or a fully qualified
+    // annotation.
+    hooked.extend(inputs.unparsed.hooks.iter().copied());
+    let discovery_package = rb_frameworks::clients::discovery_package;
+    let discovery = inputs.unparsed.discovery
+        || inputs.files.values().any(|(language, facts)| {
+            *language == Language::Java
+                && (facts.imports.iter().any(|i| discovery_package(&i.module))
+                    || facts
+                        .definitions
+                        .iter()
+                        .flat_map(|d| &d.decorations)
+                        .any(|d| {
+                            d.name
+                                .rsplit_once('.')
+                                .is_some_and(|(q, _)| discovery_package(q))
+                        }))
+        });
     let mut out = Vec::new();
     for (&path, file_clients) in &clients {
         let file = folding.ids[path];
@@ -361,6 +386,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 config_overridden: folding.take_asked(),
                 base_from_bean: call.base_from_bean,
                 base_verified,
+                discovery,
             });
         }
     }
@@ -647,6 +673,11 @@ impl<'e> Stitcher<'e> {
             };
             attrs.insert(key.into(), host.as_str().into());
         }
+        // A host naming a service may be bound to other instances by discovery (W4).
+        let rebound = site.discovery && !matches!(scope, Scope::Any);
+        if rebound {
+            attrs.insert("discovery".into(), "configured".into());
+        }
         if n > 1 {
             attrs.insert("candidates".into(), n.into());
             return Outcome {
@@ -676,6 +707,7 @@ impl<'e> Stitcher<'e> {
             && !site.config_overridden
             && !site.base_from_bean
             && !unverified
+            && !rebound
             && !e.prefix_unknown
             && !e.prefix_maybe_incomplete;
         let certainty = if synthetic {
@@ -939,6 +971,7 @@ mod tests {
             config_overridden: false,
             base_from_bean: false,
             base_verified: None,
+            discovery: false,
         }
     }
 
@@ -1028,6 +1061,29 @@ mod tests {
             ),
             &eps,
         );
+        // Discovery configured in the repository (amendment 17, W4): the host-by-name match
+        // says so, its base stays `literal`.
+        let rebound = lowered(
+            Site {
+                discovery: true,
+                ..feign.clone()
+            },
+            &eps,
+        );
+        assert!(
+            rebound.contains("\"base\":\"literal\"")
+                && rebound.contains("\"discovery\":\"configured\""),
+            "{rebound}"
+        );
+        // Without a host, discovery changes nothing.
+        let path_only = one(
+            &eps,
+            &Site {
+                discovery: true,
+                ..site(WEB, Some("POST"), Some(("/api/v1/login", Literal)), 1)
+            },
+        );
+        assert!(!path_only.1[0].contains("discovery"), "{path_only:?}");
         // No host: the path alone.
         let web = lowered(
             site(WEB, Some("POST"), Some(("/api/v1/login", Literal)), 1),
@@ -2081,6 +2137,23 @@ mod tests {
         properties: &[(&str, &str, &str)],
         overrides: &[(&str, &str)],
     ) -> Vec<Site> {
+        collect_sites_with(
+            files,
+            go_modules,
+            properties,
+            overrides,
+            &RawScan::default(),
+        )
+    }
+
+    /// [`collect_sites`] with what the raw-text scan found in the files without facts.
+    fn collect_sites_with(
+        files: &[(&str, Language, &str)],
+        go_modules: &[(&str, &str)],
+        properties: &[(&str, &str, &str)],
+        overrides: &[(&str, &str)],
+        unparsed: &RawScan,
+    ) -> Vec<Site> {
         let facts: Vec<(&str, Language, FileFacts)> = files
             .iter()
             .map(|(p, l, src)| (*p, *l, rb_syntax::extract(*l, src.as_bytes()).unwrap()))
@@ -2126,6 +2199,7 @@ mod tests {
             feign_configured: properties
                 .iter()
                 .any(|(_, k, _)| rb_frameworks::clients::feign_config_key(k)),
+            unparsed,
         };
         sites(&inputs)
     }
@@ -2317,7 +2391,18 @@ mod tests {
         eps: &[EndpointRef],
         services: &[&str],
     ) -> Vec<String> {
-        let sites = collect_sites(files, &[], properties, &[]);
+        stitched_bases_raw(files, properties, &RawScan::default(), eps, services)
+    }
+
+    /// [`stitched_bases_with`] with what the raw-text scan found in the files without facts.
+    fn stitched_bases_raw(
+        files: &[(&str, Language, &str)],
+        properties: &[(&str, &str, &str)],
+        unparsed: &RawScan,
+        eps: &[EndpointRef],
+        services: &[&str],
+    ) -> Vec<String> {
+        let sites = collect_sites_with(files, &[], properties, &[], unparsed);
         let services: Vec<ServiceRef> = services
             .iter()
             .map(|s| ServiceRef {
@@ -2767,6 +2852,175 @@ mod tests {
                 [format!("pay/cmd/main.go 3 {verdict}")]
             );
         }
+    }
+
+    /// Contract M4a amendment 17 (evaluator pass 7, W1, W2, W4), from source: a hook in a file
+    /// without token facts — a Kotlin or Groovy `RequestInterceptor` bean, a Vue component's
+    /// `axios.defaults…`, an HTML page's `window.fetch = …`, a generated Go or TS file, a file
+    /// over the scan's byte cap — caps its client kind through the raw-text scan, prose and
+    /// plain dependency entries do not; a service-discovery key caps every host-by-name
+    /// `synthetic` stitch, URL-less Feign included, with a plain carrier (`base` unchanged).
+    #[test]
+    fn unparsed_files_and_discovery_cap_carriers() {
+        let eps = vec![ep("GET", "/orders/{id}", "orders")];
+        let services = ["web", "pay", "orders", "gocli"];
+        let to = "HTTP GET /orders/{} @orders";
+        let unverified = format!("heuristic -> {to} [heuristic] base=unverified match=exact");
+        let synthetic = format!("synthetic -> {to} [synthetic] base=literal match=exact");
+        let discovered = format!("heuristic -> {to} [heuristic] base=literal match=exact");
+        let t = "import axios from \"axios\";\nconst t00 = axios.create({ baseURL: \"http://orders\" });\nexport function f() { return t00.get(\"/orders/1\"); }\nexport function bare() {\n  fetch(\"http://orders/orders/1\");\n  axios.get(\"http://orders/orders/1\");\n}\n";
+        // A Feign client with no `url`: the service name is its host (F1).
+        let feign = "package p;\nimport org.springframework.cloud.openfeign.FeignClient;\nimport org.springframework.web.bind.annotation.GetMapping;\n@FeignClient(name = \"orders\")\npublic interface OrdersFeign {\n  @GetMapping(\"/orders/1\")\n  String one();\n}\n";
+        let go = "package main\nimport \"net/http\"\nfunc bare() {\n\thttp.Get(\"http://orders/orders/1\")\n}\n";
+        let files = [
+            ("gocli/main.go", Language::Go, go),
+            (
+                "pay/src/main/java/p/OrdersFeign.java",
+                Language::Java,
+                feign,
+            ),
+            ("web/src/t.ts", Language::TypeScript, t),
+        ];
+        // Verdicts of the Go, Feign, `fetch` and axios sites.
+        let expect = |go: &str, feign: &str, fetch: &str, axios: &str| {
+            vec![
+                format!("gocli/main.go 3 {go}"),
+                format!("pay/src/main/java/p/OrdersFeign.java 5 {feign}"),
+                format!("web/src/t.ts 4 {fetch}"),
+                format!("web/src/t.ts 2 {axios}"),
+                format!("web/src/t.ts 5 {axios}"),
+            ]
+        };
+        let (s, u, d) = (synthetic.as_str(), unverified.as_str(), discovered.as_str());
+        let kotlin = "package p\nimport feign.RequestInterceptor\n@Configuration\nclass Global {\n  @Bean fun rewrite(): RequestInterceptor = RequestInterceptor { t -> t.target(\"https://api.stripe.com\") }\n}\n";
+        let groovy = "package p\n@Configuration\nclass Global {\n  @Bean RequestInterceptor rewrite() { { t -> t.target('https://api.stripe.com') } as RequestInterceptor }\n}\n";
+        let vue = "<template><div/></template>\n<script lang=\"ts\">\nimport axios from \"axios\";\naxios.defaults.adapter = reroutingAdapter;\n</script>\n";
+        let html = "<html><script>\nconst realFetch = window.fetch;\nwindow.fetch = (u, i) => realFetch(\"https://api.stripe.com/v1\", i);\n</script></html>\n";
+        let go_generated = "// Code generated by mockgen. DO NOT EDIT.\npackage main\nimport \"net/http\"\nfunc init() { http.DefaultTransport = nil }\n";
+        let ts_generated = "/** @generated */\nimport axios from \"axios\";\naxios.defaults.adapter = reroutingAdapter;\n";
+        let yml = "spring:\n  cloud:\n    discovery:\n      client:\n        simple:\n          instances:\n            orders:\n              - uri: https://api.stripe.com\n";
+        // (path, text or `None` over the byte cap) of the files without facts.
+        type Raw<'r> = Vec<(&'r str, Option<&'r str>)>;
+        let rows: Vec<(Raw<'_>, Vec<String>)> = vec![
+            (vec![], expect(s, s, s, s)),
+            // W1: languages with no grammar.
+            (
+                vec![("pay/src/main/kotlin/p/Global.kt", Some(kotlin))],
+                expect(s, u, s, s),
+            ),
+            (
+                vec![("pay/src/main/groovy/p/Global.groovy", Some(groovy))],
+                expect(s, u, s, s),
+            ),
+            (vec![("web/src/App.vue", Some(vue))], expect(s, s, s, u)),
+            (
+                vec![("web/public/index.html", Some(html))],
+                expect(s, s, u, s),
+            ),
+            // W2: generated and oversized files.
+            (
+                vec![("gocli/zz_hook.go", Some(go_generated))],
+                expect(u, s, s, s),
+            ),
+            (
+                vec![("web/src/hook.ts", Some(ts_generated))],
+                expect(s, s, s, u),
+            ),
+            // Over the byte cap: every kind a `.js` file is scanned for (not Go), and discovery.
+            (vec![("web/src/vendor.js", None)], expect(d, u, u, u)),
+            // Prose, a plain dependency entry and an XML comment are inert.
+            (
+                vec![
+                    (
+                        "web/README.md",
+                        Some("Call `axios.defaults.adapter = x` or fetch.\n"),
+                    ),
+                    (
+                        "web/package.json",
+                        Some(
+                            "{ \"dependencies\": { \"axios\": \"^1.7.7\" }, \"devDependencies\": { \"node-fetch\": \"~3.0\" } }\n",
+                        ),
+                    ),
+                    (
+                        "pay/pom.xml",
+                        Some("<project><!-- the fetch phase; feign.Client --></project>\n"),
+                    ),
+                    (
+                        "web/package-lock.json",
+                        Some("{ \"packages\": { \"node_modules/axios\": {} } }\n"),
+                    ),
+                ],
+                expect(s, s, s, s),
+            ),
+            // A dependency aliased elsewhere is no plain entry.
+            (
+                vec![(
+                    "web/package.json",
+                    Some("{ \"dependencies\": { \"axios\": \"file:./fake-axios\" } }\n"),
+                )],
+                expect(s, s, s, u),
+            ),
+            (
+                vec![(
+                    "web/package.json",
+                    Some("{ \"browser\": { \"axios\": \"./fake-axios.js\" } }\n"),
+                )],
+                expect(s, s, s, u),
+            ),
+            // W4: service-discovery configuration.
+            (
+                vec![("pay/src/main/resources/application.yml", Some(yml))],
+                expect(d, d, d, d),
+            ),
+            (
+                vec![(
+                    "pay/src/main/resources/application.properties",
+                    Some("orders.ribbon.listOfServers=api.stripe.com:443\n"),
+                )],
+                expect(d, d, d, d),
+            ),
+            (
+                vec![(
+                    "pay/src/main/kotlin/p/Lb.kt",
+                    Some(
+                        "@LoadBalancerClient(name = \"orders\", configuration = [Rebind::class])\nclass Lb\n",
+                    ),
+                )],
+                expect(d, d, d, d),
+            ),
+        ];
+        for (raw, verdicts) in rows {
+            let mut unparsed = RawScan::default();
+            for (path, text) in &raw {
+                unparsed.merge(rb_frameworks::clients::raw_scan(path, *text));
+            }
+            assert_eq!(
+                stitched_bases_raw(&files, &[], &unparsed, &eps, &services),
+                verdicts,
+                "{raw:?}"
+            );
+        }
+        // W4 in Java code: an import from Spring Cloud LoadBalancer or Ribbon, or a fully
+        // qualified annotation.
+        let lb = "package p;\nimport org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\n@LoadBalancerClient(name = \"orders\", configuration = Rebind.class)\nclass Lb {}\n";
+        let annotated = "package p;\n@org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient(name = \"orders\", configuration = Rebind.class)\nclass Lb {}\n";
+        for java in [lb, annotated] {
+            let mut with_lb = files.to_vec();
+            with_lb.insert(1, ("pay/src/main/java/p/Lb.java", Language::Java, java));
+            assert_eq!(
+                stitched_bases_raw(&with_lb, &[], &RawScan::default(), &eps, &services),
+                expect(d, d, d, d),
+                "{java}"
+            );
+        }
+        // Spring Cloud's client-side `@LoadBalanced` (another package) is no discovery key.
+        let balanced = "package p;\nimport org.springframework.cloud.client.loadbalancer.LoadBalanced;\nclass B {}\n";
+        let mut with_balanced = files.to_vec();
+        with_balanced.insert(1, ("pay/src/main/java/p/B.java", Language::Java, balanced));
+        assert_eq!(
+            stitched_bases_raw(&with_balanced, &[], &RawScan::default(), &eps, &services),
+            expect(s, s, s, s)
+        );
     }
 
     /// Contract M4a amendment 13, Gate B (evaluator pass 3, R2, R4), from source: a URL whose

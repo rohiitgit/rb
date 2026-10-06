@@ -469,4 +469,16 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
 - [x] Records: contract (amendment 16, corrections in 14 and 15, items 14 and 22), CHANGELOG, IMPLEMENT.md, lessons (2 new).
 - [x] Verification loop; clean-up of `fx4a6_*` and `var/fix-m4a-6/`.
 - Found while fixing: ftgo's integration-test client hands `node-fetch` to Apollo as `{ fetch }`, which the allow-list counts as a taint (4 `dynamic` sites capped); the harness kill (lesson) — SIGTERM and a pattern that did not match left a mutant applied for a minute, restored and checked before any further edit.
-- [ ] Evaluator pass 6 re-check.
+- [x] Evaluator pass 6 re-check: pass 7 (`tasks/eval-m4a-pass7.md`, VERDICT FAIL, W1–W4 blockers, W5 minor, W6 doc).
+
+## Review (M4a evaluator pass 7)
+- [x] Plan (orchestrator's decision, contract amendment 17): raw-text taint for every file without token facts (W1/W2), axios binding forms and a string-literal backstop (W3, W6's `"fetch"` literals), discovery configuration caps host-by-name `synthetic` (W4), a `require` subpath row (W5), item 22's residue list (W6), the closing decision; `PIPELINE` `m4a-http-11`.
+- [x] Baseline: `95e1fbb` release binary built from `git archive` in its own target directory before any change.
+- [x] Test first: rb-frameworks `global_hooks` literal rows and raw-scan rows, rb-indexer `unparsed_files_and_discovery_cap_carriers` on the unchanged code.
+- [x] Facts (`rb-syntax`): string literals `"fetch"`, `"axios"`, `"axios/…"` as `TokenRole::Literal` tokens.
+- [x] Carriers (`clients.rs`): literal backstop, `raw_scan`, discovery keys; stitcher: unparsed hooks, discovery cap.
+- [x] Mutations from a clean build; public repositories against `95e1fbb`; raw-scan cost; scratch repros end to end.
+- [x] Records: contract (amendment 17, item 22, closing decision), CHANGELOG, IMPLEMENT.md, lessons.
+- [x] Verification loop; clean-up of `fx4a7_*` and `var/fix-m4a-7/`.
+- Found while fixing: the decided "any text file" scan would have capped the fixture's own hops (a `package.json` dependency, a `pom.xml` comment) and every axios repository (lock files), so inert classes were added with rows; the first mutation run showed the W5 hook row masked by the new literal backstop (clean row added) and a redundant language guard (deleted); Spring binds environment variables, so discovery words are matched with `_` read as `.`; an e2e attempt timed out on cypher under load with 87 scratch graphs in the database (dropped; two clean runs after).
+- [ ] Evaluator pass 7 re-check (verification only, closing decision).
