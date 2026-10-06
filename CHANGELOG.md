@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M5 phase 5: AGE projection parity and `ops` (S6)
+- **Projection:** edges whose relational attributes hold `ops` (`QUERIES`, `MIGRATES`) carry it as `ops` (the same array; contract amendment 3: there is no `op` attribute), loaded from separate `<LABEL>.ops.csv` files so no other edge gets the property. Vertices load with `nid` as the loader's id column: before, every vertex also carried a redundant `id` property; AGE's own `__id__` (= `nid`) remains. `age::project` returns a `ProjectionProfile` (per file: label, rows, CSV bytes, load time), exposed as `Published.projection`.
+- **`rb index --profile`:** prints `profile: age <label> (<file>): n rows, b bytes, t ms` per loaded file and the totals (wall times printed only, never stored).
+- **e2e parity (`age_parity_failures`, every fixture):** the whole vertex set `(label, properties(n))` and the whole edge multiset `(label, start nid, end nid, properties(e))`, property maps compared as typed JSON with no extra property allowed; replaces the edge check without provenance and the endpoint-only vertex check. It failed first on `QUERIES` without `ops`, then on the extra `id`/`__id__` vertex properties (amendment 3).
+- **Tests:** the parity check; `projection_lines_list_files_and_totals` (CLI unit).
+- **Mutations** (`var/m5/mut/p5.json`): 5/5 killed (`CALLS` edges not loaded, `File` vertices not loaded, `certainty` written as text, `ops` dropped, `nid` as text).
+- **Invariant 1:** fixture dumps byte-identical to `afae548` (the projection is not in the dump); no golden changed.
+- **Verification:** fmt, clippy clean; 573 unit tests outside e2e (10 database tests vacuous without the URL), `rb-store` with the database 51/51; e2e 21/21 (`--nocapture`, no `skipping`); stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-store/src/{age,lib}.rs`, `crates/rb-cli/src/main.rs`, `crates/rb-cli/tests/e2e.rs`, `tasks/{contract-m5,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M5 phase 4: Cypher guard rails and e2e robustness (S7, S8)
 - **Migration `0006_reader_role.sql`:** role `rb_reader` (`NOLOGIN`, created only if absent), `USAGE` on `rb` and `ag_catalog`, `SELECT` on `rb.*` (and future `rb` tables), `ag_catalog.ag_graph`, `ag_catalog.ag_label`, and on every existing `rb_*` graph schema. Idempotent (applied twice in one transaction without error; `rb migrate` reruns report `schema up to date`). No table changes.
 - **Publish:** the transaction grants the new graph's schema to `rb_reader`.

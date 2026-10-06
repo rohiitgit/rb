@@ -85,6 +85,10 @@ struct IndexArgs {
         value_parser = clap::value_parser!(i64).range(0..=rb_store::MAX_KEEP_RETIRED)
     )]
     keep: i64,
+    /// Print timings: the AGE projection's load per label file (rows, CSV bytes, time). Wall
+    /// times are printed only, never stored.
+    #[arg(long)]
+    profile: bool,
 }
 
 #[derive(Subcommand)]
@@ -601,6 +605,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         scip_work_dir,
         scip_timeout_secs,
         keep,
+        profile,
     } = args;
     let path = path
         .canonicalize()
@@ -712,6 +717,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
     let rb_store::Published {
         snapshot: snap,
         retention,
+        projection,
     } = store.publish_snapshot(
         &repo,
         &commit_sha,
@@ -734,6 +740,9 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         diagnostics.len(),
         snap.age_graph.as_deref().unwrap_or("-")
     );
+    if profile {
+        print!("{}", projection_lines(&projection));
+    }
     for j in &jobs {
         let mut line = format!(
             "  scip: {} {} {}",
@@ -1119,6 +1128,31 @@ impl rb_indexer::FactsCache for WriteOnlyFactsCache<'_> {
     ) -> anyhow::Result<()> {
         self.0.save(facts)
     }
+}
+
+/// `rb index --profile`'s AGE lines (contract M5 S6): one per loaded file, then the totals.
+fn projection_lines(p: &rb_store::ProjectionProfile) -> String {
+    let mut out = String::new();
+    for f in &p.files {
+        let _ = writeln!(
+            out,
+            "  profile: age {} ({}): {} rows, {} bytes, {:.1} ms",
+            f.label,
+            f.file,
+            f.rows,
+            f.bytes,
+            f.load.as_secs_f64() * 1000.0
+        );
+    }
+    let rows: usize = p.files.iter().map(|f| f.rows).sum();
+    let bytes: u64 = p.files.iter().map(|f| f.bytes).sum();
+    let ms: f64 = p.files.iter().map(|f| f.load.as_secs_f64() * 1000.0).sum();
+    let _ = writeln!(
+        out,
+        "  profile: age total: {} files, {rows} rows, {bytes} bytes, {ms:.1} ms",
+        p.files.len()
+    );
+    out
 }
 
 /// `rb gc`'s report: one line per graph and `building` row, then a summary.
@@ -1704,6 +1738,30 @@ mod tests {
         assert!(cache.load(std::slice::from_ref(&key)).unwrap().is_empty());
         cache.save(&[(key, facts)]).unwrap();
         assert_eq!((inner.loads, inner.saved), (0, vec!["b1".to_owned()]));
+    }
+
+    /// Contract M5 S6: `rb index --profile` prints one line per loaded file and the totals.
+    #[test]
+    fn projection_lines_list_files_and_totals() {
+        let file = |file: &str, label, rows, bytes, ms| rb_store::LoadedFile {
+            file: file.into(),
+            label,
+            rows,
+            bytes,
+            load: Duration::from_millis(ms),
+        };
+        let p = rb_store::ProjectionProfile {
+            files: vec![
+                file("File.csv", "File", 3, 120, 4),
+                file("QUERIES.ops.csv", "QUERIES", 2, 90, 6),
+            ],
+        };
+        assert_eq!(
+            projection_lines(&p),
+            "  profile: age File (File.csv): 3 rows, 120 bytes, 4.0 ms\n\
+             \x20 profile: age QUERIES (QUERIES.ops.csv): 2 rows, 90 bytes, 6.0 ms\n\
+             \x20 profile: age total: 2 files, 5 rows, 210 bytes, 10.0 ms\n"
+        );
     }
 
     /// Contract M5 S4: `rb gc`'s lines name each graph's owner or its absence.

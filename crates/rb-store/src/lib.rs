@@ -101,7 +101,7 @@ use rb_model::{
 };
 use serde_json::Value;
 
-pub use age::{LoadDir, graph_name};
+pub use age::{LoadDir, LoadedFile, ProjectionProfile, graph_name};
 pub use query::{
     Api, DiCoverage, FoundNode, Handler, HttpCoverage, HttpPeer, HttpUse, OwnerShare,
     ResolutionCoverage, Resolved, RtaCoverage, ServiceCard, ServiceSummary, SqlCoverage,
@@ -186,6 +186,8 @@ pub struct SnapshotInfo {
 pub struct Published {
     pub snapshot: SnapshotInfo,
     pub retention: RetentionReport,
+    /// What the AGE projection loaded, with timings (`rb index --profile`).
+    pub projection: ProjectionProfile,
 }
 
 /// What one retention run did (contract M5 D10, S3).
@@ -564,8 +566,8 @@ impl Store {
             diagnostics,
             load_dir,
         };
-        let snapshot_id = match self.load_and_flip(&load) {
-            Ok(id) => id,
+        let (snapshot_id, projection) = match self.load_and_flip(&load) {
+            Ok(loaded) => loaded,
             Err(err) => {
                 let recorded = self.client.query_one(
                     "INSERT INTO rb.snapshot (repo_id, commit_sha, parent_id, status, tool_versions)
@@ -586,12 +588,13 @@ impl Store {
         Ok(Published {
             snapshot: self.snapshot(snapshot_id)?,
             retention,
+            projection,
         })
     }
 
     /// Writes the snapshot row and its rows, projects it and flips the pointer, all in one
-    /// transaction; returns the new snapshot's id.
-    fn load_and_flip(&mut self, load: &Load<'_>) -> anyhow::Result<i64> {
+    /// transaction; returns the new snapshot's id and what the projection loaded.
+    fn load_and_flip(&mut self, load: &Load<'_>) -> anyhow::Result<(i64, ProjectionProfile)> {
         let Load {
             repo_id,
             repo,
@@ -740,13 +743,14 @@ impl Store {
             hooks::after_copy(pid)?;
         }
 
-        age::project(&mut tx, graph, &graph_name, load_dir).with_context(|| {
-            format!(
-                "projecting snapshot into AGE (the server must see {} as /tmp/age/{})",
-                load_dir.host.display(),
-                load_dir.server_rel
-            )
-        })?;
+        let projection =
+            age::project(&mut tx, graph, &graph_name, load_dir).with_context(|| {
+                format!(
+                    "projecting snapshot into AGE (the server must see {} as /tmp/age/{})",
+                    load_dir.host.display(),
+                    load_dir.server_rel
+                )
+            })?;
 
         tx.execute(
             "UPDATE rb.snapshot SET status = 'retired' WHERE repo_id = $1 AND status = 'live'",
@@ -761,7 +765,7 @@ impl Store {
             &[&repo_id, &snapshot_id],
         )?;
         tx.commit()?;
-        Ok(snapshot_id)
+        Ok((snapshot_id, projection))
     }
 
     /// Retention for one repository (contract M5 D10, S3): see [`Store::retain`].

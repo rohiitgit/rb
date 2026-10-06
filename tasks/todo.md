@@ -676,7 +676,7 @@ Same rules as M4b:
   - *Derived:* `--timeout-ms`, row cap with `truncated: rows`, `SET LOCAL ROLE rb_reader`; the e2e start-up clean-up through `rb gc`'s code; parity queries with a 30 s timeout.
   - Files: `migrations/0006_reader_role.sql`, `rb-store/src/lib.rs`, `rb-store/src/age.rs`, `rb-cli/src/main.rs`, `rb-cli/tests/e2e.rs`.
   - **Verify:** timeout, read-only, permission-denied, row-cap and retired-snapshot rows; e2e three times under 8 CPU burners, graph counts before and after recorded.
-- [ ] **5. AGE projection parity and `op`** (S6).
+- [x] **5. AGE projection parity and `op`** (S6). Done 2026-10-07 (amendment 3: the attribute is `ops`, an array): edges with `attrs.ops` carry `ops` (separate `<LABEL>.ops.csv` files); vertices load with `nid` as the id column (the redundant `id` property is gone; AGE's `__id__` stays, = `nid`); `rb index --profile` prints each loaded file's label, rows, CSV bytes and load time and the totals (`Published.projection`, printed only); the e2e parity (`age_parity_failures`) compares the whole vertex set by `(label, properties(n))` and the whole edge multiset by `(label, start nid, end nid, properties(e))` as typed JSON, replacing the provenance-less edge check and the endpoint-only vertex check. Failed first (QUERIES without `ops`; then every vertex's extra `id`/`__id__`). Mutations 5/5 killed (a skipped edge label, a skipped vertex label, `certainty` as text, `ops` dropped, `nid` as text). Fixture dumps byte-identical.
   - *Derived:* `op` on edges with `attrs.op`; per-label load times under `rb index --profile` (printed only).
   - *Invariants:* 6: whole vertex set and edge multiset.
   - Files: `rb-store/src/age.rs`, `rb-cli/src/main.rs` (`--profile`), `rb-cli/tests/e2e.rs`.

@@ -304,35 +304,10 @@ fn check_fixture(fixture: &str, tag: &str) {
             .collect::<Vec<_>>()
     );
 
-    // AGE parity (design §12.2): the projection holds exactly the relational edges.
-    let age_edges = rb(
-        &url,
-        &[
-            "cypher",
-            "MATCH (a)-[e]->(b) RETURN a.key, label(e), b.key, e.certainty",
-            "--repo",
-            &a,
-            "--cols",
-            "src,kind,dst,certainty",
-            "--timeout-ms",
-            "30000",
-        ],
-    );
-    let mut expected: Vec<String> = graph
-        .edges()
-        .iter()
-        .map(|e| {
-            format!(
-                "{}\t{}\t{}\t{}",
-                node(e.src).key,
-                e.kind,
-                node(e.dst).key,
-                e.certainty.rank()
-            )
-        })
-        .collect();
-    expected.sort();
-    assert_eq!(sorted_rows(&age_edges), expected);
+    // Contract M5 S6 (design §12.2): the projection holds exactly the snapshot's vertices and,
+    // as a multiset, exactly its edges with their provenance, certainty and `ops`.
+    let failures = age_parity_failures(&url, &a, graph);
+    assert!(failures.is_empty(), "AGE parity:\n{}", failures.join("\n"));
 
     // Contract M4a S26: `Endpoint` vertices, and every endpoint's 1-hop neighbours in each
     // direction (`EXPOSES` in, `HANDLED_BY` out, `CONSUMES` in), equal the relational ones.
@@ -358,10 +333,7 @@ fn check_fixture(fixture: &str, tag: &str) {
             ],
         ))
     };
-    assert_eq!(
-        cypher("MATCH (e:Endpoint) RETURN e.key", "endpoint"),
-        endpoints
-    );
+    assert!(!endpoints.is_empty());
     for (outbound, query) in [
         (
             true,
@@ -455,6 +427,103 @@ fn check_fixture(fixture: &str, tag: &str) {
         "a CREATE through rb cypher must fail"
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("read-only"));
+}
+
+/// Contract M5 S6: the differences between the repository's live AGE graph and `graph`, the
+/// snapshot it projects: the whole vertex set `(label, properties)` and the whole edge multiset
+/// `(label, start nid, end nid, properties)`, each property map compared as JSON, types included
+/// (`nid` and `certainty` numbers, `ops` the relational array, the loader's `__id__` equal to
+/// `nid`, and no other property). Empty when they agree.
+fn age_parity_failures(url: &str, repo: &str, graph: &Graph) -> Vec<String> {
+    use serde_json::{Value, json};
+    let query = |cypher: &str, cols: &str| -> Vec<Vec<String>> {
+        let out = rb(
+            url,
+            &[
+                "cypher",
+                cypher,
+                "--repo",
+                repo,
+                "--cols",
+                cols,
+                "--timeout-ms",
+                "30000",
+            ],
+        );
+        out.lines()
+            .skip(1)
+            .map(|l| {
+                let mut row: Vec<String> = l.split('\t').map(str::to_owned).collect();
+                // The property map, normalised (sorted keys, compact).
+                if let Some(props) = row.last_mut() {
+                    *props = serde_json::from_str::<Value>(props)
+                        .map_or_else(|_| format!("unparsed {props}"), |v| v.to_string());
+                }
+                row
+            })
+            .collect()
+    };
+    let mut failures = Vec::new();
+    let mut compare = |what: &str, mut actual: Vec<Vec<String>>, mut expected: Vec<Vec<String>>| {
+        actual.sort();
+        expected.sort();
+        if actual != expected {
+            let missing: Vec<_> = expected.iter().filter(|r| !actual.contains(r)).collect();
+            let extra: Vec<_> = actual.iter().filter(|r| !expected.contains(r)).collect();
+            failures.push(format!(
+                "{what}: {} projected, {} relational; missing {missing:?}; extra {extra:?}",
+                actual.len(),
+                expected.len()
+            ));
+        }
+    };
+    let expected: Vec<Vec<String>> = graph
+        .nodes()
+        .iter()
+        .map(|n| {
+            vec![
+                n.kind.age_label().to_owned(),
+                // `__id__`: AGE 1.8's CSV loader writes the id column's value there too.
+                json!({"nid": n.id, "key": n.key, "name": n.name, "__id__": n.id}).to_string(),
+            ]
+        })
+        .collect();
+    compare(
+        "vertices",
+        query(
+            "MATCH (n) RETURN label(n), properties(n)",
+            "label,properties",
+        ),
+        expected,
+    );
+    let expected: Vec<Vec<String>> = graph
+        .edges()
+        .iter()
+        .map(|e| {
+            let mut props = json!({
+                "provenance": e.provenance.as_str(),
+                "certainty": e.certainty.rank(),
+            });
+            if let Some(ops) = e.attrs.get("ops") {
+                props["ops"] = ops.clone();
+            }
+            vec![
+                e.kind.to_string(),
+                e.src.to_string(),
+                e.dst.to_string(),
+                props.to_string(),
+            ]
+        })
+        .collect();
+    compare(
+        "edges",
+        query(
+            "MATCH (a)-[e]->(b) RETURN label(e), a.nid, b.nid, properties(e)",
+            "label,src,dst,properties",
+        ),
+        expected,
+    );
+    failures
 }
 
 /// The certainty names, weakest first (`rb_model::Certainty` ranks 1–5).
