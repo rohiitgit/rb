@@ -346,6 +346,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 5a: RTA proof of absence, `impl_instantiated: false` on `IMPLEMENTS`, `rta_coverage`; `PIPELINE = m4b-di-3` (amendment 9).
 - [x] Phase 5b: the `rb status` `rta:` line; invariant 1 held on spring-petclinic and routing-controllers (only added lines).
 - [x] Phase 6: `--precision rta|cha` on `rb callers` (default `rta`), `rb impact` (`cha`) and `rb path` (`rta`); pruned dispatch steps counted in every answer (`precision=` header, `rta:` line, JSON `precision`/`pruned_by_rta`); `rb table-deps` takes it with its walk in phase 9.
+- [x] Phase 7: entry kinds (`main`, `test`, `scheduled`, `listener`, `lifecycle`) and `orphan_eligible` as `Symbol` attributes, `orphan_coverage`; the whole-word scan of every non-binary file; `PIPELINE = m4b-di-4` (amendment 10).
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):

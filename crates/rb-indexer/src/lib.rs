@@ -3,10 +3,11 @@
 //! Everything here is a pure function of the commit's tree, so the same commit always yields the
 //! same graph and diagnostics.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 mod di;
+mod liveness;
 mod modules;
 mod orm;
 mod packages;
@@ -68,8 +69,9 @@ use serde_json::{Value, json};
 /// `m4b-di-1` adds manifest dependencies: `Package` versions from lockfiles, `go.mod` and poms,
 /// and Service → Service `DEPENDS_ON` `via=package` (contract M4b S15, S16); `m4b-di-2` Spring
 /// DI's `INJECTS` edges, `di_*` diagnostics and `di_coverage` (S4–S8); `m4b-di-3` RTA's
-/// `impl_instantiated: false` on `IMPLEMENTS` and `rta_coverage` (S9).
-pub const PIPELINE: &str = "m4b-di-3";
+/// `impl_instantiated: false` on `IMPLEMENTS` and `rta_coverage` (S9); `m4b-di-4` the `Symbol`
+/// attributes `entry` and `orphan_eligible` and `orphan_coverage` (S11, S12).
+pub const PIPELINE: &str = "m4b-di-4";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -138,6 +140,19 @@ pub fn index_commit(
         })
         .collect();
     diagnostics.extend(syntax::syntax_diagnostics(&facts_by_path));
+    // The whole-word scan of every non-binary file for the definitions' names (contract M4b
+    // S12 (f)); it depends on the whole commit, so it is not cached.
+    let names: HashSet<&str> = facts_by_path
+        .values()
+        .flat_map(|(_, f)| f.definitions.iter().map(|d| d.name.as_str()))
+        .collect();
+    let mut words = liveness::Words::scanned();
+    for f in manifest.files.iter().filter(|f| !f.binary) {
+        let bytes = (f.size <= liveness::WORD_SCAN_BYTES)
+            .then(|| repo.blob(&f.blob_sha))
+            .transpose()?;
+        words.scan(&f.path, bytes.as_deref(), &names);
+    }
 
     let mut texts = |lang: &str| -> anyhow::Result<BTreeMap<&str, String>> {
         let (files, skipped) = sql::text_plan(&manifest.files, lang);
@@ -194,6 +209,7 @@ pub fn index_commit(
         config,
         unparsed,
         manifests,
+        words,
     };
 
     let (graph, assembly_diagnostics) =
@@ -267,6 +283,9 @@ pub struct Content<'a> {
     pub unparsed: rb_frameworks::clients::RawScan,
     /// `package.json`, npm lockfiles, `go.mod` and `pom.xml` texts (contract M4b S15).
     pub manifests: BTreeMap<&'a str, String>,
+    /// Where the definitions' names occur in every non-binary file (contract M4b S12 (f)); the
+    /// default is "not scanned", under which no symbol is orphan-eligible.
+    pub words: liveness::Words,
 }
 
 /// What a configuration input is to the endpoint and stitching stages.
@@ -830,6 +849,18 @@ pub fn assemble(
     for (path, text) in &content.sql {
         diagnostics.extend(sql::add_migrations(&mut b, path, text)?);
     }
+    // Entry kinds and orphan eligibility (contract M4b S11, S12), after every edge producer.
+    diagnostics.push(liveness::apply(
+        &mut b,
+        &liveness::Inputs {
+            files: &content.facts,
+            keys: &keys,
+            index: &index,
+            service_of: &service_of,
+            deployable: &deployable,
+            words: &content.words,
+        },
+    ));
     Ok((b.finish()?, diagnostics))
 }
 

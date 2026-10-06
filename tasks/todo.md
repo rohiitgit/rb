@@ -556,7 +556,7 @@ Same rules as M4a:
   - *Invariants:* the defaults (Q1/Q4 `rta`, Q2/Q3 `cha`); every pruned step counted; same graph under both modes in one unit.
   - Files: `rb-store/src/code.rs`, `rb-store/src/path.rs`, `rb-cli/src/main.rs` (flags), `rb-cli/src/code.rs`, `rb-cli/src/path.rs`.
   - **Verify:** units; e2e (headers change in callers and path goldens: classified, blessed).
-- [ ] **7. Entry kinds and orphan eligibility at index time** (S11 stored kinds, S12).
+- [x] **7. Entry kinds and orphan eligibility at index time** (S11 stored kinds, S12). Done: `rb-indexer/src/liveness.rs` (entry kinds import-gated; rules (a)–(f) plus `default_export`; the uncached whole-word scan of every non-binary file streamed blob by blob in `index_commit`), `GraphBuilder::{set_node_attr, inbound}`; `PIPELINE = m4b-di-4`; amendment 10; 4 + 1 units, 35 mutants all killed (5 survivors of the first run given rows); fixture dumps vs `1f81c8f`: only `Symbol` lines gaining `entry`/`orphan_eligible` (2/6/1) and the added lines of phases 3–7. Files: `liveness.rs`, `lib.rs`, `rb-model/src/graph.rs` (the builder methods replace the planned `syntax.rs` edit: eligibility needs the edges, so attributes are set after every producer).
   - *Derived:* `Symbol` attributes `entry` and `orphan_eligible`; `orphan_coverage`; the uncached word scan.
   - *Invariants:* import-gated kinds with decoys; one keeping row per eligibility rule; scan cost measured on the public repositories in phase 15; counted growth test.
   - Files: new `rb-indexer/src/liveness.rs`, `rb-indexer/src/syntax.rs` (attributes), `rb-indexer/src/lib.rs`.

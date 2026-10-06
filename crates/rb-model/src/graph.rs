@@ -242,6 +242,36 @@ impl GraphBuilder {
         n
     }
 
+    /// Sets attribute `name` to `value` on the node `key`; returns whether the node exists
+    /// (contract M4b S11/S12: attributes derived once every edge producer has run). A node
+    /// re-added afterwards with its former attributes is then a conflict.
+    pub fn set_node_attr(&mut self, key: &NodeKey, name: &str, value: Value) -> bool {
+        match self.nodes.get_mut(key) {
+            Some((_, attrs)) => {
+                attrs.insert(name.to_owned(), value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// For each of `dsts` with inbound edges added so far: the kind and the evidence of each
+    /// edge into it, in edge-key order. One pass over the edges.
+    pub fn inbound(
+        &self,
+        dsts: &BTreeSet<NodeKey>,
+    ) -> BTreeMap<NodeKey, Vec<(EdgeKind, Vec<Evidence>)>> {
+        let mut out: BTreeMap<NodeKey, Vec<(EdgeKind, Vec<Evidence>)>> = BTreeMap::new();
+        for ((_, kind, dst, _), (_, _, evidence)) in &self.edges {
+            if dsts.contains(dst) {
+                out.entry(dst.clone())
+                    .or_default()
+                    .push((*kind, evidence.iter().cloned().collect()));
+            }
+        }
+        out
+    }
+
     /// Assigns dense ids in key order and resolves edges. Fails on dangling edge endpoints and on
     /// evidence that does not point at a `File` node.
     pub fn finish(self) -> anyhow::Result<Graph> {
@@ -585,6 +615,44 @@ mod tests {
                 (EdgeKind::InService, false)
             ]
         );
+    }
+
+    /// Contract M4b S11/S12: node attributes set after every producer has run (the `entry` and
+    /// `orphan_eligible` attributes), and the kinds and evidence of the edges into chosen nodes.
+    #[test]
+    fn node_attributes_and_inbound_evidence() {
+        let mut b = GraphBuilder::new();
+        b.add_node(svc(), "(root)", Attrs::new()).unwrap();
+        for p in ["a", "b"] {
+            b.add_node(file(p), p, Attrs::new()).unwrap();
+        }
+        let at = |line: i32| Evidence {
+            path: "a".into(),
+            span: [line, 0, line, 3],
+        };
+        b.add_edge(in_root("a").evidence(at(1))).unwrap();
+        b.add_edge(in_root("b").evidence(at(2))).unwrap();
+        b.add_edge(in_root("b").evidence(at(3))).unwrap();
+        let inbound = b.inbound(&BTreeSet::from([svc()]));
+        assert_eq!(
+            inbound[&svc()],
+            [
+                (EdgeKind::InService, vec![at(1)]),
+                (EdgeKind::InService, vec![at(2), at(3)])
+            ]
+        );
+        assert!(b.inbound(&BTreeSet::from([file("a")])).is_empty());
+        assert!(b.set_node_attr(&file("b"), "flag", Value::Bool(true)));
+        assert!(!b.set_node_attr(&file("c"), "flag", Value::Bool(true)));
+        // A node re-added with its former attributes now conflicts.
+        assert!(b.add_node(file("b"), "b", Attrs::new()).is_err());
+        let g = b.finish().unwrap();
+        let flagged: Vec<(&str, bool)> = g
+            .nodes()
+            .iter()
+            .map(|n| (n.key.as_str(), n.attrs.contains_key("flag")))
+            .collect();
+        assert_eq!(flagged, [("a", false), ("b", true), ("(root)", false)]);
     }
 
     #[test]
