@@ -82,8 +82,11 @@ use serde_json::{Value, json};
 /// `m5-1`: a `CONSUMES` edge matched by suffix because no host resolved says `base: unresolved`
 /// (contract M5 S18, M4a open item 6); `m5-2` the carrier review's fixes (S19 (a), (b), (f)):
 /// discovery words and JSON key paths in every file, parsed ones included; XML comments read;
-/// a contested base with an external candidate is external.
-pub const PIPELINE: &str = "m5-2";
+/// a contested base with an external candidate is external; `m5-3` the orphan and DI fixes
+/// (S19 (d), (e), (g)): Spring Data fragment implementations are no orphans, a supertype head
+/// resolved by name is external unless unique and imported from nowhere outside, and a class a
+/// class literal registers is a DI candidate (`ambiguous` beside the scanned beans).
+pub const PIPELINE: &str = "m5-3";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -874,6 +877,7 @@ pub fn assemble(
             service_of: &service_of,
             deployable: &deployable,
             words: &content.words,
+            fragments: &fragments,
         },
     ));
     Ok((b.finish()?, diagnostics))

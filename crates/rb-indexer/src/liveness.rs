@@ -351,6 +351,9 @@ pub(crate) struct Inputs<'a> {
     /// Deployable services (`role = service`).
     pub deployable: &'a BTreeSet<String>,
     pub words: &'a Words,
+    /// The interfaces Spring Data repositories extend, by simple name (fragments, contract
+    /// M4b D3; the set RTA's rule (h) reads).
+    pub fragments: &'a BTreeSet<String>,
 }
 
 /// Rules (a)–(e) for definition `i` of `path`: the first that fails, or `None`.
@@ -385,6 +388,20 @@ fn own_rule<'a>(inputs: &Inputs<'a>, path: &'a str, i: usize, entry: bool) -> Op
     if convention_invoked(language, def) {
         return Some("convention");
     }
+    // A Spring Data fragment implementation (a type in the chain implementing, by name, an
+    // interface a repository extends) is instantiated by its name's convention, members
+    // included (contract M5 S19 (d), M4b open item 3; RTA's rule (h)).
+    let fragment = chain.iter().any(|&j| {
+        let d = &facts.definitions[j];
+        is_type_kind(d.kind)
+            && d.supertypes.iter().any(|s| {
+                let simple = s.name.rsplit('.').next().unwrap_or(&s.name);
+                inputs.fragments.contains(simple)
+            })
+    });
+    if fragment {
+        return Some("convention");
+    }
     // A TS/JS default export is imported under any name, which no word scan sees (amendment
     // 10).
     if def.parent.is_none() && facts.default_export.as_deref() == Some(def.name.as_str()) {
@@ -405,9 +422,12 @@ fn own_rule<'a>(inputs: &Inputs<'a>, path: &'a str, i: usize, entry: bool) -> Op
 }
 
 /// Whether a declared supertype of `start`, or of any repository type they reach through
-/// their supertypes, resolves to no repository type. Breadth-first with a visited set, at
-/// most [`crate::di::MAX_SUPERTYPE_DEPTH`] levels; a chain longer than that counts as reaching
-/// an external type (conservative).
+/// their supertypes, may be no repository type: it resolves to none, or its Tier B resolution
+/// is not certain (contract M5 S19 (e), M4b open item 21): not unique, or the declaring file
+/// may take the head's name from outside the repository ([`Index::imported_from_outside`]: a
+/// library import of that name, or an on-demand import of a package outside it).
+/// Breadth-first with a visited set, at most [`crate::di::MAX_SUPERTYPE_DEPTH`] levels; a chain
+/// longer than that counts as reaching an external type (conservative).
 fn external_supertype<'a>(inputs: &Inputs<'a>, start: &[(&'a str, usize)]) -> bool {
     let mut seen: BTreeSet<(&'a str, usize)> = start.iter().copied().collect();
     let mut level: Vec<(&'a str, usize)> = start.to_vec();
@@ -418,7 +438,8 @@ fn external_supertype<'a>(inputs: &Inputs<'a>, start: &[(&'a str, usize)]) -> bo
             for s in &d.supertypes {
                 work::tick(1);
                 let found = inputs.index.type_candidates(path, d.parent, &s.name);
-                if found.is_empty() {
+                let head = s.name.split('.').next().unwrap_or(&s.name);
+                if found.len() != 1 || inputs.index.imported_from_outside(path, head) {
                     return true;
                 }
                 next.extend(found.into_iter().filter(|t| seen.insert(*t)));
@@ -616,6 +637,18 @@ mod tests {
         );
         let service_of = |p: &str| p.split('/').next().unwrap_or_default().to_owned();
         let deployable = BTreeSet::from(["svc".to_owned()]);
+        // The fragment interfaces as the pipeline computes them (DI's Spring Data beans).
+        let (depends, unparsed) = (BTreeMap::new(), rb_frameworks::clients::RawScan::default());
+        let fragments = crate::di::resolve(&crate::di::Inputs {
+            files: &by_path,
+            keys: &keys,
+            index: &index,
+            service_of: &service_of,
+            deployable: &deployable,
+            depends: &depends,
+            unparsed: &unparsed,
+        })
+        .fragments;
         let coverage = apply(
             &mut b,
             &Inputs {
@@ -625,6 +658,7 @@ mod tests {
                 service_of: &service_of,
                 deployable: &deployable,
                 words: &words,
+                fragments: &fragments,
             },
         )
         .detail;
@@ -955,6 +989,125 @@ public class Svc {
                 "{depth}"
             );
         }
+    }
+
+    /// Contract M5 S19 (d) (M4b open item 3): a class implementing, by name, an interface a
+    /// Spring Data repository extends (a fragment, which Spring Data instantiates by its name)
+    /// is not eligible, nor are its members; counted under `convention`. A class implementing
+    /// another interface stays eligible.
+    #[test]
+    fn spring_data_fragment_implementations_are_not_orphans() {
+        let repo = "package com.acme;\ninterface UserRepositoryCustom { void touch(long id); }\ninterface UserRepository extends org.springframework.data.jpa.repository.JpaRepository<User, Long>, UserRepositoryCustom {}\nclass User {}\n";
+        let fragment = "package com.acme;\nclass UserRepositoryCustomImpl implements UserRepositoryCustom {\n  public void touch(long id) { audit(); }\n  private void audit() {}\n}\n";
+        let other = "package com.acme;\ninterface Plain { void touch(long id); }\nclass PlainImpl implements Plain {\n  public void touch(long id) { record(); }\n  private void record() {}\n}\n";
+        let r = run(&[
+            ("svc/src/main/java/com/acme/R.java", repo),
+            ("svc/src/main/java/com/acme/F.java", fragment),
+            ("svc/src/main/java/com/acme/P.java", other),
+        ]);
+        assert_eq!(attrs(&r, "UserRepositoryCustomImpl#"), "");
+        assert_eq!(attrs(&r, "UserRepositoryCustomImpl#audit()."), "");
+        assert_eq!(attrs(&r, "PlainImpl#"), "eligible");
+        assert_eq!(attrs(&r, "PlainImpl#record()."), "eligible");
+        // Without the repository, the fragment interface is a plain one.
+        let r = run(&[
+            (
+                "svc/src/main/java/com/acme/R.java",
+                "package com.acme;\ninterface UserRepositoryCustom { void touch(long id); }\n",
+            ),
+            ("svc/src/main/java/com/acme/F.java", fragment),
+        ]);
+        assert_eq!(attrs(&r, "UserRepositoryCustomImpl#audit()."), "eligible");
+    }
+
+    /// Contract M5 S19 (e) (M4b open item 21): rule (e) trusts a supertype head's Tier B
+    /// resolution only when it is unique and the declaring file neither imports that name from
+    /// outside the repository (a library type the name may be) nor has an on-demand import of
+    /// a package or module outside it; otherwise the head counts as external, at any depth of
+    /// the chain. Imports from inside the repository, and a cycle, keep nothing.
+    #[test]
+    fn supertype_heads_resolved_by_name_are_external_unless_certain() {
+        const PROBE: &str = "package com.acme;\nclass Probe { boolean probe(AuthInterceptor i) { return i.preHandle(null); } }\n";
+        let local = "package com.acme;\npublic abstract class BaseInterceptor implements Local {}\ninterface Local {}\n";
+        let auth = |imports: &str| {
+            format!(
+                "package com.acme;\n{imports}public class AuthInterceptor extends BaseInterceptor {{\n  public boolean preHandle(Object a) {{ return tokenPresent(a); }}\n  private boolean tokenPresent(Object r) {{ return r != null; }}\n}}\n"
+            )
+        };
+        let row = |extra: &[(&str, &str)], auth: &str| -> String {
+            let mut files = vec![
+                ("svc/src/main/java/com/acme/BaseInterceptor.java", local),
+                ("svc/src/main/java/com/acme/AuthInterceptor.java", auth),
+                ("svc/src/main/java/com/acme/Probe.java", PROBE),
+            ];
+            files.extend_from_slice(extra);
+            attrs(&run(&files), "AuthInterceptor#tokenPresent().")
+        };
+        let sub = (
+            "svc/src/main/java/com/acme/sub/Helper.java",
+            "package com.acme.sub;\npublic class Helper {}\n",
+        );
+        // Control: the head resolves to the same package, nothing imported.
+        assert_eq!(row(&[], &auth("")), "eligible");
+        // The head imported from a library, although the package has the same name.
+        assert_eq!(
+            row(
+                &[],
+                &auth("import org.springframework.web.servlet.BaseInterceptor;\n")
+            ),
+            ""
+        );
+        // An on-demand import of a library package.
+        assert_eq!(
+            row(&[], &auth("import org.springframework.web.servlet.*;\n")),
+            ""
+        );
+        // A repository package that has no type of that name: the import names a library's.
+        assert_eq!(
+            row(&[sub], &auth("import com.acme.sub.BaseInterceptor;\n")),
+            ""
+        );
+        // On-demand and single imports of repository packages are no doubt.
+        assert_eq!(row(&[sub], &auth("import com.acme.sub.*;\n")), "eligible");
+        assert_eq!(
+            row(&[sub], &auth("import com.acme.sub.Helper;\n")),
+            "eligible"
+        );
+        // Two repository types of that name: not unique.
+        let twin = (
+            "svc/src/main/java/com/acme/Twin.java",
+            "package com.acme;\nabstract class BaseInterceptor implements Local {}\n",
+        );
+        assert_eq!(row(&[twin], &auth("")), "");
+        // Depth 2: the doubtful head is the base's own supertype.
+        let mid = "package com.acme;\nimport org.springframework.web.servlet.Middle;\npublic abstract class BaseInterceptor extends Middle {}\n";
+        let middle = (
+            "svc/src/main/java/com/acme/Middle.java",
+            "package com.acme;\nabstract class Middle implements Local {}\ninterface Local {}\n",
+        );
+        let mut files = vec![
+            ("svc/src/main/java/com/acme/BaseInterceptor.java", mid),
+            middle,
+            ("svc/src/main/java/com/acme/Probe.java", PROBE),
+        ];
+        let plain = auth("");
+        files.push(("svc/src/main/java/com/acme/AuthInterceptor.java", &plain));
+        assert_eq!(attrs(&run(&files), "AuthInterceptor#tokenPresent()."), "");
+        // A cycle with no doubtful head terminates and keeps nothing.
+        let cycle =
+            "package com.acme;\npublic abstract class BaseInterceptor extends AuthInterceptor {}\n";
+        let files = [
+            ("svc/src/main/java/com/acme/BaseInterceptor.java", cycle),
+            (
+                "svc/src/main/java/com/acme/AuthInterceptor.java",
+                plain.as_str(),
+            ),
+            ("svc/src/main/java/com/acme/Probe.java", PROBE),
+        ];
+        assert_eq!(
+            attrs(&run(&files), "AuthInterceptor#tokenPresent()."),
+            "eligible"
+        );
     }
 
     /// Evaluator pass 1, Y1 and Y14: a nested class's binary name (`Outer$Inner`) in a

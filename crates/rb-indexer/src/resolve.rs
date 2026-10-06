@@ -539,6 +539,28 @@ impl<'a> Index<'a> {
         self.resolve_type(path, scope, name)
     }
 
+    /// Whether the type name `name` written in `path` may come from outside the repository
+    /// (contract M5 S19 (e), orphan rule (e)): an import binding `name` through which no
+    /// repository type is found (a library's type of that name, which Tier B's later levels
+    /// would miss), or an on-demand import (Java `.*`, Python `*`, Go `.`) of a package or module
+    /// with no repository file. An import is outside when it reaches no repository file (a Java
+    /// single-type import reaches the file of its class, or of the outer class of a nested one).
+    pub(crate) fn imported_from_outside(&self, path: &'a str, name: &str) -> bool {
+        let language = self.language(path);
+        self.facts(path)
+            .imports
+            .iter()
+            .zip(&self.imports[path])
+            .any(|(import, targets)| {
+                let on_demand = import.wildcard
+                    || (language == Language::Go && import.alias.as_deref() == Some("."));
+                let binds = on_demand
+                    || import.alias.as_deref() == Some(name)
+                    || import.names.iter().any(|n| n.local == name);
+                !import.is_static && binds && targets.is_empty()
+            })
+    }
+
     /// The resolved direct supertypes of a type (all candidates of each declared name).
     pub(crate) fn direct_supertypes(&self, t: (&'a str, usize)) -> Vec<(&'a str, usize)> {
         self.supertypes(t)
