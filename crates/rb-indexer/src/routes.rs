@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rb_frameworks::endpoint::{endpoint_key, endpoint_name, norm_path};
-use rb_frameworks::routes::{FileRoutes, Handler, RouteBase, RouterKind};
+use rb_frameworks::endpoint::{endpoint_key, endpoint_name, norm_path, prefix_unknown_key};
+use rb_frameworks::routes::{FileRoutes, Handler, RouteBase, RouterKind, binding_identity};
 use rb_model::{
     Attrs, Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
     Provenance, Span,
@@ -225,7 +225,8 @@ struct Endpoint {
     path: String,
     service: String,
     frameworks: BTreeSet<&'static str>,
-    prefix_unknown: bool,
+    /// The router of an endpoint whose prefix is unknown (part of its key, amendment 10).
+    router: Option<String>,
     registrations: Vec<Registration>,
 }
 
@@ -250,17 +251,29 @@ pub(crate) fn add_endpoints(
         }
         let service = (inputs.service_of)(path);
         let keys = &inputs.keys[path];
+        // A router's identity in the repository: its file and its binding (amendment 10).
+        let router_id = |binding: usize| {
+            let facts = inputs.files[path].1;
+            format!("{path}#{}", binding_identity(facts, binding))
+        };
         for r in &file.routes {
-            // Full paths with their certainty; `None` when the prefix is unknown.
-            let mut paths: Vec<(String, Certainty, bool)> = Vec::new();
+            // Full paths with their certainty, and the router when the prefix is unknown (the
+            // path is then the tail below that router).
+            let mut paths: Vec<(String, Certainty, Option<String>)> = Vec::new();
             match r.base {
                 RouteBase::Root => match inputs.context_paths.get(&service) {
                     Some(ctx) if r.framework == rb_frameworks::routes::Framework::Spring => {
-                        paths.push((format!("{ctx}/{}", r.path), Certainty::Synthetic, false));
+                        paths.push((format!("{ctx}/{}", r.path), Certainty::Synthetic, None));
                     }
-                    _ => paths.push((r.path.clone(), Certainty::Exact, false)),
+                    _ => paths.push((r.path.clone(), Certainty::Exact, None)),
                 },
-                RouteBase::Unknown => paths.push((r.path.clone(), Certainty::Heuristic, true)),
+                RouteBase::Unknown(receiver) => {
+                    paths.push((
+                        r.path.clone(),
+                        Certainty::Heuristic,
+                        Some(router_id(receiver)),
+                    ));
+                }
                 RouteBase::Router(i) => {
                     let (prefixes, _) = composer.prefixes((path, i), 0);
                     for (p, cross) in &prefixes.known {
@@ -269,15 +282,16 @@ pub(crate) fn add_endpoints(
                         } else {
                             Certainty::Exact
                         };
-                        paths.push((format!("{p}/{}", r.path), certainty, false));
+                        paths.push((format!("{p}/{}", r.path), certainty, None));
                     }
                     if prefixes.unknown {
-                        paths.push((r.path.clone(), Certainty::Heuristic, true));
+                        let router = router_id(file.routers[i].binding);
+                        paths.push((r.path.clone(), Certainty::Heuristic, Some(router)));
                     }
                 }
             }
             let method = r.method.clone();
-            if paths.iter().any(|(_, _, unknown)| *unknown) {
+            if paths.iter().any(|(_, _, router)| router.is_some()) {
                 diagnostics.push(diag(
                     "route_prefix_unknown",
                     path,
@@ -303,17 +317,20 @@ pub(crate) fn add_endpoints(
                     json!({ "framework": r.framework.as_str(), "handler": text }),
                 ));
             }
-            for (full, path_certainty, unknown) in paths {
+            for (full, path_certainty, router) in paths {
                 let norm = norm_path(&full);
-                let key = endpoint_key(&method, &norm, &service);
+                let key = match &router {
+                    Some(router) => prefix_unknown_key(&method, &norm, &service, router),
+                    None => endpoint_key(&method, &norm, &service),
+                };
                 let e = endpoints.entry(key).or_insert_with(|| Endpoint {
                     method: method.clone(),
                     path: norm.clone(),
                     service: service.clone(),
+                    router: router.clone(),
                     ..Endpoint::default()
                 });
                 e.frameworks.insert(r.framework.as_str());
-                e.prefix_unknown |= unknown;
                 e.registrations.push(Registration {
                     path_certainty,
                     handler: handler.clone(),
@@ -395,8 +412,9 @@ fn add_endpoint(b: &mut GraphBuilder, key: String, e: Endpoint) -> anyhow::Resul
         "frameworks".into(),
         e.frameworks.iter().copied().collect::<Vec<_>>().into(),
     );
-    if e.prefix_unknown {
+    if let Some(router) = &e.router {
         attrs.insert("prefix_unknown".into(), true.into());
+        attrs.insert("router".into(), router.clone().into());
     }
     b.add_node(node.clone(), endpoint_name(&e.method, &e.path), attrs)?;
 
@@ -473,7 +491,7 @@ fn add_endpoint(b: &mut GraphBuilder, key: String, e: Endpoint) -> anyhow::Resul
         method: e.method,
         path: e.path,
         service: e.service,
-        prefix_unknown: e.prefix_unknown,
+        prefix_unknown: e.router.is_some(),
         certainty: exposes,
     })
 }
@@ -633,8 +651,8 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
             [
-                "EXPOSES svc -> HTTP GET /l @svc [heuristic]",
-                "EXPOSES svc -> HTTP GET /r @svc [heuristic]",
+                "EXPOSES svc -> HTTP GET /l @svc ?router=svc/r.ts#lone [heuristic]",
+                "EXPOSES svc -> HTTP GET /r @svc ?router=svc/r.ts#a [heuristic]",
             ]
         );
         let unknown: Vec<&Diagnostic> = built
@@ -650,6 +668,101 @@ mod tests {
                 .iter()
                 .filter(|n| n.kind == NodeKind::Endpoint)
                 .all(|n| n.attrs["prefix_unknown"] == true)
+        );
+    }
+
+    /// Fork F3 (contract amendment 10): an endpoint whose prefix is unknown carries its router's
+    /// identity in its key, so distinct routes on different routers never merge into one node:
+    /// two Express routers mounted nowhere and two gin groups passed as parameters each
+    /// registering `GET /` give one endpoint per router, and a known `POST /login` stays apart
+    /// from a `POST /login` under an unknown prefix (gin realworld's measured shapes).
+    #[test]
+    fn prefix_unknown_endpoints_are_keyed_by_their_router() {
+        let express = "import { Router } from \"express\";\nexport const a = Router();\nexport const b = Router();\na.get(\"/\", (q, s) => s.end());\nb.get(\"/\", (q, s) => s.end());\n";
+        let gin = "package api\nimport \"github.com/gin-gonic/gin\"\nfunc main() {\n\tr := gin.Default()\n\tr.POST(\"/login\", login)\n}\nfunc ArticlesRegister(router *gin.RouterGroup) {\n\trouter.GET(\"/\", list)\n}\nfunc UsersRegister(router *gin.RouterGroup) {\n\trouter.GET(\"/\", retrieve)\n\trouter.POST(\"/login\", login)\n}\nfunc list() {}\nfunc retrieve() {}\nfunc login() {}\n";
+        let built = build(
+            &[
+                ("svc/r.ts", Language::TypeScript, express),
+                ("svc/api.go", Language::Go, gin),
+            ],
+            &[],
+        );
+        let mut exposes: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("EXPOSES"))
+            .collect();
+        exposes.sort();
+        assert_eq!(
+            exposes,
+            [
+                "EXPOSES svc -> HTTP GET / @svc ?router=svc/api.go#ArticlesRegister.router [heuristic]",
+                "EXPOSES svc -> HTTP GET / @svc ?router=svc/api.go#UsersRegister.router [heuristic]",
+                "EXPOSES svc -> HTTP GET / @svc ?router=svc/r.ts#a [heuristic]",
+                "EXPOSES svc -> HTTP GET / @svc ?router=svc/r.ts#b [heuristic]",
+                "EXPOSES svc -> HTTP POST /login @svc ?router=svc/api.go#UsersRegister.router [heuristic]",
+                "EXPOSES svc -> HTTP POST /login @svc [exact]",
+            ]
+        );
+        // Each node names its router; a known-prefix node has no `router`.
+        for n in built
+            .graph
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Endpoint)
+        {
+            match n.key.split_once(" ?router=") {
+                Some((_, router)) => {
+                    assert_eq!(n.attrs["router"], router);
+                    assert_eq!(n.attrs["prefix_unknown"], true);
+                }
+                None => assert!(!n.attrs.contains_key("router"), "{n:?}"),
+            }
+        }
+        // Each `HANDLED_BY` leaves its own node: no node has two handlers.
+        let handled: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("HANDLED_BY"))
+            .collect();
+        let sources: BTreeSet<&str> = handled
+            .iter()
+            .map(|e| e.split(" -> ").next().unwrap())
+            .collect();
+        assert_eq!(sources.len(), handled.len(), "{handled:#?}");
+    }
+
+    /// F3 leaves every known-prefix key byte-identical to D1's format: an app route, a router
+    /// mounted in the same file, a gin engine and group, and a Spring mapping.
+    #[test]
+    fn known_prefix_keys_are_unchanged() {
+        let express = "import express, { Router } from \"express\";\nconst app = express();\nconst r = Router();\napp.use(\"/api\", r);\napp.get(\"/\", (q, s) => s.end());\nr.get(\"/x/:id\", (q, s) => s.end());\n";
+        let gin = "package main\nimport \"github.com/gin-gonic/gin\"\nfunc main() {\n\tr := gin.Default()\n\tg := r.Group(\"/billing\")\n\tg.POST(\"/pay\", pay)\n}\nfunc pay() {}\n";
+        let spring = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\n@RequestMapping(\"/api/v1\")\nclass C {\n  @PostMapping(\"/login\")\n  String login() { return \"\"; }\n}\n";
+        let built = build(
+            &[
+                ("web/app.ts", Language::TypeScript, express),
+                ("billing/main.go", Language::Go, gin),
+                ("auth/C.java", Language::Java, spring),
+            ],
+            &[],
+        );
+        let keys: BTreeSet<String> = built
+            .graph
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Endpoint)
+            .map(|n| n.key.clone())
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(
+                [
+                    "HTTP GET / @web",
+                    "HTTP GET /api/x/{} @web",
+                    "HTTP POST /billing/pay @billing",
+                    "HTTP POST /api/v1/login @auth",
+                ]
+                .map(str::to_owned)
+            )
         );
     }
 
@@ -683,7 +796,7 @@ mod tests {
         assert_eq!(
             exposes,
             [
-                "EXPOSES svc -> HTTP GET /deep @svc [heuristic]",
+                "EXPOSES svc -> HTTP GET /deep @svc ?router=svc/r.ts#r5000 [heuristic]",
                 "EXPOSES svc -> HTTP GET /s/s/s/shallow @svc [exact]",
             ]
         );
@@ -761,7 +874,7 @@ mod tests {
         assert_eq!(
             handled,
             [
-                "HANDLED_BY HTTP POST /login @svc -> rb-heuristic . . . `svc/handlers.ts`/login(). [heuristic]"
+                "HANDLED_BY HTTP POST /login @svc ?router=svc/routes.ts#r -> rb-heuristic . . . `svc/handlers.ts`/login(). [heuristic]"
             ]
         );
         assert!(

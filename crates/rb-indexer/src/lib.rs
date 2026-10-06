@@ -44,8 +44,10 @@ use serde_json::{Value, json};
 /// as a structural escape (amendment 80).
 /// `m4a-http-1` adds endpoints, `EXPOSES`, `HANDLED_BY` and route diagnostics (contract M4a),
 /// `m4a-http-2` `CONSUMES`, the `http_*` site diagnostics and `http_coverage`;
-/// `m4a-http-3` suffix matches ranked by the literals of the matched tail (M4a amendment 9).
-pub const PIPELINE: &str = "m4a-http-3";
+/// `m4a-http-3` suffix matches ranked by the literals of the matched tail (M4a amendment 9),
+/// `m4a-http-4` the router's identity in the key of an endpoint whose prefix is unknown (M4a
+/// amendment 10, fork F3).
+pub const PIPELINE: &str = "m4a-http-4";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

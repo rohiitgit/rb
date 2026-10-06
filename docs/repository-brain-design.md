@@ -487,7 +487,7 @@ Declarations that share a symbol key are aggregated per (symbol, table) rather t
 | `Service` | the project **directory** (`.` for the repo root, which is `role: unassigned` when no project is detected there). Names can collide, so name lookups return candidates instead of guessing (§9.1). |
 | `Table` | `schema.table` |
 | `Owner` | `@user`, `@org/team`, or email, verbatim from CODEOWNERS |
-| `Endpoint` | `HTTP <METHOD> <normalised path>` (path parameters → `{}`), or `GRPC <pkg.Service>/<Method>`. *As decided in contract-m4a (D1):* HTTP keys end in ` @<service key>`, e.g. `HTTP POST /api/v1/login @services/auth`, so two services' `GET /health` stay distinct; the display name is `POST /api/v1/login`. |
+| `Endpoint` | `HTTP <METHOD> <normalised path>` (path parameters → `{}`), or `GRPC <pkg.Service>/<Method>`. *As decided in contract-m4a (D1):* HTTP keys end in ` @<service key>`, e.g. `HTTP POST /api/v1/login @services/auth`, so two services' `GET /health` stay distinct; the display name is `POST /api/v1/login`. *As decided in contract-m4a (amendment 10, fork F3):* an endpoint whose prefix is unknown (a router mounted nowhere visible, a gin group passed as a parameter) is keyed by its tail plus ` ?router=<file>#<binding>`, e.g. `HTTP GET / @. ?router=users/routers.go#UserRegister.router`, so routes with one tail on different routers stay distinct; known-prefix keys are unchanged. |
 | `Package` | `<manager> <name>`; the version sits on the edge |
 
 ### 8.3 Relational schema (source of truth)
@@ -763,6 +763,7 @@ Server routes and client URLs are normalised to one form:
 - Query strings and fragments are dropped; a space is percent-encoded.
 - A client hole inside a segment makes the segment `{}`, flagged `partial`.
 - M4a reads `src/main/resources/application.properties` only. YAML, profile files and gateway configs are deferred, and a Spring YAML file mentioning `context-path` is reported as `spring_config_unread`.
+- *As decided in contract-m4a (amendment 10, fork F3):* when a route's prefix cannot be composed (an Express router mounted nowhere visible or through a default import, a gin group passed as a function parameter), the path is the tail below its router, the endpoint is flagged `prefix_unknown`, and its key carries the router's identity (the declaring file and the binding's scope-qualified name, no position), so it never merges with a route of the same tail on another router or with a known-prefix route.
 
 ### 10.2 Stitching client call sites to endpoints (`http_stitch`)
 

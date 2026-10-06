@@ -55,8 +55,10 @@ pub enum RouteBase {
     /// An Express app or router of this file: index into [`FileRoutes::routers`]. Its prefix
     /// comes from mounts, possibly in other files.
     Router(usize),
-    /// A gin group reached only as a function parameter: the prefix is unknown.
-    Unknown,
+    /// A gin group whose prefix is unknown (reached as a function parameter, through a dynamic
+    /// `Group(prefix)`, a cycle or the depth cap): index into `FileFacts::bindings` of the
+    /// registration's receiver, the router whose identity keys the endpoint ([`binding_identity`]).
+    Unknown(usize),
 }
 
 /// One route registration or mapping, before cross-file composition.
@@ -91,6 +93,8 @@ pub struct RouterDecl {
     pub kind: RouterKind,
     /// The binding's span (its identity in the file).
     pub span: Span,
+    /// Index into `FileFacts::bindings` of the binding ([`binding_identity`]).
+    pub binding: usize,
     /// Bound at the top level of the file, so other modules may import it.
     pub top_level: bool,
 }
@@ -241,6 +245,30 @@ impl Deref for FileScope<'_> {
     fn deref(&self) -> &FileFacts {
         self.facts
     }
+}
+
+/// A binding's identity within its file, stable across unrelated edits (no position): its name
+/// qualified by the names of its enclosing definitions, outermost first, with a Go method's
+/// receiver type when the type is declared in another file (`UsersRegister.router` for a
+/// parameter, `authRouter` at top level). Keys an endpoint whose prefix is unknown (contract M4a
+/// amendment 10).
+pub fn binding_identity(facts: &FileFacts, binding: usize) -> String {
+    let b = &facts.bindings[binding];
+    let mut names = vec![b.name.as_str()];
+    let mut seen = HashSet::new();
+    let mut cur = b.scope;
+    while let Some(i) = cur.filter(|&i| i < facts.definitions.len() && seen.insert(i)) {
+        let d = &facts.definitions[i];
+        names.push(&d.name);
+        if d.parent.is_none()
+            && let Some(receiver) = &d.receiver
+        {
+            names.push(receiver);
+        }
+        cur = d.parent;
+    }
+    names.reverse();
+    names.join(".")
 }
 
 /// The chain a binding is initialised with.
@@ -567,6 +595,7 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 name: b.name.clone(),
                 kind,
                 span: b.span,
+                binding: bi,
                 top_level: b.scope.is_none(),
             });
         }
@@ -756,7 +785,15 @@ fn gin(facts: &FileScope<'_>, out: &mut FileRoutes) {
         };
         let (path, base) = match prefix {
             Some(p) => (join(&p, &path), RouteBase::Root),
-            None => (path, RouteBase::Unknown),
+            // An unknown prefix always comes from a receiver binding (`gin_prefix`).
+            None => match chain
+                .root
+                .as_deref()
+                .and_then(|root| facts.binding_index_at(root, chain.span))
+            {
+                Some(receiver) => (path, RouteBase::Unknown(receiver)),
+                None => continue,
+            },
         };
         out.routes.push(RouteFact {
             framework: Framework::Gin,
@@ -866,7 +903,7 @@ mod tests {
                 let base = match r.base {
                     RouteBase::Root => "root".to_owned(),
                     RouteBase::Router(i) => format!("router {}", r_name(&facts, language, i)),
-                    RouteBase::Unknown => "unknown".to_owned(),
+                    RouteBase::Unknown(b) => format!("unknown {}", binding_identity(&facts, b)),
                 };
                 format!("{} {} {base} {handler}", r.method, norm_path(&r.path))
             })
@@ -1001,6 +1038,7 @@ public class AuthController {
                     .find(|b| b.name == "app")
                     .unwrap()
                     .span,
+                binding: facts.bindings.iter().position(|b| b.name == "app").unwrap(),
                 top_level: true,
             }]
         );
@@ -1076,7 +1114,7 @@ public class AuthController {
                 "PATCH /inline/y root name h.Y",
                 "DELETE /z root name h.Z",
                 "ANY /all root name h.All",
-                "GET /param unknown name h.P",
+                "GET /param unknown register.g name h.P",
                 "GET /engine root name h.E",
             ]
         );
@@ -1100,6 +1138,24 @@ public class AuthController {
         );
     }
 
+    /// A group of unknown prefix is identified by its receiver binding, qualified by the
+    /// enclosing definitions and, for a Go method whose type is declared elsewhere, the receiver
+    /// type; positions never enter it (contract M4a amendment 10).
+    #[test]
+    fn unknown_groups_are_identified_by_their_receiver() {
+        let src = "package api\nimport \"github.com/gin-gonic/gin\"\ntype Local struct{}\nfunc (l *Local) Register(g *gin.RouterGroup) {\n\tg.GET(\"/a\", h)\n}\nfunc (r *Remote) Register(g *gin.RouterGroup) {\n\tv := g.Group(\"/v\")\n\tv.GET(\"/b\", h)\n}\n";
+        assert_eq!(
+            summary(Language::Go, src),
+            [
+                "GET /a unknown Local.Register.g name h",
+                "GET /b unknown Remote.Register.v name h",
+            ]
+        );
+        // Moving the code down a line changes no identity.
+        let moved = src.replace("package api\n", "package api\n\n// moved\n");
+        assert_eq!(summary(Language::Go, &moved), summary(Language::Go, src));
+    }
+
     /// A group cycle through bindings (`a` from `b`, `b` from `a`) terminates with an unknown
     /// prefix; a chain of groups deeper than the cap is cut the same way.
     #[test]
@@ -1111,12 +1167,15 @@ public class AuthController {
         for b in &mut facts.bindings {
             b.visible = [0, 0, 100, 0];
         }
-        let got: Vec<(String, RouteBase)> = routes(Language::Go, &facts)
+        let got: Vec<(String, String)> = routes(Language::Go, &facts)
             .routes
             .into_iter()
-            .map(|r| (r.path, r.base))
+            .map(|r| match r.base {
+                RouteBase::Unknown(b) => (r.path, binding_identity(&facts, b)),
+                other => panic!("{other:?}"),
+            })
             .collect();
-        assert_eq!(got, [("/x".to_owned(), RouteBase::Unknown)]);
+        assert_eq!(got, [("/x".to_owned(), "a".to_owned())]);
 
         let n = 5_000;
         let mut src = String::from(
@@ -1129,7 +1188,7 @@ public class AuthController {
             "\tg{n}.GET(\"/deep\", h)\n\tg3.GET(\"/shallow\", h)\n}}\n"
         ));
         let got = summary(Language::Go, &src);
-        assert_eq!(got[0], "GET /deep unknown name h");
+        assert_eq!(got[0], "GET /deep unknown f.g5000 name h");
         assert_eq!(got[1], "GET /s/s/s/shallow root name h");
     }
 

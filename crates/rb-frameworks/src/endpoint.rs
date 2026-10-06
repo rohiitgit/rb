@@ -437,6 +437,14 @@ pub fn endpoint_key(method: &str, path: &str, service: &str) -> String {
     format!("HTTP {method} {path} @{service}")
 }
 
+/// The key of an endpoint whose prefix is unknown (contract M4a amendment 10, fork F3): the D1
+/// key of its tail followed by ` ?router=<router>`, the identity of the router or group the
+/// route is registered on, so routes with one tail on different routers stay apart. The
+/// normaliser drops query strings, so ` ?` never occurs in a normalised path.
+pub fn prefix_unknown_key(method: &str, path: &str, service: &str, router: &str) -> String {
+    format!("{} ?router={router}", endpoint_key(method, path, service))
+}
+
 /// The display name of an HTTP endpoint.
 pub fn endpoint_name(method: &str, path: &str) -> String {
     format!("{method} {path}")
@@ -686,5 +694,11 @@ mod tests {
         assert_eq!(endpoint_name("POST", "/api/v1/login"), "POST /api/v1/login");
         // ` @` never occurs inside a normalised path: spaces are encoded.
         assert!(!norm_path("/a @b").contains(" @"));
+        assert_eq!(
+            prefix_unknown_key("GET", "/", "svc", "users/routers.go#UsersRegister.router"),
+            "HTTP GET / @svc ?router=users/routers.go#UsersRegister.router"
+        );
+        // Nor does ` ?`: a query string is dropped.
+        assert!(!norm_path("/a ?router=x").contains(" ?"));
     }
 }

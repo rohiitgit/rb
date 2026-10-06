@@ -145,8 +145,10 @@ struct Shown {
     service: String,
 }
 
-/// The endpoint `input` names. Several candidates are listed as `N. <name>  [<service>]`, never
-/// picked silently, unless `pick` (1-based, in the listed order) chooses one (S15).
+/// The endpoint `input` names. Several candidates are listed as `N. <name>  [<service>]`, plus
+/// `  (prefix unknown, router <file>#<binding>)` for an endpoint keyed by its router (contract M4a
+/// amendment 10), never picked silently, unless `pick` (1-based, in the listed order) chooses
+/// one (S15).
 pub(crate) fn pick_endpoint(
     graph: &Graph,
     input: &str,
@@ -163,11 +165,16 @@ pub(crate) fn pick_endpoint(
                 .iter()
                 .enumerate()
                 .map(|(i, &id)| {
+                    let node = ctx.node(id);
+                    let router = node.attrs.get("router").and_then(Value::as_str);
                     format!(
-                        "  {}. {}  [{}]",
+                        "  {}. {}  [{}]{}",
                         i + 1,
-                        ctx.node(id).name,
-                        ctx.endpoint_service(id)
+                        node.name,
+                        ctx.endpoint_service(id),
+                        router.map_or_else(String::new, |r| format!(
+                            "  (prefix unknown, router {r})"
+                        ))
                     )
                 })
                 .collect();
@@ -361,6 +368,52 @@ mod tests {
         assert_eq!(normalised("login"), None);
         assert_eq!(normalised("AuthController.login x"), None);
         assert_eq!(normalised("POST "), None);
+    }
+
+    /// Amendment 10: endpoints that share a name on different routers (prefix unknown) are
+    /// listed with their router, and each is reachable by `--pick` or by its full key.
+    #[test]
+    fn prefix_unknown_candidates_show_their_router() {
+        use rb_model::GraphBuilder;
+        let mut b = GraphBuilder::new();
+        b.add_node(
+            rb_model::NodeKey::new(NodeKind::Service, "s"),
+            "s",
+            Attrs::new(),
+        )
+        .unwrap();
+        let keys = [
+            "HTTP GET / @s",
+            "HTTP GET / @s ?router=a.go#ArticlesRegister.router",
+            "HTTP GET / @s ?router=t.go#TagsRegister.router",
+        ];
+        for k in keys {
+            let mut attrs = json!({"service": "s"}).as_object().cloned().unwrap();
+            if let Some((_, r)) = k.split_once(" ?router=") {
+                attrs.insert("prefix_unknown".into(), true.into());
+                attrs.insert("router".into(), r.into());
+            }
+            b.add_node(
+                rb_model::NodeKey::new(NodeKind::Endpoint, k),
+                "GET /",
+                attrs,
+            )
+            .unwrap();
+        }
+        let graph = b.finish().unwrap();
+        let id = |k: &str| graph.nodes().iter().find(|n| n.key == k).unwrap().id;
+        let err = pick_endpoint(&graph, "GET /", None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "\"GET /\" matches 3 endpoints; pass --pick N:\n  1. GET /  [s]\n  2. GET /  [s]  (prefix unknown, router a.go#ArticlesRegister.router)\n  3. GET /  [s]  (prefix unknown, router t.go#TagsRegister.router)"
+        );
+        assert_eq!(
+            pick_endpoint(&graph, "GET /", Some(3)).unwrap(),
+            id(keys[2])
+        );
+        assert_eq!(pick_endpoint(&graph, keys[1], None).unwrap(), id(keys[1]));
     }
 
     /// S22: a `CONSUMES` step says how it was stitched (the host it named, the proxy it went
