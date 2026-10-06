@@ -1835,7 +1835,7 @@ fn scip_polyglot_monorepo() {
     );
     let broken_card = rb(&url, &["service", "services/broken", "--repo", &name]);
     assert!(
-        broken_card.contains("├─ Packages (1)\n│    maven/com.acme/nope@0.0.0\n"),
+        broken_card.contains("├─ Packages (1)\n│    com.acme/nope 0.0.0  [literal]\n"),
         "{broken_card}"
     );
     golden(

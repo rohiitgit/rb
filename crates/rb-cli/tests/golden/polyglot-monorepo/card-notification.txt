@@ -6,8 +6,6 @@ notification  (path: services/notification, deployable)
 ├─ File ownership
 │    @acme/messaging     5 files  100%
 │    unowned             0 files    0%
-├─ Packages (1)
-│    npm/express@?
 ├─ APIs (3)
 │    GET /health  → health().  [heuristic]
 │    POST /internal/mfa/email  → services/notification/src/server.ts (top-level code)  [exact]
@@ -20,4 +18,19 @@ notification  (path: services/notification, deployable)
 │      POST /internal/mfa/email  [synthetic]  1 site
 │    billing  (services/billing/cmd/billing)
 │      POST /internal/mfa/email  [synthetic]  1 site
-└─ HTTP client calls not stitched: 1 (rb status)
+├─ HTTP client calls not stitched: 1 (rb status)
+├─ Packages (1)
+│    express ?  [unresolved]
+├─ Database tables (1)
+│    public.email_log  insert  [exact]  (schema assumed)
+├─ Dependencies (0 services, 1 package)
+│    packages: 1
+├─ Depended on by (3)
+│    @acme/web (apps/web)  via http  [ambiguous]  POST /internal/mfa/email
+│    auth-service (services/auth)  via http  [synthetic]  POST /internal/mfa/email
+│    billing (services/billing/cmd/billing)  via http  [synthetic]  POST /internal/mfa/email
+├─ Shares tables with: none
+└─ Call graph (edges within the service)
+     2 symbols · CALLS 0, IMPLEMENTS 0, INJECTS 0, REFERENCES 0
+     certainty: -
+     entry points: endpoint 2, top-level 1

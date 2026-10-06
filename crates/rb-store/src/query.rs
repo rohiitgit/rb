@@ -31,8 +31,10 @@ pub struct OwnerShare {
     pub files: usize,
 }
 
-/// The Service Card (design §9.5): structure, packages and the HTTP sections (contract M4a S20),
-/// all computed at query time. Tables, service dependencies and the call graph arrive with M4b.
+/// The Service Card (design §9.5): structure, the HTTP sections (contract M4a S20), and the
+/// derived sections of contract M4b S18 (packages with versions, tables, service dependencies
+/// and their inverse, shared tables, the call graph and entry points), all computed at query
+/// time.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ServiceCard {
     pub key: String,
@@ -49,8 +51,6 @@ pub struct ServiceCard {
     /// Per-owner file counts, sorted by count desc then owner. A file can have several owners.
     pub file_owners: Vec<OwnerShare>,
     pub unowned_files: usize,
-    /// Keys of the packages the service depends on (`DEPENDS_ON`, design §5.5), sorted.
-    pub packages: Vec<String>,
     /// Endpoints it exposes, by key.
     pub apis: Vec<Api>,
     /// Other services' endpoints its code consumes, by service key.
@@ -59,6 +59,9 @@ pub struct ServiceCard {
     pub consumed_by: Vec<HttpPeer>,
     /// Its client call sites that were not stitched (`http_*` site diagnostics).
     pub unstitched: i64,
+    /// Packages, tables, dependencies, coupling and the call graph (contract M4b S17, S18).
+    #[serde(flatten)]
+    pub derived: crate::card::CardSections,
 }
 
 /// An endpoint a service exposes, with its handlers.
@@ -644,22 +647,6 @@ impl Store {
                 .collect())
         };
         let owners = targets("OWNED_BY")?;
-        // `Package` targets once each (a `scip` and a `manifest` edge may share one; contract
-        // M4b S15); services a manifest names are dependencies, not packages.
-        let packages: Vec<String> = self
-            .client
-            .query(
-                "SELECT o.key FROM rb.edge e
-                 JOIN rb.node o ON o.snapshot_id = e.snapshot_id AND o.id = e.dst
-                 WHERE e.snapshot_id = $1 AND e.src = $2 AND e.kind = 'DEPENDS_ON'
-                   AND o.kind = 'package'
-                 GROUP BY o.key
-                 ORDER BY o.key COLLATE \"C\"",
-                &[&snapshot_id, &id],
-            )?
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
         let apis = self.apis(snapshot_id, id)?;
         let (consumes, consumed_by) = self.http_peers(snapshot_id, id, key)?;
         let unstitched: i64 = self
@@ -686,11 +673,11 @@ impl Store {
             owners,
             file_owners,
             unowned_files,
-            packages,
             apis,
             consumes,
             consumed_by,
             unstitched,
+            derived: crate::card::card_sections(&self.load_graph(snapshot_id)?, key),
         })
     }
 

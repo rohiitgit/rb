@@ -1,7 +1,7 @@
 //! `rb` — Repository Brain CLI (design §11.1).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -1058,16 +1058,8 @@ fn render_card(c: &ServiceCard) -> String {
         files(c.unowned_files),
         percent(c.unowned_files, c.files)
     );
-    // Packages named by the service's exact (SCIP) references; heuristic projects have none.
-    if c.packages.is_empty() {
-        out += "├─ Packages: none\n";
-    } else {
-        out += &format!("├─ Packages ({})\n", c.packages.len());
-        for p in &c.packages {
-            out += &format!("│    {p}\n");
-        }
-    }
-    // The HTTP sections (contract M4a S20), the last one closing the tree.
+    // The HTTP sections (contract M4a S20), then the derived ones (contract M4b S18), the
+    // last one closing the tree.
     let mut sections = vec![
         section("APIs", c.apis.iter().map(api_line).collect()),
         section("Calls APIs of", peer_lines(&c.consumes)),
@@ -1082,6 +1074,7 @@ fn render_card(c: &ServiceCard) -> String {
             Vec::new(),
         ));
     }
+    sections.extend(derived_sections(&c.derived));
     let n = sections.len();
     for (i, (head, lines)) in sections.into_iter().enumerate() {
         let (branch, rail) = if i + 1 == n {
@@ -1095,6 +1088,139 @@ fn render_card(c: &ServiceCard) -> String {
         }
     }
     out
+}
+
+/// The card's sections of contract M4b S18: packages with versions, database tables, service
+/// dependencies by via and the packages count, the inverse, shared tables (coupling), and the
+/// call graph with entry points by kind.
+fn derived_sections(d: &rb_store::card::CardSections) -> Vec<(String, Vec<String>)> {
+    let packages = d
+        .packages
+        .iter()
+        .map(|p| {
+            let version = if p.version.is_empty() {
+                "?"
+            } else {
+                p.version.as_str()
+            };
+            let mut line = format!("{} {version}", p.name);
+            if let Some(from) = &p.version_from {
+                let _ = write!(line, "  [{from}]");
+            }
+            if p.provenance.iter().any(|x| x == "scip") {
+                line.push_str("  (scip)");
+            }
+            line
+        })
+        .collect();
+    let tables = d
+        .tables
+        .iter()
+        .map(|t| {
+            let ops = if t.ops.is_empty() {
+                "mapped".to_owned()
+            } else {
+                t.ops.join(", ")
+            };
+            let assumed = if t.schema_assumed {
+                "  (schema assumed)"
+            } else {
+                ""
+            };
+            format!("{}  {ops}  [{}]{assumed}", t.key, t.certainty)
+        })
+        .collect();
+    let dep_line = |s: &rb_store::card::ServiceDep| {
+        let mut line = format!("{} ({})  via {}  [{}]", s.name, s.key, s.via, s.certainty);
+        match s.via.as_str() {
+            "calls" => {
+                let mut parts = Vec::new();
+                for (n, what) in [(s.calls, "call site"), (s.references, "reference site")] {
+                    if n > 0 {
+                        parts.push(format!("{n} {what}{}", if n == 1 { "" } else { "s" }));
+                    }
+                }
+                let _ = write!(line, "  {}", parts.join(", "));
+            }
+            "http" => {
+                let eps: Vec<&str> = s.endpoints.iter().map(|e| e.display.as_str()).collect();
+                let _ = write!(line, "  {}", eps.join(", "));
+            }
+            _ => {}
+        }
+        line
+    };
+    let services: BTreeSet<&str> = d.dependencies.iter().map(|s| s.key.as_str()).collect();
+    let dependencies = if services.is_empty() && d.packages.is_empty() {
+        ("Dependencies: none".to_owned(), Vec::new())
+    } else {
+        let mut lines: Vec<String> = d.dependencies.iter().map(dep_line).collect();
+        lines.push(format!("packages: {}", d.packages.len()));
+        (
+            format!(
+                "Dependencies ({} service{}, {} package{})",
+                services.len(),
+                if services.len() == 1 { "" } else { "s" },
+                d.packages.len(),
+                if d.packages.len() == 1 { "" } else { "s" }
+            ),
+            lines,
+        )
+    };
+    let shares = d
+        .shares_tables
+        .iter()
+        .map(|s| format!("{} ({})  {}", s.name, s.key, s.tables.join(", ")))
+        .collect();
+    let g = &d.call_graph;
+    let kinds: Vec<String> = g.edges.iter().map(|(k, n)| format!("{k} {n}")).collect();
+    let total: usize = g.certainty.values().sum();
+    let mut shares_by: Vec<(&String, &usize)> = g.certainty.iter().collect();
+    shares_by.sort_by_key(|(c, _)| {
+        std::cmp::Reverse(code::parse_certainty(c).unwrap_or(rb_model::Certainty::Ambiguous))
+    });
+    let certainty: Vec<String> = shares_by
+        .iter()
+        .map(|(c, n)| format!("{c} {:.1}%", **n as f64 * 100.0 / total as f64))
+        .collect();
+    let entries: Vec<String> = d
+        .entry_points
+        .iter()
+        .map(|(k, n)| format!("{k} {n}"))
+        .collect();
+    let call_graph = vec![
+        format!("{} symbols · {}", g.symbols, kinds.join(", ")),
+        format!(
+            "certainty: {}",
+            if certainty.is_empty() {
+                "-".to_owned()
+            } else {
+                certainty.join(", ")
+            }
+        ),
+        format!(
+            "entry points: {}",
+            if entries.is_empty() {
+                "none".to_owned()
+            } else {
+                entries.join(", ")
+            }
+        ),
+    ];
+    vec![
+        section("Packages", packages),
+        section("Database tables", tables),
+        dependencies,
+        section(
+            "Depended on by",
+            d.depended_on_by.iter().map(dep_line).collect(),
+        ),
+        section("Shares tables with", shares),
+        (
+            "Call graph (edges within the service)".to_owned(),
+            call_graph,
+        ),
+    ]
 }
 
 /// A card section: `Title (n)` with its lines, or `Title: none`. Grouped sections count their
@@ -1494,17 +1620,30 @@ mod tests {
             owners: vec![],
             file_owners: vec![],
             unowned_files: 1,
-            packages: vec![],
             apis: vec![],
             consumes: vec![],
             consumed_by: vec![],
             unstitched: 0,
+            derived: rb_store::card::CardSections {
+                packages: vec![],
+                tables: vec![],
+                dependencies: vec![],
+                depended_on_by: vec![],
+                shares_tables: vec![],
+                call_graph: rb_store::card::CallGraph {
+                    symbols: 0,
+                    edges: Default::default(),
+                    certainty: Default::default(),
+                },
+                entry_points: Default::default(),
+            },
         };
+        // The HTTP sections, between the file ownership and the derived sections.
         let tail = |card: &ServiceCard| -> Vec<String> {
             render_card(card)
                 .lines()
-                .skip_while(|l| !l.starts_with("├─ Packages"))
-                .skip(1)
+                .skip_while(|l| !l.starts_with("├─ APIs"))
+                .take_while(|l| !l.starts_with("├─ Packages"))
                 .map(str::to_owned)
                 .collect()
         };
@@ -1513,7 +1652,7 @@ mod tests {
             [
                 "├─ APIs: none",
                 "├─ Calls APIs of: none",
-                "└─ APIs called by: none"
+                "├─ APIs called by: none"
             ]
         );
         let handler = |key: &str, kind: &str, c: &str| rb_store::Handler {
@@ -1563,7 +1702,116 @@ mod tests {
                 "│    notification  (services/notification)",
                 "│      POST /m  [synthetic]  2 sites",
                 "├─ APIs called by: none",
-                "└─ HTTP client calls not stitched: 3 (rb status)",
+                "├─ HTTP client calls not stitched: 3 (rb status)",
+            ]
+        );
+        // The derived sections (contract M4b S18), each `none` when empty, the call graph
+        // closing the tree.
+        let derived = |card: &ServiceCard| -> Vec<String> {
+            render_card(card)
+                .lines()
+                .skip_while(|l| !l.starts_with("├─ Packages"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            derived(&card),
+            [
+                "├─ Packages: none",
+                "├─ Database tables: none",
+                "├─ Dependencies: none",
+                "├─ Depended on by: none",
+                "├─ Shares tables with: none",
+                "└─ Call graph (edges within the service)",
+                "     0 symbols · ",
+                "     certainty: -",
+                "     entry points: none",
+            ]
+        );
+        use rb_store::card::{EndpointRef, PackageUse, ServiceDep, SharedTables, TableUse};
+        let d = &mut card.derived;
+        d.packages = vec![
+            PackageUse {
+                key: "npm/x@1.0.0".into(),
+                name: "x".into(),
+                version: "1.0.0".into(),
+                version_from: Some("lockfile".into()),
+                provenance: vec!["manifest".into(), "scip".into()],
+            },
+            PackageUse {
+                key: "maven/a/b@?".into(),
+                name: "a/b".into(),
+                version: String::new(),
+                version_from: Some("unresolved".into()),
+                provenance: vec!["manifest".into()],
+            },
+        ];
+        d.tables = vec![TableUse {
+            key: "public.users".into(),
+            ops: vec!["read".into(), "update".into()],
+            certainty: "exact".into(),
+            schema_assumed: true,
+        }];
+        let dep = |key: &str, via: &str, calls, refs, eps: &[&str]| ServiceDep {
+            key: key.into(),
+            name: key.to_uppercase(),
+            via: via.into(),
+            certainty: "heuristic".into(),
+            calls,
+            references: refs,
+            endpoints: eps
+                .iter()
+                .map(|e| EndpointRef {
+                    key: format!("HTTP {e} @{key}"),
+                    display: (*e).into(),
+                })
+                .collect(),
+        };
+        d.dependencies = vec![
+            dep("lib", "calls", 2, 1, &[]),
+            dep("lib", "package", 0, 0, &[]),
+            dep("n", "http", 0, 0, &["POST /m"]),
+        ];
+        d.depended_on_by = vec![dep("web", "http", 0, 0, &["POST /b"])];
+        d.shares_tables = vec![SharedTables {
+            key: "billing".into(),
+            name: "BILLING".into(),
+            tables: vec!["public.users".into()],
+        }];
+        d.call_graph.symbols = 3;
+        d.call_graph.edges = [("CALLS", 2), ("IMPLEMENTS", 1)]
+            .into_iter()
+            .map(|(k, n)| (k.to_owned(), n))
+            .collect();
+        d.call_graph.certainty = [("heuristic", 1), ("exact", 2)]
+            .into_iter()
+            .map(|(k, n)| (k.to_owned(), n))
+            .collect();
+        d.entry_points = [("main", 1), ("endpoint", 2)]
+            .into_iter()
+            .map(|(k, n)| (k.to_owned(), n))
+            .collect();
+        assert_eq!(
+            derived(&card),
+            [
+                "├─ Packages (2)",
+                "│    x 1.0.0  [lockfile]  (scip)",
+                "│    a/b ?  [unresolved]",
+                "├─ Database tables (1)",
+                "│    public.users  read, update  [exact]  (schema assumed)",
+                "├─ Dependencies (2 services, 2 packages)",
+                "│    LIB (lib)  via calls  [heuristic]  2 call sites, 1 reference site",
+                "│    LIB (lib)  via package  [heuristic]",
+                "│    N (n)  via http  [heuristic]  POST /m",
+                "│    packages: 2",
+                "├─ Depended on by (1)",
+                "│    WEB (web)  via http  [heuristic]  POST /b",
+                "├─ Shares tables with (1)",
+                "│    BILLING (billing)  public.users",
+                "└─ Call graph (edges within the service)",
+                "     3 symbols · CALLS 2, IMPLEMENTS 1",
+                "     certainty: exact 66.7%, heuristic 33.3%",
+                "     entry points: endpoint 2, main 1",
             ]
         );
     }

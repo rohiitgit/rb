@@ -5,7 +5,15 @@ edge-gateway  (path: gateway, deployable)
 ├─ File ownership
 │    @acme/platform      1 file  100%
 │    unowned            0 files    0%
-├─ Packages: none
 ├─ APIs: none
 ├─ Calls APIs of: none
-└─ APIs called by: none
+├─ APIs called by: none
+├─ Packages: none
+├─ Database tables: none
+├─ Dependencies: none
+├─ Depended on by: none
+├─ Shares tables with: none
+└─ Call graph (edges within the service)
+     0 symbols · CALLS 0, IMPLEMENTS 0, INJECTS 0, REFERENCES 0
+     certainty: -
+     entry points: none

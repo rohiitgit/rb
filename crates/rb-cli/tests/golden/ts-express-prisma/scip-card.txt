@@ -8,11 +8,22 @@ auth-api  (path: ., deployable)
 │    @acme/platform      4 files   44%
 │    @acme/data           1 file   11%
 │    unowned             0 files    0%
-├─ Packages (3)
-│    npm/@prisma/client@5.22.0
-│    npm/express@4.22.3
-│    npm/pg@8.23.0
 ├─ APIs (1)
 │    POST /api/v1/login  → src/routes/auth.ts (top-level code)  [heuristic]
 ├─ Calls APIs of: none
-└─ APIs called by: none
+├─ APIs called by: none
+├─ Packages (3)
+│    @prisma/client 5.22.0  [lockfile]  (scip)
+│    express 4.22.3  [lockfile]
+│    pg 8.23.0  [lockfile]
+├─ Database tables (2)
+│    public.sessions  insert  [exact]  (schema assumed)
+│    public.users  read  [exact]  (schema assumed)
+├─ Dependencies (0 services, 3 packages)
+│    packages: 3
+├─ Depended on by: none
+├─ Shares tables with: none
+└─ Call graph (edges within the service)
+     5 symbols · CALLS 2, IMPLEMENTS 0, INJECTS 0, REFERENCES 0
+     certainty: exact 100.0%
+     entry points: endpoint 1, top-level 1

@@ -33,9 +33,24 @@
     }
   ],
   "unowned_files": 2,
-  "packages": [],
   "apis": [],
   "consumes": [],
   "consumed_by": [],
-  "unstitched": 0
+  "unstitched": 0,
+  "packages": [],
+  "tables": [],
+  "dependencies": [],
+  "depended_on_by": [],
+  "shares_tables": [],
+  "call_graph": {
+    "symbols": 0,
+    "edges": {
+      "CALLS": 0,
+      "IMPLEMENTS": 0,
+      "INJECTS": 0,
+      "REFERENCES": 0
+    },
+    "certainty": {}
+  },
+  "entry_points": {}
 }

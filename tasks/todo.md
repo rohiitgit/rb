@@ -573,7 +573,7 @@ Same rules as M4a:
   - *Invariants:* default `cha`; visited sets on nodes and endpoints; `CONSUMES` A ↔ B cycle test; counted growth.
   - Files: `rb-store/src/query.rs`, `rb-store/src/code.rs` (shared walk), `rb-store/src/path.rs` (upstream continuation reused, not duplicated), `rb-cli/src/main.rs`.
   - **Verify:** units; e2e (`table-deps-*` re-blessed; the "arrive with call resolution (M3)" line gone).
-- [ ] **10. Service dependencies and the full card** (S17, S18).
+- [x] **10. Service dependencies and the full card** (S17, S18). Done: `rb-store/src/card.rs` (`card_sections`), `ServiceCard.derived`, `render_card`'s derived sections; amendment 13; 2 units (+ the card unit extended), 15 mutants killed (three survivors given rows; a redundant self filter deleted as equivalent). Files: `rb-store/src/{card,lib,query}.rs`, `rb-cli/src/main.rs`, `rb-cli/tests/e2e.rs` (the failed service's package line).
   - *Derived (query time):* `via=calls`/`via=http`/`via=package`; depended on by; shares tables; tables; call-graph summary; entry points by kind; JSON fields.
   - *Invariants:* bytewise order; a self-call excluded; two vias between one pair both shown.
   - Files: `rb-store/src/query.rs`, `rb-cli/src/main.rs` (`render_card`).
