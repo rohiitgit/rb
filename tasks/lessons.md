@@ -240,3 +240,7 @@
 ## 2026-10-07: keep a runtime harness out of the repository the indexer reads
 - **Mistake (caught while verifying):** the first DI repro of pass 2 put the Spring context bootstrap (`new AnnotationConfigApplicationContext(App.class)` in `main`) inside the indexed repository; that is a programmatic registration surface, so gate D capped every point (`surface`) and hid the gate-M behaviour under test.
 - **Rule:** when a finding is confirmed at run time, compile the repro's sources together with a harness class kept outside the indexed tree; index exactly the shape the finding describes, and if the harness must live in the repository, check first which gates its own code trips.
+
+## 2026-10-07: a test that loops until the system says "stop" bounds its own iterations
+- **Mistake:** the pagination e2e followed `next_offset` until it was `null`; a mutant that dropped the CLI's `--offset` made every page the first one, so the loop never ended and the mutation harness hung for ten minutes until it was stopped with SIGINT (the source restored and checked).
+- **Rule:** any test loop driven by the system under test (pages, retries, polling, a fixpoint) asserts progress at each step (the page starts where asked, the next offset is strictly larger) and runs at most a bound computed from the input (`total` pages), so a regression fails instead of hanging.

@@ -16,6 +16,13 @@ pub struct FoundNode {
     pub name: String,
 }
 
+/// One page of `find`'s matches and how many there are in all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundPage {
+    pub nodes: Vec<FoundNode>,
+    pub total: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ServiceSummary {
     pub key: String,
@@ -225,14 +232,17 @@ pub enum Resolved {
 
 impl Store {
     /// Search nodes by key or name (design §9.1): exact matches first, then substring matches ranked
-    /// by trigram similarity. Deterministic: ties break on kind and key.
+    /// by trigram similarity. Deterministic: ties break on kind and key, bytewise, so the order is
+    /// total and pages over one snapshot never drift (contract M5 D18). One `LIMIT/OFFSET` query
+    /// for the page and one count of every match.
     pub fn find(
         &mut self,
         snapshot_id: i64,
         text: &str,
         kind: Option<NodeKind>,
         limit: i64,
-    ) -> anyhow::Result<Vec<FoundNode>> {
+        offset: i64,
+    ) -> anyhow::Result<FoundPage> {
         let like = format!("%{}%", escape_like(text));
         let kind = kind.map(NodeKind::as_str);
         let rows = self.client.query(
@@ -241,10 +251,22 @@ impl Store {
                AND (key ILIKE $3 ESCAPE '\\' OR name ILIKE $3 ESCAPE '\\')
              ORDER BY (key = $4) DESC, (name = $4) DESC, similarity(name, $4) DESC,
                       length(key), kind COLLATE \"C\", key COLLATE \"C\"
-             LIMIT $5",
-            &[&snapshot_id, &kind, &like, &text, &limit],
+             LIMIT $5 OFFSET $6",
+            &[&snapshot_id, &kind, &like, &text, &limit, &offset],
         )?;
-        Ok(rows.iter().map(found_from_row).collect())
+        let total: i64 = self
+            .client
+            .query_one(
+                "SELECT count(*) FROM rb.node
+                 WHERE snapshot_id = $1 AND ($2::text IS NULL OR kind = $2)
+                   AND (key ILIKE $3 ESCAPE '\\' OR name ILIKE $3 ESCAPE '\\')",
+                &[&snapshot_id, &kind, &like],
+            )?
+            .get(0);
+        Ok(FoundPage {
+            nodes: rows.iter().map(found_from_row).collect(),
+            total,
+        })
     }
 
     /// Resolves a service by exact key (its directory) or exact name.

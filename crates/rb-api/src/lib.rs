@@ -31,6 +31,70 @@ pub const API_VERSION: u32 = 1;
 /// `rb find`'s page size: default and maximum.
 pub const FIND_LIMIT_DEFAULT: u64 = 20;
 pub const FIND_LIMIT_MAX: u64 = 1_000;
+/// The page size of the other flat lists (`services`, `snapshots`): default and maximum.
+pub const LIST_LIMIT_MAX: u64 = 1_000;
+/// The largest `offset` (Postgres' `OFFSET` is a `bigint`).
+pub const OFFSET_MAX: u64 = i64::MAX as u64;
+
+/// One page of a flat list (contract M5 D18): `limit` rows from `offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Page {
+    pub limit: u64,
+    pub offset: u64,
+}
+
+impl Page {
+    fn read(p: &Params, default: u64, max: u64) -> Result<Page, ApiError> {
+        Ok(Page {
+            limit: p.int("limit", default, 1, max)?,
+            offset: p.int("offset", 0, 0, OFFSET_MAX)?,
+        })
+    }
+}
+
+/// A page of a list and where the next one starts (`null` at the end, D18). Snapshots are
+/// immutable and every listed order is total, so offset pages over one snapshot never drift.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Paged<T> {
+    /// Rows in the whole list.
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u64,
+    pub next_offset: Option<u64>,
+    pub items: Vec<T>,
+}
+
+impl<T> Paged<T> {
+    /// The page of `all` (a list of `total` rows) that `page` names: at most `offset + limit`
+    /// elements are taken from the iterator (counted in the growth test).
+    pub fn of(total: u64, page: Page, all: impl Iterator<Item = T>) -> Paged<T> {
+        let skip = usize::try_from(page.offset).unwrap_or(usize::MAX);
+        let take = usize::try_from(page.limit).unwrap_or(usize::MAX);
+        Paged::from_rows(total, page, all.skip(skip).take(take).collect())
+    }
+
+    /// A page whose rows were already selected (`find`'s `LIMIT/OFFSET` query).
+    pub fn from_rows(total: u64, page: Page, items: Vec<T>) -> Paged<T> {
+        let end = page.offset.saturating_add(items.len() as u64);
+        Paged {
+            total,
+            offset: page.offset,
+            limit: page.limit,
+            next_offset: (end < total).then_some(end),
+            items,
+        }
+    }
+
+    fn map<U>(&self, f: impl FnMut(&T) -> U) -> Paged<U> {
+        Paged {
+            total: self.total,
+            offset: self.offset,
+            limit: self.limit,
+            next_offset: self.next_offset,
+            items: self.items.iter().map(f).collect(),
+        }
+    }
+}
 
 /// What a request asks, as a path segment of `/v1/repos/{repo}/…` and a CLI command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,9 +148,10 @@ impl Endpoint {
     /// `status` and `snapshots` describe the repository, not one snapshot.
     pub fn params(self) -> &'static [&'static str] {
         match self {
-            Endpoint::Status | Endpoint::Snapshots => &[],
-            Endpoint::Find => &["q", "kind", "limit", "snapshot"],
-            Endpoint::Services => &["snapshot"],
+            Endpoint::Status => &[],
+            Endpoint::Snapshots => &["limit", "offset"],
+            Endpoint::Find => &["q", "kind", "limit", "offset", "snapshot"],
+            Endpoint::Services => &["limit", "offset", "snapshot"],
             Endpoint::Service => &["name", "snapshot"],
             Endpoint::Callers => &[
                 "target",
@@ -181,13 +246,13 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
     Status,
-    Snapshots,
+    Snapshots(Page),
     Find {
         q: String,
         kind: Option<NodeKind>,
-        limit: u64,
+        page: Page,
     },
-    Services,
+    Services(Page),
     Service {
         name: String,
     },
@@ -242,13 +307,13 @@ pub fn parse(
         || -> Result<Option<usize>, ApiError> { Ok(p.int_opt("pick", 1, PICK_MAX)?.map(usize_of)) };
     let query = match endpoint {
         Endpoint::Status => Query::Status,
-        Endpoint::Snapshots => Query::Snapshots,
+        Endpoint::Snapshots => Query::Snapshots(Page::read(p, LIST_LIMIT_MAX, LIST_LIMIT_MAX)?),
         Endpoint::Find => Query::Find {
             q: p.text("q")?,
             kind: p.kind_opt("kind")?,
-            limit: p.int("limit", FIND_LIMIT_DEFAULT, 1, FIND_LIMIT_MAX)?,
+            page: Page::read(p, FIND_LIMIT_DEFAULT, FIND_LIMIT_MAX)?,
         },
-        Endpoint::Services => Query::Services,
+        Endpoint::Services => Query::Services(Page::read(p, LIST_LIMIT_MAX, LIST_LIMIT_MAX)?),
         Endpoint::Service => Query::Service {
             name: p.text("name")?,
         },
@@ -346,9 +411,9 @@ impl Query {
     pub fn endpoint(&self) -> Endpoint {
         match self {
             Query::Status => Endpoint::Status,
-            Query::Snapshots => Endpoint::Snapshots,
+            Query::Snapshots(_) => Endpoint::Snapshots,
             Query::Find { .. } => Endpoint::Find,
-            Query::Services => Endpoint::Services,
+            Query::Services(_) => Endpoint::Services,
             Query::Service { .. } => Endpoint::Service,
             Query::Callers { .. } => Endpoint::Callers,
             Query::Impact { .. } => Endpoint::Impact,
@@ -361,11 +426,16 @@ impl Query {
     /// The envelope's `query`: every parameter, defaults filled in, typed (D4).
     pub fn normalised(&self) -> Value {
         match self {
-            Query::Status | Query::Snapshots => json!({}),
-            Query::Find { q, kind, limit } => {
-                json!({"q": q, "kind": kind.map(NodeKind::as_str), "limit": limit})
+            Query::Status => json!({}),
+            Query::Snapshots(page) | Query::Services(page) => {
+                json!({"limit": page.limit, "offset": page.offset})
             }
-            Query::Services => json!({}),
+            Query::Find { q, kind, page } => json!({
+                "q": q,
+                "kind": kind.map(NodeKind::as_str),
+                "limit": page.limit,
+                "offset": page.offset,
+            }),
             Query::Service { name } => json!({ "name": name }),
             Query::Callers {
                 target,
@@ -437,9 +507,9 @@ pub enum Answer {
         all: bool,
         reports: Vec<StatusReport>,
     },
-    Snapshots(Vec<SnapshotInfo>),
-    Find(Vec<FoundNode>),
-    Services(Vec<ServiceSummary>),
+    Snapshots(Paged<SnapshotInfo>),
+    Find(Paged<FoundNode>),
+    Services(Paged<ServiceSummary>),
     Card(Box<ServiceCard>),
     Callers {
         ix: Arc<SnapshotIndex>,
@@ -469,7 +539,6 @@ impl Serialize for Answer {
                 .expect("one report per repository")
                 .serialize(s),
             Answer::Snapshots(snapshots) => snapshots
-                .iter()
                 .map(|x| {
                     json!({
                         "id": x.id,
@@ -480,7 +549,6 @@ impl Serialize for Answer {
                         "tool_versions": x.tool_versions,
                     })
                 })
-                .collect::<Vec<_>>()
                 .serialize(s),
             Answer::Find(found) => found.serialize(s),
             Answer::Services(services) => services.serialize(s),
@@ -613,7 +681,7 @@ pub fn run(
     }
     Ok(store.read_tx(|s| match &req.query {
         Query::Status => Ok(status(s, req.repo.as_deref())?),
-        Query::Snapshots => {
+        Query::Snapshots(page) => {
             let repo = resolve_repo(s, req.repo.as_deref())?;
             let live = live_snapshot(s, &repo).ok();
             if live.is_none() && !s.repo_names()?.contains(&repo) {
@@ -626,7 +694,10 @@ pub fn run(
                 limits: BTreeMap::new(),
                 truncated: Vec::new(),
                 certainty: None,
-                answer: Answer::Snapshots(s.snapshots(&repo)?),
+                answer: Answer::Snapshots({
+                    let all = s.snapshots(&repo)?;
+                    Paged::of(all.len() as u64, *page, all.into_iter())
+                }),
             })
         }
         _ => {
@@ -847,20 +918,29 @@ fn answer(
     settings: &Settings,
 ) -> Result<Output, ApiError> {
     let caps = settings.caps;
-    let mut out = Output {
-        repo: Some(snap.repo.clone()),
-        snapshot: Some(snapshot_ref(snap)),
-        query: query.normalised(),
-        limits: BTreeMap::new(),
-        truncated: Vec::new(),
-        certainty: None,
-        answer: Answer::Services(Vec::new()),
-    };
-    out.answer = match query {
-        Query::Find { q, kind, limit } => {
-            Answer::Find(store.find(snap.id, q, *kind, i64::try_from(*limit).expect("bounded"))?)
+    // The envelope's facets the answer sets: caps in force, limits that cut it, certainties.
+    let mut limits = BTreeMap::new();
+    let mut truncated = Vec::new();
+    let mut certainty = None;
+    let answer = match query {
+        Query::Find { q, kind, page } => {
+            let found = store.find(
+                snap.id,
+                q,
+                *kind,
+                i64::try_from(page.limit).expect("bounded"),
+                i64::try_from(page.offset).expect("bounded"),
+            )?;
+            Answer::Find(Paged::from_rows(
+                u64::try_from(found.total).expect("a count"),
+                *page,
+                found.nodes,
+            ))
         }
-        Query::Services => Answer::Services(store.services(snap.id)?),
+        Query::Services(page) => {
+            let all = store.services(snap.id)?;
+            Answer::Services(Paged::of(all.len() as u64, *page, all.into_iter()))
+        }
         Query::Service { name } => {
             let found = match store.resolve_service(snap.id, name)? {
                 Resolved::One(n) => n,
@@ -887,9 +967,9 @@ fn answer(
             // The card's derived sections read adjacency: one budget for the card (amendment 4).
             let (card, spent) =
                 rb_store::work::metered(caps.work, || store.service_card(snap.id, &ix, &found.key));
-            out.limits = limits_of(&[(Limit::Work, caps.work)]);
+            limits = limits_of(&[(Limit::Work, caps.work)]);
             if spent.refused {
-                out.truncated = vec![Limit::Work.as_str().to_owned()];
+                truncated = vec![Limit::Work.as_str().to_owned()];
             }
             Answer::Card(Box::new(card?))
         }
@@ -914,9 +994,9 @@ fn answer(
                     caps,
                 },
             );
-            out.limits = limits_of(&[(Limit::Tree, caps.tree as u64), (Limit::Work, caps.work)]);
-            out.truncated = names(&tree.truncated);
-            out.certainty = Some(histogram(caller_certainties(&tree.callers)));
+            limits = limits_of(&[(Limit::Tree, caps.tree as u64), (Limit::Work, caps.work)]);
+            truncated = names(&tree.truncated);
+            certainty = Some(histogram(caller_certainties(&tree.callers)));
             Answer::Callers { ix, tree }
         }
         Query::Impact {
@@ -928,9 +1008,9 @@ fn answer(
             let ix = indexes.index(store, snap, live)?;
             let t = render::pick_target(&ix, target, *pick)?;
             let impact = rb_store::code::impact_capped(&ix, t, *min_certainty, *precision, caps);
-            out.limits = limits_of(&[(Limit::Nodes, caps.nodes as u64), (Limit::Work, caps.work)]);
-            out.truncated = names(&impact.truncated);
-            out.certainty = Some(histogram(
+            limits = limits_of(&[(Limit::Nodes, caps.nodes as u64), (Limit::Work, caps.work)]);
+            truncated = names(&impact.truncated);
+            certainty = Some(histogram(
                 impact
                     .breaks
                     .iter()
@@ -977,13 +1057,13 @@ fn answer(
                     caps,
                 },
             )?;
-            out.limits = limits_of(&[
+            limits = limits_of(&[
                 (Limit::Nodes, caps.nodes as u64),
                 (Limit::Tree, caps.tree as u64),
                 (Limit::Work, caps.work),
             ]);
-            out.truncated = deps.rollup.truncated.clone();
-            out.certainty = Some(histogram(
+            truncated = deps.rollup.truncated.clone();
+            certainty = Some(histogram(
                 deps.migrations
                     .iter()
                     .chain(&deps.mappings)
@@ -1013,9 +1093,9 @@ fn answer(
                     caps,
                 },
             );
-            out.limits = limits_of(&[(Limit::Tree, caps.tree as u64), (Limit::Work, caps.work)]);
-            out.truncated = names(&path.truncated);
-            out.certainty = Some(
+            limits = limits_of(&[(Limit::Tree, caps.tree as u64), (Limit::Work, caps.work)]);
+            truncated = names(&path.truncated);
+            certainty = Some(
                 path.histogram
                     .iter()
                     .map(|(c, n)| (c.as_str(), *n))
@@ -1026,11 +1106,19 @@ fn answer(
                 path: Box::new(path),
             }
         }
-        Query::Status | Query::Snapshots | Query::Cypher { .. } => {
+        Query::Status | Query::Snapshots(_) | Query::Cypher { .. } => {
             unreachable!("answered by `run` itself")
         }
     };
-    Ok(out)
+    Ok(Output {
+        repo: Some(snap.repo.clone()),
+        snapshot: Some(snapshot_ref(snap)),
+        query: query.normalised(),
+        limits,
+        truncated,
+        certainty,
+        answer,
+    })
 }
 
 /// Every caller entry's certainty, depth first.
@@ -1125,6 +1213,108 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.param.as_deref(), Some("columns"));
+    }
+
+    /// Contract M5 S15: for limits 1, 7 and the maximum, the pages concatenate to the whole list;
+    /// `total` is its length; `next_offset` is null exactly on the last page; an offset past the
+    /// end is an empty page with a null `next_offset`.
+    #[test]
+    fn pages_concatenate_to_the_whole_list() {
+        for n in [0u64, 1, 6, 7, 8, 20, 1_001] {
+            let all: Vec<u64> = (0..n).collect();
+            for limit in [1, 7, LIST_LIMIT_MAX] {
+                let mut joined = Vec::new();
+                let mut offset = 0;
+                loop {
+                    let p = Paged::of(n, Page { limit, offset }, all.iter().copied());
+                    assert_eq!(p.total, n);
+                    assert!(p.items.len() as u64 <= limit);
+                    joined.extend(p.items.iter().copied());
+                    match p.next_offset {
+                        Some(next) => {
+                            assert_eq!(next, offset + limit, "{n} {limit}");
+                            offset = next;
+                        }
+                        None => {
+                            assert_eq!(joined.len() as u64, n, "the last page ends the list");
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(joined, all, "{n} {limit}");
+            }
+            let past = Paged::of(
+                n,
+                Page {
+                    limit: 7,
+                    offset: n + 3,
+                },
+                all.iter().copied(),
+            );
+            assert!(past.items.is_empty() && past.next_offset.is_none());
+        }
+        // `find`'s rows come from its query: the same rule on a selected page.
+        let p = Paged::from_rows(
+            10,
+            Page {
+                limit: 4,
+                offset: 8,
+            },
+            vec!['a', 'b'],
+        );
+        assert_eq!(p.next_offset, None);
+        let p = Paged::from_rows(
+            10,
+            Page {
+                limit: 4,
+                offset: 4,
+            },
+            vec!['a'; 4],
+        );
+        assert_eq!(p.next_offset, Some(8));
+    }
+
+    /// Contract M5 S15, invariant 10: a page examines at most `offset + limit` elements of the
+    /// list, whatever its length (counted).
+    #[test]
+    fn a_page_examines_at_most_offset_plus_limit_elements() {
+        for (n, offset, limit) in [
+            (100u64, 0u64, 7u64),
+            (100_000, 10, 7),
+            (100_000, 990, 1_000),
+        ] {
+            let examined = std::cell::Cell::new(0u64);
+            let counted = (0..n).inspect(|_| examined.set(examined.get() + 1));
+            let p = Paged::of(n, Page { limit, offset }, counted);
+            assert_eq!(p.items.len() as u64, limit.min(n.saturating_sub(offset)));
+            assert!(examined.get() <= offset + limit, "{n}: {}", examined.get());
+        }
+    }
+
+    #[test]
+    fn page_parameters_are_bounded() {
+        let ok = |pairs: &[(&str, &str)]| parse_pairs(Endpoint::Services, pairs);
+        assert!(ok(&[("limit", "1000"), ("offset", "9223372036854775807")]).is_ok());
+        for bad in [
+            ("limit", "1001"),
+            ("limit", "0"),
+            ("offset", "9223372036854775808"),
+        ] {
+            assert_eq!(
+                ok(&[bad]).unwrap_err().param.as_deref(),
+                Some(bad.0),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            parse_pairs(Endpoint::Find, &[("q", "x")])
+                .unwrap()
+                .query
+                .normalised(),
+            json!({"q": "x", "kind": null, "limit": 20, "offset": 0})
+        );
+        // A card is one answer: no page parameters.
+        assert!(parse_pairs(Endpoint::Service, &[("name", "x"), ("limit", "2")]).is_err());
     }
 
     /// Contract M5 S14: the test-only override lowers caps and never raises them.

@@ -111,6 +111,12 @@ enum Command {
     Snapshots {
         #[arg(long)]
         repo: Option<String>,
+        /// Rows listed (1-1000; default 1000).
+        #[arg(long)]
+        limit: Option<String>,
+        /// Rows skipped first (default 0): `--offset` and `--limit` page through the list.
+        #[arg(long)]
+        offset: Option<String>,
         /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
         json: bool,
@@ -135,6 +141,9 @@ enum Command {
         /// Matches listed (1-1000; default 20).
         #[arg(long)]
         limit: Option<String>,
+        /// Matches skipped first (default 0): `--offset` and `--limit` page through them.
+        #[arg(long)]
+        offset: Option<String>,
         #[arg(long)]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
@@ -150,6 +159,12 @@ enum Command {
         service: Option<String>,
         #[arg(long)]
         repo: Option<String>,
+        /// Services listed (without a service) (1-1000; default 1000).
+        #[arg(long)]
+        limit: Option<String>,
+        /// Services skipped first (default 0): `--offset` and `--limit` page through the list.
+        #[arg(long)]
+        offset: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
         snapshot: Option<String>,
@@ -431,11 +446,20 @@ fn asked(command: Command) -> Option<Asked> {
     let mut p = Params::new();
     Some(match command {
         Command::Status { repo, json } => (Endpoint::Status, repo, p, Out::json_if(json)),
-        Command::Snapshots { repo, json } => (Endpoint::Snapshots, repo, p, Out::json_if(json)),
+        Command::Snapshots {
+            repo,
+            limit,
+            offset,
+            json,
+        } => {
+            p.set_opt("limit", limit).set_opt("offset", offset);
+            (Endpoint::Snapshots, repo, p, Out::json_if(json))
+        }
         Command::Find {
             text,
             kind,
             limit,
+            offset,
             repo,
             snapshot,
             json,
@@ -443,16 +467,21 @@ fn asked(command: Command) -> Option<Asked> {
             p.set("q", text)
                 .set_opt("kind", kind)
                 .set_opt("limit", limit)
+                .set_opt("offset", offset)
                 .set_opt("snapshot", snapshot);
             (Endpoint::Find, repo, p, Out::json_if(json))
         }
         Command::Service {
             service,
             repo,
+            limit,
+            offset,
             snapshot,
             json,
         } => {
-            p.set_opt("snapshot", snapshot);
+            p.set_opt("snapshot", snapshot)
+                .set_opt("limit", limit)
+                .set_opt("offset", offset);
             let endpoint = match service {
                 Some(name) => {
                     p.set("name", name);
@@ -575,7 +604,13 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
         Ok(output) => {
             match out {
                 Out::Json => print!("{}", output.body()),
-                Out::Text => print!("{}", render_text(&output)),
+                Out::Text => {
+                    print!("{}", render_text(&output));
+                    // A page that is not the last says so on stderr: stdout stays rows only.
+                    if let Some(line) = more_line(&output.answer) {
+                        eprintln!("{line}");
+                    }
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -590,11 +625,27 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
     }
 }
 
+/// `rows 1-20 of 57 listed; next page: --offset 20` when a paged list continues (D18).
+fn more_line(answer: &Answer) -> Option<String> {
+    let (offset, shown, total, next) = match answer {
+        Answer::Find(p) => (p.offset, p.items.len(), p.total, p.next_offset?),
+        Answer::Services(p) => (p.offset, p.items.len(), p.total, p.next_offset?),
+        Answer::Snapshots(p) => (p.offset, p.items.len(), p.total, p.next_offset?),
+        _ => return None,
+    };
+    Some(format!(
+        "rows {}-{} of {total} listed; next page: --offset {next}",
+        offset + 1,
+        offset + shown as u64
+    ))
+}
+
 /// The text rendering of an answer (the CLI's own; JSON is `rb-api`'s).
 fn render_text(output: &rb_api::Output) -> String {
     match &output.answer {
         Answer::Status { all, reports } => status_text(*all, reports),
         Answer::Snapshots(snapshots) => snapshots
+            .items
             .iter()
             .map(|x| {
                 format!(
@@ -609,10 +660,12 @@ fn render_text(output: &rb_api::Output) -> String {
             })
             .collect(),
         Answer::Find(found) => found
+            .items
             .iter()
             .map(|n| format!("{}\t{}\t{}\n", n.kind, n.key, n.name))
             .collect(),
         Answer::Services(services) => services
+            .items
             .iter()
             .map(|s| format!("{}\t{}\t{}\t{}\n", s.key, s.name, s.role, files(s.files)))
             .collect(),
@@ -1966,6 +2019,30 @@ mod tests {
             assert!(parse(args).is_ok(), "{args:?}");
         }
         assert!(asked(Cli::try_parse_from(["rb", "migrate"]).unwrap().command).is_none());
+    }
+
+    /// Contract M5 D18: a page that is not the last names the rows shown and the next offset.
+    #[test]
+    fn more_line_names_the_next_offset() {
+        let page = |offset, next| {
+            Answer::Find(rb_api::Paged::from_rows(
+                25,
+                rb_api::Page { limit: 8, offset },
+                vec![
+                    rb_store::FoundNode {
+                        kind: "file".into(),
+                        key: "k".into(),
+                        name: "n".into(),
+                    };
+                    next
+                ],
+            ))
+        };
+        assert_eq!(
+            more_line(&page(8, 8)).as_deref(),
+            Some("rows 9-16 of 25 listed; next page: --offset 16")
+        );
+        assert_eq!(more_line(&page(24, 1)), None, "the last page");
     }
 
     /// Contract M3b amendment 41: an all-SCIP repository has no heuristic site, so the line

@@ -954,3 +954,50 @@ fn cypher_on_a_retired_snapshot_is_refused() {
         (vec![vec!["6".to_owned()]], vec![])
     );
 }
+
+/// Contract M5 S15, D18: `find`'s pages (one `LIMIT/OFFSET` query and one count) concatenate to
+/// the whole match list at limits 1, 7 and 1,000, `total` counts every match, and an offset past
+/// the end is an empty page; the order is total, so repeated reads give the same pages.
+#[test]
+fn find_pages_concatenate_to_the_whole_list() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("findpages");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let snap = store
+        .publish_snapshot(
+            &repo,
+            &"a".repeat(40),
+            &json!({}),
+            &sample_graph(23, 0),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    // `f` matches the 23 files (`src/fN.ts`) and the 23 symbols (`sym fN`) by key.
+    let whole = store.find(snap.id, "f", None, 1_000, 0).unwrap();
+    assert_eq!(whole.total, 46);
+    assert_eq!(whole.nodes.len(), 46);
+    for limit in [1i64, 7, 1_000] {
+        let mut joined = Vec::new();
+        let mut offset = 0;
+        while offset < whole.total {
+            let page = store.find(snap.id, "f", None, limit, offset).unwrap();
+            assert_eq!(page.total, whole.total);
+            assert!(page.nodes.len() as i64 <= limit);
+            offset += page.nodes.len() as i64;
+            joined.extend(page.nodes);
+        }
+        assert_eq!(joined, whole.nodes, "limit {limit}");
+    }
+    let past = store.find(snap.id, "f", None, 7, 46).unwrap();
+    assert!(past.nodes.is_empty() && past.total == 46);
+    let kinds = store
+        .find(snap.id, "f", Some(NodeKind::Symbol), 1_000, 0)
+        .unwrap();
+    assert_eq!(kinds.total, 23);
+}

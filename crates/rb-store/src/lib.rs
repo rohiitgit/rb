@@ -275,7 +275,7 @@ use serde_json::Value;
 
 pub use age::{LoadDir, LoadedFile, ProjectionProfile, graph_name};
 pub use query::{
-    Api, DiCoverage, FoundNode, Handler, HttpCoverage, HttpPeer, HttpUse, OwnerShare,
+    Api, DiCoverage, FoundNode, FoundPage, Handler, HttpCoverage, HttpPeer, HttpUse, OwnerShare,
     ResolutionCoverage, Resolved, RtaCoverage, ServiceCard, ServiceSummary, SqlCoverage,
     TableAccess, TableDeps,
 };

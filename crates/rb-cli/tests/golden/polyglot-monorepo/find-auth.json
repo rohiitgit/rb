@@ -8,50 +8,57 @@
   "query": {
     "kind": null,
     "limit": 8,
+    "offset": 0,
     "q": "auth"
   },
   "limits": {},
   "truncated": [],
-  "result": [
-    {
-      "kind": "file",
-      "key": "apps/web/src/api/auth.ts",
-      "name": "auth.ts"
-    },
-    {
-      "kind": "service",
-      "key": "services/auth",
-      "name": "auth-service"
-    },
-    {
-      "kind": "symbol",
-      "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#",
-      "name": "AuthController"
-    },
-    {
-      "kind": "symbol",
-      "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#AuthController().",
-      "name": "AuthController"
-    },
-    {
-      "kind": "symbol",
-      "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthApplication.java`/AuthApplication#",
-      "name": "AuthApplication"
-    },
-    {
-      "kind": "file",
-      "key": "services/auth/src/main/java/com/acme/auth/AuthController.java",
-      "name": "AuthController.java"
-    },
-    {
-      "kind": "file",
-      "key": "services/auth/src/main/java/com/acme/auth/AuthApplication.java",
-      "name": "AuthApplication.java"
-    },
-    {
-      "kind": "file",
-      "key": "services/auth/src/main/resources/db/migration/V2__audit.sql",
-      "name": "V2__audit.sql"
-    }
-  ]
+  "result": {
+    "total": 25,
+    "offset": 0,
+    "limit": 8,
+    "next_offset": 8,
+    "items": [
+      {
+        "kind": "file",
+        "key": "apps/web/src/api/auth.ts",
+        "name": "auth.ts"
+      },
+      {
+        "kind": "service",
+        "key": "services/auth",
+        "name": "auth-service"
+      },
+      {
+        "kind": "symbol",
+        "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#",
+        "name": "AuthController"
+      },
+      {
+        "kind": "symbol",
+        "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#AuthController().",
+        "name": "AuthController"
+      },
+      {
+        "kind": "symbol",
+        "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthApplication.java`/AuthApplication#",
+        "name": "AuthApplication"
+      },
+      {
+        "kind": "file",
+        "key": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+        "name": "AuthController.java"
+      },
+      {
+        "kind": "file",
+        "key": "services/auth/src/main/java/com/acme/auth/AuthApplication.java",
+        "name": "AuthApplication.java"
+      },
+      {
+        "kind": "file",
+        "key": "services/auth/src/main/resources/db/migration/V2__audit.sql",
+        "name": "V2__audit.sql"
+      }
+    ]
+  }
 }

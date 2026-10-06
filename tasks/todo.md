@@ -701,7 +701,10 @@ Same rules as M4b:
   - *Derived:* `rb callers --json` (with `entry`), `rb status --json`, `rb find --json`, `rb snapshots`; existing JSON outputs inside the envelope; `--snapshot` on every question.
   - Files: `crates/rb-api/src/lib.rs`, `rb-cli/src/main.rs`, `rb-store/src/query.rs` (status as data), `rb-cli/tests/e2e.rs`.
   - **Verify:** new JSON goldens; existing JSON goldens re-blessed after a diff showing only the envelope (classified); a question on a retired snapshot and on a deleted one.
-- [ ] **8. Pagination** (S15, D18).
+- [x] **8. Pagination** (S15, D18). Done 2026-10-07: `limit`/`offset` on `find` (one `LIMIT/OFFSET` query and one count: `Store::find` → `FoundPage`), `services` and `snapshots` (default and max 1,000, paged by `Paged::of` taking at most `offset + limit` elements); results `{total, offset, limit, next_offset, items}`; CLI `--limit`/`--offset` (`rb service` list, `rb snapshots`, `rb find --offset`), next page on stderr. Golden `find-auth.json` (items equal the old result; `offset: 0` in the query; classified). Mutations 6/6 killed (the CLI-offset mutant first hung the e2e page loop: the loop now asserts progress and is bounded; lesson recorded). Dumps byte-identical.
+  - *State:* none.
+  - *Derived:* `limit`/`offset` on `find` (default 20, max 1,000), `services` and `snapshots` (default and max 1,000); results `{total, offset, limit, next_offset, items}`; `find` as one `LIMIT/OFFSET` query plus one count; in-memory lists paged by skipping and taking from an iterator; the text lists the page's rows on stdout and, when more remain, the next offset on stderr (stdout stays rows only).
+  - *Invariants:* 9/10: a page examines at most `offset + limit` list elements (counted); concatenated pages equal the whole list; `next_offset` null exactly on the last page; orders total (find ends on kind and key bytewise; services by key; snapshots by id).
   - Files: `crates/rb-api/src/lib.rs`, `rb-store/src/query.rs` (`find` count and offset), `rb-cli/src/main.rs` (`--limit`/`--offset` where listed), `rb-cli/tests/e2e.rs`.
   - **Verify:** concatenated pages equal the full list at limits 1, 7 and the maximum; counted test.
 - [ ] **9. `rb serve`** (S13; D1, D3, D7, D8; after F1 is confirmed).

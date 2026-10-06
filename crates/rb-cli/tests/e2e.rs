@@ -1640,7 +1640,7 @@ fn json_answers_snapshots_and_error_codes() {
     );
     golden(fixture, "find-auth.json", &stable(&find, &name, first));
     // The JSON lists what the text lists.
-    let listed: Vec<String> = json(&find)["result"]
+    let listed: Vec<String> = json(&find)["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -1673,7 +1673,7 @@ fn json_answers_snapshots_and_error_codes() {
     );
     let second = live_id(&url, &name);
     let rows: Vec<(i64, String, Option<i64>, bool)> =
-        json(&rb(&url, &["snapshots", "--repo", &name, "--json"]))["result"]
+        json(&rb(&url, &["snapshots", "--repo", &name, "--json"]))["result"]["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -1879,6 +1879,89 @@ fn json_answers_snapshots_and_error_codes() {
             );
         }
     }
+}
+
+/// Contract M5 S15, D18 (polyglot, `--no-scip`): `rb find`, `rb service` and `rb snapshots`
+/// page with `--limit`/`--offset`; at limits 1, 7 and the maximum the pages concatenate to the
+/// whole list, `total` is its length, `next_offset` is null exactly on the last page, an offset
+/// past the end is an empty page; text prints the page's rows on stdout and the next offset on
+/// stderr.
+#[test]
+fn flat_lists_page_by_limit_and_offset() {
+    let Some(url) = db_url() else { return };
+    let repo = fixture_repo("polyglot-monorepo");
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_pages_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    rb(
+        &url,
+        &["index", path, "--repo", &name, "--no-scip", "--force"],
+    );
+    rb(
+        &url,
+        &["index", path, "--repo", &name, "--no-scip", "--force"],
+    );
+    let json = |args: &[&str]| -> serde_json::Value {
+        serde_json::from_str(&rb(&url, &[args, &["--repo", &name, "--json"]].concat())).unwrap()
+    };
+    for (list, max) in [
+        (&["find", "a"][..], "1000"),
+        (&["service"][..], "1000"),
+        (&["snapshots"][..], "1000"),
+    ] {
+        let whole = json(&[list, &["--limit", max]].concat());
+        let total = whole["result"]["total"].as_u64().unwrap();
+        let items = whole["result"]["items"].as_array().unwrap().clone();
+        assert_eq!(items.len() as u64, total, "{list:?}");
+        assert!(total >= 3, "{list:?}: {total}");
+        assert!(whole["result"]["next_offset"].is_null());
+        for limit in ["1", "7", max] {
+            let mut joined = Vec::new();
+            let mut offset = 0u64;
+            // Terminates: each page starts where asked, the next one strictly later, and there
+            // are at most `total` pages.
+            for _ in 0..=total {
+                let off = offset.to_string();
+                let page = json(&[list, &["--limit", limit, "--offset", &off]].concat());
+                let r = &page["result"];
+                assert_eq!(
+                    (r["total"].as_u64(), r["offset"].as_u64()),
+                    (Some(total), Some(offset))
+                );
+                joined.extend(r["items"].as_array().unwrap().iter().cloned());
+                match r["next_offset"].as_u64() {
+                    Some(next) => {
+                        assert!(next > offset, "{list:?}: {next} after {offset}");
+                        offset = next;
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(joined, items, "{list:?} limit {limit}");
+        }
+        let past = (total + 2).to_string();
+        let r = &json(&[list, &["--offset", &past]].concat())["result"];
+        assert!(r["items"].as_array().unwrap().is_empty() && r["next_offset"].is_null());
+    }
+    // Text: the rows on stdout, the next page on stderr.
+    let (code, out, err) = rb_exit(
+        &url,
+        &[
+            "find", "a", "--limit", "2", "--offset", "1", "--repo", &name,
+        ],
+    );
+    assert_eq!((code, out.lines().count()), (0, 2), "{out}");
+    let total = json(&["find", "a"])["result"]["total"].as_u64().unwrap();
+    assert_eq!(
+        err,
+        format!("rows 2-3 of {total} listed; next page: --offset 3\n")
+    );
+    let (_, _, err) = rb_exit(&url, &["service", "--repo", &name]);
+    assert_eq!(err, "", "the whole list fits one page");
 }
 
 /// Contract M3a R9-R11: `rb callers` and `rb impact` goldens on every fixture, including the
