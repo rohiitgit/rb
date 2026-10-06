@@ -4,35 +4,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use anyhow::bail;
-use rb_model::{Certainty, Graph};
+use rb_api::render::{describe_line as line, endpoint_service};
+use rb_model::Certainty;
 use rb_store::code::{
     Caller, CallerTree, Describer, Impact, Impacted, Orphans, Precision, SnapshotIndex,
 };
 use rb_store::limits::Limit;
-use serde_json::{Value, json};
 
-pub(crate) fn parse_certainty(s: &str) -> Result<Certainty, String> {
-    [
-        Certainty::Ambiguous,
-        Certainty::Heuristic,
-        Certainty::Synthetic,
-        Certainty::Dispatch,
-        Certainty::Exact,
-    ]
-    .into_iter()
-    .find(|c| c.as_str() == s)
-    .ok_or_else(|| {
-        format!("unknown certainty {s:?} (ambiguous, heuristic, synthetic, dispatch, exact)")
-    })
-}
-
-pub(crate) fn parse_precision(s: &str) -> Result<Precision, String> {
-    [Precision::Rta, Precision::Cha]
-        .into_iter()
-        .find(|p| p.as_str() == s)
-        .ok_or_else(|| format!("unknown precision {s:?} (rta, cha)"))
-}
+pub(crate) use rb_api::{parse_certainty, parse_precision};
 
 /// The header of an answer that expands dispatch (contract M4b S10, amendment 21):
 /// `precision=<p>`, `rta` marked as opt-in, and how many dispatch steps RTA skipped when it
@@ -53,79 +32,14 @@ pub(crate) fn precision_lines(precision: Precision, pruned: usize) -> String {
     out
 }
 
-/// The node `input` names. Several candidates are listed, never picked silently, unless `pick`
-/// (1-based, in the listed order) chooses one.
-pub(crate) fn pick_target(
-    ix: &SnapshotIndex,
-    input: &str,
-    pick: Option<usize>,
-) -> anyhow::Result<i64> {
-    let candidates = rb_store::code::resolve_target(ix, input);
-    let d = Describer::new(ix);
-    match (candidates.as_slice(), pick) {
-        ([], _) => bail!("nothing matches {input:?} (try `rb find {input}`)"),
-        ([only], _) => Ok(*only),
-        (many, Some(n)) if (1..=many.len()).contains(&n) => Ok(many[n - 1]),
-        (many, _) => {
-            let list: Vec<String> = many
-                .iter()
-                .enumerate()
-                .map(|(i, &id)| format!("  {}. {}", i + 1, line(&d, id)))
-                .collect();
-            bail!(
-                "{input:?} matches {} symbols; pass --pick N:\n{}",
-                many.len(),
-                list.join("\n")
-            )
-        }
-    }
-}
-
-/// `display  path:line  [service]`
-fn line(d: &Describer<'_>, id: i64) -> String {
-    let info = d.describe(id);
-    // A file (top-level code) is its own location.
-    let is_file = info.display == info.path;
-    let mut s = if is_file {
-        format!("{} (top-level code)", info.display)
-    } else {
-        info.display
-    };
-    if !info.path.is_empty() && !is_file {
-        let _ = write!(s, "  {}:{}", info.path, info.line);
-    }
-    if let Some(service) = info.service {
-        let _ = write!(s, "  [{service}]");
-    }
-    s
-}
-
-/// The name of the service exposing endpoint `id` (its key when no node names it).
-fn endpoint_service(graph: &Graph, id: i64) -> String {
-    let Some(e) = graph.nodes().iter().find(|n| n.id == id) else {
-        return String::new();
-    };
-    let key = e
-        .attrs
-        .get("service")
-        .and_then(|s| s.as_str())
-        .unwrap_or_default();
-    graph
-        .nodes()
-        .iter()
-        .find(|n| n.kind == rb_model::NodeKind::Service && n.key == key)
-        .map_or(key, |n| n.name.as_str())
-        .to_owned()
-}
-
 /// `POST /api/v1/login  [auth-service]`: an endpoint's name and the name of its service, then
 /// `  (prefix unknown, router <file>#<binding>)` for an endpoint keyed by its router (M4a
 /// open item 7, contract M4b S13).
-fn endpoint_label(graph: &Graph, id: i64) -> String {
-    let Some(e) = graph.nodes().iter().find(|n| n.id == id) else {
+fn endpoint_label(ix: &SnapshotIndex, id: i64) -> String {
+    let Some(e) = ix.get_node(id) else {
         return id.to_string();
     };
-    let mut label = format!("{}  [{}]", e.name, endpoint_service(graph, id));
+    let mut label = format!("{}  [{}]", e.name, endpoint_service(ix, id));
     if let Some(router) = e.attrs.get("router").and_then(|r| r.as_str()) {
         let _ = write!(label, "  (prefix unknown, router {router})");
     }
@@ -189,98 +103,6 @@ pub(crate) fn render_callers(ix: &SnapshotIndex, tree: &CallerTree) -> String {
     out
 }
 
-/// A node as JSON: its key and how it is shown.
-fn node_json(graph: &Graph, d: &Describer<'_>, id: i64) -> Value {
-    let info = d.describe(id);
-    let key = graph
-        .nodes()
-        .iter()
-        .find(|n| n.id == id)
-        .map(|n| n.key.as_str());
-    json!({
-        "key": key,
-        "display": info.display,
-        "path": info.path,
-        "line": info.line,
-        "service": info.service,
-    })
-}
-
-/// `rb impact --json` (contract M4b S13): every section of the text answer, with keys.
-pub(crate) fn impact_json(ix: &SnapshotIndex, impact: &Impact) -> Value {
-    let graph = ix.graph();
-    let d = Describer::new(ix);
-    let impacted = |xs: &[Impacted]| -> Vec<Value> {
-        xs.iter()
-            .map(|x| {
-                let mut v = node_json(graph, &d, x.node);
-                v["distance"] = x.distance.into();
-                v["certainty"] = x.certainty.as_str().into();
-                v
-            })
-            .collect()
-    };
-    let endpoints: Vec<Value> = impact
-        .endpoints
-        .iter()
-        .map(|x| {
-            let node = graph.nodes().iter().find(|n| n.id == x.node);
-            json!({
-                "key": node.map(|n| n.key.as_str()),
-                "name": node.map(|n| n.name.as_str()),
-                "service": endpoint_service(graph, x.node),
-                "router": node.and_then(|n| n.attrs.get("router")),
-                "distance": x.distance,
-                "certainty": x.certainty.as_str(),
-                "handler_removed": x.distance == 1,
-            })
-        })
-        .collect();
-    let orphans = match &impact.orphans {
-        Orphans::NotComputed(reason) => json!({"computed": false, "reason": reason}),
-        Orphans::Computed(list) => json!({
-            "computed": true,
-            "nodes": list
-                .iter()
-                .map(|o| {
-                    let mut v = node_json(graph, &d, o.node);
-                    v["distance"] = o.distance.into();
-                    v["via"] = json!({
-                        "key": node_json(graph, &d, o.via.0)["key"],
-                        "how": o.via.1,
-                    });
-                    v
-                })
-                .collect::<Vec<_>>(),
-        }),
-    };
-    json!({
-        "removed": impact
-            .removed
-            .iter()
-            .map(|&n| node_json(graph, &d, n))
-            .collect::<Vec<_>>(),
-        "precision": impact.precision.as_str(),
-        "pruned_by_rta": impact.pruned_by_rta,
-        "breaks": impacted(&impact.breaks),
-        "affects": impacted(&impact.affects),
-        "endpoints": endpoints,
-        "orphans": orphans,
-        "tests": impacted(&impact.tests),
-        "services": impact
-            .services
-            .iter()
-            .map(|(key, n, own)| json!({"key": key, "impacted": n, "own": own}))
-            .collect::<Vec<_>>(),
-        "owners": impact
-            .owners
-            .iter()
-            .map(|(o, n)| json!({"owner": o, "impacted": n}))
-            .collect::<Vec<_>>(),
-        "truncated": impact.truncated.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-    })
-}
-
 pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
     let graph = ix.graph();
     let d = Describer::new(ix);
@@ -323,7 +145,7 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
             out,
             "  {}  {}  {}{}",
             x.distance,
-            endpoint_label(graph, x.node),
+            endpoint_label(ix, x.node),
             x.certainty.as_str(),
             if x.distance == 1 {
                 "  (handler removed)"
@@ -410,6 +232,7 @@ pub(crate) fn truncated_line(limits: &BTreeSet<Limit>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
     /// Contract M4b S10: every answer that expands dispatch states its precision, and the RTA
     /// line appears exactly when steps were pruned.
@@ -558,7 +381,10 @@ mod tests {
             ),
             "{callers}"
         );
-        let json = impact_json(&rb_store::code::SnapshotIndex::new(graph.clone()), &impact);
+        let json = rb_api::render::impact_json(
+            &rb_store::code::SnapshotIndex::new(graph.clone()),
+            &impact,
+        );
         assert_eq!(json["endpoints"][0]["handler_removed"], true);
         assert_eq!(json["endpoints"][0]["router"], "a.go#r");
         assert_eq!(json["orphans"]["nodes"][0]["via"]["how"], "calls");

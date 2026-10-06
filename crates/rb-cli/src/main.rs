@@ -5,6 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
@@ -12,9 +13,9 @@ use anyhow::{Context, bail, ensure};
 mod code;
 mod path;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rb_model::{NodeKind, ServiceRole, canonical_dump};
-use rb_store::code::SnapshotIndex;
-use rb_store::{LoadDir, Resolved, ServiceCard, SnapshotInfo, Store, TableAccess, TableDeps};
+use rb_api::{Answer, Endpoint, Params};
+use rb_model::{ServiceRole, canonical_dump};
+use rb_store::{LoadDir, ServiceCard, SnapshotInfo, Store, TableAccess, TableDeps};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -119,9 +120,10 @@ enum Command {
         text: String,
         /// Restrict to one node kind (symbol, file, service, table, owner, endpoint, package).
         #[arg(long)]
-        kind: Option<NodeKind>,
-        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(i64).range(1..=1000))]
-        limit: i64,
+        kind: Option<String>,
+        /// Matches listed (1-1000; default 20).
+        #[arg(long)]
+        limit: Option<String>,
         #[arg(long)]
         repo: Option<String>,
     },
@@ -145,12 +147,12 @@ enum Command {
         json: bool,
         /// Dispatch expansion in the caller walk (as for `callers`); `cha` by default, since
         /// under-reporting a table's dependents is the dangerous failure.
-        #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
-        precision: rb_store::code::Precision,
+        #[arg(long)]
+        precision: Option<String>,
         /// API hops followed through `CONSUMES` to services reaching the table only through
-        /// another service's endpoint (0-8).
-        #[arg(long, default_value_t = rb_store::rollup::DEFAULT_HOPS)]
-        hops: usize,
+        /// another service's endpoint (0-8; default 4).
+        #[arg(long)]
+        hops: Option<String>,
     },
     /// Show what calls a function or method (Q1), as a caller tree.
     Callers {
@@ -159,23 +161,24 @@ enum Command {
         target: String,
         #[arg(long)]
         repo: Option<String>,
-        /// Levels of callers to follow (1-25).
-        #[arg(long, default_value_t = 1)]
-        depth: usize,
+        /// Levels of callers to follow (1-25; default 1).
+        #[arg(long)]
+        depth: Option<String>,
         /// Also count function values passed around (`REFERENCES`).
         #[arg(long)]
         include_references: bool,
-        /// Ignore edges below this certainty (ambiguous, heuristic, synthetic, dispatch, exact).
-        #[arg(long, default_value = "ambiguous", value_parser = code::parse_certainty)]
-        min_certainty: rb_model::Certainty,
+        /// Ignore edges below this certainty (ambiguous, the default; heuristic, synthetic,
+        /// dispatch, exact).
+        #[arg(long)]
+        min_certainty: Option<String>,
         /// Choose among several matching symbols (1-based, as listed).
         #[arg(long)]
-        pick: Option<usize>,
+        pick: Option<String>,
         /// Dispatch expansion: `cha` (the default) follows every overrider; `rta` (opt-in)
         /// skips, and counts, overriders whose type is proven never instantiated, and may hide
         /// callers reached through forms the scan cannot see.
-        #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
-        precision: rb_store::code::Precision,
+        #[arg(long)]
+        precision: Option<String>,
     },
     /// Show what breaks if a symbol or table is removed (Q2).
     Impact {
@@ -183,14 +186,15 @@ enum Command {
         target: String,
         #[arg(long)]
         repo: Option<String>,
-        #[arg(long, default_value = "ambiguous", value_parser = code::parse_certainty)]
-        min_certainty: rb_model::Certainty,
+        /// As for `callers`.
         #[arg(long)]
-        pick: Option<usize>,
+        min_certainty: Option<String>,
+        #[arg(long)]
+        pick: Option<String>,
         /// Dispatch expansion (as for `callers`); `cha` by default, since under-reporting is
         /// the dangerous failure here.
-        #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
-        precision: rb_store::code::Precision,
+        #[arg(long)]
+        precision: Option<String>,
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -203,12 +207,12 @@ enum Command {
         query: String,
         #[arg(long)]
         repo: Option<String>,
-        /// Call levels followed per service hop (1-25).
-        #[arg(long, default_value_t = rb_store::path::DEFAULT_DEPTH)]
-        depth: usize,
-        /// Service hops followed through `CONSUMES` (0-8).
-        #[arg(long, default_value_t = rb_store::path::DEFAULT_HOPS)]
-        hops: usize,
+        /// Call levels followed per service hop (1-25; default 12).
+        #[arg(long)]
+        depth: Option<String>,
+        /// Service hops followed through `CONSUMES` (0-8; default 4).
+        #[arg(long)]
+        hops: Option<String>,
         /// Show helper calls that reach no table or endpoint instead of collapsing them.
         #[arg(long)]
         full: bool,
@@ -216,10 +220,10 @@ enum Command {
         format: Format,
         /// Choose among several matching endpoints (1-based, as listed).
         #[arg(long)]
-        pick: Option<usize>,
+        pick: Option<String>,
         /// Dispatch expansion, both ways (as for `callers`; `cha` by default).
-        #[arg(long, default_value = "cha", value_parser = code::parse_precision)]
-        precision: rb_store::code::Precision,
+        #[arg(long)]
+        precision: Option<String>,
     },
     /// Remove what interrupted or older runs left behind: AGE graphs named `rb_*` that are not a
     /// live snapshot's, and `building` snapshot rows. Never runs implicitly.
@@ -242,18 +246,14 @@ enum Command {
         query: String,
         #[arg(long)]
         repo: Option<String>,
-        /// Comma-separated names for the RETURN columns, in order.
-        #[arg(long, default_value = "result", value_delimiter = ',')]
-        cols: Vec<String>,
-        /// Statement timeout in milliseconds (1-30000); a query over it is cancelled with an
-        /// error, never cut short. At most 10,000 rows are printed, then `truncated: rows`.
-        #[arg(
-            long,
-            env = "RB_CYPHER_TIMEOUT_MS",
-            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
-            value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
-        )]
-        timeout_ms: u64,
+        /// Comma-separated names for the RETURN columns, in order (default `result`).
+        #[arg(long)]
+        cols: Option<String>,
+        /// Statement timeout in milliseconds (1-30000; default 2000); a query over it is
+        /// cancelled with an error, never cut short. At most 10,000 rows are printed, then
+        /// `truncated: rows`.
+        #[arg(long, env = "RB_CYPHER_TIMEOUT_MS")]
+        timeout_ms: Option<String>,
     },
 }
 
@@ -279,8 +279,17 @@ enum Format {
     Json,
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+fn main() -> ExitCode {
+    match run_cli(Cli::parse()) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
     let mut store = Store::connect(&cli.database_url)?;
     match cli.command {
         Command::Migrate => {
@@ -356,203 +365,6 @@ fn main() -> anyhow::Result<()> {
                 None => std::io::stdout().write_all(dump.as_bytes())?,
             }
         }
-        Command::Find {
-            text,
-            kind,
-            limit,
-            repo,
-        } => on_live(&mut store, repo, |store, snap| {
-            for n in store.find(snap.id, &text, kind, limit)? {
-                println!("{}\t{}\t{}", n.kind, n.key, n.name);
-            }
-            Ok(())
-        })?,
-        Command::Service {
-            service,
-            repo,
-            json,
-        } => on_live(&mut store, repo, |store, snap| {
-            match service {
-                None => {
-                    let services = store.services(snap.id)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&services)?);
-                    } else {
-                        for s in services {
-                            println!("{}\t{}\t{}\t{}", s.key, s.name, s.role, files(s.files));
-                        }
-                    }
-                }
-                Some(text) => {
-                    let found = match store.resolve_service(snap.id, &text)? {
-                        Resolved::One(n) => n,
-                        Resolved::None => {
-                            bail!("no service matches {text:?} (try `rb service` to list them)")
-                        }
-                        Resolved::Ambiguous(candidates) => {
-                            let list: Vec<String> = candidates
-                                .iter()
-                                .map(|c| format!("  {}  ({})", c.key, c.name))
-                                .collect();
-                            bail!(
-                                "{text:?} matches several services; pass a directory:\n{}",
-                                list.join("\n")
-                            );
-                        }
-                    };
-                    let ix = SnapshotIndex::new(store.load_graph(snap.id)?);
-                    let card = store.service_card(snap.id, &ix, &found.key)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&card)?);
-                    } else {
-                        print!("{}", render_card(&card));
-                    }
-                }
-            }
-            Ok(())
-        })?,
-        Command::TableDeps {
-            table,
-            repo,
-            json,
-            precision,
-            hops,
-        } => {
-            ensure!(
-                hops <= rb_store::rollup::MAX_HOPS,
-                "--hops must be between 0 and {}",
-                rb_store::rollup::MAX_HOPS
-            );
-            on_live(&mut store, repo, |store, snap| {
-                let found = match store.resolve_table(snap.id, &table)? {
-                    Resolved::One(n) => n,
-                    Resolved::None => {
-                        bail!("no table matches {table:?} (try `rb find {table} --kind table`)")
-                    }
-                    Resolved::Ambiguous(candidates) => {
-                        let list: Vec<String> =
-                            candidates.iter().map(|c| format!("  {}", c.key)).collect();
-                        bail!(
-                            "{table:?} matches several tables; pass schema.table:\n{}",
-                            list.join("\n")
-                        );
-                    }
-                };
-                let ix = SnapshotIndex::new(store.load_graph(snap.id)?);
-                let deps = store.table_deps(
-                    snap.id,
-                    &ix,
-                    &found.key,
-                    rb_store::rollup::RollupOptions {
-                        precision,
-                        hops,
-                        caps: Default::default(),
-                    },
-                )?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&deps)?);
-                } else {
-                    print!("{}", render_table_deps(&deps));
-                }
-                Ok(())
-            })?;
-        }
-        Command::Callers {
-            target,
-            repo,
-            depth,
-            include_references,
-            min_certainty,
-            pick,
-            precision,
-        } => {
-            ensure!(
-                (1..=rb_store::code::MAX_CALLER_DEPTH).contains(&depth),
-                "--depth must be between 1 and {}",
-                rb_store::code::MAX_CALLER_DEPTH
-            );
-            let ix = SnapshotIndex::new(on_live(&mut store, repo, |store, snap| {
-                store.load_graph(snap.id)
-            })?);
-            let t = code::pick_target(&ix, &target, pick)?;
-            let tree = rb_store::code::callers(
-                &ix,
-                t,
-                rb_store::code::CallerOptions {
-                    depth,
-                    include_references,
-                    min_certainty,
-                    precision,
-                    caps: Default::default(),
-                },
-            );
-            print!("{}", code::render_callers(&ix, &tree));
-        }
-        Command::Impact {
-            target,
-            repo,
-            min_certainty,
-            pick,
-            precision,
-            json,
-        } => {
-            let ix = SnapshotIndex::new(on_live(&mut store, repo, |store, snap| {
-                store.load_graph(snap.id)
-            })?);
-            let t = code::pick_target(&ix, &target, pick)?;
-            let impact = rb_store::code::impact(&ix, t, min_certainty, precision);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&code::impact_json(&ix, &impact))?
-                );
-            } else {
-                print!("{}", code::render_impact(&ix, &impact));
-            }
-        }
-        Command::Path {
-            query,
-            repo,
-            depth,
-            hops,
-            full,
-            format,
-            pick,
-            precision,
-        } => {
-            ensure!(
-                (1..=rb_store::path::MAX_DEPTH).contains(&depth),
-                "--depth must be between 1 and {}",
-                rb_store::path::MAX_DEPTH
-            );
-            ensure!(
-                hops <= rb_store::path::MAX_HOPS,
-                "--hops must be between 0 and {}",
-                rb_store::path::MAX_HOPS
-            );
-            let ix = SnapshotIndex::new(on_live(&mut store, repo, |store, snap| {
-                store.load_graph(snap.id)
-            })?);
-            let endpoint = path::pick_endpoint(&ix, &query, pick)?;
-            let request = rb_store::path::request_path(
-                &ix,
-                endpoint,
-                rb_store::path::PathOptions {
-                    depth,
-                    hops,
-                    full,
-                    precision,
-                    caps: Default::default(),
-                },
-            );
-            match format {
-                Format::Text => print!("{}", path::render_text(&ix, &request)),
-                Format::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&path::render_json(&ix, &request))?
-                ),
-            }
-        }
         Command::Gc { dry_run, prefix } => {
             let plan = store.gc_plan(&prefix)?;
             let done = if dry_run {
@@ -586,28 +398,202 @@ fn main() -> anyhow::Result<()> {
                 println!("scip: {verb} {} rows, {} bytes", r.rows, r.bytes);
             }
         }
+        question => {
+            let asked = asked(question).expect("every other command is a question");
+            return answer(&mut store, asked);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// How a question's answer is printed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Out {
+    Text,
+    Json,
+}
+
+impl Out {
+    fn json_if(json: bool) -> Out {
+        if json { Out::Json } else { Out::Text }
+    }
+}
+
+/// A question command: what it asks, of which repository, with which parameters, and how the
+/// answer is printed.
+type Asked = (Endpoint, Option<String>, Params, Out);
+
+/// The question a command asks, its flags as the request layer's string parameters (contract M5
+/// S12: `rb-api` alone validates them); `None` for the commands that are not questions.
+fn asked(command: Command) -> Option<Asked> {
+    Some(match command {
+        Command::Find {
+            text,
+            kind,
+            limit,
+            repo,
+        } => {
+            let mut p = Params::new();
+            p.set("q", text)
+                .set_opt("kind", kind)
+                .set_opt("limit", limit);
+            (Endpoint::Find, repo, p, Out::Text)
+        }
+        Command::Service {
+            service,
+            repo,
+            json,
+        } => {
+            let mut p = Params::new();
+            let endpoint = match service {
+                Some(name) => {
+                    p.set("name", name);
+                    Endpoint::Service
+                }
+                None => Endpoint::Services,
+            };
+            (endpoint, repo, p, Out::json_if(json))
+        }
+        Command::TableDeps {
+            table,
+            repo,
+            json,
+            precision,
+            hops,
+        } => {
+            let mut p = Params::new();
+            p.set("table", table)
+                .set_opt("precision", precision)
+                .set_opt("hops", hops);
+            (Endpoint::TableDeps, repo, p, Out::json_if(json))
+        }
+        Command::Callers {
+            target,
+            repo,
+            depth,
+            include_references,
+            min_certainty,
+            pick,
+            precision,
+        } => {
+            let mut p = Params::new();
+            p.set("target", target)
+                .set_opt("depth", depth)
+                .set_flag("include_references", include_references)
+                .set_opt("min_certainty", min_certainty)
+                .set_opt("pick", pick)
+                .set_opt("precision", precision);
+            (Endpoint::Callers, repo, p, Out::Text)
+        }
+        Command::Impact {
+            target,
+            repo,
+            min_certainty,
+            pick,
+            precision,
+            json,
+        } => {
+            let mut p = Params::new();
+            p.set("target", target)
+                .set_opt("min_certainty", min_certainty)
+                .set_opt("pick", pick)
+                .set_opt("precision", precision);
+            (Endpoint::Impact, repo, p, Out::json_if(json))
+        }
+        Command::Path {
+            query,
+            repo,
+            depth,
+            hops,
+            full,
+            format,
+            pick,
+            precision,
+        } => {
+            let mut p = Params::new();
+            p.set("endpoint", query)
+                .set_opt("depth", depth)
+                .set_opt("hops", hops)
+                .set_flag("full", full)
+                .set_opt("pick", pick)
+                .set_opt("precision", precision);
+            (
+                Endpoint::Path,
+                repo,
+                p,
+                Out::json_if(format == Format::Json),
+            )
+        }
         Command::Cypher {
             query,
             repo,
             cols,
             timeout_ms,
         } => {
-            let snap = live_snapshot(&mut store, repo)?;
-            let limits = rb_store::CypherLimits {
-                timeout_ms,
-                ..Default::default()
-            };
-            let out = store.cypher(snap.id, &query, &cols, limits)?;
-            println!("{}", out.columns.join("\t"));
-            for row in &out.rows {
-                println!("{}", row.join("\t"));
+            let mut p = Params::new();
+            p.set("query", query)
+                .set_opt("columns", cols)
+                .set_opt("timeout_ms", timeout_ms);
+            (Endpoint::Cypher, repo, p, Out::Text)
+        }
+        Command::Migrate
+        | Command::Index(_)
+        | Command::Status { .. }
+        | Command::Dump { .. }
+        | Command::Gc { .. }
+        | Command::Cache { .. } => return None,
+    })
+}
+
+/// Answers a question through the request layer (contract M5 D2, S12), the same parameters and
+/// code the server uses, and prints it; a refused request prints its message and exits with
+/// D5's code.
+fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Result<ExitCode> {
+    let settings = rb_api::Settings::default();
+    let answered = rb_api::parse(endpoint, repo.as_deref(), &params, &settings)
+        .and_then(|req| rb_api::run(store, &mut rb_api::LoadEach, &req, &settings));
+    match answered {
+        Ok(output) => {
+            match out {
+                Out::Json => print!("{}", output.result_json()),
+                Out::Text => print!("{}", render_text(&output.answer)),
             }
-            if !out.truncated.is_empty() {
-                println!("truncated: {}", out.truncated.join(", "));
-            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e.cli_text());
+            Ok(ExitCode::from(e.kind.exit_code()))
         }
     }
-    Ok(())
+}
+
+/// The text rendering of an answer (the CLI's own; JSON is `rb-api`'s).
+fn render_text(answer: &Answer) -> String {
+    match answer {
+        Answer::Find(found) => found
+            .iter()
+            .map(|n| format!("{}\t{}\t{}\n", n.kind, n.key, n.name))
+            .collect(),
+        Answer::Services(services) => services
+            .iter()
+            .map(|s| format!("{}\t{}\t{}\t{}\n", s.key, s.name, s.role, files(s.files)))
+            .collect(),
+        Answer::Card(card) => render_card(card),
+        Answer::Callers { ix, tree } => code::render_callers(ix, tree),
+        Answer::Impact { ix, impact } => code::render_impact(ix, impact),
+        Answer::TableDeps(deps) => render_table_deps(deps),
+        Answer::Path { ix, path } => path::render_text(ix, path),
+        Answer::Cypher(rows) => {
+            let mut out = format!("{}\n", rows.columns.join("\t"));
+            for row in &rows.rows {
+                let _ = writeln!(out, "{}", row.join("\t"));
+            }
+            if !rows.truncated.is_empty() {
+                let _ = writeln!(out, "truncated: {}", rows.truncated.join(", "));
+            }
+            out
+        }
+    }
 }
 
 fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<()> {
@@ -1642,19 +1628,6 @@ fn percent(part: usize, total: usize) -> usize {
     }
 }
 
-/// Runs `f` on the repository's live snapshot, the pointer and every read in one read-only
-/// transaction (contract M5 S1).
-fn on_live<T>(
-    store: &mut Store,
-    repo: Option<String>,
-    f: impl FnOnce(&mut Store, &SnapshotInfo) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    store.read_tx(|store| {
-        let snap = live_snapshot(store, repo)?;
-        store.read_snapshot(snap.id, |store| f(store, &snap))
-    })
-}
-
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
     let repo = match repo {
         Some(r) => r,
@@ -1827,15 +1800,84 @@ mod tests {
         }
     }
 
+    /// Contract M5 S12: question flags reach the request layer as text, which alone validates
+    /// them; its refusal names the flag in the CLI's text.
     #[test]
-    fn find_limit_is_validated_at_parse_time() {
-        for bad in ["0", "-1", "1001"] {
-            assert!(
-                Cli::try_parse_from(["rb", "find", "x", "--limit", bad]).is_err(),
-                "{bad}"
-            );
+    fn question_flags_are_validated_by_the_request_layer() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let (endpoint, repo, params, _) = asked(cli.command).unwrap();
+            rb_api::parse(
+                endpoint,
+                repo.as_deref(),
+                &params,
+                &rb_api::Settings::default(),
+            )
+        };
+        for (args, flag) in [
+            (
+                &["rb", "find", "x", "--limit", "1001"][..],
+                "--limit must be between 1 and 1000 (got 1001)",
+            ),
+            (
+                &["rb", "find", "x", "--limit", "0"],
+                "--limit must be between 1 and 1000 (got 0)",
+            ),
+            (
+                &["rb", "callers", "x", "--depth", "26"],
+                "--depth must be between 1 and 25 (got 26)",
+            ),
+            (
+                &["rb", "path", "x", "--hops", "9"],
+                "--hops must be between 0 and 8 (got 9)",
+            ),
+            (
+                &["rb", "table-deps", "t", "--hops=-1"],
+                "--hops must be an integer between 0 and 8 (got \"-1\")",
+            ),
+            (
+                &["rb", "cypher", "RETURN 1", "--timeout-ms", "30001"],
+                "--timeout-ms must be between 1 and 30000 (got 30001)",
+            ),
+            (
+                &["rb", "impact", "x", "--precision", "vta"],
+                "--precision must be one of rta, cha (got \"vta\")",
+            ),
+        ] {
+            let e = parse(args).unwrap_err();
+            assert_eq!(e.kind.exit_code(), 2, "{args:?}");
+            assert_eq!(e.cli_text(), flag, "{args:?}");
         }
-        assert!(Cli::try_parse_from(["rb", "find", "x", "--limit", "1000"]).is_ok());
+        for args in [
+            &["rb", "find", "x", "--limit", "1000"][..],
+            &[
+                "rb",
+                "callers",
+                "x",
+                "--depth",
+                "25",
+                "--include-references",
+                "--pick",
+                "2",
+            ],
+            &[
+                "rb", "path", "GET /", "--hops", "0", "--full", "--format", "json",
+            ],
+            &["rb", "service"],
+            &["rb", "service", ".", "--json"],
+            &[
+                "rb",
+                "cypher",
+                "RETURN 1",
+                "--cols",
+                "a,b",
+                "--timeout-ms",
+                "30000",
+            ],
+        ] {
+            assert!(parse(args).is_ok(), "{args:?}");
+        }
+        assert!(asked(Cli::try_parse_from(["rb", "migrate"]).unwrap().command).is_none());
     }
 
     /// Contract M3b amendment 41: an all-SCIP repository has no heuristic site, so the line

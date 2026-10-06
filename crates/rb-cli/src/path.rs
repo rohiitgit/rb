@@ -1,198 +1,13 @@
-//! `rb path` (Q4, design §10.3, contract M4a S15–S18): choosing the endpoint and rendering the
-//! request path as text or JSON. The walks live in `rb_store::path`.
+//! `rb path` (Q4, design §10.3, contract M4a S15–S18): the request path as text. The walks live
+//! in `rb_store::path`; choosing the endpoint and the JSON live in `rb_api::render`.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use anyhow::bail;
-use rb_frameworks::endpoint::{endpoint_name, norm_method, norm_path};
-use rb_model::{Attrs, EdgeKind, Graph, Node, NodeKind};
-use rb_store::code::{Describer, SnapshotIndex};
+use rb_api::render::{PathView, router_note};
+use rb_model::Attrs;
+use rb_store::code::SnapshotIndex;
 use rb_store::path::{PathNode, RequestPath, Via};
-use serde_json::{Value, json};
-
-/// `<METHOD> <path>` normalised as routes are (S3), when the input has that form.
-pub(crate) fn normalised(input: &str) -> Option<String> {
-    let (method, path) = input.trim().split_once(char::is_whitespace)?;
-    let path = path.trim();
-    let is_method = !method.is_empty() && method.chars().all(|c| c.is_ascii_alphabetic());
-    (is_method && !path.is_empty()).then(|| endpoint_name(&norm_method(method), &norm_path(path)))
-}
-
-/// Node lookups and descriptions for one graph.
-struct Ctx<'g> {
-    graph: &'g Graph,
-    by_id: HashMap<i64, &'g Node>,
-    /// The attributes of each `CONSUMES` edge, by `(client, endpoint)`.
-    consumes: HashMap<(i64, i64), &'g Attrs>,
-    describer: Describer<'g>,
-}
-
-impl<'g> Ctx<'g> {
-    fn new(ix: &'g SnapshotIndex) -> Self {
-        let graph = ix.graph();
-        Ctx {
-            graph,
-            by_id: graph.nodes().iter().map(|n| (n.id, n)).collect(),
-            consumes: graph
-                .edges()
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Consumes)
-                .map(|e| ((e.src, e.dst), &e.attrs))
-                .collect(),
-            describer: Describer::new(ix),
-        }
-    }
-
-    fn node(&self, id: i64) -> &'g Node {
-        self.by_id[&id]
-    }
-
-    /// How a `CONSUMES` step was stitched (its edge's attributes): upstream the client is the
-    /// node and the endpoint its parent, downstream the other way round.
-    fn stitch(&self, parent: Option<i64>, n: &PathNode, upstream: bool) -> Option<&'g Attrs> {
-        if n.via != Via::Consumes {
-            return None;
-        }
-        let parent = parent?;
-        let pair = if upstream {
-            (n.node, parent)
-        } else {
-            (parent, n.node)
-        };
-        self.consumes.get(&pair).copied()
-    }
-
-    /// The name of the service exposing an endpoint (its key when no node names it).
-    fn endpoint_service(&self, id: i64) -> String {
-        let key = self.node(id).attrs["service"].as_str().unwrap_or_default();
-        self.graph
-            .nodes()
-            .iter()
-            .find(|n| n.kind == NodeKind::Service && n.key == key)
-            .map_or_else(|| key.to_owned(), |n| n.name.clone())
-    }
-
-    /// How a tree node is shown: its label (an endpoint's name, a table with the operations the
-    /// parent performs on it, a symbol with its location, a file as top-level code), plus the
-    /// JSON fields.
-    fn shown(&self, parent: Option<i64>, n: &PathNode) -> Shown {
-        let node = self.node(n.node);
-        match node.kind {
-            NodeKind::Endpoint => {
-                let service = self.endpoint_service(n.node);
-                Shown {
-                    label: format!("{}  [{service}]", node.name),
-                    display: node.name.clone(),
-                    path: String::new(),
-                    line: 0,
-                    service,
-                }
-            }
-            NodeKind::Table => {
-                let ops: Vec<String> = parent
-                    .and_then(|p| {
-                        self.graph
-                            .edges()
-                            .iter()
-                            .find(|e| e.src == p && e.dst == n.node && e.kind == EdgeKind::Queries)
-                    })
-                    .and_then(|e| e.attrs.get("ops")?.as_array().cloned())
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|o| o.as_str().map(str::to_owned))
-                    .collect();
-                let label = if ops.is_empty() {
-                    node.key.clone()
-                } else {
-                    format!("{} ({})", node.key, ops.join(", "))
-                };
-                Shown {
-                    label,
-                    display: node.key.clone(),
-                    path: String::new(),
-                    line: 0,
-                    service: String::new(),
-                }
-            }
-            _ => {
-                let info = self.describer.describe(n.node);
-                let service = info.service.unwrap_or_default();
-                let mut label = if node.kind == NodeKind::File {
-                    format!("{} (top-level code)", info.display)
-                } else {
-                    format!("{}  {}:{}", info.display, info.path, info.line)
-                };
-                if !service.is_empty() {
-                    let _ = write!(label, "  [{service}]");
-                }
-                Shown {
-                    label,
-                    display: info.display,
-                    path: info.path,
-                    line: info.line,
-                    service,
-                }
-            }
-        }
-    }
-}
-
-struct Shown {
-    label: String,
-    display: String,
-    path: String,
-    line: i32,
-    service: String,
-}
-
-/// The endpoint `input` names. Several candidates are listed as `N. <name>  [<service>]`, plus
-/// `  (prefix unknown, router <file>#<binding>)` for an endpoint keyed by its router (contract M4a
-/// amendment 10), never picked silently, unless `pick` (1-based, in the listed order) chooses
-/// one (S15).
-pub(crate) fn pick_endpoint(
-    ix: &SnapshotIndex,
-    input: &str,
-    pick: Option<usize>,
-) -> anyhow::Result<i64> {
-    let candidates = rb_store::path::resolve_endpoints(ix, input, normalised(input).as_deref());
-    let ctx = Ctx::new(ix);
-    match (candidates.as_slice(), pick) {
-        ([], _) => bail!("no endpoint matches {input:?} (try `rb find {input} --kind endpoint`)"),
-        ([only], _) => Ok(*only),
-        (many, Some(n)) if (1..=many.len()).contains(&n) => Ok(many[n - 1]),
-        (many, _) => {
-            let list: Vec<String> = many
-                .iter()
-                .enumerate()
-                .map(|(i, &id)| {
-                    let node = ctx.node(id);
-                    format!(
-                        "  {}. {}  [{}]{}",
-                        i + 1,
-                        node.name,
-                        ctx.endpoint_service(id),
-                        router_note(node)
-                    )
-                })
-                .collect();
-            bail!(
-                "{input:?} matches {} endpoints; pass --pick N:\n{}",
-                many.len(),
-                list.join("\n")
-            )
-        }
-    }
-}
-
-/// `  (prefix unknown, router <file>#<binding>)` for an endpoint keyed by its router (contract
-/// M4a amendment 10, M4b S13 item 7), else nothing.
-fn router_note(e: &Node) -> String {
-    e.attrs
-        .get("router")
-        .and_then(Value::as_str)
-        .map_or_else(String::new, |r| format!("  (prefix unknown, router {r})"))
-}
+use serde_json::Value;
 
 /// `  (via host gateway, suffix match, 2 candidates)`: the parts of a stitch that qualify it
 /// (S22), or nothing.
@@ -231,7 +46,7 @@ fn certainty(n: &PathNode) -> String {
 }
 
 fn render_nodes(
-    ctx: &Ctx<'_>,
+    ctx: &PathView<'_>,
     parent: Option<i64>,
     nodes: &[PathNode],
     depth: usize,
@@ -276,7 +91,7 @@ fn render_nodes(
 }
 
 pub(crate) fn render_text(ix: &SnapshotIndex, path: &RequestPath) -> String {
-    let ctx = Ctx::new(ix);
+    let ctx = PathView::new(ix);
     let e = ctx.node(path.endpoint);
     let service = ctx.endpoint_service(path.endpoint);
     let mut out = format!("Request path: {}  [{service}]{}\n", e.name, router_note(e));
@@ -319,71 +134,12 @@ pub(crate) fn render_text(ix: &SnapshotIndex, path: &RequestPath) -> String {
     out
 }
 
-fn json_nodes(ctx: &Ctx<'_>, parent: Option<i64>, nodes: &[PathNode], upstream: bool) -> Value {
-    nodes
-        .iter()
-        .map(|n| {
-            let s = ctx.shown(parent, n);
-            json!({
-                "key": ctx.node(n.node).key,
-                "display": s.display,
-                "path": s.path,
-                "line": s.line,
-                "service": s.service,
-                "certainty": n.certainty.as_str(),
-                "branch": n.branch.as_str(),
-                "via": n.via.as_str(),
-                "stitch": ctx.stitch(parent, n, upstream),
-                "children": json_nodes(ctx, Some(n.node), &n.children, upstream),
-                "collapsed": n.collapsed,
-            })
-        })
-        .collect()
-}
-
-/// The S18 JSON: `{endpoint, precision, pruned_by_rta, upstream, downstream, histogram,
-/// truncated}` (contract M4a S18, M4b S10).
-pub(crate) fn render_json(ix: &SnapshotIndex, path: &RequestPath) -> Value {
-    let ctx = Ctx::new(ix);
-    let e = ctx.node(path.endpoint);
-    json!({
-        "endpoint": {
-            "key": e.key,
-            "name": e.name,
-            "service": ctx.endpoint_service(path.endpoint),
-            "router": e.attrs.get("router"),
-        },
-        "precision": path.precision.as_str(),
-        "pruned_by_rta": path.pruned_by_rta,
-        "upstream": json_nodes(&ctx, Some(path.endpoint), &path.upstream, true),
-        "downstream": json_nodes(&ctx, None, &path.downstream, false),
-        "histogram": path
-            .histogram
-            .iter()
-            .map(|(c, n)| json!({ "certainty": c.as_str(), "count": n }))
-            .collect::<Vec<_>>(),
-        "truncated": path.truncated.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn method_and_path_inputs_are_normalised_like_routes() {
-        assert_eq!(
-            normalised("post /api/v1//login/").as_deref(),
-            Some("POST /api/v1/login")
-        );
-        assert_eq!(
-            normalised("GET /users/:id").as_deref(),
-            Some("GET /users/{}")
-        );
-        assert_eq!(normalised("login"), None);
-        assert_eq!(normalised("AuthController.login x"), None);
-        assert_eq!(normalised("POST "), None);
-    }
+    use rb_api::render::{path_json as render_json, pick_endpoint};
+    use rb_model::{EdgeKind, NodeKind};
+    use serde_json::json;
 
     /// Amendment 10: endpoints that share a name on different routers (prefix unknown) are
     /// listed with their router, and each is reachable by `--pick` or by its full key.
@@ -423,7 +179,7 @@ mod tests {
             None,
         )
         .unwrap_err()
-        .to_string();
+        .message;
         assert_eq!(
             err,
             "\"GET /\" matches 3 endpoints; pass --pick N:\n  1. GET /  [s]\n  2. GET /  [s]  (prefix unknown, router a.go#ArticlesRegister.router)\n  3. GET /  [s]  (prefix unknown, router t.go#TagsRegister.router)"
