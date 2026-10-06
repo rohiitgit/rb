@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M5 phase 14: residue records (S20)
+- **No code.** Contract amendment 11: M4b open items 18 (registration forms gate M cannot see) and 20 (computed names) restated under this contract's soundness table, each with an example and the weaker false result still possible; M4a open item 22's residue list unchanged (S19 a, b removed three scan-visible forms from it).
+- **Maven's choice between duplicates (M4b open item 23 (c))**, with the scip-java image's own Maven (Apache Maven 3.9.16, Java 21.0.12.1), offline (`--network none`, the shared `.m2` cache mounted read-only, `maven-help-plugin:3.5.1:effective-pom`; poms in `var/m5/p14/maven-dup/`, each also swapped): a duplicate `<dependency>` keeps the last (warning "must be unique … malformed"); a property defined twice takes the last (no warning); a duplicate `<dependencyManagement>` entry keeps both and the first governs (warning). Deterministic in 3.9.16 but undocumented and inconsistent across the three forms, so the `@?` answer stays.
+- **New forms from S19, listed as M6 items:** an instance base contested inside `axios.create`, spreads of objects from other files or parameters, `@Import` of a configuration class (its `@Bean` method is no candidate yet), class-literal registrants in Kotlin/Groovy, and the precision costs of the new conservative rules (structure-free JSON keys, `ribbon` in code, on-demand imports in rule (e)).
+- Files: `tasks/{contract-m5,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M5 phase 13b: review fixes, orphans and DI (S19 c, d, e, g)
 - **S19 (c):** M4a open item 22 (d) closed by M4b S1 (the X1 row is in `raw_text_hooks_and_discovery_keys`); recorded.
 - **S19 (d), M4b open item 3:** `liveness::Inputs` gains `fragments` (DI's interfaces that Spring Data repositories extend, the set RTA's rule (h) reads); a definition is not orphan-eligible when it or an enclosing type implements one by simple name; counted under `convention` (no new `kept` key, which would change every dump's `orphan_coverage` line; amendment 10).

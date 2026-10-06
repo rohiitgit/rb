@@ -739,7 +739,7 @@ Same rules as M4b:
   - *Invariants:* 1 (keeps symbols alive; `ambiguous` instead of a single wrong `heuristic`); depth 2 and cycle rows for rule (e).
   - Files: `rb-indexer/src/{liveness,di,resolve,lib}.rs`.
   - **Verify:** as 13a; depth and cycle rows for rule (e); `ambiguous` over the registrant and the scanned bean.
-- [ ] **14. Residue records** (S20). No code: M4b 18, 20 and M4a 22's residue under this contract; the Maven duplicate check from phase 0; new forms from 13a/13b listed as M6 items.
+- [x] **14. Residue records** (S20). Done 2026-10-07 (amendment 11): M4b 18 and 20 restated with examples and their weaker false results; M4a 22's residue list unchanged (three scan-visible forms removed by S19 a, b); Maven 3.9.16 in the scip-java image, offline: duplicate `<dependency>` → last wins (warning), duplicate property → last wins (no warning), duplicate `<dependencyManagement>` entry → first governs (warning); undocumented and inconsistent, so `@?` stays; five new forms listed as M6 items. No code.
   - **Verify:** each record names its example and the claim's residue class.
 - [ ] **15. Fetch-phase egress and per-repository caches** (S21, S22; only if F2 is "in").
   - *State:* `RECIPE` bumped; `rb.toml` `[scip] registries`.
