@@ -1934,6 +1934,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rb-frameworks",
  "rb-git",
  "rb-indexer",
  "rb-model",

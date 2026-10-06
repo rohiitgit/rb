@@ -10,7 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, bail, ensure};
 
 mod code;
-use clap::{Args, Parser, Subcommand};
+mod path;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rb_model::{NodeKind, ServiceRole, canonical_dump};
 use rb_store::{LoadDir, Resolved, ServiceCard, SnapshotInfo, Store, TableAccess, TableDeps};
 use serde_json::{Value, json};
@@ -159,6 +160,29 @@ enum Command {
         #[arg(long)]
         pick: Option<usize>,
     },
+    /// Show the request path through an endpoint (Q4): the client calls reaching it across
+    /// services, and what its handler reaches (tables, other services' endpoints).
+    Path {
+        /// An endpoint key, `<METHOD> <path>`, part of an endpoint name, or a handler or client
+        /// symbol (as for `callers`).
+        query: String,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Call levels followed per service hop (1-25).
+        #[arg(long, default_value_t = rb_store::path::DEFAULT_DEPTH)]
+        depth: usize,
+        /// Service hops followed through `CONSUMES` (0-8).
+        #[arg(long, default_value_t = rb_store::path::DEFAULT_HOPS)]
+        hops: usize,
+        /// Show helper calls that reach no table or endpoint instead of collapsing them.
+        #[arg(long)]
+        full: bool,
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+        /// Choose among several matching endpoints (1-based, as listed).
+        #[arg(long)]
+        pick: Option<usize>,
+    },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
         /// openCypher query, e.g. "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)".
@@ -169,6 +193,12 @@ enum Command {
         #[arg(long, default_value = "result", value_delimiter = ',')]
         cols: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    Text,
+    Json,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -358,6 +388,41 @@ fn main() -> anyhow::Result<()> {
             let t = code::pick_target(&graph, &target, pick)?;
             let impact = rb_store::code::impact(&graph, t, min_certainty);
             print!("{}", code::render_impact(&graph, &impact));
+        }
+        Command::Path {
+            query,
+            repo,
+            depth,
+            hops,
+            full,
+            format,
+            pick,
+        } => {
+            ensure!(
+                (1..=rb_store::path::MAX_DEPTH).contains(&depth),
+                "--depth must be between 1 and {}",
+                rb_store::path::MAX_DEPTH
+            );
+            ensure!(
+                hops <= rb_store::path::MAX_HOPS,
+                "--hops must be between 0 and {}",
+                rb_store::path::MAX_HOPS
+            );
+            let snap = live_snapshot(&mut store, repo)?;
+            let graph = store.load_graph(snap.id)?;
+            let endpoint = path::pick_endpoint(&graph, &query, pick)?;
+            let request = rb_store::path::request_path(
+                &graph,
+                endpoint,
+                rb_store::path::PathOptions { depth, hops, full },
+            );
+            match format {
+                Format::Text => print!("{}", path::render_text(&graph, &request)),
+                Format::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&path::render_json(&graph, &request))?
+                ),
+            }
         }
         Command::Cypher { query, repo, cols } => {
             let snap = live_snapshot(&mut store, repo)?;

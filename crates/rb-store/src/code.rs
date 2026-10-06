@@ -22,8 +22,8 @@ const REQUIRING: &[EdgeKind] = &[
     EdgeKind::HandledBy,
 ];
 
-/// Adjacency of a graph, built once per question.
-struct View<'g> {
+/// Adjacency of a graph, built once per question (shared with `rb path`).
+pub(crate) struct View<'g> {
     graph: &'g Graph,
     index: HashMap<i64, usize>,
     inbound: HashMap<i64, Vec<&'g Edge>>,
@@ -31,7 +31,7 @@ struct View<'g> {
 }
 
 impl<'g> View<'g> {
-    fn new(graph: &'g Graph) -> Self {
+    pub(crate) fn new(graph: &'g Graph) -> Self {
         let index = graph
             .nodes()
             .iter()
@@ -52,11 +52,16 @@ impl<'g> View<'g> {
         }
     }
 
-    fn node(&self, id: i64) -> &'g Node {
+    pub(crate) fn node(&self, id: i64) -> &'g Node {
         &self.graph.nodes()[self.index[&id]]
     }
 
-    fn inbound(&self, id: i64, kind: EdgeKind, min: Certainty) -> impl Iterator<Item = &'g Edge> {
+    pub(crate) fn inbound(
+        &self,
+        id: i64,
+        kind: EdgeKind,
+        min: Certainty,
+    ) -> impl Iterator<Item = &'g Edge> {
         self.inbound
             .get(&id)
             .into_iter()
@@ -65,7 +70,7 @@ impl<'g> View<'g> {
             .filter(move |e| e.kind == kind && e.certainty >= min)
     }
 
-    fn outbound(&self, id: i64, kind: EdgeKind) -> impl Iterator<Item = &'g Edge> {
+    pub(crate) fn outbound(&self, id: i64, kind: EdgeKind) -> impl Iterator<Item = &'g Edge> {
         self.outbound
             .get(&id)
             .into_iter()
@@ -94,7 +99,7 @@ impl<'g> View<'g> {
     }
 
     /// The file node declaring `id` (or `id` itself when it is a file).
-    fn file_of(&self, id: i64) -> Option<i64> {
+    pub(crate) fn file_of(&self, id: i64) -> Option<i64> {
         if self.node(id).kind == NodeKind::File {
             return Some(id);
         }
@@ -103,7 +108,7 @@ impl<'g> View<'g> {
 
     /// Methods `id` implements or overrides, transitively (each once), with the weakest
     /// `IMPLEMENTS` certainty on the way.
-    fn overridden(&self, id: i64, min: Certainty) -> Vec<(i64, Certainty)> {
+    pub(crate) fn overridden(&self, id: i64, min: Certainty) -> Vec<(i64, Certainty)> {
         let mut seen = HashSet::from([id]);
         let mut out = Vec::new();
         let mut stack = vec![(id, Certainty::Exact)];

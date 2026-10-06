@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+rb-frameworks.workspace = true
 rb-git.workspace = true
 rb-indexer.workspace = true
 rb-model.workspace = true

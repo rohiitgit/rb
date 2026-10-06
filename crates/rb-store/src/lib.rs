@@ -6,6 +6,7 @@
 
 mod age;
 pub mod code;
+pub mod path;
 mod query;
 
 use anyhow::{Context, bail};
