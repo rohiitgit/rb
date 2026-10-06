@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4b phase 4b: the `di:` status line
+- **`rb_store::Store::di_coverage`** reads the `di_coverage` diagnostic (points, buckets, gates; empty for a snapshot indexed before DI). **`rb status`** prints `di: <p> injection points: <n> plain, <n> capped, <n> ambiguous, <n> too ambiguous, <n> external, <n> unresolved, <n> optional absent, <n> not a bean, <n> test` (zero buckets omitted, order fixed; amendment 2's bucket names).
+- **Tests:** `di_line_orders_buckets_and_omits_zeros` (written with the function); new golden `polyglot-monorepo/status-di.txt`: `di: 1 injection points: 1 unresolved`. Its one member: `AuthController(MfaClient)` in `services/auth`, `di_unresolved` `no_bean`, since no `@EnableFeignClients` exists before phase 12c.
+- **Verification:** fmt, clippy clean; 514 unit tests (rb 15); e2e 17/17 with the database and containers; stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-store/src/{query,lib}.rs`, `crates/rb-cli/src/main.rs`, `crates/rb-cli/tests/e2e.rs`, `crates/rb-cli/tests/golden/polyglot-monorepo/status-di.txt`, `tasks/todo.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-06] (wall clock) M4b phase 4a: DI resolution
 - **`rb-indexer/src/di.rs`** (new; S4–S8 under F2): every injection point of the snapshot's Java files resolved to beans:
   - **Scope (D8):** main sources only (test points are bucket `test`, test beans are no candidates); classpath(S) from `via=package` edges (deployable services excluded); component roots from exactly one `@SpringBootApplication`/`@ComponentScan` class (else `scan_roots_unknown`), repository roots from `@Enable*Repositories` (else the component roots), Feign beans only under `@EnableFeignClients` roots of the same service.

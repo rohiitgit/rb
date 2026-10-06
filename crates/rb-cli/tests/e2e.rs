@@ -770,6 +770,12 @@ fn polyglot_monorepo_structure_goldens() {
         .find(|l| l.trim_start().starts_with("http:"))
         .unwrap_or_default();
     golden(fixture, "status-http.txt", &format!("{http_line}\n"));
+    // Contract M4b S7: one bucket per injection point.
+    let di_line = status
+        .lines()
+        .find(|l| l.trim_start().starts_with("di:"))
+        .unwrap_or_default();
+    golden(fixture, "status-di.txt", &format!("{di_line}\n"));
 }
 
 /// Every `(service, path)` of a `rb path --format json` tree, depth first.

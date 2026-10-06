@@ -246,6 +246,7 @@ fn main() -> anyhow::Result<()> {
                     );
                     println!("  {}", code_line(&store.resolution_coverage(live.id)?));
                     println!("  {}", http_line(&store.http_coverage(live.id)?));
+                    println!("  {}", di_line(&store.di_coverage(live.id)?));
                     for d in store.load_diagnostics(live.id)? {
                         if d.kind == "scip_status" {
                             println!("  {}", scip_status_line(&d));
@@ -696,6 +697,34 @@ fn http_line(c: &rb_store::HttpCoverage) -> String {
         "http: {} routes in {} services; {} client calls",
         c.routes, c.services, c.sites
     );
+    let parts: Vec<String> = ORDER
+        .iter()
+        .filter_map(|(bucket, label)| {
+            let n = *c.buckets.get(*bucket)?;
+            (n > 0).then(|| format!("{n} {label}"))
+        })
+        .collect();
+    if !parts.is_empty() {
+        let _ = write!(line, ": {}", parts.join(", "));
+    }
+    line
+}
+
+/// The `rb status` DI line (contract M4b S7, amendment 2): injection points per bucket, zero
+/// buckets omitted, in a fixed order.
+fn di_line(c: &rb_store::DiCoverage) -> String {
+    const ORDER: &[(&str, &str)] = &[
+        ("plain", "plain"),
+        ("capped", "capped"),
+        ("ambiguous", "ambiguous"),
+        ("too_ambiguous", "too ambiguous"),
+        ("external", "external"),
+        ("unresolved", "unresolved"),
+        ("optional_absent", "optional absent"),
+        ("not_a_bean", "not a bean"),
+        ("test", "test"),
+    ];
+    let mut line = format!("di: {} injection points", c.points);
     let parts: Vec<String> = ORDER
         .iter()
         .filter_map(|(bucket, label)| {
@@ -1271,6 +1300,31 @@ mod tests {
         assert_eq!(
             http_line(&c),
             "http: 3 routes in 2 services; 10 client calls: 2 synthetic, 1 heuristic, 2 ambiguous, 1 too ambiguous, 1 external, 2 dynamic, 1 self"
+        );
+    }
+
+    /// Contract M4b S7: zero buckets omitted, a fixed order, the points first.
+    #[test]
+    fn di_line_orders_buckets_and_omits_zeros() {
+        let mut c = rb_store::DiCoverage::default();
+        assert_eq!(di_line(&c), "di: 0 injection points");
+        for (bucket, n) in [
+            ("test", 1),
+            ("not_a_bean", 1),
+            ("optional_absent", 0),
+            ("unresolved", 2),
+            ("external", 1),
+            ("too_ambiguous", 1),
+            ("ambiguous", 1),
+            ("capped", 3),
+            ("plain", 2),
+        ] {
+            c.buckets.insert(bucket.into(), n);
+            c.points += n;
+        }
+        assert_eq!(
+            di_line(&c),
+            "di: 12 injection points: 2 plain, 3 capped, 1 ambiguous, 1 too ambiguous, 1 external, 2 unresolved, 1 not a bean, 1 test"
         );
     }
 

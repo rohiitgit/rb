@@ -183,6 +183,16 @@ pub struct HttpCoverage {
     pub buckets: BTreeMap<String, i64>,
 }
 
+/// DI coverage of a snapshot (contract M4b S7, amendment 2): injection points per bucket and
+/// the gates that capped them, as the indexer counted them (`di_coverage`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct DiCoverage {
+    pub points: i64,
+    /// Bucket → points; empty for a snapshot indexed before DI.
+    pub buckets: BTreeMap<String, i64>,
+    pub gates: BTreeMap<String, i64>,
+}
+
 /// Outcome of resolving user input to exactly one node (design §9.1: never pick silently).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {
@@ -353,6 +363,37 @@ impl Store {
             migration_statements: r.get(1),
             unparsed: r.get(2),
             tables: r.get(3),
+        })
+    }
+
+    pub fn di_coverage(&mut self, snapshot_id: i64) -> anyhow::Result<DiCoverage> {
+        let detail: Option<Value> = self
+            .client
+            .query_opt(
+                "SELECT detail FROM rb.diagnostic WHERE snapshot_id = $1 AND kind = 'di_coverage'",
+                &[&snapshot_id],
+            )?
+            .map(|r| r.get(0));
+        let Some(detail) = detail else {
+            return Ok(DiCoverage::default());
+        };
+        let counts = |field: &str| -> anyhow::Result<BTreeMap<String, i64>> {
+            detail[field]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| {
+                    let n = v
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("di_coverage {field}.{k}: {v}"))?;
+                    Ok((k.clone(), n))
+                })
+                .collect()
+        };
+        Ok(DiCoverage {
+            points: detail["points"].as_i64().unwrap_or_default(),
+            buckets: counts("buckets")?,
+            gates: counts("gates")?,
         })
     }
 
