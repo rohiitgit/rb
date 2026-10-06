@@ -527,6 +527,23 @@ impl<'a> Index<'a> {
         self.files[path].1
     }
 
+    /// The types a type name written in `path` at `scope` resolves to (§5.4 levels, dotted
+    /// names through their container), as `(file, definition)`; for DI's injected and bean
+    /// types (contract M4b S4).
+    pub(crate) fn type_candidates(
+        &self,
+        path: &'a str,
+        scope: Option<usize>,
+        name: &str,
+    ) -> Vec<(&'a str, usize)> {
+        self.resolve_type(path, scope, name)
+    }
+
+    /// The resolved direct supertypes of a type (all candidates of each declared name).
+    pub(crate) fn direct_supertypes(&self, t: (&'a str, usize)) -> Vec<(&'a str, usize)> {
+        self.supertypes(t)
+    }
+
     fn def(&self, s: Sym<'a>) -> &'a Definition {
         &self.facts(s.0).definitions[s.1]
     }

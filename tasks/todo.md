@@ -537,7 +537,9 @@ Same rules as M4a:
   - *Invariants:* M3b's `scip` package edges unchanged; classpath closure has a cycle test.
   - Files: new `rb-indexer/src/packages.rs`, `rb-indexer/src/lib.rs` (wiring, `PIPELINE = m4b-di-1`).
   - **Verify:** units; e2e churn (manifest edges on all three fixtures) classified line by line, then blessed.
-- [ ] **4. DI resolution in the indexer** (S4–S8).
+- [x] **4a. DI resolution in the indexer** (S4–S8). Done: `rb-indexer/src/di.rs` (candidates, roots, classpath, narrowing, gates D and M, `INJECTS` capped at `heuristic`, `di_*`, `di_coverage`), resolver accessors, `RawScan` gate inputs; `PIPELINE = m4b-di-2`; amendment 8; 8 + 1 units, 28 mutants all killed; fixture dumps only add lines vs `1f81c8f`.
+- [ ] **4b. `di:` status line** (S7): `rb-store` coverage read, `rb-cli` line, `status-di.txt` golden.
+- (original phase 4 entry, split as above) **4. DI resolution in the indexer** (S4–S8).
   - *Derived:* candidates per point; narrowing; gates D and M; `INJECTS` with `capped_by`; `di_*` diagnostics; `di_coverage`; the `di:` status line.
   - *Invariants:* never `exact`; the minimum over resolution, path and rule; merge per edge; buckets sum (unit); each gate has its own biting row; counted growth test.
   - Files: new `rb-indexer/src/di.rs`, `rb-indexer/src/lib.rs`, `rb-indexer/src/resolve.rs` (type resolution exposed), `rb-store/src/query.rs` (coverage read), `rb-cli/src/main.rs` (status line).

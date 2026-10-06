@@ -864,10 +864,6 @@ pub(crate) fn add(b: &mut GraphBuilder, edges: &[ManifestEdge]) -> anyhow::Resul
 
 /// classpath(S) (D8): S and every service S reaches by `via=package` edges, transitively; one
 /// BFS with a visited set, so a cycle terminates.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "DI resolution reads it (contract M4b phase 4)")
-)]
 pub(crate) fn classpath(
     service: &str,
     depends: &BTreeMap<String, BTreeSet<String>>,

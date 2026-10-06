@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+mod di;
 mod modules;
 mod orm;
 mod packages;
@@ -64,8 +65,9 @@ use serde_json::{Value, json};
 /// text, string literals naming `fetch` or axios, discovery configuration caps host-by-name
 /// `synthetic`).
 /// `m4b-di-1` adds manifest dependencies: `Package` versions from lockfiles, `go.mod` and poms,
-/// and Service → Service `DEPENDS_ON` `via=package` (contract M4b S15, S16).
-pub const PIPELINE: &str = "m4b-di-1";
+/// and Service → Service `DEPENDS_ON` `via=package` (contract M4b S15, S16); `m4b-di-2` Spring
+/// DI's `INJECTS` edges, `di_*` diagnostics and `di_coverage` (S4–S8).
+pub const PIPELINE: &str = "m4b-di-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -744,6 +746,24 @@ pub fn assemble(
             (!ctx.is_empty()).then(|| (service.clone(), ctx.to_owned()))
         })
         .collect();
+    // Spring DI (contract M4b S4–S8): `INJECTS` from injection points to beans.
+    let deployable: BTreeSet<String> = boundaries
+        .projects()
+        .iter()
+        .filter(|p| p.deployable)
+        .map(|p| p.dir.clone())
+        .collect();
+    let depends = di::package_dependencies(&manifest_edges);
+    let resolution = di::resolve(&di::Inputs {
+        files: &content.facts,
+        keys: &keys,
+        index: &index,
+        service_of: &service_of,
+        deployable: &deployable,
+        depends: &depends,
+        unparsed: &content.unparsed,
+    });
+    diagnostics.extend(di::add_injects(&mut b, resolution)?);
     let (route_diagnostics, endpoints) = routes::add_endpoints(
         &mut b,
         &routes::Inputs {
@@ -1117,6 +1137,7 @@ mod tests {
             consumes(RawScan {
                 hooks: BTreeSet::from([rb_frameworks::clients::ClientKind::Fetch]),
                 discovery: false,
+                ..RawScan::default()
             }),
             ["heuristic base=unverified discovery=-"]
         );
@@ -1124,6 +1145,7 @@ mod tests {
             consumes(RawScan {
                 hooks: BTreeSet::new(),
                 discovery: true,
+                ..RawScan::default()
             }),
             ["heuristic base=literal discovery=configured"]
         );

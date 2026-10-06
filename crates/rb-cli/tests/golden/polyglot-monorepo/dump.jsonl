@@ -264,6 +264,8 @@
 ["E","endpoint","HTTP POST /internal/mfa/sms @services/notification","HANDLED_BY","file","services/notification/src/server.ts","treesitter",5,{"handler_spans":[[11,30,13,1]]},[["services/notification/src/server.ts",[11,0,13,2]]]]
 ["D","codeowners_ignored","CODEOWNERS",null,{"used":".github/CODEOWNERS"}]
 ["D","codeowners_invalid_line",".github/CODEOWNERS",[10,0,10,53],{"error":"character ranges (`[...]`) are not supported"}]
+["D","di_coverage",null,null,{"buckets":{"ambiguous":0,"capped":0,"external":0,"not_a_bean":0,"optional_absent":0,"plain":0,"test":0,"too_ambiguous":0,"unresolved":1},"gates":{},"points":1}]
+["D","di_unresolved","services/auth/src/main/java/com/acme/auth/AuthController.java",[9,26,9,39],{"detail":"no_bean","type":"MfaClient"}]
 ["D","http_coverage",null,null,{"ambiguous":1,"bases":{"unverified":0,"verified":0},"dynamic":1,"external":1,"heuristic":2,"self":1,"sites":8,"synthetic":2,"too_ambiguous":0,"unmatched":0}]
 ["D","http_external","apps/web/src/api/http.ts",[7,9,7,57],{"client":"fetch","host":"status.example.com","url":"https://status.example.com/api/v1/login"}]
 ["D","http_self","services/notification/src/selfcheck.ts",[2,20,2,89],{"client":"fetch","host":"localhost","url":"http://localhost:3000/internal/mfa/email"}]

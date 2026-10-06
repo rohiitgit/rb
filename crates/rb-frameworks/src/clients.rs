@@ -452,13 +452,34 @@ pub struct RawScan {
     /// Some such file configures service discovery or load balancing, which may bind a
     /// service name to any host: no host-by-name stitch (F1) is `synthetic`.
     pub discovery: bool,
+    /// DI-surface findings (contract M4b S6 gate D) as `(path, what)`
+    /// ([`crate::di::surface_text`]).
+    pub di_surface: Vec<(String, String)>,
+    /// Every whole word of the text of such files that are not inert (comments included), for
+    /// the mention gates (contract M4b S6 gate M, S9 (d)).
+    pub words: BTreeSet<String>,
+    /// Some non-inert file was over the byte cap: its words are unknown, so every name counts
+    /// as mentioned.
+    pub words_unread: bool,
 }
 
 impl RawScan {
     pub fn merge(&mut self, other: RawScan) {
         self.hooks.extend(other.hooks);
         self.discovery |= other.discovery;
+        self.di_surface.extend(other.di_surface);
+        self.words.extend(other.words);
+        self.words_unread |= other.words_unread;
     }
+}
+
+/// The whole words of a text: maximal runs of `[A-Za-z0-9_$]` and other alphanumeric
+/// characters.
+pub fn text_words(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The names whose appearance as a whole word in a file without token facts taints a client
@@ -603,9 +624,19 @@ fn has_word(text: &str, word: &str) -> bool {
 /// it taints every kind it would be scanned for, and discovery, so the cap can only
 /// over-taint. Inert text ([`inert`]) is not scanned.
 pub fn raw_scan(path: &str, text: Option<&str>) -> RawScan {
-    let mut out = RawScan::default();
+    let mut out = RawScan {
+        di_surface: crate::di::surface_text(path, text)
+            .into_iter()
+            .map(|what| (path.to_owned(), what))
+            .collect(),
+        ..RawScan::default()
+    };
     if inert(path) {
         return out;
+    }
+    match text {
+        Some(text) => out.words = text_words(text),
+        None => out.words_unread = true,
     }
     let go = path.to_ascii_lowercase().ends_with(".go");
     let kinds = RAW_SURFACE
@@ -2706,6 +2737,40 @@ mod tests {
         ] {
             assert_eq!(hooks(Language::Java, &src), [ClientKind::Feign], "{src}");
         }
+    }
+
+    /// Contract M4b S6/S9 (d): the raw-text scan also collects the whole words of non-inert
+    /// files, XML comments included (CDATA cannot hide a name), and gate D's findings; a file
+    /// over the cap leaves its words unknown.
+    #[test]
+    fn raw_scan_collects_words_and_di_surface() {
+        let x = raw_scan(
+            "p/ctx.xml",
+            Some("<a><![CDATA[ <!-- ]]> KafkaAuditSink <!-- x --></a>"),
+        );
+        assert!(x.words.contains("KafkaAuditSink") && x.words.contains("CDATA"));
+        assert!(!x.words_unread && x.di_surface.is_empty());
+        let k = raw_scan("p/Cfg.kt", Some("@Configuration class Cfg"));
+        assert_eq!(
+            k.di_surface,
+            [("p/Cfg.kt".to_owned(), "raw Configuration".to_owned())]
+        );
+        assert!(
+            raw_scan("README.md", Some("KafkaAuditSink"))
+                .words
+                .is_empty()
+        );
+        assert!(
+            raw_scan("w/package-lock.json", Some("KafkaAuditSink"))
+                .words
+                .is_empty()
+        );
+        let over = raw_scan("p/big.kt", None);
+        assert!(over.words_unread && over.words.is_empty());
+        assert_eq!(over.di_surface.len(), 1);
+        let mut merged = x;
+        merged.merge(over);
+        assert!(merged.words_unread && merged.words.contains("KafkaAuditSink"));
     }
 
     /// Contract M4a amendment 17 (evaluator pass 7, W1, W2, W4): the raw-text scan of a file

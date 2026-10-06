@@ -581,6 +581,15 @@ Environment: `df` 10 GiB free; `docker context show` = `desktop-linux`; `rb-scip
    - **Maven:** only `<project><dependencies>` is read (not `dependencyManagement`, plugin dependencies or profiles). `${project.version}`, `${project.groupId}` and `${project.artifactId}` count as same-pom properties. A version range or a partly interpolated version is unresolved. Scopes: `compile`/none → `runtime`, `system` → `provided`, `<optional>true` → `optional`. The evidence is the `artifactId` line.
    - **Go:** a `replace` to a local directory that is a service's makes the requirement a `synthetic` `via=package` edge; a requirement naming another service's module path without one is `heuristic`.
    - **The card's `Packages` section** now lists `Package` targets only, once each. Without that, a `via=package` Service target and a key shared by a `scip` and a `manifest` edge would print as packages, or twice. S18 reworks the section into objects.
+8. **DI resolution, as built (phase 4a, S4–S8 under F2).**
+   - **`resolution` values:** besides `unique`, `qualifier`, `primary` and `ambiguous`, an edge chosen by name fallback (or `@Resource`'s name) has `resolution: name` (with `by_name: true`, `capped_by` containing `by_name`), and a collection's edges have `resolution: collection`. The four decided values cannot state those two outcomes honestly.
+   - **A qualifier then `@Primary`:** when a qualifier leaves several beans, `@Primary` among them narrows further, as Spring's `determineAutowireCandidate` does after filtering by qualifier. The edge then has both `qualifier` and `primary: true`, `resolution: primary`.
+   - **External types:** an injected type that resolves to no definition of the snapshot is bucket `external`, whether or not an import names an external package; a repository `@Bean` method whose return type has the same simple name is the candidate instead (`external_type`). A `@Bean` method whose return type does not resolve is a candidate for a repository type only through the types its body creates (`bean_type_inferred`).
+   - **A consumer outside its service's known component roots** is not scanned, so its points are bucket `not_a_bean` (detail `outside_scan_roots`).
+   - **A conditional among the candidates narrowing removed** makes the edge `conditional` (and the point `capped`), as S5 states; a conditional consumer does too.
+   - **Gate inputs from files without facts:** `RawScan` (M4a amendment 17's selection) also carries gate D's text findings (`di_surface`), the whole words of non-inert files with XML comments kept (`words`, for gate M and S9 (d)), and `words_unread` for a file over the byte cap (every name then counts as mentioned).
+   - **Deterministic merge:** one edge per `(owner, bean)`: the best site's certainty, then the first site by path and span, gives the attributes; every site is evidence and `sites = n`.
+   - **Phase split:** phase 4 is done as 4a (resolution, edges, diagnostics, `di_coverage`) and 4b (the `di:` status line and its golden), to keep each phase within five hand-edited files.
 
 ## Orchestrator decisions on the forks (2026-10-06)
 
