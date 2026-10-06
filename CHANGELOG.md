@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4b phase 1a: X1 row; parameter, type and modifier facts
+- **M4a open item 24 (X1):** `raw_text_hooks_and_discovery_keys` gains the row `("w/public/index.html", "<script>document.write(\"<!--\"); window.fetch = f; // --></script>", [Fetch])`. Mutant B (an `.html` file stripped of `<!-- … -->` like XML) fails exactly that row (`test result: FAILED. 0 passed; 1 failed`); the file was restored, its bytes compared with the saved copy, and the test passes again.
+- **New neutral facts** (`rb-syntax`, fingerprinted through `lib.rs`, `bindings.rs`, `decorations.rs`):
+  - `Binding.parameter`: 0-based position in its function, method, constructor or lambda (Java, TS/JS, Go, Python; Python's `self` counts; a Go receiver and named results are not parameters; unnamed and variadic Go parameters and Java varargs take a position);
+  - `Binding.type_args` (one level, simple names; a wildcard as its bound) and `Binding.array` (amendment 4: `T[]`, element in `type_args[0]`), Java and TypeScript;
+  - `Definition.return_type` (Java methods, TypeScript functions, methods and function-valued declarators) and `Definition.modifiers` (sorted; Java keywords, TS/JS `export`/`export_default`/`abstract`/`static`).
+  - Existing facts are unchanged: `type_name` still strips arguments, Java varargs and Go variadic names stay unbound.
+- **Tests first:** `parameter_tests::{java_parameter_positions, typescript_and_javascript_parameter_positions, go_and_python_parameter_positions, java_type_arguments_one_level_deep, typescript_type_arguments_one_level_deep}`, `signature_tests::{java_return_types_and_modifiers, typescript_return_types_and_modifiers, go_and_python_have_neither}` did not compile before the change.
+- **Verification:** fmt, clippy clean; 481 unit tests (rb 14, rb-frameworks 82, rb-git 26, rb-indexer 171, rb-model 11, rb-scip 40, rb-sql 27, rb-store 27, rb-syntax 83); e2e 17/17 with the database and containers, **no golden changed**; stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-syntax/src/{lib,bindings,decorations,keys}.rs`, `crates/rb-frameworks/src/clients.rs`, `tasks/{contract-m4b,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-06] (wall clock) M4b phase 0: preflight
 - **Records only, no code change.** Contract `tasks/contract-m4b.md` gains "Checked in phase 0": D9's Spring rules, Spring Data's `Impl` fragment convention, `@EnableFeignClients`' default package (the annotated class's), Boot's JPA repository base (the auto-configuration package), Lombok's constructor rules, `Introspector.decapitalize` and the npm v2/v3 `packages` layout, each confirmed from a primary source (Spring Framework, Spring Data, Spring Boot and Lombok references, `DefaultListableBeanFactory` and `FeignClientsRegistrar` sources, Java SE API, npm docs). `ObjectFactory<T>` joins the wrapper list.
 - **Amendments 1–3:** Lombok generates its constructor even next to a declared one (two constructors, none marked: no points); under F2 the DI buckets `synthetic`/`heuristic` become `plain`/`capped` and every `INJECTS` carries `resolution`; gate D reads main sources only (measured: spring-petclinic's test-only `FilterType`/`ApplicationListener` imports).

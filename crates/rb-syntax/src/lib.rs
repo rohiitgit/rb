@@ -165,6 +165,15 @@ pub struct Definition {
     /// Declared type parameters (`BaseRepo<T, ID>` → `T`, `ID`), for Java and TypeScript.
     #[serde(default)]
     pub type_params: Vec<String>,
+    /// The declared return type as written, type arguments included: a Java method's (`void`
+    /// too; not a constructor's), a TypeScript method's or function's annotation (contract M4b
+    /// S1).
+    #[serde(default)]
+    pub return_type: Option<String>,
+    /// Modifiers as written, sorted: Java `public`, `protected`, `private`, `static`,
+    /// `abstract`, `final`, `default`; TS/JS `export`, `export_default`, `abstract`, `static`.
+    #[serde(default)]
+    pub modifiers: Vec<String>,
 }
 
 /// An annotation or decorator on a definition.
@@ -502,6 +511,20 @@ pub struct Binding {
     /// Java annotations on a field or parameter (`@Value("${k:d}")`), in source order.
     #[serde(default)]
     pub decorations: Vec<Decoration>,
+    /// The 0-based position of a parameter in its function, method, constructor or lambda
+    /// (Java, TS/JS, Go, Python; Python's `self` counts); `None` for fields, locals, a Go
+    /// receiver and named results (contract M4b S1). A destructured parameter's names share it.
+    #[serde(default)]
+    pub parameter: Option<u32>,
+    /// The declared type's arguments as simple names, one level deep (`List<Notifier>` →
+    /// `Notifier`, `Map<String, a.Sink>` → `String`, `Sink`; a wildcard as its bound), Java and
+    /// TypeScript; for an array ([`Binding::array`]) its element type alone.
+    #[serde(default)]
+    pub type_args: Vec<String>,
+    /// The declared type is an array (`T[]`, Java `T...`), whose element is `type_args[0]`;
+    /// `type_name` is then empty, as before.
+    #[serde(default)]
+    pub array: bool,
 }
 
 /// Parses `source` and extracts its definitions and references.
@@ -542,6 +565,8 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             supertypes: decorations::supertypes(language, d.node, source),
             class_constants: decorations::class_constants(language, d.node, source),
             type_params: decorations::type_params(language, d.node, source),
+            return_type: decorations::return_type(language, d.node, source),
+            modifiers: decorations::modifiers(language, d.node, source),
         })
         .collect();
     attach_go_methods(&mut definitions);
@@ -621,6 +646,9 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                 } else {
                     Vec::new()
                 },
+                parameter: b.parameter.map(|p| u32::try_from(p).unwrap_or(u32::MAX)),
+                type_args: b.type_args,
+                array: b.array,
             }
         })
         .collect();

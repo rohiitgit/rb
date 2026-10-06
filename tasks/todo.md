@@ -516,7 +516,7 @@ Same rules as M4a:
   - Run S6's and S9's matchers as a throwaway script over the fixtures and the public repositories, and read every hit (lesson 2026-10-06, "measure a conservative fallback on the fixtures"). Record the expected cost, or amend a list with its reason.
   - Check the `.m2` cache for `spring-context` and `spring-boot-autoconfigure` (the new fixture classes).
   - **Verify:** the contract gains "Checked in phase 0" with each finding and its source; any deviation from a decision is written as an amendment before code.
-- [ ] **1a. X1 and parameter, type and modifier facts** (S1).
+- [x] **1a. X1 and parameter, type and modifier facts** (S1). Done: X1's HTML row kills mutant B (HTML stripped like XML: the row fails, restored bytes compared); `Binding.parameter`/`type_args`/`array` (amendment 4), `Definition.return_type`/`modifiers`; 8 new units (failed to compile first); e2e 17/17 with no golden change.
   - *State:* `Binding.parameter`, `Binding.type_args`, `Definition.return_type`, `Definition.modifiers`.
   - *Derived:* none.
   - *Invariants:* facts stay neutral; fingerprint test; no golden change.

@@ -2723,6 +2723,12 @@ mod tests {
         for (path, text, want) in [
             ("w/src/App.vue", "axios.defaults.adapter = a;", vec![Axios]),
             ("w/public/index.html", "window.fetch = f;", vec![Fetch]),
+            // HTML is not stripped like XML (M4a open item 24): `<!--` in a script is code.
+            (
+                "w/public/index.html",
+                "<script>document.write(\"<!--\"); window.fetch = f; // --></script>",
+                vec![Fetch],
+            ),
             ("w/src/App.svelte", "$fetch(u)", vec![Fetch]),
             ("p/G.kt", "import feign.RequestInterceptor", vec![Feign]),
             ("p/G.groovy", "@Bean Feign.Builder b()", vec![Feign]),

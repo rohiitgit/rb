@@ -435,6 +435,102 @@ pub(crate) fn type_params(language: Language, def: Node<'_>, source: &[u8]) -> V
         .collect()
 }
 
+/// The declared return type as written (contract M4b S1): a Java method's `type` (not a
+/// constructor's), a TypeScript function's or method's return annotation, also for a function
+/// value bound by a declarator (`const f = (): T => …`).
+pub(crate) fn return_type(language: Language, def: Node<'_>, source: &[u8]) -> Option<String> {
+    match language {
+        Language::Java => (def.kind() == "method_declaration")
+            .then(|| def.child_by_field_name("type"))
+            .flatten()
+            .map(|t| text(t, source)),
+        Language::TypeScript | Language::Tsx => {
+            let function = if def.kind() == "variable_declarator" {
+                def.child_by_field_name("value")?
+            } else {
+                def
+            };
+            let annotation = function.child_by_field_name("return_type")?;
+            let mut c = annotation.walk();
+            let ty = if annotation.kind() == "type_annotation" {
+                annotation.named_children(&mut c).last()?
+            } else {
+                annotation
+            };
+            Some(text(ty, source))
+        }
+        _ => None,
+    }
+}
+
+/// Java modifiers that [`modifiers`] records.
+const JAVA_MODIFIERS: &[&str] = &[
+    "public",
+    "protected",
+    "private",
+    "static",
+    "abstract",
+    "final",
+    "default",
+];
+
+/// A definition's modifiers as written, sorted (contract M4b S1). Java: the keywords of its
+/// `modifiers` node in [`JAVA_MODIFIERS`]. TS/JS: `export` or `export_default` from an
+/// enclosing export statement (through a declarator and its declaration), `abstract` for an
+/// abstract class or method, `static` for a static member.
+pub(crate) fn modifiers(language: Language, def: Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match language {
+        Language::Java => {
+            let mut c = def.walk();
+            for m in def.children(&mut c).filter(|c| c.kind() == "modifiers") {
+                let mut mc = m.walk();
+                for t in m.children(&mut mc) {
+                    let word = text(t, source);
+                    if JAVA_MODIFIERS.contains(&word.as_str()) {
+                        out.push(word);
+                    }
+                }
+            }
+        }
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            let mut holder = def;
+            if holder.kind() == "variable_declarator"
+                && let Some(declaration) = holder
+                    .parent()
+                    .filter(|p| matches!(p.kind(), "lexical_declaration" | "variable_declaration"))
+            {
+                holder = declaration;
+            }
+            if let Some(export) = holder.parent().filter(|p| p.kind() == "export_statement") {
+                let mut c = export.walk();
+                let default = export.children(&mut c).any(|t| t.kind() == "default");
+                out.push(if default { "export_default" } else { "export" }.to_owned());
+            }
+            if matches!(
+                def.kind(),
+                "abstract_class_declaration" | "abstract_method_signature"
+            ) {
+                out.push("abstract".to_owned());
+            }
+            let mut c = def.walk();
+            for t in def.children(&mut c) {
+                match t.kind() {
+                    "static" => out.push("static".to_owned()),
+                    "abstract" if !out.iter().any(|m| m == "abstract") => {
+                        out.push("abstract".to_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Language::Python | Language::Go => {}
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn field_text(node: Node<'_>, fields: &[&str], source: &[u8]) -> Option<String> {
     fields
         .iter()
@@ -948,6 +1044,84 @@ export @Entity({ name: 'orders', schema: 'shop' }) class Order {}
         assert_eq!(
             names_and_spans(Language::Python, python),
             [("models.Model".into(), span)]
+        );
+    }
+}
+
+/// Contract M4b S1: a definition's declared return type and its modifiers.
+#[cfg(test)]
+mod signature_tests {
+    use crate::{Language, extract};
+
+    /// `name: return_type [modifiers]` per definition.
+    fn signatures(language: Language, src: &str) -> Vec<String> {
+        extract(language, src.as_bytes())
+            .unwrap()
+            .definitions
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}: {} [{}]",
+                    d.name,
+                    d.return_type.as_deref().unwrap_or("-"),
+                    d.modifiers.join(" ")
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn java_return_types_and_modifiers() {
+        let src = "public abstract class K {\n  @Bean public static final Map<String, List<Repo>> m() { return null; }\n  protected abstract void run();\n  private K() {}\n  interface I { default int d() { return 1; } Repo r(); }\n  final static class N {}\n}\n";
+        assert_eq!(
+            signatures(Language::Java, src),
+            [
+                "K: - [abstract public]",
+                "m: Map<String, List<Repo>> [final public static]",
+                "run: void [abstract protected]",
+                "K: - [private]",
+                "I: - []",
+                "d: int [default]",
+                "r: Repo []",
+                "N: - [final static]"
+            ]
+        );
+    }
+
+    #[test]
+    fn typescript_return_types_and_modifiers() {
+        let src = "export class A { static make(): A { return new A(); } run() {} }\nexport default class B {}\nexport abstract class C { abstract go(): Promise<void>; }\nexport function f(): string { return ''; }\nfunction g() {}\nexport const h = (): number => 1;\nconst i = function (): Repo { return r; };\n";
+        assert_eq!(
+            signatures(Language::TypeScript, src),
+            [
+                "A: - [export]",
+                "make: A [static]",
+                "run: - []",
+                "B: - [export_default]",
+                "C: - [abstract export]",
+                "go: Promise<void> [abstract]",
+                "f: string [export]",
+                "g: - []",
+                "h: number [export]",
+                "i: Repo []"
+            ]
+        );
+        let js = "export default function main() {}\n";
+        assert_eq!(
+            signatures(Language::JavaScript, js),
+            ["main: - [export_default]"]
+        );
+    }
+
+    #[test]
+    fn go_and_python_have_neither() {
+        assert_eq!(
+            signatures(Language::Go, "package p\nfunc F() int { return 1 }\n"),
+            ["F: - []"]
+        );
+        assert_eq!(
+            signatures(Language::Python, "def f() -> int:\n    return 1\n"),
+            ["f: - []"]
         );
     }
 }

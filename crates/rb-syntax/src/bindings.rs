@@ -23,6 +23,12 @@ pub(crate) struct RawBinding<'t> {
     pub value: Option<Node<'t>>,
     /// Declared constant (`const`, Java `final` or an interface field, Go `const`).
     pub constant: bool,
+    /// The parameter's position in its function (contract M4b S1).
+    pub parameter: Option<usize>,
+    /// The declared type's arguments by simple name, or an array's element type.
+    pub type_args: Vec<String>,
+    /// The declared type is an array.
+    pub array: bool,
 }
 
 /// Every binding in the file, in source order.
@@ -188,9 +194,161 @@ fn push<'t>(
             from_start: false,
             value: None,
             constant: false,
+            parameter: None,
+            type_args: Vec::new(),
+            array: false,
         });
     }
     name.is_some()
+}
+
+/// Sets the position of the binding `push` just recorded, if it recorded one.
+fn positioned(out: &mut [RawBinding<'_>], pushed: bool, position: Option<usize>) {
+    if let (true, Some(b)) = (pushed, out.last_mut()) {
+        b.parameter = position;
+    }
+}
+
+/// Sets the type arguments of the binding `push` just recorded from its declared type node.
+fn with_type_args(out: &mut [RawBinding<'_>], pushed: bool, ty: Option<Node<'_>>, source: &[u8]) {
+    if let (true, Some(b), Some(ty)) = (pushed, out.last_mut(), ty) {
+        (b.type_args, b.array) = type_args(ty, source);
+    }
+}
+
+/// A declared type's arguments by simple name, one level deep, and whether it is an array, in
+/// which case the element type is the only argument (contract M4b S1): `List<Notifier>` →
+/// `Notifier`; `Map<String, a.Sink>` → `String`, `Sink`; `Notifier[]` → `Notifier`, array.
+fn type_args(node: Node<'_>, source: &[u8]) -> (Vec<String>, bool) {
+    let mut c = node.walk();
+    match node.kind() {
+        "type_annotation" | "annotated_type" | "parenthesized_type" => node
+            .named_children(&mut c)
+            .filter(|n| !is_annotation(*n))
+            .last()
+            .map(|inner| type_args(inner, source))
+            .unwrap_or_default(),
+        "generic_type" => {
+            let args = node
+                .named_children(&mut c)
+                .find(|n| n.kind() == "type_arguments");
+            let names = args
+                .map(|a| {
+                    let mut ac = a.walk();
+                    a.named_children(&mut ac)
+                        .filter_map(|n| simple_type(n, source))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (names, false)
+        }
+        "array_type" => {
+            let element = node
+                .child_by_field_name("element")
+                .or_else(|| node.named_child(0));
+            (
+                element
+                    .and_then(|e| simple_type(e, source))
+                    .into_iter()
+                    .collect(),
+                true,
+            )
+        }
+        _ => (Vec::new(), false),
+    }
+}
+
+fn is_annotation(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "annotation" | "marker_annotation" | "comment" | "line_comment" | "block_comment"
+    )
+}
+
+/// A type argument by its simple name: a qualified name's last identifier, a generic type's
+/// name, an annotated type's type, a wildcard's bound (`?` when it has none).
+fn simple_type(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut c = node.walk();
+    match node.kind() {
+        "comment" | "line_comment" | "block_comment" => None,
+        "generic_type" => simple_type(
+            node.child_by_field_name("name")
+                .or_else(|| node.named_child(0))?,
+            source,
+        ),
+        "annotated_type" | "type_annotation" | "parenthesized_type" => node
+            .named_children(&mut c)
+            .filter(|n| !is_annotation(*n))
+            .last()
+            .and_then(|inner| simple_type(inner, source)),
+        "wildcard" => Some(
+            node.named_children(&mut c)
+                .filter(|n| !is_annotation(*n))
+                .last()
+                .and_then(|bound| simple_type(bound, source))
+                .unwrap_or_else(|| "?".to_owned()),
+        ),
+        "scoped_type_identifier" | "nested_type_identifier" | "qualified_type" => node
+            .named_children(&mut c)
+            .filter(|n| !is_annotation(*n))
+            .last()
+            .and_then(|last| simple_type(last, source)),
+        _ => Some(text(node, source)),
+    }
+}
+
+/// The position of a parameter node among its list's parameters (`kinds`), comments and
+/// separators left out.
+fn index_among(node: Node<'_>, kinds: &[&str]) -> Option<usize> {
+    let parent = node.parent()?;
+    let mut c = parent.walk();
+    parent
+        .named_children(&mut c)
+        .filter(|n| kinds.contains(&n.kind()))
+        .position(|n| n.id() == node.id())
+}
+
+const JAVA_PARAMETERS: &[&str] = &["formal_parameter", "spread_parameter"];
+const ES_PARAMETERS: &[&str] = &["required_parameter", "optional_parameter"];
+const PYTHON_PARAMETERS: &[&str] = &[
+    "identifier",
+    "default_parameter",
+    "typed_parameter",
+    "typed_default_parameter",
+    "list_splat_pattern",
+    "dictionary_splat_pattern",
+];
+
+/// Go: the position of a `parameter_declaration`'s first name in its function's parameters
+/// (not a receiver's or named result's list); unnamed parameters take one position each.
+fn go_position(node: Node<'_>) -> Option<usize> {
+    let list = node.parent().filter(|l| l.kind() == "parameter_list")?;
+    let owner = list.parent()?;
+    if owner
+        .child_by_field_name("parameters")
+        .is_none_or(|p| p.id() != list.id())
+    {
+        return None;
+    }
+    let mut c = list.walk();
+    let mut base = 0;
+    for p in list.named_children(&mut c) {
+        if p.id() == node.id() {
+            return Some(base);
+        }
+        if matches!(
+            p.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            let mut pc = p.walk();
+            base += p
+                .children_by_field_name("name", &mut pc)
+                .filter(|n| n.kind() == "identifier")
+                .count()
+                .max(1);
+        }
+    }
+    None
 }
 
 /// Sets the initialiser and constness of the binding `push` just recorded, if it recorded one.
@@ -347,6 +505,9 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                     d.child_by_field_name("value"),
                     java_constant(node, source),
                 );
+                if !is_var {
+                    with_type_args(out, pushed, declared, source);
+                }
             }
         }
         // An interface's or annotation type's field: implicitly `static final`.
@@ -382,6 +543,11 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 source,
             );
             initialised(out, pushed, None, java_constant(node, source));
+            // A `spread_parameter` has no `name` field, so it is never recorded (unchanged).
+            if node.kind() == "formal_parameter" {
+                positioned(out, pushed, index_among(node, JAVA_PARAMETERS));
+                with_type_args(out, pushed, node.child_by_field_name("type"), source);
+            }
         }
         "enhanced_for_statement" => {
             let name = node.child_by_field_name("name");
@@ -417,8 +583,9 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                     "inferred_parameters" => pattern_names(params, &mut names),
                     _ => {}
                 }
-                for n in names {
-                    push(out, Some(n), None, false, node, params, source);
+                for (i, n) in names.into_iter().enumerate() {
+                    let pushed = push(out, Some(n), None, false, node, params, source);
+                    positioned(out, pushed, Some(i));
                 }
             }
         }
@@ -438,6 +605,7 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
                 .or_else(|| node.child_by_field_name("property"));
             let pushed = push(out, name, ty, true, node, node, source);
             initialised(out, pushed, node.child_by_field_name("value"), false);
+            with_type_args(out, pushed, node.child_by_field_name("type"), source);
         }
         "required_parameter" | "optional_parameter" => {
             let mut c = node.walk();
@@ -451,22 +619,29 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
             if let Some(pattern) = node.child_by_field_name("pattern") {
                 let mut names = Vec::new();
                 pattern_names(pattern, &mut names);
+                let position = index_among(node, ES_PARAMETERS);
                 for n in names {
-                    push(out, Some(n), ty.clone(), member, node, node, source);
+                    let pushed = push(out, Some(n), ty.clone(), member, node, node, source);
+                    positioned(out, pushed, position);
+                    with_type_args(out, pushed, node.child_by_field_name("type"), source);
                 }
             }
         }
         // JavaScript parameters (TypeScript wraps them in `required_parameter`).
         "formal_parameters" => {
             let mut c = node.walk();
-            for p in node.named_children(&mut c) {
+            let parameters = node
+                .named_children(&mut c)
+                .filter(|p| !matches!(p.kind(), "comment"));
+            for (i, p) in parameters.enumerate() {
                 if matches!(p.kind(), "required_parameter" | "optional_parameter") {
                     continue;
                 }
                 let mut names = Vec::new();
                 pattern_names(p, &mut names);
                 for n in names {
-                    push(out, Some(n), None, false, p, node, source);
+                    let pushed = push(out, Some(n), None, false, p, node, source);
+                    positioned(out, pushed, Some(i));
                 }
             }
         }
@@ -476,7 +651,8 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
                 .child_by_field_name("parameter")
                 .filter(|p| p.kind() == "identifier")
             {
-                push(out, Some(p), None, false, node, p, source);
+                let pushed = push(out, Some(p), None, false, node, p, source);
+                positioned(out, pushed, Some(0));
             }
         }
         "variable_declarator" => {
@@ -598,7 +774,8 @@ fn python<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 };
                 // `self`/`cls` are handled as the enclosing class.
                 let name = name.filter(|n| !matches!(text(*n, source).as_str(), "self" | "cls"));
-                push(out, name, ty, false, p, node, source);
+                let pushed = push(out, name, ty, false, p, node, source);
+                positioned(out, pushed, index_among(p, PYTHON_PARAMETERS));
             }
         }
         "assignment" => {
@@ -712,8 +889,12 @@ fn go<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 .filter(|n| matches!(n.kind(), "identifier" | "field_identifier"))
                 .collect();
             let values = node.child_by_field_name("value");
+            let position = (node.kind() == "parameter_declaration")
+                .then(|| go_position(node))
+                .flatten();
             for (i, name) in declared.iter().enumerate() {
                 let pushed = push(out, Some(*name), ty.clone(), member, node, node, source);
+                positioned(out, pushed, position.map(|p| p + i));
                 let value = nth_value(values, i).filter(|_| {
                     values.is_some_and(|v| {
                         v.kind() != "expression_list" || v.named_child_count() == declared.len()
@@ -1256,6 +1437,117 @@ mod tests {
         assert!(
             *end >= after(go, "r.M1()").0 && *end < after(go, "r.M2()").0,
             "{rows:?}"
+        );
+    }
+}
+
+/// Contract M4b S1: a parameter's position in its function, and a declared type's arguments.
+#[cfg(test)]
+mod parameter_tests {
+    use crate::{Language, extract};
+
+    /// `name@position` for every binding (`-` when not a parameter).
+    fn positions(language: Language, src: &str) -> Vec<String> {
+        extract(language, src.as_bytes())
+            .unwrap()
+            .bindings
+            .iter()
+            .map(|b| match b.parameter {
+                Some(p) => format!("{}@{p}", b.name),
+                None => format!("{}@-", b.name),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn java_parameter_positions() {
+        // A varargs parameter is not a binding (its name sits in a declarator; unchanged), but
+        // it counts as a position.
+        let src = "class K {\n  private Repo repo;\n  K(Repo r, @Value(\"x\") String s, Notifier... ns) { Store local = x(); }\n  void m(int a) { xs.forEach((p, q) -> p.go()); xs.forEach(z -> z.go()); try (Repo t = r()) {} catch (RuntimeException e) {} }\n}\n";
+        assert_eq!(
+            positions(Language::Java, src),
+            [
+                "repo@-", "r@0", "s@1", "local@-", "a@0", "p@0", "q@1", "z@0", "t@-", "e@-"
+            ]
+        );
+    }
+
+    #[test]
+    fn typescript_and_javascript_parameter_positions() {
+        let ts = "class K {\n  f: Svc;\n  constructor(private svc: Svc, x?: number, { a, b }: Opts) { const y = 1; }\n}\nconst g = (u: U, v) => u;\nitems.map(w => w);\n";
+        assert_eq!(
+            positions(Language::TypeScript, ts),
+            [
+                "f@-", "svc@0", "x@1", "a@2", "b@2", "y@-", "g@-", "u@0", "v@1", "w@0"
+            ]
+        );
+        let js = "function f(a, [b, c], d = 1) { let e = 2; }\n";
+        assert_eq!(
+            positions(Language::JavaScript, js),
+            ["a@0", "b@1", "c@1", "d@2", "e@-"]
+        );
+    }
+
+    #[test]
+    fn go_and_python_parameter_positions() {
+        // The receiver and named results are not parameters; a variadic parameter is not a
+        // binding (unchanged) but takes its position. `int, s string` names two strings.
+        let go = "package p\nfunc (c *C) M(a, b int, _ string, d ...Repo, e Repo) (n int) { x := 1 }\nfunc F(int, s string) {}\n";
+        assert_eq!(
+            positions(Language::Go, go),
+            [
+                "c@-", "a@0", "b@1", "_@2", "e@4", "n@-", "x@-", "int@0", "s@1"
+            ]
+        );
+        // `self` keeps position 0 although it is not a binding.
+        let py = "class K:\n    def f(self, u: User, *args, k=1, **kw):\n        v = 2\n";
+        assert_eq!(
+            positions(Language::Python, py),
+            ["u@1", "args@2", "k@3", "kw@4", "v@-"]
+        );
+    }
+
+    /// `name: type_args` (with `[]` for an array) for every binding that has type arguments.
+    fn args(language: Language, src: &str) -> Vec<String> {
+        extract(language, src.as_bytes())
+            .unwrap()
+            .bindings
+            .iter()
+            .filter(|b| !b.type_args.is_empty() || b.array)
+            .map(|b| {
+                let array = if b.array { "[]" } else { "" };
+                format!("{}: {}{array}", b.name, b.type_args.join(","))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn java_type_arguments_one_level_deep() {
+        let src = "class K {\n  List<Notifier> ns;\n  Map<String, com.x.Sink> m;\n  Optional<List<Repo>> o;\n  ObjectProvider<? extends Repo> p;\n  Notifier[] arr;\n  Repo plain;\n  K(Set<@NonNull Notifier> s, Notifier[] vs) {}\n}\n";
+        assert_eq!(
+            args(Language::Java, src),
+            [
+                "ns: Notifier",
+                "m: String,Sink",
+                "o: List",
+                "p: Repo",
+                "arr: Notifier[]",
+                "s: Notifier",
+                "vs: Notifier[]"
+            ]
+        );
+        // The declared type itself is unchanged (type arguments stripped).
+        let facts = extract(Language::Java, src.as_bytes()).unwrap();
+        let ns = facts.bindings.iter().find(|b| b.name == "ns").unwrap();
+        assert_eq!(ns.type_name, "List");
+    }
+
+    #[test]
+    fn typescript_type_arguments_one_level_deep() {
+        let src = "class K {\n  a: Array<Notifier>;\n  b: Map<string, ns.Sink>;\n  c: Notifier[];\n  d: Repo;\n  constructor(private e: Promise<Repo>) {}\n}\n";
+        assert_eq!(
+            args(Language::TypeScript, src),
+            ["a: Notifier", "b: string,Sink", "c: Notifier[]", "e: Repo"]
         );
     }
 }
