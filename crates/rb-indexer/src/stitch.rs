@@ -104,10 +104,10 @@ pub(crate) struct Site {
     pub config_overridden: bool,
     /// The base was read from a `@Bean` method taken as the injected instance (amendment 12).
     pub base_from_bean: bool,
-    /// Gate A (amendment 13): the call is on an instance whose base comes from its construction,
-    /// and nothing can change that base afterwards (`Some(true)`) or something may
-    /// (`Some(false)`: the host still restricts, the site is never `synthetic`, and its edge
-    /// says `base: unverified`); `None` for a call on no such instance.
+    /// Gate A (amendments 13 and 14): the call is on an instance whose base comes from its
+    /// construction, and the conservative token scan proves that base unchanged (`Some(true)`)
+    /// or does not (`Some(false)`: the host still restricts, the site is never `synthetic`, and
+    /// its edge says `base: unverified`); `None` for a call on no such instance.
     pub base_verified: Option<bool>,
 }
 
@@ -292,7 +292,6 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
         .iter()
         .map(|(path, (language, facts))| (*path, rb_frameworks::clients::clients(*language, facts)))
         .collect();
-    let tainted = escaped_instances(inputs, &clients);
     let mut out = Vec::new();
     for (&path, file_clients) in &clients {
         let file = folding.ids[path];
@@ -303,24 +302,14 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
             // A base stated at the call (axios request config) replaces the instance's
             // (amendment 12).
             let stated = call.base.clone().map(|b| (file, b));
-            // Gate A across files (amendment 13): a top-level instance a file importing it
-            // uses otherwise is unverified.
-            let unverify = |target: &str, name: &str| {
-                tainted.contains(&(target, name)) || tainted.contains(&(target, "*"))
-            };
             let mut base_verified = call.base_verified;
-            if let (Some(true), Some(name)) = (base_verified, &call.top_instance)
-                && unverify(path, name)
-            {
-                base_verified = Some(false);
-            }
             let base = match &call.instance {
                 Some(name) => match imported_instance(inputs, &clients, path, facts, name) {
                     Some((target, instance)) => {
+                        // An imported instance is exported, so never verified (Gate A,
+                        // amendment 14); `verified` says so.
                         if instance.base.is_some() {
-                            base_verified = Some(
-                                instance.verified && !unverify(target, instance.name.as_str()),
-                            );
+                            base_verified = Some(instance.verified);
                         }
                         stated.or_else(|| instance.base.clone().map(|b| (folding.ids[target], b)))
                     }
@@ -350,40 +339,6 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 base_from_bean: call.base_from_bean,
                 base_verified,
             });
-        }
-    }
-    out
-}
-
-/// Gate A across files (contract M4a amendment 13): `(file, exported name)` for every name a
-/// file imports and uses other than as the receiver of a request call
-/// ([`FileClients::escaped_imports`]), resolved through M3a module resolution; `(file, "*")`
-/// for a namespace import used so, which may reach any of the module's exports.
-fn escaped_instances<'a>(
-    inputs: &Inputs<'a, '_>,
-    clients: &BTreeMap<&'a str, FileClients>,
-) -> HashSet<(&'a str, &'a str)> {
-    let mut out = HashSet::new();
-    for (&path, fc) in clients {
-        if fc.escaped_imports.is_empty() {
-            continue;
-        }
-        let facts = inputs.files[path].1;
-        let escaped = |name: &str| {
-            fc.escaped_imports
-                .binary_search_by(|e| e.as_str().cmp(name))
-                .is_ok()
-        };
-        for (import, files) in facts.imports.iter().zip(inputs.index.import_targets(path)) {
-            for &f in files {
-                rb_frameworks::work::tick(1);
-                for n in import.names.iter().filter(|n| escaped(&n.local)) {
-                    out.insert((f, n.name.as_str()));
-                }
-                if import.alias.as_deref().is_some_and(escaped) {
-                    out.insert((f, "*"));
-                }
-            }
         }
     }
     out
@@ -2307,10 +2262,12 @@ mod tests {
                 "web/src/calls.ts 4 external",
                 "web/src/calls.ts 5 external",
                 "web/src/calls.ts 6 external",
-                "web/src/calls.ts 7 synthetic -> HTTP GET /orders/{} @orders [synthetic]",
+                // Both instances are exported, so their bases are never verified (Gate A,
+                // amendment 14): `heuristic`.
+                "web/src/calls.ts 7 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
                 "web/src/calls.ts 8 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
                 "web/src/calls.ts 9 external",
-                "web/src/calls.ts 10 synthetic -> HTTP GET /orders/{} @orders [synthetic]",
+                "web/src/calls.ts 10 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
             ]
         );
     }
@@ -2352,26 +2309,74 @@ mod tests {
             .collect()
     }
 
-    /// Contract M4a amendment 13, Gate A (evaluator pass 3, R1), from source: an instance whose
-    /// base its file (or a file importing it) can change after construction keeps its host but
-    /// never reaches `synthetic`, and says `base: unverified`; an unchanged one still does.
+    /// Contract M4a amendment 14, Gate A (evaluator passes 3 and 4), from source: every
+    /// repro of T1–T4 (a use or write before the declaration, in a nested function or a class;
+    /// an aliased or default export; a Java field changed through another reference, an inner
+    /// class, a method returning `this`, a subclass, a Lombok getter or another file; a
+    /// `uriBuilderFactory` next to `baseUrl`) keeps its host but never reaches `synthetic` and
+    /// says `base: unverified` (or, when the factory states another host, is `external`). The
+    /// controls stay `synthetic`: a method-local `WebClient` used only for requests (the
+    /// Store-Microservices form), an unexported module `const` used only for requests, a
+    /// function-local instance, and an inline `axios.create(…).get(…)`.
     #[test]
     fn a_base_reaches_synthetic_only_when_the_instance_is_unchanged() {
-        let calls = "import axios from \"axios\";\nimport { shared2, shared4, shared5 } from \"./client\";\nimport { shared6 } from \"./client2\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nconst api1 = axios.create({ baseURL: \"http://orders\" });\napi1.defaults.baseURL = \"https://api.stripe.com\";\nconst api2 = axios.create({ baseURL: \"http://orders\" });\napi2.interceptors.request.use((c) => { c.baseURL = \"https://api.stripe.com\"; return c; });\nlet api3 = axios.create({ baseURL: \"http://orders\" });\nexport function t03setup() { api3 = axios.create({ baseURL: \"https://api.stripe.com\" }); }\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst api4 = axios.create({ baseURL: \"http://orders\", ...stripeOpts });\nexport async function f() {\n  await api.get(\"/orders/1\");\n  await api1.get(\"/orders/1\");\n  await api2.get(\"/orders/1\");\n  await api3.get(\"/orders/1\");\n  await api4.get(\"/orders/1\");\n  await shared2.get(\"/orders/1\");\n  await shared4.get(\"/orders/1\");\n  await shared5.get(\"/orders/1\");\n  await shared6.get(\"/orders/1\");\n}\n";
-        // `shared2` is changed by its own module, `shared4` by a module importing it (and its
-        // own module calls it too), `shared6` through a namespace import (which reaches every
-        // export of `client2`: a namespace member is not told apart).
-        let client = "import axios from \"axios\";\nexport const shared2 = axios.create({ baseURL: \"http://orders\" });\nshared2.defaults.baseURL = \"https://api.stripe.com\";\nexport const shared4 = axios.create({ baseURL: \"http://orders\" });\nexport const shared5 = axios.create({ baseURL: \"http://orders\" });\nexport async function own() { await shared4.get(\"/orders/1\"); }\n";
-        let client2 = "import axios from \"axios\";\nexport const shared6 = axios.create({ baseURL: \"http://orders\" });\n";
-        let setup = "import { shared4 } from \"./client\";\nimport * as c from \"./client2\";\nshared4.interceptors.request.use(rewrite);\nc.shared6.defaults.baseURL = \"https://api.stripe.com\";\n";
-        let java = "package p;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass Clients {\n  private final WebClient.Builder b1 = WebClient.builder().baseUrl(\"http://orders\");\n  private final WebClient w3 = WebClient.create(\"http://orders\");\n  Clients() { b1.baseUrl(\"https://api.stripe.com\"); }\n  void j01() { b1.build().get().uri(\"/orders/1\").retrieve(); }\n  void j03() { w3.get().uri(\"/orders/1\").retrieve(); }\n}\n";
-        let files = [
+        let calls = "import axios from \"axios\";\nimport { shared5 } from \"./client\";\nexport function a01setup(url) { a01.defaults.baseURL = url; }\nexport function a02reset() { a02 = axios.create({ baseURL: \"https://api.stripe.com\" }); }\nclass Cfg { static init() { a10.defaults.baseURL = \"https://api.stripe.com\"; } }\nconst api = axios.create({ baseURL: \"http://orders\" });\nconst a01 = axios.create({ baseURL: \"http://orders\" });\nlet a02 = axios.create({ baseURL: \"http://orders\" });\nconst a10 = axios.create({ baseURL: \"http://orders\" });\nconst api1 = axios.create({ baseURL: \"http://orders\" });\napi1.defaults.baseURL = \"https://api.stripe.com\";\nexport async function f() {\n  await api.get(\"/orders/1\");\n  await a01.get(\"/orders/1\");\n  await a02.get(\"/orders/1\");\n  await a10.get(\"/orders/1\");\n  await api1.get(\"/orders/1\");\n  await shared5.get(\"/orders/1\");\n  await axios.create({ baseURL: \"http://orders\" }).get(\"/orders/1\");\n}\nexport function a06() {\n  const setup = () => { a06api.defaults.baseURL = \"https://api.stripe.com\"; };\n  const a06api = axios.create({ baseURL: \"http://orders\" });\n  setup();\n  return a06api.get(\"/orders/1\");\n}\nexport function local() {\n  const c = axios.create({ baseURL: \"http://orders\" });\n  return c.get(\"/orders/1\");\n}\n";
+        // An exported instance is never verified, even one used only for requests.
+        let client = "import axios from \"axios\";\nexport const shared5 = axios.create({ baseURL: \"http://orders\" });\n";
+        let a04 = "import axios from \"axios\";\nconst a04api = axios.create({ baseURL: \"http://orders\" });\nexport { a04api as ordersApi };\nexport function a04() { return a04api.get(\"/orders/1\"); }\n";
+        let a04mut = "import { ordersApi } from \"./a04\";\nordersApi.defaults.baseURL = \"https://api.stripe.com\";\n";
+        let a05 = "import axios from \"axios\";\nconst a05api = axios.create({ baseURL: \"http://orders\" });\nexport { a05api as default };\nexport function a05() { return a05api.get(\"/orders/1\"); }\n";
+        let a05mut = "import client from \"./a05\";\nclient.interceptors.request.use((c) => { c.baseURL = \"https://api.stripe.com\"; return c; });\n";
+        let imports = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.web.client.RestClient;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.reactive.function.client.WebClient;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nimport lombok.Getter;\n";
+        let rt = "new RestTemplateBuilder().rootUri(\"http://orders\").build()";
+        let stripe = "new DefaultUriBuilderFactory(\"https://api.stripe.com\")";
+        let get = "getForObject(\"/orders/1\", String.class)";
+        let c1 = format!(
+            "{imports}public class C1 {{\n  final RestTemplate rt1 = {rt};\n  private final RestTemplate rt4 = {rt};\n  public String k01() {{ return rt1.{get}; }}\n  public String k04() {{ return rt4.{get}; }}\n  static void tweak(C1 other) {{ other.rt4.setUriTemplateHandler({stripe}); }}\n  class Inner {{ void t() {{ C1.this.rt1.setUriTemplateHandler({stripe}); }} }}\n  C1 self() {{ return this; }}\n}}\nclass Tweak1 {{ static void tweak(C1 c) {{ c.rt1.setUriTemplateHandler({stripe}); c.self().rt4.setUriTemplateHandler({stripe}); }} }}\n"
+        );
+        let base2 = format!(
+            "{imports}public class Base2 {{\n  protected final RestTemplate rt2 = {rt};\n  public String k02() {{ return rt2.{get}; }}\n}}\n"
+        );
+        let sub2 = format!(
+            "{imports}public class Sub2 extends Base2 {{\n  Sub2() {{ rt2.setUriTemplateHandler({stripe}); }}\n}}\n"
+        );
+        let c3 = format!(
+            "{imports}@Getter\npublic class C3 {{\n  private final RestTemplate rt3 = {rt};\n  public String k03() {{ return rt3.{get}; }}\n}}\n"
+        );
+        let use3 = format!(
+            "{imports}class Use3 {{ static void t(C3 c) {{ c.getRt3().setUriTemplateHandler({stripe}); }} }}\n"
+        );
+        let c7 = format!(
+            "{imports}public class C7 {{\n  public RestTemplate rt7 = {rt};\n  public String k07() {{ return rt7.{get}; }}\n}}\n"
+        );
+        let use7 = format!(
+            "{imports}class Use7 {{ static void t(C7 c) {{ c.rt7 = new RestTemplateBuilder().rootUri(\"https://api.stripe.com\").build(); }} }}\n"
+        );
+        let c5 = format!(
+            "{imports}public class C5 {{\n  private final WebClient w5 = WebClient.builder().uriBuilderFactory({stripe}).baseUrl(\"http://orders\").build();\n  private final RestClient r6 = RestClient.builder().uriBuilderFactory({stripe}).baseUrl(\"http://orders\").build();\n  void k05() {{ w5.get().uri(\"/orders/1\").retrieve(); }}\n  void k06() {{ r6.get().uri(\"/orders/1\").retrieve(); }}\n  void k15() {{\n    WebClient w = WebClient.builder().baseUrl(\"http://orders\").uriBuilderFactory(new DefaultUriBuilderFactory(\"http://orders\")).build();\n    w.get().uri(\"/orders/1\").retrieve();\n  }}\n}}\n"
+        );
+        let store = format!(
+            "{imports}public class Store {{\n  void s01() {{\n    WebClient webClient = WebClient.builder().baseUrl(\"http://orders\").build();\n    webClient.get().uri(\"/orders/1\").retrieve();\n  }}\n}}\n"
+        );
+        let java = |f: &str| format!("pay/src/main/java/p/{f}.java");
+        let paths: Vec<String> = [
+            "C1", "Base2", "Sub2", "C3", "Use3", "C7", "Use7", "C5", "Store",
+        ]
+        .iter()
+        .map(|f| java(f))
+        .collect();
+        let sources = [&c1, &base2, &sub2, &c3, &use3, &c7, &use7, &c5, &store];
+        let mut files: Vec<(&str, Language, &str)> = vec![
             ("web/src/calls.ts", Language::TypeScript, calls),
             ("web/src/client.ts", Language::TypeScript, client),
-            ("web/src/client2.ts", Language::TypeScript, client2),
-            ("web/src/setup.ts", Language::TypeScript, setup),
-            ("pay/src/main/java/p/Clients.java", Language::Java, java),
+            ("web/src/a04.ts", Language::TypeScript, a04),
+            ("web/src/a04mut.ts", Language::TypeScript, a04mut),
+            ("web/src/a05.ts", Language::TypeScript, a05),
+            ("web/src/a05mut.ts", Language::TypeScript, a05mut),
         ];
+        for (p, src) in paths.iter().zip(sources) {
+            files.push((p.as_str(), Language::Java, src.as_str()));
+        }
         let eps = vec![ep("GET", "/orders/{id}", "orders")];
         let got = stitched_bases(&files, &eps, &["web", "pay", "orders"]);
         let to = "HTTP GET /orders/{} @orders";
@@ -2380,18 +2385,26 @@ mod tests {
         assert_eq!(
             got,
             [
-                format!("pay/src/main/java/p/Clients.java 6 {unverified}"),
-                format!("pay/src/main/java/p/Clients.java 7 {synthetic}"),
-                format!("web/src/calls.ts 13 {synthetic}"),
+                format!("pay/src/main/java/p/Base2.java 9 {unverified}"),
+                format!("pay/src/main/java/p/C1.java 10 {unverified}"),
+                format!("pay/src/main/java/p/C1.java 11 {unverified}"),
+                format!("pay/src/main/java/p/C3.java 10 {unverified}"),
+                "pay/src/main/java/p/C5.java 10 external".to_owned(),
+                "pay/src/main/java/p/C5.java 11 external".to_owned(),
+                format!("pay/src/main/java/p/C5.java 14 {unverified}"),
+                format!("pay/src/main/java/p/C7.java 9 {unverified}"),
+                format!("pay/src/main/java/p/Store.java 10 {synthetic}"),
+                format!("web/src/a04.ts 3 {unverified}"),
+                format!("web/src/a05.ts 3 {unverified}"),
+                format!("web/src/calls.ts 12 {synthetic}"),
+                format!("web/src/calls.ts 13 {unverified}"),
                 format!("web/src/calls.ts 14 {unverified}"),
                 format!("web/src/calls.ts 15 {unverified}"),
                 format!("web/src/calls.ts 16 {unverified}"),
                 format!("web/src/calls.ts 17 {unverified}"),
-                format!("web/src/calls.ts 18 {unverified}"),
-                format!("web/src/calls.ts 19 {unverified}"),
-                format!("web/src/calls.ts 20 {synthetic}"),
-                format!("web/src/calls.ts 21 {unverified}"),
-                format!("web/src/client.ts 5 {unverified}"),
+                format!("web/src/calls.ts 18 {synthetic}"),
+                format!("web/src/calls.ts 24 {unverified}"),
+                format!("web/src/calls.ts 28 {synthetic}"),
             ]
         );
         // Guard: a site whose base is unverified is never `synthetic`.
@@ -2404,17 +2417,14 @@ mod tests {
             .collect();
         let stitcher = Stitcher::new(&eps, &services);
         let sites = collect_sites(&files, &[], &[], &[]);
-        assert_eq!(
-            sites
-                .iter()
-                .filter(|s| s.base_verified == Some(false))
-                .count(),
-            9
-        );
+        let unverified: Vec<&Site> = sites
+            .iter()
+            .filter(|s| s.base_verified == Some(false))
+            .collect();
+        assert_eq!(unverified.len(), 16);
         assert!(
-            sites
+            unverified
                 .iter()
-                .filter(|s| s.base_verified == Some(false))
                 .all(|s| stitcher.site(s).bucket != Bucket::Synthetic)
         );
     }
@@ -2426,7 +2436,7 @@ mod tests {
     #[test]
     fn a_path_must_start_with_a_literal() {
         let ts = "import axios from \"axios\";\nconst orders = axios.create({ baseURL: \"http://orders\" });\nexport async function l(base: string, id: string, p: string, q: string) {\n  await orders.get(`${process.env.STRIPE_URL}/reports/1`);\n  await orders.get(base + \"/reports/1\");\n  await orders.get(`/${id}/reports/1`);\n  await fetch(`http://orders:${p}${q}/t1/reports/1`);\n  await fetch(`http://orders:${p}/t1/reports/1`);\n}\n";
-        let java = "package p;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass C {\n  private final WebClient wc10 = WebClient.create(\"http://orders\");\n  void j19() { wc10.get().uri(System.getenv(\"X\") + \"/reports/1\").retrieve(); }\n}\n";
+        let java = "package p;\nimport org.springframework.web.reactive.function.client.WebClient;\nclass C {\n  void j19() {\n    WebClient wc10 = WebClient.create(\"http://orders\");\n    wc10.get().uri(System.getenv(\"X\") + \"/reports/1\").retrieve();\n  }\n}\n";
         let eps = vec![ep("GET", "/{tenant}/reports/{id}", "orders")];
         let to = "HTTP GET /{}/reports/{} @orders";
         assert_eq!(
@@ -2440,7 +2450,7 @@ mod tests {
             ),
             [
                 format!(
-                    "pay/src/main/java/p/C.java 4 heuristic -> {to} [heuristic] base=literal match=suffix"
+                    "pay/src/main/java/p/C.java 5 heuristic -> {to} [heuristic] base=literal match=suffix"
                 ),
                 // `fetch` sites first, then axios (pack order within a file).
                 format!("web/src/l.ts 6 heuristic -> {to} [heuristic] base=literal match=suffix"),

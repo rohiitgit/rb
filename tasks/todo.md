@@ -430,4 +430,17 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
 - [x] Records: contract (amendment 13, corrections in 12, invariant 11, open items 11, 14, 21–23), README, CHANGELOG, IMPLEMENT.md, lessons.
 - [x] Verification loop; clean-up of `fx4a3_*` and `var/fix-m4a-3/`.
 - Found while fixing: a namespace import used otherwise cannot be attributed to one export, so it unverifies every export of its module (recorded, open item 22); `resolve::tests::field_chains_binding_chains_and_big_packages_stay_fast` (an M3a wall-clock bound) fails under the machine's current load at `e06e590` and at this change alike (3.04 s and 3.1 s against 3 s).
-- [ ] Evaluator pass 4.
+- [x] Evaluator pass 4 (`tasks/eval-m4a-pass4.md`, VERDICT FAIL on `b75b6fc`): fixed below.
+
+## Review (M4a evaluator pass 4)
+- [x] Plan (orchestrator's decision, contract amendment 14): narrow Gate A to a conservative, scope-insensitive token scan (T1–T4), conditional documents (T5), open item 14 (T6), records (T7); `PIPELINE` `m4a-http-8`.
+- [x] Baseline: `b75b6fc` release binary built from `git archive` in its own target directory before any change.
+- [x] Facts (`rb-syntax/src/tokens.rs`, replacing `uses.rs`): `NameToken` per token of a candidate name, role declaration / receiver / other; unit first.
+- [x] Gate A (`clients.rs` `Gate`, `plain_construction`, `chain_base` precedence; `stitch.rs` importer taint deleted), test-first: the new units failed on the `b75b6fc` tree.
+- [x] T5 (`fold::conditional_document`), test-first.
+- [x] Mutations: 16 mutants, one per rule condition, all killed (see CHANGELOG).
+- [x] Public repositories against `b75b6fc`; fresh == cached == second name.
+- [x] Records: contract (amendment 14, correction in 13, open items 14 and 22), CHANGELOG, IMPLEMENT.md, lessons (rewritten).
+- [x] Verification loop; clean-up of `fx4a4_*` and `var/fix-m4a-4/`.
+- Found while fixing: once the scan is name-based, several guards were redundant with the declaration role (a member check, a function-kind check on the scope, a Java/TS switch for top-level constants: none can fire without the role already failing), and excluding fields from the recorded names made the role's field rule unbitten (mutant M9 survived). All four were deleted, so the declaration role is the one guard that keeps fields, parameters, `var`s and exported bindings unverified, and M9 now kills it. An aliased import of another module's export with the instance's name (`import { api as shared }`) is a token of the name, so it unverifies the local `api`: by design (the scan is name-based).
+- [ ] Evaluator pass 5.

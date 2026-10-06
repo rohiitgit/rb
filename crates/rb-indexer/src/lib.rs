@@ -53,8 +53,10 @@ use serde_json::{Value, json};
 /// after a literal port, more Spring configuration counted, `node-fetch`), `m4a-http-7`
 /// evaluator pass 3's (M4a amendment 13: verified instance bases, paths that start with a hole
 /// matched by suffix, the config client turned off only by a base document, `cross-fetch` and
-/// inline client instances).
-pub const PIPELINE: &str = "m4a-http-7";
+/// inline client instances), `m4a-http-8` evaluator pass 4's (M4a amendment 14: a conservative
+/// token scan verifies instance bases, a `uriBuilderFactory` overrides `baseUrl`, any
+/// `spring.config.activate.*` document is conditional).
+pub const PIPELINE: &str = "m4a-http-8";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -349,10 +351,10 @@ fn spring_config(
         };
         read.push((path, text, kind, service_of(path), entries));
     }
-    // `false` turns the client off only in a base (non-profile) document of
+    // `false` turns the client off only in a base (unconditional) document of
     // `application.properties`/`application.yml`, and only when no file or document sets it
-    // back to `true`: a profile's switch applies to that profile alone (amendment 13; evaluator
-    // pass 3, R3).
+    // back to `true`: a profile's or a cloud platform's switch applies there alone (amendments
+    // 13 and 14; evaluator passes 3 and 4, R3 and T5).
     let (mut off, mut on): (BTreeSet<&str>, BTreeSet<&str>) = Default::default();
     for (path, text, kind, service, _) in &read {
         if *kind == ConfigFile::Build {
@@ -375,7 +377,7 @@ fn spring_config(
                 Some(v)
                     if v.eq_ignore_ascii_case("false")
                         && base_file
-                        && !rb_frameworks::fold::profile_document(doc) =>
+                        && !rb_frameworks::fold::conditional_document(doc) =>
                 {
                     off.insert(service);
                 }
@@ -1601,12 +1603,14 @@ mod tests {
         );
     }
 
-    /// Contract M4a amendment 13 (evaluator pass 3, R3): `spring.cloud.config.enabled=false`
-    /// turns the config client off only in the base (non-profile) `application.properties` or
-    /// `application.yml` document, and only when no profile file or document sets it back to
-    /// `true`. A profile file (`application-local.properties`), a profile `bootstrap` file, a
-    /// profile document of `application.yml` (`on-profile` or the legacy `spring.profiles`) or
-    /// of a multi-document `application.properties` (`#---`) never turns it off.
+    /// Contract M4a amendments 13 and 14 (evaluator passes 3 and 4, R3 and T5):
+    /// `spring.cloud.config.enabled=false` turns the config client off only in the base
+    /// (unconditional) `application.properties` or `application.yml` document, and only when no
+    /// profile file or document sets it back to `true`. A profile file
+    /// (`application-local.properties`), a profile `bootstrap` file, or a conditional document
+    /// of `application.yml` or of a multi-document `application.properties` (`#---`): any
+    /// `spring.config.activate.*` key (`on-profile`, `on-cloud-platform`) or the legacy
+    /// `spring.profiles`, never turns it off; `spring.profiles.active` is no condition.
     #[test]
     fn only_the_base_document_turns_the_config_client_off() {
         let res = "src/main/resources";
@@ -1650,6 +1654,24 @@ mod tests {
                 format!("m/{res}/application.yml"),
                 "users.url: http://users\n---\nspring.profiles: test\nspring.cloud.config.enabled: false\n",
             ),
+            // Activated on a cloud platform, not by a profile (evaluator pass 4, T5: `bk7`,
+            // `bk6`): still not the base document.
+            ("o/pom.xml".to_owned(), pom),
+            (
+                format!("o/{res}/application.properties"),
+                "users.url=http://users\nspring.config.import=optional:configserver:http://cfgsrv:8888\n#---\nspring.config.activate.on-cloud-platform=kubernetes\nspring.cloud.config.enabled=false\n",
+            ),
+            ("p/pom.xml".to_owned(), pom),
+            (
+                format!("p/{res}/application.yml"),
+                "users:\n  url: http://users\n---\nspring:\n  config:\n    activate:\n      on-cloud-platform: kubernetes\n  cloud:\n    config:\n      enabled: false\n",
+            ),
+            // `spring.profiles.active` in the base document is no activation condition.
+            ("q/pom.xml".to_owned(), pom),
+            (
+                format!("q/{res}/application.yml"),
+                "spring:\n  profiles:\n    active: dev\n  cloud:\n    config:\n      enabled: false\n",
+            ),
             // The base document does turn it off.
             ("n/pom.xml".to_owned(), pom),
             (
@@ -1678,12 +1700,16 @@ mod tests {
                 "\"l\" [\"config_client\"]",
                 "\"m\" [\"config_client\",\"yaml\"]",
                 "\"n\" [\"yaml\"]",
+                "\"o\" [\"config_client\"]",
+                "\"p\" [\"config_client\",\"yaml\"]",
+                "\"q\" [\"yaml\"]",
             ]
         );
-        for service in ["h", "i", "j", "k", "l", "m"] {
+        for service in ["h", "i", "j", "k", "l", "m", "o", "p"] {
             assert!(spring.overrides[service].all, "{service}");
         }
         assert!(!spring.overrides["n"].all);
+        assert!(!spring.overrides["q"].all);
     }
 
     #[test]

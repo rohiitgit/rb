@@ -454,12 +454,20 @@ pub fn properties_documents(text: &str) -> Vec<BTreeMap<String, String>> {
     docs.iter().map(|d| parse_properties(d)).collect()
 }
 
-/// Whether a configuration document applies only to some profiles: it sets
-/// `spring.config.activate.on-profile`, or the legacy `spring.profiles`, to a value.
-pub fn profile_document(doc: &BTreeMap<String, String>) -> bool {
-    ["spring.config.activate.on-profile", "spring.profiles"]
-        .iter()
-        .any(|k| doc.get(*k).is_some_and(|v| !v.trim().is_empty()))
+/// Whether a configuration document applies only under a condition, so it is not a base
+/// document (evaluator pass 4, T5): it carries any `spring.config.activate.*` key
+/// (`on-profile`, `on-cloud-platform`, …), or the legacy `spring.profiles` with a value or a
+/// list (`spring.profiles.active`/`include`/`group` alone are no condition).
+pub fn conditional_document(doc: &BTreeMap<String, String>) -> bool {
+    let legacy = |k: &str| {
+        k.strip_prefix("spring.profiles")
+            .is_some_and(|rest| rest.starts_with('['))
+    };
+    doc.keys()
+        .any(|k| k.starts_with("spring.config.activate.") || legacy(k))
+        || doc.get("spring.profiles").is_some_and(|v| {
+            !v.trim().is_empty() || !doc.keys().any(|k| k.starts_with("spring.profiles."))
+        })
 }
 
 fn dotted(prefix: &str, key: &str) -> String {
