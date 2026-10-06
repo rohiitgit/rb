@@ -1,1 +1,1 @@
-  http: 7 routes in 3 services; 8 client calls: 2 synthetic, 2 heuristic, 1 ambiguous, 1 external, 1 dynamic, 1 self
+  http: 7 routes in 3 services; 9 client calls: 2 synthetic, 2 heuristic, 1 ambiguous, 1 external, 1 dynamic, 2 self

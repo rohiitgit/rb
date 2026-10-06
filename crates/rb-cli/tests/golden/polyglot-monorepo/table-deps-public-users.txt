@@ -6,8 +6,11 @@ precision=cha
 │    auth-service (services/auth)
 │      UserDao#emailOf()  read  services/auth/src/main/java/com/acme/auth/UserDao.java:15  [exact, schema assumed]
 │      UserDao#touch()  update  services/auth/src/main/java/com/acme/auth/UserDao.java:19  [exact, schema assumed]
-├─ Services (callers up to entry points) (1)
+│    github.com/acme/billing (services/billing)
+│      Owner()  read  services/billing/internal/invoice.go:29  [exact, schema assumed]
+├─ Services (callers up to entry points) (2)
 │    auth-service (services/auth)  read+update  direct  [exact]
 │      endpoint POST /api/v1/login  [heuristic]
+│    github.com/acme/billing (services/billing)  read  direct  [exact]
 └─ Through APIs (1)
      @acme/web (apps/web)  via POST /api/v1/login of auth-service  [heuristic]

@@ -22,3 +22,10 @@ func Purge(db *sql.DB, table string) error {
 	_, err := db.Exec("DELETE FROM " + table)
 	return err
 }
+
+// Owner returns the e-mail of an invoice's owner from the accounts table auth maintains.
+func Owner(db *sql.DB, id int64) (string, error) {
+	var email string
+	err := db.QueryRow("SELECT email FROM users WHERE id = $1", id).Scan(&email)
+	return email, err
+}

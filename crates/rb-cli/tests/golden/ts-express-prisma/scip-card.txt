@@ -1,14 +1,15 @@
 auth-api  (path: ., deployable)
 ├─ Detected by: package.json
 ├─ Manifests: package.json
-├─ Files: 9 (other 4, typescript 4, prisma 1)
+├─ Files: 10 (typescript 5, other 4, prisma 1)
 ├─ Owners: @acme/platform
 ├─ File ownership
-│    @acme/auth-team     4 files   44%
-│    @acme/platform      4 files   44%
-│    @acme/data           1 file   11%
+│    @acme/auth-team     5 files   50%
+│    @acme/platform      4 files   40%
+│    @acme/data           1 file   10%
 │    unowned             0 files    0%
-├─ APIs (1)
+├─ APIs (2)
+│    GET /ops/health  → src/routes/health.ts (top-level code)  [heuristic]
 │    POST /api/v1/login  → src/routes/auth.ts (top-level code)  [heuristic]
 ├─ Calls APIs of: none
 ├─ APIs called by: none
@@ -26,4 +27,4 @@ auth-api  (path: ., deployable)
 └─ Call graph (edges within the service)
      5 symbols · CALLS 2, IMPLEMENTS 0, INJECTS 0, REFERENCES 0
      certainty: exact 100.0%
-     entry points: endpoint 1, top-level 1
+     entry points: endpoint 2, top-level 1

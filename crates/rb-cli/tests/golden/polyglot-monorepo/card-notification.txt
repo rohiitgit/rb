@@ -18,7 +18,7 @@ notification  (path: services/notification, deployable)
 │      POST /internal/mfa/email  [synthetic]  1 site
 │    billing  (services/billing/cmd/billing)
 │      POST /internal/mfa/email  [synthetic]  1 site
-├─ HTTP client calls not stitched: 1 (rb status)
+├─ HTTP client calls not stitched: 2 (rb status)
 ├─ Packages (1)
 │    express ?  [unresolved]
 ├─ Database tables (1)
@@ -31,6 +31,6 @@ notification  (path: services/notification, deployable)
 │    billing (services/billing/cmd/billing)  via http  [synthetic]  POST /internal/mfa/email
 ├─ Shares tables with: none
 └─ Call graph (edges within the service)
-     2 symbols · CALLS 0, IMPLEMENTS 0, INJECTS 0, REFERENCES 0
+     3 symbols · CALLS 0, IMPLEMENTS 0, INJECTS 0, REFERENCES 0
      certainty: -
      entry points: endpoint 2, top-level 1

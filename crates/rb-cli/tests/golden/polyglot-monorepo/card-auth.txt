@@ -28,7 +28,8 @@ auth-service  (path: services/auth, deployable)
 │    packages: 3
 ├─ Depended on by (1)
 │    @acme/web (apps/web)  via http  [heuristic]  POST /api/v1/login
-├─ Shares tables with: none
+├─ Shares tables with (1)
+│    github.com/acme/billing (services/billing)  public.users
 └─ Call graph (edges within the service)
      13 symbols · CALLS 2, IMPLEMENTS 0, INJECTS 2, REFERENCES 0
      certainty: heuristic 100.0%

@@ -591,7 +591,7 @@ Same rules as M4a:
   - **Verify:** as 12a.
 - [x] **12c. Fixtures: java-spring-jpa, part 3, and polyglot auth.** Edits to `DefaultAuthService.java` and `LegacyAuth.java`; polyglot new `AuthApplication.java`; edits to `UserDao.java` and `AuthController.java`. Done: `@Primary`, `@Bean` and name-fallback points; `LegacyDigest` helper for the orphan case (amendment 16); Feign and `@Repository` beans in polyglot; `rb path` login gains both `QUERIES`; 26 goldens classified.
   - **Verify:** as 12a; the `rb path` login goldens gain `QUERIES public.users`/`audit.users` (classified).
-- [ ] **12d. Fixtures: polyglot billing and notification, ts-express-prisma.** Edits to `services/billing/internal/invoice.go` and `services/notification/src/selfcheck.ts`; new `src/routes/health.ts`; edit to `src/app.ts`.
+- [x] **12d. Fixtures: polyglot billing and notification, ts-express-prisma.** Edits to `services/billing/internal/invoice.go` and `services/notification/src/selfcheck.ts`; new `src/routes/health.ts`; edit to `src/app.ts`. Done: shared `public.users` (coupling, Q3 second service), `smsCheck` bucket `self`, `GET /ops/health` known prefix `heuristic`.
   - **Verify:** as 12a.
 - [ ] **13. Goldens and precision guards** (S22, S24, S26).
   - *State:* the guard files (data beside the goldens).
