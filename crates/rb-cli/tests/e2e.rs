@@ -776,6 +776,12 @@ fn polyglot_monorepo_structure_goldens() {
         .find(|l| l.trim_start().starts_with("di:"))
         .unwrap_or_default();
     golden(fixture, "status-di.txt", &format!("{di_line}\n"));
+    // Contract M4b S9: implementing types proven never instantiated.
+    let rta_line = status
+        .lines()
+        .find(|l| l.trim_start().starts_with("rta:"))
+        .unwrap_or_default();
+    golden(fixture, "status-rta.txt", &format!("{rta_line}\n"));
 }
 
 /// Every `(service, path)` of a `rb path --format json` tree, depth first.

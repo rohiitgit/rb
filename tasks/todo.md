@@ -545,7 +545,7 @@ Same rules as M4a:
   - Files: new `rb-indexer/src/di.rs`, `rb-indexer/src/lib.rs`, `rb-indexer/src/resolve.rs` (type resolution exposed), `rb-store/src/query.rs` (coverage read), `rb-cli/src/main.rs` (status line).
   - **Verify:** units including S5's table and the S6 mutations; e2e churn classified (current fixtures: `java-spring-jpa`'s two points capped by `scan_roots_unknown`; polyglot `MfaClient` `unresolved` until `@EnableFeignClients` arrives in 12c).
 - [x] **5a. RTA proof at index time** (S9). Done: `rb-indexer/src/rta.rs`, `GraphBuilder::{edge_sources, set_edge_attr}`, fragment names from DI; `PIPELINE = m4b-di-3`; amendment 9; 5 + 1 units, 20 mutants all killed; fixture dumps only add `rta_coverage` (no type proven before the fixture phases; java-spring-jpa's one considered type `DefaultAuthService` kept by `annotation`).
-- [ ] **5b. `rta:` status line** (S9): `Store::rta_coverage`, `rb status` line, golden.
+- [x] **5b. `rta:` status line** (S9): `Store::rta_coverage`, `rb status` `rta:` line, `polyglot-monorepo/status-rta.txt`. Invariant 1 on two public repositories (spring-petclinic, routing-controllers, `--no-scip`, `1f81c8f` vs this binary): 0 lines removed or changed; added lines are only `Package`/`manifest`, `INJECTS`, `di_coverage`, `rta_coverage`.
 - (original phase 5 entry, split as above) **5. RTA proof at index time** (S9).
   - *Derived:* proven types; `impl_instantiated: false` on their `IMPLEMENTS` edges; `rta_coverage`; the `rta:` line.
   - *Invariants:* the edge set and certainties are unchanged (dump diff against the phase-0 baseline shows attributes only); one keeping row per rule; subtype propagation tested at depth 1/2 and in reverse; a cycle test; counted growth test.

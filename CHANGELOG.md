@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4b phase 5b: the `rta:` status line; invariant 1 on public repositories
+- **`rb_store::Store::rta_coverage`** reads `rta_coverage`; **`rb status`** prints `rta: <proven> of <types> implementing types never instantiated (<k> dispatch edges prunable)`. Unit `rta_line_counts_types_and_edges` (written with the function); new golden `polyglot-monorepo/status-rta.txt` (`rta: 0 of 0 …`: polyglot has no `IMPLEMENTS` edge).
+- **Invariant 1 on two public repositories** (`--no-scip`, `--force`, debug binaries of `1f81c8f` and this commit, dumps diffed):
+  - spring-petclinic @ `818c4136ea97`: 0 lines removed or changed; +64 lines: 28 `Package` nodes and 28 `manifest` `DEPENDS_ON`, 6 `INJECTS` (all `capped` by `surface`: `ImportRuntimeHints` in `PetClinicApplication`, as phase 0 predicted), `di_coverage` (23 points: 6 capped, 17 test), `rta_coverage` (8 types, all kept by `surface`: the test `includeFilters`).
+  - routing-controllers @ `bf6fbfdc7fa5`: 0 lines removed or changed; +102 lines: 50 `Package`/`manifest` pairs, `di_coverage` (0 points), `rta_coverage` (40 types: 33 `library`, 7 `test`).
+  - No `IMPLEMENTS` row changed on either: no type is proven there, so the flag's own churn is measured on the fixtures (phases 12a–d) and in S27 (phase 15).
+- **Verification:** fmt, clippy clean; 521 unit tests (rb 16); e2e 17/17 with the database and containers; stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-store/src/{query,lib}.rs`, `crates/rb-cli/src/main.rs`, `crates/rb-cli/tests/e2e.rs`, `crates/rb-cli/tests/golden/polyglot-monorepo/status-rta.txt`, `tasks/todo.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-06] (wall clock) M4b phase 5a: RTA proof
 - **`rb-indexer/src/rta.rs`** (new; S9, D4): every Java or TS/JS type that is (or contains) the source of an `IMPLEMENTS` edge is proven never instantiated only when, in order:
   - it is in a deployable service and not in a test source;

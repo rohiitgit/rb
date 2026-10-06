@@ -247,6 +247,7 @@ fn main() -> anyhow::Result<()> {
                     println!("  {}", code_line(&store.resolution_coverage(live.id)?));
                     println!("  {}", http_line(&store.http_coverage(live.id)?));
                     println!("  {}", di_line(&store.di_coverage(live.id)?));
+                    println!("  {}", rta_line(&store.rta_coverage(live.id)?));
                     for d in store.load_diagnostics(live.id)? {
                         if d.kind == "scip_status" {
                             println!("  {}", scip_status_line(&d));
@@ -736,6 +737,14 @@ fn di_line(c: &rb_store::DiCoverage) -> String {
         let _ = write!(line, ": {}", parts.join(", "));
     }
     line
+}
+
+/// The `rb status` RTA line (contract M4b S9).
+fn rta_line(c: &rb_store::RtaCoverage) -> String {
+    format!(
+        "rta: {} of {} implementing types never instantiated ({} dispatch edges prunable)",
+        c.proven, c.types, c.prunable_edges
+    )
 }
 
 /// `.` for the repository root, as in the `scip_status` diagnostic.
@@ -1300,6 +1309,21 @@ mod tests {
         assert_eq!(
             http_line(&c),
             "http: 3 routes in 2 services; 10 client calls: 2 synthetic, 1 heuristic, 2 ambiguous, 1 too ambiguous, 1 external, 2 dynamic, 1 self"
+        );
+    }
+
+    /// Contract M4b S9.
+    #[test]
+    fn rta_line_counts_types_and_edges() {
+        let c = rb_store::RtaCoverage {
+            types: 7,
+            proven: 2,
+            prunable_edges: 5,
+            kept: Default::default(),
+        };
+        assert_eq!(
+            rta_line(&c),
+            "rta: 2 of 7 implementing types never instantiated (5 dispatch edges prunable)"
         );
     }
 

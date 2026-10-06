@@ -193,6 +193,17 @@ pub struct DiCoverage {
     pub gates: BTreeMap<String, i64>,
 }
 
+/// RTA coverage of a snapshot (contract M4b S9): implementing types considered, those proven
+/// never instantiated, the first failing rule of the others, and the `IMPLEMENTS` edges
+/// flagged (`rta_coverage`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct RtaCoverage {
+    pub types: i64,
+    pub proven: i64,
+    pub prunable_edges: i64,
+    pub kept: BTreeMap<String, i64>,
+}
+
 /// Outcome of resolving user input to exactly one node (design §9.1: never pick silently).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {
@@ -394,6 +405,34 @@ impl Store {
             points: detail["points"].as_i64().unwrap_or_default(),
             buckets: counts("buckets")?,
             gates: counts("gates")?,
+        })
+    }
+
+    pub fn rta_coverage(&mut self, snapshot_id: i64) -> anyhow::Result<RtaCoverage> {
+        let detail: Option<Value> = self
+            .client
+            .query_opt(
+                "SELECT detail FROM rb.diagnostic WHERE snapshot_id = $1 AND kind = 'rta_coverage'",
+                &[&snapshot_id],
+            )?
+            .map(|r| r.get(0));
+        let Some(detail) = detail else {
+            return Ok(RtaCoverage::default());
+        };
+        let n = |v: &Value| -> anyhow::Result<i64> {
+            v.as_i64()
+                .ok_or_else(|| anyhow::anyhow!("rta_coverage: {v}"))
+        };
+        Ok(RtaCoverage {
+            types: n(&detail["types"])?,
+            proven: n(&detail["proven"])?,
+            prunable_edges: n(&detail["prunable_edges"])?,
+            kept: detail["kept"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| Ok((k.clone(), n(v)?)))
+                .collect::<anyhow::Result<_>>()?,
         })
     }
 

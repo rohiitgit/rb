@@ -344,6 +344,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 4a: Spring DI resolution, `INJECTS` (never above `heuristic`, F2), `di_*` diagnostics and `di_coverage`; `PIPELINE = m4b-di-2` (amendment 8).
 - [x] Phase 4b: the `rb status` `di:` line and `status-di.txt`.
 - [x] Phase 5a: RTA proof of absence, `impl_instantiated: false` on `IMPLEMENTS`, `rta_coverage`; `PIPELINE = m4b-di-3` (amendment 9).
+- [x] Phase 5b: the `rb status` `rta:` line; invariant 1 held on spring-petclinic and routing-controllers (only added lines). Next: phase 6 (precision at query time).
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
