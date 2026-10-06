@@ -358,7 +358,8 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 12c: `DefaultAuthService`'s `@Primary`, `@Bean` and name-fallback points; `LegacyAuth`'s not-a-bean field and orphan helper; polyglot auth's application, Feign and `@Repository` beans (login now reaches `public.users` and `audit.users`).
 - [x] Phase 12d: billing shares `public.users` with auth, notification's relative `smsCheck` stays unstitched (`self`), ts-express-prisma mounts a default-imported router (`GET /ops/health`).
 - [x] Phase 13: precision guards and dump checks for `INJECTS`, `DEPENDS_ON` and `impl_instantiated`, each bitten by a recorded mutation; DI/RTA/orphan goldens; S22 settled (amendment 17).
-- [x] Phase 14: SCIP mode end to end: `scip-injects.txt` (amendment 18). Next: phase 15 (public repositories).
+- [x] Phase 14: SCIP mode end to end: `scip-injects.txt` (amendment 18).
+- [x] Phase 15: eight public repositories measured (contract measurement section; amendments 19–20: a by-simple-name `@Bean` match fixed, `PIPELINE = m4b-di-7`). Next: phase 16 (records).
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):

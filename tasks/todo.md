@@ -604,7 +604,7 @@ Same rules as M4a:
   - *Invariants:* no `skipping:`; fresh = cached; every SCIP golden diff classified.
   - Files: `rb-cli/tests/e2e.rs`.
   - **Verify:** SCIP e2e with containers, twice.
-- [ ] **15. Public repositories** (S27).
+- [x] **15. Public repositories** (S27). Done: eight repositories (realworld-spring added for Lombok, amendment 20), counts by script, every sample read; amendment 19 fixes the one false `heuristic` `INJECTS` found (`m4b-di-7`); invariant 1 and determinism hold; results in the contract's measurement section.
   - Clone into the scratchpad (or `var/m4b/` if the orchestrator says so).
   - Run `--no-scip` fresh and cached; run SCIP for (a) and (b).
   - Compute every count with a script from the dumps; identify one member per non-zero bucket.

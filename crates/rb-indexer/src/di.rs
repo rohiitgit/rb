@@ -143,6 +143,18 @@ fn simple(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
+/// Whether two type names as written can name the same type: one is a dot-separated suffix of
+/// the other (`Builder` and `WebClient.Builder` may; `ChatClient.Builder` and
+/// `WebClient.Builder` do not). Amendment 19: an external injected type and a `@Bean` method's
+/// return type are matched by name, so only names that agree as far as both are written match.
+fn written_agree(a: &str, b: &str) -> bool {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    long == short
+        || long
+            .strip_suffix(short)
+            .is_some_and(|rest| rest.ends_with('.'))
+}
+
 /// The types `start` is assignable to: itself and its supertypes, breadth-first with a visited
 /// set, at most [`MAX_SUPERTYPE_DEPTH`] levels (deeper ones are not assignable: conservative).
 pub(crate) fn assignable<'a>(index: &Index<'a>, start: &[Sym<'a>]) -> BTreeSet<Sym<'a>> {
@@ -521,7 +533,8 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             .copied()
             .filter(|&i| {
                 work::tick(1);
-                eligible(&ctx.beans[i])
+                let b = &ctx.beans[i];
+                written_agree(&p.element, &b.bean.type_name) && eligible(b)
             })
             .collect();
         if candidates.is_empty() {
@@ -989,6 +1002,24 @@ mod tests {
             "import org.x.Clock;\n@Configuration class Cfg { @Bean Clock clock() { return null; } }\n@Service class Svc { Svc(Clock c) {} }\n",
         );
         assert_eq!(gate(&r), ["external_type"]);
+        // Contract M4b amendment 19 (measured on spring-petclinic-microservices): the injected
+        // type and the method's return type must agree as written, one a dot-separated suffix
+        // of the other, so a nested `ChatClient.Builder` is not a `WebClient.Builder`.
+        let cfg = "import org.x.WebClient;\nimport org.y.ChatClient;\n@Configuration class Cfg { @Bean WebClient.Builder web() { return null; } }\n";
+        for written in ["ChatClient.Builder", "ReactiveWebClient.Builder"] {
+            let r = one(&format!(
+                "{cfg}@Service class Svc {{ Svc({written} b) {{}} }}\n"
+            ));
+            assert!(r.edges.is_empty(), "{written}: {:?}", r.edges);
+            assert_eq!(r.buckets, BTreeMap::from([("external", 1)]), "{written}");
+        }
+        for written in ["WebClient.Builder", "org.x.WebClient.Builder", "Builder"] {
+            let r = one(&format!(
+                "{cfg}@Service class Svc {{ Svc({written} b) {{}} }}\n"
+            ));
+            assert_eq!(gate(&r), ["external_type"], "{written}");
+            assert_eq!(r.edges.len(), 1, "{written}");
+        }
         // Name fallback.
         let r = one(
             "interface Repo {}\n@Component class Main implements Repo {}\n@Component class Other implements Repo {}\n@Service class Svc { Svc(Repo main) {} }\n",

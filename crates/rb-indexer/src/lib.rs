@@ -72,8 +72,10 @@ use serde_json::{Value, json};
 /// `impl_instantiated: false` on `IMPLEMENTS` and `rta_coverage` (S9); `m4b-di-4` the `Symbol`
 /// attributes `entry` and `orphan_eligible` and `orphan_coverage` (S11, S12); `m4b-di-5`
 /// Express mounts of default imports (S19) and catch-all endpoints only for named hosts (S20);
-/// `m4b-di-6` injected Spring clients' bases from the `@Bean` method DI resolves (S21).
-pub const PIPELINE: &str = "m4b-di-6";
+/// `m4b-di-6` injected Spring clients' bases from the `@Bean` method DI resolves (S21);
+/// `m4b-di-7` an external injected type matches a `@Bean` return type only when the names as
+/// written agree (amendment 19).
+pub const PIPELINE: &str = "m4b-di-7";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
