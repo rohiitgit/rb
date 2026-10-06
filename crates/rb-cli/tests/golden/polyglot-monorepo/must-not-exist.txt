@@ -20,3 +20,9 @@ HANDLED_BY * -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/Mf
 EXPOSES * -> HTTP POST /api/v1/logout @services/auth
 HANDLED_BY * -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#logout().
 EXPOSES * -> HTTP POST /internal/mfa/push @services/notification
+# Contract M4a item 5 (M4b S22): a relative call whose only path match is its own service's /sms.
+CONSUMES rb-heuristic . . . `services/notification/src/selfcheck.ts`/smsCheck(). -> *
+# UserDao's only point is an external JdbcTemplate: no edge (bucket external).
+INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao# -> *
+# Contract M4b F2: no INJECTS reaches synthetic.
+INJECTS * -> * [synthetic]

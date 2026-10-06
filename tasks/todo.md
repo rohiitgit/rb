@@ -593,7 +593,7 @@ Same rules as M4a:
   - **Verify:** as 12a; the `rb path` login goldens gain `QUERIES public.users`/`audit.users` (classified).
 - [x] **12d. Fixtures: polyglot billing and notification, ts-express-prisma.** Edits to `services/billing/internal/invoice.go` and `services/notification/src/selfcheck.ts`; new `src/routes/health.ts`; edit to `src/app.ts`. Done: shared `public.users` (coupling, Q3 second service), `smsCheck` bucket `self`, `GET /ops/health` known prefix `heuristic`.
   - **Verify:** as 12a.
-- [ ] **13. Goldens and precision guards** (S22, S24, S26).
+- [x] **13. Goldens and precision guards** (S22, S24, S26). Done: guard lines on the three fixtures, `m4b_invariant_failures`, labelled AGE parity, producer coverage, `spring_di_rta_and_orphan_goldens` (7 new goldens); 27 code + 5 other mutants killed; S22: own-service bitten by `smsCheck`, the dynamic check not equivalent to P2 (unit row); invariant 1 by `inv1.py` (amendment 17).
   - *State:* the guard files (data beside the goldens).
   - *Invariants:* every guard line and dump check bitten by a recorded mutation (item 5's own-service mutation included; the dynamic-URL check settled as equivalent or bitten, with the reasoning); producer coverage for `INJECTS` and both `DEPENDS_ON` forms; the invariant-1 check against the phase-0 baseline; AGE parity for `INJECTS` and Service → Service `DEPENDS_ON`.
   - Files: `rb-cli/tests/e2e.rs`, plus the six guard files.

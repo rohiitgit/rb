@@ -5,3 +5,6 @@
 HANDLED_BY * -> rb-heuristic . . . `src/cache.ts`/Cache#findUserByEmail().
 # No route without the mount prefix.
 EXPOSES * -> HTTP POST /login @.
+# Contract M4b S19: the default-imported router's prefix is known, so no router-keyed endpoint.
+EXPOSES * -> HTTP GET /health @. ?router=src/routes/health.ts#health
+EXPOSES * -> HTTP GET /health @.

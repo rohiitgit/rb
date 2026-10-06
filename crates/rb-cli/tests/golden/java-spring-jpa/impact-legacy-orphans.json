@@ -1,0 +1,37 @@
+{
+  "affects": [],
+  "breaks": [],
+  "endpoints": [],
+  "orphans": {
+    "computed": true,
+    "nodes": [
+      {
+        "display": "LegacyDigest#legacyHash().",
+        "distance": 1,
+        "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyDigest#legacyHash().",
+        "line": 28,
+        "path": "src/main/java/com/acme/auth/LegacyAuth.java",
+        "service": "auth-service",
+        "via": {
+          "how": "calls",
+          "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth#authenticate()."
+        }
+      }
+    ]
+  },
+  "owners": [],
+  "precision": "cha",
+  "pruned_by_rta": 0,
+  "removed": [
+    {
+      "display": "LegacyAuth#authenticate().",
+      "key": "rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth#authenticate().",
+      "line": 19,
+      "path": "src/main/java/com/acme/auth/LegacyAuth.java",
+      "service": "auth-service"
+    }
+  ],
+  "services": [],
+  "tests": [],
+  "truncated": false
+}

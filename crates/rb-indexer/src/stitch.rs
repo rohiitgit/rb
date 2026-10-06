@@ -1817,6 +1817,18 @@ mod tests {
     #[test]
     fn dynamic_and_unmatched() {
         let eps = endpoints();
+        // Contract M4b S22 (M4a item 5): a known base and a path of holes only. A client hole
+        // matches an endpoint parameter in an exact match, so P2's suffix rule (a literal in
+        // the client and in the matched tail) does not apply here: the dynamic check alone
+        // stands between `fetch("/" + code)` and another service's `GET /{code}`.
+        let params = vec![ep("GET", "/{code}", AUTH), ep("GET", "/{a}/{b}", AUTH)];
+        for url in ["/{?}", "/{?}/{?}"] {
+            assert_eq!(
+                one(&params, &site(WEB, Some("GET"), Some((url, Literal)), 1)),
+                (Bucket::Dynamic, vec![]),
+                "{url}"
+            );
+        }
         assert_eq!(
             one(&eps, &site(WEB, Some("GET"), None, 1)).0,
             Bucket::Dynamic

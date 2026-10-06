@@ -1,0 +1,4 @@
+callers of KafkaAuditSink#record().  src/main/java/com/acme/auth/AuditConfig.java:29  [auth-service]
+precision=cha
+  DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:21  [auth-service]  heuristic, via dispatch
+certainty: heuristic 1

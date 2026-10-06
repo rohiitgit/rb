@@ -213,9 +213,10 @@ fn check_fixture(fixture: &str, tag: &str) {
     // Both are collected before asserting, so a regression shows every line and rule it breaks.
     let mut failures = guard_failures(fixture, &dump_a);
     failures.extend(http_invariant_failures(graph));
+    failures.extend(m4b_invariant_failures(graph));
     assert!(
         failures.is_empty(),
-        "precision guards and HTTP invariants of {fixture}:\n{}",
+        "precision guards and invariants of {fixture}:\n{}",
         failures.join("\n")
     );
 
@@ -344,6 +345,52 @@ fn check_fixture(fixture: &str, tag: &str) {
         expected.sort();
         assert_eq!(
             cypher(query, "endpoint,kind,neighbour"),
+            expected,
+            "{query}"
+        );
+    }
+
+    // Contract M4b S26: the projection's `INJECTS` edges and Service -> Service `DEPENDS_ON`
+    // edges, read through their labels, equal the relational ones (each end's 1-hop neighbours
+    // over that label). The Java fixtures have injections, the monorepo a `via=package` edge.
+    for (kind, src_kind, dst_kind, query) in [
+        (
+            EdgeKind::Injects,
+            NodeKind::Symbol,
+            NodeKind::Symbol,
+            "MATCH (a:Symbol)-[r:INJECTS]->(b:Symbol) RETURN a.key, b.key, r.provenance, r.certainty",
+        ),
+        (
+            EdgeKind::DependsOn,
+            NodeKind::Service,
+            NodeKind::Service,
+            "MATCH (a:Service)-[r:DEPENDS_ON]->(b:Service) RETURN a.key, b.key, r.provenance, r.certainty",
+        ),
+    ] {
+        let mut expected: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|e| {
+                e.kind == kind && node(e.src).kind == src_kind && node(e.dst).kind == dst_kind
+            })
+            .map(|e| {
+                format!(
+                    "{}\t{}\t{}\t{}",
+                    node(e.src).key,
+                    node(e.dst).key,
+                    e.provenance,
+                    e.certainty.rank()
+                )
+            })
+            .collect();
+        expected.sort();
+        let produced = match kind {
+            EdgeKind::Injects => fixture != "ts-express-prisma",
+            _ => fixture == "polyglot-monorepo",
+        };
+        assert_eq!(!expected.is_empty(), produced, "{kind} edges in {fixture}");
+        assert_eq!(
+            cypher(query, "src,dst,provenance,certainty"),
             expected,
             "{query}"
         );
@@ -565,20 +612,89 @@ fn http_invariant_failures(graph: &Graph) -> Vec<String> {
     failures
 }
 
-/// Contract M4a S23 (producer coverage, design §8.5): each fixture has both guard files, they
-/// parse, and together their must-exist lines assert every edge kind M4a produces.
+/// Contract M4b invariants 2, 10 and S24 over a fixture's graph: every `INJECTS` has provenance
+/// `di`, joins two `Symbol`s, is `heuristic` or `ambiguous` (F2: never `synthetic`, so never
+/// above it) and has evidence at a `File`; every `manifest` `DEPENDS_ON` has evidence at a
+/// `File`; `impl_instantiated` appears only on `IMPLEMENTS` and only as `false`. Returns the
+/// violations.
+fn m4b_invariant_failures(graph: &Graph) -> Vec<String> {
+    let by_id: HashMap<i64, &rb_model::Node> = graph.nodes().iter().map(|n| (n.id, n)).collect();
+    let files: HashSet<&str> = graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::File)
+        .map(|n| n.key.as_str())
+        .collect();
+    let mut failures = Vec::new();
+    for e in graph.edges() {
+        let (src, dst) = (by_id[&e.src], by_id[&e.dst]);
+        let what = format!("{} {} -> {}", e.kind, src.key, dst.key);
+        let evidenced =
+            !e.evidence.is_empty() && e.evidence.iter().all(|ev| files.contains(ev.path.as_str()));
+        if e.kind == EdgeKind::Injects {
+            if e.provenance != Provenance::Di || e.certainty > Certainty::Heuristic {
+                failures.push(format!(
+                    "M4b invariant 2: {what}: {:?} {:?}",
+                    e.provenance, e.certainty
+                ));
+            }
+            if src.kind != NodeKind::Symbol || dst.kind != NodeKind::Symbol {
+                failures.push(format!("M4b invariant 2: {what}: not Symbol to Symbol"));
+            }
+        }
+        if (e.kind == EdgeKind::Injects
+            || (e.kind == EdgeKind::DependsOn && e.provenance == Provenance::Manifest))
+            && !evidenced
+        {
+            failures.push(format!(
+                "M4b invariant 10: {what}: evidence {:?}",
+                e.evidence
+            ));
+        }
+        if let Some(flag) = e.attrs.get("impl_instantiated")
+            && (e.kind != EdgeKind::Implements || flag != &serde_json::Value::Bool(false))
+        {
+            failures.push(format!("M4b S24: {what}: impl_instantiated {flag}"));
+        }
+    }
+    failures
+}
+
+/// Contract M4a S23 and M4b S24 (producer coverage, design §8.5): each fixture has both guard
+/// files, they parse, and together their must-exist lines assert every edge kind M4a and M4b
+/// produce: `INJECTS`, both `DEPENDS_ON` forms (to a `Package` and, `via=package`, to a
+/// `Service`) and an `IMPLEMENTS` flagged `impl_instantiated: false`.
 #[test]
-fn precision_guards_assert_every_http_edge_kind() {
+fn precision_guards_assert_every_produced_edge_kind() {
     let mut kinds = HashSet::new();
+    let (mut to_service, mut to_package, mut flagged) = (false, false, false);
     for fixture in ["ts-express-prisma", "java-spring-jpa", "polyglot-monorepo"] {
         for g in parse_guards(fixture, "must-exist.txt") {
+            let via_package = g.attrs.get("via").and_then(|v| v.as_str()) == Some("package");
+            if g.kind == EdgeKind::DependsOn.to_string() {
+                to_service |= via_package;
+                to_package |= g.attrs.contains_key("version_from");
+            }
+            flagged |= g.kind == EdgeKind::Implements.to_string()
+                && g.attrs.get("impl_instantiated") == Some(&serde_json::Value::Bool(false));
             kinds.insert(g.kind);
         }
         assert!(!parse_guards(fixture, "must-not-exist.txt").is_empty());
     }
-    for kind in [EdgeKind::Exposes, EdgeKind::HandledBy, EdgeKind::Consumes] {
+    for kind in [
+        EdgeKind::Exposes,
+        EdgeKind::HandledBy,
+        EdgeKind::Consumes,
+        EdgeKind::Injects,
+    ] {
         assert!(kinds.contains(&kind.to_string()), "no must-exist {kind}");
     }
+    assert!(to_service, "no must-exist DEPENDS_ON via=package");
+    assert!(to_package, "no must-exist DEPENDS_ON to a package");
+    assert!(
+        flagged,
+        "no must-exist IMPLEMENTS with impl_instantiated: false"
+    );
 }
 
 /// Data rows of `rb cypher` output (header dropped), sorted bytewise; agtype strings print unquoted.
@@ -1152,6 +1268,118 @@ fn code_question_goldens() {
     assert!(
         err.contains("1. login()") && err.contains("2. AuthController#login()"),
         "{err}"
+    );
+}
+
+/// The line of `rb status` that starts with `prefix` (indentation ignored), newline-terminated.
+fn status_line(status: &str, prefix: &str) -> String {
+    let line = status
+        .lines()
+        .find(|l| l.trim_start().starts_with(prefix))
+        .unwrap_or_default();
+    format!("{line}\n")
+}
+
+/// Contract M4b S7, S9, S10, S11, S13, S18 and S24 on `java-spring-jpa` (`--no-scip`): the DI
+/// and RTA status lines, the full card, `KafkaAuditSink#record()`'s dispatch caller pruned
+/// under `rta` and shown under `cha`, and the orphan `LegacyAuth#authenticate()` leaves behind,
+/// in text and JSON.
+#[test]
+fn spring_di_rta_and_orphan_goldens() {
+    let Some(url) = db_url() else { return };
+    let fixture = "java-spring-jpa";
+    let repo = fixture_repo(fixture);
+    let name = format!("t_di_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    rb(
+        &url,
+        &[
+            "index",
+            repo.path().to_str().unwrap(),
+            "--repo",
+            &name,
+            "--no-scip",
+        ],
+    );
+    let status = rb(&url, &["status", "--repo", &name]);
+    golden(fixture, "status-di.txt", &status_line(&status, "di:"));
+    golden(fixture, "status-rta.txt", &status_line(&status, "rta:"));
+    golden(
+        fixture,
+        "card.txt",
+        &rb(&url, &["service", ".", "--repo", &name]),
+    );
+
+    // The only caller of `KafkaAuditSink#record()` is a dispatch step from `AuditSink#record()`,
+    // whose implementation is never instantiated: pruned and counted under `rta` (the default),
+    // listed under `cha`.
+    let kafka = rb(&url, &["callers", "KafkaAuditSink.record", "--repo", &name]);
+    assert!(
+        !kafka.contains("DefaultAuthService#authenticate()")
+            && kafka.contains("rta: 1 dispatch step"),
+        "{kafka}"
+    );
+    golden(fixture, "callers-kafka-record.txt", &kafka);
+    let kafka_cha = rb(
+        &url,
+        &[
+            "callers",
+            "KafkaAuditSink.record",
+            "--precision",
+            "cha",
+            "--repo",
+            &name,
+        ],
+    );
+    assert!(
+        kafka_cha.contains("DefaultAuthService#authenticate()"),
+        "{kafka_cha}"
+    );
+    golden(fixture, "callers-kafka-record-cha.txt", &kafka_cha);
+    // `LogAuditSink` is instantiated by the `@Bean` method: its dispatch caller stays under both.
+    for precision in ["rta", "cha"] {
+        let log = rb(
+            &url,
+            &[
+                "callers",
+                "LogAuditSink.record",
+                "--precision",
+                precision,
+                "--repo",
+                &name,
+            ],
+        );
+        assert!(
+            log.contains("DefaultAuthService#authenticate()") && !log.contains("pruned"),
+            "{precision}: {log}"
+        );
+    }
+
+    // Removing the legacy endpoint method leaves its digest helper without a use.
+    golden(
+        fixture,
+        "impact-legacy-orphans.txt",
+        &rb(
+            &url,
+            &["impact", "LegacyAuth.authenticate", "--repo", &name],
+        ),
+    );
+    golden(
+        fixture,
+        "impact-legacy-orphans.json",
+        &rb(
+            &url,
+            &[
+                "impact",
+                "LegacyAuth.authenticate",
+                "--json",
+                "--repo",
+                &name,
+            ],
+        ),
     );
 }
 

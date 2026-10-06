@@ -1,0 +1,11 @@
+removing LegacyAuth#authenticate().  src/main/java/com/acme/auth/LegacyAuth.java:19  [auth-service]
+precision=cha
+breaks: requiring edges into it (0):
+affects: reaches those through calls or references (0):
+endpoints: handled by the removed or impacted code (0):
+orphans: may become dead code (1):
+  1  LegacyDigest#legacyHash().  src/main/java/com/acme/auth/LegacyAuth.java:28  [auth-service]  via LegacyAuth#authenticate(). (calls)
+tests (0):
+services: -
+owners: -
+certainty: -

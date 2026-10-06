@@ -6,3 +6,22 @@ EXPOSES * -> HTTP POST /api/v1/login @.
 # LegacyAuth has mappings but no stereotype (D12): no route, no handler.
 EXPOSES * -> HTTP POST /auth/legacy/login @.
 HANDLED_BY * -> rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth#authenticate().
+# Contract M4b F2: no INJECTS reaches synthetic.
+INJECTS * -> * [synthetic]
+# The qualifier wins: AuthController's PasswordHasher field gets PlainHasher only.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher#
+# @Primary wins for DefaultAuthService's unqualified hasher.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/PlainHasher#
+# Name fallback picks one notifier: not the other.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/EmailNotifier#
+# A same-named @Service from another package is no stereotype: never a candidate.
+INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/support/ReportNotifier.java`/ReportNotifier#
+# The @Bean method is the bean; the class it instantiates is not a candidate.
+INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/LogAuditSink#
+# An @Autowired field in a class that is no bean (a commented-out @Component): no point resolved.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth# -> *
+# RTA keeps LogAuditSink (new in the @Bean method) and the Spring Data fragment (instantiated by name).
+IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/LogAuditSink#record(). -> * {"impl_instantiated":false}
+IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/LogAuditSink# -> * {"impl_instantiated":false}
+IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/UserRepositoryCustomImpl.java`/UserRepositoryCustomImpl#touch(). -> * {"impl_instantiated":false}
+IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/UserRepositoryCustomImpl.java`/UserRepositoryCustomImpl# -> * {"impl_instantiated":false}

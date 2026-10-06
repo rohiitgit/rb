@@ -4,3 +4,10 @@
 # The router is mounted under /api/v1 from another file: heuristic (S7).
 EXPOSES . -> HTTP POST /api/v1/login @. [heuristic]
 HANDLED_BY HTTP POST /api/v1/login @. -> src/routes/auth.ts [heuristic] {"handler_spans":[[5,26,12,1]]}
+# Contract M4b S19 (M4a item 1): a default-imported router mounted under /ops, composed across files.
+EXPOSES . -> HTTP GET /ops/health @. [heuristic]
+HANDLED_BY HTTP GET /ops/health @. -> src/routes/health.ts [heuristic] {"handler_spans":[[3,22,3,51]]}
+# Contract M4b S15: versions from package-lock.json (v3).
+DEPENDS_ON . -> npm/express@4.22.3 [exact] {"declared":"^4.19.2","version_from":"lockfile"}
+DEPENDS_ON . -> npm/pg@8.23.0 [exact] {"version_from":"lockfile"}
+DEPENDS_ON . -> npm/@prisma/client@5.22.0 [exact] {"version_from":"lockfile"}

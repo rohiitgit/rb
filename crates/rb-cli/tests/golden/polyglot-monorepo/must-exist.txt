@@ -23,3 +23,11 @@ CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main.go`/notifyPaid().
 CONSUMES rb-heuristic . . . `apps/web/src/api/billing.ts`/payInvoice(). -> HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing [heuristic] {"match":"suffix"}
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /internal/mfa/email @services/notification [ambiguous] {"candidates":2}
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing [ambiguous] {"candidates":2}
+# Contract M4b S8: a Feign client is a bean under @EnableFeignClients, a @Repository class a stereotype.
+INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient# [heuristic] {"origin":"feign","resolution":"unique"}
+INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao# [heuristic] {"origin":"stereotype","resolution":"unique"}
+# Contract M4b S15, S16: Service -> Service from a workspace range, Go and unresolved npm versions.
+DEPENDS_ON apps/web -> packages/shared [synthetic] {"declared":"*","via":"package"}
+DEPENDS_ON services/billing -> go/github.com/gin-gonic/gin@v1.10.0 [synthetic] {"version_from":"go_mod"}
+DEPENDS_ON apps/web -> npm/axios@? [exact] {"version_from":"unresolved"}
+DEPENDS_ON services/broken -> maven/com.acme/nope@0.0.0 [exact] {"version_from":"literal"}

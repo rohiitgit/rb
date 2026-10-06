@@ -4,3 +4,25 @@
 # The context path from application.properties is stated config: synthetic (amendment 4).
 EXPOSES . -> HTTP POST /auth/api/v1/login @. [synthetic]
 HANDLED_BY HTTP POST /auth/api/v1/login @. -> rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController#login(). [synthetic]
+# Contract M4b S5, S8 under F2: every INJECTS is heuristic (one candidate or a collection) or
+# ambiguous, its narrowing stated in `resolution`.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# [heuristic] {"origin":"stereotype","resolution":"unique","via":"constructor"}
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher# [heuristic] {"primary":true,"resolution":"primary"}
+# The qualifier wins over @Primary (a field point).
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/PlainHasher# [heuristic] {"qualifier":"plainHasher","resolution":"qualifier","via":"field"}
+# Profile-conditional candidates: ambiguous, never a single edge (a setter point).
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Tokens.java`/JwtIssuer# [ambiguous] {"candidates":2,"conditional":true,"via":"setter"}
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Tokens.java`/DevIssuer# [ambiguous] {"candidates":2,"conditional":true,"via":"setter"}
+# List<Notifier>: every candidate, capped by the non-Spring @Service decoy (annotation_unread).
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/EmailNotifier# [heuristic] {"capped_by":["annotation_unread"],"collection":true}
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/SmsNotifier# [heuristic] {"capped_by":["annotation_unread"],"collection":true}
+# A @Bean factory is the target, and Spring Data's repository interface is a bean of its own type.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditConfig#auditSink(). [heuristic] {"origin":"bean_method","resolution":"unique"}
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository# [heuristic] {"origin":"spring_data","resolution":"unique"}
+# Name fallback: `Notifier smsNotifier` picks the bean named smsNotifier, capped by_name.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/SmsNotifier# [heuristic] {"by_name":true,"capped_by":["annotation_unread","by_name"],"resolution":"name"}
+# Contract M4b S9: KafkaAuditSink is never instantiated; its type and method dispatch steps are flagged.
+IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/KafkaAuditSink# -> rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditSink# [heuristic] {"impl_instantiated":false}
+IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/KafkaAuditSink#record(). -> rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditSink#record(). [heuristic] {"impl_instantiated":false}
+# Contract M4b S15: a parent-managed starter is declared, its version unresolved.
+DEPENDS_ON . -> maven/org.springframework.boot/spring-boot-starter-web@? [exact] {"version_from":"unresolved"}
