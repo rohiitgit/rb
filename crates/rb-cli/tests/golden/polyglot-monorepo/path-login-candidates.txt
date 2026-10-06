@@ -1,0 +1,3 @@
+Error: "login" matches 2 endpoints; pass --pick N:
+  1. GET /api/v1/login  [auth-service]
+  2. POST /api/v1/login  [auth-service]

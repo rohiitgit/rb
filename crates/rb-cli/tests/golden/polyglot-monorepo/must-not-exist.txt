@@ -1,0 +1,22 @@
+# Precision guards (contract M4a D10, S23), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# The GET login page receives no POST client.
+CONSUMES rb-heuristic . . . `apps/web/src/api/auth.ts`/login(). -> HTTP GET /api/v1/login @services/auth
+# Feign's literal host names notification: billing's same-path decoy and notification's /sms are not targets.
+CONSUMES rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
+CONSUMES rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode(). -> HTTP POST /internal/mfa/sms @services/notification
+# A client never links into its own service.
+CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main.go`/notifyPaid(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
+# A dynamic URL and an external host give no edge (status's path equals auth's login path).
+CONSUMES rb-heuristic . . . `apps/web/src/api/http.ts`/get(). -> *
+CONSUMES rb-heuristic . . . `apps/web/src/api/http.ts`/status(). -> *
+# A loopback host is the caller's own service: no edge at all, in particular not to billing's decoy.
+CONSUMES rb-heuristic . . . `services/notification/src/selfcheck.ts`/selfcheck(). -> *
+# A Feign interface's mapping is a client call, never a route of the service declaring it.
+EXPOSES * -> HTTP POST /internal/mfa/email @services/auth
+HANDLED_BY * -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode().
+# Commented-out routes give nothing; the plain method under the comment handles nothing.
+EXPOSES * -> HTTP POST /api/v1/logout @services/auth
+HANDLED_BY * -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#logout().
+EXPOSES * -> HTTP POST /internal/mfa/push @services/notification

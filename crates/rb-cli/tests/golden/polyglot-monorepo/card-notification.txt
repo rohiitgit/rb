@@ -1,0 +1,22 @@
+notification  (path: services/notification, deployable)
+├─ Detected by: dockerfile, package.json
+├─ Manifests: services/notification/package.json
+├─ Files: 5 (other 3, typescript 2)
+├─ Owners: @acme/messaging
+├─ File ownership
+│    @acme/messaging     5 files  100%
+│    unowned             0 files    0%
+├─ Packages: none
+├─ APIs (3)
+│    GET /health  → health().  [heuristic]
+│    POST /internal/mfa/email  → services/notification/src/server.ts (top-level code)  [exact]
+│    POST /internal/mfa/sms  → services/notification/src/server.ts (top-level code)  [exact]
+├─ Calls APIs of: none
+├─ APIs called by (3)
+│    @acme/web  (apps/web)
+│      POST /internal/mfa/email  [ambiguous]  1 site
+│    auth-service  (services/auth)
+│      POST /internal/mfa/email  [synthetic]  1 site
+│    billing  (services/billing/cmd/billing)
+│      POST /internal/mfa/email  [synthetic]  1 site
+└─ HTTP client calls not stitched: 1 (rb status)

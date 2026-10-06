@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use anyhow::bail;
 use rb_frameworks::endpoint::{endpoint_name, norm_method, norm_path};
-use rb_model::{EdgeKind, Graph, Node, NodeKind};
+use rb_model::{Attrs, EdgeKind, Graph, Node, NodeKind};
 use rb_store::code::Describer;
 use rb_store::path::{PathNode, RequestPath, Via};
 use serde_json::{Value, json};
@@ -23,6 +23,8 @@ pub(crate) fn normalised(input: &str) -> Option<String> {
 struct Ctx<'g> {
     graph: &'g Graph,
     by_id: HashMap<i64, &'g Node>,
+    /// The attributes of each `CONSUMES` edge, by `(client, endpoint)`.
+    consumes: HashMap<(i64, i64), &'g Attrs>,
     describer: Describer<'g>,
 }
 
@@ -31,12 +33,33 @@ impl<'g> Ctx<'g> {
         Ctx {
             graph,
             by_id: graph.nodes().iter().map(|n| (n.id, n)).collect(),
+            consumes: graph
+                .edges()
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Consumes)
+                .map(|e| ((e.src, e.dst), &e.attrs))
+                .collect(),
             describer: Describer::new(graph),
         }
     }
 
     fn node(&self, id: i64) -> &'g Node {
         self.by_id[&id]
+    }
+
+    /// How a `CONSUMES` step was stitched (its edge's attributes): upstream the client is the
+    /// node and the endpoint its parent, downstream the other way round.
+    fn stitch(&self, parent: Option<i64>, n: &PathNode, upstream: bool) -> Option<&'g Attrs> {
+        if n.via != Via::Consumes {
+            return None;
+        }
+        let parent = parent?;
+        let pair = if upstream {
+            (n.node, parent)
+        } else {
+            (parent, n.node)
+        };
+        self.consumes.get(&pair).copied()
     }
 
     /// The name of the service exposing an endpoint (its key when no node names it).
@@ -157,6 +180,33 @@ pub(crate) fn pick_endpoint(
     }
 }
 
+/// `  (via host gateway, suffix match, 2 candidates)`: the parts of a stitch that qualify it
+/// (S22), or nothing.
+fn stitch_note(attrs: Option<&Attrs>) -> String {
+    let Some(attrs) = attrs else {
+        return String::new();
+    };
+    let text = |k: &str| attrs.get(k).and_then(Value::as_str);
+    let mut parts = Vec::new();
+    if let Some(h) = text("via_host") {
+        parts.push(format!("via host {h}"));
+    }
+    if let Some(h) = text("host") {
+        parts.push(format!("host {h}"));
+    }
+    if text("match") == Some("suffix") {
+        parts.push("suffix match".to_owned());
+    }
+    if let Some(n) = attrs.get("candidates").and_then(Value::as_u64) {
+        parts.push(format!("{n} candidates"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", parts.join(", "))
+    }
+}
+
 /// `[step]`, or `[step, branch weaker]` when the branch is weaker than the step.
 fn certainty(n: &PathNode) -> String {
     if n.branch < n.certainty {
@@ -191,7 +241,13 @@ fn render_nodes(
             }
             (false, _) => format!("→ {}", s.label),
         };
-        let _ = writeln!(out, "{}{line}  {}", "  ".repeat(depth), certainty(n));
+        let _ = writeln!(
+            out,
+            "{}{line}  {}{}",
+            "  ".repeat(depth),
+            certainty(n),
+            stitch_note(ctx.stitch(parent, n, upstream))
+        );
         render_nodes(ctx, Some(n.node), &n.children, depth + 1, upstream, out);
         if n.collapsed > 0 {
             let calls = if n.collapsed == 1 { "call" } else { "calls" };
@@ -245,7 +301,7 @@ pub(crate) fn render_text(graph: &Graph, path: &RequestPath) -> String {
     out
 }
 
-fn json_nodes(ctx: &Ctx<'_>, parent: Option<i64>, nodes: &[PathNode]) -> Value {
+fn json_nodes(ctx: &Ctx<'_>, parent: Option<i64>, nodes: &[PathNode], upstream: bool) -> Value {
     nodes
         .iter()
         .map(|n| {
@@ -259,7 +315,8 @@ fn json_nodes(ctx: &Ctx<'_>, parent: Option<i64>, nodes: &[PathNode]) -> Value {
                 "certainty": n.certainty.as_str(),
                 "branch": n.branch.as_str(),
                 "via": n.via.as_str(),
-                "children": json_nodes(ctx, Some(n.node), &n.children),
+                "stitch": ctx.stitch(parent, n, upstream),
+                "children": json_nodes(ctx, Some(n.node), &n.children, upstream),
                 "collapsed": n.collapsed,
             })
         })
@@ -276,8 +333,8 @@ pub(crate) fn render_json(graph: &Graph, path: &RequestPath) -> Value {
             "name": e.name,
             "service": ctx.endpoint_service(path.endpoint),
         },
-        "upstream": json_nodes(&ctx, Some(path.endpoint), &path.upstream),
-        "downstream": json_nodes(&ctx, None, &path.downstream),
+        "upstream": json_nodes(&ctx, Some(path.endpoint), &path.upstream, true),
+        "downstream": json_nodes(&ctx, None, &path.downstream, false),
         "histogram": path
             .histogram
             .iter()
@@ -304,5 +361,151 @@ mod tests {
         assert_eq!(normalised("login"), None);
         assert_eq!(normalised("AuthController.login x"), None);
         assert_eq!(normalised("POST "), None);
+    }
+
+    /// S22: a `CONSUMES` step says how it was stitched (the host it named, the proxy it went
+    /// through, a suffix match, the number of candidates), in text and in JSON, both upstream
+    /// (the client under the endpoint) and downstream (the endpoint under the client).
+    #[test]
+    fn consumes_steps_show_how_they_were_stitched() {
+        use rb_model::{Attrs, Certainty, Evidence, GraphBuilder, NewEdge, Provenance};
+        let mut b = GraphBuilder::new();
+        let key = |kind, k: &str| rb_model::NodeKey::new(kind, k);
+        for s in ["w", "s"] {
+            let mut attrs = Attrs::new();
+            attrs.insert("role".into(), "service".into());
+            b.add_node(key(NodeKind::Service, s), s, attrs).unwrap();
+        }
+        let add = |b: &mut GraphBuilder, kind, k: &str, name: &str, attrs: Value| {
+            b.add_node(key(kind, k), name, attrs.as_object().cloned().unwrap())
+                .unwrap();
+        };
+        add(&mut b, NodeKind::File, "w/c.ts", "c.ts", json!({}));
+        add(&mut b, NodeKind::File, "s/h.ts", "h.ts", json!({}));
+        let x = "HTTP POST /x @s";
+        let y = "HTTP GET /y @w";
+        add(
+            &mut b,
+            NodeKind::Endpoint,
+            x,
+            "POST /x",
+            json!({"service": "s"}),
+        );
+        add(
+            &mut b,
+            NodeKind::Endpoint,
+            y,
+            "GET /y",
+            json!({"service": "w"}),
+        );
+        for (name, file) in [("a", "w/c.ts"), ("d", "w/c.ts"), ("h", "s/h.ts")] {
+            add(
+                &mut b,
+                NodeKind::Symbol,
+                name,
+                name,
+                json!({"kind": "function"}),
+            );
+            let e = NewEdge::new(
+                key(NodeKind::Symbol, name),
+                EdgeKind::DefinedIn,
+                key(NodeKind::File, file),
+                Provenance::Treesitter,
+                Certainty::Exact,
+            )
+            .evidence(Evidence {
+                path: file.into(),
+                span: [0, 9, 0, 10],
+            });
+            b.add_edge(e).unwrap();
+        }
+        for (file, s) in [("w/c.ts", "w"), ("s/h.ts", "s")] {
+            let e = NewEdge::new(
+                key(NodeKind::File, file),
+                EdgeKind::InService,
+                key(NodeKind::Service, s),
+                Provenance::Manifest,
+                Certainty::Exact,
+            );
+            b.add_edge(e).unwrap();
+        }
+        let consumes = |src: &str, c, attrs: Value| {
+            NewEdge::new(
+                key(NodeKind::Symbol, src),
+                EdgeKind::Consumes,
+                key(NodeKind::Endpoint, x),
+                Provenance::HttpStitch,
+                c,
+            )
+            .attrs(attrs.as_object().cloned().unwrap())
+            .evidence(Evidence {
+                path: "w/c.ts".into(),
+                span: [1, 0, 1, 5],
+            })
+        };
+        b.add_edge(consumes(
+            "a",
+            Certainty::Heuristic,
+            json!({"match": "exact", "via_host": "gateway", "sites": 1}),
+        ))
+        .unwrap();
+        b.add_edge(consumes(
+            "d",
+            Certainty::Ambiguous,
+            json!({"match": "suffix", "host": "s", "candidates": 2, "sites": 1}),
+        ))
+        .unwrap();
+        for (ep, h, file) in [(y, "a", "w/c.ts"), (x, "h", "s/h.ts")] {
+            let e = NewEdge::new(
+                key(NodeKind::Endpoint, ep),
+                EdgeKind::HandledBy,
+                key(NodeKind::Symbol, h),
+                Provenance::Treesitter,
+                Certainty::Exact,
+            )
+            .evidence(Evidence {
+                path: file.into(),
+                span: [0, 0, 0, 1],
+            });
+            b.add_edge(e).unwrap();
+        }
+        let graph = b.finish().unwrap();
+        let id = |k: &str| graph.nodes().iter().find(|n| n.key == k).unwrap().id;
+        let opts = rb_store::path::PathOptions {
+            depth: rb_store::path::DEFAULT_DEPTH,
+            hops: rb_store::path::DEFAULT_HOPS,
+            full: false,
+        };
+
+        let up = rb_store::path::request_path(&graph, id(x), opts);
+        let text = render_text(&graph, &up);
+        assert!(
+            text.contains("  client a  w/c.ts:1  [w]  [heuristic]  (via host gateway)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  client d  w/c.ts:1  [w]  [ambiguous]  (host s, suffix match, 2 candidates)\n"
+            ),
+            "{text}"
+        );
+        // Only `CONSUMES` steps carry a stitch: the handler line does not.
+        assert!(text.contains("  h  s/h.ts:1  [s]  [exact]\n"), "{text}");
+        let json = render_json(&graph, &up);
+        assert_eq!(json["upstream"][0]["stitch"]["via_host"], "gateway");
+        assert_eq!(json["upstream"][1]["stitch"]["candidates"], 2);
+        assert_eq!(json["downstream"][0]["stitch"], Value::Null);
+
+        let down = rb_store::path::request_path(&graph, id(y), opts);
+        let text = render_text(&graph, &down);
+        assert!(
+            text.contains("→ CONSUMES POST /x  [s]  [heuristic]  (via host gateway)\n"),
+            "{text}"
+        );
+        let json = render_json(&graph, &down);
+        assert_eq!(
+            json["downstream"][0]["children"][0]["stitch"]["match"],
+            "exact"
+        );
     }
 }

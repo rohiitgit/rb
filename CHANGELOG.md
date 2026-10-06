@@ -1,5 +1,47 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4a phase 8c
+- Goldens and precision guards (S22, S23, S25, S26; contract amendment 8).
+  - **`rb-cli/src/path.rs`:** a `CONSUMES` step ends in `(via host gateway)`, `(host …)`, `(suffix match)`, `(n candidates)`; JSON nodes gain `stitch`. Test-first: `consumes_steps_show_how_they_were_stitched` failed before the change (no note), passes after; mutations "upstream pair reversed" and "note dropped" each fail it.
+  - **`rb-cli/tests/e2e.rs`:** `check_fixture` (all three fixtures) checks the guard files and the HTTP invariants (invariant 3 `http_stitch` only `CONSUMES` and at most `synthetic`; 5 cross-service; 1 one `EXPOSES` from the key's service; 12 evidence at a `File`) in one collected assertion, and S26's AGE parity for `Endpoint` vertices and their in/out 1-hop neighbours; new `request_path_goldens` (S22: candidates, text, JSON, key and differently written inputs give the same output, ≥ 3 services and TypeScript + Java on the login path, + Go on the email path's callers, `--pick 2` checked against the listed order); `precision_guards_assert_every_http_edge_kind` (producer coverage, no database); `card-notification.txt`, `status-http.txt`, `impact-send-code.txt`.
+  - **Guards** (`crates/rb-cli/tests/golden/<fixture>/must-{exist,not-exist}.txt`): polyglot 17 + 13 lines, Java 2 + 3, TS 2 + 2.
+  - **Fixture:** `java-spring-jpa` `LegacyAuth` gains inert `@RequestMapping("/legacy")`/`@PostMapping("/login")` (no stereotype); notification gains `app.get("/health", health)` with a named handler (for S24). Both amendment 8.
+  - **Mutations** (scratchpad harness: apply, run `ts_express_prisma java_spring_jpa polyglot_monorepo`, restore, `cmp`; every run printed its `test result` line; every guard line is bitten by at least one):
+    | Mutation | Bites |
+    |---|---|
+    | host restriction off (`Scope::Only` keeps all) | forbidden `sendCode → billing decoy`; missing `sendCode` synthetic |
+    | own-service exclusion off | nothing alone (see amendment 8) |
+    | host off + own off | forbidden `notifyPaid → billing decoy` and `sendCode → billing`; invariant 5 |
+    | loopback restricts nothing | forbidden `selfcheck() -> *` |
+    | loopback restricts nothing + own off | forbidden `selfcheck() -> *` (×2 edges); invariant 5 |
+    | external host → unrestricted | forbidden `status() -> *` |
+    | client method ignored | forbidden `login → GET /api/v1/login`; missing `login` heuristic |
+    | literal segments match any literal | forbidden `sendCode → /sms`; missing both synthetic and both ambiguous lines |
+    | dynamic check off | nothing (equivalent here, see amendment 8) |
+    | suffix matching off | missing `payInvoice` suffix |
+    | ambiguity off (`n > 99`) | missing both `resend` ambiguous lines |
+    | F1 off (a name-matched host never gives `synthetic`) | missing both synthetic lines |
+    | synthetic → exact | missing both synthetic lines; invariant 3 |
+    | interfaces routed (Feign) | forbidden `EXPOSES * -> POST /internal/mfa/email @services/auth`, `HANDLED_BY * -> sendCode`; missing `resend` lines (3 candidates) |
+    | stereotype gate off | forbidden `POST /auth/legacy/login` and its `HANDLED_BY` (Java) |
+    | context path ignored | missing both `/auth/…` lines; forbidden `POST /api/v1/login @.` (Java) |
+    | `handler_spans` dropped | missing the three span lines (polyglot 2, TS 1) |
+    | named handlers unresolved | missing `health`, `payInvoice`, `mfaEcho` handler lines |
+    | cross-file flag off | missing TS `EXPOSES`/`HANDLED_BY` heuristic |
+    | decorated handler heuristic | missing `login`/`loginPage` exact, Java `login` synthetic |
+    | mount prefix dropped | forbidden TS `POST /login @.`; missing TS lines |
+    | same-file route path heuristic | missing auth `EXPOSES` ×2, `HANDLED_BY` ×2, billing `EXPOSES` exact |
+    | Express app root marked cross-file | missing notification `EXPOSES` exact, its two span lines, both synthetic lines |
+    | `HANDLED_BY` evidence dropped | invariant 12 (all three fixtures) |
+    | fixture: `// @PostMapping("/logout")` uncommented | forbidden `POST /api/v1/logout`, `HANDLED_BY logout` |
+    | fixture: push route uncommented | forbidden `POST /internal/mfa/push` |
+    | fixture: `fetch(url)` → ``fetch(`${url}/api/v1/login`)`` | forbidden `get() -> *` |
+    | fixture: `authRouter.get("/cached", cache.findUserByEmail)` | forbidden `HANDLED_BY * -> Cache#findUserByEmail()` |
+    | guard file: `selfcheck` → `selfCheck` | `vacuous (no node …)` |
+  - **Goldens** (predicted, then compared with `RB_BLESS=1` line by line): new `path-login-candidates.txt` (`1. GET /api/v1/login`, `2. POST /api/v1/login`, exit 1), `path-login.txt` (web `LoginForm()` ← `onSubmit` → `login()` `[heuristic] (via host gateway)`; `AuthController#login()` `[exact]` → `MfaClient#sendCode()` → `CONSUMES POST /internal/mfa/email [synthetic, branch heuristic] (host notification)` ⇒ `server.ts (top-level code)` → `QUERIES public.email_log (insert)`), `path-login.json`, `path-mfa-email.txt` (callers: Feign `sendCode` (host notification) continuing through `⇐ entered at POST /api/v1/login` to web; Go `notifyPaid()` [synthetic] ← `payInvoice()` ⇐ billing pay ← web `payInvoice()` (suffix match); web `resend()` [ambiguous] (2 candidates); downstream only the email handler's insert, not the sms handler), `status-http.txt` (`7 routes in 3 services; 8 client calls: 2 synthetic, 2 heuristic, 1 ambiguous, 1 external, 1 dynamic, 1 self`), `card-notification.txt` (3 APIs, called by web [ambiguous], auth [synthetic], billing [synthetic]; 1 unstitched: `selfcheck.ts`), `impact-send-code.txt` (breaks `AuthController#login()`, endpoint `2 POST /api/v1/login heuristic`). Changed: `callers-legacy.txt` (line 5 → 14), `dump.jsonl` (+6/−3: `health` symbol, endpoint, `EXPOSES` exact, `HANDLED_BY` heuristic, blob, `server.ts` unresolved 7/3 → 8/4), `status-code.txt` 4/18/21 → 4/19/22, `scip-status.txt` (code line unchanged: `server.ts` is SCIP-owned there) notification definitions 1/1 → 2/2 and unmatched 8 → 10 (`app.get`, `res.json`).
+  - **Verification:** fmt and clippy clean; 414 unit tests (rb 13, rb-frameworks 58, rb-git 26, rb-indexer 147, rb-model 11, rb-scip 40, rb-sql 27, rb-store 21, rb-syntax 71); e2e with the database and containers 17/17 twice (45.1 s, 44.1 s; no `skipping:`), determinism (two repos, forced rebuild, warm = cold, SCIP cached = fresh) inside it; stub scan: only `rb-sql/src/lib.rs:1111`.
+  - Files: `crates/rb-cli/src/path.rs`, `crates/rb-cli/tests/e2e.rs`, six guard files, two fixture files; goldens above.
+
 ## [2026-10-06] (wall clock) M4a phase 8b
 - Fixture plan, part 2: the web clients and the Java context path. No code change.
   - **Fixture:** new `polyglot-monorepo/apps/web/src/api/billing.ts` (`fetch(`${base}/invoices/${id}/pay`, { method: "POST" })`, `base` a parameter), `mfa.ts` (`axios.post("/internal/mfa/email", { email })`), `http.ts` (`get(url)` → `fetch(url)`; `status()` → `fetch("https://status.example.com/api/v1/login")`); new `java-spring-jpa/src/main/resources/application.properties` (`server.servlet.context-path=/auth`). Staged before the e2e run.

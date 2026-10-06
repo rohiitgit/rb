@@ -1,0 +1,25 @@
+# Precision guards (contract M4a D10, S23), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# Routes: the Spring controller's POST and GET on one path, each to its own method.
+EXPOSES services/auth -> HTTP POST /api/v1/login @services/auth [exact]
+EXPOSES services/auth -> HTTP GET /api/v1/login @services/auth [exact]
+HANDLED_BY HTTP POST /api/v1/login @services/auth -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login(). [exact]
+HANDLED_BY HTTP GET /api/v1/login @services/auth -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#loginPage(). [exact]
+# Express inline handlers: the file, scoped to each arrow function's span.
+EXPOSES services/notification -> HTTP POST /internal/mfa/email @services/notification [exact]
+HANDLED_BY HTTP POST /internal/mfa/email @services/notification -> services/notification/src/server.ts [exact] {"handler_spans":[[6,32,9,1]]}
+HANDLED_BY HTTP POST /internal/mfa/sms @services/notification -> services/notification/src/server.ts [exact] {"handler_spans":[[11,30,13,1]]}
+# A named Express handler resolves like a call: heuristic without SCIP (exact with it, S24).
+HANDLED_BY HTTP GET /health @services/notification -> rb-heuristic . . . `services/notification/src/server.ts`/health(). [heuristic]
+# gin: a group composed in the same function; named handlers resolve heuristically (Go has no SCIP).
+EXPOSES services/billing/cmd/billing -> HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing [exact]
+HANDLED_BY HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing -> rb-heuristic . . . `services/billing/cmd/billing/main.go`/payInvoice(). [heuristic]
+HANDLED_BY HTTP POST /internal/mfa/email @services/billing/cmd/billing -> rb-heuristic . . . `services/billing/cmd/billing/main.go`/mfaEcho(). [heuristic]
+# Stitching: through the gateway proxy, Feign's and Go's literal hosts, a suffix match, two candidates.
+CONSUMES rb-heuristic . . . `apps/web/src/api/auth.ts`/login(). -> HTTP POST /api/v1/login @services/auth [heuristic] {"match":"exact","via_host":"gateway"}
+CONSUMES rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode(). -> HTTP POST /internal/mfa/email @services/notification [synthetic] {"host":"notification","match":"exact"}
+CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main.go`/notifyPaid(). -> HTTP POST /internal/mfa/email @services/notification [synthetic] {"host":"notification","match":"exact"}
+CONSUMES rb-heuristic . . . `apps/web/src/api/billing.ts`/payInvoice(). -> HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing [heuristic] {"match":"suffix"}
+CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /internal/mfa/email @services/notification [ambiguous] {"candidates":2}
+CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing [ambiguous] {"candidates":2}

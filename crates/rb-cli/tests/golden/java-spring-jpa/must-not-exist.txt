@@ -1,0 +1,8 @@
+# Precision guards (contract M4a D10, S23), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# No route without the context path.
+EXPOSES * -> HTTP POST /api/v1/login @.
+# LegacyAuth has mappings but no stereotype (D12): no route, no handler.
+EXPOSES * -> HTTP POST /auth/legacy/login @.
+HANDLED_BY * -> rb-heuristic . . . `src/main/java/com/acme/auth/LegacyAuth.java`/LegacyAuth#authenticate().

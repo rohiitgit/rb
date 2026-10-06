@@ -1,0 +1,6 @@
+# Precision guards (contract M4a D10, S23), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# The router is mounted under /api/v1 from another file: heuristic (S7).
+EXPOSES . -> HTTP POST /api/v1/login @. [heuristic]
+HANDLED_BY HTTP POST /api/v1/login @. -> src/routes/auth.ts [heuristic] {"handler_spans":[[5,26,12,1]]}

@@ -10,9 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use rb_model::{EdgeKind, NodeKind, canonical_dump};
+use rb_model::{Certainty, EdgeKind, Graph, NodeKind, Provenance, canonical_dump};
 use rb_store::Store;
 
 fn workspace_root() -> PathBuf {
@@ -209,6 +209,16 @@ fn check_fixture(fixture: &str, tag: &str) {
     let graph = &indexed.graph;
     let node = |id: i64| graph.nodes().iter().find(|n| n.id == id).unwrap();
 
+    // Contract M4a S23: the fixture's precision guards, and the HTTP invariants every dump keeps.
+    // Both are collected before asserting, so a regression shows every line and rule it breaks.
+    let mut failures = guard_failures(fixture, &dump_a);
+    failures.extend(http_invariant_failures(graph));
+    assert!(
+        failures.is_empty(),
+        "precision guards and HTTP invariants of {fixture}:\n{}",
+        failures.join("\n")
+    );
+
     // The fixture commit holds the tracked files and nothing else (amendment 40).
     let mut files: Vec<String> = graph
         .nodes()
@@ -292,6 +302,53 @@ fn check_fixture(fixture: &str, tag: &str) {
     expected.sort();
     assert_eq!(sorted_rows(&age_edges), expected);
 
+    // Contract M4a S26: `Endpoint` vertices, and every endpoint's 1-hop neighbours in each
+    // direction (`EXPOSES` in, `HANDLED_BY` out, `CONSUMES` in), equal the relational ones.
+    let mut endpoints: Vec<String> = graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::Endpoint)
+        .map(|n| n.key.clone())
+        .collect();
+    endpoints.sort();
+    let cypher = |query: &str, cols: &str| {
+        sorted_rows(&rb(&url, &["cypher", query, "--repo", &a, "--cols", cols]))
+    };
+    assert_eq!(
+        cypher("MATCH (e:Endpoint) RETURN e.key", "endpoint"),
+        endpoints
+    );
+    for (outbound, query) in [
+        (
+            true,
+            "MATCH (e:Endpoint)-[r]->(n) RETURN e.key, label(r), n.key",
+        ),
+        (
+            false,
+            "MATCH (n)-[r]->(e:Endpoint) RETURN e.key, label(r), n.key",
+        ),
+    ] {
+        let mut expected: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter_map(|e| {
+                let (end, other) = if outbound {
+                    (node(e.src), node(e.dst))
+                } else {
+                    (node(e.dst), node(e.src))
+                };
+                (end.kind == NodeKind::Endpoint)
+                    .then(|| format!("{}\t{}\t{}", end.key, e.kind, other.key))
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(
+            cypher(query, "endpoint,kind,neighbour"),
+            expected,
+            "{query}"
+        );
+    }
+
     // Cypher runs read-only: writes are rejected.
     let out = Command::new(env!("CARGO_BIN_EXE_rb"))
         .args([
@@ -308,6 +365,220 @@ fn check_fixture(fixture: &str, tag: &str) {
         "a CREATE through rb cypher must fail"
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("read-only"));
+}
+
+/// The certainty names, weakest first (`rb_model::Certainty` ranks 1–5).
+const CERTAINTIES: [&str; 5] = ["ambiguous", "heuristic", "synthetic", "dispatch", "exact"];
+
+/// One precision-guard line (contract M4a D10, S23): `<KIND> <src key> -> <dst key>
+/// [<certainty>] {<attributes>}`, with `*` for any key and the last two parts optional.
+#[derive(Debug)]
+struct Guard {
+    line: String,
+    kind: String,
+    src: String,
+    dst: String,
+    certainty: Option<String>,
+    attrs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// An edge row of a dump: kind, source key, target key, certainty name and attributes.
+struct DumpEdge {
+    kind: String,
+    src: String,
+    dst: String,
+    certainty: String,
+    attrs: serde_json::Value,
+}
+
+impl Guard {
+    fn matches(&self, e: &DumpEdge) -> bool {
+        self.kind == e.kind
+            && (self.src == "*" || self.src == e.src)
+            && (self.dst == "*" || self.dst == e.dst)
+            && self.certainty.as_ref().is_none_or(|c| *c == e.certainty)
+            && self.attrs.iter().all(|(k, v)| e.attrs.get(k) == Some(v))
+    }
+}
+
+fn parse_guards(fixture: &str, file: &str) -> Vec<Guard> {
+    let path = golden_path(fixture, file);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("precision guards {}: {e}", path.display()));
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|line| {
+            let bad = || panic!("{}: unreadable guard {line:?}", path.display());
+            let (kind, rest) = line.split_once(' ').unwrap_or_else(bad);
+            let (src, mut dst) = rest.split_once(" -> ").unwrap_or_else(bad);
+            let mut attrs = serde_json::Map::new();
+            // Keys never contain `{"` (an endpoint path's parameter is `{}`).
+            if let Some(i) = dst.find(" {\"") {
+                attrs = serde_json::from_str(&dst[i + 1..]).unwrap_or_else(|e| {
+                    panic!("{}: unreadable attributes in {line:?}: {e}", path.display())
+                });
+                dst = &dst[..i];
+            }
+            let mut certainty = None;
+            for c in CERTAINTIES {
+                if let Some(d) = dst.strip_suffix(&format!(" [{c}]")) {
+                    certainty = Some(c.to_owned());
+                    dst = d;
+                }
+            }
+            Guard {
+                line: line.to_owned(),
+                kind: kind.to_owned(),
+                src: src.to_owned(),
+                dst: dst.to_owned(),
+                certainty,
+                attrs,
+            }
+        })
+        .collect()
+}
+
+/// The guard lines `dump` fails: every `must-exist.txt` line must match an edge of `dump`, and
+/// no `must-not-exist.txt` line may; a must-not-exist line's source key (unless `*`) must name a
+/// node of the dump, so a misspelt key cannot make a line pass vacuously.
+fn guard_failures(fixture: &str, dump: &str) -> Vec<String> {
+    let mut nodes = HashSet::new();
+    let mut edges = Vec::new();
+    for line in dump.lines().skip(1) {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let text = |i: usize| row[i].as_str().unwrap_or_default().to_owned();
+        match row[0].as_str() {
+            Some("N") => {
+                nodes.insert(text(2));
+            }
+            Some("E") => {
+                let rank = row[7].as_i64().unwrap();
+                edges.push(DumpEdge {
+                    kind: text(3),
+                    src: text(2),
+                    dst: text(5),
+                    certainty: CERTAINTIES[usize::try_from(rank - 1).unwrap()].to_owned(),
+                    attrs: row[8].clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut failures = Vec::new();
+    for g in parse_guards(fixture, "must-exist.txt") {
+        if !edges.iter().any(|e| g.matches(e)) {
+            failures.push(format!("missing: {}", g.line));
+        }
+    }
+    for g in parse_guards(fixture, "must-not-exist.txt") {
+        if g.src != "*" && !nodes.contains(&g.src) {
+            failures.push(format!("vacuous (no node {:?}): {}", g.src, g.line));
+        }
+        for e in edges.iter().filter(|e| g.matches(e)) {
+            failures.push(format!(
+                "forbidden: {}\n    found {} {} -> {} [{}] {}",
+                g.line, e.kind, e.src, e.dst, e.certainty, e.attrs
+            ));
+        }
+    }
+    failures
+}
+
+/// Contract M4a invariants 1, 3, 5 and 12 over a fixture's graph: `http_stitch` gives only
+/// `CONSUMES`, never above `synthetic`; a `CONSUMES` source lies in another service than the
+/// endpoint; every endpoint has exactly one `EXPOSES`, from the service its key names; every
+/// `EXPOSES`, `HANDLED_BY` and `CONSUMES` edge has evidence at a `File`. Returns the violations.
+fn http_invariant_failures(graph: &Graph) -> Vec<String> {
+    let mut failures = Vec::new();
+    let by_id: HashMap<i64, &rb_model::Node> = graph.nodes().iter().map(|n| (n.id, n)).collect();
+    let files: HashSet<&str> = graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::File)
+        .map(|n| n.key.as_str())
+        .collect();
+    let out_edge = |src: i64, kind: EdgeKind| {
+        graph
+            .edges()
+            .iter()
+            .find(|e| e.src == src && e.kind == kind)
+            .map(|e| e.dst)
+    };
+    // The service of a symbol (through its file) or of a file.
+    let service_of = |id: i64| {
+        let file = if by_id[&id].kind == NodeKind::File {
+            Some(id)
+        } else {
+            out_edge(id, EdgeKind::DefinedIn)
+        };
+        file.and_then(|f| out_edge(f, EdgeKind::InService))
+            .map(|s| by_id[&s].key.as_str())
+    };
+    let mut exposes: HashMap<i64, Vec<i64>> = HashMap::new();
+    for e in graph.edges() {
+        let (src, dst) = (by_id[&e.src], by_id[&e.dst]);
+        let what = format!("{} {} -> {}", e.kind, src.key, dst.key);
+        if e.provenance == Provenance::HttpStitch || e.kind == EdgeKind::Consumes {
+            if !(e.kind == EdgeKind::Consumes
+                && e.provenance == Provenance::HttpStitch
+                && e.certainty <= Certainty::Synthetic)
+            {
+                failures.push(format!(
+                    "invariant 3: {what}: {:?} {:?}",
+                    e.provenance, e.certainty
+                ));
+            }
+            let own = service_of(e.src);
+            if own.is_none() {
+                failures.push(format!("invariant 5: {what}: the client has no service"));
+            } else if own == dst.attrs["service"].as_str() {
+                failures.push(format!(
+                    "invariant 5: {what}: a client consumes its own service"
+                ));
+            }
+        }
+        if matches!(
+            e.kind,
+            EdgeKind::Exposes | EdgeKind::HandledBy | EdgeKind::Consumes
+        ) && (e.evidence.is_empty()
+            || !e.evidence.iter().all(|ev| files.contains(ev.path.as_str())))
+        {
+            failures.push(format!("invariant 12: {what}: evidence {:?}", e.evidence));
+        }
+        if e.kind == EdgeKind::Exposes {
+            exposes.entry(e.dst).or_default().push(e.src);
+        }
+    }
+    for n in graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::Endpoint)
+    {
+        let from: Vec<&str> = exposes
+            .get(&n.id)
+            .map(|v| v.iter().map(|s| by_id[s].key.as_str()).collect())
+            .unwrap_or_default();
+        if from != [n.attrs["service"].as_str().unwrap_or_default()] {
+            failures.push(format!("invariant 1: {}: EXPOSES from {from:?}", n.key));
+        }
+    }
+    failures
+}
+
+/// Contract M4a S23 (producer coverage, design §8.5): each fixture has both guard files, they
+/// parse, and together their must-exist lines assert every edge kind M4a produces.
+#[test]
+fn precision_guards_assert_every_http_edge_kind() {
+    let mut kinds = HashSet::new();
+    for fixture in ["ts-express-prisma", "java-spring-jpa", "polyglot-monorepo"] {
+        for g in parse_guards(fixture, "must-exist.txt") {
+            kinds.insert(g.kind);
+        }
+        assert!(!parse_guards(fixture, "must-not-exist.txt").is_empty());
+    }
+    for kind in [EdgeKind::Exposes, EdgeKind::HandledBy, EdgeKind::Consumes] {
+        assert!(kinds.contains(&kind.to_string()), "no must-exist {kind}");
+    }
 }
 
 /// Data rows of `rb cypher` output (header dropped), sorted bytewise; agtype strings print unquoted.
@@ -332,13 +603,17 @@ fn polyglot_monorepo() {
     check_fixture("polyglot-monorepo", "poly");
 }
 
+fn golden_path(fixture: &str, name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(fixture)
+        .join(name)
+}
+
 /// Compares `actual` with `tests/golden/<fixture>/<name>`; `RB_BLESS=1` rewrites the file instead.
 /// Blessed output must be reviewed by hand before it is committed.
 fn golden(fixture: &str, name: &str, actual: &str) {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/golden")
-        .join(fixture)
-        .join(name);
+    let path = golden_path(fixture, name);
     if std::env::var("RB_BLESS").is_ok_and(|v| v == "1") {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, actual).unwrap();
@@ -400,6 +675,12 @@ fn polyglot_monorepo_structure_goldens() {
         fixture,
         "card-gateway.txt",
         &rb(&url, &["service", "edge-gateway", "--repo", &name]),
+    );
+    // Contract M4a S20: a service with two inline-handled APIs called by three services.
+    golden(
+        fixture,
+        "card-notification.txt",
+        &rb(&url, &["service", "notification", "--repo", &name]),
     );
     golden(
         fixture,
@@ -483,6 +764,149 @@ fn polyglot_monorepo_structure_goldens() {
         .find(|l| l.trim_start().starts_with("code:"))
         .unwrap_or_default();
     golden(fixture, "status-code.txt", &format!("{code_line}\n"));
+    // Contract M4a S14: routes, and one bucket per client call site.
+    let http_line = status
+        .lines()
+        .find(|l| l.trim_start().starts_with("http:"))
+        .unwrap_or_default();
+    golden(fixture, "status-http.txt", &format!("{http_line}\n"));
+}
+
+/// Every `(service, path)` of a `rb path --format json` tree, depth first.
+fn path_steps(nodes: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    for n in nodes.as_array().unwrap() {
+        out.push((
+            n["service"].as_str().unwrap().to_owned(),
+            n["path"].as_str().unwrap().to_owned(),
+        ));
+        path_steps(&n["children"], out);
+    }
+}
+
+/// Contract M4a S22 (Q4 on `polyglot-monorepo`, `--no-scip`): the login request path from the
+/// web client through auth's controller and its Feign client into notification's inline
+/// handler and its table, and the MFA email endpoint's callers in three services.
+#[test]
+fn request_path_goldens() {
+    let Some(url) = db_url() else { return };
+    let fixture = "polyglot-monorepo";
+    let repo = fixture_repo(fixture);
+    let name = format!("t_path_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    rb(
+        &url,
+        &[
+            "index",
+            repo.path().to_str().unwrap(),
+            "--repo",
+            &name,
+            "--no-scip",
+        ],
+    );
+    // S15: a name matching two endpoints lists both and picks neither.
+    golden(
+        fixture,
+        "path-login-candidates.txt",
+        &rb_fails(&url, &["path", "login", "--repo", &name]),
+    );
+    let login = rb(&url, &["path", "POST /api/v1/login", "--repo", &name]);
+    golden(fixture, "path-login.txt", &login);
+    // The same endpoint by its key and by a differently written method and path.
+    assert_eq!(
+        rb(
+            &url,
+            &[
+                "path",
+                "HTTP POST /api/v1/login @services/auth",
+                "--repo",
+                &name
+            ]
+        ),
+        login
+    );
+    assert_eq!(
+        rb(&url, &["path", "post /api/v1//login/", "--repo", &name]),
+        login
+    );
+    let json = rb(
+        &url,
+        &[
+            "path",
+            "POST /api/v1/login",
+            "--format",
+            "json",
+            "--repo",
+            &name,
+        ],
+    );
+    golden(fixture, "path-login.json", &json);
+    // The login path spans three services and two languages (TypeScript → Java → TypeScript).
+    let tree: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let mut steps = Vec::new();
+    path_steps(&tree["upstream"], &mut steps);
+    path_steps(&tree["downstream"], &mut steps);
+    let services: HashSet<&str> = steps.iter().map(|(s, _)| s.as_str()).collect();
+    assert!(
+        ["@acme/web", "auth-service", "notification"]
+            .iter()
+            .all(|s| services.contains(s)),
+        "{services:?}"
+    );
+    let languages = |steps: &[(String, String)]| -> HashSet<String> {
+        steps
+            .iter()
+            .filter_map(|(_, p)| Path::new(p).extension())
+            .map(|e| e.to_string_lossy().replace("tsx", "ts"))
+            .collect()
+    };
+    assert_eq!(
+        languages(&steps),
+        HashSet::from(["ts".to_owned(), "java".to_owned()])
+    );
+
+    // Two services expose `POST /internal/mfa/email`; billing's is listed first (key order).
+    let err = rb_fails(&url, &["path", "POST /internal/mfa/email", "--repo", &name]);
+    assert!(
+        err.contains("1. POST /internal/mfa/email  [billing]")
+            && err.contains("2. POST /internal/mfa/email  [notification]"),
+        "{err}"
+    );
+    let email = rb(
+        &url,
+        &[
+            "path",
+            "POST /internal/mfa/email",
+            "--pick",
+            "2",
+            "--repo",
+            &name,
+        ],
+    );
+    golden(fixture, "path-mfa-email.txt", &email);
+    // With the email path, Go joins: TypeScript, Java and Go callers.
+    let json = rb(
+        &url,
+        &[
+            "path",
+            "POST /internal/mfa/email",
+            "--pick",
+            "2",
+            "--format",
+            "json",
+            "--repo",
+            &name,
+        ],
+    );
+    let tree: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let mut steps = Vec::new();
+    path_steps(&tree["upstream"], &mut steps);
+    assert_eq!(
+        languages(&steps),
+        HashSet::from(["ts".to_owned(), "java".to_owned(), "go".to_owned()])
+    );
 }
 
 /// Output order is bytewise, independent of the database's locale collation.
@@ -662,6 +1086,8 @@ fn code_question_goldens() {
                     &["callers", "MfaClient.sendCode", "--depth", "2"],
                 ),
                 ("impact-login-pick.txt", &["impact", "login", "--pick", "1"]),
+                // Contract M4a S21: the Feign method's caller handles the login endpoint.
+                ("impact-send-code.txt", &["impact", "MfaClient.sendCode"]),
             ],
         ),
     ];

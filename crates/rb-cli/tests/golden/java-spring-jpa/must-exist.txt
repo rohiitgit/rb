@@ -1,0 +1,6 @@
+# Precision guards (contract M4a D10, S23), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# The context path from application.properties is stated config: synthetic (amendment 4).
+EXPOSES . -> HTTP POST /auth/api/v1/login @. [synthetic]
+HANDLED_BY HTTP POST /auth/api/v1/login @. -> rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController#login(). [synthetic]

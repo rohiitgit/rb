@@ -13,4 +13,8 @@ app.post("/internal/mfa/sms", (_req, res) => {
   res.status(501).end();
 });
 // app.post("/internal/mfa/push", async (req, res) => { res.status(202).end(); });
+function health(_req: express.Request, res: express.Response) {
+  res.json({ ok: true });
+}
+app.get("/health", health);
 app.listen(3000);
