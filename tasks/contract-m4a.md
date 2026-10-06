@@ -218,3 +218,12 @@ Resolved in this contract: D1–D12 above.
 
 - **F1: yes, as recommended.** A host matched to a service by name or directory may reach `synthetic` when the match is unique, the URL value is a literal, a folded constant or an `application.properties` value, and the path matches exactly. Every other host-to-service match caps at `heuristic`.
 - **F2: Python routes and clients stay in M6**, as recommended. M4a covers Spring, Express, gin and Go `net/http`.
+
+## Amendments (generator, phases 1–4, 2026-10-06)
+
+1. **Phase 1 facts, as built (S1, S2).** Three refinements the assertions did not spell out, each needed by a later step:
+   - **Bindings for two more declaration forms.** S2 said initialisers are "recorded for the declarations M3a already records as bindings", but M3a recorded neither Go `const` specs nor Java interface fields (`constant_declaration`), and S12 folds both (`pkg.Const`, `Type.CONST`). Both are now bindings (`constant = true`; interface fields are members). They are also visible to the M3a resolver, where a constant name shadows like any variable; the full e2e suite (15 tests, with containers) passed with no golden change, so no fixture edge moved. Go's `const a, b = …` lists its commas under the `name` field, so names are filtered to identifiers.
+   - **Every argument summary carries its span** (`Arg::Other { span }` too), so a pack can find the chain recorded for a call argument at the same span (the `asyncHandler(fn)` unwrap of S5, `http.Post(fmt.Sprintf(…))` of S11). `Init::Call` holds the index of that chain in `FileFacts.chains`.
+   - **`DecorationArg.items`**: the elements of an array value (`@GetMapping({"/a", "/b"})`, `method = {RequestMethod.GET, …}`), each decoded like a value, for S4's "arrays give one endpoint per path".
+   - String templates decode their literal pieces one by one between holes (an escape never spans an interpolation); the SQL candidates are rendered from the same parts, and every SQL golden is unchanged.
+

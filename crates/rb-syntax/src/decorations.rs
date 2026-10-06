@@ -87,6 +87,10 @@ fn decoration(language: Language, node: Node<'_>, source: &[u8]) -> Decoration {
                         key: field_text(arg, &["key", "name"], source),
                         value,
                         literal,
+                        items: arg
+                            .child_by_field_name("value")
+                            .map(|v| items(language, v, source))
+                            .unwrap_or_default(),
                     });
                 }
                 // TypeORM-style options objects: their pairs become keyed arguments.
@@ -103,6 +107,10 @@ fn decoration(language: Language, node: Node<'_>, source: &[u8]) -> Decoration {
                                 .map(|k| value_text(language, k, source).0),
                             value,
                             literal,
+                            items: pair
+                                .child_by_field_name("value")
+                                .map(|v| items(language, v, source))
+                                .unwrap_or_default(),
                         });
                     }
                 }
@@ -113,6 +121,7 @@ fn decoration(language: Language, node: Node<'_>, source: &[u8]) -> Decoration {
                         key: None,
                         value,
                         literal,
+                        items: items(language, arg, source),
                     });
                 }
             }
@@ -121,6 +130,7 @@ fn decoration(language: Language, node: Node<'_>, source: &[u8]) -> Decoration {
     Decoration {
         name: name_node.map(|n| text(n, source)).unwrap_or_default(),
         args,
+        span: crate::span(node),
     }
 }
 
@@ -372,6 +382,30 @@ fn named_texts(node: Node<'_>, source: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// The elements of an array value (Java `{…}`, a TS array, a Python list), each decoded like a
+/// value; empty for any other value.
+fn items(language: Language, node: Node<'_>, source: &[u8]) -> Vec<DecorationArg> {
+    if !matches!(
+        node.kind(),
+        "element_value_array_initializer" | "array" | "list"
+    ) {
+        return Vec::new();
+    }
+    let mut c = node.walk();
+    node.named_children(&mut c)
+        .filter(|n| !is_comment(*n))
+        .map(|n| {
+            let (value, literal) = value_text(language, n, source);
+            DecorationArg {
+                key: None,
+                value,
+                literal,
+                items: Vec::new(),
+            }
+        })
+        .collect()
+}
+
 /// A value's decoded text and whether it is a static string (see `DecorationArg::literal`).
 fn value_text(language: Language, node: Node<'_>, source: &[u8]) -> (String, bool) {
     crate::strings::string_expression(language, node, source)
@@ -492,6 +526,63 @@ interface UserRepository extends org.springframework.data.jpa.repository.JpaRepo
                 // Names are kept as written; packs compare the last segment.
                 "UserRepository: org.springframework.data.jpa.repository.JpaRepository<User,Long>"
             ]
+        );
+    }
+
+    /// Contract M4a S2: a decoration's span is the whole annotation or decorator; array values
+    /// keep their elements.
+    #[test]
+    fn decorations_have_spans_and_array_items() {
+        let java = "class C {\n  @RequestMapping(value = {\"/a\", \"/b\" + \"c\"}, method = {RequestMethod.GET, RequestMethod.POST})\n  @Deprecated void m() {}\n  @GetMapping({\"/x\"}) void n() {}\n}\n";
+        let f = extract(Language::Java, java.as_bytes()).unwrap();
+        let m = f.definitions.iter().find(|d| d.name == "m").unwrap();
+        let mapping = &m.decorations[0];
+        let text_span = |token: &str| {
+            let start = java.find(token).unwrap();
+            let before = &java[..start];
+            let row = before.matches('\n').count() as i32;
+            let col = (start - before.rfind('\n').map_or(0, |i| i + 1)) as i32;
+            [row, col, row, col + token.len() as i32]
+        };
+        assert_eq!(
+            mapping.span,
+            text_span(
+                "@RequestMapping(value = {\"/a\", \"/b\" + \"c\"}, method = {RequestMethod.GET, RequestMethod.POST})"
+            )
+        );
+        assert_eq!(m.decorations[1].span, text_span("@Deprecated"));
+        let items = |a: &crate::DecorationArg| -> Vec<(String, bool)> {
+            a.items
+                .iter()
+                .map(|i| (i.value.clone(), i.literal))
+                .collect()
+        };
+        assert_eq!(
+            items(&mapping.args[0]),
+            [("/a".to_owned(), true), ("/bc".to_owned(), true)]
+        );
+        assert_eq!(
+            items(&mapping.args[1]),
+            [
+                ("RequestMethod.GET".to_owned(), false),
+                ("RequestMethod.POST".to_owned(), false)
+            ]
+        );
+        let n = f.definitions.iter().find(|d| d.name == "n").unwrap();
+        assert_eq!(items(&n.decorations[0].args[0]), [("/x".to_owned(), true)]);
+        assert!(n.decorations[0].args[0].key.is_none());
+
+        let ts = "class C {\n  @Get(['/a', '/b']) find() {}\n}\n";
+        let f = extract(Language::TypeScript, ts.as_bytes()).unwrap();
+        let find = f.definitions.iter().find(|d| d.name == "find").unwrap();
+        assert_eq!(
+            items(&find.decorations[0].args[0]),
+            [("/a".to_owned(), true), ("/b".to_owned(), true)]
+        );
+        let start = ts.find("@Get").unwrap();
+        assert_eq!(
+            find.decorations[0].span[1] as usize,
+            start - ts[..start].rfind('\n').unwrap() - 1
         );
     }
 

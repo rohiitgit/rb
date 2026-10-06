@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-10-06] (wall clock) M4a phase 1
+- Neutral facts in `rb-syntax` (S1, S2; contract amendment 1). No graph change.
+  - **Call chains** (`FileFacts.chains`, new `calls.rs`): every outermost call with its receiver root as written and its links in order, each with argument summaries (`Template` with literal parts and holes, `Name`, `Function`, `Object` one level deep, `Other`), all with spans; calls inside callbacks and arguments are chains of their own; decorator and annotation calls are skipped; expression texts are capped at 256 bytes.
+  - **String templates** (`StrTemplate`, `strings::string_template`): the SQL decoding split into literal parts and holes, each hole keeping its expression and span; SQL candidates are rendered from the same parts.
+  - **Bindings:** `init` (template, call by chain index, name, `??`/`||` fallback), `constant` (TS/JS `const`, Java `final` and interface fields, Go `const`), `decorations` on Java fields and parameters. Go `const` specs and Java interface fields are new bindings (amendment 1).
+  - **Decorations:** `span` (the whole annotation or decorator) and `items` for array values.
+  - `calls.rs` is in the extractor fingerprint; `every_extractor_module_is_fingerprinted` fails when a source file `extract` uses is missing from it (shown by removing `calls.rs` from the list, then restored and `cmp`-checked).
+  - New units (rb-syntax): `typescript_chains_nested_calls_and_callbacks`, `tsx_chains`, `calls_inside_callbacks_keep_their_enclosing_definition`, `decorators_are_not_calls`, `java_chains_concatenation_and_text_blocks`, `go_chains_groups_and_sprintf`, `python_smoke`, `long_expressions_are_capped`, `typescript_initialisers_and_constants`, `java_initialisers_constants_and_annotations`, `go_initialisers_and_constants`, `decorations_have_spans_and_array_items`, `every_extractor_module_is_fingerprinted`. Positions are derived from the source text.
+  - **Verification:** fmt and clippy clean; 348 unit tests (rb 9, rb-frameworks 28, rb-git 26, rb-indexer 124, rb-model 11, rb-scip 40, rb-sql 27, rb-store 12, rb-syntax 71); e2e with the database 15/15 (49.3 s, no `skipping:`), **no golden re-blessed**; stub scan: only the known SQL-string hit `rb-sql/src/lib.rs:1111`.
+  - Files: `crates/rb-syntax/src/{lib,calls,strings,bindings,decorations}.rs`.
+
 ## [2026-10-06] (wall clock) M4a phase 0
 - Preflight, no code. Contract "Checked in phase 0": D12 confirmed (Spring Framework 6.0 release notes: type-level `@RequestMapping` alone no longer makes a controller; issue #29650 shows the `@Controller` check); gin's `Default`/`New`/`Group`/verb/`Handle` signatures (handlers variadic, so the last argument is the handler); Go 1.22 `ServeMux` patterns (`[METHOD ][HOST]/[PATH]`, `{name}`, `{name...}`, `{$}`, no method = every method). Docker context `desktop-linux`, both indexer images present, 14 GiB free.
 

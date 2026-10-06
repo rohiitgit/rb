@@ -7,7 +7,7 @@
 
 use tree_sitter::Node;
 
-use crate::Language;
+use crate::{Language, StrTemplate, TemplatePart, calls::capped, span};
 
 /// A string expression that may be SQL, before its enclosing definition is resolved.
 pub(crate) struct RawCandidate<'t> {
@@ -111,6 +111,37 @@ pub(crate) fn string_expression(
     Some((text, holes == 0))
 }
 
+/// A string expression of `language` as literal parts and holes (contract M4a S1), decoded like
+/// [`string_expression`]. `None` if `node` is not a string expression.
+pub(crate) fn string_template(
+    language: Language,
+    node: Node<'_>,
+    source: &[u8],
+) -> Option<StrTemplate> {
+    let syn = syntax(language);
+    let mut node = node;
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        node = node.named_child(0)?;
+    }
+    if !is_string_expr(node, &syn) {
+        return None;
+    }
+    let mut parts: Vec<TemplatePart> = Vec::new();
+    for part in parts_of(node, &syn, source) {
+        match (parts.last_mut(), part) {
+            (Some(TemplatePart::Lit { text }), TemplatePart::Lit { text: more }) => {
+                text.push_str(&more);
+            }
+            (_, TemplatePart::Lit { text }) if text.is_empty() => {}
+            (_, part) => parts.push(part),
+        }
+    }
+    Some(StrTemplate {
+        parts,
+        span: span(node),
+    })
+}
+
 pub(crate) fn sql_candidates<'t>(
     language: Language,
     root: Node<'t>,
@@ -167,16 +198,30 @@ fn is_string_expr(node: Node<'_>, syn: &Syntax) -> bool {
 
 /// The normalised text of a string expression; non-literal parts become `$n`.
 fn flatten(node: Node<'_>, syn: &Syntax, source: &[u8], holes: &mut usize) -> String {
+    parts_of(node, syn, source)
+        .into_iter()
+        .map(|p| match p {
+            TemplatePart::Lit { text } => text,
+            TemplatePart::Hole { .. } => {
+                *holes += 1;
+                format!("${holes}")
+            }
+        })
+        .collect()
+}
+
+/// A string expression's literal parts and holes, in order (not merged).
+fn parts_of(node: Node<'_>, syn: &Syntax, source: &[u8]) -> Vec<TemplatePart> {
     let kind = node.kind();
     if syn.literals.contains(&kind) {
-        return literal_text(node, syn, source, holes);
+        return literal_parts(node, syn, source);
     }
     if syn.implicit_concat.contains(&kind) {
         let mut cursor = node.walk();
         let parts: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         return parts
             .into_iter()
-            .map(|p| flatten(p, syn, source, holes))
+            .flat_map(|p| parts_of(p, syn, source))
             .collect();
     }
     if is_plus(node, syn) {
@@ -187,26 +232,31 @@ fn flatten(node: Node<'_>, syn: &Syntax, source: &[u8], holes: &mut usize) -> St
         return operands
             .into_iter()
             .flatten()
-            .map(|operand| {
+            .flat_map(|operand| {
                 if is_string_expr(operand, syn) {
-                    flatten(operand, syn, source, holes)
+                    parts_of(operand, syn, source)
                 } else {
-                    hole(holes)
+                    vec![hole(operand, source)]
                 }
             })
             .collect();
     }
-    hole(holes)
+    vec![hole(node, source)]
 }
 
-fn hole(holes: &mut usize) -> String {
-    *holes += 1;
-    format!("${holes}")
+fn hole(expr: Node<'_>, source: &[u8]) -> TemplatePart {
+    TemplatePart::Hole {
+        expr: capped(String::from_utf8_lossy(&source[expr.byte_range()]).into_owned()),
+        span: span(expr),
+    }
 }
 
-/// A literal's value: interpolations replaced, delimiters and prefixes removed, escapes decoded.
-fn literal_text(node: Node<'_>, syn: &Syntax, source: &[u8], holes: &mut usize) -> String {
-    let mut text = String::new();
+/// A literal's value as parts: interpolations become holes (their inner expression), delimiters
+/// and prefixes are removed and escapes decoded, piece by piece between the holes (an escape
+/// never spans an interpolation).
+fn literal_parts(node: Node<'_>, syn: &Syntax, source: &[u8]) -> Vec<TemplatePart> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut holes: Vec<TemplatePart> = Vec::new();
     let mut at = node.start_byte();
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
@@ -214,29 +264,57 @@ fn literal_text(node: Node<'_>, syn: &Syntax, source: &[u8], holes: &mut usize) 
         .into_iter()
         .filter(|c| syn.holes.contains(&c.kind()))
     {
-        text.push_str(&String::from_utf8_lossy(&source[at..child.start_byte()]));
-        text.push_str(&hole(holes));
+        pieces.push(String::from_utf8_lossy(&source[at..child.start_byte()]).into_owned());
+        // The interpolated expression, without `${ }` or `{ }` and a format spec.
+        let mut ic = child.walk();
+        let expr = child
+            .child_by_field_name("expression")
+            .or_else(|| child.named_children(&mut ic).next())
+            .unwrap_or(child);
+        holes.push(hole(expr, source));
         at = child.end_byte();
     }
-    text.push_str(&String::from_utf8_lossy(&source[at..node.end_byte()]));
+    pieces.push(String::from_utf8_lossy(&source[at..node.end_byte()]).into_owned());
 
-    let prefix: String = text.chars().take_while(char::is_ascii_alphabetic).collect();
-    let rest = &text[prefix.len()..];
+    let first = &pieces[0];
+    let prefix: String = first
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    let rest = &first[prefix.len()..];
     let width = if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
         3
     } else {
         1
     };
-    let body = rest
-        .get(width..rest.len().saturating_sub(width))
-        .unwrap_or_default();
     let raw = prefix.contains(['r', 'R']) || syn.raw_literals.contains(&node.kind());
-    let body = if width == 3 && syn.text_blocks {
-        java_text_block(body)
-    } else {
-        body.to_owned()
-    };
-    if raw { body } else { unescape(&body) }
+    let last = pieces.len() - 1;
+    let bodies: Vec<String> = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, piece)| {
+            let start = if i == 0 { prefix.len() + width } else { 0 };
+            let end = if i == last {
+                piece.len().saturating_sub(width)
+            } else {
+                piece.len()
+            };
+            let body = piece.get(start..end).unwrap_or_default();
+            let body = if width == 3 && syn.text_blocks && last == 0 {
+                java_text_block(body)
+            } else {
+                body.to_owned()
+            };
+            if raw { body } else { unescape(&body) }
+        })
+        .collect();
+    let mut out = Vec::with_capacity(bodies.len() + holes.len());
+    let mut holes = holes.into_iter();
+    for body in bodies {
+        out.push(TemplatePart::Lit { text: body });
+        out.extend(holes.next());
+    }
+    out
 }
 
 /// Java text blocks drop the opening line and the indentation common to all lines (JLS 3.10.6).

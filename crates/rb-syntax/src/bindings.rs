@@ -19,6 +19,10 @@ pub(crate) struct RawBinding<'t> {
     pub scope: Option<Node<'t>>,
     /// The extent starts at the start of `from` rather than its end (hoisted `var`).
     pub from_start: bool,
+    /// The initialiser expression, when there is one per name.
+    pub value: Option<Node<'t>>,
+    /// Declared constant (`const`, Java `final` or an interface field, Go `const`).
+    pub constant: bool,
 }
 
 /// Every binding in the file, in source order.
@@ -157,7 +161,7 @@ fn scope_of<'t>(language: Language, node: Node<'t>) -> Node<'t> {
     cur
 }
 
-/// Records `name` (when present), visible from the end of `from`.
+/// Records `name` (when present), visible from the end of `from`; whether it was recorded.
 fn push<'t>(
     out: &mut Vec<RawBinding<'t>>,
     name: Option<Node<'t>>,
@@ -166,7 +170,7 @@ fn push<'t>(
     node: Node<'t>,
     from: Node<'t>,
     source: &[u8],
-) {
+) -> bool {
     // A declaration without a known type is kept (empty `type_name`): it still shadows outer
     // bindings and marks the name as a variable rather than a type.
     let type_name = type_name
@@ -182,8 +186,45 @@ fn push<'t>(
             to: node,
             scope: None,
             from_start: false,
+            value: None,
+            constant: false,
         });
     }
+    name.is_some()
+}
+
+/// Sets the initialiser and constness of the binding `push` just recorded, if it recorded one.
+fn initialised<'t>(
+    out: &mut [RawBinding<'t>],
+    pushed: bool,
+    value: Option<Node<'t>>,
+    constant: bool,
+) {
+    if let (true, Some(b)) = (pushed, out.last_mut()) {
+        b.value = value;
+        b.constant = constant;
+    }
+}
+
+/// The `n`th expression of a Go `expression_list` (or the expression itself).
+fn nth_value(list: Option<Node<'_>>, n: usize) -> Option<Node<'_>> {
+    let list = list?;
+    if list.kind() != "expression_list" {
+        return (n == 0).then_some(list);
+    }
+    let mut c = list.walk();
+    list.named_children(&mut c).nth(n)
+}
+
+/// A Java declaration is `final`.
+fn java_constant(node: Node<'_>, source: &[u8]) -> bool {
+    let mut c = node.walk();
+    node.children(&mut c)
+        .filter(|m| m.kind() == "modifiers")
+        .any(|m| {
+            let mut mc = m.walk();
+            m.children(&mut mc).any(|t| text(t, source) == "final")
+        })
 }
 
 /// Go and Python built-ins that are spelled like ordinary type names (Java and TypeScript give
@@ -291,7 +332,7 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 } else {
                     declared.and_then(|t| type_name(t, source))
                 };
-                push(
+                let pushed = push(
                     out,
                     d.child_by_field_name("name"),
                     ty,
@@ -300,6 +341,28 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                     d,
                     source,
                 );
+                initialised(
+                    out,
+                    pushed,
+                    d.child_by_field_name("value"),
+                    java_constant(node, source),
+                );
+            }
+        }
+        // An interface's or annotation type's field: implicitly `static final`.
+        "constant_declaration" => {
+            let ty = typed(node);
+            for d in declarators(node) {
+                let pushed = push(
+                    out,
+                    d.child_by_field_name("name"),
+                    ty.clone(),
+                    true,
+                    node,
+                    d,
+                    source,
+                );
+                initialised(out, pushed, d.child_by_field_name("value"), true);
             }
         }
         "formal_parameter" | "spread_parameter" | "catch_formal_parameter" | "resource" => {
@@ -309,7 +372,7 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                     .find(|n| n.kind() == "catch_type")
                     .and_then(|t| type_name(t, source))
             });
-            push(
+            let pushed = push(
                 out,
                 node.child_by_field_name("name"),
                 ty,
@@ -318,6 +381,7 @@ fn java<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 node,
                 source,
             );
+            initialised(out, pushed, None, java_constant(node, source));
         }
         "enhanced_for_statement" => {
             let name = node.child_by_field_name("name");
@@ -372,7 +436,8 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
             let name = node
                 .child_by_field_name("name")
                 .or_else(|| node.child_by_field_name("property"));
-            push(out, name, ty, true, node, node, source);
+            let pushed = push(out, name, ty, true, node, node, source);
+            initialised(out, pushed, node.child_by_field_name("value"), false);
         }
         "required_parameter" | "optional_parameter" => {
             let mut c = node.walk();
@@ -434,8 +499,16 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
                     .parent()
                     .filter(|p| p.kind() == "variable_declaration")
                     .and_then(|_| hoisting_scope(node));
+                let constant = node.parent().is_some_and(|p| {
+                    p.kind() == "lexical_declaration"
+                        && p.child_by_field_name("kind")
+                            .is_some_and(|k| text(k, source) == "const")
+                });
+                // Only a plain name takes the initialiser.
+                let init = value.filter(|_| name.kind() == "identifier");
                 for n in names {
-                    push(out, Some(n), ty.clone(), false, node, node, source);
+                    let pushed = push(out, Some(n), ty.clone(), false, node, node, source);
+                    initialised(out, pushed, init, constant);
                     if let (Some(h), Some(b)) = (hoisted, out.last_mut()) {
                         b.from = h;
                         b.from_start = true;
@@ -487,7 +560,7 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
                 .filter(|v| v.kind() == "new_expression")
                 .and_then(|v| type_name(v, source));
             if on_this {
-                push(
+                let pushed = push(
                     out,
                     left.child_by_field_name("property"),
                     ty,
@@ -496,6 +569,7 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
                     node,
                     source,
                 );
+                initialised(out, pushed, node.child_by_field_name("right"), false);
             }
         }
         _ => {}
@@ -542,8 +616,12 @@ fn python<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                         .and_then(|r| r.child_by_field_name("function"))
                         .and_then(|f| type_name(f, source))
                 });
+            let right = node.child_by_field_name("right");
             match left.kind() {
-                "identifier" => push(out, Some(left), ty, false, node, node, source),
+                "identifier" => {
+                    let pushed = push(out, Some(left), ty, false, node, node, source);
+                    initialised(out, pushed, right, false);
+                }
                 "pattern_list" | "tuple_pattern" | "list_pattern" => {
                     let mut names = Vec::new();
                     pattern_names(left, &mut names);
@@ -556,7 +634,7 @@ fn python<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                         .child_by_field_name("object")
                         .is_some_and(|o| text(o, source) == "self") =>
                 {
-                    push(
+                    let pushed = push(
                         out,
                         left.child_by_field_name("attribute"),
                         ty,
@@ -565,6 +643,7 @@ fn python<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                         node,
                         source,
                     );
+                    initialised(out, pushed, right, false);
                 }
                 _ => {}
             }
@@ -621,13 +700,26 @@ fn go<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
         n.children_by_field_name("name", &mut c).collect::<Vec<_>>()
     };
     match node.kind() {
-        "var_spec" | "parameter_declaration" | "field_declaration" => {
+        "var_spec" | "const_spec" | "parameter_declaration" | "field_declaration" => {
             let ty = node
                 .child_by_field_name("type")
                 .and_then(|t| type_name(t, source));
             let member = node.kind() == "field_declaration";
-            for name in names(node) {
-                push(out, Some(name), ty.clone(), member, node, node, source);
+            let constant = node.kind() == "const_spec";
+            // `const a, b = …` lists its commas under the `name` field too.
+            let declared: Vec<Node<'t>> = names(node)
+                .into_iter()
+                .filter(|n| matches!(n.kind(), "identifier" | "field_identifier"))
+                .collect();
+            let values = node.child_by_field_name("value");
+            for (i, name) in declared.iter().enumerate() {
+                let pushed = push(out, Some(*name), ty.clone(), member, node, node, source);
+                let value = nth_value(values, i).filter(|_| {
+                    values.is_some_and(|v| {
+                        v.kind() != "expression_list" || v.named_child_count() == declared.len()
+                    })
+                });
+                initialised(out, pushed, value, constant);
             }
         }
         "short_var_declaration" => {
@@ -657,7 +749,12 @@ fn go<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                         is_literal.then(|| type_name(*value, source)).flatten()
                     });
                 let name = Some(*name).filter(|n| n.kind() == "identifier");
-                push(out, name, ty, false, node, node, source);
+                let pushed = push(out, name, ty, false, node, node, source);
+                let value = rights
+                    .get(i)
+                    .copied()
+                    .filter(|_| lefts.len() == rights.len());
+                initialised(out, pushed, value, false);
             }
         }
         // `for k, v := range …`
@@ -887,6 +984,138 @@ mod tests {
                 "c: ? in f",
                 "v: ? in f",
                 "ok: ? in f"
+            ]
+        );
+    }
+
+    /// `name = init [const]` for every binding with an initialiser or constness, where `init`
+    /// is abbreviated: `'lit{hole}'`, `call root.link`, `name x`, `x ?? 'lit'`.
+    fn inits(language: Language, src: &str) -> Vec<String> {
+        let facts = extract(language, src.as_bytes()).unwrap();
+        let template = |t: &crate::StrTemplate| {
+            let parts: Vec<String> = t
+                .parts
+                .iter()
+                .map(|p| match p {
+                    crate::TemplatePart::Lit { text } => text.clone(),
+                    crate::TemplatePart::Hole { expr, .. } => format!("{{{expr}}}"),
+                })
+                .collect();
+            format!("'{}'", parts.join(""))
+        };
+        facts
+            .bindings
+            .iter()
+            .filter(|b| b.init.is_some() || b.constant)
+            .map(|b| {
+                let init = match &b.init {
+                    None => "-".to_owned(),
+                    Some(crate::Init::Template { template: t }) => template(t),
+                    Some(crate::Init::Call { chain }) => {
+                        let c = &facts.chains[*chain];
+                        let links: Vec<&str> = c.links.iter().map(|l| l.name.as_str()).collect();
+                        format!(
+                            "call {}{}",
+                            c.root
+                                .as_deref()
+                                .map(|r| format!("{r}."))
+                                .unwrap_or_default(),
+                            links.join(".")
+                        )
+                    }
+                    Some(crate::Init::Name { text, .. }) => format!("name {text}"),
+                    Some(crate::Init::Fallback { primary, default }) => {
+                        format!("{primary} ?? {}", template(default))
+                    }
+                };
+                let constant = if b.constant { " const" } else { "" };
+                format!("{} = {init}{constant}", b.name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn typescript_initialisers_and_constants() {
+        let src = "const API = import.meta.env.VITE_API_URL ?? \"http://gateway\";\nconst BASE = process.env.BASE || 'http://x';\nexport const app = express();\nconst r = express.Router();\nlet u = `${API}/u`;\nconst n = API;\nconst api = await axios.create({ baseURL: API });\nconst { a } = mk();\nclass K { base = '/k'; constructor() { this.c = http.client(); } }\nconst x = 1 + f();\n";
+        assert_eq!(
+            inits(Language::TypeScript, src),
+            [
+                "API = import.meta.env.VITE_API_URL ?? 'http://gateway' const",
+                "BASE = process.env.BASE ?? 'http://x' const",
+                "app = call express const",
+                "r = call express.Router const",
+                "u = '{API}/u'",
+                "n = name API const",
+                "api = call axios.create const",
+                // A destructured name takes no initialiser, but is still declared `const`.
+                "a = - const",
+                "base = '/k'",
+                "c = call http.client",
+                "x = - const",
+            ]
+        );
+        // The call initialiser points at the chain recorded for that call.
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let app = facts.bindings.iter().find(|b| b.name == "app").unwrap();
+        let Some(crate::Init::Call { chain }) = app.init else {
+            panic!("{app:?}")
+        };
+        let start = src.find("express()").unwrap();
+        assert_eq!(
+            facts.chains[chain].span[1] as usize,
+            start - src[..start].rfind('\n').unwrap() - 1
+        );
+    }
+
+    #[test]
+    fn java_initialisers_constants_and_annotations() {
+        let src = "class K {\n  static final String BASE = \"/api\";\n  String mutable = \"/m\";\n  private final WebClient web = WebClient.builder().baseUrl(\"http://x\").build();\n  @Value(\"${auth.url:http://auth}\") private String authUrl;\n  K(@Value(\"${k}\") String k) { final String p = BASE + \"/x\"; }\n}\ninterface Paths { String ROOT = \"/r\"; }\n";
+        assert_eq!(
+            inits(Language::Java, src),
+            [
+                "BASE = '/api' const",
+                "mutable = '/m'",
+                "web = call WebClient.builder.baseUrl.build const",
+                "p = '{BASE}/x' const",
+                "ROOT = '/r' const",
+            ]
+        );
+        let facts = extract(Language::Java, src.as_bytes()).unwrap();
+        let annotated: Vec<(String, String, String)> = facts
+            .bindings
+            .iter()
+            .flat_map(|b| {
+                b.decorations
+                    .iter()
+                    .map(|d| (b.name.clone(), d.name.clone(), d.args[0].value.clone()))
+            })
+            .collect();
+        assert_eq!(
+            annotated,
+            [
+                (
+                    "authUrl".to_owned(),
+                    "Value".to_owned(),
+                    "${auth.url:http://auth}".to_owned()
+                ),
+                ("k".to_owned(), "Value".to_owned(), "${k}".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn go_initialisers_and_constants() {
+        let src = "package main\nconst base = \"http://notification:3000\"\nconst (\n\tA, B = \"a\", \"b\"\n\tC = iota\n)\nvar mutable = \"/m\"\nfunc main() {\n\tr := gin.Default()\n\tapi := r.Group(\"/billing\")\n\tx, y := f()\n}\n";
+        assert_eq!(
+            inits(Language::Go, src),
+            [
+                "base = 'http://notification:3000' const",
+                "A = 'a' const",
+                "B = 'b' const",
+                "C = - const",
+                "mutable = '/m'",
+                "r = call gin.Default",
+                "api = call r.Group",
             ]
         );
     }

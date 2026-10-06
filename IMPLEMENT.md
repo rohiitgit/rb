@@ -299,6 +299,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 ## M4a Endpoints and request paths: in progress
 
 - [x] Phase 0: preflight (D12 confirmed in the Spring 6.0 release notes; gin and Go 1.22 `ServeMux` grammars recorded in the contract)
+- [x] Phase 1: neutral facts (call chains, string templates, binding initialisers and constants, decoration spans; amendment 1)
 
 - **Split (2026-10-06):** M4 becomes M4a (this entry) and M4b. M4b covers Spring DI and Spring Data synthesis, RTA, derived `DEPENDS_ON`, the full Service Card, Q3's roll-up and orphan detection; it is not started. Design §13 has both rows.
 - **Contract:** `tasks/contract-m4a.md`, S1–S28 and invariants 1–13. Phases are in `tasks/todo.md`.

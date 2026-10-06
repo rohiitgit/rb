@@ -5,6 +5,7 @@
 //! §5.4) from a file's path and facts alone.
 
 mod bindings;
+mod calls;
 mod decorations;
 mod imports;
 mod keys;
@@ -46,6 +47,7 @@ fn fingerprint_input() -> String {
         include_str!("decorations.rs"),
         include_str!("imports.rs"),
         include_str!("bindings.rs"),
+        include_str!("calls.rs"),
     ]
     .join("\n")
 }
@@ -168,6 +170,9 @@ pub struct Decoration {
     /// As written, possibly qualified (`Table`, `app.route`, `javax.persistence.Entity`).
     pub name: String,
     pub args: Vec<DecorationArg>,
+    /// The whole annotation or decorator (`@PostMapping("/login")`), so evidence can point at it.
+    #[serde(default)]
+    pub span: Span,
 }
 
 /// One decoration argument. String literals (and `+` concatenations of them) are decoded, with
@@ -180,6 +185,10 @@ pub struct DecorationArg {
     /// `value` is a fixed string known statically (no identifiers, calls or interpolations).
     #[serde(default)]
     pub literal: bool,
+    /// The elements of an array value (Java `{"/a", "/b"}`, a TS or Python list), each decoded
+    /// like a value; empty for any other value.
+    #[serde(default)]
+    pub items: Vec<DecorationArg>,
 }
 
 /// A named supertype; `name` is as written (possibly qualified), type arguments by simple name.
@@ -235,6 +244,111 @@ pub struct SqlCandidate {
     pub callee: Option<String>,
 }
 
+/// A string expression as literal parts and holes (contract M4a S1): a literal, a template
+/// string, an f-string or a `+` concatenation with at least one literal. Literal parts are
+/// decoded as for SQL candidates; every interpolation or non-literal operand is a hole that keeps
+/// its expression text (at most [`MAX_EXPR_BYTES`]) and span. Adjacent literal parts are merged.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StrTemplate {
+    pub parts: Vec<TemplatePart>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TemplatePart {
+    Lit { text: String },
+    Hole { expr: String, span: Span },
+}
+
+/// Expression texts kept in facts (holes, names, receiver roots) are cut to this many bytes.
+pub const MAX_EXPR_BYTES: usize = 256;
+
+/// An outermost call expression and the calls chained onto its receiver (contract M4a S1):
+/// `router.route('/x').get(h).post(h2)` is the root `router` and the links `route`, `get`,
+/// `post`, in source order. Calls nested in arguments or callbacks are chains of their own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallChain {
+    /// The receiver of the first link as written (`app`, `this.restTemplate`, `axios`, `http`),
+    /// `None` when the chain starts with a plain call (`fetch(…)`, `express()`).
+    pub root: Option<String>,
+    pub links: Vec<CallLink>,
+    /// The whole outermost call expression.
+    pub span: Span,
+    /// Index into `FileFacts::definitions` of the innermost definition containing the call.
+    pub enclosing: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallLink {
+    /// The called name (`post`, `getForObject`, `Group`); empty when the callee is not a name
+    /// (`f()(x)`).
+    pub name: String,
+    /// Span of the name (of the callee when there is no name).
+    pub span: Span,
+    pub args: Vec<Arg>,
+}
+
+/// A summary of one call argument (contract M4a S1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Arg {
+    /// A string expression.
+    Template { template: StrTemplate },
+    /// An identifier or a member path as written (`login`, `ctrl.login`, `HttpMethod.POST`).
+    Name { text: String, span: Span },
+    /// An inline function (arrow, function expression, lambda, Go func literal).
+    Function { span: Span },
+    /// An object literal, one level deep (nested objects are `Other`).
+    Object {
+        span: Span,
+        entries: Vec<ObjectEntry>,
+    },
+    /// Anything else (a call, a number, an array, …).
+    Other { span: Span },
+}
+
+impl Arg {
+    pub fn span(&self) -> Span {
+        match self {
+            Arg::Template { template } => template.span,
+            Arg::Name { span, .. }
+            | Arg::Function { span }
+            | Arg::Object { span, .. }
+            | Arg::Other { span } => *span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectEntry {
+    /// The key as written, string keys decoded (`baseURL`, `method`).
+    pub key: String,
+    pub value: Arg,
+}
+
+/// A binding's initialiser (contract M4a S2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Init {
+    Template {
+        template: StrTemplate,
+    },
+    /// A call: index into `FileFacts::chains` of the call chain it is.
+    Call {
+        chain: usize,
+    },
+    Name {
+        text: String,
+        span: Span,
+    },
+    /// `a ?? 'lit'` or `a || 'lit'`: the name `a` with a default string.
+    Fallback {
+        primary: String,
+        default: StrTemplate,
+    },
+}
+
 /// Everything extracted from one blob. Definitions are sorted by position (a Go method's parent
 /// may be a type declared later in the file).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -258,6 +372,9 @@ pub struct FileFacts {
     /// Names bound to a declared or constructed type, in source order.
     #[serde(default)]
     pub bindings: Vec<Binding>,
+    /// Outermost call expressions with their chained calls, in source order.
+    #[serde(default)]
+    pub chains: Vec<CallChain>,
 }
 
 /// One import statement (or one spec of a Go import block).
@@ -304,6 +421,15 @@ pub struct Binding {
     /// outside this extent means another declaration.
     #[serde(default)]
     pub visible: Span,
+    /// The initialiser, when it is a string, a call, a name or a `??`/`||` fallback.
+    #[serde(default)]
+    pub init: Option<Init>,
+    /// Declared constant: TS/JS `const`, a Java `final` variable or interface field, Go `const`.
+    #[serde(default)]
+    pub constant: bool,
+    /// Java annotations on a field or parameter (`@Value("${k:d}")`), in source order.
+    #[serde(default)]
+    pub decorations: Vec<Decoration>,
 }
 
 /// Parses `source` and extracts its definitions and references.
@@ -374,6 +500,12 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         })
         .collect();
 
+    let raw_chains = calls::chains(language, root, source);
+    let chain_index: HashMap<usize, usize> = raw_chains
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.node.id(), i))
+        .collect();
     let bindings: Vec<Binding> = bindings::bindings(language, root, source)
         .into_iter()
         .map(|b| {
@@ -408,7 +540,26 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                     point(to.row),
                     point(to.column),
                 ],
+                init: b
+                    .value
+                    .and_then(|v| calls::init(language, v, source, &chain_index)),
+                constant: b.constant,
+                decorations: if language == Language::Java {
+                    decorations::decorations(language, b.node, source)
+                } else {
+                    Vec::new()
+                },
             }
+        })
+        .collect();
+    let chains = raw_chains
+        .into_iter()
+        .map(|c| CallChain {
+            root: c.root,
+            links: c.links,
+            span: span(c.node),
+            enclosing: enclosing(c.node.start_byte(), &starts, &ends, &lexical_parent)
+                .map(|i| nearest_kept(i, &kept, &lexical_parent)),
         })
         .collect();
 
@@ -430,6 +581,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         imports: imports::imports(language, root, source),
         package: imports::package(language, root, source),
         bindings,
+        chains,
     })
 }
 
@@ -1184,6 +1336,43 @@ export function hash(s: string): string {
         // FNV-1a reference value and sensitivity.
         assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
         assert_ne!(fnv1a(b"(a) @name"), fnv1a(b"(b) @name"));
+    }
+
+    /// Contract M4a S2: every source file of this crate that `extract` depends on is part of
+    /// the fingerprint, so a new extractor module can never serve stale cached facts.
+    /// `keys.rs` derives keys from facts after extraction and is the only exemption.
+    #[test]
+    fn every_extractor_module_is_fingerprinted() {
+        const NOT_USED_BY_EXTRACT: &[&str] = &["keys.rs"];
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let input = fingerprint_input();
+        let mut checked = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            if NOT_USED_BY_EXTRACT.contains(&name.as_str()) {
+                let module = name.trim_end_matches(".rs");
+                let lib = include_str!("lib.rs");
+                let body =
+                    &lib[lib.find("pub fn extract(").unwrap()..lib.find("fn drop_locals").unwrap()];
+                assert!(
+                    !body.contains(&format!("{module}::")),
+                    "extract uses {name}"
+                );
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                input.contains(&content),
+                "{name} is not in the extractor fingerprint"
+            );
+            checked.push(name);
+        }
+        checked.sort();
+        assert!(checked.contains(&"calls.rs".to_owned()), "{checked:?}");
     }
 
     /// EXTRACTOR_VERSION must change whenever a grammar version changes.
