@@ -541,7 +541,22 @@ impl Store {
                 .collect())
         };
         let owners = targets("OWNED_BY")?;
-        let packages = targets("DEPENDS_ON")?;
+        // `Package` targets once each (a `scip` and a `manifest` edge may share one; contract
+        // M4b S15); services a manifest names are dependencies, not packages.
+        let packages: Vec<String> = self
+            .client
+            .query(
+                "SELECT o.key FROM rb.edge e
+                 JOIN rb.node o ON o.snapshot_id = e.snapshot_id AND o.id = e.dst
+                 WHERE e.snapshot_id = $1 AND e.src = $2 AND e.kind = 'DEPENDS_ON'
+                   AND o.kind = 'package'
+                 GROUP BY o.key
+                 ORDER BY o.key COLLATE \"C\"",
+                &[&snapshot_id, &id],
+            )?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
         let apis = self.apis(snapshot_id, id)?;
         let (consumes, consumed_by) = self.http_peers(snapshot_id, id, key)?;
         let unstitched: i64 = self

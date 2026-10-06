@@ -8,6 +8,7 @@ use std::path::Path;
 
 mod modules;
 mod orm;
+mod packages;
 mod projects;
 mod resolve;
 mod routes;
@@ -62,7 +63,9 @@ use serde_json::{Value, json};
 /// `m4a-http-11` evaluator pass 7's (M4a amendment 17: files without token facts scanned as
 /// text, string literals naming `fetch` or axios, discovery configuration caps host-by-name
 /// `synthetic`).
-pub const PIPELINE: &str = "m4a-http-11";
+/// `m4b-di-1` adds manifest dependencies: `Package` versions from lockfiles, `go.mod` and poms,
+/// and Service → Service `DEPENDS_ON` `via=package` (contract M4b S15, S16).
+pub const PIPELINE: &str = "m4b-di-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -172,6 +175,12 @@ pub fn index_commit(
         .filter(|f| is_config_input(&f.path))
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
+    let manifests = manifest
+        .files
+        .iter()
+        .filter(|f| packages::is_input(&f.path) && !f.binary)
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<_>>()?;
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
@@ -180,6 +189,7 @@ pub fn index_commit(
         scip: scip_projects,
         config,
         unparsed,
+        manifests,
     };
 
     let (graph, assembly_diagnostics) =
@@ -251,6 +261,8 @@ pub struct Content<'a> {
     pub config: BTreeMap<&'a str, String>,
     /// What the raw-text scan of the files without facts found (contract M4a amendment 17).
     pub unparsed: rb_frameworks::clients::RawScan,
+    /// `package.json`, npm lockfiles, `go.mod` and `pom.xml` texts (contract M4b S15).
+    pub manifests: BTreeMap<&'a str, String>,
 }
 
 /// What a configuration input is to the endpoint and stitching stages.
@@ -668,6 +680,15 @@ pub fn assemble(
             .evidence(at),
         )?;
     }
+    // Manifest dependencies (contract M4b S15, S16), next to the SCIP ones.
+    let paths: BTreeSet<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+    let (manifest_edges, manifest_diagnostics) = packages::dependencies(&packages::Inputs {
+        projects: boundaries.projects(),
+        texts: &content.manifests,
+        paths: &paths,
+    });
+    packages::add(&mut b, &manifest_edges)?;
+    diagnostics.extend(manifest_diagnostics);
     // ORM mappings from every file first, so accesses can resolve entities across files.
     for (path, (_, facts)) in &content.facts {
         syntax::add_symbols(&mut b, path, facts, &keys[path])?;

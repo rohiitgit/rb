@@ -7,9 +7,12 @@ auth-service  (path: services/auth, deployable)
 │    @acme/identity     4 files   67%
 │    @acme/data         2 files   33%
 │    unowned            0 files    0%
-├─ Packages (4)
+├─ Packages (7)
 │    maven/jdk@21
+│    maven/org.springframework.boot/spring-boot-starter-jdbc@?
+│    maven/org.springframework.boot/spring-boot-starter-web@?
 │    maven/org.springframework.cloud/spring-cloud-openfeign-core@4.1.3
+│    maven/org.springframework.cloud/spring-cloud-starter-openfeign@?
 │    maven/org.springframework/spring-jdbc@6.1.13
 │    maven/org.springframework/spring-web@6.1.13
 ├─ APIs (2)

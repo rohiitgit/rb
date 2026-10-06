@@ -8,8 +8,10 @@ auth-api  (path: ., deployable)
 │    @acme/platform      4 files   44%
 │    @acme/data           1 file   11%
 │    unowned             0 files    0%
-├─ Packages (1)
+├─ Packages (3)
 │    npm/@prisma/client@5.22.0
+│    npm/express@4.22.3
+│    npm/pg@8.23.0
 ├─ APIs (1)
 │    POST /api/v1/login  → src/routes/auth.ts (top-level code)  [heuristic]
 ├─ Calls APIs of: none

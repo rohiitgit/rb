@@ -1814,14 +1814,18 @@ fn scip_polyglot_monorepo() {
         assert_exact_code_edges(&dump, auth_package, "services/auth/", "services/auth") >= 1,
         "{dump}"
     );
-    // S8: the ok Maven service lists its packages; the failed one has none.
+    // S8: the ok Maven service lists its packages; the failed one has no `scip` package, only
+    // its pom's literal dependency (contract M4b S15, provenance `manifest`).
     golden(
         fixture,
         "scip-card-auth.txt",
         &rb(&url, &["service", "services/auth", "--repo", &name]),
     );
     let broken_card = rb(&url, &["service", "services/broken", "--repo", &name]);
-    assert!(broken_card.contains("Packages: none"), "{broken_card}");
+    assert!(
+        broken_card.contains("├─ Packages (1)\n│    maven/com.acme/nope@0.0.0\n"),
+        "{broken_card}"
+    );
     golden(
         fixture,
         "scip-callers-send-code.txt",

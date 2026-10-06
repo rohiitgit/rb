@@ -340,6 +340,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 1a: X1's HTML row; parameter positions, type arguments, array flag, return types and modifiers as facts (amendment 4); no golden change.
 - [x] Phase 1b: default exports and per-file mention roles as facts (amendment 5); no golden change.
 - [x] Phase 2: Spring DI facts per file (`rb_frameworks::di`: beans, injection points, scans, gate D; amendment 6); no golden change.
+- [x] Phase 3: manifest packages with versions (npm lockfile, go.mod, pom) and Service → Service `via=package`; `PIPELINE = m4b-di-1` (amendment 7).
 
 - **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):

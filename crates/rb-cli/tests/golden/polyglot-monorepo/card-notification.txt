@@ -6,7 +6,8 @@ notification  (path: services/notification, deployable)
 ├─ File ownership
 │    @acme/messaging     5 files  100%
 │    unowned             0 files    0%
-├─ Packages: none
+├─ Packages (1)
+│    npm/express@?
 ├─ APIs (3)
 │    GET /health  → health().  [heuristic]
 │    POST /internal/mfa/email  → services/notification/src/server.ts (top-level code)  [exact]

@@ -532,7 +532,7 @@ Same rules as M4a:
   - *Invariants:* every Spring name is import-gated (negative test each); decoys give nothing.
   - Files: new `rb-frameworks/src/di.rs`, `rb-frameworks/src/lib.rs`.
   - **Verify:** rb-frameworks units; e2e unchanged.
-- [ ] **3. Manifest packages and `via=package`** (S15, S16).
+- [x] **3. Manifest packages and `via=package`** (S15, S16). Done: `rb-indexer/src/packages.rs` (npm with lockfile walk, go.mod, pom; Service → Service; classpath closure); `PIPELINE = m4b-di-1`; card packages deduped (amendment 7); 6 units; fixture dumps vs the `1f81c8f` baseline: only added `Package` nodes and `manifest` `DEPENDS_ON` lines; six goldens re-blessed after classification.
   - *Derived:* direct dependencies with versions (lockfile walk, go.mod, pom literal or property); `Package` nodes in M3b's key form (`@?`); `DEPENDS_ON` with provenance `manifest`, evidence at the entry; Service → Service `via=package`; `lockfile_*` diagnostics.
   - *Invariants:* M3b's `scip` package edges unchanged; classpath closure has a cycle test.
   - Files: new `rb-indexer/src/packages.rs`, `rb-indexer/src/lib.rs` (wiring, `PIPELINE = m4b-di-1`).
