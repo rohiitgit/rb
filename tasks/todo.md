@@ -587,7 +587,7 @@ Same rules as M4a:
   - **Verify:** units; e2e unchanged until the fixture phase.
 - [x] **12a. Fixtures: java-spring-jpa, part 1.** New `AuthApplication.java`, `Hashing.java`, `Tokens.java`, `AuditConfig.java`, `Notifiers.java`; `git add`. Done: package-private types and `Notifier.java` (amendment 16); `INJECTS` lose `scan_roots_unknown` (`plain 2`), `KafkaAuditSink` proven (2 prunable edges), `main`/`lifecycle` entries; SCIP card and status re-blessed through container runs.
   - **Verify:** e2e; predict every new `INJECTS`, `impl_instantiated` and coverage line before blessing.
-- [ ] **12b. Fixtures: java-spring-jpa, part 2.** New `UserRepositoryCustomImpl.java`, `support/Service.java`, `support/ReportNotifier.java`; edits to `UserRepository.java` and `AuthController.java`.
+- [x] **12b. Fixtures: java-spring-jpa, part 2.** New `UserRepositoryCustomImpl.java`, `support/Service.java`, `support/ReportNotifier.java`; edits to `UserRepository.java` and `AuthController.java`. Done: qualifier, collection (capped by the decoy, `annotation_unread`), conditional ambiguous setter edges; fragment kept by RTA; eight goldens moved by the line shift, SCIP card and status re-blessed.
   - **Verify:** as 12a.
 - [ ] **12c. Fixtures: java-spring-jpa, part 3, and polyglot auth.** Edits to `DefaultAuthService.java` and `LegacyAuth.java`; polyglot new `AuthApplication.java`; edits to `UserDao.java` and `AuthController.java`.
   - **Verify:** as 12a; the `rb path` login goldens gain `QUERIES public.users`/`audit.users` (classified).

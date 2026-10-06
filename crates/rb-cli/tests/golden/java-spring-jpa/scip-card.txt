@@ -1,15 +1,15 @@
 auth-service  (path: ., deployable)
 ├─ Detected by: maven
 ├─ Manifests: pom.xml
-├─ Files: 15 (java 11, other 2, python 1, sql 1)
+├─ Files: 18 (java 14, other 2, python 1, sql 1)
 ├─ Owners: none
 ├─ File ownership
-│    unowned    15 files  100%
+│    unowned    18 files  100%
 ├─ APIs (1)
 │    POST /auth/api/v1/login  → com/acme/auth/AuthController#login().  [synthetic]
 ├─ Calls APIs of: none
 ├─ APIs called by: none
-├─ Packages (9)
+├─ Packages (10)
 │    jakarta.persistence/jakarta.persistence-api 3.1.0  (scip)
 │    jdk 21  (scip)
 │    org.springframework.boot/spring-boot-autoconfigure 3.3.4  (scip)
@@ -17,15 +17,16 @@ auth-service  (path: ., deployable)
 │    org.springframework.boot/spring-boot-starter-web ?  [unresolved]
 │    org.springframework.boot/spring-boot 3.3.4  (scip)
 │    org.springframework.data/spring-data-jpa 3.3.4  (scip)
+│    org.springframework/spring-beans 6.1.13  (scip)
 │    org.springframework/spring-context 6.1.13  (scip)
 │    org.springframework/spring-web 6.1.13  (scip)
 ├─ Database tables (1)
 │    public.users  delete, insert, read, update  [exact]  (schema assumed)
-├─ Dependencies (0 services, 9 packages)
-│    packages: 9
+├─ Dependencies (0 services, 10 packages)
+│    packages: 10
 ├─ Depended on by: none
 ├─ Shares tables with: none
 └─ Call graph (edges within the service)
-     45 symbols · CALLS 3, IMPLEMENTS 18, INJECTS 2, REFERENCES 0
-     certainty: exact 87.0%, heuristic 13.0%
+     52 symbols · CALLS 5, IMPLEMENTS 23, INJECTS 7, REFERENCES 0
+     certainty: exact 77.1%, heuristic 17.1%, ambiguous 5.7%
      entry points: endpoint 1, lifecycle 1, main 1

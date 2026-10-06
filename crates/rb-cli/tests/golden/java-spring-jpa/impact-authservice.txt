@@ -1,7 +1,7 @@
 removing AuthService#authenticate().  src/main/java/com/acme/auth/AuthService.java:4  [auth-service]
 precision=cha
 breaks: requiring edges into it (2):
-  1  AuthController#login().  src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  heuristic
+  1  AuthController#login().  src/main/java/com/acme/auth/AuthController.java:31  [auth-service]  heuristic
   1  DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:14  [auth-service]  heuristic
 affects: reaches those through calls or references (0):
 endpoints: handled by the removed or impacted code (1):
