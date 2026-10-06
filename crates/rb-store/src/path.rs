@@ -12,9 +12,9 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use rb_model::{Certainty, Edge, EdgeKind, Graph, NodeKind, Span};
+use rb_model::{Certainty, Edge, EdgeKind, NodeKind, Span};
 
-use crate::code::{Precision, View, resolve_target};
+use crate::code::{Precision, SnapshotIndex, View, resolve_target};
 
 /// Default and maximum call levels followed per hop (design §11.2).
 pub const DEFAULT_DEPTH: usize = 12;
@@ -132,7 +132,8 @@ impl Default for PathOptions {
 /// `normalised`, the input read as `<METHOD> <path>` and normalised by the caller, against
 /// endpoint names; a case-insensitive substring of endpoint names; a symbol (design §9.1 forms)
 /// that handles endpoints or consumes them. Several means the caller must choose.
-pub fn resolve_endpoints(graph: &Graph, input: &str, normalised: Option<&str>) -> Vec<i64> {
+pub fn resolve_endpoints(ix: &SnapshotIndex, input: &str, normalised: Option<&str>) -> Vec<i64> {
+    let graph = ix.graph();
     let mut endpoints: Vec<&rb_model::Node> = graph
         .nodes()
         .iter()
@@ -157,9 +158,9 @@ pub fn resolve_endpoints(graph: &Graph, input: &str, normalised: Option<&str>) -
     if !substring.is_empty() {
         return substring;
     }
-    let v = View::new(graph);
+    let v = View::new(ix);
     let mut found: BTreeSet<(&str, i64)> = BTreeSet::new();
-    for s in resolve_target(graph, input) {
+    for s in resolve_target(ix, input) {
         let handled = v
             .inbound(s, EdgeKind::HandledBy, Certainty::Ambiguous)
             .map(|e| e.src);
@@ -172,8 +173,8 @@ pub fn resolve_endpoints(graph: &Graph, input: &str, normalised: Option<&str>) -
 }
 
 /// The request path through `endpoint` (S16–S18).
-pub fn request_path(graph: &Graph, endpoint: i64, opts: PathOptions) -> RequestPath {
-    let mut w = Walk::new(graph, endpoint, opts);
+pub fn request_path(ix: &SnapshotIndex, endpoint: i64, opts: PathOptions) -> RequestPath {
+    let mut w = Walk::new(ix, endpoint, opts);
     let opts = w.opts;
     let up = w.upstream(endpoint, 0, Certainty::Exact);
     w.seen.clear();
@@ -212,8 +213,8 @@ pub struct Upstream {
 }
 
 /// The upstream walk of [`request_path`] from `endpoint`, without the downstream one.
-pub fn upstream_of(graph: &Graph, endpoint: i64, opts: PathOptions) -> Upstream {
-    let mut w = Walk::new(graph, endpoint, opts);
+pub fn upstream_of(ix: &SnapshotIndex, endpoint: i64, opts: PathOptions) -> Upstream {
+    let mut w = Walk::new(ix, endpoint, opts);
     let up = w.upstream(endpoint, 0, Certainty::Exact);
     Upstream {
         nodes: up.iter().map(|&i| w.tree(i, false).0).collect(),
@@ -297,14 +298,14 @@ pub(crate) fn handler_spans(e: &Edge) -> Option<Vec<Span>> {
 
 impl<'g> Walk<'g> {
     /// A walk from `endpoint`, its options clamped to their caps.
-    fn new(graph: &'g Graph, endpoint: i64, opts: PathOptions) -> Self {
+    fn new(ix: &'g SnapshotIndex, endpoint: i64, opts: PathOptions) -> Self {
         let opts = PathOptions {
             depth: opts.depth.clamp(1, MAX_DEPTH),
             hops: opts.hops.min(MAX_HOPS),
             ..opts
         };
         Walk {
-            v: View::with_precision(graph, opts.precision),
+            v: View::with_precision(ix, opts.precision),
             opts,
             items: Vec::new(),
             truncated: BTreeSet::new(),
@@ -782,6 +783,12 @@ mod tests {
 
     use super::*;
 
+    /// The index of a test graph.
+    fn ix(g: &Graph) -> SnapshotIndex {
+        SnapshotIndex::new(g.clone())
+    }
+    use rb_model::Graph;
+
     /// A graph built by name: files belong to the service named by their first path segment,
     /// symbols are `path#name` declared at a line, endpoints `HTTP <name> @<service>`.
     struct G {
@@ -1025,7 +1032,7 @@ mod tests {
     #[test]
     fn the_login_path_spans_three_services() {
         let (g, login, _) = login_graph();
-        let p = request_path(&g, id(&g, &login), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &login), PathOptions::default());
         assert_eq!(
             lines(&g, &p.upstream),
             [
@@ -1050,7 +1057,7 @@ mod tests {
         assert!(p.truncated.is_empty());
         // `--full` shows the helpers.
         let full = request_path(
-            &g,
+            &ix(&g),
             id(&g, &login),
             PathOptions {
                 full: true,
@@ -1077,7 +1084,7 @@ mod tests {
     #[test]
     fn upstream_continues_through_handlers_and_inline_spans() {
         let (g, _, email) = login_graph();
-        let p = request_path(&g, id(&g, &email), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &email), PathOptions::default());
         assert_eq!(
             lines(&g, &p.upstream),
             [
@@ -1103,7 +1110,7 @@ mod tests {
         assert_eq!(
             lines(
                 &g,
-                &request_path(&g, id(&g, &target), PathOptions::default()).upstream
+                &request_path(&ix(&g), id(&g, &target), PathOptions::default()).upstream
             ),
             [
                 "consumes n/server.ts [heuristic]",
@@ -1124,7 +1131,7 @@ mod tests {
         assert_eq!(
             lines(
                 &g,
-                &request_path(&g, id(&g, &target), PathOptions::default()).upstream
+                &request_path(&ix(&g), id(&g, &target), PathOptions::default()).upstream
             ),
             ["consumes n/server.ts [heuristic]"]
         );
@@ -1139,12 +1146,12 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            names(resolve_endpoints(&g, &login.key, None)),
+            names(resolve_endpoints(&ix(&g), &login.key, None)),
             [login.key.as_str()]
         );
         assert_eq!(
             names(resolve_endpoints(
-                &g,
+                &ix(&g),
                 "post /API/v1//login/",
                 Some("POST /api/v1/login")
             )),
@@ -1152,23 +1159,23 @@ mod tests {
         );
         // A case-insensitive substring of names; several are all listed.
         assert_eq!(
-            names(resolve_endpoints(&g, "LOGIN", None)),
+            names(resolve_endpoints(&ix(&g), "LOGIN", None)),
             [login.key.as_str()]
         );
         assert_eq!(
-            names(resolve_endpoints(&g, "post", None)),
+            names(resolve_endpoints(&ix(&g), "post", None)),
             [login.key.as_str(), email.key.as_str()]
         );
         // Symbol forms: a handler starts at its endpoints, a client at what it consumes.
         assert_eq!(
-            names(resolve_endpoints(&g, "auth/Ctl.java#login", None)),
+            names(resolve_endpoints(&ix(&g), "auth/Ctl.java#login", None)),
             [login.key.as_str()]
         );
         assert_eq!(
-            names(resolve_endpoints(&g, "sendCode", None)),
+            names(resolve_endpoints(&ix(&g), "sendCode", None)),
             [email.key.as_str()]
         );
-        assert!(resolve_endpoints(&g, "nothing", None).is_empty());
+        assert!(resolve_endpoints(&ix(&g), "nothing", None).is_empty());
     }
 
     /// Every walk has a cycle test: a `CALLS` cycle, self-recursion, an upstream cycle and
@@ -1193,7 +1200,7 @@ mod tests {
         b.edge(&hb, Calls, &hb, Exact, ("b/h.ts", 3));
         let g = b.finish();
         let p = request_path(
-            &g,
+            &ix(&g),
             id(&g, &ea),
             PathOptions {
                 depth: MAX_DEPTH,
@@ -1282,7 +1289,7 @@ mod tests {
             ..PathOptions::default()
         };
         assert_eq!(PathOptions::default().precision, Precision::Rta, "D5");
-        let rta = request_path(&g, id(&g, &e), with(Precision::Rta));
+        let rta = request_path(&ix(&g), id(&g, &e), with(Precision::Rta));
         assert_eq!(
             lines(&g, &rta.downstream),
             [
@@ -1293,7 +1300,7 @@ mod tests {
             ]
         );
         assert_eq!((rta.precision, rta.pruned_by_rta), (Precision::Rta, 1));
-        let cha = request_path(&g, id(&g, &e), with(Precision::Cha));
+        let cha = request_path(&ix(&g), id(&g, &e), with(Precision::Cha));
         assert_eq!(
             lines(&g, &cha.downstream),
             [
@@ -1309,7 +1316,7 @@ mod tests {
         assert_eq!((cha.precision, cha.pruned_by_rta), (Precision::Cha, 0));
         // Upstream of `GET /r`: `A.m` consumes it, and `h` calls `I.m`, which `A.m` overrides.
         let up = |p| {
-            let r = request_path(&g, id(&g, &remote), with(p));
+            let r = request_path(&ix(&g), id(&g, &remote), with(p));
             (lines(&g, &r.upstream), r.pruned_by_rta)
         };
         assert_eq!(
@@ -1334,7 +1341,7 @@ mod tests {
         let (g, e) = chain(5000);
         for d in [DEFAULT_DEPTH, MAX_DEPTH] {
             let p = request_path(
-                &g,
+                &ix(&g),
                 id(&g, &e),
                 PathOptions {
                     depth: d,
@@ -1347,14 +1354,14 @@ mod tests {
             assert_eq!(p.truncated, BTreeSet::from([Limit::Depth]));
         }
         // Collapsed, the cut chain reaches no sink: only the handler shows.
-        let p = request_path(&g, id(&g, &e), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &e), PathOptions::default());
         assert_eq!(
             lines(&g, &p.downstream),
             [format!("handler f0 [exact] +{DEFAULT_DEPTH}")]
         );
         // Within the depth the table is reached and nothing is cut.
         let (g, e) = chain(10);
-        let p = request_path(&g, id(&g, &e), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &e), PathOptions::default());
         assert!(p.truncated.is_empty());
         assert_eq!(depth(&p.downstream), 12);
     }
@@ -1388,7 +1395,7 @@ mod tests {
                 .filter(|l| l.trim_start().starts_with("consumes"))
                 .count()
         };
-        let p = request_path(&g, id(&g, &eps[0]), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &eps[0]), PathOptions::default());
         assert_eq!(
             hops_shown(&p),
             DEFAULT_HOPS + 1,
@@ -1396,7 +1403,7 @@ mod tests {
         );
         assert_eq!(p.truncated, BTreeSet::from([Limit::Hops]));
         let p = request_path(
-            &g,
+            &ix(&g),
             id(&g, &eps[0]),
             PathOptions {
                 hops: 99,
@@ -1415,7 +1422,7 @@ mod tests {
             b.edge(&h, Queries, &t, Exact, ("s/h.ts", 1));
         }
         let g = b.finish();
-        let p = request_path(&g, id(&g, &e), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &e), PathOptions::default());
         let shown = 1 + p.downstream[0].children.len();
         assert_eq!(shown, NODE_CAP);
         assert_eq!(p.truncated, BTreeSet::from([Limit::Nodes]));
@@ -1448,9 +1455,10 @@ mod tests {
     fn rb_path_grows_linearly() {
         let work = |g: &Graph, e: &NodeKey| {
             let e = id(g, e);
+            let ix = ix(g);
             crate::work::take();
             request_path(
-                g,
+                &ix,
                 e,
                 PathOptions {
                     depth: MAX_DEPTH,
@@ -1500,7 +1508,7 @@ mod tests {
         b.edge(&server, Queries, &email_log, Exact, ("notify/server.ts", 3));
         b.edge(&server, Queries, &sms_log, Exact, ("notify/server.ts", 8));
         let g = b.finish();
-        let p = request_path(&g, id(&g, &login), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &login), PathOptions::default());
         assert_eq!(
             lines(&g, &p.downstream),
             [
@@ -1549,7 +1557,7 @@ mod tests {
         b.edge(&c1, Consumes, &e1, Heuristic, ("a/c.ts", 2));
         b.edge(&c2, Consumes, &e2, Heuristic, ("a/c.ts", 6));
         let g = b.finish();
-        let p = request_path(&g, id(&g, &target), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &target), PathOptions::default());
         assert_eq!(
             lines(&g, &p.upstream),
             [
@@ -1592,7 +1600,7 @@ mod tests {
         b.edge(&fb, Calls, &setup, Heuristic, ("loop/s.ts", 13));
         b.edge(&setup, Queries, &setup_log, Exact, ("loop/s.ts", 15));
         let g = b.finish();
-        let p = request_path(&g, id(&g, &a), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &a), PathOptions::default());
         assert_eq!(
             lines(&g, &p.downstream),
             [
@@ -1604,7 +1612,7 @@ mod tests {
             ]
         );
         // `/b` itself still walks its handler's span.
-        let p = request_path(&g, id(&g, &bb), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &bb), PathOptions::default());
         let got = lines(&g, &p.downstream);
         assert!(
             got.iter().any(|l| l.contains("queries b_log"))
@@ -1614,7 +1622,7 @@ mod tests {
         // Upstream, the mirror (amendment 13; evaluator pass 3, R5): the site inside `/b`'s
         // inline handler is entered only at `GET /b`; `fa` calling `fb` registers `/b`, it does
         // not run the call, so `fa` and `GET /a` are no entries.
-        let p = request_path(&g, id(&g, &login), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &login), PathOptions::default());
         assert_eq!(
             lines(&g, &p.upstream),
             [
@@ -1640,7 +1648,7 @@ mod tests {
         b.edge(&server, Calls, &helper, Heuristic, ("n/server.ts", 4));
         b.edge(&helper, Consumes, &target, Heuristic, ("n/lib.ts", 2));
         let g = b.finish();
-        let p = request_path(&g, id(&g, &target), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &target), PathOptions::default());
         assert_eq!(
             lines(&g, &p.upstream),
             [
@@ -1682,7 +1690,7 @@ mod tests {
                 .filter(|l| l.trim_start().starts_with("handles"))
                 .count()
         };
-        let p = request_path(&g, id(&g, &eps[0]), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &eps[0]), PathOptions::default());
         assert_eq!(
             entered(&p),
             DEFAULT_HOPS + 1,
@@ -1690,7 +1698,7 @@ mod tests {
         );
         assert_eq!(p.truncated, BTreeSet::from([Limit::Hops]));
         let p = request_path(
-            &g,
+            &ix(&g),
             id(&g, &eps[0]),
             PathOptions {
                 hops: 99,
@@ -1710,7 +1718,7 @@ mod tests {
             prev = caller;
         }
         let g = b.finish();
-        let p = request_path(&g, id(&g, &e), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &e), PathOptions::default());
         assert_eq!(
             depth(&p.upstream),
             DEFAULT_DEPTH + 1,
@@ -1719,7 +1727,7 @@ mod tests {
         assert_eq!(p.truncated, BTreeSet::from([Limit::Depth]));
         let (g, e) = chain(3);
         assert!(
-            request_path(&g, id(&g, &e), PathOptions::default())
+            request_path(&ix(&g), id(&g, &e), PathOptions::default())
                 .truncated
                 .is_empty()
         );
@@ -1755,7 +1763,7 @@ mod tests {
         b.edge(&ctl, Calls, &hash, Heuristic, ("auth/a.ts", 3));
         b.edge(&hash, Queries, &t, Exact, ("shared/u.ts", 2));
         let g = b.finish();
-        let p = request_path(&g, id(&g, &login), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &login), PathOptions::default());
         assert_eq!(
             lines(&g, &p.downstream),
             [
@@ -1779,7 +1787,7 @@ mod tests {
         b.edge(&e, HandledBy, &h2, Ambiguous, ("s/a.ts", 0));
         b.edge(&h2, Queries, &t, Exact, ("s/b.ts", 1));
         let g = b.finish();
-        let p = request_path(&g, id(&g, &e), PathOptions::default());
+        let p = request_path(&ix(&g), id(&g, &e), PathOptions::default());
         assert_eq!(
             lines(&g, &p.downstream),
             [

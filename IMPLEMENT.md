@@ -421,3 +421,4 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Phase 3 (S4, S5): `rb gc` (scoped by `--prefix`, dry run), `rb cache prune --facts|--scip`, `--no-cache` writes the facts it extracts. On the shared database `rb gc` would drop two retired `fp3_*` graphs: not run.
   - [x] Phase 4 (S7, S8): migration 0006 (`rb_reader`), Cypher in a read-only transaction as `rb_reader` with `--timeout-ms` and a 10,000-row cap (`truncated: rows`); e2e start-up clean-up through `rb gc`'s code; 3 green e2e runs under 8 CPU burners.
   - [x] Phase 5 (S6): `ops` on `QUERIES`/`MIGRATES` edges in AGE (amendment 3), vertices without the redundant `id` property, `rb index --profile` per-label load lines, whole-property parity on every fixture.
+  - [x] Phase 6a (S9): `SnapshotIndex` (CSR adjacency, `Send + Sync`) built once per snapshot; every question, Q3's roll-up and the card take it; a depth-1 caller question costs the same operations at n and 4n.

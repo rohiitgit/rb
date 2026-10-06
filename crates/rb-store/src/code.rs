@@ -52,12 +52,105 @@ fn never_instantiated(e: &Edge) -> bool {
         == Some(false)
 }
 
-/// Adjacency of a graph, built once per question (shared with `rb path`).
+/// A snapshot's graph with its node index and its inbound and outbound adjacency, built once and
+/// shared by every question on the snapshot (contract M5 S9; design §8.4's in-memory CSR):
+/// immutable, `Send + Sync`, so a server can hold one per live snapshot. Adjacency lists keep the
+/// graph's edge order (by `(src, kind, dst, provenance)`), as each question's own did before.
+#[derive(Debug, Clone)]
+pub struct SnapshotIndex {
+    graph: Graph,
+    /// Node id → position in `graph.nodes()`.
+    position: HashMap<i64, usize>,
+    /// CSR by node position: the edges into (out of) position `p` are
+    /// `in_edges[in_start[p]..in_start[p + 1]]`, as indices into `graph.edges()`.
+    in_start: Vec<usize>,
+    in_edges: Vec<usize>,
+    out_start: Vec<usize>,
+    out_edges: Vec<usize>,
+}
+
+impl SnapshotIndex {
+    /// Builds the index in one pass over the nodes and two over the edges (counted).
+    pub fn new(graph: Graph) -> Self {
+        crate::work::tick(graph.nodes().len() + graph.edges().len());
+        let position: HashMap<i64, usize> = graph
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id, i))
+            .collect();
+        let csr = |end: fn(&Edge) -> i64| -> (Vec<usize>, Vec<usize>) {
+            let mut start = vec![0usize; graph.nodes().len() + 1];
+            for e in graph.edges() {
+                start[position[&end(e)] + 1] += 1;
+            }
+            for p in 1..start.len() {
+                start[p] += start[p - 1];
+            }
+            let mut cursor = start.clone();
+            let mut edges = vec![0usize; graph.edges().len()];
+            for (i, e) in graph.edges().iter().enumerate() {
+                let slot = &mut cursor[position[&end(e)]];
+                edges[*slot] = i;
+                *slot += 1;
+            }
+            (start, edges)
+        };
+        let (in_start, in_edges) = csr(|e| e.dst);
+        let (out_start, out_edges) = csr(|e| e.src);
+        SnapshotIndex {
+            graph,
+            position,
+            in_start,
+            in_edges,
+            out_start,
+            out_edges,
+        }
+    }
+
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// The node with id `id`, if the snapshot has one.
+    pub fn get_node(&self, id: i64) -> Option<&Node> {
+        self.position.get(&id).map(|&p| &self.graph.nodes()[p])
+    }
+
+    /// The node with id `id`.
+    ///
+    /// # Panics
+    /// When the snapshot has no such node (ids come from its own edges and lookups).
+    pub fn node(&self, id: i64) -> &Node {
+        &self.graph.nodes()[self.position[&id]]
+    }
+
+    fn adjacent<'a>(
+        &'a self,
+        id: i64,
+        start: &'a [usize],
+        edges: &'a [usize],
+    ) -> impl Iterator<Item = &'a Edge> {
+        let range = self
+            .position
+            .get(&id)
+            .map_or(0..0, |&p| start[p]..start[p + 1]);
+        edges[range].iter().map(|&i| &self.graph.edges()[i])
+    }
+
+    fn edges_into(&self, id: i64) -> impl Iterator<Item = &Edge> {
+        self.adjacent(id, &self.in_start, &self.in_edges)
+    }
+
+    fn edges_out_of(&self, id: i64) -> impl Iterator<Item = &Edge> {
+        self.adjacent(id, &self.out_start, &self.out_edges)
+    }
+}
+
+/// One question's view of a [`SnapshotIndex`]: its precision and the dispatch steps it pruned
+/// (shared with `rb path`, Q3's roll-up and the card).
 pub(crate) struct View<'g> {
-    graph: &'g Graph,
-    index: HashMap<i64, usize>,
-    inbound: HashMap<i64, Vec<&'g Edge>>,
-    outbound: HashMap<i64, Vec<&'g Edge>>,
+    ix: &'g SnapshotIndex,
     precision: Precision,
     /// The dispatch steps `(implementing, implemented)` skipped under RTA, each once.
     pruned: RefCell<BTreeSet<(i64, i64)>>,
@@ -65,28 +158,13 @@ pub(crate) struct View<'g> {
 
 impl<'g> View<'g> {
     /// A view that expands dispatch by CHA.
-    pub(crate) fn new(graph: &'g Graph) -> Self {
-        Self::with_precision(graph, Precision::Cha)
+    pub(crate) fn new(ix: &'g SnapshotIndex) -> Self {
+        Self::with_precision(ix, Precision::Cha)
     }
 
-    pub(crate) fn with_precision(graph: &'g Graph, precision: Precision) -> Self {
-        let index = graph
-            .nodes()
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.id, i))
-            .collect();
-        let mut inbound: HashMap<i64, Vec<&Edge>> = HashMap::new();
-        let mut outbound: HashMap<i64, Vec<&Edge>> = HashMap::new();
-        for e in graph.edges() {
-            inbound.entry(e.dst).or_default().push(e);
-            outbound.entry(e.src).or_default().push(e);
-        }
+    pub(crate) fn with_precision(ix: &'g SnapshotIndex, precision: Precision) -> Self {
         View {
-            graph,
-            index,
-            inbound,
-            outbound,
+            ix,
             precision,
             pruned: RefCell::new(BTreeSet::new()),
         }
@@ -113,11 +191,11 @@ impl<'g> View<'g> {
     }
 
     pub(crate) fn graph(&self) -> &'g Graph {
-        self.graph
+        self.ix.graph()
     }
 
     pub(crate) fn node(&self, id: i64) -> &'g Node {
-        &self.graph.nodes()[self.index[&id]]
+        self.ix.node(id)
     }
 
     pub(crate) fn inbound(
@@ -125,22 +203,20 @@ impl<'g> View<'g> {
         id: i64,
         kind: EdgeKind,
         min: Certainty,
-    ) -> impl Iterator<Item = &'g Edge> {
-        self.inbound
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .copied()
+    ) -> impl Iterator<Item = &'g Edge> + use<'g> {
+        self.ix
+            .edges_into(id)
             .inspect(|_| crate::work::tick(1))
             .filter(move |e| e.kind == kind && e.certainty >= min)
     }
 
-    pub(crate) fn outbound(&self, id: i64, kind: EdgeKind) -> impl Iterator<Item = &'g Edge> {
-        self.outbound
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .copied()
+    pub(crate) fn outbound(
+        &self,
+        id: i64,
+        kind: EdgeKind,
+    ) -> impl Iterator<Item = &'g Edge> + use<'g> {
+        self.ix
+            .edges_out_of(id)
             .inspect(|_| crate::work::tick(1))
             .filter(move |e| e.kind == kind)
     }
@@ -281,12 +357,12 @@ pub struct NodeInfo {
     pub service: Option<String>,
 }
 
-/// Describes nodes of one graph (builds the adjacency once).
+/// Describes nodes of one snapshot.
 pub struct Describer<'g>(View<'g>);
 
 impl<'g> Describer<'g> {
-    pub fn new(graph: &'g Graph) -> Self {
-        Describer(View::new(graph))
+    pub fn new(ix: &'g SnapshotIndex) -> Self {
+        Describer(View::new(ix))
     }
 
     pub fn describe(&self, id: i64) -> NodeInfo {
@@ -327,8 +403,9 @@ pub fn symbol_display(key: &str) -> &str {
 /// plain name. Several means the caller must choose (§9.1).
 /// `path:line` picks the symbol declared at or nearest above that line in that file: symbols
 /// record where their name is, not their full extent.
-pub fn resolve_target(graph: &Graph, input: &str) -> Vec<i64> {
-    let v = View::new(graph);
+pub fn resolve_target(ix: &SnapshotIndex, input: &str) -> Vec<i64> {
+    let v = View::new(ix);
+    let graph = ix.graph();
     let wanted = |n: &&Node| matches!(n.kind, NodeKind::Symbol | NodeKind::Table);
     let sorted = |mut ids: Vec<&Node>| -> Vec<i64> {
         ids.sort_by(|a, b| a.key.cmp(&b.key));
@@ -429,8 +506,8 @@ pub struct CallerOptions {
 
 /// Callers of `target` up to `depth` levels (§9.2): breadth-first, so each caller appears once,
 /// at its shortest distance, under the first node (in output order) that reached it.
-pub fn callers(graph: &Graph, target: i64, opts: CallerOptions) -> CallerTree {
-    let v = View::with_precision(graph, opts.precision);
+pub fn callers(ix: &SnapshotIndex, target: i64, opts: CallerOptions) -> CallerTree {
+    let v = View::with_precision(ix, opts.precision);
     let depth = opts.depth.clamp(1, MAX_CALLER_DEPTH);
     let mut seen = HashSet::from([target]);
     // node → its callers (without their own callers yet), in discovery order.
@@ -546,12 +623,12 @@ pub struct Impacted {
 
 /// What removing `target` breaks (§9.3), dispatch included at `precision`.
 pub fn impact(
-    graph: &Graph,
+    ix: &SnapshotIndex,
     target: i64,
     min_certainty: Certainty,
     precision: Precision,
 ) -> Impact {
-    let v = View::with_precision(graph, precision);
+    let v = View::with_precision(ix, precision);
     // The target plus everything it contains.
     let mut removed = vec![target];
     let mut in_removed = HashSet::from([target]);
@@ -863,14 +940,11 @@ fn endpoint_rollup(
             if d > 0
                 && let Some(spans) = crate::path::handler_spans(e)
             {
-                let inside = v
-                    .outbound
-                    .get(&n)
-                    .into_iter()
-                    .flatten()
-                    .filter(|x| REQUIRING.contains(&x.kind) && impacted.contains_key(&x.dst))
-                    .flat_map(|x| &x.evidence)
-                    .any(|ev| spans.iter().any(|s| crate::path::within(ev.span, *s)));
+                let inside =
+                    v.ix.edges_out_of(n)
+                        .filter(|x| REQUIRING.contains(&x.kind) && impacted.contains_key(&x.dst))
+                        .flat_map(|x| &x.evidence)
+                        .any(|ev| spans.iter().any(|s| crate::path::within(ev.span, *s)));
                 if !inside {
                     continue;
                 }
@@ -1076,6 +1150,11 @@ mod tests {
         b.finish().unwrap()
     }
 
+    /// The index of a test graph.
+    fn ix(g: &Graph) -> SnapshotIndex {
+        SnapshotIndex::new(g.clone())
+    }
+
     fn id(g: &Graph, desc: &str) -> i64 {
         g.nodes()
             .iter()
@@ -1096,7 +1175,8 @@ mod tests {
     #[test]
     fn scip_java_keys_display_as_their_descriptor() {
         let g = fixture();
-        let d = Describer::new(&g);
+        let gi = ix(&g);
+        let d = Describer::new(&gi);
         let info = d.describe(id(&g, "acme/auth/AuthService#authenticate()."));
         assert_eq!(info.display, "com/acme/auth/AuthService#authenticate().");
         assert_eq!(
@@ -1139,7 +1219,7 @@ mod tests {
     fn target_resolution_tiers() {
         let g = fixture();
         let one = |input: &str| -> Vec<String> {
-            resolve_target(&g, input)
+            resolve_target(&ix(&g), input)
                 .into_iter()
                 .map(|i| desc(&g, i))
                 .collect()
@@ -1175,7 +1255,7 @@ mod tests {
         let g = fixture();
         let t = id(&g, "SvcImpl#run().");
         assert_eq!(
-            flat(&g, &callers(&g, t, opts(1))),
+            flat(&g, &callers(&ix(&g), t, opts(1))),
             [
                 // Direct, ambiguous.
                 "1 Job#tick(). [ambiguous]",
@@ -1185,7 +1265,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            flat(&g, &callers(&g, t, opts(2))),
+            flat(&g, &callers(&ix(&g), t, opts(2))),
             [
                 "1 Job#tick(). [ambiguous]",
                 "1 Ctl#handle(). [heuristic] (dispatch)",
@@ -1197,7 +1277,7 @@ mod tests {
             ..opts(2)
         };
         assert_eq!(
-            flat(&g, &callers(&g, t, strict)),
+            flat(&g, &callers(&ix(&g), t, strict)),
             [
                 "1 Ctl#handle(). [heuristic] (dispatch)",
                 "2 page(). [heuristic]"
@@ -1209,13 +1289,13 @@ mod tests {
     fn references_only_on_request() {
         let g = fixture();
         let t = id(&g, "Util#fmt().");
-        assert!(callers(&g, t, opts(1)).callers.is_empty());
+        assert!(callers(&ix(&g), t, opts(1)).callers.is_empty());
         let with_refs = CallerOptions {
             include_references: true,
             ..opts(1)
         };
         assert_eq!(
-            flat(&g, &callers(&g, t, with_refs)),
+            flat(&g, &callers(&ix(&g), t, with_refs)),
             ["1 Ctl#other(). [heuristic] (ref)"]
         );
     }
@@ -1224,7 +1304,7 @@ mod tests {
     fn impact_tiers_rollups_and_class_members() {
         let g = fixture();
         let t = id(&g, "Svc#run().");
-        let i = impact(&g, t, Certainty::Ambiguous, Precision::Cha);
+        let i = impact(&ix(&g), t, Certainty::Ambiguous, Precision::Cha);
         let names = |xs: &[Impacted]| -> Vec<String> {
             xs.iter()
                 .map(|x| {
@@ -1261,7 +1341,12 @@ mod tests {
         assert!(!i.truncated);
 
         // Removing the class removes its members too.
-        let ctl = impact(&g, id(&g, "Ctl#"), Certainty::Ambiguous, Precision::Cha);
+        let ctl = impact(
+            &ix(&g),
+            id(&g, "Ctl#"),
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
         let removed: Vec<String> = ctl.removed.iter().map(|&n| desc(&g, n)).collect();
         assert_eq!(removed, ["Ctl#", "Ctl#handle()."]);
         assert_eq!(names(&ctl.breaks), ["1 page(). [heuristic]"]);
@@ -1271,7 +1356,7 @@ mod tests {
     fn impact_on_an_implementation_includes_its_dispatch_callers() {
         let g = fixture();
         let i = impact(
-            &g,
+            &ix(&g),
             id(&g, "SvcImpl#run()."),
             Certainty::Ambiguous,
             Precision::Cha,
@@ -1324,7 +1409,7 @@ mod tests {
             .unwrap();
         }
         let g = b.finish().unwrap();
-        let tree = callers(&g, id(&g, "fact()."), opts(3));
+        let tree = callers(&ix(&g), id(&g, "fact()."), opts(3));
         assert_eq!(
             flat(&g, &tree),
             ["1 fact(). [heuristic]", "1 main(). [heuristic]"]
@@ -1365,9 +1450,9 @@ mod tests {
         }
         let g = b.finish().unwrap();
         let a = id(&g, "a().");
-        let tree = callers(&g, a, opts(MAX_CALLER_DEPTH));
+        let tree = callers(&ix(&g), a, opts(MAX_CALLER_DEPTH));
         assert!(flat(&g, &tree).len() <= 3, "{:?}", flat(&g, &tree));
-        let i = impact(&g, a, Certainty::Ambiguous, Precision::Cha);
+        let i = impact(&ix(&g), a, Certainty::Ambiguous, Precision::Cha);
         assert!(i.breaks.len() + i.affects.len() <= 2);
     }
 
@@ -1429,27 +1514,32 @@ mod tests {
             ..opts(2)
         };
         let a = id(&g, "A#m().");
-        let rta = callers(&g, a, with(Precision::Rta));
+        let rta = callers(&ix(&g), a, with(Precision::Rta));
         assert!(flat(&g, &rta).is_empty(), "{:?}", flat(&g, &rta));
         assert_eq!((rta.precision, rta.pruned_by_rta), (Precision::Rta, 1));
-        let cha = callers(&g, a, with(Precision::Cha));
+        let cha = callers(&ix(&g), a, with(Precision::Cha));
         assert_eq!(flat(&g, &cha), ["1 c(). [heuristic] (dispatch)"]);
         assert_eq!((cha.precision, cha.pruned_by_rta), (Precision::Cha, 0));
         // The kept step is taken under `rta` too, and nothing is pruned.
-        let kept = callers(&g, id(&g, "B#m()."), with(Precision::Rta));
+        let kept = callers(&ix(&g), id(&g, "B#m()."), with(Precision::Rta));
         assert_eq!(flat(&g, &kept), ["1 c(). [heuristic] (dispatch)"]);
         assert_eq!(kept.pruned_by_rta, 0);
 
         // `rb impact` on `A#m()`: its dispatch caller is affected under `cha` only.
         let affected = |p| -> (Vec<String>, usize) {
-            let i = impact(&g, a, Certainty::Ambiguous, p);
+            let i = impact(&ix(&g), a, Certainty::Ambiguous, p);
             let names = i.affects.iter().map(|x| desc(&g, x.node)).collect();
             (names, i.pruned_by_rta)
         };
         assert_eq!(affected(Precision::Cha), (vec!["c().".to_owned()], 0));
         assert_eq!(affected(Precision::Rta), (Vec::new(), 1));
         // Requiring edges are not dispatch: `A#m()` still breaks when `I#m()` is removed.
-        let i = impact(&g, id(&g, "I#m()."), Certainty::Ambiguous, Precision::Rta);
+        let i = impact(
+            &ix(&g),
+            id(&g, "I#m()."),
+            Certainty::Ambiguous,
+            Precision::Rta,
+        );
         let breaks: Vec<String> = i.breaks.iter().map(|x| desc(&g, x.node)).collect();
         assert_eq!(breaks, ["A#m().", "B#m().", "c()."]);
         // The walk from the breaking `A#m()` skips its dispatch step and counts it, although
@@ -1544,7 +1634,7 @@ mod tests {
         let g = b.finish().unwrap();
         let rollup = |name: &str| -> Vec<String> {
             impact(
-                &g,
+                &ix(&g),
                 id(&g, &format!("{name}().")),
                 Certainty::Ambiguous,
                 Precision::Cha,
@@ -1725,7 +1815,12 @@ mod tests {
         let l = b.sym("lib/l.java", "l");
         b.edge(&t, EdgeKind::Calls, &l);
         let g = b.b.finish().unwrap();
-        let i = impact(&g, sym_id(&g, &t), Certainty::Ambiguous, Precision::Cha);
+        let i = impact(
+            &ix(&g),
+            sym_id(&g, &t),
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
         assert_eq!(
             orphan_lines(&g, &i),
             [
@@ -1742,7 +1837,12 @@ mod tests {
         let cm = b.sym("app/a.java", "C.m");
         b.edge(&cm, EdgeKind::Implements, &rm);
         let g = b.b.finish().unwrap();
-        let i = impact(&g, sym_id(&g, &rm), Certainty::Ambiguous, Precision::Cha);
+        let i = impact(
+            &ix(&g),
+            sym_id(&g, &rm),
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
         assert_eq!(orphan_lines(&g, &i), ["1 C.m (via R.m dispatch)"]);
 
         // A target in a library service: not computed.
@@ -1751,7 +1851,12 @@ mod tests {
         let lh = b.sym("lib/l.java", "h");
         b.edge(&lt, EdgeKind::Calls, &lh);
         let g = b.b.finish().unwrap();
-        let i = impact(&g, sym_id(&g, &lt), Certainty::Ambiguous, Precision::Cha);
+        let i = impact(
+            &ix(&g),
+            sym_id(&g, &lt),
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
         assert_eq!(orphan_lines(&g, &i), ["not computed: library service"]);
     }
 
@@ -1779,10 +1884,20 @@ mod tests {
         )
         .unwrap();
         let g = b.b.finish().unwrap();
-        let cha = impact(&g, sym_id(&g, &t), Certainty::Ambiguous, Precision::Cha);
+        let cha = impact(
+            &ix(&g),
+            sym_id(&g, &t),
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
         assert!(orphan_lines(&g, &cha).is_empty());
         // Under `rta` `K.m` is not reached by dispatch at all: no candidate, no orphan.
-        let rta = impact(&g, sym_id(&g, &t), Certainty::Ambiguous, Precision::Rta);
+        let rta = impact(
+            &ix(&g),
+            sym_id(&g, &t),
+            Certainty::Ambiguous,
+            Precision::Rta,
+        );
         assert!(orphan_lines(&g, &rta).is_empty());
         assert_eq!(rta.pruned_by_rta, 1);
     }
@@ -1805,7 +1920,12 @@ mod tests {
         b.b.add_node(ep.clone(), "GET /t", Attrs::new()).unwrap();
         b.edge(&ep, EdgeKind::HandledBy, &t);
         let g = b.b.finish().unwrap();
-        let i = impact(&g, sym_id(&g, &t), Certainty::Ambiguous, Precision::Cha);
+        let i = impact(
+            &ix(&g),
+            sym_id(&g, &t),
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
         let keys = |xs: &[Impacted]| -> Vec<String> {
             xs.iter()
                 .map(|x| {
@@ -1903,7 +2023,7 @@ mod tests {
             };
             walk(
                 &g,
-                &callers(&g, sym_id(&g, target), opts).callers,
+                &callers(&ix(&g), sym_id(&g, target), opts).callers,
                 1,
                 &mut out,
             );
@@ -1946,12 +2066,58 @@ mod tests {
     #[test]
     fn a_5000_deep_dead_chain_is_orphaned() {
         let (g, t) = chain_and_fan(5000, 0);
-        let i = impact(&g, t, Certainty::Ambiguous, Precision::Cha);
+        let i = impact(&ix(&g), t, Certainty::Ambiguous, Precision::Cha);
         let Orphans::Computed(list) = &i.orphans else {
             panic!("{:?}", i.orphans)
         };
         assert_eq!(list.len(), 5000);
         assert_eq!(list.last().unwrap().distance, 5000);
+    }
+
+    /// Contract M5 S9: one index serves every request of a server, across threads.
+    #[test]
+    fn the_index_is_send_and_sync() {
+        fn shared<T: Send + Sync>() {}
+        shared::<SnapshotIndex>();
+    }
+
+    /// Contract M5 S9: the index's adjacency lists keep the graph's edge order, as each
+    /// question's own adjacency did, so every answer and golden is unchanged.
+    #[test]
+    fn adjacency_keeps_the_edge_order() {
+        let g = fixture();
+        let ix = ix(&g);
+        for n in g.nodes() {
+            let into: Vec<&Edge> = g.edges().iter().filter(|e| e.dst == n.id).collect();
+            let out: Vec<&Edge> = g.edges().iter().filter(|e| e.src == n.id).collect();
+            assert_eq!(ix.edges_into(n.id).collect::<Vec<_>>(), into);
+            assert_eq!(ix.edges_out_of(n.id).collect::<Vec<_>>(), out);
+        }
+        assert_eq!(ix.edges_into(-1).count(), 0, "an unknown id has no edges");
+    }
+
+    /// Contract M5 S9, invariant 10: a depth-1 caller question costs the same counted
+    /// operations whether the graph has n or 4n other nodes (its neighbourhood is fixed); the
+    /// adjacency it reads is built once per snapshot, counted apart, and grows at most 5× for 4×.
+    #[test]
+    fn a_depth_one_question_does_not_grow_with_the_graph() {
+        let cost = |len: usize| {
+            let (g, _) = chain_and_fan(len, 0);
+            let n0 = g.nodes().iter().find(|n| n.name == "n0").unwrap().id;
+            crate::work::take();
+            let ix = SnapshotIndex::new(g);
+            let build = crate::work::take();
+            let tree = callers(&ix, n0, opts(1));
+            let question = crate::work::take();
+            assert_eq!(tree.callers.len(), 1);
+            (build, question)
+        };
+        let ((build_small, small), (build_large, large)) = (cost(1000), cost(4000));
+        assert_eq!(small, large, "depth-1 callers: {small} -> {large}");
+        assert!(
+            build_large <= build_small * 5,
+            "index build: {build_small} -> {build_large}"
+        );
     }
 
     /// Invariant 9: orphans grow linearly in chains and fans (counted, 4× → ≤ 5×).
@@ -1960,7 +2126,7 @@ mod tests {
         let count = |len, fan| {
             let (g, t) = chain_and_fan(len, fan);
             crate::work::take();
-            let i = impact(&g, t, Certainty::Ambiguous, Precision::Cha);
+            let i = impact(&ix(&g), t, Certainty::Ambiguous, Precision::Cha);
             assert!(matches!(i.orphans, Orphans::Computed(ref l) if l.len() == len + fan));
             crate::work::take()
         };

@@ -10,11 +10,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use rb_model::{Certainty, EdgeKind, Evidence, Graph, NodeKind};
+use rb_model::{Certainty, EdgeKind, Evidence, NodeKind};
 use serde::Serialize;
 
 use crate::code::{
-    IMPACT_NODE_CAP, MAX_CALLER_DEPTH, Precision, View, endpoint_display, entry_kinds,
+    IMPACT_NODE_CAP, MAX_CALLER_DEPTH, Precision, SnapshotIndex, View, endpoint_display,
+    entry_kinds,
 };
 use crate::path::{self, Limit, PathNode, PathOptions, Via};
 
@@ -118,8 +119,8 @@ struct Step<'g> {
 }
 
 /// Q3's roll-up for `table` (S14).
-pub fn table_rollup(graph: &Graph, table: i64, opts: RollupOptions) -> TableRollup {
-    let v = View::with_precision(graph, opts.precision);
+pub fn table_rollup(ix: &SnapshotIndex, table: i64, opts: RollupOptions) -> TableRollup {
+    let v = View::with_precision(ix, opts.precision);
     let any = Certainty::Ambiguous;
     let mut truncated: BTreeSet<Limit> = BTreeSet::new();
 
@@ -309,7 +310,7 @@ pub fn table_rollup(graph: &Graph, table: i64, opts: RollupOptions) -> TableRoll
             precision: opts.precision,
         };
         for (&e, &c) in &through_endpoints {
-            let up = path::upstream_of(graph, e, path_opts);
+            let up = path::upstream_of(ix, e, path_opts);
             truncated.extend(up.truncated.iter().copied());
             pruned += up.pruned_by_rta;
             let start = vec![chain_step(&v, e)];
@@ -427,6 +428,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The index of a test graph.
+    fn ix(g: &Graph) -> SnapshotIndex {
+        SnapshotIndex::new(g.clone())
+    }
+    use rb_model::Graph;
 
     /// Files belong to the service named by their first path segment; symbols are
     /// `<path>#<name>`; endpoints `HTTP <name> @<service>`.
@@ -567,7 +574,7 @@ mod tests {
             .unwrap()
             .id;
         table_rollup(
-            g,
+            &ix(g),
             t,
             RollupOptions {
                 precision: Precision::Cha,

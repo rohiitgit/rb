@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M5 phase 6a: prebuilt snapshot index (S9)
+- **`SnapshotIndex`** (`rb_store::code`): built once per snapshot from its `Graph` (owned): node id → position, and inbound and outbound adjacency as CSR arrays of edge indices, each list in the graph's edge order (as every question's own `HashMap` adjacency was); immutable and `Send + Sync`; its build counts `nodes + edges` operations. `View` is now the per-question state over it: the index, the precision and the pruned dispatch steps.
+- **Signatures:** `resolve_target`, `Describer::new`, `callers`, `impact`, `path::resolve_endpoints`, `request_path`, `upstream_of`, `rollup::table_rollup` and `card::card_sections` take `&SnapshotIndex`; `Store::table_deps(snapshot, ix, key, opts)` and `Store::service_card(snapshot, ix, key)` no longer load the graph themselves. The CLI loads the graph in its read transaction and builds one index per invocation; its renderers take the index.
+- **Tests:** `a_depth_one_question_does_not_grow_with_the_graph` (counted: failed first at 3,009 → 12,009 operations for chains of 1,000 and 4,000, now equal; the build ≤ 5× for 4×), `adjacency_keeps_the_edge_order`, `the_index_is_send_and_sync`; existing tests now build an index per graph (`ix(&g)`).
+- **Mutations** (`var/m5/mut/p6a.json`): a question rebuilding the index and reversed adjacency order: both killed by units; the reversed order does not change any golden (outputs are sorted), recorded so the order unit is known to be that guard.
+- **Invariant 1:** fixture dumps byte-identical to `afae548`; every golden passes unchanged (no re-bless).
+- **Verification:** fmt, clippy clean; 576 unit tests outside e2e (10 database tests vacuous without the URL), `rb-store` with the database 54/54; e2e 21/21 (`--nocapture`, no `skipping`); stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-store/src/{code,path,rollup,card,query}.rs`, `crates/rb-cli/src/{main,code,path}.rs`, `tasks/todo.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M5 phase 5: AGE projection parity and `ops` (S6)
 - **Projection:** edges whose relational attributes hold `ops` (`QUERIES`, `MIGRATES`) carry it as `ops` (the same array; contract amendment 3: there is no `op` attribute), loaded from separate `<LABEL>.ops.csv` files so no other edge gets the property. Vertices load with `nid` as the loader's id column: before, every vertex also carried a redundant `id` property; AGE's own `__id__` (= `nid`) remains. `age::project` returns a `ProjectionProfile` (per file: label, rows, CSV bytes, load time), exposed as `Published.projection`.
 - **`rb index --profile`:** prints `profile: age <label> (<file>): n rows, b bytes, t ms` per loaded file and the totals (wall times printed only, never stored).

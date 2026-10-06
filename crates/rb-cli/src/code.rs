@@ -6,7 +6,9 @@ use std::fmt::Write as _;
 
 use anyhow::bail;
 use rb_model::{Certainty, Graph};
-use rb_store::code::{Caller, CallerTree, Describer, Impact, Impacted, Orphans, Precision};
+use rb_store::code::{
+    Caller, CallerTree, Describer, Impact, Impacted, Orphans, Precision, SnapshotIndex,
+};
 use serde_json::{Value, json};
 
 pub(crate) fn parse_certainty(s: &str) -> Result<Certainty, String> {
@@ -52,9 +54,13 @@ pub(crate) fn precision_lines(precision: Precision, pruned: usize) -> String {
 
 /// The node `input` names. Several candidates are listed, never picked silently, unless `pick`
 /// (1-based, in the listed order) chooses one.
-pub(crate) fn pick_target(graph: &Graph, input: &str, pick: Option<usize>) -> anyhow::Result<i64> {
-    let candidates = rb_store::code::resolve_target(graph, input);
-    let d = Describer::new(graph);
+pub(crate) fn pick_target(
+    ix: &SnapshotIndex,
+    input: &str,
+    pick: Option<usize>,
+) -> anyhow::Result<i64> {
+    let candidates = rb_store::code::resolve_target(ix, input);
+    let d = Describer::new(ix);
     match (candidates.as_slice(), pick) {
         ([], _) => bail!("nothing matches {input:?} (try `rb find {input}`)"),
         ([only], _) => Ok(*only),
@@ -144,8 +150,8 @@ fn histogram<'c>(certainties: impl Iterator<Item = &'c Certainty>) -> String {
     )
 }
 
-pub(crate) fn render_callers(graph: &Graph, tree: &CallerTree) -> String {
-    let d = Describer::new(graph);
+pub(crate) fn render_callers(ix: &SnapshotIndex, tree: &CallerTree) -> String {
+    let d = Describer::new(ix);
     let mut out = format!("callers of {}\n", line(&d, tree.target));
     out.push_str(&precision_lines(tree.precision, tree.pruned_by_rta));
     fn walk(
@@ -199,8 +205,9 @@ fn node_json(graph: &Graph, d: &Describer<'_>, id: i64) -> Value {
 }
 
 /// `rb impact --json` (contract M4b S13): every section of the text answer, with keys.
-pub(crate) fn impact_json(graph: &Graph, impact: &Impact) -> Value {
-    let d = Describer::new(graph);
+pub(crate) fn impact_json(ix: &SnapshotIndex, impact: &Impact) -> Value {
+    let graph = ix.graph();
+    let d = Describer::new(ix);
     let impacted = |xs: &[Impacted]| -> Vec<Value> {
         xs.iter()
             .map(|x| {
@@ -272,8 +279,9 @@ pub(crate) fn impact_json(graph: &Graph, impact: &Impact) -> Value {
     })
 }
 
-pub(crate) fn render_impact(graph: &Graph, impact: &Impact) -> String {
-    let d = Describer::new(graph);
+pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
+    let graph = ix.graph();
+    let d = Describer::new(ix);
     let target = impact.removed.first().copied();
     let mut out = String::new();
     if let Some(t) = target {
@@ -496,8 +504,13 @@ mod tests {
         .unwrap();
         let graph = b.finish().unwrap();
         let t = graph.nodes().iter().find(|n| n.name == "T").unwrap().id;
-        let impact = rb_store::code::impact(&graph, t, Certainty::Ambiguous, Precision::Cha);
-        let text = render_impact(&graph, &impact);
+        let impact = rb_store::code::impact(
+            &rb_store::code::SnapshotIndex::new(graph.clone()),
+            t,
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
+        let text = render_impact(&rb_store::code::SnapshotIndex::new(graph.clone()), &impact);
         for want in [
             "breaks: requiring edges into it (1):\n  1  app/test/ATest.java/t",
             "endpoints: handled by the removed or impacted code (1):\n  1  GET /  [app]  (prefix unknown, router a.go#r)  exact  (handler removed)\n",
@@ -513,7 +526,7 @@ mod tests {
         // `rb callers` marks the endpoint handler and the test method (S11).
         let h = graph.nodes().iter().find(|n| n.name == "h").unwrap().id;
         let tree = rb_store::code::callers(
-            &graph,
+            &rb_store::code::SnapshotIndex::new(graph.clone()),
             h,
             rb_store::code::CallerOptions {
                 depth: 2,
@@ -522,14 +535,14 @@ mod tests {
                 precision: Precision::Rta,
             },
         );
-        let callers = render_callers(&graph, &tree);
+        let callers = render_callers(&rb_store::code::SnapshotIndex::new(graph.clone()), &tree);
         assert!(
             callers.contains(
                 "  app/A.java/T  app/A.java:2  [app]  heuristic  (entry: endpoint GET /  (prefix unknown, router a.go#r))\n    app/test/ATest.java/t  app/test/ATest.java:2  [app]  heuristic  (entry: test)\n"
             ),
             "{callers}"
         );
-        let json = impact_json(&graph, &impact);
+        let json = impact_json(&rb_store::code::SnapshotIndex::new(graph.clone()), &impact);
         assert_eq!(json["endpoints"][0]["handler_removed"], true);
         assert_eq!(json["endpoints"][0]["router"], "a.go#r");
         assert_eq!(json["orphans"]["nodes"][0]["via"]["how"], "calls");

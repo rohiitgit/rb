@@ -13,6 +13,7 @@ mod code;
 mod path;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rb_model::{NodeKind, ServiceRole, canonical_dump};
+use rb_store::code::SnapshotIndex;
 use rb_store::{LoadDir, Resolved, ServiceCard, SnapshotInfo, Store, TableAccess, TableDeps};
 use serde_json::{Value, json};
 
@@ -399,7 +400,8 @@ fn main() -> anyhow::Result<()> {
                             );
                         }
                     };
-                    let card = store.service_card(snap.id, &found.key)?;
+                    let ix = SnapshotIndex::new(store.load_graph(snap.id)?);
+                    let card = store.service_card(snap.id, &ix, &found.key)?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&card)?);
                     } else {
@@ -436,8 +438,10 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                 };
+                let ix = SnapshotIndex::new(store.load_graph(snap.id)?);
                 let deps = store.table_deps(
                     snap.id,
+                    &ix,
                     &found.key,
                     rb_store::rollup::RollupOptions { precision, hops },
                 )?;
@@ -463,10 +467,12 @@ fn main() -> anyhow::Result<()> {
                 "--depth must be between 1 and {}",
                 rb_store::code::MAX_CALLER_DEPTH
             );
-            let graph = on_live(&mut store, repo, |store, snap| store.load_graph(snap.id))?;
-            let t = code::pick_target(&graph, &target, pick)?;
+            let ix = SnapshotIndex::new(on_live(&mut store, repo, |store, snap| {
+                store.load_graph(snap.id)
+            })?);
+            let t = code::pick_target(&ix, &target, pick)?;
             let tree = rb_store::code::callers(
-                &graph,
+                &ix,
                 t,
                 rb_store::code::CallerOptions {
                     depth,
@@ -475,7 +481,7 @@ fn main() -> anyhow::Result<()> {
                     precision,
                 },
             );
-            print!("{}", code::render_callers(&graph, &tree));
+            print!("{}", code::render_callers(&ix, &tree));
         }
         Command::Impact {
             target,
@@ -485,16 +491,18 @@ fn main() -> anyhow::Result<()> {
             precision,
             json,
         } => {
-            let graph = on_live(&mut store, repo, |store, snap| store.load_graph(snap.id))?;
-            let t = code::pick_target(&graph, &target, pick)?;
-            let impact = rb_store::code::impact(&graph, t, min_certainty, precision);
+            let ix = SnapshotIndex::new(on_live(&mut store, repo, |store, snap| {
+                store.load_graph(snap.id)
+            })?);
+            let t = code::pick_target(&ix, &target, pick)?;
+            let impact = rb_store::code::impact(&ix, t, min_certainty, precision);
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&code::impact_json(&graph, &impact))?
+                    serde_json::to_string_pretty(&code::impact_json(&ix, &impact))?
                 );
             } else {
-                print!("{}", code::render_impact(&graph, &impact));
+                print!("{}", code::render_impact(&ix, &impact));
             }
         }
         Command::Path {
@@ -517,10 +525,12 @@ fn main() -> anyhow::Result<()> {
                 "--hops must be between 0 and {}",
                 rb_store::path::MAX_HOPS
             );
-            let graph = on_live(&mut store, repo, |store, snap| store.load_graph(snap.id))?;
-            let endpoint = path::pick_endpoint(&graph, &query, pick)?;
+            let ix = SnapshotIndex::new(on_live(&mut store, repo, |store, snap| {
+                store.load_graph(snap.id)
+            })?);
+            let endpoint = path::pick_endpoint(&ix, &query, pick)?;
             let request = rb_store::path::request_path(
-                &graph,
+                &ix,
                 endpoint,
                 rb_store::path::PathOptions {
                     depth,
@@ -530,10 +540,10 @@ fn main() -> anyhow::Result<()> {
                 },
             );
             match format {
-                Format::Text => print!("{}", path::render_text(&graph, &request)),
+                Format::Text => print!("{}", path::render_text(&ix, &request)),
                 Format::Json => println!(
                     "{}",
-                    serde_json::to_string_pretty(&path::render_json(&graph, &request))?
+                    serde_json::to_string_pretty(&path::render_json(&ix, &request))?
                 ),
             }
         }

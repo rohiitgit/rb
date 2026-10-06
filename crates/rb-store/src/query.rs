@@ -290,9 +290,12 @@ impl Store {
         })
     }
 
+    /// Q3 for the table `key` of the snapshot `ix` indexes (contract M5 S9: the index is the
+    /// caller's, built once per snapshot).
     pub fn table_deps(
         &mut self,
         snapshot_id: i64,
+        ix: &crate::code::SnapshotIndex,
         key: &str,
         opts: crate::rollup::RollupOptions,
     ) -> anyhow::Result<TableDeps> {
@@ -366,15 +369,15 @@ impl Store {
         migrations.sort_by(order);
         mappings.sort_by(order);
         accesses.sort_by(order);
-        let graph = self.load_graph(snapshot_id)?;
-        let Some(node) = graph
+        let Some(node) = ix
+            .graph()
             .nodes()
             .iter()
             .find(|n| n.kind == NodeKind::Table && n.key == key)
         else {
             bail!("no table with key {key:?} in the graph of snapshot {snapshot_id}");
         };
-        let rollup = crate::rollup::table_rollup(&graph, node.id, opts);
+        let rollup = crate::rollup::table_rollup(ix, node.id, opts);
         Ok(TableDeps {
             key: key.to_owned(),
             name: table.get(1),
@@ -565,7 +568,13 @@ impl Store {
             .collect()
     }
 
-    pub fn service_card(&mut self, snapshot_id: i64, key: &str) -> anyhow::Result<ServiceCard> {
+    /// The card of service `key` of the snapshot `ix` indexes (contract M5 S9).
+    pub fn service_card(
+        &mut self,
+        snapshot_id: i64,
+        ix: &crate::code::SnapshotIndex,
+        key: &str,
+    ) -> anyhow::Result<ServiceCard> {
         let Some(row) = self.client.query_opt(
             "SELECT id, name, attrs FROM rb.node WHERE snapshot_id = $1 AND kind = 'service' AND key = $2",
             &[&snapshot_id, &key],
@@ -677,7 +686,7 @@ impl Store {
             consumes,
             consumed_by,
             unstitched,
-            derived: crate::card::card_sections(&self.load_graph(snapshot_id)?, key),
+            derived: crate::card::card_sections(ix, key),
         })
     }
 

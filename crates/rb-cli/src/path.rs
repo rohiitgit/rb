@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use anyhow::bail;
 use rb_frameworks::endpoint::{endpoint_name, norm_method, norm_path};
 use rb_model::{Attrs, EdgeKind, Graph, Node, NodeKind};
-use rb_store::code::Describer;
+use rb_store::code::{Describer, SnapshotIndex};
 use rb_store::path::{PathNode, RequestPath, Via};
 use serde_json::{Value, json};
 
@@ -29,7 +29,8 @@ struct Ctx<'g> {
 }
 
 impl<'g> Ctx<'g> {
-    fn new(graph: &'g Graph) -> Self {
+    fn new(ix: &'g SnapshotIndex) -> Self {
+        let graph = ix.graph();
         Ctx {
             graph,
             by_id: graph.nodes().iter().map(|n| (n.id, n)).collect(),
@@ -39,7 +40,7 @@ impl<'g> Ctx<'g> {
                 .filter(|e| e.kind == EdgeKind::Consumes)
                 .map(|e| ((e.src, e.dst), &e.attrs))
                 .collect(),
-            describer: Describer::new(graph),
+            describer: Describer::new(ix),
         }
     }
 
@@ -150,12 +151,12 @@ struct Shown {
 /// amendment 10), never picked silently, unless `pick` (1-based, in the listed order) chooses
 /// one (S15).
 pub(crate) fn pick_endpoint(
-    graph: &Graph,
+    ix: &SnapshotIndex,
     input: &str,
     pick: Option<usize>,
 ) -> anyhow::Result<i64> {
-    let candidates = rb_store::path::resolve_endpoints(graph, input, normalised(input).as_deref());
-    let ctx = Ctx::new(graph);
+    let candidates = rb_store::path::resolve_endpoints(ix, input, normalised(input).as_deref());
+    let ctx = Ctx::new(ix);
     match (candidates.as_slice(), pick) {
         ([], _) => bail!("no endpoint matches {input:?} (try `rb find {input} --kind endpoint`)"),
         ([only], _) => Ok(*only),
@@ -274,8 +275,8 @@ fn render_nodes(
     }
 }
 
-pub(crate) fn render_text(graph: &Graph, path: &RequestPath) -> String {
-    let ctx = Ctx::new(graph);
+pub(crate) fn render_text(ix: &SnapshotIndex, path: &RequestPath) -> String {
+    let ctx = Ctx::new(ix);
     let e = ctx.node(path.endpoint);
     let service = ctx.endpoint_service(path.endpoint);
     let mut out = format!("Request path: {}  [{service}]{}\n", e.name, router_note(e));
@@ -342,8 +343,8 @@ fn json_nodes(ctx: &Ctx<'_>, parent: Option<i64>, nodes: &[PathNode], upstream: 
 
 /// The S18 JSON: `{endpoint, precision, pruned_by_rta, upstream, downstream, histogram,
 /// truncated}` (contract M4a S18, M4b S10).
-pub(crate) fn render_json(graph: &Graph, path: &RequestPath) -> Value {
-    let ctx = Ctx::new(graph);
+pub(crate) fn render_json(ix: &SnapshotIndex, path: &RequestPath) -> Value {
+    let ctx = Ctx::new(ix);
     let e = ctx.node(path.endpoint);
     json!({
         "endpoint": {
@@ -416,41 +417,61 @@ mod tests {
         }
         let graph = b.finish().unwrap();
         let id = |k: &str| graph.nodes().iter().find(|n| n.key == k).unwrap().id;
-        let err = pick_endpoint(&graph, "GET /", None)
-            .unwrap_err()
-            .to_string();
+        let err = pick_endpoint(
+            &rb_store::code::SnapshotIndex::new(graph.clone()),
+            "GET /",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert_eq!(
             err,
             "\"GET /\" matches 3 endpoints; pass --pick N:\n  1. GET /  [s]\n  2. GET /  [s]  (prefix unknown, router a.go#ArticlesRegister.router)\n  3. GET /  [s]  (prefix unknown, router t.go#TagsRegister.router)"
         );
         assert_eq!(
-            pick_endpoint(&graph, "GET /", Some(3)).unwrap(),
+            pick_endpoint(
+                &rb_store::code::SnapshotIndex::new(graph.clone()),
+                "GET /",
+                Some(3)
+            )
+            .unwrap(),
             id(keys[2])
         );
-        assert_eq!(pick_endpoint(&graph, keys[1], None).unwrap(), id(keys[1]));
+        assert_eq!(
+            pick_endpoint(
+                &rb_store::code::SnapshotIndex::new(graph.clone()),
+                keys[1],
+                None
+            )
+            .unwrap(),
+            id(keys[1])
+        );
         // The request path's header and JSON name the router too (M4b S13 item 7).
         let path = rb_store::path::request_path(
-            &graph,
+            &rb_store::code::SnapshotIndex::new(graph.clone()),
             id(keys[1]),
             rb_store::path::PathOptions::default(),
         );
         assert!(
-            render_text(&graph, &path).starts_with(
+            render_text(&rb_store::code::SnapshotIndex::new(graph.clone()), &path).starts_with(
                 "Request path: GET /  [s]  (prefix unknown, router a.go#ArticlesRegister.router)\n"
             ),
             "{}",
-            render_text(&graph, &path)
+            render_text(&rb_store::code::SnapshotIndex::new(graph.clone()), &path)
         );
         assert_eq!(
-            render_json(&graph, &path)["endpoint"]["router"],
+            render_json(&rb_store::code::SnapshotIndex::new(graph.clone()), &path)["endpoint"]["router"],
             "a.go#ArticlesRegister.router"
         );
         let plain = rb_store::path::request_path(
-            &graph,
+            &rb_store::code::SnapshotIndex::new(graph.clone()),
             id(keys[0]),
             rb_store::path::PathOptions::default(),
         );
-        assert!(render_text(&graph, &plain).starts_with("Request path: GET /  [s]\n"));
+        assert!(
+            render_text(&rb_store::code::SnapshotIndex::new(graph.clone()), &plain)
+                .starts_with("Request path: GET /  [s]\n")
+        );
     }
 
     /// S22: a `CONSUMES` step says how it was stitched (the host it named, the proxy it went
@@ -568,8 +589,12 @@ mod tests {
             precision: rb_store::code::Precision::Rta,
         };
 
-        let up = rb_store::path::request_path(&graph, id(x), opts);
-        let text = render_text(&graph, &up);
+        let up = rb_store::path::request_path(
+            &rb_store::code::SnapshotIndex::new(graph.clone()),
+            id(x),
+            opts,
+        );
+        let text = render_text(&rb_store::code::SnapshotIndex::new(graph.clone()), &up);
         assert!(
             text.contains("  client a  w/c.ts:1  [w]  [heuristic]  (via host gateway)\n"),
             "{text}"
@@ -582,18 +607,22 @@ mod tests {
         );
         // Only `CONSUMES` steps carry a stitch: the handler line does not.
         assert!(text.contains("  h  s/h.ts:1  [s]  [exact]\n"), "{text}");
-        let json = render_json(&graph, &up);
+        let json = render_json(&rb_store::code::SnapshotIndex::new(graph.clone()), &up);
         assert_eq!(json["upstream"][0]["stitch"]["via_host"], "gateway");
         assert_eq!(json["upstream"][1]["stitch"]["candidates"], 2);
         assert_eq!(json["downstream"][0]["stitch"], Value::Null);
 
-        let down = rb_store::path::request_path(&graph, id(y), opts);
-        let text = render_text(&graph, &down);
+        let down = rb_store::path::request_path(
+            &rb_store::code::SnapshotIndex::new(graph.clone()),
+            id(y),
+            opts,
+        );
+        let text = render_text(&rb_store::code::SnapshotIndex::new(graph.clone()), &down);
         assert!(
             text.contains("→ CONSUMES POST /x  [s]  [heuristic]  (via host gateway)\n"),
             "{text}"
         );
-        let json = render_json(&graph, &down);
+        let json = render_json(&rb_store::code::SnapshotIndex::new(graph.clone()), &down);
         assert_eq!(
             json["downstream"][0]["children"][0]["stitch"]["match"],
             "exact"

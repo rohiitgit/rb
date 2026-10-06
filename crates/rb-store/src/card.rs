@@ -9,10 +9,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use rb_model::{Certainty, Edge, EdgeKind, Graph, NodeKind, Provenance};
+use rb_model::{Certainty, Edge, EdgeKind, NodeKind, Provenance};
 use serde::Serialize;
 
-use crate::code::{endpoint_display, entry_kinds};
+use crate::code::{SnapshotIndex, endpoint_display, entry_kinds};
 
 /// A package the service depends on (`Service -DEPENDS_ON-> Package`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -115,8 +115,8 @@ impl Acc {
 }
 
 /// The derived sections of service `key`'s card.
-pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
-    let nodes: HashMap<i64, &rb_model::Node> = graph.nodes().iter().map(|n| (n.id, n)).collect();
+pub fn card_sections(ix: &SnapshotIndex, key: &str) -> CardSections {
+    let graph = ix.graph();
     // Each file's service, each node's file.
     let mut service_of_file: HashMap<i64, i64> = HashMap::new();
     let mut file_of: HashMap<i64, i64> = HashMap::new();
@@ -137,7 +137,7 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
         }
     }
     let service_of = |n: i64| -> Option<i64> {
-        match nodes.get(&n)?.kind {
+        match ix.get_node(n)?.kind {
             NodeKind::File => service_of_file.get(&n).copied(),
             NodeKind::Service => Some(n),
             NodeKind::Endpoint => exposed_by.get(&n).copied(),
@@ -184,7 +184,7 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
         crate::work::tick(1);
         let (src_mine, dst_mine) = (mine(e.src), mine(e.dst));
         match e.kind {
-            EdgeKind::DependsOn if e.src == me => match nodes[&e.dst].kind {
+            EdgeKind::DependsOn if e.src == me => match ix.node(e.dst).kind {
                 NodeKind::Package => {
                     let entry = packages.entry(e.dst).or_default();
                     entry.0.insert(e.provenance.as_str().to_owned());
@@ -197,7 +197,7 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
                 }
                 _ => {}
             },
-            EdgeKind::DependsOn if e.dst == me && nodes[&e.src].kind == NodeKind::Service => {
+            EdgeKind::DependsOn if e.dst == me && ix.node(e.src).kind == NodeKind::Service => {
                 inn.entry((e.src, "package")).or_default().add(e.certainty);
             }
             EdgeKind::Queries | EdgeKind::MapsTo => {
@@ -219,7 +219,7 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
                     entry.1 = entry.1.max(e.certainty);
                     entry.2 |= assumed == Some(true);
                 }
-                if src_mine && nodes[&e.src].kind == NodeKind::File {
+                if src_mine && ix.node(e.src).kind == NodeKind::File {
                     top_level.insert(e.src);
                 }
             }
@@ -246,26 +246,26 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
                     }
                     _ => {}
                 }
-                if src_mine && nodes[&e.src].kind == NodeKind::File {
+                if src_mine && ix.node(e.src).kind == NodeKind::File {
                     top_level.insert(e.src);
                 }
             }
             EdgeKind::Consumes => {
                 let target = service_of(e.dst);
-                if src_mine && nodes[&e.src].kind == NodeKind::File {
+                if src_mine && ix.node(e.src).kind == NodeKind::File {
                     top_level.insert(e.src);
                 }
                 match (src_mine, target) {
                     (true, Some(t)) if t != me => {
                         let acc = out.entry((t, "http")).or_default();
                         acc.add(e.certainty);
-                        acc.endpoints.insert(endpoint_ref(nodes[&e.dst]));
+                        acc.endpoints.insert(endpoint_ref(ix.node(e.dst)));
                     }
                     (false, Some(t)) if t == me => {
                         if let Some(s) = service_of(e.src) {
                             let acc = inn.entry((s, "http")).or_default();
                             acc.add(e.certainty);
-                            acc.endpoints.insert(endpoint_ref(nodes[&e.dst]));
+                            acc.endpoints.insert(endpoint_ref(ix.node(e.dst)));
                         }
                     }
                     _ => {}
@@ -305,8 +305,8 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
         let mut v: Vec<ServiceDep> = m
             .into_iter()
             .map(|((s, via), acc)| ServiceDep {
-                key: nodes[&s].key.clone(),
-                name: nodes[&s].name.clone(),
+                key: ix.node(s).key.clone(),
+                name: ix.node(s).name.clone(),
                 via: via.to_owned(),
                 certainty: acc.best.unwrap_or(Certainty::Ambiguous).as_str().to_owned(),
                 calls: acc.calls,
@@ -321,15 +321,15 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
     for t in tables.keys() {
         for &s in table_users.get(t).into_iter().flatten() {
             if s != me {
-                shared.entry(s).or_default().insert(nodes[t].key.clone());
+                shared.entry(s).or_default().insert(ix.node(*t).key.clone());
             }
         }
     }
     let mut shares_tables: Vec<SharedTables> = shared
         .into_iter()
         .map(|(s, tables)| SharedTables {
-            key: nodes[&s].key.clone(),
-            name: nodes[&s].name.clone(),
+            key: ix.node(s).key.clone(),
+            name: ix.node(s).name.clone(),
             tables: tables.into_iter().collect(),
         })
         .collect();
@@ -337,7 +337,7 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
     let mut packages: Vec<PackageUse> = packages
         .into_iter()
         .map(|(p, (provenance, version_from))| {
-            let node = nodes[&p];
+            let node = ix.node(p);
             let attr = |k: &str| {
                 node.attrs
                     .get(k)
@@ -358,7 +358,7 @@ pub fn card_sections(graph: &Graph, key: &str) -> CardSections {
     let mut tables: Vec<TableUse> = tables
         .into_iter()
         .map(|(t, (ops, c, assumed))| TableUse {
-            key: nodes[&t].key.clone(),
+            key: ix.node(t).key.clone(),
             ops: ops.into_iter().collect(),
             certainty: c.as_str().to_owned(),
             schema_assumed: assumed,
@@ -622,7 +622,7 @@ mod tests {
         );
         let graph = g.b.finish().unwrap();
 
-        let c = card_sections(&graph, "a");
+        let c = card_sections(&crate::code::SnapshotIndex::new(graph.clone()), "a");
         let deps: Vec<String> = c
             .dependencies
             .iter()
@@ -686,7 +686,7 @@ mod tests {
             ])
         );
         // A library seen from its side: depended on by `a` by calls and by package.
-        let l = card_sections(&graph, "lib");
+        let l = card_sections(&crate::code::SnapshotIndex::new(graph.clone()), "lib");
         let by: Vec<String> = l
             .depended_on_by
             .iter()
@@ -716,7 +716,7 @@ mod tests {
             }
             let graph = g.b.finish().unwrap();
             crate::work::take();
-            let c = card_sections(&graph, "a");
+            let c = card_sections(&crate::code::SnapshotIndex::new(graph.clone()), "a");
             assert_eq!(c.dependencies[0].calls, n);
             crate::work::take()
         };
