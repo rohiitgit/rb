@@ -156,3 +156,11 @@
 - **Mistake:** D9 ("most literal segments win") was written for exact matches and applied unchanged to suffix matches, where the client matches only the endpoint's tail. On spring-petclinic-microservices it sent 3 of 5 suffix calls to the endpoint with the longest path instead of the one whose tail the call names; the fixtures never showed it because their one suffix site had a single candidate.
 - **Rule:** when a rule orders candidates, restate it for each kind of match it orders (exact, suffix, wildcard) in terms of the part that actually matched, and give each kind a unit with two candidates where the whole-path reading and the matched-part reading disagree.
 
+
+## 2026-10-06: a node key must denote one thing, including when part of its identity is unknown
+- **Mistake:** endpoint keys were `(method, path, service)`, and a route whose prefix was unknown kept only its tail in the path, so on gin-realworld four nodes stood for two to three distinct routes each (`GET /` = articles, tags and user); the fixtures had no unknown prefix, so only a public repository showed it (fork F3).
+- **Rule:** when a component of a natural key can be unknown, replace it in the key by a stable anchor of the unknown (here the router's file and scope-qualified binding, never a position) instead of dropping it, and test with two inputs that differ only in the unknown part.
+
+## 2026-10-06: count test results from a log that holds both streams
+- **Mistake (caught before recording):** `cargo test > log 2>&1` was written as `2>&1 > log`, which sends stderr (where cargo prints `Running …`) to the terminal; the awk sum keyed on `Running` lines then counted every `test result` line, the e2e suite's 17 included, and gave 436 instead of 419.
+- **Rule:** redirect as `> file 2>&1`, and check that the per-crate lines the sum is built from name every binary (`unittests`, `tests/e2e.rs`) before trusting the total.

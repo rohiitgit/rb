@@ -296,7 +296,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - Follow-up: the e2e fixture copy should skip ignored files (an IDE's `target/` inside a fixture broke `orm_table_deps_goldens`).
 - **Restored on Docker Desktop (the user's choice, 2026-09-30 22:00 wall clock):** `compose.yaml` takes its host port from `RB_DB_PORT` (default 55432); the database runs on 55433 while the dead VM's forward holds 55432, freshly migrated (0001–0004). `--network none`, amd64 emulation and home-directory bind mounts were re-verified there.
 
-## M4a Endpoints and request paths: in progress
+## M4a Endpoints and request paths: built, pending the evaluator
 
 - [x] Phase 0: preflight (D12 confirmed in the Spring 6.0 release notes; gin and Go 1.22 `ServeMux` grammars recorded in the contract)
 - [x] Phase 1: neutral facts (call chains, string templates, binding initialisers and constants, decoration spans; amendment 1)
@@ -310,7 +310,9 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - [x] Phase 8b: fixture plan part 2 (web suffix, ambiguous, dynamic and external clients; Java context path `/auth`). 
 - [x] Phase 8c: S22 path goldens (text, JSON, candidates), `status-http`, notification card, `impact-send-code`; precision guards for the three fixtures with a biting mutation per line; HTTP invariants and AGE endpoint parity on every fixture dump; `rb path` shows how each `CONSUMES` step was stitched (amendment 8). 
 - [x] Phase 9: SCIP mode (`scip-path-login.txt`: the controller → Feign hop `exact`; notification's named `health` handler `exact`). 
-- [x] Phase 10: public repositories measured (contract "Measurement"): petclinic-microservices 16/16 endpoints and 5/5 `CONSUMES` after amendment 9 (suffix ranking by the matched tail); node-express 20/20 as labelled (19 `prefix_unknown`); gin 13/17 (fork F3: `prefix_unknown` endpoints with different unknown prefixes share a key). Next: 11 (records and review).
+- [x] Phase 10: public repositories measured (contract "Measurement"): petclinic-microservices 16/16 endpoints and 5/5 `CONSUMES` after amendment 9 (suffix ranking by the matched tail); node-express 20/20 as labelled (19 `prefix_unknown`); gin 13/17 (fork F3: `prefix_unknown` endpoints with different unknown prefixes share a key).
+- [x] Fork F3 (orchestrator: option b; amendment 10, `73a111b`): a prefix-unknown endpoint's key ends in ` ?router=<file>#<binding>` (the router binding's file and scope-qualified name, no position); known-prefix keys unchanged; `rb path` candidates name the router; `PIPELINE = m4a-http-4`. gin re-measured: 22 endpoints, the 4 merged nodes split into 9, 20/20 sampled.
+- [x] Phase 11 records: contract measurement table and **Open items** (8 items, each with its number and milestone: default-import Express mounts and gin parameter groups → M4b, YAML discovery names → M6, `--no-cache` facts writes → M5, unbitten guard mutations → M4b, `base: literal` on suffix edges → M5, endpoints listed twice in `rb impact` → M4b, facts-cache growth → M5); design, README, todo and changelog synced. Next: the evaluator's pass; M4a is not marked done until it decides.
 
 - **Split (2026-10-06):** M4 becomes M4a (this entry) and M4b. M4b covers Spring DI and Spring Data synthesis, RTA, derived `DEPENDS_ON`, the full Service Card, Q3's roll-up and orphan detection; it is not started. Design §13 has both rows.
 - **Contract:** `tasks/contract-m4a.md`, S1–S28 and invariants 1–13. Phases are in `tasks/todo.md`.
@@ -322,7 +324,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - Inline handlers are span-scoped. `rb path` sinks are tables and endpoints.
   - Precision guards are `must-exist.txt` and `must-not-exist.txt` beside the goldens.
   - No new dependency and no migration.
-- **Forks for the orchestrator:** F1 (may a name-matched host reach `synthetic`? recommended yes) and F2 (Python in M6, recommended).
+- **Forks for the orchestrator:** F1 (may a name-matched host reach `synthetic`? decided yes), F2 (Python in M6, decided as recommended) and F3 (identity of a prefix-unknown endpoint, raised by the gin measurement; decided: the router's identity in the key, amendment 10).
 
 ## M4b DI and dispatch: not started
 

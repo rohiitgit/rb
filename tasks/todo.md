@@ -325,7 +325,7 @@ Findings from the research step (2026-09-29):
 
 # M4 Frameworks (split into M4a and M4b; design §13)
 
-- **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). In progress (phases below).
+- **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). Built (phases 0–11 and fork F3); awaiting the evaluator, who decides whether M4a is done.
 - **M4b, DI and dispatch** (Spring DI, Spring Data synthesis, RTA, derived `DEPENDS_ON`, full Service Card, Q3 roll-up, orphan detection): not started. Its contract is written after M4a closes.
 
 ## M4a phases
@@ -386,8 +386,11 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
   - Record the counts and buckets (one member per non-zero bucket), the time and the facts-cache size against the M3b binary.
   - Sample 20 endpoints and the `CONSUMES` edges by the contract's rule and hand-check each against the source.
   - **Verify:** the numbers are recorded in the contract's measurement section, computed by a tool, not summed by hand.
+- [x] **F3. Router identity in prefix-unknown endpoint keys** (orchestrator decision on fork F3). Done 2026-10-06 (contract amendment 10, `73a111b`).
+  - *State:* none new (`RouterDecl.binding`, `RouteBase::Unknown(binding)` are per-file route facts). *Derived:* prefix-unknown keys `HTTP <M> <tail> @<service> ?router=<file>#<binding>` and the `router` attribute; `rb path` candidates name the router. *Invariants:* known-prefix keys byte-identical (unit); the identity holds no position (unit); invariant 1 restated. Files: `rb-frameworks/src/{routes,endpoint}.rs`, `rb-indexer/src/{routes,lib}.rs`, `rb-cli/src/path.rs`.
+  - **Verify:** units test-first, two mutations; e2e with no golden change; gin realworld re-measured (22 endpoints, 20/20 sampled, fresh == cached).
 - [ ] **11. Records and review** (S28).
-  - Records: contract amendments, design §8.2/§10/§13 sync, README status and quickstart (`rb path`), IMPLEMENT.md, CHANGELOG, lessons.
-  - Full verification loop and the stub scan.
-  - A separate evaluator pass; fix its findings test-first (each round adds contract amendments).
+  - [x] Records (2026-10-06): contract (amendment 10, the measurement table with the gin re-measure, **Open items**), design §8.2/§9.6/§10/§13 (M4a row: built, pending the evaluator), README (status, `rb path`, the `http:` line, card sections), IMPLEMENT.md, CHANGELOG, lessons.
+  - [x] Full verification loop and the stub scan.
+  - [ ] A separate evaluator pass; fix its findings test-first (each round adds contract amendments). M4a is not marked done until the evaluator decides.
   - Commit after each verified phase.

@@ -3,7 +3,7 @@
 A deterministic, LLM-free code-intelligence graph for Git repositories. It is built with Rust, Postgres and Apache AGE.
 The design is in [docs/repository-brain-design.md](docs/repository-brain-design.md).
 
-**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution) and M3b (SCIP) are done; M4 (frameworks) is next.** `rb` indexes a commit into a snapshot containing:
+**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution) and M3b (SCIP) are done; M4a (endpoints and request paths) is built and awaits the evaluator's review; M4b (DI and dispatch) is next.** `rb` indexes a commit into a snapshot containing:
 
 - one `File` node per blob, with its blob SHA, size, language and binary/generated flags;
 - one `Service` per detected project (package.json, Maven, Gradle, go.mod / `package main`, Cargo, pyproject, Dockerfile, `rb.toml`), marked deployable or library;
@@ -12,9 +12,10 @@ The design is in [docs/repository-brain-design.md](docs/repository-brain-design.
 - `Table` nodes from SQL parsed with the real Postgres parser. `MIGRATES` edges come from `.sql` files, `QUERIES` edges from SQL strings in code (exact when passed to a known database call) and from ORM calls, and `MAPS_TO` edges from ORM entity mappings (JPA, Prisma, TypeORM, SQLAlchemy, Django).
 - `CALLS`, `REFERENCES` and `IMPLEMENTS` edges between symbols: exact (provenance `scip`) where a SCIP indexer ran for the project in a container, heuristic otherwise (resolved from imports, packages and typed bindings, never by bare name across the repository).
 - `Package` nodes and `DEPENDS_ON` edges from the external symbols a SCIP index names.
-- `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests, syntax errors, oversized files, unresolved references, one `scip_status` per build root).
+- `Endpoint` nodes from Spring MVC, Express, gin and Go `net/http` routes, with `EXPOSES` (service → endpoint) and `HANDLED_BY` (endpoint → handler); `CONSUMES` edges (provenance `http_stitch`, never above `synthetic`) from `fetch`, axios, Feign, `RestTemplate`, `WebClient`/`RestClient` and Go `net/http` client calls to other services' endpoints (contract `tasks/contract-m4a.md`). An endpoint key is `HTTP <METHOD> <path> @<service>`; when a route's prefix cannot be composed it is flagged `prefix_unknown` and its key ends in ` ?router=<file>#<binding>`.
+- `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests, syntax errors, oversized files, unresolved references, one `scip_status` per build root, route diagnostics and one bucket per HTTP client call that was not stitched).
 
-Each snapshot is stored relationally and projected into an AGE graph. Routes and cross-service request paths arrive in M4.
+Each snapshot is stored relationally and projected into an AGE graph.
 
 ## Quickstart
 
@@ -29,7 +30,8 @@ target/debug/rb service                # list services; `rb service <dir|name>` 
 target/debug/rb find login --kind symbol  # search nodes by key or name
 target/debug/rb table-deps users         # migrations and code touching a table
 target/debug/rb callers AuthService.login --depth 2   # what calls a function or method (Q1)
-target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2)
+target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2), with the endpoints it handles
+target/debug/rb path "POST /api/v1/login"             # the request path through an endpoint (Q4); --format json, --pick N
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
 ```
 
@@ -41,6 +43,35 @@ Run `rb` from the project root. AGE's CSV loaders only read files under the serv
 | `RB_AGE_LOAD_DIR` | `var/age-load` |
 
 If 55432 is taken, start the database on another port with `RB_DB_PORT=55433 docker compose up -d --wait` and point `RB_DATABASE_URL` at it.
+
+### Endpoints and request paths
+
+`rb status` prints an `http:` line for each repository: endpoints, the services exposing them, and every client call site counted in exactly one bucket (zero buckets omitted):
+
+```
+  http: 7 routes in 3 services; 8 client calls: 2 synthetic, 2 heuristic, 1 ambiguous, 1 external, 1 dynamic, 1 self
+```
+
+`rb path <query>` takes an endpoint key, `<METHOD> <path>` (normalised as routes are), part of an endpoint name, or a handler or client symbol. Several matching endpoints are listed, never picked silently; `--pick N` chooses one (a prefix-unknown endpoint's line names its router). The output joins the upstream tree (client calls in other services and their callers) and the downstream tree (the handler's calls within its service and library services, ending in `QUERIES` tables and `CONSUMES` endpoints, which continue into the next service up to `--hops`, default 4). Each step shows file:line, service and certainty, and how a `CONSUMES` step was stitched (`via host gateway`, `host notification`, `suffix match`, `n candidates`). Helper calls that reach no table or endpoint collapse into `+ k helper calls` unless `--full`. These are statically possible paths, not a trace of one request.
+
+```
+Request path: POST /api/v1/login  [auth-service]
+Statically possible paths from the call graph and HTTP stitching, not a trace of one request.
+UPSTREAM
+  client login().  apps/web/src/api/auth.ts:6  [@acme/web]  [heuristic]  (via host gateway)
+    ← LoginForm().onSubmit().  apps/web/src/pages/Login.tsx:4  [@acme/web]  [heuristic]
+      ← LoginForm().  apps/web/src/pages/Login.tsx:3  [@acme/web]  [heuristic]
+ENDPOINT  POST /api/v1/login  [auth-service]
+DOWNSTREAM
+  AuthController#login().  services/auth/src/main/java/com/acme/auth/AuthController.java:15  [auth-service]  [exact]
+    → MfaClient#sendCode().  services/auth/src/main/java/com/acme/auth/MfaClient.java:9  [auth-service]  [heuristic]
+      → CONSUMES POST /internal/mfa/email  [notification]  [synthetic, branch heuristic]  (host notification)
+        ⇒ services/notification/src/server.ts (top-level code)  [notification]  [exact, branch heuristic]
+          → QUERIES public.email_log (insert)  [exact, branch heuristic]
+certainty: exact 3, synthetic 1, heuristic 4
+```
+
+The Service Card (`rb service <name>`) gains `APIs` (each endpoint with its handler and certainty, `(prefix unknown)` when flagged), `Calls APIs of` and `APIs called by` (grouped by service, with sites), and `HTTP client calls not stitched: k (rb status)`. `rb impact` lists the endpoints handled by the removed or impacted code under `endpoints:`.
 
 ### SCIP indexers
 
@@ -87,10 +118,10 @@ Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e
 | `crates/rb-git` | commit → manifest (gitoxide), CODEOWNERS, glob matcher, boundary detection |
 | `crates/rb-syntax` | Tree-sitter extraction (definitions, references, SQL candidates) and heuristic symbol keys |
 | `crates/rb-sql` | SQL statements → tables and operations (pg_query parse-tree walk) |
-| `crates/rb-frameworks` | ORM packs: JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django |
+| `crates/rb-frameworks` | ORM packs (JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django); route and HTTP-client packs, endpoint normalisation, URL constant folding |
 | `crates/rb-scip` | SCIP: project detection, container jobs (fetch + offline index), index cache key, `index.scip` decoding, symbol parsing |
-| `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → SCIP jobs (cached) → join → snapshot graph + diagnostics |
-| `crates/rb-store` | migrations, snapshot publish/retention, evidence, AGE projection, read-only Cypher, find/service queries |
+| `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → SCIP jobs (cached) → join → endpoints and HTTP stitching → snapshot graph + diagnostics |
+| `crates/rb-store` | migrations, snapshot publish/retention, evidence, AGE projection, read-only Cypher, find/service queries, `callers`/`impact`/`path` walks |
 | `crates/rb-cli` | the `rb` binary |
 | `docker/scip-java/` | the slim scip-java image |
 | `migrations/` | SQL schema, embedded into the binary |
