@@ -71,8 +71,9 @@ use serde_json::{Value, json};
 /// DI's `INJECTS` edges, `di_*` diagnostics and `di_coverage` (S4–S8); `m4b-di-3` RTA's
 /// `impl_instantiated: false` on `IMPLEMENTS` and `rta_coverage` (S9); `m4b-di-4` the `Symbol`
 /// attributes `entry` and `orphan_eligible` and `orphan_coverage` (S11, S12); `m4b-di-5`
-/// Express mounts of default imports (S19) and catch-all endpoints only for named hosts (S20).
-pub const PIPELINE: &str = "m4b-di-5";
+/// Express mounts of default imports (S19) and catch-all endpoints only for named hosts (S20);
+/// `m4b-di-6` injected Spring clients' bases from the `@Bean` method DI resolves (S21).
+pub const PIPELINE: &str = "m4b-di-6";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -776,7 +777,7 @@ pub fn assemble(
         .map(|p| p.dir.clone())
         .collect();
     let depends = di::package_dependencies(&manifest_edges);
-    let resolution = di::resolve(&di::Inputs {
+    let mut resolution = di::resolve(&di::Inputs {
         files: &content.facts,
         keys: &keys,
         index: &index,
@@ -786,6 +787,7 @@ pub fn assemble(
         unparsed: &content.unparsed,
     });
     let fragments = resolution.fragments.clone();
+    let points = std::mem::take(&mut resolution.points);
     diagnostics.extend(di::add_injects(&mut b, resolution)?);
     // RTA (contract M4b S9, D4): after every `IMPLEMENTS` producer (SCIP, Tier B).
     let considered =
@@ -825,6 +827,7 @@ pub fn assemble(
         overrides: &spring.overrides,
         feign_configured: feign_configured(&content.config),
         unparsed: &content.unparsed,
+        points: &points,
     });
     let services: Vec<stitch::ServiceRef> = boundaries
         .projects()

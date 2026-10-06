@@ -190,6 +190,8 @@ pub(crate) struct Inputs<'a, 'i> {
     pub feign_configured: bool,
     /// What the raw-text scan of the files without facts found (contract M4a amendment 17).
     pub unparsed: &'i RawScan,
+    /// Injection points and their unique beans (contract M4b S21).
+    pub points: &'i crate::di::Points,
 }
 
 /// One file's top-level non-member bindings (`None`) and type members (`Some(type)`) by name.
@@ -343,9 +345,16 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
         let service = (inputs.service_of)(path);
         for call in &file_clients.calls {
             folding.take_asked();
+            // An injected Spring client: the base of the `@Bean` method its injection point
+            // resolves to (contract M4b S21).
+            let from_bean = call
+                .injected
+                .and_then(|bi| injected_base(inputs, &folding, path, facts, bi, call.kind));
             // A base stated at the call (axios request config) replaces the instance's
             // (amendment 12).
-            let stated = call.base.clone().map(|b| (file, b));
+            let stated = from_bean
+                .clone()
+                .or_else(|| call.base.clone().map(|b| (file, b)));
             let mut base_verified = if hooked.contains(&call.kind) {
                 Some(false)
             } else {
@@ -388,13 +397,45 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 method: call.method.clone(),
                 url,
                 config_overridden: folding.take_asked(),
-                base_from_bean: call.base_from_bean,
+                base_from_bean: from_bean.is_some(),
                 base_verified,
                 discovery,
             });
         }
     }
     out
+}
+
+/// The base of an injected Spring client bound at `bi` in `path` (contract M4b S21): the
+/// injection point of the binding's owner for its type (the one of the binding's name, else
+/// the only one), when it resolved to exactly one bean, a `@Bean` method stating a base for
+/// `kind`; with that method's file, where the value folds.
+fn injected_base(
+    inputs: &Inputs<'_, '_>,
+    folding: &Folding<'_, '_>,
+    path: &str,
+    facts: &FileFacts,
+    bi: usize,
+    kind: ClientKind,
+) -> Option<(usize, UrlValue)> {
+    let b = &facts.bindings[bi];
+    let simple = |t: &str| t.rsplit('.').next().unwrap_or(t).to_owned();
+    let points = inputs.points.by_owner.get(&(path.to_owned(), b.scope?))?;
+    let typed: Vec<&crate::di::PointRef> = points
+        .iter()
+        .filter(|p| simple(&p.element) == simple(&b.type_name))
+        .collect();
+    let point = match typed.iter().find(|p| p.name == b.name) {
+        Some(p) => p,
+        None => match typed.as_slice() {
+            [only] => only,
+            _ => return None,
+        },
+    };
+    let (bean_path, method) = inputs.points.unique.get(&(path.to_owned(), point.span))?;
+    let (_, bean_facts) = inputs.files.get(bean_path.as_str())?;
+    let value = rb_frameworks::clients::bean_base(bean_facts, *method, kind)?;
+    Some((*folding.ids.get(bean_path.as_str())?, value))
 }
 
 /// The axios instance an imported name is, with its file: the first resolved target (in path
@@ -2263,6 +2304,19 @@ mod tests {
                 )
             })
             .collect();
+        // Spring DI over the same files, every first path segment a deployable service, for
+        // the bases of injected clients (contract M4b S21).
+        let deployable: BTreeSet<String> = by_path.keys().map(|p| service_of(p)).collect();
+        let depends = BTreeMap::new();
+        let resolution = crate::di::resolve(&crate::di::Inputs {
+            files: &by_path,
+            keys: &keys,
+            index: &index,
+            service_of: &service_of,
+            deployable: &deployable,
+            depends: &depends,
+            unparsed,
+        });
         let inputs = Inputs {
             files: &by_path,
             index: &index,
@@ -2274,8 +2328,79 @@ mod tests {
                 .iter()
                 .any(|(_, k, _)| rb_frameworks::clients::feign_config_key(k)),
             unparsed,
+            points: &resolution.points,
         };
         sites(&inputs)
+    }
+
+    /// Contract M4b S21 (M4a item 15): an injected Spring client takes its base from the
+    /// `@Bean` method its injection point resolves to, in any file, when that resolution has
+    /// exactly one candidate and the method states a base; the site is marked `base_from_bean`
+    /// and is never `synthetic`. Otherwise its base is unknown, as before.
+    #[test]
+    fn injected_clients_take_the_resolved_beans_base() {
+        let cfg = "package com.acme;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.beans.factory.annotation.Qualifier;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\n@Configuration\npublic class Cfg {\n  @Bean @Qualifier(\"stripe\") RestTemplate stripe(RestTemplateBuilder b) { return b.rootUri(\"https://api.stripe.com\").build(); }\n  @Bean @Qualifier(\"gh\") RestTemplate gh(RestTemplateBuilder b) { return b.rootUri(\"https://api.github.com\").build(); }\n}\n";
+        let pay = |param: &str| {
+            format!(
+                "package com.acme;\nimport org.springframework.stereotype.Service;\nimport org.springframework.beans.factory.annotation.Qualifier;\nimport org.springframework.web.client.RestTemplate;\n@Service\npublic class Pay {{\n  private final RestTemplate rt;\n  Pay({param} RestTemplate rt) {{ this.rt = rt; }}\n  void charge() {{ rt.postForObject(\"/charges\", null, String.class); }}\n}}\n"
+            )
+        };
+        let shown = |pay: &str, cfg: &str| -> Vec<String> {
+            collect_sites_with(
+                &[
+                    ("svc/src/main/java/com/acme/Cfg.java", Language::Java, cfg),
+                    ("svc/src/main/java/com/acme/Pay.java", Language::Java, pay),
+                ],
+                &[],
+                &[],
+                &[],
+                &RawScan::default(),
+            )
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}{}",
+                    s.url.as_ref().map_or("?".to_owned(), render),
+                    if s.base_from_bean { " from_bean" } else { "" }
+                )
+            })
+            .collect()
+        };
+        // Two qualified beans in another file: the point's qualifier picks one.
+        assert_eq!(
+            shown(&pay("@Qualifier(\"stripe\")"), cfg),
+            ["https://api.stripe.com/charges from_bean"]
+        );
+        // One bean in another file.
+        let one = cfg.replace(
+            "  @Bean @Qualifier(\"gh\") RestTemplate gh(RestTemplateBuilder b) { return b.rootUri(\"https://api.github.com\").build(); }\n",
+            "",
+        );
+        assert_eq!(
+            shown(&pay(""), &one),
+            ["https://api.stripe.com/charges from_bean"]
+        );
+        // Two candidates and no qualifier: ambiguous, so the base is unknown.
+        assert_eq!(shown(&pay(""), cfg), ["{?}/charges"]);
+        // Two points of the type in the owner: the one named like the field.
+        let two = "package com.acme;\nimport org.springframework.stereotype.Service;\nimport org.springframework.beans.factory.annotation.Qualifier;\nimport org.springframework.web.client.RestTemplate;\n@Service\npublic class Pay {\n  private final RestTemplate rt;\n  private final RestTemplate other;\n  Pay(@Qualifier(\"gh\") RestTemplate other, @Qualifier(\"stripe\") RestTemplate rt) { this.rt = rt; this.other = other; }\n  void charge() { rt.postForObject(\"/charges\", null, String.class); }\n}\n";
+        assert_eq!(
+            shown(two, cfg),
+            ["https://api.stripe.com/charges from_bean"]
+        );
+        // The only point of the type, named otherwise, next to a point of another type.
+        let renamed = pay("").replace(
+            "Pay( RestTemplate rt) { this.rt = rt; }",
+            "Pay(java.time.Clock clock, RestTemplate template) { this.rt = template; }",
+        );
+        assert!(renamed.contains("RestTemplate template"), "{renamed}");
+        assert_eq!(
+            shown(&renamed, &one),
+            ["https://api.stripe.com/charges from_bean"]
+        );
+        // A bean method that states no base leaves it unknown too.
+        let bare = one.replace(".rootUri(\"https://api.stripe.com\")", "");
+        assert_eq!(shown(&pay(""), &bare), ["{?}/charges"]);
     }
 
     /// Evaluator pass 1, P1, from source: a port hole written as a template literal, a

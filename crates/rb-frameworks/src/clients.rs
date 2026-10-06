@@ -97,10 +97,11 @@ pub struct ClientCall {
     pub span: Span,
     /// The definition the call is made from (for Feign, the interface method).
     pub source: Option<usize>,
-    /// The base was read from a `@Bean` method of the file that builds a client of this kind,
-    /// taken as the injected instance (dependency injection is M4b), so the site never reaches
-    /// `synthetic` (contract M4a amendment 12).
-    pub base_from_bean: bool,
+    /// Spring: the call's receiver is an injected instance (nothing in the file configures the
+    /// binding): the index into `FileFacts::bindings` of that binding. Its base is the one the
+    /// `@Bean` method its injection point resolves to states ([`bean_base`]), which the indexer
+    /// reads through DI (contract M4b S21); the pack reads none.
+    pub injected: Option<usize>,
     /// Gate A (contract M4a amendments 13–16) on what carries the request: `Some(false)` when
     /// the carrier (the instance, builder or copy the request is sent through) or the request
     /// itself is not provably plain, whatever the URL's source, so the site never reaches
@@ -741,7 +742,7 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
             instance: None,
             span: chain.span,
             source: chain.enclosing,
-            base_from_bean: false,
+            injected: None,
             base_verified: None,
         });
     }
@@ -1062,7 +1063,7 @@ fn axios_call(
         instance,
         span: chain.span,
         source: chain.enclosing,
-        base_from_bean: false,
+        injected: None,
         // A request config that is not plain (an `adapter`, a spread, a variable) may send the
         // request elsewhere whatever carries it (amendment 15).
         base_verified: (!plain_config(config)).then_some(false),
@@ -1149,7 +1150,7 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBas
         // The root URI configured on the instance; a relative URL needs one (amendment 12).
         // The carrier is the instance (Gate A), or an inline construction, plain only as a bare
         // `new RestTemplate()` (amendment 16).
-        let base = bases.of(receiver, ClientKind::RestTemplate);
+        let base = bases.of(receiver);
         let plain = match receiver {
             Some(bi) => bases.carrier(bi),
             None => plain_construction(facts, chain, 0),
@@ -1163,7 +1164,7 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBas
             instance: None,
             span: chain.span,
             source: chain.enclosing,
-            base_from_bean: base.from_bean,
+            injected: receiver.filter(|_| base.injected),
         });
     }
 }
@@ -1384,22 +1385,68 @@ const SPRING_CONTEXT: &str = "org.springframework.context.annotation";
 
 /// What configures each Spring client instance of one file, indexed once (contract M4a
 /// amendment 12, Q1): per binding, the chains assigned to it (`this.rt = b.rootUri(…).build()`)
-/// or calling a URI template handler setter on it; and the base facts of the file's `@Bean`
-/// methods per client kind, for an instance injected from them. With the file's [`Gate`].
+/// or calling a URI template handler setter on it. With the file's [`Gate`].
 struct SpringBases<'s, 'f> {
     facts: &'s FileScope<'f>,
     /// Binding → indices of the chains that configure it.
     configured: HashMap<usize, Vec<usize>>,
-    beans: HashMap<ClientKind, Vec<BaseFact>>,
     gate: Gate<'f>,
 }
 
 /// A Spring client's base as [`SpringBases::of`] reads it.
 struct SpringBase {
     value: UrlValue,
-    from_bean: bool,
+    /// Nothing in the file configures the instance: it is injected (contract M4b S21).
+    injected: bool,
     /// The base was read from the carrier's construction (not unknown, not a `@Bean`'s).
     read: bool,
+}
+
+/// The `@Bean` methods of a file (an import-gated `@Bean` on a method).
+fn bean_methods(facts: &FileFacts) -> HashSet<usize> {
+    facts
+        .definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| {
+            d.kind == DefKind::Method
+                && d.decorations
+                    .iter()
+                    .any(|a| is_annotation(facts, a, SPRING_CONTEXT, "Bean"))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The base the `@Bean` method `method` states for a `kind` client (contract M4b S21): the one
+/// value every chain in it (or in a lambda inside it) that builds a `kind` client and sets a
+/// base agrees on; `None` when it is no `@Bean` method, states none, or states several or an
+/// unreadable one.
+pub fn bean_base(facts: &FileFacts, method: usize, kind: ClientKind) -> Option<UrlValue> {
+    if !bean_methods(facts).contains(&method) {
+        return None;
+    }
+    let scope = FileScope::new(facts);
+    let mut stated = Vec::new();
+    for chain in &facts.chains {
+        // The chain's innermost enclosing `@Bean` method, through nested definitions.
+        let mut def = chain.enclosing;
+        let mut seen = 0;
+        while let Some(d) = def.filter(|&d| d != method && seen < 64) {
+            def = facts.definitions[d].parent;
+            seen += 1;
+        }
+        if def != Some(method) || chain_kind(&scope, chain) != Some(kind) {
+            continue;
+        }
+        if let base @ BaseFact::Stated(_) = chain_base(&scope, chain, chain.links.len()) {
+            stated.push(base);
+        }
+    }
+    if stated.is_empty() {
+        return None;
+    }
+    agreed(&stated)
 }
 
 /// The calls on a Spring client or builder binding that leave its configuration as built
@@ -1433,20 +1480,7 @@ fn spring_requests(facts: &FileFacts, type_name: &str) -> &'static [&'static str
 
 impl<'s, 'f> SpringBases<'s, 'f> {
     fn new(facts: &'s FileScope<'f>, gate: Gate<'f>) -> Self {
-        let in_bean: HashSet<usize> = facts
-            .definitions
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| {
-                d.kind == DefKind::Method
-                    && d.decorations
-                        .iter()
-                        .any(|a| is_annotation(facts, a, SPRING_CONTEXT, "Bean"))
-            })
-            .map(|(i, _)| i)
-            .collect();
         let mut configured: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut beans: HashMap<ClientKind, Vec<BaseFact>> = HashMap::new();
         for (ci, chain) in facts.chains.iter().enumerate() {
             let target = match (&chain.assigned, chain.links.first()) {
                 (Some(left), _) => Some(left.as_str()),
@@ -1458,24 +1492,10 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             {
                 configured.entry(bi).or_default().push(ci);
             }
-            // A chain in a `@Bean` method (or a lambda inside one) that sets a base.
-            let mut def = chain.enclosing;
-            let mut seen = 0;
-            while let Some(d) = def.filter(|d| !in_bean.contains(d) && seen < 64) {
-                def = facts.definitions[d].parent;
-                seen += 1;
-            }
-            if def.is_some()
-                && let BaseFact::Stated(v) = chain_base(facts, chain, chain.links.len())
-                && let Some(kind) = chain_kind(facts, chain)
-            {
-                beans.entry(kind).or_default().push(BaseFact::Stated(v));
-            }
         }
         SpringBases {
             facts,
             configured,
-            beans,
             gate,
         }
     }
@@ -1517,14 +1537,15 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             })
     }
 
-    /// The base of a `kind` client bound at `receiver`: one stated base when everything that
+    /// The base of a client bound at `receiver`: one stated base when everything that
     /// configures the instance agrees, else unknown. An instance nothing in the file
-    /// configures is injected: the file's `@Bean` methods for that kind decide, the same way
-    /// (such an instance is never a plain carrier, so its base is never verified).
-    fn of(&self, receiver: Option<usize>, kind: ClientKind) -> SpringBase {
+    /// configures is injected: its base is left to the indexer, which reads the `@Bean` method
+    /// its injection point resolves to (contract M4b S21; such an instance is never a plain
+    /// carrier, so its base is never verified).
+    fn of(&self, receiver: Option<usize>) -> SpringBase {
         let unknown = SpringBase {
             value: UrlValue::Unknown,
-            from_bean: false,
+            injected: false,
             read: false,
         };
         let Some(bi) = receiver else {
@@ -1548,14 +1569,9 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             facts.push(chain_base(self.facts, c, c.links.len()));
         }
         if facts.is_empty() {
-            let beans = self.beans.get(&kind).map_or(&[][..], Vec::as_slice);
-            return match agreed(beans) {
-                Some(value) => SpringBase {
-                    value,
-                    from_bean: true,
-                    read: false,
-                },
-                None => unknown,
+            return SpringBase {
+                injected: true,
+                ..unknown
             };
         }
         let Some(value) = agreed(&facts) else {
@@ -1563,7 +1579,7 @@ impl<'s, 'f> SpringBases<'s, 'f> {
         };
         SpringBase {
             value,
-            from_bean: false,
+            injected: false,
             read: true,
         }
     }
@@ -1648,7 +1664,7 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases)
             BaseFact::Stated(value) => (
                 SpringBase {
                     value,
-                    from_bean: false,
+                    injected: false,
                     read: true,
                 },
                 plain_construction(facts, chain, verb),
@@ -1656,13 +1672,13 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases)
             BaseFact::Fresh => (
                 SpringBase {
                     value: UrlValue::Unknown,
-                    from_bean: false,
+                    injected: false,
                     read: false,
                 },
                 plain_construction(facts, chain, verb),
             ),
             BaseFact::Unreadable => (
-                bases.of(receiver, kind),
+                bases.of(receiver),
                 receiver.is_some_and(|bi| bases.carrier(bi)) && plain_links(&chain.links[..verb]),
             ),
         };
@@ -1675,7 +1691,7 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases)
             instance: None,
             span: chain.span,
             source: chain.enclosing,
-            base_from_bean: base.from_bean,
+            injected: receiver.filter(|_| base.injected),
         });
     }
 }
@@ -1805,7 +1821,7 @@ fn feign(facts: &FileScope<'_>, out: &mut FileClients) {
                     instance: None,
                     span: d.span,
                     source: Some(m),
-                    base_from_bean: false,
+                    injected: None,
                     // A declarative interface: no instance carries the request (amendment 15).
                     base_verified: None,
                 });
@@ -1877,7 +1893,7 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             instance: None,
             span: chain.span,
             source: chain.enclosing,
-            base_from_bean: false,
+            injected: None,
             // The package's functions and `http.DefaultClient` are the bare module client
             // (amendment 15); a `http.Client` binding is not provably plain (its `Transport`
             // may reroute), nor is a request built by `NewRequest`, which whatever `Do`es it
@@ -1984,8 +2000,8 @@ mod tests {
                 if let Some(i) = &c.instance {
                     s.push_str(&format!(" instance={i}"));
                 }
-                if c.base_from_bean {
-                    s.push_str(" from_bean");
+                if c.injected.is_some() {
+                    s.push_str(" injected");
                 }
                 if c.base_verified == Some(false) {
                     s.push_str(" unverified");
@@ -2078,12 +2094,12 @@ mod tests {
             [
                 // A field is never a plain carrier, whatever the URL's source (amendments 14
                 // and 15).
-                "rest_template GET 'http://visits/owners/{id}' base=? unverified",
-                "rest_template PUT '{BASE}/x' base=? unverified",
-                "rest_template ? '/y' base=? unverified",
+                "rest_template GET 'http://visits/owners/{id}' base=? injected unverified",
+                "rest_template PUT '{BASE}/x' base=? injected unverified",
+                "rest_template ? '/y' base=? injected unverified",
                 "web_client GET '/owners/{ownerId}' base='http://customers-service' unverified",
-                "web_client POST 'http://visits-service/pets/visits' base=? unverified",
-                "rest_client DELETE '/r' base=? unverified",
+                "web_client POST 'http://visits-service/pets/visits' base=? injected unverified",
+                "rest_client DELETE '/r' base=? injected unverified",
                 "web_client GET '' base='http://x'",
             ]
         );
@@ -2095,7 +2111,7 @@ mod tests {
         assert_eq!(
             calls(Language::Java, ctor),
             [
-                "rest_template GET 'http://localhost:{port}/x/{id}' base=? unverified",
+                "rest_template GET 'http://localhost:{port}/x/{id}' base=? injected unverified",
                 "web_client GET '/owners' base='http://customers' unverified",
             ]
         );
@@ -2218,7 +2234,7 @@ mod tests {
                 "rest_template POST '/charges' base='https://api.stripe.com' unverified",
                 "rest_template GET '/orders/1' base='http://orders' unverified",
                 "rest_template GET '/repos' base='https://api.github.com' unverified",
-                "rest_template GET '/x' base=? unverified",
+                "rest_template GET '/x' base=? injected unverified",
                 "rest_template GET '/y' base=? unverified",
                 "rest_template GET '/v' base='http://visits' unverified",
                 "web_client GET '/v1/charges' base='https://api.stripe.com' unverified",
@@ -2226,29 +2242,58 @@ mod tests {
                 "web_client GET '/u' base='http://users' unverified",
             ]
         );
-        // An injected instance: the file's `@Bean` method that builds one states its base.
+        // An injected instance: marked for the indexer, which reads the base of the `@Bean`
+        // method the injection point resolves to (contract M4b S21); the pack reads none.
         let bean = "package p;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nclass Cfg {\n  @Bean RestTemplate stripe(RestTemplateBuilder b) { return b.rootUri(\"https://api.stripe.com\").build(); }\n}\nclass Pay {\n  private final RestTemplate rt;\n  Pay(RestTemplate rt) { this.rt = rt; }\n  void charge() { rt.postForObject(\"/charges\", null, String.class); }\n}\n";
         assert_eq!(
             calls(Language::Java, bean),
-            // A bean's base is never provably the injected one's: unverified (amendment 13).
-            ["rest_template POST '/charges' base='https://api.stripe.com' from_bean unverified"]
+            // An injected field is never a plain carrier (amendments 13, 15).
+            ["rest_template POST '/charges' base=? injected unverified"]
         );
-        // Two beans with different bases: unknown. An injected field is never a plain
-        // carrier (amendment 15).
-        let two = bean.replace(
-            "  @Bean RestTemplate stripe",
-            "  @Bean RestTemplate gh(RestTemplateBuilder b) { return b.rootUri(\"https://api.github.com\").build(); }\n  @Bean RestTemplate stripe",
+        // The base a `@Bean` method states, by method: one stated value, else none.
+        let facts = extract(Language::Java, bean.as_bytes()).unwrap();
+        let method = |name: &str| {
+            facts
+                .definitions
+                .iter()
+                .position(|d| d.name == name)
+                .unwrap()
+        };
+        assert_eq!(
+            bean_base(&facts, method("stripe"), ClientKind::RestTemplate)
+                .as_ref()
+                .map(show_value)
+                .as_deref(),
+            Some("'https://api.stripe.com'")
         );
         assert_eq!(
-            calls(Language::Java, &two),
-            ["rest_template POST '/charges' base=? unverified"]
+            bean_base(&facts, method("stripe"), ClientKind::WebClient),
+            None
         );
+        assert_eq!(
+            bean_base(&facts, method("charge"), ClientKind::RestTemplate),
+            None
+        );
+        let two = bean.replace(
+            "{ return b.rootUri(\"https://api.stripe.com\").build(); }",
+            "{ if (x) return b.rootUri(\"https://a\").build(); return b.rootUri(\"https://b\").build(); }",
+        );
+        let facts = extract(Language::Java, two.as_bytes()).unwrap();
+        let stripe = facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "stripe")
+            .unwrap();
+        assert_eq!(bean_base(&facts, stripe, ClientKind::RestTemplate), None);
         // Without the `@Bean` import it is just a method.
         let plain = bean.replace("import org.springframework.context.annotation.Bean;\n", "");
-        assert_eq!(
-            calls(Language::Java, &plain),
-            ["rest_template POST '/charges' base=? unverified"]
-        );
+        let facts = extract(Language::Java, plain.as_bytes()).unwrap();
+        let stripe = facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "stripe")
+            .unwrap();
+        assert_eq!(bean_base(&facts, stripe, ClientKind::RestTemplate), None);
     }
 
     /// Contract M4a amendment 14, Gate A (evaluator passes 3 and 4): an axios instance's base

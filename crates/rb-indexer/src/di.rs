@@ -83,6 +83,26 @@ pub(crate) struct Resolution {
     /// The interfaces Spring Data repositories extend, by simple name, in every Java file
     /// (fragment interfaces for RTA's rule (h), D3).
     pub fragments: BTreeSet<String>,
+    /// The main-source injection points and the beans they resolve to uniquely, for the bases
+    /// of injected HTTP clients (contract M4b S21).
+    pub points: Points,
+}
+
+/// An injection point by name, injected type and span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PointRef {
+    pub name: String,
+    pub element: String,
+    pub span: Span,
+}
+
+/// Injection points as client bases need them (contract M4b S21).
+#[derive(Debug, Default)]
+pub(crate) struct Points {
+    /// Per `(path, owner)`: every main-source point.
+    pub by_owner: BTreeMap<(String, usize), Vec<PointRef>>,
+    /// Per `(path, point span)`: the one bean a point resolved to, as `(path, definition)`.
+    pub unique: BTreeMap<(String, Span), (String, usize)>,
 }
 
 /// A bean with where it is.
@@ -365,6 +385,15 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                 *out.buckets.get_mut("test").unwrap() += 1;
                 continue;
             }
+            out.points
+                .by_owner
+                .entry(((*path).to_owned(), p.owner))
+                .or_default()
+                .push(PointRef {
+                    name: p.name.clone(),
+                    element: p.element.clone(),
+                    span: p.span,
+                });
             resolve_point(&ctx, p, &mut out);
         }
     }
@@ -655,6 +684,14 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
     bucket(out, label);
     for g in &gates {
         *out.gates.entry(g).or_default() += 1;
+    }
+    // A wrapper with one candidate holds that bean too (`rt[0]` of a one-bean array).
+    if let [i] = chosen[..] {
+        let b = &ctx.beans[i];
+        out.points.unique.insert(
+            (ctx.path.to_owned(), p.span),
+            (b.path.to_owned(), b.bean.definition),
+        );
     }
     let src = inputs.keys[ctx.path][p.owner].clone();
     for &i in &chosen {

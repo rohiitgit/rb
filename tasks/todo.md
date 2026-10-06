@@ -579,7 +579,7 @@ Same rules as M4a:
   - Files: `rb-store/src/query.rs`, `rb-cli/src/main.rs` (`render_card`).
   - **Verify:** units; e2e (every card re-blessed after classification).
 - [x] **11a. M4a items 1 and 9** (S19, S20). Done: default-import mounts through `default_export` (`rb-indexer/src/routes.rs`), catch-alls only for named hosts with `catch_all_only` (`stitch.rs`); `PIPELINE = m4b-di-5`; amendment 14 (S19 measured on node-express-realworld: 0 of 19 resolved, layout recorded as an open item); 2 units + 1 changed row, 7 mutants killed (one equivalent check deleted). Invariant 1: fixture dumps unchanged apart from the phase-7 lines; node-express-realworld vs `1f81c8f`: additions and the six `Symbol` attribute lines only.
-- [ ] **11b. M4a item 15** (S21): DI-resolved client bases.
+- [x] **11b. M4a item 15** (S21): DI-resolved client bases. Done: `ClientCall.injected`, `clients::bean_base` (rb-frameworks), `di::Points` (per-owner points, unique beans), `stitch::injected_base`; `PIPELINE = m4b-di-6`; amendment 15; 1 new unit with five rows + the pack units updated, 10 mutants killed (two survivors given a row). Invariant 1: fixture dumps identical to 11a's; petclinic-microservices and piggymetrics `CONSUMES` unchanged vs `1f81c8f`. Files: `rb-frameworks/src/clients.rs`, `rb-indexer/src/{di,stitch,lib}.rs`.
 - (original phase 11 entry, split as above) **11. M4a items 1, 9, 15** (S19–S21).
   - *Derived:* default-import mounts composed; catch-all candidates restricted to named hosts; DI-resolved client bases (`base_from_bean`).
   - *Invariants:* each can only lower or remove (`CONSUMES` diff against the baseline classified); M4a's `synthetic` bar untouched (the existing never-`synthetic` guards still green).
