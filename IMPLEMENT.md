@@ -334,6 +334,36 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - No new dependency and no migration.
 - **Forks for the orchestrator:** F1 (may a name-matched host reach `synthetic`? decided yes), F2 (Python in M6, decided as recommended) and F3 (identity of a prefix-unknown endpoint, raised by the gin measurement; decided: the router's identity in the key, amendment 10).
 
-## M4b DI and dispatch: not started
+## M4b DI and dispatch: contract written, not started
 
-- Next milestone (M4a is closed). Scope listed in `tasks/contract-m4a.md` ("Scope"); its contract is written next. Carried in from M4a: open items 1, 2, 5, 7, 9, 15 and 24 of `tasks/contract-m4a.md`.
+- **Contract:** `tasks/contract-m4b.md` (2026-10-06), S1–S28 and invariants 1–11. Phases 0–16 are in `tasks/todo.md`.
+- **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
+  - `INJECTS` never above `synthetic`, and `synthetic` only through SCIP-resolved types and allow-listed gates;
+  - RTA prunes only by a proof of absence, and every pruned step is counted;
+  - orphans only for symbols every mention of which is accounted for;
+  - `manifest` versions only from a lockfile or a literal.
+
+  The residue is listed per claim. Pass 1 is a full review; pass 2 is verification-only, and new attack forms in residue classes go to M5's adversarial review.
+- **Decided in the contract (D1–D13):**
+  - `INJECTS` goes from the injection point's owner to the bean definition (class, `@Bean` method, Spring Data or Feign interface).
+  - Spring Data repositories are beans of their own interface type: no synthetic node.
+  - RTA is stored as `impl_instantiated: false` only.
+  - Precision defaults are `rta` for Q1/Q4 and `cha` for Q2/Q3.
+  - Service → Service `via=calls`/`via=http` are derived at query time; `via=package` is stored with provenance `manifest`.
+  - Package versions come from `package-lock.json`, `go.mod` and pom literals or properties, in M3b's key form, with `@?` when unresolved.
+  - DI scope is the service's classpath and literal scan roots, main sources only.
+  - Spring's resolution rules are as modelled in D9, to be confirmed in phase 0.
+  - Entry points are an allow-list.
+  - Orphans are a greatest-fixpoint reachability computed only in deployable services.
+  - Q3 has an API hop up to `--hops`.
+- **M4a open items:** 1, 5, 7, 9, 15 and 24 are in M4b. Item 2 (gin parameter groups) moves to M6.
+- **Forks for the orchestrator:**
+  - F1: service dependencies derived or stored;
+  - F2: may `INJECTS` reach `synthetic`;
+  - F3: gin groups to M6;
+  - F4: orphan eligibility by a whole-word mention scan;
+  - F5: Spring Data as a bean rather than a synthetic node;
+  - F6: no active-profile evaluation.
+
+  Each has a recommendation.
+- No new dependency and no migration are planned.

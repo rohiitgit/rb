@@ -326,7 +326,7 @@ Findings from the research step (2026-09-29):
 # M4 Frameworks (split into M4a and M4b; design §13)
 
 - **M4a, endpoints and request paths:** contract `tasks/contract-m4a.md` (S1–S28). **Closed 2026-10-06** (contract amendment 18) after eight evaluator passes; pass 8 (`tasks/eval-m4a-pass8.md`, verification only) VERDICT PASS.
-- **M4b, DI and dispatch** (Spring DI, Spring Data synthesis, RTA, derived `DEPENDS_ON`, full Service Card, Q3 roll-up, orphan detection): not started (next). Its contract is written next; it inherits M4a open items 1, 2, 5, 7, 9, 15 and 24.
+- **M4b, DI and dispatch** (Spring DI, Spring Data beans, RTA, entry points, orphans, Q3 roll-up, package versions and service dependencies, full Service Card): contract `tasks/contract-m4b.md` (S1–S28, soundness claims and closing bar up front, forks F1–F6) written 2026-10-06; not started. Of the M4a open items it takes 1, 5, 7, 9, 15 and 24; item 2 moves to M6.
 
 ## M4a phases
 
@@ -486,4 +486,127 @@ Each phase has at most 5 hand-edited files (blessed goldens are reviewed separat
 ## M4a closing
 - [x] Evaluator pass 8 (verification only): W1–W6 repros and controls end to end, inert-text exemptions, 19 mutants from a clean build (18 killed; X1), seven public repositories byte-identical to `95e1fbb`, regression suite, invariant 13, docs vs code.
 - [x] M4a closed 2026-10-06 (contract amendment 18: final S1–S28/invariant table, review history of passes 1–8, closing measurement, open items by milestone with the M5 adversarial carrier review list); design §13, README, IMPLEMENT.md, CHANGELOG updated.
-- [ ] M4b: write its contract (not started).
+- [x] M4b: contract written (`tasks/contract-m4b.md`, 2026-10-06); phases below.
+
+## M4b phases (contract `tasks/contract-m4b.md`)
+
+Same rules as M4a:
+- Each phase has at most 5 hand-edited files. Blessed goldens and guard data are reviewed separately and listed in the changelog.
+- Each phase is test-first: the new units fail, or do not compile, before the change.
+- Each phase ends with its verification step.
+- Every phase runs fmt, `clippy --workspace --all-targets -D warnings` and the touched crates' unit tests, counted from a log holding both streams.
+- The e2e suite runs with `RB_TEST_DATABASE_URL`.
+- Any golden that changes gets a classified line diff before `RB_BLESS=1`.
+- Mutation runs follow M4a's harness rules: fresh mtime, restored bytes checked, a `test result:` line per mutant, stopped with SIGINT.
+
+`PIPELINE` becomes `m4b-di-1` at the first output change and is bumped on each later one.
+
+- [ ] **0. Preflight** (no code).
+  - Read the contract (soundness section first), the lessons, and M4a amendments 14–18.
+  - Run `df`, `docker context show`, and `docker image inspect` for both indexer images.
+  - Confirm from primary docs the "not verified" list:
+    - D9's Spring rules: implicit single-constructor injection, `@Autowired` constructors, `@Resource` by name, `@Qualifier`/`@Primary`/name fallback and `-parameters`, `Introspector.decapitalize`, wrappers;
+    - Spring Data fragment naming;
+    - `@EnableFeignClients` default packages;
+    - Boot's JPA repository base package;
+    - Lombok's generated constructors;
+    - the npm v2/v3 lockfile layout for workspaces.
+  - Clone the S27 candidates, check the layout of each by reading, and pin commits.
+  - Build the M4a closing binary (`28e47ba`, own target directory) and dump the three fixtures and the S27 repositories. These are the invariant-1 baseline and S27's comparison.
+  - Run S6's and S9's matchers as a throwaway script over the fixtures and the public repositories, and read every hit (lesson 2026-10-06, "measure a conservative fallback on the fixtures"). Record the expected cost, or amend a list with its reason.
+  - Check the `.m2` cache for `spring-context` and `spring-boot-autoconfigure` (the new fixture classes).
+  - **Verify:** the contract gains "Checked in phase 0" with each finding and its source; any deviation from a decision is written as an amendment before code.
+- [ ] **1a. X1 and parameter, type and modifier facts** (S1).
+  - *State:* `Binding.parameter`, `Binding.type_args`, `Definition.return_type`, `Definition.modifiers`.
+  - *Derived:* none.
+  - *Invariants:* facts stay neutral; fingerprint test; no golden change.
+  - Files: `rb-frameworks/src/clients.rs` (the open-item-24 row only, shown killing mutant B), `rb-syntax/src/lib.rs`, `bindings.rs`, `decorations.rs`.
+  - **Verify:** units per language (positions from `src.find`); e2e passes with **no** re-bless.
+- [ ] **1b. Default exports and mentions** (S1).
+  - *State:* `FileFacts.default_export` and `FileFacts.mentions` (roles per name; no spans).
+  - *Invariants:* one unit row per role, plus `getLogger(X.class)`, `@Import(X.class)`, a qualified name and a string; fingerprinted.
+  - Files: `rb-syntax/src/lib.rs`, `imports.rs`, new `rb-syntax/src/mentions.rs`.
+  - **Verify:** units; e2e unchanged.
+- [ ] **2. Spring facts, pure** (S2, S3).
+  - *Derived:* per file: beans (stereotypes, `@Bean` methods with return types, Spring Data incl. store bases, Feign), bean names, qualifiers, `@Primary`, conditionals, annotations outside the inert list, scan and enable roots, `scan_unread`, injection points (forms, Lombok, wrappers, exclusions), and gate D's surface findings for the file.
+  - *Invariants:* every Spring name is import-gated (negative test each); decoys give nothing.
+  - Files: new `rb-frameworks/src/di.rs`, `rb-frameworks/src/lib.rs`.
+  - **Verify:** rb-frameworks units; e2e unchanged.
+- [ ] **3. Manifest packages and `via=package`** (S15, S16).
+  - *Derived:* direct dependencies with versions (lockfile walk, go.mod, pom literal or property); `Package` nodes in M3b's key form (`@?`); `DEPENDS_ON` with provenance `manifest`, evidence at the entry; Service → Service `via=package`; `lockfile_*` diagnostics.
+  - *Invariants:* M3b's `scip` package edges unchanged; classpath closure has a cycle test.
+  - Files: new `rb-indexer/src/packages.rs`, `rb-indexer/src/lib.rs` (wiring, `PIPELINE = m4b-di-1`).
+  - **Verify:** units; e2e churn (manifest edges on all three fixtures) classified line by line, then blessed.
+- [ ] **4. DI resolution in the indexer** (S4–S8).
+  - *Derived:* candidates per point; narrowing; gates D and M; `INJECTS` with `capped_by`; `di_*` diagnostics; `di_coverage`; the `di:` status line.
+  - *Invariants:* never `exact`; the minimum over resolution, path and rule; merge per edge; buckets sum (unit); each gate has its own biting row; counted growth test.
+  - Files: new `rb-indexer/src/di.rs`, `rb-indexer/src/lib.rs`, `rb-indexer/src/resolve.rs` (type resolution exposed), `rb-store/src/query.rs` (coverage read), `rb-cli/src/main.rs` (status line).
+  - **Verify:** units including S5's table and the S6 mutations; e2e churn classified (current fixtures: `java-spring-jpa`'s two points capped by `scan_roots_unknown`; polyglot `MfaClient` `unresolved` until `@EnableFeignClients` arrives in 12c).
+- [ ] **5. RTA proof at index time** (S9).
+  - *Derived:* proven types; `impl_instantiated: false` on their `IMPLEMENTS` edges; `rta_coverage`; the `rta:` line.
+  - *Invariants:* the edge set and certainties are unchanged (dump diff against the phase-0 baseline shows attributes only); one keeping row per rule; subtype propagation tested at depth 1/2 and in reverse; a cycle test; counted growth test.
+  - Files: new `rb-indexer/src/rta.rs`, `rb-indexer/src/lib.rs`, the `IMPLEMENTS` producers' attribute hook (`resolve.rs`/`scip.rs`, or one `GraphBuilder` call in `rb-model/src/graph.rs`: D4, the generator's choice recorded), `rb-cli/src/main.rs`.
+  - **Verify:** units; e2e churn classified (expected: no fixture type proven before the fixture phases, so dumps change only in the new coverage row).
+- [ ] **6. Precision at query time** (S10).
+  - *Derived (query time):* filtered dispatch steps; `pruned_by_rta`; the `precision=` header.
+  - *Invariants:* the defaults (Q1/Q4 `rta`, Q2/Q3 `cha`); every pruned step counted; same graph under both modes in one unit.
+  - Files: `rb-store/src/code.rs`, `rb-store/src/path.rs`, `rb-cli/src/main.rs` (flags), `rb-cli/src/code.rs`, `rb-cli/src/path.rs`.
+  - **Verify:** units; e2e (headers change in callers and path goldens: classified, blessed).
+- [ ] **7. Entry kinds and orphan eligibility at index time** (S11 stored kinds, S12).
+  - *Derived:* `Symbol` attributes `entry` and `orphan_eligible`; `orphan_coverage`; the uncached word scan.
+  - *Invariants:* import-gated kinds with decoys; one keeping row per eligibility rule; scan cost measured on the public repositories in phase 15; counted growth test.
+  - Files: new `rb-indexer/src/liveness.rs`, `rb-indexer/src/syntax.rs` (attributes), `rb-indexer/src/lib.rs`.
+  - **Verify:** units; e2e churn (symbol attributes) classified.
+- [ ] **8. Entry marks, orphans, tests and item 7 in the questions** (S11 query side, S13).
+  - *Derived (query time):* `(entry: …)` marks; the orphan reachability; `tests (n)`; endpoints listed once; the router shown for prefix-unknown endpoints; `rb impact --json`.
+  - *Invariants:* the greatest-fixpoint formulation (dead cycle orphaned; a cycle with an outside caller live); dispatch liveness; library services not computed; 5,000-deep chain; counted growth.
+  - Files: `rb-store/src/code.rs`, `rb-store/src/path.rs` (header), `rb-cli/src/code.rs`, `rb-cli/src/main.rs`, `rb-cli/src/path.rs`.
+  - **Verify:** units; e2e (impact and callers goldens re-blessed after classification).
+- [ ] **9. Q3 roll-up** (S14).
+  - *Derived (query time):* callers up to entry points; per-service ops, direct or indirect, endpoints (span-scoped), entry kinds; "through APIs" up to `--hops`; JSON `services`, `through_apis`.
+  - *Invariants:* default `cha`; visited sets on nodes and endpoints; `CONSUMES` A ↔ B cycle test; counted growth.
+  - Files: `rb-store/src/query.rs`, `rb-store/src/code.rs` (shared walk), `rb-store/src/path.rs` (upstream continuation reused, not duplicated), `rb-cli/src/main.rs`.
+  - **Verify:** units; e2e (`table-deps-*` re-blessed; the "arrive with call resolution (M3)" line gone).
+- [ ] **10. Service dependencies and the full card** (S17, S18).
+  - *Derived (query time):* `via=calls`/`via=http`/`via=package`; depended on by; shares tables; tables; call-graph summary; entry points by kind; JSON fields.
+  - *Invariants:* bytewise order; a self-call excluded; two vias between one pair both shown.
+  - Files: `rb-store/src/query.rs`, `rb-cli/src/main.rs` (`render_card`).
+  - **Verify:** units; e2e (every card re-blessed after classification).
+- [ ] **11. M4a items 1, 9, 15** (S19–S21).
+  - *Derived:* default-import mounts composed; catch-all candidates restricted to named hosts; DI-resolved client bases (`base_from_bean`).
+  - *Invariants:* each can only lower or remove (`CONSUMES` diff against the baseline classified); M4a's `synthetic` bar untouched (the existing never-`synthetic` guards still green).
+  - Files: `rb-frameworks/src/routes.rs`, `rb-indexer/src/routes.rs`, `rb-indexer/src/stitch.rs`, `rb-indexer/src/di.rs` (base lookup for S21).
+  - **Verify:** units; e2e unchanged until the fixture phase.
+- [ ] **12a. Fixtures: java-spring-jpa, part 1.** New `AuthApplication.java`, `Hashing.java`, `Tokens.java`, `AuditConfig.java`, `Notifiers.java`; `git add`.
+  - **Verify:** e2e; predict every new `INJECTS`, `impl_instantiated` and coverage line before blessing.
+- [ ] **12b. Fixtures: java-spring-jpa, part 2.** New `UserRepositoryCustomImpl.java`, `support/Service.java`, `support/ReportNotifier.java`; edits to `UserRepository.java` and `AuthController.java`.
+  - **Verify:** as 12a.
+- [ ] **12c. Fixtures: java-spring-jpa, part 3, and polyglot auth.** Edits to `DefaultAuthService.java` and `LegacyAuth.java`; polyglot new `AuthApplication.java`; edits to `UserDao.java` and `AuthController.java`.
+  - **Verify:** as 12a; the `rb path` login goldens gain `QUERIES public.users`/`audit.users` (classified).
+- [ ] **12d. Fixtures: polyglot billing and notification, ts-express-prisma.** Edits to `services/billing/internal/invoice.go` and `services/notification/src/selfcheck.ts`; new `src/routes/health.ts`; edit to `src/app.ts`.
+  - **Verify:** as 12a.
+- [ ] **13. Goldens and precision guards** (S22, S24, S26).
+  - *State:* the guard files (data beside the goldens).
+  - *Invariants:* every guard line and dump check bitten by a recorded mutation (item 5's own-service mutation included; the dynamic-URL check settled as equivalent or bitten, with the reasoning); producer coverage for `INJECTS` and both `DEPENDS_ON` forms; the invariant-1 check against the phase-0 baseline; AGE parity for `INJECTS` and Service → Service `DEPENDS_ON`.
+  - Files: `rb-cli/tests/e2e.rs`, plus the six guard files.
+  - **Verify:** e2e twice; determinism (two repos, forced rebuild, warm = cold).
+- [ ] **14. SCIP mode** (S25).
+  - Before the run: `df`, the images and the context.
+  - *Derived:* `scip-injects.txt` (the `synthetic` row end to end).
+  - *Invariants:* no `skipping:`; fresh = cached; every SCIP golden diff classified.
+  - Files: `rb-cli/tests/e2e.rs`.
+  - **Verify:** SCIP e2e with containers, twice.
+- [ ] **15. Public repositories** (S27).
+  - Clone into the scratchpad (or `var/m4b/` if the orchestrator says so).
+  - Run `--no-scip` fresh and cached; run SCIP for (a) and (b).
+  - Compute every count with a script from the dumps; identify one member per non-zero bucket.
+  - Diff against the phase-0 baseline dumps and classify.
+  - Hand-check the samples (`INJECTS` 20, all proven types or 20, 10 `rb impact` orphan runs, 20 package edges, 2 tables per Java repository).
+  - Record the wall time and facts-cache size against `28e47ba`.
+  - **Verify:** numbers recorded in the contract's measurement section, computed by a tool; clones and `m4b_*` repositories removed afterwards.
+- [ ] **16. Records and review** (S28).
+  - Records: contract amendments, measurement and open items; design §5.5/§6.2/§6.4/§8.5/§9.2–§9.5/§10.3/§13; README; IMPLEMENT.md; CHANGELOG; lessons.
+  - Full verification loop and the stub scan.
+  - Evaluator pass 1 (full review); fix its findings test-first, one amendment each.
+  - Evaluator pass 2 (verification only, per the contract's closing bar); new attack forms in residue classes go to M5's adversarial review, not the verdict.
+  - Commit after each verified phase.

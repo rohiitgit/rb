@@ -309,6 +309,8 @@ SCIP symbols from other packages (manager, package name, version) become `Packag
 
 **As built in M3b** (contract `tasks/contract-m3b.md`, amendments 11–12): a `Package` node per distinct `(manager, name, version)` named by an occurrence of an undefined global symbol in a SCIP-ok project, keyed `<manager>/<name>@<version>` (`maven/org.springframework/spring-web@6.1.13`, `npm/@prisma/client@5.22.0`, `maven/jdk@21`), and `Service -DEPENDS_ON-> Package` (`scip`/`exact`) from the referencing file's service with one evidence site. The version is the one the indexer saw, not a lockfile's; external `Symbol` stubs and edges into them are not built (a node per external symbol for no question yet asked). `rb service` lists the packages.
 
+*As decided in contract-m4b (not built yet):* direct dependencies are also read from manifests: `package.json` with `package-lock.json` (v2/v3), `go.mod` `require` lines, and `pom.xml` literal or same-pom property versions. They give `Service -DEPENDS_ON-> Package` with provenance `manifest`, M3b's key form, and `@?` when the version is unresolved. `pnpm-lock.yaml`, `yarn.lock`, Gradle and Python lockfiles are M6. A dependency on another service's package gives `Service -DEPENDS_ON{via=package}-> Service`.
+
 ---
 
 ## 6. Call-graph construction
@@ -328,6 +330,8 @@ A call through an interface or virtual method resolves (in SCIP) to the **declar
   - it is named in a framework registration (routes, a `@Component` scan);
   - it is listed in reflection config (e.g. `META-INF/services`, GraalVM `reflect-config.json`).
   Each `IMPLEMENTS` edge carries `impl_instantiated: bool`. Queries default to `precision=rta`, which skips overriders of never-instantiated types. `precision=cha` includes them all, and gives the conservative answer for Q2.
+
+*As decided in contract-m4b (D4, S9; not built yet):* a type counts as instantiated unless a proof of absence holds. Every mention of its name in the repository must be its declaration, an import or a supertype clause; there must be no string or raw-text mention and no annotation outside an inert list; it must not be default-exported, a test class, a Spring Data fragment or in a library service; and every subtype must also be proven. Java and TS/JS only. The attribute is written only as `impl_instantiated: false`. Pruned steps are counted in every answer. Defaults: `rta` for Q1/Q4, `cha` for Q2/Q3.
 
 ### 6.3 Provenance and certainty
 
@@ -355,6 +359,13 @@ A transitive answer's certainty is the **minimum** certainty along its best path
 5. **Spring Data.** A repository interface without an implementation class gets a synthetic implementation. Its derived query methods (`findBy…`, `countBy…`, `existsBy…` → read; `save*` → write; `delete*` → delete) produce `QUERIES` edges to the entity's table, with provenance `orm` and certainty `synthetic`.
 
 DI facts do **not** rewrite `CALLS` edges. A call on an injected field still targets the interface method. DI affects dispatch expansion only, through the instantiation set and the qualifier narrowing recorded on `INJECTS`.
+
+*As decided in contract-m4b (D1–D3, D8, D9, S2–S8; not built yet):*
+- `INJECTS` goes from the class (or `@Bean` method) owning the injection point to the bean's definition: a stereotype class, a `@Bean` method, or a Spring Data or Feign interface.
+- It is never `exact`. It reaches `synthetic` only through SCIP-resolved types and under allow-listed gates: literal scan roots, no conditional among the candidates, a plain DI surface, and no class literal or string naming a candidate.
+- Conditional beans are `ambiguous` and flagged, never `synthetic`.
+- A Spring Data repository is a bean of its own interface type: no synthetic node and no edge to the framework base. Its fragment implementations count as instantiated.
+- Receiver-aware narrowing of dispatch is not planned.
 
 ### 6.5 Known blind spots
 
@@ -488,7 +499,7 @@ Declarations that share a symbol key are aggregated per (symbol, table) rather t
 | `Table` | `schema.table` |
 | `Owner` | `@user`, `@org/team`, or email, verbatim from CODEOWNERS |
 | `Endpoint` | `HTTP <METHOD> <normalised path>` (path parameters → `{}`), or `GRPC <pkg.Service>/<Method>`. *As decided in contract-m4a (D1):* HTTP keys end in ` @<service key>`, e.g. `HTTP POST /api/v1/login @services/auth`, so two services' `GET /health` stay distinct; the display name is `POST /api/v1/login`. *As decided in contract-m4a (amendment 10, fork F3):* an endpoint whose prefix is unknown (a router mounted nowhere visible, a gin group passed as a parameter) is keyed by its tail plus ` ?router=<file>#<binding>`, e.g. `HTTP GET / @. ?router=users/routers.go#UserRegister.router`, so routes with one tail on different routers stay distinct; known-prefix keys are unchanged. |
-| `Package` | `<manager> <name>`; the version sits on the edge |
+| `Package` | `<manager> <name>`; the version sits on the edge. *As built in M3b and kept by contract-m4b:* `<manager>/<name>@<version>`, `@?` when unknown. |
 
 ### 8.3 Relational schema (source of truth)
 
@@ -633,7 +644,7 @@ Distance, when needed, is computed afterwards by a bounded BFS in the client ove
 | `HANDLED_BY` | Endpoint → Symbol | route packs ⋈ SCIP | |
 | `CONSUMES` | Symbol → Endpoint | http-clients + stitching (§10) | `match=exact|suffix|ambiguous` |
 | `OWNED_BY` | File/Service → Owner | CODEOWNERS | |
-| `DEPENDS_ON` | Service → Service/Package | derived (§9.5), lockfiles | `via` = calls/http/package |
+| `DEPENDS_ON` | Service → Service/Package | derived (§9.5), lockfiles | `via` = calls/http/package. *As decided in contract-m4b (D6):* Service → Package (provenance `scip` or `manifest`) and Service → Service `via=package` are stored; `via=calls`/`via=http` are derived at query time. |
 
 **Producer-coverage invariant** (checked in CI, §12): every edge kind in this table has at least one producer and at least one golden fixture asserting it.
 
@@ -673,6 +684,8 @@ EXECUTE callers('{"key": "scip-java maven com.acme:auth 1.4.0 com/acme/auth/Auth
 
 **Output:** a caller tree. Each node shows its file:line, service and certainty. Entry points (endpoint handlers, `main`, test methods, scheduled jobs) are marked as tree roots.
 
+*As decided in contract-m4b (D10, S11; not built yet):* entry kinds are `endpoint`, `top-level`, `main`, `test`, `scheduled`, `listener` and `lifecycle`. They are marked wherever they appear in the tree, and expansion continues past them.
+
 ### 9.3 Q2 — "What breaks if I remove this?"
 
 "Breaks" has two strengths, and they are reported separately:
@@ -693,6 +706,8 @@ If `t` is a class, the target set is `t` plus all its members (via `CONTAINS`), 
 
 **Orphan detection** (what becomes dead code): run a forward BFS from `t` over `CALLS ∪ REFERENCES` within the same service. A reached node `n` becomes an orphan if **all** of its inbound requiring edges come from the removed set ∪ orphans, and `n` is not an entry point. The orphan set is computed as a fixpoint.
 
+*As decided in contract-m4b (D11, S12, S13; not built yet):* orphans are the candidates not reachable from live seeds, which is the greatest fixpoint, so dead cycles are found. They are computed only in deployable services. A symbol can be an orphan only when it is `orphan_eligible`: every whole-word mention of its name in the repository's text is accounted for by an edge into it, it carries no non-inert annotation, its name is not convention-invoked, and it is not a Go method.
+
 **Defaults:** `precision=cha` for Q2, because under-reporting is the dangerous failure here. Depth is unlimited within the CSR's visited-set BFS, capped at 200 k nodes, with `truncated=true` if the cap is hit.
 
 ### 9.4 Q3 — "Which services depend on this table?"
@@ -706,6 +721,8 @@ If `t` is a class, the target set is `t` plus all its members (via `CONTAINS`), 
    - the endpoints in that service that reach the table.
 5. Services that reach the table only through `CONSUMES` into another service are **not** listed as table dependents. Instead they are shown as "`X` depends on this table through `POST /api/users` of `user-service`". This distinction matters for ownership.
 6. **Migrations:** list which files and services `MIGRATES` the table. This answers "who owns the schema".
+
+*As decided in contract-m4b (D5, D12, S14; not built yet):* Q3 defaults to `precision=cha`. Callers include `REFERENCES`. Endpoints reaching the table respect inline-handler spans. Services reaching the table only through an API are listed with the endpoint chain, up to `--hops`.
 
 ### 9.5 Service Card
 
@@ -740,6 +757,8 @@ The Dependencies section is built from these derived service edges:
 - `{via=package}` from lockfiles.
 
 Shared tables are reported as **coupling**, deliberately kept separate from dependency.
+
+*As decided in contract-m4b (S15–S18; not built yet):* `via=calls` and `via=http` are computed at query time from `CALLS`/`REFERENCES` and `CONSUMES` edges crossing services. `via=package` comes from manifests. The card adds Packages with versions, Database tables, Dependencies, Depended on by, Shares tables with, and a Call graph summary with entry points by kind.
 
 ### 9.6 Q4 — "Show the request path for login"
 
@@ -810,6 +829,7 @@ Input: an endpoint query such as `login`. Resolution matches `Endpoint` keys by 
 - **Scope.** The walk covers the handler's service plus library services. A call into another deployable service is shown and not followed.
 - **Inline handlers.** A handler that is an inline function is its enclosing definition (or `File`), restricted to the edges whose evidence lies in its span.
 - **Dispatch** is CHA until M4b brings RTA. `INJECTS` arrives with M4b.
+  *As decided in contract-m4b (S10):* RTA applies with `--precision` (default `rta`). `rb path` does not follow `INJECTS`, which is a type-level edge with no method step.
 - **Limits.** `--hops` defaults to 4 (maximum 8).
 - **Output** is text and JSON; Mermaid/DOT are deferred.
 - *As built in M4a (amendments 6 and 10):* input resolution tries an exact endpoint key, then `<METHOD> <path>` normalised as routes are, then a substring of endpoint names, then a handler or client symbol; several candidates are listed (a prefix-unknown endpoint with its router) and `--pick N` chooses, never a silent pick. Each `CONSUMES` step says how it was stitched (host, proxy, suffix match, candidate count).
@@ -946,9 +966,9 @@ Each milestone is shippable and has an exit criterion that is a test, not a demo
 | **M3a Tier B** | Import, package and binding facts; module resolution; heuristic `CALLS/REFERENCES/IMPLEMENTS`; resolution coverage; `rb callers`, `rb impact` over the in-memory graph | contract `tasks/contract-m3a.md` R1–R13: Q1/Q2 goldens on all fixtures with must-not-exist cases; ≥ 90% precision on a hand-checked sample of 4 public repos. **Done 2026-10-01** after six evaluator passes; resolved share of own-code references: gin 63%, petclinic 39%, requests 30%, hono 15%; sampled precision 96/96. |
 | **M3b SCIP** | SCIP orchestration in pinned containers (scip-java, scip-typescript first); SCIP⋈TS join; key replacement per project; `Package`/`DEPENDS_ON` from external symbols (change sets and orphan detection deferred: contract scope) | exact edges on the fixtures that build; cached and fresh indexes dump identically. **Done 2026-10-06** (built 2026-10-01; contract `tasks/contract-m3b.md` S1–S13, amendments 1–81 after twelve evaluator passes; final binary measured on nine public repositories): Maven and npm projects; spring-petclinic 256 exact `CALLS` and 13 `IMPLEMENTS`, class-validator 398 and 2, jsoup 14,013 and 688, spring-retry 459 and 252, networknt/json-schema-validator 6,449 and 731, spring-petclinic/spring-petclinic-rest 652 and 166, vavr 27,257 and 5,994, TheAlgorithms/Java 10,374 and 269, typestack/routing-controllers 169 and 38, 0 documents rejected and 0 supertypes unconfirmed on each (evaluator passes 6 and 7 sampled 80/80 `CALLS` and 32/32 `IMPLEMENTS` correct); open items (effective source encoding, TypeScript restructurings Tree-sitter parses cleanly, TypeScript interface-method `IMPLEMENTS`, Gradle, spring-retry's test tree, M6 build recipes, workspace installs, tsconfig include/exclude, a registry allow-list for the fetch phase) are listed in contract amendment 81 and carried to M4–M6. |
 | **M4a Endpoints and request paths** | Spring MVC, Express and Go (gin, `net/http`) route packs; `fetch`/axios, Feign/`RestTemplate`/`WebClient` and Go `net/http` client packs; endpoint normalisation; `http_stitch`; `rb path`; the Service Card's API section; the `rb impact` endpoint roll-up | contract `tasks/contract-m4a.md` S1–S28: Q4 goldens on `polyglot-monorepo` (TypeScript → Java → TypeScript, plus Go); must-exist and must-not-exist edge lists green on all three fixtures; no `CONSUMES` above `synthetic`; three public repositories measured (20/20 sampled endpoints). **Done 2026-10-06** (built 2026-10-06; contract `tasks/contract-m4a.md` S1–S28 and invariants 1–13 all PASS, amendments 1–18 after eight evaluator passes, fork F3 decided; closing binary `28e47ba`, `PIPELINE` `m4a-http-11`): fixture goldens and guards green with and without SCIP, e2e 17/17; seven public repositories (spring-petclinic-microservices, node-express-realworld, golang-gin-realworld, piggymetrics, ftgo-application, piomin, Store-Microservices) give 195 endpoints and 94 client sites, `CONSUMES` 13 heuristic and 2 ambiguous, **0 `synthetic`, 0 false `synthetic`**, fresh == cached; spring-petclinic-microservices 16/16 endpoints and 5/5 `CONSUMES` correct, node-express-realworld 20/20 as labelled, golang-gin-realworld 20/20 sampled. A request is `synthetic` only through a carrier proven plain by a repository-wide token scan plus a raw-text scan of unparsed files, with no discovery configuration (amendments 13–17). Open items (24, each with its milestone: M4b, M5 including the adversarial carrier review, M6) are consolidated in contract amendment 18 and the contract's Open items table. |
-| **M4b DI and dispatch** | Spring DI synthesis (`INJECTS`, qualifiers, `@Primary`, profiles/conditionals); Spring Data synthetic implementations; RTA filter (`impl_instantiated`, `precision=rta` default); derived `DEPENDS_ON` (calls/http/package, lockfile versions); the rest of the full Service Card; Q3 service roll-up with endpoints; orphan detection; entry points in `rb callers` | Q3 goldens on `polyglot-monorepo` and `java-spring-jpa`; RTA precision guards (an uninstantiated implementation is not a dispatch target) green. **Not started.** |
+| **M4b DI and dispatch** | Spring DI synthesis (`INJECTS`, never above `synthetic`: qualifiers, `@Primary`, name fallback, profiles/conditionals never `synthetic`, `@Bean` methods, Lombok constructors); Spring Data repositories and Feign clients as beans (no synthetic node, fork F5); RTA as a proof of absence (`impl_instantiated: false`; `precision=rta` default for Q1/Q4, `cha` for Q2/Q3); entry points; orphan detection; Q3 service roll-up with endpoints and "through APIs"; `Package` versions from `package-lock.json`, `go.mod` and pom literals; service dependencies (`via=package` stored, `via=calls`/`via=http` at query time, fork F1); the rest of the full Service Card; M4a open items 1, 5, 7, 9, 15, 24 (item 2 moves to M6) | contract `tasks/contract-m4b.md` S1–S28, with its soundness claims and closing bar stated up front: Q3 goldens on `polyglot-monorepo` and `java-spring-jpa`; RTA precision guards (an uninstantiated implementation is not a dispatch target) green; DI, RTA and orphan guards with biting mutations; seven public repositories measured (0 false `synthetic` `INJECTS`, 0 pruned-but-instantiated types, 0 false orphans in the samples). **Contract written 2026-10-06; not started.** |
 | **M5 Scale & API** | REST API with guard rails; bulk AGE loading; snapshot retention; `rb diff`; benchmark on 2 large OSS repos | §12.5 targets met or gaps documented with profiles |
-| **M6 Breadth** | scip-python/go/clang/rust-analyzer; Kotlin/C#; OpenAPI/gRPC packs; gateway configs; message topics; architecture-rule checks in Cypher as a CI gate | per-language fixtures; rules engine golden tests |
+| **M6 Breadth** | scip-python/go/clang/rust-analyzer; Kotlin/C#; OpenAPI/gRPC packs; gateway configs; message topics; architecture-rule checks in Cypher as a CI gate. *Moved here by contract-m4b:* gin groups passed as parameters (M4a open item 2), Guice/Dagger/NestJS/.NET DI, Spring XML and Kotlin bean definitions, active-profile evaluation, pnpm/yarn/Gradle/Python lockfiles | per-language fixtures; rules engine golden tests |
 
 ---
 
