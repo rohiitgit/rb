@@ -1,6 +1,6 @@
 # M5 contract: scale and API — REST API with guard rails, snapshot lifecycle, `rb diff`, AGE loading, fetch-phase egress, benchmark (draft, planner, 2026-10-07)
 
-**Status (evaluator pass 1 fixed, 2026-10-07):** built (phases 0–20); evaluator pass 1 (full review, `tasks/eval-m5-pass1.md`: FAIL on Z1, Z2) fixed test-first as amendment 16; pass 2 (verification only) pending. Open items are consolidated in "Open items" at the end.
+**Status (closed, 2026-10-07):** built (phases 0–20); evaluator pass 1 (full review, `tasks/eval-m5-pass1.md`: FAIL on Z1, Z2) fixed test-first as amendment 16; evaluator pass 2 (verification only, `tasks/eval-m5-pass2.md`) PASS; **M5 is closed** (amendment 17). Open items are consolidated in "Open items" at the end and by milestone in amendment 17.
 
 Written before any code. M5 is done only when every assertion below is backed by a passing test or a recorded measurement. Nothing here is built yet. "Verified facts" are only what was read in the code, the goldens or the records at commit `afae548` (M4b closed, `PIPELINE` `m4b-di-8`).
 
@@ -363,6 +363,87 @@ The contract proceeds with each recommendation unless told otherwise.
     - **Mutations (each run against the tests named, the file restored from its copy and byte-compared, no harness or server left running):** m16 (`kept_snapshot` accepts any status but `building`) killed by the API suite (the failed snapshot answered `nothing matches "a"`); m17 (`while let` → `if let` in `drop_non_live_graphs`) killed by the stopped-publish test and the property test; Z1's check removed: killed by the `rb-server` unit and the API suite; Cypher's `live` gate removed: killed by the `rb-store` test and the e2e (`rb cypher --snapshot <old>` exit 0); the `SnapshotInfo` mask removed: killed by both (the retired row names its graph); `rb serve`'s sweep call removed: killed by the e2e (two graphs after the server started); the path decoding removed: killed by the `rb-server` unit and the API suite (`%5F` → `not_found`); decoding twice: killed (`%255F`); hex digits in base 36: killed; duplicate-`Host` check at `> 2`: killed; the authority allow-list check removed: killed; the authority = `Host` check removed: killed. 16 mutants, 16 killed.
     - **Records:** invariant 1: the three fixture dumps with this tree equal phase 20's (`var/m5/p20/dumps/`) byte for byte (the change touches no dump). `rb cache prune --facts` removed 19,783 stale facts rows (649,322,998 bytes), keeping 19,123 current ones. Verification (`var/m5/scripts/verify.sh ev1`): fmt, clippy clean; 639 unit tests outside e2e and api; `rb-store` with the database 65/65; `rb-server` 12/12; e2e 30/30; api 1/1; no `skipping`, no listener, stub scan clean.
 
+17. **M5 is closed (evaluator pass 2, 2026-10-07).** Pass 2 (`tasks/eval-m5-pass2.md`, against `5cb1a2c`) was the verification-only re-check the closing bar decided. It returned **VERDICT: PASS**:
+    - **Z1–Z7 hold end to end, with controls unchanged.**
+      - Z1: `status`/`snapshots` of a never-indexed name are `not_found` on both surfaces, including encoded and unicode names.
+      - Z2: the pass-1 lock plus `kill -9` repro with no hook, run twice. Cypher on the retired snapshot is `invalid_param` on both surfaces. `rb snapshots`/`rb status` name no graph for it, and `rb gc --dry-run` lists the leftover. Healed once by `rb serve`'s startup sweep (stderr names the graph) and once by the next publish; `gc` then reports "nothing to remove".
+      - Z3: `%5F`, `%5f` and an encoded first letter name the real repository; `%2F` stays in the segment; `%255F` is decoded once; malformed escapes are `invalid_param`.
+      - Z4: three duplicate-`Host` orders give `400`; three foreign authorities give `421`; an authority that differs from `Host` gives `400`.
+      - Z5: a `failed` snapshot through `callers`, `find` and Cypher is `not_found`.
+      - Z7: `414`/`431`/`400` are bare; a 65,000-character target gets its JSON.
+    - **Mutations:** 12 of 12 mutants of amendment 16's conditions were killed from a clean build (Host ×3, decoding ×2, m17, the `live` gate, the `SnapshotInfo` mask, sweeping only the first repository, Z1's check, m16, the serve sweep call). One is killed only through the e2e when other repositories exist (note N2).
+    - **Regression:**
+      - `verify.sh` twice (`ev2a`, `ev2b`): fmt, clippy, 639 unit tests, `rb-store` 65/65, `rb-server` 12/12, e2e 30/30 with the seven `scip_*` tests, api 1/1 (150 sets); no `skipping`, no listener, stub scan clean.
+      - Invariant 1: fixture dumps byte-identical to phase 20's. spring-petclinic @ `818c4136ea97` fresh == cached == a second name == phase 20's, and against `afae548` exactly the one S19 (d) `orphan_coverage` row.
+      - Benchmark determinism (`--no-scip`, HEAD binary): shardingsphere and mattermost fresh == cached, each byte-identical to its recorded phase-17 dump.
+      - API ≡ CLI on 29 of the evaluator's own parameter sets, with bodies identical across two server runs. No host paths.
+    - **Notes, non-blocking (M6 review list, open items 24 and 25):**
+      - **N1:** `rb serve` sweeps before it checks the bind address, so a refused non-loopback bind still drops leftover graphs. No request is answered, so the claim holds.
+      - **N2:** the sweep's "every repository" has no database-independent test; `sweep_graphs` is unit-tested with one repository.
+
+    **Final status of the assertions and invariants (pass 2):**
+
+    | # | Status | Evidence (pass 2) |
+    |---|---|---|
+    | S1 | PASS | DB suite twice; pass 1's concurrent reads (35 dumps, 0 mixed) |
+    | S2 | PASS | lock in every DDL path; measurement recorded (phases 0–1) |
+    | S3 | PASS (fixed, Z2) | Z2 repro twice, healed by publish and by serve; m17 and the sweep mutants killed |
+    | S4 | PASS | `rb gc --dry-run` lists the leftover; "nothing to remove" after healing |
+    | S5 | PASS | fresh `--no-cache` == cached on petclinic and both benchmark repositories |
+    | S6 | PASS | e2e parity twice; benchmark parity recorded (S24) |
+    | S7 | PASS | read-only Cypher (pass 1); retired snapshot `invalid_param` |
+    | S8 | PASS | e2e 30/30 twice, no `skipping` |
+    | S9, S10 | PASS | units, property tests, e2e |
+    | S11 | PASS | envelopes in every identity set |
+    | S12 | PASS (fixed, Z1) | both surfaces; Z1-check mutant killed |
+    | S13 | PASS (fixed, Z3, Z4) | probes and controls; Host and decoding mutants killed; N1 noted |
+    | S14 | PASS | API suite twice; 29 own sets; Z7 residue (open item 23) |
+    | S15 | PASS | paging sets identical |
+    | S16, S17 | PASS | apply/inverse (pass 1); `diff` sets identical |
+    | S18, S19 | PASS | invariant 1 classified (12 rows on seven repositories, phase 20; re-checked on the fixtures and spring-petclinic) |
+    | S20 | PASS | records |
+    | S21 | PASS | probe suite twice; escape review is open item 22 (M6) |
+    | S22 | PASS | recorded (spring-retry) |
+    | S23–S26 | PASS | measured and recorded; §12.5 below |
+    | S27 | PASS | determinism and invariant 1 (above) |
+    | S28 | PASS | verification loop twice; both evaluator passes done |
+
+    | Invariant | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+    |---|---|---|---|---|---|---|---|---|---|---|---|
+    | Status | PASS | PASS | PASS | PASS | PASS (fixed, Z2) | PASS | PASS (N1) | PASS | PASS | PASS | PASS |
+
+    **Review history:**
+    - **Pass 1** (full review, against `9a2719f`, FAIL): 7 findings.
+      - Major: Z1 (`status` of an unknown repository answered 200) and Z2 (a publish killed between flip and retention left a second AGE graph, and Cypher answered on the retired snapshot).
+      - Minor: Z3 (path segments not decoded), Z4 (duplicate `Host`, absolute-form authority).
+      - Test coverage: Z5 (m16), Z6 (m17).
+      - Doc: Z7 (hyper's bare refusals).
+      - 17 mutants, 15 killed. All seven were fixed test-first in `5cb1a2c` (amendment 16).
+    - **Pass 2** (verification only, against `5cb1a2c`, PASS): no blocking finding; N1 and N2 are non-blocking notes.
+
+    **Benchmark summary (§12.5, S24–S25; Apple M4, 10 cores, Docker VM 10 CPUs / 7.75 GiB, shared machine, loads stated per run above):**
+    - **Full index ≤ 15 min excluding the fetch:**
+      - met without SCIP (shardingsphere 35.0 s, mattermost 29.2 s fresh);
+      - met with SCIP on mattermost (610.6 s including fetches; 4 of 11 TypeScript projects build);
+      - **missed with SCIP on shardingsphere** (≈ 1,238 s; the profile shows 96.6 % of `rb`'s main-thread samples waiting on the single scip-java job for the 446-module reactor; open items 1–2).
+    - **Incremental ≤ 30 s: met** (17.9–19.6 s, `--no-scip`).
+    - **Q1 p95 ≤ 50 ms: met** (≤ 3.33 ms).
+    - **Q2 p95 ≤ 500 ms: met** (≤ 152.1 ms).
+    - **Q4 p95 ≤ 1 s: met on mattermost** (3.64 ms, 66 endpoints); shardingsphere has none.
+
+    **Open items by target milestone** (the table in "Open items"):
+    - **M6:**
+      - SCIP and build breadth: 1–5, 8, 18;
+      - request-path precision: 6, 7, 11, 12;
+      - DI registrants: 13, 14;
+      - precision items measured in M5: 17;
+      - benchmark gaps to re-measure: 9; S19's costs: 10;
+      - only if asked for: 19 (authentication and remote binding), 20 (move detection);
+      - **22** (adversarial egress review of the fetch phase);
+      - the **M6 review list** from pass 2: **24** (N1), **25** (N2).
+    - **Residue (no target):** 15, 16, 23.
+    - **Not planned:** 21.
+
 ## Benchmark measurements (S23–S26; phases 16–19)
 
 Hardware of record (D14): Apple M4 (`Mac16,12`), 10 cores, 16 GiB, macOS 26.6.2; Docker Desktop VM 10 CPUs, 8,319,504,384 bytes (7.75 GiB); Postgres 18 + AGE 1.8 in the compose container `repository-brain-brain-db-1` (port 55433). The machine is shared: other applications (Firefox, VS Code, Music, Spotlight's `mdworker`s after each clone) run throughout and are left alone; each timing states the load averages at its start and end. Raw outputs: `var/m5/bench/out/` (meta, stdout, stderr, `sample` call trees), scripts in `var/m5/scripts/`.
@@ -496,5 +577,7 @@ Every item M5 leaves open, with its source, its example or measurement, and its 
 | 21 | Not planned, recorded: the `RB_SERVER` thin client (the identity suite proves the surfaces agree), partition-per-snapshot (retention's delete measured at 1.27–1.40 s per snapshot), edge-delta loading (incremental targets met with whole-snapshot assembly), facts-cache compaction (9 % and 17 % of the repositories' snapshots, under D13's 25 %) | Scope; S24 | as listed | none | not planned |
 | 22 | Adversarial egress review: evaluator pass 1 did not attempt escapes beyond the project's probe suite (`scip_egress_probes_from_a_fetch_container`) | evaluator pass 1 (S21, "not done in this pass") | — | none known; the probe suite's forbidden paths are closed | M6: a dedicated review of the fetch phase (repository-controlled build configuration, proxy parsing, Docker Desktop networking) |
 | 23 | hyper's transport-level refusals have no JSON body (`414` URI over 65,534 bytes, `431` too many or too large headers, `400` malformed request), sent before the request reaches the server | evaluator pass 1, Z7 (amendment 16 (e)) | bare status, empty body, no `Server-Timing` (test `transport_refusals_are_hyper_bare_statuses`) | none: a status with no body, never a different answer | residue (a JSON body would need a replacement for hyper's HTTP/1 parser) |
+| 24 | `rb serve` runs its startup sweep (a write) before it checks the bind address: a refused non-loopback `--bind` still drops leftover graphs | evaluator pass 2, N1 | `rb serve --bind 0.0.0.0:…` sweeps, then refuses (`crates/rb-cli/src/main.rs` calls `sweep_leftover_graphs` before `rb_server::serve` checks loopback) | none: no request is answered; the sweep drops only graphs no read uses | M6: check the bind before the sweep, or state it in the README |
+| 25 | The startup sweep's "every repository" has no database-independent test | evaluator pass 2, N2 | mutant "sweep only the first repository name" survives the `rb-store` suite (one repository) and is killed by the e2e only when another repository sorts first | none (coverage): a regression would leave a leftover that reads ignore and the next publish drops | M6: a `rb-store` test with leftovers in two repositories |
 
 Closed in M5 (for the record): M4a open items 4 (`--no-cache` writes, S5), 6 (S18), 8, 11, 22's follow-up (Gate A's cost) and 23 (measured, S24–S26), 10 as far as the benchmark allows (the 8 `ambiguous` read; no heuristic edge to sample: item 9), 21 (part, S19 (f)), 22 (a)–(d) (S19); M4b open items 3 (S19 (d)), 10 (`rb callers --json`, S11), 11 (measured), 21 (S19 (e)), 23 (a) (S19 (g)) and 23 (c) (Maven's duplicate handling observed, `@?` stays); design §14's fetch-phase egress (S21, S22) and the AGE DDL lock (S2); evaluator pass 1's Z2 crash window as far as answers go (amendment 16 (b): no read uses a leftover graph; the next publish or `rb serve` start of the repository removes it).

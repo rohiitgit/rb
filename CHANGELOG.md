@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026-10-07] (wall clock) Close M5 (evaluator pass 2: VERDICT PASS)
+- Records only, no code change. Evaluator pass 2 (`tasks/eval-m5-pass2.md`, verification only, against `5cb1a2c`): Z1–Z7 hold end to end with controls unchanged — Z2's lock + `kill -9` repro run twice without a hook (Cypher on the retired snapshot `invalid_param` on both surfaces, no graph named for it, `rb gc --dry-run` lists the leftover; healed once by `rb serve`'s startup sweep, once by the next publish); Z1, Z3, Z4 and Z7 by raw-socket probes; Z5 through a real `failed` snapshot.
+- 12 mutants of amendment 16's conditions from a clean build: 12 killed (one, sweeping only the first repository, only through the e2e when other repositories exist: N2).
+- Regression: `verify.sh` twice (fmt, clippy, 639 unit tests, `rb-store` 65/65, `rb-server` 12/12, e2e 30/30 with the seven `scip_*` tests, api 1/1; no `skipping`, no listener, stub scan clean). Invariant 1: fixture dumps equal phase 20's; spring-petclinic fresh == cached == second name == phase 20's, and against `afae548` exactly the S19 (d) row. shardingsphere and mattermost `--no-scip` fresh == cached, each equal to its phase-17 dump. API ≡ CLI on 29 own parameter sets (encoded and unicode names, retired and failed snapshots, Cypher), identical across two server runs; no host paths.
+- Contract amendment 17: final S1–S28/invariant table, review history (pass 1: 2 major, 2 minor, 2 test coverage, 1 doc, fixed in `5cb1a2c`; pass 2: none blocking), §12.5 summary (met except the SCIP full index on shardingsphere, with its profile), open items by milestone; new open items 24 (N1: `rb serve` sweeps before its bind check) and 25 (N2: a two-repository sweep test), both M6. Design §13 marks M5 done and lists the items M5 moved to M6. README, IMPLEMENT.md and `tasks/todo.md` list M6 as next. One closing lesson.
+
 ## [2026-10-07] (wall clock) M5 evaluator pass 1 fixed: unknown repos, self-healing graphs, Host strictness (amendment 16)
 - **Evaluator pass 1** (`tasks/eval-m5-pass1.md`, against `9a2719f`, VERDICT FAIL) fixed test-first, as the orchestrator decided.
 - **Z1:** `status` of a repository never indexed is `not_found` (exit 3 / `404`) on both surfaces, checked in `rb-api`.

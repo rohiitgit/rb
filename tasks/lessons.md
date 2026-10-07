@@ -269,3 +269,7 @@
 ## 2026-10-07: a test that sends more than the server reads may see a reset instead of the reply
 - **Mistake (caught while writing the Z7 test):** a 420,078-byte header was answered `200` (hyper read it whole although its buffer limit is about 410 KiB), and a 1 MiB header was `431` only because the server closed before reading the rest, which a client can see as a connection reset instead of the reply.
 - **Rule:** a transport-limit row in a test must be one the server reads whole before refusing (too many headers, a long target); a refusal that closes mid-request is recorded as a measurement, not asserted, and a limit is never assumed from a constant in the source without sending the request.
+
+## 2026-10-07: a claim about "every" item needs a test with at least two, in a state the test controls
+- **Mistake (evaluator pass 2, N2):** `rb serve`'s startup sweep claims every repository, but `sweep_graphs` was tested with one repository; the mutant that sweeps only the first name survived the `rb-store` suite and was killed by the e2e only because the evaluator's own repositories happened to sort before the test's.
+- **Rule:** when a mechanism loops over a collection, test it with at least two members whose order puts the interesting one last, inside state the test creates; a kill that depends on what else is in a shared database is not a kill.

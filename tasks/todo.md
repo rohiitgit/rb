@@ -770,5 +770,13 @@ Same rules as M4b:
     - [x] Open items 22 (adversarial egress review → M6), 23 (Z7); Z2's window closed for answers.
     - [x] Mutations 16/16 killed; invariant 1: fixture dumps equal phase 20's; `rb cache prune --facts` (19,783 rows, 649,322,998 bytes).
     - [x] Verification (`var/m5/scripts/verify.sh ev1`): fmt, clippy; 639 unit; store 65/65; server 12/12; e2e 30/30; api 1/1; no `skipping`, no listener, stub scan clean.
-  - [ ] Evaluator pass 2 (verification only, per the contract's closing bar).
+  - [x] Evaluator pass 2 (verification only, per the contract's closing bar; `tasks/eval-m5-pass2.md`: PASS).
   - Commit after each verified phase.
+
+## M5 closing
+- [x] Evaluator pass 2 (verification only, against `5cb1a2c`): Z1–Z7 repros and controls end to end (Z2's lock + `kill -9` twice, healed by `rb serve` and by the next publish), 12 mutants of amendment 16 from a clean build (12 killed), `verify.sh` twice green, invariant 1 (fixtures = phase 20; spring-petclinic: the one S19 (d) row against `afae548`), fresh == cached on spring-petclinic and both benchmark repositories (each equal to its phase-17 dump), API ≡ CLI on 29 own sets, no host paths, docs vs code (N1, N2: non-blocking, open items 24, 25).
+- [x] M5 closed 2026-10-07 (contract amendment 17: final S1–S28/invariant table, review history of passes 1–2, §12.5 summary, open items by milestone with the M6 review list and item 22); design §13, README, IMPLEMENT.md, CHANGELOG updated.
+
+# M6 Breadth (design §13)
+
+- [ ] Not started. Scope in design §13, plus the items M4b and M5 moved there (contract-m5 amendment 17: open items 1–14, 17–20, 22, 24, 25). Its contract is written first.

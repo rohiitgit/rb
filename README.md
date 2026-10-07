@@ -3,7 +3,7 @@
 A deterministic, LLM-free code-intelligence graph for Git repositories. It is built with Rust, Postgres and Apache AGE.
 The design is in [docs/repository-brain-design.md](docs/repository-brain-design.md).
 
-**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution), M3b (SCIP), M4a (endpoints and request paths) and M4b (DI and dispatch) are done; M5 (scale and API: `rb serve`, `rb diff`, JSON everywhere, retention and `rb gc`, the fetch-phase egress proxy, the benchmark) is built and pending its evaluator review (contract `tasks/contract-m5.md`).** `rb` indexes a commit into a snapshot containing:
+**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution), M3b (SCIP), M4a (endpoints and request paths), M4b (DI and dispatch) and M5 (scale and API: `rb serve`, `rb diff`, JSON everywhere, retention and `rb gc`, the fetch-phase egress proxy, the benchmark; contract `tasks/contract-m5.md`) are done; M6 (breadth) is next.** `rb` indexes a commit into a snapshot containing:
 
 - one `File` node per blob, with its blob SHA, size, language and binary/generated flags;
 - one `Service` per detected project (package.json, Maven, Gradle, go.mod / `package main`, Cargo, pyproject, Dockerfile, `rb.toml`), marked deployable or library;
