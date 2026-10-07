@@ -86,7 +86,9 @@ use serde_json::{Value, json};
 /// (S19 (d), (e), (g)): Spring Data fragment implementations are no orphans, a supertype head
 /// resolved by name is external unless unique and imported from nowhere outside, and a class a
 /// class literal registers is a DI candidate (`ambiguous` beside the scanned beans).
-pub const PIPELINE: &str = "m5-3";
+/// `m6a-1`: scip-java documents are judged without their Lombok-generated occurrences
+/// (contract M6a D1).
+pub const PIPELINE: &str = "m6a-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -933,6 +935,16 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
                 .map(|(reason, n)| (reason.as_str().to_owned(), Value::from(*n)))
                 .collect::<serde_json::Map<String, Value>>(),
         });
+        // Contract M6a D3: written only when non-zero, so a project without Lombok dumps as
+        // before M6a.
+        for (key, n) in [
+            ("lombok_removed", c.lombok_removed),
+            ("documents_lombok", c.documents_lombok),
+        ] {
+            if n > 0 {
+                detail["coverage"][key] = n.into();
+            }
+        }
     }
     if matches!(
         p.status,
@@ -1645,6 +1657,32 @@ mod tests {
         // The phase that failed is recorded, as for a timeout (contract M3b amendment 56).
         assert_eq!(d.detail["phase"], "fetch");
         assert!(d.detail.get("budget_secs").is_none(), "{}", d.detail);
+    }
+
+    /// Contract M6a D3, S3: the Lombok counters are written to the coverage only when
+    /// non-zero, so a project without Lombok dumps as before; the other keys are unchanged.
+    #[test]
+    fn lombok_counters_are_written_only_when_non_zero() {
+        let project = ok_project("", "scip-java", vec![]);
+        let plain = scip::Coverage::default();
+        let d = scip_status(&project, Some(&plain));
+        let keys: Vec<&String> = d.detail["coverage"].as_object().unwrap().keys().collect();
+        assert!(!keys.iter().any(|k| k.contains("lombok")), "{keys:?}");
+        let lombok = scip::Coverage {
+            lombok_removed: 27,
+            documents_lombok: 4,
+            ..Default::default()
+        };
+        let d = scip_status(&project, Some(&lombok));
+        assert_eq!(d.detail["coverage"]["lombok_removed"], 27);
+        assert_eq!(d.detail["coverage"]["documents_lombok"], 4);
+        let mut without = d.detail["coverage"].as_object().unwrap().clone();
+        without.remove("lombok_removed");
+        without.remove("documents_lombok");
+        assert_eq!(
+            serde_json::Value::Object(without),
+            scip_status(&project, Some(&plain)).detail["coverage"]
+        );
     }
 
     /// Contract M4a amendment 16 (evaluator pass 6, V2): a Feign client key in any settings

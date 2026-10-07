@@ -1265,6 +1265,16 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
                 let _ = write!(line, " ({})", reasons.join(", "));
             }
         }
+        // Occurrences removed as Lombok-generated before the agreement checks (contract M6a
+        // D1, D3), when there are any.
+        if n("lombok_removed") > 0 {
+            let _ = write!(
+                line,
+                ", lombok-generated {} in {} documents",
+                n("lombok_removed"),
+                n("documents_lombok")
+            );
+        }
         let _ = write!(
             line,
             ", relationships dropped {} ({} in project, {} anonymous)",
@@ -2841,6 +2851,22 @@ mod tests {
             "{}",
             scip_status_line(&rejected)
         );
+        // Contract M6a D3: the Lombok removals follow the rejected documents, only when there
+        // are any.
+        let lombok = diagnostic(json!({
+            "indexer": "scip-java", "status": "ok", "unpinned": false, "image": "sha256:1",
+            "coverage": {"definitions_without_occurrence": 0, "documents_rejected": 1,
+                         "documents_rejected_reasons": {"structure_disagreement": 1},
+                         "lombok_removed": 27, "documents_lombok": 4},
+        }));
+        assert!(
+            scip_status_line(&lombok).contains(
+                ", documents rejected 1 (structure_disagreement 1), lombok-generated 27 in 4 documents, relationships dropped 0"
+            ),
+            "{}",
+            scip_status_line(&lombok)
+        );
+        assert!(!scip_status_line(&rejected).contains("lombok"));
         // Contract M3b amendment 67: a snapshot written before a field existed (the evaluator's
         // `fp3_class_validator`, before amendments 62 and 64) omits it instead of printing 0.
         let old = diagnostic(json!({

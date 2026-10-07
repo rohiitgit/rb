@@ -96,6 +96,35 @@ impl Package {
     }
 }
 
+/// Whether `symbol` is Lombok's `@lombok.Generated` annotation type (contract M6a D1), the
+/// marker Lombok puts on every member it generates: package `maven/org.projectlombok/lombok` of
+/// any version, descriptors exactly the namespace `lombok/` and the type `Generated#`, read from
+/// the parsed symbol, never from its text.
+pub fn is_lombok_generated_marker(symbol: &str) -> bool {
+    use scip::types::descriptor::Suffix;
+    if scip::symbol::is_local_symbol(symbol) {
+        return false;
+    }
+    let Ok(parsed) = scip::symbol::parse_symbol(symbol) else {
+        return false;
+    };
+    let in_lombok = parsed
+        .package
+        .as_ref()
+        .is_some_and(|p| p.manager == "maven" && p.name == "maven/org.projectlombok/lombok");
+    let descriptors: Vec<(&str, Result<Suffix, i32>)> = parsed
+        .descriptors
+        .iter()
+        .map(|d| (d.name.as_str(), d.suffix.enum_value()))
+        .collect();
+    in_lombok
+        && descriptors
+            == [
+                ("lombok", Ok(Suffix::Namespace)),
+                ("Generated", Ok(Suffix::Type)),
+            ]
+}
+
 /// The package of a global symbol; `None` for local symbols, strings the grammar rejects and
 /// symbols with no package (scip-java's namespace-only `scip-java maven . . org/springframework/`).
 pub fn package(symbol: &str) -> Option<Package> {
@@ -282,5 +311,38 @@ mod tests {
         assert_eq!(package("local 3"), None);
         assert_eq!(package("not a symbol"), None);
         assert_eq!(package(""), None);
+    }
+
+    /// Contract M6a D1, S1 (k): the marker is Lombok's own `lombok.Generated` annotation type,
+    /// told apart by the parsed package (`maven/org.projectlombok/lombok`, any version) and the
+    /// whole descriptor path (`lombok/` then `Generated#`), never by text.
+    #[test]
+    fn the_lombok_marker_is_identified_by_package_and_descriptors() {
+        let yes = [
+            "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Generated#",
+            "scip-java maven maven/org.projectlombok/lombok 1.18.30 lombok/Generated#",
+        ];
+        for symbol in yes {
+            assert!(is_lombok_generated_marker(symbol), "{symbol}");
+        }
+        let no = [
+            // Another package that declares the same type name.
+            "scip-java maven maven/com.example/fake 1.0 lombok/Generated#",
+            // No package at all.
+            "scip-java maven . . lombok/Generated#",
+            // Other types and members of Lombok, and the namespace alone.
+            "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Getter#",
+            "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/experimental/Generated#",
+            "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Generated#value().",
+            "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/",
+            // javax's and the JDK's `Generated`.
+            "scip-java maven jdk 21 javax/annotation/processing/Generated#",
+            "scip-java maven maven/javax.annotation/javax.annotation-api 1.3.2 javax/annotation/Generated#",
+            "local 4",
+            "not a symbol",
+        ];
+        for symbol in no {
+            assert!(!is_lombok_generated_marker(symbol), "{symbol}");
+        }
     }
 }

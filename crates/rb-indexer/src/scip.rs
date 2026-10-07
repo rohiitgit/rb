@@ -144,6 +144,12 @@ pub(crate) struct Coverage {
     pub documents_rejected: usize,
     /// `documents_rejected` by the first reason that applied.
     pub documents_rejected_reasons: BTreeMap<rb_scip::Rejection, usize>,
+    /// Occurrences of the accepted scip-java documents removed as Lombok-generated before the
+    /// agreement checks (contract M6a D1): those at a `lombok/Generated#` marker's span and the
+    /// definitions it encloses exactly.
+    pub lombok_removed: usize,
+    /// Accepted documents with at least one such removal (contract M6a D3).
+    pub documents_lombok: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -172,15 +178,37 @@ pub(crate) fn join(
         }
     };
     let mut out = Joined::default();
+    // Contract M6a D1, D2: in a scip-java index, each document's Lombok-generated occurrences
+    // are removed first, and every check below judges what remains, unchanged. A document
+    // without a marker is used as it is.
+    let without_lombok: Vec<Option<(rb_scip::Document, usize)>> = index
+        .documents
+        .iter()
+        .map(|doc| {
+            languages
+                .contains(&Language::Java)
+                .then(|| remove_lombok_generated(doc))
+                .flatten()
+        })
+        .collect();
+    // Per path, the occurrences removed from its document.
+    let mut removed: BTreeMap<String, usize> = BTreeMap::new();
     // The documents with facts, each with its occurrences by span, that pass the agreement
     // check (contract M3b amendment 64): a rejected document is left out entirely, as if the
     // index had none for its file except that it is counted as rejected, not as missing.
     let mut indexed: BTreeSet<String> = BTreeSet::new();
     let mut docs: Vec<Doc<'_>> = Vec::new();
-    for doc in &index.documents {
+    for (doc, lombok) in index.documents.iter().zip(&without_lombok) {
         let path = repo_path(&doc.path);
         let Some(&(_, facts)) = files.get(path.as_str()) else {
             continue;
+        };
+        let doc = match lombok {
+            Some((stripped, n)) => {
+                removed.insert(path.clone(), *n);
+                stripped
+            }
+            None => doc,
         };
         indexed.insert(path.clone());
         let rejected = doc.rejected.or_else(|| {
@@ -267,6 +295,13 @@ pub(crate) fn join(
         }
     }
     let (docs, naming) = (docs_kept, naming_kept);
+    // Counted for accepted documents only, like every other coverage figure (contract M6a D3).
+    for (path, ..) in &docs {
+        if let Some(&n) = removed.get(path) {
+            out.coverage.lombok_removed += n;
+            out.coverage.documents_lombok += 1;
+        }
+    }
     // Every global symbol the accepted documents define, so references to dependencies are
     // told apart; a symbol defined only in a rejected document is the project's own but has no
     // node (`references_undocumented`).
@@ -1078,6 +1113,49 @@ fn definition_disagreement(facts: &FileFacts, occurrences: &[rb_scip::Occurrence
     })
 }
 
+/// Contract M6a D1: `doc` without the occurrences Lombok marks as generated, with how many were
+/// removed; `None` when it holds no marker (it is then judged exactly as before M6a). The
+/// markers are the spans of `doc`'s reference occurrences of `@lombok.Generated`
+/// ([`rb_scip::symbol::is_lombok_generated_marker`]); removed are the occurrences at a marker's
+/// span and the definitions (global or local) whose enclosing range is a marker's span, exactly.
+/// Lombok annotates every member it generates with that marker, and scip-java gives the
+/// member's definition, its parameters and its body's references that span (probe P2b). A real
+/// member's range runs from its first modifier to its end and a real reference names one
+/// token, so neither equals a marker span (an annotation, a declarator with its terminator, or
+/// `class … }`); a reference merely inside a marker span (an anonymous class in a field
+/// initializer) is kept. One pass collects the markers into a sorted set and one filters.
+fn remove_lombok_generated(doc: &rb_scip::Document) -> Option<(rb_scip::Document, usize)> {
+    rb_frameworks::work::tick(doc.occurrences.len());
+    let markers: BTreeSet<Span> = doc
+        .occurrences
+        .iter()
+        .filter(|o| !o.is_definition() && rb_scip::symbol::is_lombok_generated_marker(&o.symbol))
+        .map(|o| o.span)
+        .collect();
+    if markers.is_empty() {
+        return None;
+    }
+    rb_frameworks::work::tick(doc.occurrences.len());
+    let generated = |o: &rb_scip::Occurrence| {
+        markers.contains(&o.span)
+            || (o.is_definition() && o.enclosing.is_some_and(|e| markers.contains(&e)))
+    };
+    let occurrences: Vec<rb_scip::Occurrence> = doc
+        .occurrences
+        .iter()
+        .filter(|o| !generated(o))
+        .cloned()
+        .collect();
+    let n = doc.occurrences.len() - occurrences.len();
+    Some((
+        rb_scip::Document {
+            occurrences,
+            ..doc.clone()
+        },
+        n,
+    ))
+}
+
 fn is_global_definition(o: &rb_scip::Occurrence) -> bool {
     o.is_definition() && !o.symbol.starts_with("local ")
 }
@@ -1412,6 +1490,8 @@ mod tests {
                 relationships_anonymous: 0,
                 documents_rejected: 0,
                 documents_rejected_reasons: BTreeMap::new(),
+                lombok_removed: 0,
+                documents_lombok: 0,
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -3071,6 +3151,8 @@ mod tests {
                 relationships_anonymous: 0,
                 documents_rejected: 0,
                 documents_rejected_reasons: BTreeMap::new(),
+                lombok_removed: 0,
+                documents_lombok: 0,
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();
@@ -5489,5 +5571,602 @@ mod tests {
         let joined = join_sources(Language::TypeScript, &[("src/a.ts", src)], &index);
         assert_eq!(joined.coverage.definitions_matched, 3);
         assert!(edge_lines(&joined).is_empty(), "{:?}", edge_lines(&joined));
+    }
+
+    // Contract M6a D1-D3 (S1, S2): Lombok-generated occurrences are removed before the
+    // agreement checks. The synthetic documents below have the shapes `rb-scip-java:0.13.1`
+    // gave Lombok 1.18.34 in probe P2b (`var/m6a/phase0/p2b`): a `lombok/Generated#` reference
+    // at the marker span, every generated definition enclosed by exactly that span, generated
+    // bodies' references at it, and generated definitions' own ranges where javac's positions
+    // put them (after a class annotation, or on the first later text match of their name).
+    // Every position is derived from the source.
+
+    const LOMBOK: &str = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/";
+
+    /// The span of the `nth` match of `needle` in `src`, all of it (one row).
+    fn text_span(src: &str, needle: &str, nth: usize) -> Span {
+        let at = tok(src, needle, nth);
+        [at[0], at[1], at[0], at[1] + needle.len() as i32]
+    }
+
+    /// Lombok's marker reference at `span`.
+    fn marker(span: Span) -> Occurrence {
+        occ_at(span, &format!("{LOMBOK}Generated#"), 0)
+    }
+
+    /// A definition Lombok generated: its own range `span`, its enclosing range the marker's.
+    fn generated(span: Span, symbol: &str, marker: Span) -> Occurrence {
+        enclosed(occ_at(span, symbol, 1), marker)
+    }
+
+    /// A multi-line range from the end of `after` to column `col` of the next row: where
+    /// scip-java puts the members a class annotation generates (P2b: `[6:5–7:6]` after `@Data`).
+    fn after(after: Span, col: i32) -> Span {
+        [after[0], after[3], after[0] + 1, col]
+    }
+
+    /// The index of one Java document.
+    fn java_index(
+        path: &str,
+        mut occurrences: Vec<Occurrence>,
+        symbols: Vec<SymbolInfo>,
+    ) -> ScipIndex {
+        occurrences.sort();
+        ScipIndex {
+            documents: vec![Document {
+                path: path.into(),
+                occurrences,
+                symbols,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// `joined`'s coverage without the Lombok counters, for comparing with a twin index that
+    /// has no Lombok occurrences.
+    fn without_lombok(joined: &Joined) -> Coverage {
+        Coverage {
+            lombok_removed: 0,
+            documents_lombok: 0,
+            ..joined.coverage.clone()
+        }
+    }
+
+    const USER: &str = "package p;\n\nimport lombok.Data;\n\n@Data\npublic class User {\n    private String name;\n\n    public String greet() { return name + helper(); }\n    private String helper() { return \"!\"; }\n}\n";
+
+    /// `User.java` with `@Data`: the hand-written occurrences, and Lombok's (when `lombok`):
+    /// the marker at `@Data`, the generated bodies' references there, the setter, `equals`,
+    /// `canEqual`, `hashCode`, `toString`, the getter and the constructor enclosed by it, and
+    /// a generated parameter (a local).
+    fn user_occurrences(marker_symbol: &str, lombok: bool) -> (Vec<Occurrence>, usize) {
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/User#{d}");
+        let mut occurrences = vec![
+            enclosed(occ_at(tok(USER, "User", 0), &sym(""), 1), [4, 0, 10, 1]),
+            enclosed(
+                occ_at(tok(USER, "name", 0), &sym("name."), 1),
+                between(USER, "private String name", 0, ";"),
+            ),
+            enclosed(
+                occ_at(tok(USER, "greet", 0), &sym("greet()."), 1),
+                between(USER, "public String greet", 0, "}"),
+            ),
+            occ_at(tok(USER, "name", 1), &sym("name."), 0),
+            occ_at(tok(USER, "helper", 0), &sym("helper()."), 0),
+            enclosed(
+                occ_at(tok(USER, "helper", 1), &sym("helper()."), 1),
+                between(USER, "private String helper", 0, "}"),
+            ),
+        ];
+        if !lombok {
+            // Without Lombok, javac's implicit constructor has no range.
+            occurrences.push(occ_at(tok(USER, "User", 0), &sym("`<init>`()."), 1));
+            return (occurrences, 0);
+        }
+        let data = text_span(USER, "@Data", 0);
+        let lombok = vec![
+            occ_at(data, marker_symbol, 0),
+            occ_at(data, &sym("name."), 0),
+            occ_at(data, "scip-java maven jdk 21 java/lang/Object#equals().", 0),
+            occ_at(data, &sym("canEqual()."), 0),
+            generated(tok(USER, "User", 0), &sym("`<init>`()."), data),
+            generated(after(data, 6), &sym("setName()."), data),
+            generated(after(data, 5), &sym("equals()."), data),
+            generated(after(data, 7), &sym("canEqual()."), data),
+            generated(after(data, 7), &sym("hashCode()."), data),
+            generated(after(data, 7), &sym("toString()."), data),
+            generated(after(data, 6), &sym("getName()."), data),
+            generated(after(data, 0), "local 0", data),
+        ];
+        let n = lombok.len();
+        occurrences.extend(lombok);
+        (occurrences, n)
+    }
+
+    /// S1 (a), (c), (d): a `@Data` class. At `cfa8ab9` the generated members, which only javac
+    /// sees, make the document a `structure_disagreement`; with them removed it is accepted,
+    /// `greet() → helper()` is exact, and the result equals the twin index without Lombok's
+    /// occurrences except for the counters: the generated bodies' references and parameters
+    /// leave no trace but `lombok_removed`.
+    #[test]
+    fn a_data_class_is_accepted_once_its_generated_members_are_removed() {
+        let path = "p/User.java";
+        let (occurrences, removed) = user_occurrences(&format!("{LOMBOK}Generated#"), true);
+        let joined = join_sources(
+            Language::Java,
+            &[(path, USER)],
+            &java_index(path, occurrences, Vec::new()),
+        );
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert!(joined.documented.contains(path));
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/User#{d}");
+        assert_eq!(
+            edge_lines(&joined),
+            [format!("{} Calls {}", sym("greet()."), sym("helper()."))]
+        );
+        assert_eq!(
+            (
+                joined.coverage.lombok_removed,
+                joined.coverage.documents_lombok
+            ),
+            (removed, 1)
+        );
+        let (plain, _) = user_occurrences("", false);
+        let twin = join_sources(
+            Language::Java,
+            &[(path, USER)],
+            &java_index(path, plain, Vec::new()),
+        );
+        assert_eq!(
+            (
+                &joined.keys,
+                &joined.edges,
+                &joined.documented,
+                &joined.packages
+            ),
+            (&twin.keys, &twin.edges, &twin.documented, &twin.packages)
+        );
+        assert_eq!(without_lombok(&joined), twin.coverage);
+        assert_eq!(
+            (twin.coverage.lombok_removed, twin.coverage.documents_lombok),
+            (0, 0)
+        );
+    }
+
+    /// S1 (j), (k): D1 never clears a verdict it did not cause. A Lombok document the decoder
+    /// rejected (`structural_escape`) stays rejected for that reason; one that also holds a
+    /// member only javac sees without a marker stays a `structure_disagreement`; a
+    /// `lombok/Generated#` of another package is no marker, so nothing is removed.
+    #[test]
+    fn lombok_removal_never_clears_another_verdict() {
+        let path = "p/User.java";
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/User#{d}");
+        let marker_symbol = format!("{LOMBOK}Generated#");
+        let joined_with = |occurrences: Vec<Occurrence>, rejected: Option<rb_scip::Rejection>| {
+            let mut index = java_index(path, occurrences, Vec::new());
+            index.documents[0].rejected = rejected;
+            join_sources(Language::Java, &[(path, USER)], &index)
+        };
+        let (occurrences, _) = user_occurrences(&marker_symbol, true);
+        let escaped = joined_with(
+            occurrences.clone(),
+            Some(rb_scip::Rejection::StructuralEscape),
+        );
+        assert_eq!(
+            escaped.coverage.documents_rejected_reasons,
+            BTreeMap::from([(rb_scip::Rejection::StructuralEscape, 1)])
+        );
+        let mut hidden = occurrences;
+        hidden.push(generated(
+            after(text_span(USER, "private String name;", 0), 4),
+            &sym("hidden()."),
+            between(USER, "private String name", 0, ";"),
+        ));
+        let unmarked = joined_with(hidden, None);
+        assert_eq!(
+            unmarked.coverage.documents_rejected_reasons,
+            BTreeMap::from([(rb_scip::Rejection::StructureDisagreement, 1)])
+        );
+        let (fake, _) = user_occurrences(
+            "scip-java maven maven/com.example/fake 1.0 lombok/Generated#",
+            true,
+        );
+        let fake = joined_with(fake, None);
+        assert_eq!(
+            fake.coverage.documents_rejected_reasons,
+            BTreeMap::from([(rb_scip::Rejection::StructureDisagreement, 1)])
+        );
+        for joined in [&escaped, &unmarked, &fake] {
+            assert!(joined.edges.is_empty());
+            assert_eq!(
+                (
+                    joined.coverage.lombok_removed,
+                    joined.coverage.documents_lombok
+                ),
+                (0, 0),
+                "a rejected document counts no removal"
+            );
+        }
+    }
+
+    /// S1 (b): a getter a class-level `@Getter` generates from a field. scip-java places its
+    /// definition at the first later text match of its name, the `getName()` call inside
+    /// `greet()` beside the real reference there, with the field's declarator (`name;`) as its
+    /// enclosing range and the marker; at `cfa8ab9` that is a `definition_disagreement` (a
+    /// method defined on a reference inside a method). Removed, the document is accepted, the
+    /// real reference stays and counts as `undocumented` (the project's own member without a
+    /// definition, like a record's accessors; amendment 2), and no edge targets the getter.
+    #[test]
+    fn a_field_getter_defined_at_a_call_is_removed_and_its_call_is_undocumented() {
+        let src = "package p;\n\nimport lombok.Getter;\n\n@Getter\npublic class Acct {\n    private String name;\n\n    public String greet() { return getName() + helper(); }\n    private String helper() { return \"!\"; }\n}\n";
+        let path = "p/Acct.java";
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/Acct#{d}");
+        let field = text_span(src, "name;", 0);
+        let mut occurrences = vec![
+            enclosed(occ_at(tok(src, "Acct", 0), &sym(""), 1), [4, 0, 10, 1]),
+            occ_at(tok(src, "Acct", 0), &sym("`<init>`()."), 1),
+            enclosed(
+                occ_at(tok(src, "name", 0), &sym("name."), 1),
+                between(src, "private String name", 0, ";"),
+            ),
+            enclosed(
+                occ_at(tok(src, "greet", 0), &sym("greet()."), 1),
+                between(src, "public String greet", 0, "}"),
+            ),
+            occ_at(tok(src, "getName", 0), &sym("getName()."), 0),
+            occ_at(tok(src, "helper", 0), &sym("helper()."), 0),
+            enclosed(
+                occ_at(tok(src, "helper", 1), &sym("helper()."), 1),
+                between(src, "private String helper", 0, "}"),
+            ),
+        ];
+        let lombok = vec![
+            marker(field),
+            occ_at(field, &sym("name."), 0),
+            occ_at(field, "scip-java maven jdk 21 java/lang/String#", 0),
+            generated(tok(src, "getName", 0), &sym("getName()."), field),
+        ];
+        let removed = lombok.len();
+        occurrences.extend(lombok);
+        let joined = join_sources(
+            Language::Java,
+            &[(path, src)],
+            &java_index(path, occurrences, Vec::new()),
+        );
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(
+            edge_lines(&joined),
+            [format!("{} Calls {}", sym("greet()."), sym("helper()."))]
+        );
+        assert_eq!(joined.coverage.references_undocumented, 1);
+        assert_eq!(
+            (
+                joined.coverage.lombok_removed,
+                joined.coverage.documents_lombok
+            ),
+            (removed, 1)
+        );
+    }
+
+    /// S1 (e): `@Builder`'s nested type, its members and `builder()`, all enclosed by the
+    /// `@Builder` marker: at `cfa8ab9` the nested type, which only javac sees, makes the
+    /// document a `structure_disagreement`. Removed, it is accepted; the calls into the
+    /// builder are the project's own members without definitions (`undocumented`), never edges.
+    #[test]
+    fn a_builder_and_its_nested_type_are_removed() {
+        let src = "package p;\n\nimport lombok.Builder;\n\n@Builder\npublic class Built {\n    private final String id;\n\n    public static Built make() { return Built.builder().id(\"x\").build(); }\n}\n";
+        let path = "p/Built.java";
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/Built#{d}");
+        let builder = text_span(src, "@Builder", 0);
+        let mut occurrences = vec![
+            enclosed(occ_at(tok(src, "Built", 0), &sym(""), 1), [4, 0, 9, 1]),
+            enclosed(
+                occ_at(tok(src, "id", 0), &sym("id."), 1),
+                between(src, "private final String id", 0, ";"),
+            ),
+            enclosed(
+                occ_at(tok(src, "make", 0), &sym("make()."), 1),
+                between(src, "public static Built make", 0, "}"),
+            ),
+            occ_at(tok(src, "Built", 1), &sym(""), 0),
+            occ_at(tok(src, "Built", 2), &sym(""), 0),
+            occ_at(tok(src, "builder()", 0), &sym("builder()."), 0),
+            occ_at(tok(src, "id(", 0), &sym("BuiltBuilder#id()."), 0),
+            occ_at(tok(src, "build()", 0), &sym("BuiltBuilder#build()."), 0),
+        ];
+        let lombok = vec![
+            marker(builder),
+            occ_at(builder, &sym("id."), 0),
+            generated(tok(src, "Built", 0), &sym("`<init>`()."), builder),
+            generated(after(builder, 9), &sym("BuiltBuilder#"), builder),
+            generated(after(builder, 9), &sym("BuiltBuilder#`<init>`()."), builder),
+            generated(after(builder, 4), &sym("BuiltBuilder#build()."), builder),
+            generated(after(builder, 7), &sym("BuiltBuilder#toString()."), builder),
+            generated(tok(src, "id", 0), &sym("BuiltBuilder#id."), builder),
+            generated(tok(src, "id", 0), &sym("BuiltBuilder#id()."), builder),
+            generated(after(builder, 6), &sym("builder()."), builder),
+            generated(tok(src, "id", 0), "local 0", builder),
+        ];
+        let removed = lombok.len();
+        occurrences.extend(lombok);
+        let joined = join_sources(
+            Language::Java,
+            &[(path, src)],
+            &java_index(path, occurrences, Vec::new()),
+        );
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert!(joined.documented.contains(path));
+        assert!(
+            joined.edges.iter().all(|e| e.kind == EdgeKind::References),
+            "{:?}",
+            edge_lines(&joined)
+        );
+        assert_eq!(joined.coverage.references_undocumented, 3);
+        assert_eq!(
+            (
+                joined.coverage.lombok_removed,
+                joined.coverage.documents_lombok
+            ),
+            (removed, 1)
+        );
+    }
+
+    /// S1 (f): a hand-written method annotated `@lombok.Generated` keeps its definition (its
+    /// enclosing range runs from the annotation to its closing brace, never the marker's span),
+    /// is paired and keyed, and its call is exact; only the marker reference itself is removed.
+    #[test]
+    fn a_hand_written_generated_method_is_kept() {
+        let src = "package p;\n\npublic class Marked {\n    @lombok.Generated\n    public int value() { return 1; }\n\n    public int use() { return value(); }\n}\n";
+        let path = "p/Marked.java";
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/Marked#{d}");
+        let annotation = text_span(src, "@lombok.Generated", 0);
+        let value_end = text_span(src, "public int value() { return 1; }", 0);
+        let occurrences = vec![
+            enclosed(occ_at(tok(src, "Marked", 0), &sym(""), 1), [2, 0, 7, 1]),
+            occ_at(tok(src, "Marked", 0), &sym("`<init>`()."), 1),
+            occ_at(tok(src, "lombok", 0), "scip-java maven . . lombok/", 0),
+            marker(tok(src, "Generated", 0)),
+            enclosed(
+                occ_at(tok(src, "value", 0), &sym("value()."), 1),
+                [annotation[0], annotation[1], value_end[2], value_end[3]],
+            ),
+            enclosed(
+                occ_at(tok(src, "use", 0), &sym("use()."), 1),
+                between(src, "public int use", 0, "}"),
+            ),
+            occ_at(tok(src, "value", 1), &sym("value()."), 0),
+        ];
+        let joined = join_sources(
+            Language::Java,
+            &[(path, src)],
+            &java_index(path, occurrences, Vec::new()),
+        );
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(
+            edge_lines(&joined),
+            [format!("{} Calls {}", sym("use()."), sym("value()."))]
+        );
+        assert!(joined.keys[path].values().any(|k| *k == sym("value().")));
+        assert_eq!(
+            (
+                joined.coverage.lombok_removed,
+                joined.coverage.documents_lombok
+            ),
+            (1, 1)
+        );
+    }
+
+    /// S1 (g): with a class-level `@Getter`, a field's marker spans its whole declarator, here
+    /// an anonymous class's body. Only occurrences at the marker's span and definitions
+    /// enclosed by exactly that span are removed: the anonymous class's method (a local with
+    /// its own range) and the call inside it are kept and judged as without Lombok (the call is
+    /// credited to the class, design §8.2), equal to the twin index without Lombok.
+    #[test]
+    fn an_anonymous_class_inside_a_marker_span_is_kept() {
+        let src = "package p;\n\nimport lombok.Getter;\n\n@Getter\npublic class Anon {\n    private final Runnable task = new Runnable() { public void run() { helper(); } };\n\n    static void helper() {}\n}\n";
+        let path = "p/Anon.java";
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/Anon#{d}");
+        let declarator = between(src, "task = new", 0, "} };");
+        let plain = vec![
+            enclosed(occ_at(tok(src, "Anon", 0), &sym(""), 1), [4, 0, 9, 1]),
+            occ_at(tok(src, "Anon", 0), &sym("`<init>`()."), 1),
+            enclosed(
+                occ_at(tok(src, "task", 0), &sym("task."), 1),
+                between(src, "private final Runnable task", 0, "} };"),
+            ),
+            occ_at(tok(src, "Runnable", 1), "local 0", 1),
+            enclosed(
+                occ_at(tok(src, "run", 0), "local 1", 1),
+                between(src, "public void run", 0, "}"),
+            ),
+            occ_at(tok(src, "helper", 0), &sym("helper()."), 0),
+            enclosed(
+                occ_at(tok(src, "helper", 1), &sym("helper()."), 1),
+                between(src, "static void helper", 0, "}"),
+            ),
+        ];
+        let mut occurrences = plain.clone();
+        occurrences.extend([
+            marker(declarator),
+            occ_at(declarator, &sym("task."), 0),
+            generated(after(declarator, 4), &sym("getTask()."), declarator),
+        ]);
+        let joined = join_sources(
+            Language::Java,
+            &[(path, src)],
+            &java_index(path, occurrences, Vec::new()),
+        );
+        let twin = join_sources(
+            Language::Java,
+            &[(path, src)],
+            &java_index(path, plain, Vec::new()),
+        );
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(
+            edge_lines(&joined),
+            [format!("{} Calls {}", sym(""), sym("helper()."))]
+        );
+        assert_eq!((&joined.edges, &joined.keys), (&twin.edges, &twin.keys));
+        assert_eq!(without_lombok(&joined), twin.coverage);
+        assert_eq!(joined.coverage.lombok_removed, 3);
+    }
+
+    /// S1 (h): an enum with `@Getter` whose constant body defines a method: the generated
+    /// getter, defined by scip-java at the `getCode()` call inside `show()` (a
+    /// `definition_disagreement` at `cfa8ab9`), is removed; the constant body's method still
+    /// binds through its local symbol (amendment 54).
+    #[test]
+    fn an_enum_constant_body_still_binds_in_a_lombok_enum() {
+        let src = "package p;\n\nimport lombok.Getter;\n\n@Getter\npublic enum Color {\n    RED { public String show() { return \"R\"; } },\n    GREEN;\n\n    private final String code = \"c\";\n\n    public String show() { return getCode(); }\n}\n";
+        let path = "p/Color.java";
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/Color#{d}");
+        let field = text_span(src, "code = \"c\";", 0);
+        let occurrences = vec![
+            occ_at(tok(src, "Color", 0), &sym(""), 1),
+            enclosed(
+                occ_at(tok(src, "RED", 0), &sym("RED."), 1),
+                between(src, "RED {", 0, "} }"),
+            ),
+            occ_at(tok(src, "show", 0), "local 3", 1),
+            occ_at(tok(src, "GREEN", 0), &sym("GREEN."), 1),
+            occ_at(tok(src, "code", 0), &sym("code."), 1),
+            occ_at(tok(src, "show", 1), &sym("show()."), 1),
+            occ_at(tok(src, "getCode", 0), &sym("getCode()."), 0),
+            marker(field),
+            occ_at(field, &sym("code."), 0),
+            generated(tok(src, "getCode", 0), &sym("getCode()."), field),
+        ];
+        let symbols = vec![
+            local_method("local 3", "show"),
+            enum_constant(&sym("RED.")),
+            enum_constant(&sym("GREEN.")),
+        ];
+        let joined = join_sources(
+            Language::Java,
+            &[(path, src)],
+            &java_index(path, occurrences, symbols),
+        );
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(joined.coverage.definitions_local, 1);
+        assert_eq!(joined.coverage.references_undocumented, 1);
+        assert_eq!(
+            (
+                joined.coverage.lombok_removed,
+                joined.coverage.documents_lombok
+            ),
+            (3, 1)
+        );
+    }
+
+    const SHADOW: &str = "package p;\n\nimport lombok.Getter;\n\npublic class Shadow {\n    public String run() { return new Named().getName() + new Explicit().getName(); }\n}\n\nclass Named {\n    @Getter String name;\n}\n\nclass Explicit {\n    String getName() { return \"e\"; }\n}\n";
+
+    /// S2 with P2b's real positions (`Shadow.java`): scip-java defines the getter `Named`'s
+    /// field-level `@Getter` generates at `Explicit`'s declaration name, enclosed by the
+    /// `@Getter` marker. `Explicit`'s definition keeps `Explicit#getName().`, the call through
+    /// `new Explicit()` is exact to it, the call through `new Named()` is `undocumented`, and no
+    /// edge targets `Named#getName().`. At `cfa8ab9` the unpaired generated method rejects the
+    /// document (`structure_disagreement`).
+    #[test]
+    fn a_hand_written_method_at_a_generated_definitions_position_keeps_its_own_key() {
+        let path = "p/Shadow.java";
+        let sym = |d: &str| format!("scip-java maven maven/com.acme/demo 1.0 p/{d}");
+        let getter = text_span(SHADOW, "@Getter", 0);
+        let occurrences = vec![
+            enclosed(
+                occ_at(tok(SHADOW, "Shadow", 0), &sym("Shadow#"), 1),
+                [4, 0, 6, 1],
+            ),
+            occ_at(tok(SHADOW, "Shadow", 0), &sym("Shadow#`<init>`()."), 1),
+            enclosed(
+                occ_at(tok(SHADOW, "run", 0), &sym("Shadow#run()."), 1),
+                between(SHADOW, "public String run", 0, "}"),
+            ),
+            occ_at(tok(SHADOW, "Named", 0), &sym("Named#`<init>`()."), 0),
+            occ_at(tok(SHADOW, "getName", 0), &sym("Named#getName()."), 0),
+            occ_at(tok(SHADOW, "Explicit", 0), &sym("Explicit#`<init>`()."), 0),
+            occ_at(tok(SHADOW, "getName", 1), &sym("Explicit#getName()."), 0),
+            enclosed(
+                occ_at(tok(SHADOW, "Named", 1), &sym("Named#"), 1),
+                [8, 0, 10, 1],
+            ),
+            occ_at(tok(SHADOW, "Named", 1), &sym("Named#`<init>`()."), 1),
+            marker(getter),
+            occ_at(getter, &sym("Named#name."), 0),
+            occ_at(getter, "scip-java maven jdk 21 java/lang/String#", 0),
+            enclosed(
+                occ_at(tok(SHADOW, "name", 0), &sym("Named#name."), 1),
+                between(SHADOW, "@Getter String name", 0, ";"),
+            ),
+            enclosed(
+                occ_at(tok(SHADOW, "Explicit", 1), &sym("Explicit#"), 1),
+                [12, 0, 14, 1],
+            ),
+            occ_at(tok(SHADOW, "Explicit", 1), &sym("Explicit#`<init>`()."), 1),
+            enclosed(
+                occ_at(tok(SHADOW, "getName", 2), &sym("Explicit#getName()."), 1),
+                between(SHADOW, "String getName()", 0, "}"),
+            ),
+            generated(tok(SHADOW, "getName", 2), &sym("Named#getName()."), getter),
+        ];
+        let joined = join_sources(
+            Language::Java,
+            &[(path, SHADOW)],
+            &java_index(path, occurrences, Vec::new()),
+        );
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        let keys: Vec<&String> = joined.keys[path].values().collect();
+        assert!(keys.contains(&&sym("Explicit#getName().")), "{keys:?}");
+        assert!(!keys.contains(&&sym("Named#getName().")), "{keys:?}");
+        let edges = edge_lines(&joined);
+        assert!(
+            edges.contains(&format!(
+                "{} Calls {}",
+                sym("Shadow#run()."),
+                sym("Explicit#getName().")
+            )),
+            "{edges:?}"
+        );
+        assert!(
+            edges.iter().all(|e| !e.ends_with(&sym("Named#getName()."))),
+            "{edges:?}"
+        );
+        assert_eq!(joined.coverage.references_undocumented, 1);
+    }
+
+    /// A document of `n` generated members, each a marker with a definition it encloses and a
+    /// body reference at it, beside `n` real definitions.
+    fn lombok_work_for(n: usize) -> u64 {
+        let sym = |d: String| format!("scip-java maven maven/com.acme/demo 1.0 p/Big#{d}");
+        let mut occurrences = Vec::new();
+        for i in 0..n as i32 {
+            let at: Span = [i, 0, i, 5];
+            occurrences.extend([
+                marker(at),
+                occ_at(at, &sym(format!("f{i}.")), 0),
+                generated([i, 5, i + 1, 3], &sym(format!("getF{i}().")), at),
+                enclosed(
+                    occ_at([i, 10, i, 12], &sym(format!("m{i}().")), 1),
+                    [i, 6, i, 30],
+                ),
+            ]);
+        }
+        occurrences.sort();
+        let doc = Document {
+            path: "p/Big.java".into(),
+            occurrences,
+            ..Default::default()
+        };
+        rb_frameworks::work::take();
+        let (_, removed) = remove_lombok_generated(&doc).unwrap();
+        assert_eq!(removed, 3 * n);
+        rb_frameworks::work::take()
+    }
+
+    /// Contract M6a S19, invariants 9 and 10: D1's removal is one pass into a sorted set and
+    /// one filtering pass (counted: 4× the occurrences and markers → at most 5× the work).
+    #[test]
+    fn lombok_removal_grows_linearly() {
+        let (small, large) = (lombok_work_for(100), lombok_work_for(400));
+        assert!(large <= small * 5, "{small} -> {large}");
     }
 }

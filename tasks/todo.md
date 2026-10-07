@@ -805,7 +805,7 @@ Same rules as M5:
 - [x] **1. `rb serve` start-up order and the two-repository sweep** (S14, S15; D10). Done 2026-10-07: *State* the bind address and the repository list; *Invariant* 11 (no write before the bind check). S14's e2e row failed first (`a refused start leaves the leftover`); mutant "sweep only the first name" killed by `rb-store` alone. Verify `var/m6a/logs/p1-*`.
   - Files: `rb-cli/src/main.rs`, `rb-store/src/db_tests.rs`, `rb-cli/tests/e2e.rs`.
   - **Verify:** S14's e2e fails first (the refused start sweeps); the "first repository only" mutant is killed by the `rb-store` test alone; loop green.
-- [ ] **2. Lombok removal and counters** (S1, S2 units, S3; D1–D3; `PIPELINE` `m6a-1`).
+- [x] **2. Lombok removal and counters** (S1, S2 units, S3; D1–D3; `PIPELINE` `m6a-1`). Done 2026-10-07: 7 of the 8 new join units failed first (the 8th, (j)/(k), is a control that held); 5 mutants killed; fixture dumps (both modes) byte-identical to `var/m6a/base`; amendments 2 (`undocumented`) and 3 (`@FieldNameConstants` residue).
   - *Derived:* marker spans per scip-java document; removed occurrences; `lombok_removed`, `documents_lombok` (written only when non-zero).
   - *Invariants:* 2, 3; S1 (i) over every fixture document.
   - Files: `rb-indexer/src/scip.rs`, `rb-indexer/src/lib.rs` (coverage JSON), `rb-cli/src/main.rs` (status line).
