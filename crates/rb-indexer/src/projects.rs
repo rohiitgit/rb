@@ -143,6 +143,8 @@ pub struct ScipProject {
     pub stderr_tail: String,
     /// The fetch step had no lockfile, so the index is not reproducible.
     pub unpinned: bool,
+    /// Workspace members grouped into this job (contract M6a D5); 0 for any other job.
+    pub workspace_members: usize,
 }
 
 /// Whether jobs run at all.
@@ -152,21 +154,25 @@ pub(crate) enum Mode<'a> {
     Run(&'a dyn Runner),
 }
 
-/// Runs (or serves from the cache) every job of `files`, in job order.
+/// Runs (or serves from the cache) every job of `files`, in job order; also returns the
+/// workspace roots left ungrouped (contract M6a D5), which `rb index` prints and nothing stores.
 pub(crate) fn run_projects(
     files: &[FileEntry],
     read_blob: &dyn Fn(&str) -> anyhow::Result<Vec<u8>>,
     mode: &Mode<'_>,
     options: &ScipOptions,
     cache: &mut dyn ScipCache,
-) -> anyhow::Result<Vec<ScipProject>> {
+) -> anyhow::Result<(Vec<ScipProject>, Vec<rb_scip::jobs::Ungrouped>)> {
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let blobs: BTreeMap<&str, &str> = files
         .iter()
         .map(|f| (f.path.as_str(), f.blob_sha.as_str()))
         .collect();
+    // The manifest reader of D5: `package.json` files and workspace roots' `yarn.lock`.
+    let read_path = |path: &str| blobs.get(path).and_then(|blob| read_blob(blob).ok());
+    let plan = rb_scip::jobs(&paths, &read_path);
     let mut out = Vec::new();
-    for job in rb_scip::jobs(&paths) {
+    for job in plan.jobs {
         let mut project = ScipProject {
             root: job.root.clone(),
             indexer: job.indexer.as_str(),
@@ -177,6 +183,7 @@ pub(crate) fn run_projects(
             cached: false,
             stderr_tail: String::new(),
             unpinned: job.unpinned,
+            workspace_members: plan.members.get(&job.root).map_or(0, Vec::len),
         };
         let runner = match mode {
             Mode::Skip(reason) => {
@@ -268,7 +275,7 @@ pub(crate) fn run_projects(
         }
         out.push(project);
     }
-    Ok(out)
+    Ok((out, plan.ungrouped))
 }
 
 /// Contract M3b amendment 64 (`source_encoding`): when a Maven build declares a source encoding
@@ -477,7 +484,9 @@ mod tests {
         let fake = Fake::new(index_bytes(), false, true);
         let mut cache = MemCache::default();
         let opts = options(tmp.path(), &fake);
-        let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert_eq!(cold.len(), 1);
         let p = &cold[0];
         assert_eq!((p.root.as_str(), p.indexer), ("web", "scip-typescript"));
@@ -491,7 +500,9 @@ mod tests {
         assert_eq!(cache.puts, 1);
         assert!(!tmp.path().join("work").read_dir().unwrap().any(|_| true));
 
-        let warm = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        let warm = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert_eq!(*fake.runs.borrow(), 2, "no container ran");
         assert!(warm[0].cached);
         assert_eq!(warm[0].index, cold[0].index);
@@ -536,7 +547,8 @@ mod tests {
             &opts,
             &mut cache,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         let statuses: Vec<(&str, &str, Option<String>)> = skipped
             .iter()
             .map(|p| (p.root.as_str(), p.status.as_str(), p.status.reason()))
@@ -550,7 +562,9 @@ mod tests {
         );
         assert_eq!(*fake.runs.borrow(), 0);
 
-        let ran = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        let ran = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
         // The scip-java image is not built locally: unsupported, with the reason pointing at
         // the image's README.
         assert_eq!(ran[0].status.as_str(), "unsupported");
@@ -572,14 +586,18 @@ mod tests {
             (row.status.as_str(), row.phase.as_deref()),
             ("failed", Some("fetch"))
         );
-        let again = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        let again = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert!(again[1].cached && again[1].status == RunStatus::Failed(rb_scip::Phase::Fetch));
         assert_eq!(*fake.runs.borrow(), 1);
         // A `failed` row without a phase (an older binary's) is a miss: the job runs again.
         for row in cache.rows.values_mut() {
             row.phase = None;
         }
-        let rerun = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        let rerun = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert!(!rerun[1].cached && rerun[1].status == RunStatus::Failed(rb_scip::Phase::Fetch));
         assert_eq!(*fake.runs.borrow(), 2);
 
@@ -593,11 +611,14 @@ mod tests {
             &opts,
             &mut WriteOnlyScipCache(&mut cache),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(!retried[1].cached && retried[1].status == RunStatus::Ok);
         assert_eq!(*retry.runs.borrow(), 2, "fetch and index ran again");
         assert_eq!(cache.puts, 3, "the outcome is written");
-        let served = run_projects(&files, &read, &Mode::Run(&retry), &opts, &mut cache).unwrap();
+        let served = run_projects(&files, &read, &Mode::Run(&retry), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert!(served[1].cached && served[1].status == RunStatus::Ok);
         assert_eq!(*retry.runs.borrow(), 2);
     }
@@ -612,7 +633,9 @@ mod tests {
         let fake = Fake::new(index_bytes(), false, true);
         let mut cache = MemCache::default();
         let opts = options(tmp.path(), &fake);
-        let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert_eq!(cold.len(), 1);
         assert_eq!(
             (cold[0].indexer, cold[0].status.as_str()),
@@ -623,7 +646,9 @@ mod tests {
         let keys: Vec<&(String, String)> = cache.rows.keys().collect();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].1, JAVA_ID, "the cache key's image part is the ID");
-        let warm = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        let warm = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert!(warm[0].cached);
         assert_eq!(*fake.runs.borrow(), 3, "no container ran");
         assert_eq!(warm[0].image, JAVA_ID);
@@ -698,7 +723,8 @@ mod tests {
                 &opts,
                 &mut MemCache::default(),
             )
-            .unwrap();
+            .unwrap()
+            .0;
             projects[0]
                 .index
                 .as_ref()
@@ -756,7 +782,9 @@ mod tests {
             ..Fake::new(index_bytes(), false, false)
         };
         let opts = options(tmp.path(), &refused);
-        let ran = run_projects(&files, &read, &Mode::Run(&refused), &opts, &mut cache).unwrap();
+        let ran = run_projects(&files, &read, &Mode::Run(&refused), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert_eq!(
             ran[0].status,
             RunStatus::Environment("shim: docker run refused".into())
@@ -777,7 +805,9 @@ mod tests {
             budget,
             ..options(tmp.path(), &slow)
         };
-        let ran = run_projects(&files, &read, &Mode::Run(&slow), &opts, &mut cache).unwrap();
+        let ran = run_projects(&files, &read, &Mode::Run(&slow), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert_eq!(
             ran[0].status,
             RunStatus::Timeout {
@@ -795,7 +825,9 @@ mod tests {
         // The next run tries again and, succeeding, is cached.
         let fine = Fake::new(index_bytes(), false, false);
         let opts = options(tmp.path(), &fine);
-        let ran = run_projects(&files, &read, &Mode::Run(&fine), &opts, &mut cache).unwrap();
+        let ran = run_projects(&files, &read, &Mode::Run(&fine), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert_eq!(ran[0].status, RunStatus::Ok);
         assert_eq!(*fine.runs.borrow(), 2, "fetch and index ran");
         assert_eq!(cache.puts, 1);
@@ -804,7 +836,9 @@ mod tests {
         for entry in cache.rows.values_mut() {
             entry.status = "timeout".into();
         }
-        let ran = run_projects(&files, &read, &Mode::Run(&fine), &opts, &mut cache).unwrap();
+        let ran = run_projects(&files, &read, &Mode::Run(&fine), &opts, &mut cache)
+            .unwrap()
+            .0;
         assert!(!ran[0].cached && ran[0].status == RunStatus::Ok);
         assert_eq!(*fine.runs.borrow(), 4, "the stale row was not served");
         assert_eq!(cache.puts, 2, "the row is replaced");

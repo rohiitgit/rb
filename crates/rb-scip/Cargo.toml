@@ -14,6 +14,8 @@ protobuf.workspace = true
 rb-model.workspace = true
 scip.workspace = true
 serde.workspace = true
+# Reading `package.json`'s `workspaces` (contract M6a D5).
+serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]

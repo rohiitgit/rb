@@ -817,7 +817,7 @@ Same rules as M5:
 - [x] **4. TypeScript interface-method `IMPLEMENTS`** (S5–S7; D4; `PIPELINE` `m6a-2`). Only if P1b found no super→sub relationship. Done 2026-10-07 (P1b: 0): S5's two positive units failed first; the waiver-on-Java mutant survived the amendment-78 unit (classes) and is killed by a new Java-interface unit, the waiver-on-every-TS-type mutant by a TS-class unit (amendment 4); fixture dumps byte-identical; Java SCIP goldens unchanged.
   - Files: `rb-indexer/src/scip.rs`.
   - **Verify:** S5's positive rows fail first; the waiver-on-Java mutant killed by the amendment-78 unit; Java SCIP goldens unchanged.
-- [ ] **5. Workspace membership** (S8; D5).
+- [x] **5. Workspace membership** (S8; D5). Done 2026-10-07: `rb_scip::jobs(files, read) -> Plan` (jobs, members per grouped root, ungrouped reasons); 6 new units (did not compile before); mutants partial `*`, no-lockfile grouping and a quadratic trie walk killed; `polyglot-monorepo` prints `workspace . not grouped (workspace_without_lockfile)` and dumps byte-identically; amendment 5.
   - *Derived:* the job list from the file list and the root manifests; ungrouped reasons.
   - Files: `rb-scip/src/jobs.rs`, `rb-scip/src/lib.rs`, `rb-indexer/src/projects.rs` (manifest reader).
   - **Verify:** S8's rows; the two mutations killed; `polyglot-monorepo`'s jobs unchanged (unit and SCIP golden).

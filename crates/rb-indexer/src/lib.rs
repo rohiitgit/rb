@@ -107,6 +107,9 @@ pub struct Indexed {
     pub scanned: usize,
     /// The SCIP jobs of the commit, in job order, with their decoded indexes dropped.
     pub scip: Vec<ScipProject>,
+    /// Workspace roots whose members were not grouped, and why (contract M6a D5): printed by
+    /// `rb index`, never stored, so a dump does not change through them.
+    pub scip_ungrouped: Vec<rb_scip::jobs::Ungrouped>,
 }
 
 /// Indexes `rev` of the repository at `repo_path`, reusing and filling `cache` and, for SCIP
@@ -199,7 +202,7 @@ pub fn index_commit(
     if let projects::Mode::Run(_) = mode {
         std::fs::create_dir_all(&scip.work_dir)?;
     }
-    let scip_projects = projects::run_projects(
+    let (scip_projects, scip_ungrouped) = projects::run_projects(
         &manifest.files,
         &|blob: &str| repo.blob(blob),
         &mode,
@@ -245,6 +248,7 @@ pub fn index_commit(
         parsed,
         scanned,
         scip,
+        scip_ungrouped,
     })
 }
 
@@ -906,6 +910,10 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
     if let Some(phase) = p.status.phase() {
         detail["phase"] = phase.as_str().into();
     }
+    // Contract M6a D3, D5: only for a grouped workspace root, so other jobs dump as before.
+    if p.workspace_members > 0 {
+        detail["workspace_members"] = p.workspace_members.into();
+    }
     if let rb_scip::RunStatus::Timeout { budget_secs, .. } = &p.status {
         detail["budget_secs"] = (*budget_secs).into();
     }
@@ -1318,6 +1326,7 @@ mod tests {
                 cached: false,
                 stderr_tail: String::new(),
                 unpinned: false,
+                workspace_members: 0,
             }],
             ..Content::default()
         };
@@ -1409,6 +1418,7 @@ mod tests {
             cached: false,
             stderr_tail: String::new(),
             unpinned: false,
+            workspace_members: 0,
         }
     }
 
@@ -1658,6 +1668,23 @@ mod tests {
         // The phase that failed is recorded, as for a timeout (contract M3b amendment 56).
         assert_eq!(d.detail["phase"], "fetch");
         assert!(d.detail.get("budget_secs").is_none(), "{}", d.detail);
+    }
+
+    /// Contract M6a D3, D5: a grouped workspace root's member count is written to its
+    /// `scip_status` (whatever its status, so a failed fetch shows it too) only when non-zero.
+    #[test]
+    fn workspace_members_are_written_only_for_a_grouped_root() {
+        let mut project = ok_project("", "scip-typescript", vec![]);
+        let plain = scip_status(&project, None);
+        assert!(
+            plain.detail.get("workspace_members").is_none(),
+            "{}",
+            plain.detail
+        );
+        project.workspace_members = 2;
+        project.status = rb_scip::RunStatus::Failed(rb_scip::Phase::Fetch);
+        let grouped = scip_status(&project, None);
+        assert_eq!(grouped.detail["workspace_members"], 2);
     }
 
     /// Contract M6a D3, S3: the Lombok counters are written to the coverage only when

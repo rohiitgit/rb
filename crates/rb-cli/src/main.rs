@@ -971,6 +971,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         parsed,
         scanned,
         scip: jobs,
+        scip_ungrouped,
     } = if no_cache {
         rb_indexer::index_commit(
             &path,
@@ -1045,6 +1046,15 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
                 eprintln!("    {l}");
             }
         }
+    }
+    // Workspace roots whose packages keep separate jobs, and why (contract M6a D5); printed
+    // only, so a dump does not change through them.
+    for u in &scip_ungrouped {
+        println!(
+            "  scip: workspace {} not grouped ({})",
+            root_label(&u.root),
+            u.reason
+        );
     }
     Ok(())
 }
@@ -1224,6 +1234,10 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
                 let _ = write!(line, ": {reason}");
             }
         }
+    }
+    // A grouped workspace root (contract M6a D5), only when there are members.
+    if let Some(members) = d.detail["workspace_members"].as_u64() {
+        let _ = write!(line, ", workspace {members} members");
     }
     if let Some(c) = d.detail.get("coverage") {
         let n = |k: &str| c[k].as_u64().unwrap_or(0);
@@ -2867,6 +2881,16 @@ mod tests {
             scip_status_line(&lombok)
         );
         assert!(!scip_status_line(&rejected).contains("lombok"));
+        // Contract M6a D5: a grouped workspace root's members, failed or not.
+        let grouped = diagnostic(json!({
+            "indexer": "scip-typescript", "status": "failed", "unpinned": false,
+            "phase": "fetch", "workspace_members": 7,
+        }));
+        assert_eq!(
+            scip_status_line(&grouped),
+            "scip: . scip-typescript failed (fetch phase), workspace 7 members"
+        );
+        assert!(!scip_status_line(&rejected).contains("workspace"));
         // Contract M3b amendment 67: a snapshot written before a field existed (the evaluator's
         // `fp3_class_validator`, before amendments 62 and 64) omits it instead of printing 0.
         let old = diagnostic(json!({
