@@ -1,0 +1,14 @@
+# Precision guards for the ts-workspaces fixture (contract M6a S11), checked against the SCIP dump.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# The workspace root's job indexes both members: app's call into core through the workspace link.
+CALLS scip-typescript npm @ws/app 1.0.0 src/`svc.ts`/main(). -> scip-typescript npm @ws/core 1.0.0 src/`index.ts`/run(). [exact]
+CALLS scip-typescript npm @ws/core 1.0.0 src/`index.ts`/run(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Base#m(). [exact]
+# D4: interface methods implement what they override, through the declared clauses.
+IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Mid#m(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Base#m(). [exact]
+IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Deep#m(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Mid#m(). [exact]
+IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Deep#m(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Base#m(). [exact]
+IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Other#n(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Base#n(). [exact]
+# A class in another member implements core's interface method.
+IMPLEMENTS scip-typescript npm @ws/app 1.0.0 src/`svc.ts`/Svc#m(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Mid#m(). [exact]
+# legacy/ is not a member: its own (unpinned) job.
+CALLS scip-typescript npm legacy 1.0.0 src/`old.ts`/caller(). -> scip-typescript npm legacy 1.0.0 src/`old.ts`/old(). [exact]

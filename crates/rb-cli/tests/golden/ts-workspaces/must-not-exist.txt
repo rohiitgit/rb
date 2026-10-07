@@ -1,0 +1,11 @@
+# Precision guards for the ts-workspaces fixture (contract M6a S11), checked against the SCIP dump.
+# No interface-method IMPLEMENTS from super to sub (D4), none from a member with no super member.
+IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Base#m(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Mid#m().
+IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Mid#m(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Deep#m().
+IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Base#n(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Other#n().
+IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Mid#extra(). -> *
+# tools/e2e's call into the linked core package names a symbol its own index does not define:
+# counted external, as for any symbol another job defines (no cross-job rule; recorded).
+CALLS scip-typescript npm e2e-tools 1.0.0 src/`check.ts`/check(). -> scip-typescript npm @ws/core 1.0.0 src/`index.ts`/run().
+# Every code edge of a SCIP-ok project is exact.
+CALLS * -> * [heuristic]

@@ -1,0 +1,8 @@
+{
+  "name": "e2e-tools",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@ws/core": "file:../../packages/core"
+  }
+}

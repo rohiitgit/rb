@@ -3460,6 +3460,78 @@ fn scip_java_lombok() {
     assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
 }
 
+/// Contract M6a S11: the npm-workspaces fixture. The root's job is grouped (`workspace 2
+/// members`, fetched at the root from its lockfile, offline: every package is local) and indexes
+/// both members, so `packages/app`'s call into `packages/core` is exact through the workspace
+/// link and D4's interface-method `IMPLEMENTS` edges are present (guards); `tools/e2e`'s job
+/// exports its `file:` link target (`1 link targets`); `legacy/`, not a member, keeps its own
+/// unpinned job. The fetch runs twice from an emptied per-repository cache with the same stored
+/// output; cached, fresh and a second repository name dump identically.
+#[test]
+fn scip_ts_workspaces() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = rb_scip::docker_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "ts-workspaces";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipws_{}", std::process::id());
+    let other = format!("t_scipws2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(first.contains("scip: . scip-typescript ok"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!(
+            "scip_ts_workspaces guard failures:\n{}",
+            failures.join("\n")
+        );
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        assert_exact_code_edges(&dump, "scip-typescript npm @ws/", "packages/", ".") >= 2,
+        "{dump}"
+    );
+
+    let cached = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(
+        cached.contains("scip: . scip-typescript ok (cached"),
+        "{cached}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    // A cold and a warm per-repository package cache store the same output (lesson
+    // 2026-10-07, "splitting a cache re-exposes the tools' own bookkeeping").
+    let cache = workspace_root().join("var/scip/cache").join(&name);
+    for run in ["cold", "warm"] {
+        // The first run may have been served from the index cache (it outlives test runs), in
+        // which case no fetch created the package cache: emptied either way.
+        if run == "cold" && cache.exists() {
+            std::fs::remove_dir_all(&cache).unwrap();
+        }
+        let fresh = rb(
+            &url,
+            &["index", path, "--repo", &name, "--force", "--no-cache"],
+        );
+        assert!(
+            fresh.contains("scip: . scip-typescript ok ") && !fresh.contains("(cached"),
+            "{run}: {fresh}"
+        );
+        assert_eq!(rb(&url, &["dump", "--repo", &name]), dump, "{run}");
+    }
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 /// Contract M3b S10 and invariant 4: a monorepo mixing a Maven project that indexes, one that
 /// fails to build on purpose (`services/broken`), and TypeScript packages. `rb index` succeeds,
 /// the failed project keeps its stderr tail and stays heuristic, the others are exact.

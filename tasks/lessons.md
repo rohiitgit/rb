@@ -273,3 +273,7 @@
 ## 2026-10-07: a claim about "every" item needs a test with at least two, in a state the test controls
 - **Mistake (evaluator pass 2, N2):** `rb serve`'s startup sweep claims every repository, but `sweep_graphs` was tested with one repository; the mutant that sweeps only the first name survived the `rb-store` suite and was killed by the e2e only because the evaluator's own repositories happened to sort before the test's.
 - **Rule:** when a mechanism loops over a collection, test it with at least two members whose order puts the interesting one last, inside state the test creates; a kill that depends on what else is in a shared database is not a kill.
+
+## 2026-10-07: a test step that depends on a side effect of a run must not assume the run happened
+- **Mistake (caught by the verify loop, M6a phase 8):** `scip_ts_workspaces` deleted the per-repository package cache with `remove_dir_all(...).unwrap()` before its cold fetch. Alone it passed (the first index ran a container, which created the cache); in the full suite the first index was served from the database's index cache (rows outlive test runs), no fetch ran, the directory did not exist, and the test panicked.
+- **Rule:** when a test manipulates state that only a non-cached run creates (a package cache, a work directory, a container), make the step idempotent (`exists()` before removing) and force the run that must happen (`--no-cache`), then run the test once warm and once from an emptied database cache before blessing.
