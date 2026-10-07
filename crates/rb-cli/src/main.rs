@@ -78,6 +78,12 @@ struct IndexArgs {
     /// over it is killed and recorded as `timeout`. Default: 600 for the fetch, 900 for the index.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     scip_timeout_secs: Option<u64>,
+    /// Extra registry hosts the SCIP fetch phase may reach through its egress proxy, besides
+    /// Maven Central and the npm and Yarn registries (comma-separated DNS names, HTTPS only).
+    /// Set on the indexing host, never read from the repository: the repository's own build
+    /// runs in the fetch phase, so it must not widen what that phase can reach.
+    #[arg(long, env = "RB_SCIP_REGISTRIES", value_delimiter = ',')]
+    scip_registries: Vec<String>,
     /// Retired snapshots kept per repository after this run, besides the live one (0-20); older
     /// ones and every failed run's row are deleted, and only the live snapshot keeps an AGE graph.
     #[arg(
@@ -339,6 +345,10 @@ enum Command {
         /// Only repositories whose names start with this (graphs named `rb_<prefix>…`).
         #[arg(long, default_value = "")]
         prefix: String,
+        /// Also remove the SCIP fetch phase's Docker networks (`rb-scip-fetch`,
+        /// `rb-scip-egress`) and any egress proxy container left by an interrupted run.
+        #[arg(long)]
+        egress: bool,
     },
     /// Manage the caches stored in the database.
     Cache {
@@ -466,7 +476,11 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                 None => std::io::stdout().write_all(dump.as_bytes())?,
             }
         }
-        Command::Gc { dry_run, prefix } => {
+        Command::Gc {
+            dry_run,
+            prefix,
+            egress,
+        } => {
             let plan = store.gc_plan(&prefix)?;
             let done = if dry_run {
                 plan
@@ -474,6 +488,17 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                 store.gc_apply(&plan)?
             };
             print!("{}", gc_lines(&done, dry_run));
+            if egress {
+                rb_scip::docker_available().map_err(|e| anyhow::anyhow!("gc --egress: {e}"))?;
+                let found = rb_scip::DockerRunner::default().egress_leftovers(!dry_run)?;
+                let verb = if dry_run { "would remove" } else { "removed" };
+                if found.is_empty() {
+                    println!("gc: no egress network or proxy");
+                }
+                for item in found {
+                    println!("{verb} {item}");
+                }
+            }
         }
         Command::Cache {
             action:
@@ -825,9 +850,11 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         no_scip,
         scip_work_dir,
         scip_timeout_secs,
+        scip_registries,
         keep,
         profile,
     } = args;
+    let egress = rb_scip::Egress::with(&scip_registries).map_err(|e| anyhow::anyhow!("{e}"))?;
     let path = path
         .canonicalize()
         .with_context(|| format!("repository path {}", path.display()))?;
@@ -903,9 +930,10 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
     let scip = rb_indexer::ScipOptions {
         mode: scip_mode,
         images,
-        cache_dir: scip_work_dir.join("cache"),
+        cache_dir: scip_cache_dir(&scip_work_dir, &repo),
         work_dir: scip_work_dir,
         budget,
+        egress,
     };
     // Both caches live in the store; the indexer borrows each through its own trait.
     let cell = RefCell::new(&mut *store);
@@ -1374,6 +1402,13 @@ fn projection_lines(p: &rb_store::ProjectionProfile) -> String {
         p.files.len()
     );
     out
+}
+
+/// The repository's own package-manager caches under the SCIP work directory,
+/// `<work>/cache/<repo>` (contract M5 S22): one repository's fetch never writes where another's
+/// reads. Repository names are `[a-z0-9_]`, so the name is a safe path component.
+fn scip_cache_dir(work: &Path, repo: &str) -> PathBuf {
+    work.join("cache").join(repo)
 }
 
 /// `rb gc`'s report: one line per graph and `building` row, then a summary.
@@ -2648,6 +2683,7 @@ mod tests {
     fn tool_versions_record_image_identities_when_scip_is_on() {
         let images = rb_scip::Images {
             java: Err("absent".into()),
+            proxy: Ok("sha256:proxy".into()),
         };
         let on = tool_versions(&rb_indexer::ScipMode::On, &images);
         assert_eq!(on["scip"], "on");
@@ -2655,6 +2691,7 @@ mod tests {
         assert_eq!(on["scip_typescript"], rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE);
         let present = rb_scip::Images {
             java: Ok("sha256:abc".into()),
+            proxy: Ok("sha256:proxy".into()),
         };
         assert_eq!(
             tool_versions(&rb_indexer::ScipMode::On, &present)["scip_java"],
@@ -2851,6 +2888,41 @@ mod tests {
             ": docker is not available"
         );
         assert_eq!(status_detail(&rb_scip::RunStatus::Ok), "");
+    }
+
+    /// Contract M5 S22: each repository's package caches live in a directory of its own, so
+    /// two repositories share no Maven or npm cache; the allow-list's extra hosts come from the
+    /// host's flag or environment and are validated.
+    #[test]
+    fn scip_caches_are_per_repository_and_registries_are_validated() {
+        let work = Path::new("/w/var/scip");
+        assert_eq!(
+            scip_cache_dir(work, "shop"),
+            Path::new("/w/var/scip/cache/shop")
+        );
+        assert_ne!(
+            scip_cache_dir(work, "shop"),
+            scip_cache_dir(work, "shop_api")
+        );
+        assert!(!scip_cache_dir(work, "shop").starts_with(scip_cache_dir(work, "sho")));
+        let cli = Cli::try_parse_from([
+            "rb",
+            "index",
+            ".",
+            "--scip-registries",
+            "repo.spring.io,maven.example.org",
+        ])
+        .unwrap();
+        let Command::Index(args) = cli.command else {
+            panic!("an index command")
+        };
+        assert_eq!(
+            args.scip_registries,
+            ["repo.spring.io", "maven.example.org"]
+        );
+        let egress = rb_scip::Egress::with(&args.scip_registries).unwrap();
+        assert!(egress.hosts.contains(&"repo.spring.io".to_owned()));
+        assert!(rb_scip::Egress::with(&["*.example.org".to_owned()]).is_err());
     }
 
     #[test]

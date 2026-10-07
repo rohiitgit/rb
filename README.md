@@ -35,7 +35,7 @@ target/debug/rb callers AuthService.login --depth 2   # what calls a function or
 target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2): endpoints, orphans, tests; --json
 target/debug/rb path "POST /api/v1/login"             # the request path through an endpoint (Q4); --format json, --pick N
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
-target/debug/rb gc --dry-run           # graphs and `building` rows interrupted or older runs left
+target/debug/rb gc --dry-run           # graphs and `building` rows interrupted or older runs left (`--egress`: the fetch networks too)
 target/debug/rb cache prune --facts --scip --dry-run   # cache rows of other extractor versions and images
 ```
 
@@ -118,16 +118,18 @@ The Service Card adds `Packages` (version and where it came from: `[lockfile]`, 
 
 ```sh
 docker build -t rb-scip-java:0.13.1 docker/scip-java      # slim local scip-java image (see docker/scip-java/README.md)
+docker build -t rb-egress-proxy:1.11.3 docker/egress-proxy # the fetch phase's egress proxy (see docker/egress-proxy/README.md)
 docker pull --platform linux/amd64 sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845
 ```
 
-Each job exports the project's files, runs a fetch phase on Docker's default bridge network (`mvn … go-offline` and the build, or `npm ci --ignore-scripts --logs-max=0`; no credentials, no host toolchains), then indexes with `--network none`. Indexes are cached in the database by `(project input hash, image)`; the input hash covers the project's blobs and the fetch recipe (`rb_scip::RECIPE`), so an unchanged project runs no container and an index from an older recipe is never served. Without Docker or an image the project stays heuristic and `rb status` says so (`scip: … skipped`/`unsupported`); the images' identities are part of the snapshot's tool configuration, and a snapshot whose jobs did not all finish (`skipped`, `unsupported`, `environment`, `timeout`) is never "up to date" while SCIP is on, so the next `rb index` tries again (`rebuilding: n SCIP jobs did not finish last time`).
+Each job exports the project's files, runs a fetch phase (`mvn … go-offline` and the build, or `npm ci --ignore-scripts --logs-max=0`; no credentials, no host toolchains), then indexes with `--network none`. The fetch phase runs behind an egress allow-list: its containers attach only to the `--internal` Docker network `rb-scip-fetch` (no route out, no external DNS), whose one other member is a tinyproxy container started for that run (`rb-egress-<run>`, also on the bridge `rb-scip-egress`), which forwards only `CONNECT <host>:443` to Maven Central (`repo.maven.apache.org`, `repo1.maven.org`), the npm registry and the Yarn registry, plus the hosts in `--scip-registries`; plain HTTP, other ports, IP addresses and every other host are refused, and a failed fetch's report names what the proxy refused (`egress proxy refused: repo.example.com:443`). Maven reads the proxy from a generated `settings.xml`, npm/Yarn/pnpm from the proxy variables. Package caches are per repository (`<scip-work-dir>/cache/<repo>/{m2,npm}`), so one repository's fetch never writes where another's reads, and both Maven phases turn the Develocity/Gradle Enterprise build caches off (a cache hit would skip `javac`, leaving sources without an index). `rb index` creates the two networks when absent and never removes them; `rb gc --egress` removes them and any proxy an interrupted run left. Without the proxy image every job is `unsupported`: no fetch runs unguarded. Indexes are cached in the database by `(project input hash, image)`; the input hash covers the project's blobs, the fetch recipe (`rb_scip::RECIPE`) and the allow-list, so an unchanged project runs no container, an index from an older recipe is never served, and a fetch that failed on a host outside the list is retried once the host is added. Without Docker or an image the project stays heuristic and `rb status` says so (`scip: … skipped`/`unsupported`); the images' identities are part of the snapshot's tool configuration, and a snapshot whose jobs did not all finish (`skipped`, `unsupported`, `environment`, `timeout`) is never "up to date" while SCIP is on, so the next `rb index` tries again (`rebuilding: n SCIP jobs did not finish last time`).
 
 | Flag | Meaning |
 |---|---|
 | `--no-scip` | run no indexer; every project is heuristic (a different tool configuration from a run with indexers) |
 | `--scip-work-dir <dir>` (`RB_SCIP_WORK_DIR`, default `var/scip`) | exports and package caches; must lie under the home directory (the path the runtime's VM shares, see below) |
 | `--scip-timeout-secs <n>` | budget per phase (defaults 600 s fetch, 900 s index); a run over it is killed and reported as `timeout`, not cached |
+| `--scip-registries <host,…>` (`RB_SCIP_REGISTRIES`) | extra registry hosts the fetch phase may reach over HTTPS (lower-case DNS names; no wildcard, port or IP); configured on the indexing host, never read from the repository, whose own build runs in the fetch phase |
 | `--no-cache` | parse every file without reading cached facts (the facts are still written, so the next plain run reuses them), and re-run every SCIP job and replace its cached outcome |
 
 #### Container runtime
@@ -136,6 +138,7 @@ Each job exports the project's files, runs a fetch phase on Docker's default bri
 
 ```sh
 docker build -t rb-scip-java:0.13.1 docker/scip-java      # slim scip-java image (docker/scip-java/README.md); absent → `unsupported`
+docker build -t rb-egress-proxy:1.11.3 docker/egress-proxy # egress proxy (docker/egress-proxy/README.md); absent → every job `unsupported`
 docker pull --platform linux/amd64 sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845
 ```
 

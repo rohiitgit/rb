@@ -5,13 +5,28 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::egress::{CLIENT_CONFIG_AT, Egress, PROXY_IMAGE};
 use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_JAVA_IMAGE, SCIP_TYPESCRIPT_IMAGE};
-use crate::runner::{ContainerRun, Network, Outcome, Runner};
+use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
 
 /// The fetch and index recipe, part of every index's cache key (contract M3b amendment 47).
 /// Bump it whenever the container commands, the images' invocation or the export rules change:
 /// an index produced by another recipe is then a cache miss, never served as "cached".
-pub const RECIPE: &str = "m3b-2";
+/// `m5-egress-1`: the fetch phase behind the egress proxy, per-repository dependency caches and
+/// the Develocity/Gradle Enterprise build caches off in both Maven phases (contract M5 S21,
+/// S22).
+pub const RECIPE: &str = "m5-egress-1";
+
+/// The Develocity and Gradle Enterprise Maven extensions' build caches, off in both Maven
+/// phases (contract M5 S22): a cache hit skips `javac`, so its sources get no SCIP document
+/// (spring-retry's test tree, contract M3b open items), and the remote cache is a host outside
+/// the allow-list anyway.
+const BUILD_CACHES_OFF: [&str; 4] = [
+    "-Ddevelocity.cache.local.enabled=false",
+    "-Ddevelocity.cache.remote.enabled=false",
+    "-Dgradle.cache.local.enabled=false",
+    "-Dgradle.cache.remote.enabled=false",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
@@ -164,6 +179,9 @@ pub struct Images {
     /// scip-typescript needs no field: its jobs run by, cache under and are identified by the
     /// pinned digest reference (Docker pulls it when absent; contract M3b amendment 48).
     pub java: Result<String, String>,
+    /// The egress proxy image (contract M5 S21): its ID, or the reason every job is
+    /// `unsupported` (no fetch runs without the proxy; nothing builds it implicitly).
+    pub proxy: Result<String, String>,
 }
 
 impl Images {
@@ -175,6 +193,12 @@ impl Images {
                      docker/scip-java/README.md describes"
                 )
             }),
+            proxy: runner.image_id(PROXY_IMAGE).ok_or_else(|| {
+                format!(
+                    "egress proxy: image {PROXY_IMAGE} is not available locally; build it as \
+                     docker/egress-proxy/README.md describes"
+                )
+            }),
         }
     }
 
@@ -184,17 +208,22 @@ impl Images {
             java: Err(format!(
                 "scip-java: image {SCIP_JAVA_IMAGE} was not looked up"
             )),
+            proxy: Err(format!(
+                "egress proxy: image {PROXY_IMAGE} was not looked up"
+            )),
         }
     }
 
     /// The image `job` runs in and its index is cached under: the digest reference itself for
     /// a pinned image, the image ID for the locally built scip-java one. `Err` is the reason
-    /// the job is `unsupported`.
+    /// the job is `unsupported`: the indexer image, or the egress proxy image, is absent.
     pub fn for_job(&self, job: &Job) -> Result<String, String> {
-        match job.indexer {
+        let image = match job.indexer {
             Indexer::ScipTypescript => Ok(SCIP_TYPESCRIPT_IMAGE.to_owned()),
             Indexer::ScipJava => self.java.clone(),
-        }
+        }?;
+        self.proxy.as_ref().map_err(Clone::clone)?;
+        Ok(image)
     }
 
     /// The identity recorded per indexer: the digest reference of a pinned image, the image ID
@@ -208,12 +237,15 @@ impl Images {
 }
 
 /// Runs `job` in `image` (from [`Images::for_job`]) over `files` (`(root-relative path, bytes)`)
-/// with `cache_dir` holding package-manager caches shared across jobs. `work_dir` names the
-/// job (the caller names it after the job's input hash); this run's export lives next to it in
-/// a directory of its own, `<work_dir>-<pid>-<nanos>` (created, removed afterwards), and its
-/// containers are named `rb-scip-<that name>-<phase>`, so two runs of the same job at once
-/// share nothing (contract M3b amendment 22) and a run over its budget can be killed by name
-/// (amendment 18).
+/// with `cache_dir` holding the repository's package-manager caches (contract M5 S22: the
+/// caller keys it by repository). `work_dir` names the job (the caller names it after the
+/// job's input hash); this run's export lives next to it in a directory of its own,
+/// `<work_dir>-<pid>-<nanos>` (created, removed afterwards), and its containers are named
+/// `rb-scip-<that name>-<phase>`, so two runs of the same job at once share nothing (contract
+/// M3b amendment 22) and a run over its budget can be killed by name (amendment 18). The fetch
+/// phase runs behind its own egress proxy, `rb-egress-<that name>`, allowing `egress`'s hosts
+/// (contract M5 S21); its configuration lives in `<that directory>-egress` while it runs.
+#[allow(clippy::too_many_arguments)]
 pub fn run_job(
     job: &Job,
     image: &str,
@@ -221,6 +253,7 @@ pub fn run_job(
     work_dir: &Path,
     cache_dir: &Path,
     budget: &Budget,
+    egress: &Egress,
     runner: &dyn Runner,
 ) -> anyhow::Result<ScipRun> {
     let started = std::time::Instant::now();
@@ -244,6 +277,7 @@ pub fn run_job(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos())
     );
+    let egress_dir = work_dir.with_file_name(format!("{instance}-egress"));
     let work_dir = &work_dir.with_file_name(&instance);
     export(files, work_dir)?;
     std::fs::create_dir_all(cache_dir)?;
@@ -257,14 +291,57 @@ pub fn run_job(
             fetch.name = Some(format!("{name}-fetch"));
         }
         index.name = Some(format!("{name}-index"));
-        for fetch in &fetches {
-            let outcome = match runner.run(fetch) {
-                Ok(outcome) => outcome,
-                Err(e) => return Ok(environment(format!("{e:#}"), started)),
-            };
-            if !outcome.ok() {
-                return Ok(finished(&outcome, None, Phase::Fetch, fetch, started));
+        // The fetch phase behind this run's own proxy (contract M5 S21).
+        let proxy = ProxySpec {
+            name: format!("rb-egress-{instance}"),
+            image: PROXY_IMAGE.to_owned(),
+            config_dir: egress_dir.join("proxy"),
+        };
+        egress.write_config(&proxy.config_dir)?;
+        let address = match runner.start_proxy(&proxy) {
+            Ok(address) => address,
+            Err(e) => return Ok(environment(format!("egress proxy: {e:#}"), started)),
+        };
+        let fetched = (|| -> anyhow::Result<Option<ScipRun>> {
+            let client = crate::runner::absolute(&{
+                let dir = egress_dir.join("client");
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(
+                    dir.join("settings.xml"),
+                    crate::egress::maven_settings(&address),
+                )?;
+                dir
+            })?;
+            for fetch in &mut fetches {
+                fetch.env.extend(crate::egress::proxy_env(&address));
+                fetch
+                    .readonly
+                    .push((client.clone(), CLIENT_CONFIG_AT.to_owned()));
+                let outcome = match runner.run(fetch) {
+                    Ok(outcome) => outcome,
+                    Err(e) => return Ok(Some(environment(format!("{e:#}"), started))),
+                };
+                if !outcome.ok() {
+                    return Ok(Some(finished(&outcome, None, Phase::Fetch, fetch, started)));
+                }
             }
+            Ok(None)
+        })();
+        let log = runner.stop_proxy(&proxy.name);
+        if let Some(mut failed) = fetched? {
+            // What the proxy refused explains most failed fetches; the log's times are not
+            // kept (they are no function of the commit).
+            let refused = crate::egress::refusals(&log);
+            if !refused.is_empty() {
+                failed.stderr_tail = format!(
+                    "{}\negress proxy refused: {}",
+                    failed.stderr_tail,
+                    refused.join(", ")
+                )
+                .trim()
+                .to_owned();
+            }
+            return Ok(failed);
         }
         let outcome = match runner.run(&index) {
             Ok(outcome) => outcome,
@@ -284,6 +361,7 @@ pub fn run_job(
         ))
     })();
     let _ = std::fs::remove_dir_all(work_dir);
+    let _ = std::fs::remove_dir_all(&egress_dir);
     result
 }
 
@@ -390,8 +468,15 @@ fn typescript_runs(
         workdir,
         mount_at: "/src".into(),
         caches: vec![(npm_cache, "/root/.npm".into())],
-        env: vec![("NODE_OPTIONS".into(), "--max-old-space-size=4096".into())],
-        network: Network::Registries,
+        readonly: Vec::new(),
+        // npm's update notifier checks the registry and prints a notice unless its cache says it
+        // checked recently, so a failed fetch's stderr (part of the dump) would depend on the
+        // cache's state, which per-repository caches made visible (contract M5 S22).
+        env: vec![
+            ("NODE_OPTIONS".into(), "--max-old-space-size=4096".into()),
+            ("npm_config_update_notifier".into(), "false".into()),
+        ],
+        network: Network::Fetch,
         cpus: budget.cpus,
         memory: budget.memory.clone(),
         timeout: budget.fetch_timeout,
@@ -469,7 +554,7 @@ fn typescript_runs(
 
 /// The fetch and index invocations for a scip-java Maven job (docker/scip-java/README.md,
 /// verified on the Java fixture). The fetch phase resolves plugins and dependencies into the
-/// Maven cache shared across jobs (`go-offline`) and then does one online build, so that the
+/// repository's Maven cache (`go-offline`) and then does one online build, so that the
 /// index phase can run the same build with `--offline` under `--network none`. Arguments after
 /// `--` replace scip-java's default Maven arguments, so they are repeated plus `--offline`.
 /// Maven logs to stdout by default; `MAVEN_OPTS` moves its logger to stderr so a failed build's
@@ -492,21 +577,26 @@ fn java_runs(
         workdir,
         mount_at: "/sources".into(),
         caches: vec![(m2, "/root/.m2".into())],
+        readonly: Vec::new(),
         env: vec![(
             "MAVEN_OPTS".into(),
             "-Dorg.slf4j.simpleLogger.logFile=System.err".into(),
         )],
-        network: Network::Registries,
+        network: Network::Fetch,
         cpus: budget.cpus,
         memory: budget.memory.clone(),
         timeout: budget.fetch_timeout,
         entrypoint: None,
         args: Vec::new(),
     };
+    // The fetch phase reads the egress proxy from the settings `run_job` mounts (Maven ignores
+    // the proxy environment variables; contract M5 S21).
+    let settings = format!("{CLIENT_CONFIG_AT}/settings.xml");
     let mvn = |goals: &[&str]| ContainerRun {
-        args: ["mvn", "-B", "-q"]
+        args: ["mvn", "-B", "-q", "-s", settings.as_str()]
             .iter()
             .chain(goals)
+            .chain(BUILD_CACHES_OFF.iter())
             .map(|s| (*s).to_owned())
             .collect(),
         ..base.clone()
@@ -530,8 +620,10 @@ fn java_runs(
             "verify",
             "-DskipTests",
         ]
-        .map(String::from)
-        .to_vec(),
+        .iter()
+        .chain(BUILD_CACHES_OFF.iter())
+        .map(|s| (*s).to_owned())
+        .collect(),
         ..base
     };
     Ok((fetches, index))
@@ -586,6 +678,15 @@ mod tests {
         fail_index: bool,
         java_image: bool,
         fetch_outcome: Option<anyhow::Result<Outcome>>,
+        /// `start <name> <filter>` and `stop <name>` per proxy call, in order.
+        proxies: RefCell<Vec<String>>,
+        /// The proxy cannot start (an `Err` with this text).
+        proxy_fails: Option<String>,
+        /// What a stopped proxy logged.
+        proxy_log: String,
+        proxy_image: bool,
+        /// `<mount> <settings.xml>` per read-only mount a run saw, read while it ran.
+        settings: RefCell<Vec<String>>,
     }
 
     impl Fake {
@@ -596,13 +697,26 @@ mod tests {
                 fail_index,
                 java_image: true,
                 fetch_outcome: None,
+                proxies: RefCell::new(Vec::new()),
+                proxy_fails: None,
+                proxy_log: String::new(),
+                proxy_image: true,
+                settings: RefCell::new(Vec::new()),
             }
         }
     }
 
+    const PROXY_AT: &str = "10.9.8.7";
+
     impl Runner for Fake {
         fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
             self.runs.borrow_mut().push(run.clone());
+            for (host, inside) in &run.readonly {
+                let settings = std::fs::read_to_string(host.join("settings.xml"))?;
+                self.settings
+                    .borrow_mut()
+                    .push(format!("{inside} {settings}"));
+            }
             let is_index = run.network == Network::None;
             if !is_index && let Some(outcome) = &self.fetch_outcome {
                 return match outcome {
@@ -627,7 +741,29 @@ mod tests {
         }
 
         fn image_id(&self, image: &str) -> Option<String> {
-            (self.java_image && image == SCIP_JAVA_IMAGE).then(|| JAVA_ID.to_owned())
+            match image {
+                SCIP_JAVA_IMAGE => self.java_image.then(|| JAVA_ID.to_owned()),
+                PROXY_IMAGE => self.proxy_image.then(|| "sha256:proxy".to_owned()),
+                _ => None,
+            }
+        }
+
+        fn start_proxy(&self, spec: &ProxySpec) -> anyhow::Result<String> {
+            let filter = std::fs::read_to_string(spec.config_dir.join("filter"))?;
+            self.proxies.borrow_mut().push(format!(
+                "start {} {}",
+                spec.name,
+                filter.lines().collect::<Vec<_>>().join(",")
+            ));
+            match &self.proxy_fails {
+                Some(e) => Err(anyhow::anyhow!("{e}")),
+                None => Ok(PROXY_AT.to_owned()),
+            }
+        }
+
+        fn stop_proxy(&self, name: &str) -> String {
+            self.proxies.borrow_mut().push(format!("stop {name}"));
+            self.proxy_log.clone()
         }
     }
 
@@ -684,6 +820,7 @@ mod tests {
             &work,
             &cache,
             &Budget::default(),
+            &Egress::default(),
             &fake,
         )
         .unwrap();
@@ -703,7 +840,7 @@ mod tests {
             runs[1].name.as_deref(),
             Some(format!("rb-scip-{exported}-index").as_str())
         );
-        assert_eq!(runs[0].network, Network::Registries);
+        assert_eq!(runs[0].network, Network::Fetch);
         assert_eq!(
             runs[0].entrypoint.as_deref(),
             Some("/usr/local/bin/actual-npm")
@@ -773,6 +910,7 @@ mod tests {
             &tmp.path().join("w"),
             &tmp.path().join("c"),
             &Budget::default(),
+            &Egress::default(),
             &fake,
         )
         .unwrap();
@@ -792,6 +930,7 @@ mod tests {
             &tmp.path().join("w"),
             &tmp.path().join("c"),
             &Budget::default(),
+            &Egress::default(),
             &fake,
         )
         .unwrap();
@@ -817,7 +956,17 @@ mod tests {
             fetch_timeout: Duration::from_secs(10),
             index_timeout: Duration::from_secs(20),
         };
-        let run = run_job(&job, &image, &files(), &work, &cache, &budget, &fake).unwrap();
+        let run = run_job(
+            &job,
+            &image,
+            &files(),
+            &work,
+            &cache,
+            &budget,
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
         assert_eq!(run.status, RunStatus::Ok);
         assert_eq!(run.index.as_deref(), Some(&b"fake-index"[..]));
         assert!(!work.exists());
@@ -845,27 +994,52 @@ mod tests {
             assert!(r.env[0].1.contains("logFile=System.err"));
             assert_eq!((r.cpus, r.memory.as_str()), (3.0, "6g"));
         }
-        assert_eq!(runs[0].network, Network::Registries);
+        // Contract M5 S21, S22: the fetch phase reads the egress proxy from the mounted
+        // settings, and both phases turn the Develocity/Gradle Enterprise build caches off.
+        let caches_off = [
+            "-Ddevelocity.cache.local.enabled=false",
+            "-Ddevelocity.cache.remote.enabled=false",
+            "-Dgradle.cache.local.enabled=false",
+            "-Dgradle.cache.remote.enabled=false",
+        ];
+        let with_off = |args: &[&str]| -> Vec<String> {
+            args.iter()
+                .chain(caches_off.iter())
+                .map(|s| (*s).to_owned())
+                .collect()
+        };
+        assert_eq!(runs[0].network, Network::Fetch);
         assert_eq!(
             runs[0].args,
-            [
+            with_off(&[
                 "mvn",
                 "-B",
                 "-q",
+                "-s",
+                "/rb-egress/settings.xml",
                 "org.apache.maven.plugins:maven-dependency-plugin:3.11.0:go-offline"
-            ]
+            ])
         );
         assert_eq!(runs[0].timeout, Duration::from_secs(10));
-        assert_eq!(runs[1].network, Network::Registries);
+        assert_eq!(runs[1].network, Network::Fetch);
         assert_eq!(
             runs[1].args,
-            ["mvn", "-B", "-q", "clean", "verify", "-DskipTests"]
+            with_off(&[
+                "mvn",
+                "-B",
+                "-q",
+                "-s",
+                "/rb-egress/settings.xml",
+                "clean",
+                "verify",
+                "-DskipTests"
+            ])
         );
         assert_eq!(runs[2].network, Network::None);
         assert_eq!(runs[2].timeout, Duration::from_secs(20));
         assert_eq!(
             runs[2].args,
-            [
+            with_off(&[
                 "scip-java",
                 "index",
                 "--build-tool",
@@ -876,12 +1050,137 @@ mod tests {
                 "clean",
                 "verify",
                 "-DskipTests"
-            ]
+            ])
         );
         assert!(
             cache.join("m2").is_dir(),
             "the Maven cache directory is created"
         );
+    }
+
+    /// Contract M5 S21: each run's fetch phase runs behind its own egress proxy, started
+    /// before the first fetch with the allow-list as its filter and stopped before the index
+    /// phase; the fetch containers get the proxy's address (environment, Maven settings mounted
+    /// read-only), the index phase none of it; the run's egress files are removed.
+    #[test]
+    fn the_fetch_phase_runs_behind_its_own_egress_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let cache = tmp.path().join("cache");
+        let fake = Fake::new(false, false);
+        let egress = Egress::with(&["repo.spring.io".to_owned()]).unwrap();
+        let run = run_job(
+            &java_job(Fetch::Maven),
+            JAVA_ID,
+            &files(),
+            &work,
+            &cache,
+            &Budget::default(),
+            &egress,
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(run.status, RunStatus::Ok);
+        let runs = fake.runs.borrow();
+        let instance = runs[0]
+            .workdir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            *fake.proxies.borrow(),
+            [
+                format!(
+                    "start rb-egress-{instance} registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443"
+                ),
+                format!("stop rb-egress-{instance}"),
+            ]
+        );
+        let url = format!("http://{PROXY_AT}:8888");
+        for fetch in &runs[..2] {
+            assert_eq!(fetch.network, Network::Fetch);
+            assert!(
+                fetch.env.contains(&("HTTPS_PROXY".to_owned(), url.clone())),
+                "{:?}",
+                fetch.env
+            );
+            assert_eq!(fetch.readonly.len(), 1);
+            assert_eq!(fetch.readonly[0].1, "/rb-egress");
+        }
+        let settings = fake.settings.borrow();
+        assert_eq!(settings.len(), 2);
+        assert!(
+            settings[0].starts_with("/rb-egress <settings>")
+                && settings[0].contains(&format!("<host>{PROXY_AT}</host>")),
+            "{}",
+            settings[0]
+        );
+        let index = &runs[2];
+        assert_eq!(index.network, Network::None);
+        assert!(index.readonly.is_empty());
+        assert!(
+            !index
+                .env
+                .iter()
+                .any(|(k, _)| k.contains("PROXY") || k.contains("proxy"))
+        );
+        assert!(!tmp.path().join(format!("{instance}-egress")).exists());
+    }
+
+    /// Contract M5 S21: a failed fetch stops the proxy too and names what it refused (without
+    /// the log's times); a proxy that cannot start is an `environment` outcome (not cached)
+    /// and no container runs; without the proxy image every job is `unsupported`.
+    #[test]
+    fn egress_failures_are_reported_and_never_run_unguarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, cache) = (tmp.path().join("work"), tmp.path().join("cache"));
+        let mut fake = Fake::new(true, false);
+        fake.proxy_log = "NOTICE    Oct 06 23:33:11.069 [1]: Proxying refused on filtered url \"repo.spring.io:443\"\nNOTICE    Oct 06 23:33:12.069 [1]: Proxying refused on filtered url \"repo.spring.io:443\"\n".into();
+        let run = |fake: &Fake| {
+            run_job(
+                &java_job(Fetch::Maven),
+                JAVA_ID,
+                &files(),
+                &work,
+                &cache,
+                &Budget::default(),
+                &Egress::default(),
+                fake,
+            )
+            .unwrap()
+        };
+        let failed = run(&fake);
+        assert_eq!(failed.status, RunStatus::Failed(Phase::Fetch));
+        assert!(
+            failed
+                .stderr_tail
+                .ends_with("boom\negress proxy refused: repo.spring.io:443"),
+            "{}",
+            failed.stderr_tail
+        );
+        assert_eq!(fake.proxies.borrow().len(), 2, "started and stopped");
+        assert_eq!(fake.runs.borrow().len(), 1, "no index after a failed fetch");
+
+        let mut fake = Fake::new(false, false);
+        fake.proxy_fails = Some("network rb-scip-fetch exists with internal=false".into());
+        let down = run(&fake);
+        assert!(
+            matches!(&down.status, RunStatus::Environment(r) if r.starts_with("egress proxy:")),
+            "{:?}",
+            down.status
+        );
+        assert!(!down.status.is_cacheable());
+        assert!(fake.runs.borrow().is_empty(), "nothing ran unguarded");
+
+        let mut fake = Fake::new(false, false);
+        fake.proxy_image = false;
+        let images = Images::resolve(&fake);
+        for job in [java_job(Fetch::Maven), ts_job(NodeLock::PackageLock)] {
+            let reason = images.for_job(&job).unwrap_err();
+            assert!(reason.contains("rb-egress-proxy:1.11.3"), "{reason}");
+        }
+        assert_eq!(images.identity(Indexer::ScipJava), JAVA_ID);
     }
 
     /// Contract M3b amendment 22: two runs of the same job (the same input hash, so the same
@@ -903,6 +1202,7 @@ mod tests {
                 &work,
                 &cache,
                 &Budget::default(),
+                &Egress::default(),
                 &fake,
             )
             .unwrap();
@@ -969,6 +1269,7 @@ mod tests {
             &tmp.path().join("w"),
             &tmp.path().join("c"),
             &Budget::default(),
+            &Egress::default(),
             &fake,
         )
         .unwrap();
@@ -992,6 +1293,7 @@ mod tests {
             &tmp.path().join("w"),
             &tmp.path().join("c"),
             &Budget::default(),
+            &Egress::default(),
             &fake,
         )
         .unwrap();
@@ -1092,6 +1394,7 @@ mod tests {
                 &tmp.path().join("w"),
                 &tmp.path().join("c"),
                 &Budget::default(),
+                &Egress::default(),
                 &fake,
             )
             .unwrap();
@@ -1113,6 +1416,14 @@ mod tests {
                 entrypoint == "/usr/local/bin/actual-npm",
                 "{lockfile:?}: {:?}",
                 fetch.args
+            );
+            // Contract M5 S22: no update notice depends on the cache's state.
+            assert!(
+                fetch
+                    .env
+                    .contains(&("npm_config_update_notifier".into(), "false".into())),
+                "{lockfile:?}: {:?}",
+                fetch.env
             );
         }
     }
@@ -1140,6 +1451,7 @@ mod tests {
             &tmp.path().join("w"),
             &tmp.path().join("c"),
             &Budget::default(),
+            &Egress::default(),
             &fake,
         )
         .unwrap();
@@ -1199,6 +1511,7 @@ mod tests {
                 &tmp.path().join("w"),
                 &tmp.path().join("c"),
                 &budget,
+                &Egress::default(),
                 &fake,
             )
             .unwrap();

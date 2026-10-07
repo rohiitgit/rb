@@ -102,9 +102,12 @@ pub struct ScipOptions {
     /// the same commit at once share nothing; contract M3b amendment 22), removed after the
     /// run. Must be a path the container runtime can bind-mount.
     pub work_dir: PathBuf,
-    /// Package-manager caches shared across jobs.
+    /// The repository's package-manager caches (contract M5 S22: the caller keys the directory
+    /// by repository, so one repository's fetch cannot poison another's).
     pub cache_dir: PathBuf,
     pub budget: Budget,
+    /// The fetch phase's allow-list (contract M5 S21), part of every job's cache key.
+    pub egress: rb_scip::Egress,
 }
 
 impl ScipOptions {
@@ -116,6 +119,7 @@ impl ScipOptions {
             work_dir: PathBuf::new(),
             cache_dir: PathBuf::new(),
             budget: Budget::default(),
+            egress: rb_scip::Egress::default(),
         }
     }
 }
@@ -196,7 +200,8 @@ pub(crate) fn run_projects(
             .filter(|(path, _)| in_root(path, &job.root))
             .map(|(p, b)| (*p, *b))
             .collect();
-        let input_hash = rb_scip::project_input_hash(&job.root, under_root.iter().copied());
+        let input_hash =
+            rb_scip::project_input_hash(&job.root, under_root.iter().copied(), &options.egress);
         // A row whose status no current run would write (a `timeout` from an older binary) is
         // a miss (contract M3b amendment 31).
         let cached = cache.get(&input_hash, &project.image)?.and_then(|entry| {
@@ -222,6 +227,7 @@ pub(crate) fn run_projects(
                     &options.work_dir.join(&input_hash[..16]),
                     &options.cache_dir,
                     &options.budget,
+                    &options.egress,
                     runner,
                 )?;
                 let entry = ScipCacheEntry {
@@ -377,7 +383,18 @@ mod tests {
         }
 
         fn image_id(&self, image: &str) -> Option<String> {
+            if image == rb_scip::egress::PROXY_IMAGE {
+                return Some("sha256:proxy".to_owned());
+            }
             (self.java_image && image == rb_scip::jobs::SCIP_JAVA_IMAGE).then(|| JAVA_ID.to_owned())
+        }
+
+        fn start_proxy(&self, _: &rb_scip::ProxySpec) -> anyhow::Result<String> {
+            Ok("10.9.8.7".to_owned())
+        }
+
+        fn stop_proxy(&self, _: &str) -> String {
+            String::new()
         }
     }
 
@@ -439,6 +456,7 @@ mod tests {
             work_dir: tmp.join("work"),
             cache_dir: tmp.join("cache"),
             budget: Budget::default(),
+            egress: rb_scip::Egress::default(),
         }
     }
 

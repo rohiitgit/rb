@@ -181,11 +181,23 @@ pub struct Cleanup<'a> {
 }
 
 impl Drop for Cleanup<'_> {
+    /// Deletes the repositories, their package caches (`var/scip/cache/<repo>`, contract M5
+    /// S22) and, when a SCIP job ran for one of them, the egress networks it created (contract
+    /// M5 S21; the tests of this binary run one at a time, so no other run is using them).
     fn drop(&mut self) {
         if let Ok(mut store) = Store::connect(self.url) {
             for r in &self.repos {
                 let _ = store.delete_repo(r);
             }
+        }
+        let mut ran = false;
+        for r in &self.repos {
+            let cache = workspace_root().join("var/scip/cache").join(r);
+            ran |= cache.exists();
+            let _ = std::fs::remove_dir_all(cache);
+        }
+        if ran {
+            let _ = rb_scip::DockerRunner::default().egress_leftovers(true);
         }
     }
 }

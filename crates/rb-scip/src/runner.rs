@@ -8,9 +8,11 @@ use std::time::Duration;
 /// What a container may reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
-    /// The fetch phase: Docker's default bridge network, unrestricted (registry allow-listing
-    /// is M5; contract M3b amendment 27).
-    Registries,
+    /// The fetch phase: the internal network [`crate::egress::FETCH_NETWORK`] (no route out),
+    /// whose only other member is the run's egress proxy, and no resolver of its own
+    /// (`--dns 127.0.0.1`; the network's embedded resolver answers no external name anyway;
+    /// contract M5 D15, S21).
+    Fetch,
     /// The index phase: nothing.
     None,
 }
@@ -31,6 +33,8 @@ pub struct ContainerRun {
     pub mount_at: String,
     /// Extra mounts `(host, container)`: dependency caches shared between the two phases.
     pub caches: Vec<(PathBuf, String)>,
+    /// Read-only mounts `(host, container)`: the egress client configuration.
+    pub readonly: Vec<(PathBuf, String)>,
     pub env: Vec<(String, String)>,
     pub network: Network,
     pub cpus: f32,
@@ -63,6 +67,26 @@ pub trait Runner {
     /// does not have it. A digest-pinned reference needs no lookup; a locally built image (the
     /// scip-java one) has no registry digest, so its ID is what identifies it in the cache key.
     fn image_id(&self, image: &str) -> Option<String>;
+
+    /// Starts one fetch run's egress proxy (contract M5 S21): creates the fetch and egress
+    /// networks when absent, starts `spec.name` from `spec.image` on the egress network with
+    /// `spec.config_dir` mounted read-only, connects it to the fetch network, waits until it
+    /// listens, and returns its address there (the fetch containers need no DNS to reach it).
+    fn start_proxy(&self, spec: &ProxySpec) -> anyhow::Result<String>;
+
+    /// Stops and removes the proxy `name`; returns what it logged (its refusals are reported
+    /// with a failed fetch). Never fails: a proxy already gone logged nothing.
+    fn stop_proxy(&self, name: &str) -> String;
+}
+
+/// One run's egress proxy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxySpec {
+    /// `rb-egress-<run instance>`: unique to the run, like its containers.
+    pub name: String,
+    pub image: String,
+    /// Holds `tinyproxy.conf` and `filter` ([`crate::egress::Egress::write_config`]).
+    pub config_dir: PathBuf,
 }
 
 /// The `docker run` arguments for `run`: no credentials, no host toolchains, the network
@@ -75,12 +99,16 @@ pub fn docker_args(run: &ContainerRun) -> Vec<String> {
     if let Some(p) = &run.platform {
         a.extend(["--platform".into(), p.clone()]);
     }
+    match run.network {
+        Network::Fetch => a.extend([
+            "--network".into(),
+            crate::egress::FETCH_NETWORK.into(),
+            "--dns".into(),
+            "127.0.0.1".into(),
+        ]),
+        Network::None => a.extend(["--network".into(), "none".into()]),
+    }
     a.extend([
-        "--network".into(),
-        match run.network {
-            Network::Registries => "bridge".into(),
-            Network::None => "none".into(),
-        },
         "--cpus".into(),
         format!("{}", run.cpus),
         "--memory".into(),
@@ -92,6 +120,9 @@ pub fn docker_args(run: &ContainerRun) -> Vec<String> {
     ]);
     for (host, inside) in &run.caches {
         a.extend(["-v".into(), format!("{}:{}", host.display(), inside)]);
+    }
+    for (host, inside) in &run.readonly {
+        a.extend(["-v".into(), format!("{}:{}:ro", host.display(), inside)]);
     }
     for (k, v) in &run.env {
         a.extend(["-e".into(), format!("{k}={v}")]);
@@ -212,6 +243,148 @@ impl Runner for DockerRunner {
         let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         (out.status.success() && id.starts_with("sha256:")).then_some(id)
     }
+
+    fn start_proxy(&self, spec: &ProxySpec) -> anyhow::Result<String> {
+        use crate::egress::{EGRESS_NETWORK, FETCH_NETWORK, LABEL, PROXY_CONFIG_AT, PROXY_PORT};
+        self.ensure_network(FETCH_NETWORK, true)?;
+        self.ensure_network(EGRESS_NETWORK, false)?;
+        let config = format!(
+            "{}:{PROXY_CONFIG_AT}:ro",
+            absolute(&spec.config_dir)?.display()
+        );
+        let label = format!("{LABEL}=proxy");
+        self.docker_ok(&[
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            &spec.name,
+            "--label",
+            &label,
+            "--network",
+            EGRESS_NETWORK,
+            "--cpus",
+            "0.5",
+            "--memory",
+            "64m",
+            "-v",
+            &config,
+            &spec.image,
+        ])?;
+        let started = (|| -> anyhow::Result<String> {
+            self.docker_ok(&["network", "connect", FETCH_NETWORK, &spec.name])?;
+            let format =
+                format!("{{{{(index .NetworkSettings.Networks \"{FETCH_NETWORK}\").IPAddress}}}}");
+            let address = self.docker_ok(&["inspect", "--format", &format, &spec.name])?;
+            anyhow::ensure!(
+                !address.is_empty(),
+                "the egress proxy has no address on {FETCH_NETWORK}"
+            );
+            let port = PROXY_PORT.to_string();
+            for _ in 0..100 {
+                if self
+                    .docker_ok(&["exec", &spec.name, "nc", "-z", "127.0.0.1", &port])
+                    .is_ok()
+                {
+                    return Ok(address);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            anyhow::bail!("the egress proxy did not listen within 10 s")
+        })();
+        if started.is_err() {
+            self.stop_proxy(&spec.name);
+        }
+        started
+    }
+
+    fn stop_proxy(&self, name: &str) -> String {
+        let log = Command::new(&self.docker)
+            .args(["logs", name])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map(|o| {
+                let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&o.stderr));
+                text
+            })
+            .unwrap_or_default();
+        let _ = self.docker_ok(&["rm", "-f", name]);
+        log
+    }
+}
+
+impl DockerRunner {
+    /// Runs the CLI with `args`; its trimmed stdout, or an error with its stderr.
+    fn docker_ok(&self, args: &[&str]) -> anyhow::Result<String> {
+        let out = Command::new(&self.docker)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| anyhow::anyhow!("starting docker: {e}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "docker {}: {}",
+            args.first().copied().unwrap_or_default(),
+            tail(&String::from_utf8_lossy(&out.stderr), 3)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+
+    /// Creates the labelled network `name` (`--internal` when asked) unless it exists; a
+    /// concurrent creation by another run is no error. An existing network of that name must be
+    /// as asked (internal or not): a bridge with a route out is never used as the fetch network.
+    fn ensure_network(&self, name: &str, internal: bool) -> anyhow::Result<()> {
+        let inspect = |runner: &DockerRunner| {
+            runner.docker_ok(&["network", "inspect", "--format", "{{.Internal}}", name])
+        };
+        let found = match inspect(self) {
+            Ok(found) => found,
+            Err(_) => {
+                let label = format!("{}=network", crate::egress::LABEL);
+                let mut args = vec!["network", "create", "--label", &label];
+                if internal {
+                    args.push("--internal");
+                }
+                args.push(name);
+                // Another run may have created it in between: inspect again either way.
+                let _ = self.docker_ok(&args);
+                inspect(self)?
+            }
+        };
+        anyhow::ensure!(
+            found == internal.to_string(),
+            "network {name} exists with internal={found}; expected internal={internal} \
+             (remove it with `rb gc --egress`)"
+        );
+        Ok(())
+    }
+
+    /// The egress networks and proxy containers on this host (`rb gc --egress`); with
+    /// `remove`, removes them (proxies first). Returns what was found, as `container <name>` or
+    /// `network <name>`.
+    pub fn egress_leftovers(&self, remove: bool) -> anyhow::Result<Vec<String>> {
+        use crate::egress::{EGRESS_NETWORK, FETCH_NETWORK, LABEL};
+        let filter = format!("label={LABEL}=proxy");
+        let containers =
+            self.docker_ok(&["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"])?;
+        let mut found = Vec::new();
+        for name in containers.lines().filter(|l| !l.is_empty()) {
+            if remove {
+                self.docker_ok(&["rm", "-f", name])?;
+            }
+            found.push(format!("container {name}"));
+        }
+        for name in [FETCH_NETWORK, EGRESS_NETWORK] {
+            if self.docker_ok(&["network", "inspect", name]).is_ok() {
+                if remove {
+                    self.docker_ok(&["network", "rm", name])?;
+                }
+                found.push(format!("network {name}"));
+            }
+        }
+        Ok(found)
+    }
 }
 
 /// The last `lines` lines of `text`.
@@ -239,6 +412,7 @@ mod tests {
             workdir: PathBuf::from("/tmp/checkout"),
             mount_at: "/src".into(),
             caches: vec![(PathBuf::from("/tmp/npm-cache"), "/root/.npm".into())],
+            readonly: Vec::new(),
             env: vec![("NODE_OPTIONS".into(), "--max-old-space-size=4096".into())],
             network: Network::None,
             cpus: 2.0,
@@ -252,19 +426,26 @@ mod tests {
             args,
             "run --rm --platform linux/amd64 --network none --cpus 2 --memory 4g -v /tmp/checkout:/src -w /src -v /tmp/npm-cache:/root/.npm -e NODE_OPTIONS=--max-old-space-size=4096 sourcegraph/scip-typescript@sha256:0000 index --output index.scip"
         );
+        // Contract M5 S21: the fetch phase attaches only to the internal fetch network, with
+        // no resolver of its own, and its egress client files mounted read-only.
         let fetch = ContainerRun {
             name: Some("rb-scip-0123456789abcdef-fetch".into()),
-            network: Network::Registries,
+            network: Network::Fetch,
             platform: None,
+            readonly: vec![(PathBuf::from("/tmp/egress"), "/rb-egress".into())],
             entrypoint: Some("npm".into()),
             args: vec!["ci".into()],
             ..run
         };
         let args = docker_args(&fetch).join(" ");
         assert!(
-            args.starts_with("run --rm --name rb-scip-0123456789abcdef-fetch --network bridge"),
+            args.starts_with(
+                "run --rm --name rb-scip-0123456789abcdef-fetch --network rb-scip-fetch --dns 127.0.0.1 --cpus"
+            ),
             "{args}"
         );
+        assert!(args.contains(" -v /tmp/egress:/rb-egress:ro "), "{args}");
+        assert!(!args.contains("bridge"), "{args}");
         assert!(!args.contains("--platform"), "{args}");
         assert!(
             args.contains("--entrypoint npm sourcegraph/scip-typescript@sha256:0000 ci"),
@@ -305,6 +486,7 @@ mod tests {
             workdir: dir.to_path_buf(),
             mount_at: "/src".into(),
             caches: Vec::new(),
+            readonly: Vec::new(),
             env: Vec::new(),
             network: Network::None,
             cpus: 1.0,
@@ -366,6 +548,97 @@ mod tests {
             logged.lines().any(|l| l == "kill rb-scip-abc-fetch"),
             "{logged}"
         );
+    }
+
+    /// A fake `docker` for the egress commands: logs every call; `network inspect` answers
+    /// from `$DIR/net-<name>` (absent: fails, as for a missing network) and `network create`
+    /// writes that file (`true` with `--internal`); `inspect` prints an address; `logs` prints
+    /// a refusal.
+    fn fake_egress_docker(dir: &Path) -> (DockerRunner, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let log = dir.join("log");
+        let script = format!(
+            "#!/bin/sh\nDIR={dir}\necho \"$@\" >> \"$DIR/log\"\nlast() {{ for a; do :; done; echo \"$a\"; }}\ncase \"$1 $2\" in\n  'network inspect') f=\"$DIR/net-$(last \"$@\")\"; [ -f \"$f\" ] || exit 1; cat \"$f\" ;;\n  'network create') n=$(last \"$@\"); case \"$*\" in *--internal*) echo true ;; *) echo false ;; esac > \"$DIR/net-$n\" ;;\n  'network rm') rm -f \"$DIR/net-$3\" ;;\n  *) case \"$1\" in\n       inspect) echo 172.30.0.2 ;;\n       logs) echo 'NOTICE x [1]: Proxying refused on filtered url \"example.com:443\"' ;;\n       ps) echo rb-egress-left ;;\n     esac ;;\nesac\n",
+            dir = dir.display()
+        );
+        let docker = dir.join("docker");
+        std::fs::write(&docker, script).unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (
+            DockerRunner {
+                docker,
+                kill_grace: Duration::from_millis(500),
+            },
+            log,
+        )
+    }
+
+    /// Contract M5 S21: starting a proxy creates the fetch network `--internal` and the egress
+    /// network when absent (labelled), starts the proxy on the egress network with its
+    /// configuration read-only, connects it to the fetch network, waits for it to listen and
+    /// returns its address there; stopping it returns its log and removes it. A fetch network
+    /// that exists but is not internal is refused before any proxy starts; `rb gc --egress`
+    /// lists and removes the proxies and both networks.
+    #[test]
+    fn egress_proxies_run_on_an_internal_network_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (runner, log) = fake_egress_docker(tmp.path());
+        let config = tmp.path().join("proxy");
+        std::fs::create_dir_all(&config).unwrap();
+        let spec = ProxySpec {
+            name: "rb-egress-run1".into(),
+            image: crate::egress::PROXY_IMAGE.into(),
+            config_dir: config.clone(),
+        };
+        assert_eq!(runner.start_proxy(&spec).unwrap(), "172.30.0.2");
+        assert!(
+            runner
+                .stop_proxy("rb-egress-run1")
+                .contains("example.com:443")
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let config = absolute(&config).unwrap();
+        for want in [
+            "network create --label rb.egress=network --internal rb-scip-fetch".to_owned(),
+            "network create --label rb.egress=network rb-scip-egress".to_owned(),
+            format!(
+                "run -d --rm --name rb-egress-run1 --label rb.egress=proxy --network rb-scip-egress --cpus 0.5 --memory 64m -v {}:/etc/tinyproxy:ro rb-egress-proxy:1.11.3",
+                config.display()
+            ),
+            "network connect rb-scip-fetch rb-egress-run1".to_owned(),
+            "exec rb-egress-run1 nc -z 127.0.0.1 8888".to_owned(),
+            "logs rb-egress-run1".to_owned(),
+            "rm -f rb-egress-run1".to_owned(),
+        ] {
+            assert!(calls.lines().any(|l| l == want), "{want}\n{calls}");
+        }
+        // A bridged network posing as the fetch network: refused, no proxy started.
+        let tmp = tempfile::tempdir().unwrap();
+        let (runner, log) = fake_egress_docker(tmp.path());
+        std::fs::write(tmp.path().join("net-rb-scip-fetch"), "false\n").unwrap();
+        let err = runner.start_proxy(&spec).unwrap_err().to_string();
+        assert!(err.contains("internal=false"), "{err}");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(!calls.lines().any(|l| l.starts_with("run ")), "{calls}");
+        // `rb gc --egress`.
+        std::fs::write(tmp.path().join("net-rb-scip-egress"), "false\n").unwrap();
+        assert_eq!(
+            runner.egress_leftovers(false).unwrap(),
+            [
+                "container rb-egress-left",
+                "network rb-scip-fetch",
+                "network rb-scip-egress"
+            ]
+        );
+        runner.egress_leftovers(true).unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        for want in [
+            "rm -f rb-egress-left",
+            "network rm rb-scip-fetch",
+            "network rm rb-scip-egress",
+        ] {
+            assert!(calls.lines().any(|l| l == want), "{want}\n{calls}");
+        }
     }
 
     #[test]

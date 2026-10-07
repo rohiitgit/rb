@@ -2854,11 +2854,13 @@ fn scip_unfinished_jobs_are_not_up_to_date() {
             && refused.contains(": shim: docker run refused for <host path>"),
         "{refused}"
     );
-    // Amendment 49: the stored reason names no host path.
+    // Amendment 49: the stored reason names no host path. Since contract M5 S21 the first
+    // `docker run` a job makes starts its egress proxy, so that is the run refused.
     let dump = rb(&url, &["dump", "--repo", &name]);
     assert!(
-        dump.contains("\"reason\":\"shim: docker run refused for <host path>\"")
-            && !dump.contains("/Users/nobody"),
+        dump.contains(
+            "\"reason\":\"egress proxy: docker run: shim: docker run refused for <host path>\""
+        ) && !dump.contains("/Users/nobody"),
         "{dump}"
     );
     let rebuilt = rb(&url, &["index", path, "--repo", &name]);
@@ -2895,6 +2897,128 @@ fn scip_unfinished_jobs_are_not_up_to_date() {
             && rebuilt.contains("scip: . scip-java ok (cached"),
         "{rebuilt}"
     );
+}
+
+/// Contract M5 S21, the probe suite: from a container started exactly as a fetch job is
+/// (`docker_args` of a `Network::Fetch` run with the proxy's environment, in the scip-java image,
+/// which has `curl`), behind a proxy started as `run_job` starts one, with the built-in
+/// allow-list: an allow-listed registry answers over `CONNECT`; a host off the list, a direct IP
+/// through the proxy and plain HTTP to an allow-listed host are refused by the proxy (its log
+/// names each); direct TCP to an outside address and to the Docker host's gateway fails, DNS
+/// resolves no external name, and UDP to a public resolver has no route. The fetch network is
+/// `--internal`. Needs Docker, both local images and the network; skipped otherwise.
+#[test]
+fn scip_egress_probes_from_a_fetch_container() {
+    use rb_scip::Runner as _;
+    let Some(_url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let runner = rb_scip::DockerRunner::default();
+    if runner.image_id(rb_scip::egress::PROXY_IMAGE).is_none() {
+        eprintln!(
+            "skipping: {} is not built; see docker/egress-proxy/README.md",
+            rb_scip::egress::PROXY_IMAGE
+        );
+        return;
+    }
+    let pid = std::process::id();
+    let dir = workspace_root().join(format!("var/scip/probe-{pid}"));
+    struct Removed<'a>(&'a Path, &'a rb_scip::DockerRunner);
+    impl Drop for Removed<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0);
+            let _ = self.1.egress_leftovers(true);
+        }
+    }
+    let _removed = Removed(&dir, &runner);
+    let egress = rb_scip::Egress::default();
+    egress.write_config(&dir.join("proxy")).unwrap();
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    let spec = rb_scip::ProxySpec {
+        name: format!("rb-egress-probe-{pid}"),
+        image: rb_scip::egress::PROXY_IMAGE.into(),
+        config_dir: dir.join("proxy"),
+    };
+    let address = runner.start_proxy(&spec).unwrap();
+    let script = r#"exec 1>&2
+code() { curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$@" 2>/dev/null; echo " exit=$?"; }
+echo "allowed $(code https://repo.maven.apache.org/maven2/)"
+echo "host $(code https://example.com/)"
+echo "plain $(code -x "$http_proxy" http://repo.maven.apache.org/maven2/)"
+echo "ip $(code https://1.1.1.1/)"
+echo "direct $(code --noproxy '*' --connect-timeout 5 https://1.1.1.1/)"
+echo "gateway $(code --noproxy '*' --connect-timeout 5 http://192.168.65.254:55433/)"
+getent hosts example.com > /dev/null; echo "dns exit=$?"
+timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?"
+"#;
+    let probe = rb_scip::ContainerRun {
+        name: Some(format!("rb-scip-probe-{pid}-fetch")),
+        image: rb_scip::jobs::SCIP_JAVA_IMAGE.into(),
+        platform: None,
+        workdir: dir.join("work"),
+        mount_at: "/sources".into(),
+        caches: Vec::new(),
+        readonly: Vec::new(),
+        env: rb_scip::egress::proxy_env(&address),
+        network: rb_scip::Network::Fetch,
+        cpus: 1.0,
+        memory: "1g".into(),
+        timeout: std::time::Duration::from_secs(300),
+        entrypoint: Some("bash".into()),
+        args: vec!["-c".into(), script.into()],
+    };
+    let args = rb_scip::runner::docker_args(&probe).join(" ");
+    assert!(
+        args.contains("--network rb-scip-fetch --dns 127.0.0.1"),
+        "{args}"
+    );
+    let outcome = runner.run(&probe).unwrap();
+    let log = runner.stop_proxy(&spec.name);
+    let internal = Command::new("docker")
+        .args([
+            "network",
+            "inspect",
+            "--format",
+            "{{.Internal}}",
+            "rb-scip-fetch",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&internal.stdout).trim(), "true");
+    let result = |probe: &str| -> String {
+        outcome
+            .stderr_tail
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{probe} ")))
+            .unwrap_or_else(|| panic!("no {probe} line:\n{}", outcome.stderr_tail))
+            .to_owned()
+    };
+    eprintln!("egress probes:\n{}", outcome.stderr_tail);
+    assert!(outcome.ok(), "{}", outcome.stderr_tail);
+    assert_eq!(result("allowed"), "200 exit=0");
+    for refused in ["host", "ip", "direct", "gateway"] {
+        let r = result(refused);
+        assert!(
+            r.starts_with("000 exit=") && r != "000 exit=0",
+            "{refused}: {r}"
+        );
+    }
+    assert_eq!(result("plain"), "403 exit=0");
+    assert_ne!(result("dns"), "exit=0");
+    assert_ne!(result("udp"), "exit=0");
+    assert_eq!(
+        rb_scip::egress::refusals(&log),
+        [
+            "1.1.1.1:443",
+            "example.com:443",
+            "http://repo.maven.apache.org/maven2/"
+        ],
+        "{log}"
+    );
+    assert!(log.contains("CONNECT repo.maven.apache.org:443"), "{log}");
+    assert!(!log.contains("CONNECT 192.168.65.254"), "{log}");
 }
 
 /// Docker answering and the local scip-java image built (docker/scip-java/README.md); the

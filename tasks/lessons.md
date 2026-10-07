@@ -244,3 +244,11 @@
 ## 2026-10-07: a test that loops until the system says "stop" bounds its own iterations
 - **Mistake:** the pagination e2e followed `next_offset` until it was `null`; a mutant that dropped the CLI's `--offset` made every page the first one, so the loop never ended and the mutation harness hung for ten minutes until it was stopped with SIGINT (the source restored and checked).
 - **Rule:** any test loop driven by the system under test (pages, retries, polling, a fixpoint) asserts progress at each step (the page starts where asked, the next offset is strictly larger) and runs at most a bound computed from the input (`total` pages), so a regression fails instead of hanging.
+
+## 2026-10-07: splitting a cache re-exposes the tools' own bookkeeping in it
+- **Mistake (caught by the e2e, fixed before committing):** per-repository package caches gave every fixture an empty npm cache, and npm's update notifier, which records its last check there, printed a "new version available" notice on the first fetch and not on the next; a failed fetch's stderr, which the dump stores, then differed between two runs of one commit. The shared cache had hidden it for months because its notifier timestamp was always fresh.
+- **Rule:** whenever a cache is split, moved or emptied, run the determinism checks again from a cold cache and a warm one, and turn off every tool behaviour that depends on cache state and can reach stored output (update notifiers, "previous attempt" failure caches, telemetry banners) explicitly in the recipe.
+
+## 2026-10-07: an allow-list the adversary can extend is no allow-list
+- **Mistake (caught while designing, amendment 12):** the contract let the fetch phase's registry allow-list be extended by `rb.toml`, which `rb` reads from the repository being indexed; the repository's own build is exactly what the egress guard contains, so it could have allowed its own exfiltration host.
+- **Rule:** for every input to a security control, ask who writes it; configuration that widens a guard comes from the operator's side (flags, host environment), never from the data the guard is applied to, and is validated in the form the guard matches literally.

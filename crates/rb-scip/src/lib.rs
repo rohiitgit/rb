@@ -9,7 +9,12 @@ pub mod jobs;
 pub use jobs::{Indexer, Job, jobs, maven_source_encoding};
 pub mod runner;
 
-pub use runner::{ContainerRun, DockerRunner, Network, Outcome, Runner, docker_available};
+pub use runner::{
+    ContainerRun, DockerRunner, Network, Outcome, ProxySpec, Runner, docker_available,
+};
+pub mod egress;
+
+pub use egress::Egress;
 pub mod hash;
 
 pub use hash::project_input_hash;
