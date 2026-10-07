@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M6a phase 1: `rb serve` checks its bind before its sweep; a two-repository sweep test (S14, S15; D10)
+- **Fix (contract-m5 open item 24):** `rb serve` runs `rb_server::check_bind` before `sweep_leftover_graphs`, its only write, so a refused address writes nothing; `serve` keeps its own check for other callers.
+- **Tests:** e2e `a_publish_killed_after_its_flip_self_heals` gains S14's row (with the leftover planted, `rb serve --bind 0.0.0.0:0` exits non-zero with `refusing to bind` and the leftover stays; the loopback server then sweeps it) — failed first on `cfa8ab9`'s order. `rb-store` `the_startup_sweep_covers_every_repository_it_is_given` (open item 25): leftovers in two repositories the test creates, the later-sorting one included; both swept, both live graphs kept.
+- **Mutation** (`var/m6a/scripts/mutate.sh`, restored and byte-compared): `sweep_graphs` over the first name only → killed by the new `rb-store` test alone (the one-repository test passes under it).
+- **Verification** (`var/m6a/logs/p1-*`): clippy clean, fmt clean after `cargo fmt` (one assert re-wrapped; the store test re-run); 640 unit tests outside e2e and api; `rb-store` 66/66, `rb-server` 12/12; e2e 30/30, api 1/1 (150 sets), no `skipping`; no listener; stub scan: only `rb-sql/src/lib.rs:1111`. No dump changes (invariant 1 untouched by this phase).
+- Files: `crates/rb-cli/src/main.rs`, `crates/rb-cli/tests/e2e.rs`, `crates/rb-store/src/db_tests.rs`; records `tasks/todo.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M6a phase 0: preflight (no code)
 - **Baseline:** HEAD's code equals `cfa8ab9`'s (only records changed), so its release build is the invariant-1 binary `var/m6a/base/rb-cfa8ab9` (sha256 `69800d61…f009b`); `--no-scip` fixture dumps equal M5 phase 20's byte for byte; SCIP dumps and status lines saved (`var/m6a/base/{noscip,scip}/`, scripts `var/m6a/scripts/{fixture_dumps,verify}.sh`).
 - **P1b** (D4's gate, scip-typescript 0.4.0, `--network none`, 13 interface forms plus a cross-package supertype): every member relationship runs sub → super; super → sub count **0**, so D4 is built.

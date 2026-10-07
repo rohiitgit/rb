@@ -434,6 +434,10 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                 Err(_) => Duration::ZERO,
             },
         };
+        // A refused address writes nothing: the bind check comes before the sweep, which is
+        // the server's only write (contract M6a D10); `serve` repeats the check for its other
+        // callers.
+        rb_server::check_bind(&config.bind)?;
         sweep_leftover_graphs(&config.database_url);
         rb_server::serve(
             config,
@@ -764,9 +768,10 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
 
 /// `rb serve`'s startup sweep (contract M5 amendment 16): drops the AGE graphs that non-live
 /// snapshots still name (left by a publisher killed between its flip and its retention), for
-/// every repository, one graph per transaction under the DDL lock, before any request is
-/// answered; the requests themselves stay read-only. Reads never use such a graph, so a sweep
-/// that cannot run (no database yet) is reported on stderr and the server starts anyway.
+/// every repository, one graph per transaction under the DDL lock, after the bind address passed
+/// its check (contract M6a D10) and before any request is answered; the requests themselves stay
+/// read-only. Reads never use such a graph, so a sweep that cannot run (no database yet) is
+/// reported on stderr and the server starts anyway.
 fn sweep_leftover_graphs(database_url: &str) {
     let swept = Store::connect(database_url).and_then(|mut store| {
         let repos = store.repo_names()?;

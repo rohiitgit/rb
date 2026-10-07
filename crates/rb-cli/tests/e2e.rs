@@ -1519,6 +1519,16 @@ fn a_publish_killed_after_its_flip_self_heals() {
         ]
     );
 
+    // Contract M6a S14 (D10): a server that refuses its bind address writes nothing, so the
+    // leftover survives it; the one that starts on loopback sweeps it.
+    let (code, _, err) = rb_exit(&url, &["serve", "--bind", "0.0.0.0:0"]);
+    assert_ne!(code, 0, "a non-loopback bind is refused: {err}");
+    assert!(err.contains("refusing to bind"), "{err}");
+    assert_eq!(
+        graphs(&mut probe),
+        both,
+        "a refused start leaves the leftover"
+    );
     let server = Served::start(&url, &[]);
     assert_eq!(graphs(&mut probe), vec![format!("rb_{name}_{new}")]);
     drop(server);

@@ -1117,6 +1117,62 @@ fn a_publish_stopped_after_its_flip_leaves_a_graph_that_reads_ignore_and_sweeps_
     );
 }
 
+/// Contract M6a S15 (contract-m5 open item 25, lesson "a claim about 'every' item needs a test
+/// with at least two"): `rb serve`'s startup sweep is given every repository name; with a
+/// leftover graph in each of two repositories this test creates, and the name that sorts last
+/// holding one, the sweep drops both and keeps each live graph. A sweep that stopped after the
+/// first name would leave the later repository's leftover, whatever else the database holds.
+#[test]
+fn the_startup_sweep_covers_every_repository_it_is_given() {
+    let Some(db) = db() else { return };
+    let (first, last) = (repo_name("sweep2_a"), repo_name("sweep2_b"));
+    assert!(
+        first < last,
+        "the repository holding the interesting leftover sorts last"
+    );
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![first.clone(), last.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let mut probe = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    // One complete publish, then one stopped after its flip: the first snapshot's graph is the
+    // leftover, the second's the live graph.
+    let mut leftover = |store: &mut Store, repo: &str| -> (String, String) {
+        let run = |store: &mut Store, step: u32| {
+            store.publish_snapshot(
+                repo,
+                &format!("{step:040}"),
+                &json!({"step": step}),
+                &sample_graph(2, step),
+                &[],
+                &load_dir(),
+            )
+        };
+        let old = run(store, 1).unwrap().snapshot.id;
+        let err = crate::hooks::with_stop_after_flip(|| run(store, 2)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stopped after the flip"),
+            "{err:#}"
+        );
+        let new = store.live_snapshot(repo).unwrap().unwrap().id;
+        assert_eq!(
+            repo_state(&mut probe, repo).graphs,
+            vec![crate::graph_name(repo, old), crate::graph_name(repo, new)],
+            "{repo}: a leftover and the live graph"
+        );
+        (crate::graph_name(repo, old), crate::graph_name(repo, new))
+    };
+    let (first_left, first_live) = leftover(&mut store, &first);
+    let (last_left, last_live) = leftover(&mut store, &last);
+
+    let mut swept = store.sweep_graphs(&[first.clone(), last.clone()]).unwrap();
+    swept.sort();
+    assert_eq!(swept, vec![first_left, last_left]);
+    assert_eq!(repo_state(&mut probe, &first).graphs, vec![first_live]);
+    assert_eq!(repo_state(&mut probe, &last).graphs, vec![last_live]);
+}
+
 /// Contract M5 S15, D18: `find`'s pages (one `LIMIT/OFFSET` query and one count) concatenate to
 /// the whole match list at limits 1, 7 and 1,000, `total` counts every match, and an offset past
 /// the end is an empty page; the order is total, so repeated reads give the same pages.

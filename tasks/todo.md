@@ -802,7 +802,7 @@ Same rules as M5:
   - The layout check of S10 (a scratch build with only the repository-shaped export; `ts-express-prisma` and `polyglot-monorepo` SCIP dumps vs the baseline) and the `npm ci` link-target check (F2's fallback).
   - The second Lombok repository by D11's rule (GitHub API sizes, pom read, one fetch attempt); D5's glob forms counted on mattermost's and the candidates' manifests; the largest `--scip-memory` the VM holds beside Postgres.
   - **Verify:** the contract gains "Checked in phase 0" with every finding and its source; a deviation from a decision is an amendment before code.
-- [ ] **1. `rb serve` start-up order and the two-repository sweep** (S14, S15; D10).
+- [x] **1. `rb serve` start-up order and the two-repository sweep** (S14, S15; D10). Done 2026-10-07: *State* the bind address and the repository list; *Invariant* 11 (no write before the bind check). S14's e2e row failed first (`a refused start leaves the leftover`); mutant "sweep only the first name" killed by `rb-store` alone. Verify `var/m6a/logs/p1-*`.
   - Files: `rb-cli/src/main.rs`, `rb-store/src/db_tests.rs`, `rb-cli/tests/e2e.rs`.
   - **Verify:** S14's e2e fails first (the refused start sweeps); the "first repository only" mutant is killed by the `rb-store` test alone; loop green.
 - [ ] **2. Lombok removal and counters** (S1, S2 units, S3; D1–D3; `PIPELINE` `m6a-1`).
