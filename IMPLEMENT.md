@@ -8,7 +8,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - The `engineer` rules apply to all code.
 - Every batch runs plan → tests first → implement → separate evaluator agent → verify → commit.
 - **Backups:** a project zip goes in `archive/` (gitignored) before each major change, and a git commit follows each verified batch. Per-file `.backup` copies are deliberately not used, because fixture tests copy whole directories and stray files would change the golden dumps.
-- **Verification:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55432/rb cargo test --workspace`.
+- **Verification:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:<port>/rb cargo test --workspace`, where `<port>` is the database's: 55432 by default (`compose.yaml`), 55433 on this machine since 2026-09-30 (`RB_DB_PORT=55433`; see the Docker Desktop restoration below). In M5 the loop is `var/m5/scripts/verify.sh <tag>`.
 
 ## M0 Foundations: complete (commit a8f5ac2)
 
@@ -396,7 +396,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   Each has a recommendation.
 - No new dependency and no migration are planned.
 
-## M5 Scale & API: in progress
+## M5 Scale & API: built, pending evaluator review
 
 - **Contract:** `tasks/contract-m5.md` (2026-10-07), S1–S28 and invariants 1–11. Phases 0–20 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front** (lesson 2026-10-06):
@@ -439,3 +439,4 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Phase 17b (S24 on mattermost): `--no-scip` 29.2 s fresh / 19.6 s cached / 17.9–19.6 s incremental; SCIP 610.6 s fresh (4 of 11 TypeScript projects index; the webapp's workspace packages and two e2e projects with `file:` links outside their root fail their fetch, M6), 24.0 s cached; deterministic, parity OK; 121 MiB + 44 MiB AGE per snapshot; S18/S19 change nothing there.
   - [x] Phase 18 (S25): latency through a warm `rb serve`, two runs per repository: Q1 depth 1 p95 1.6–3.3 ms, Q2 on the 20 hubs p95 94–152 ms, Q4 p95 3.6 ms (mattermost's 66 endpoints; shardingsphere has none), all within §12.5; no `truncated` answer; snapshot index built in 0.57–0.63 s, server RSS 249–284 MiB; cold CLI 0.4–0.6 s per question.
   - [x] Phase 19 (S26): no heuristic or `synthetic` `CONSUMES` on either benchmark repository; mattermost's 8 `ambiguous` are all false (in-process Go test requests matched by the relative-URL convention; M6 items); the M4a forms counted (none reaches an edge); Gate A lowers 0 edges; no DI, `INJECTS` or RTA proof to sample; mattermost's one sampled orphan is true; S19 costs nothing there. Benchmark artifacts removed and the database vacuumed.
+  - [x] Phase 20, records (S27, S28 except the evaluator passes; no code): invariant 1 re-checked with the HEAD binary against `afae548` — fixtures and the four M4b repositories differ only in the rows S18 and S19 (c–g) named (12 changed rows in all, each classified), and every dump equals phase 13b's byte for byte; the contract's open items consolidated with target milestones (M6 unless stated), its measurement section corrected (phase 19's disk figures); design §8.3, §8.4, §11, §12.5, §13 and §14 updated as decided and measured; README: `rb serve`, `rb diff`, the JSON envelope, `--snapshot`, pages, `rb gc`, `rb cache prune`, `--keep`, `--timeout-ms`, `--profile`, the egress proxy and per-repository caches, each example run as printed against the database (repository `m5r_polyglot`, removed after); the port references say both 55432 (default) and 55433 (this machine). Next: evaluator pass 1 (full review), then pass 2 (verification only).

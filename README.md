@@ -3,7 +3,7 @@
 A deterministic, LLM-free code-intelligence graph for Git repositories. It is built with Rust, Postgres and Apache AGE.
 The design is in [docs/repository-brain-design.md](docs/repository-brain-design.md).
 
-**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution), M3b (SCIP), M4a (endpoints and request paths) and M4b (DI and dispatch) are done; M5 (scale and API) is next.** `rb` indexes a commit into a snapshot containing:
+**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution), M3b (SCIP), M4a (endpoints and request paths) and M4b (DI and dispatch) are done; M5 (scale and API: `rb serve`, `rb diff`, JSON everywhere, retention and `rb gc`, the fetch-phase egress proxy, the benchmark) is built and pending its evaluator review (contract `tasks/contract-m5.md`).** `rb` indexes a commit into a snapshot containing:
 
 - one `File` node per blob, with its blob SHA, size, language and binary/generated flags;
 - one `Service` per detected project (package.json, Maven, Gradle, go.mod / `package main`, Cargo, pyproject, Dockerfile, `rb.toml`), marked deployable or library;
@@ -22,7 +22,7 @@ Each snapshot is stored relationally and projected into an AGE graph.
 ## Quickstart
 
 ```sh
-docker compose up -d --wait            # Postgres 18 + AGE 1.8.0 on 127.0.0.1:55432
+docker compose up -d --wait            # Postgres 18 + AGE 1.8.0 on 127.0.0.1:55432 (RB_DB_PORT moves it)
 cargo build
 target/debug/rb migrate
 target/debug/rb index /path/to/repo    # --rev <rev>, --repo <name>, --force, --no-cache, --keep <n>
@@ -35,20 +35,361 @@ target/debug/rb callers AuthService.login --depth 2   # what calls a function or
 target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2): endpoints, orphans, tests; --json
 target/debug/rb path "POST /api/v1/login"             # the request path through an endpoint (Q4); --format json, --pick N
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
+target/debug/rb snapshots             # kept snapshots (live, retired, failed), newest first
+target/debug/rb diff                  # the live snapshot against its parent: endpoints, table access, dependencies, nodes, edges
+target/debug/rb serve                 # the REST API on 127.0.0.1:55480 (read-only, loopback only)
 target/debug/rb gc --dry-run           # graphs and `building` rows interrupted or older runs left (`--egress`: the fetch networks too)
 target/debug/rb cache prune --facts --scip --dry-run   # cache rows of other extractor versions and images
 ```
-
-Snapshots: a publish writes the snapshot row, its rows, the AGE graph and the live flip in one transaction, so a failed or killed run leaves at most a `failed` row (written after the rollback). Each run keeps the live snapshot plus the `--keep` newest retired ones (default 2, at most 20, env `RB_KEEP_RETIRED`) and deletes older and `failed` rows; only the live snapshot keeps an AGE graph, and graphs are created and dropped one per transaction under a database-wide lock. Every read command reads the live pointer and the snapshot in one read-only transaction. `rb gc` (never implicit; `--dry-run` lists, `--prefix` limits it to repositories whose names start with the prefix) removes graphs no live snapshot names and `building` rows left by binaries before M5; `rb cache prune --facts|--scip` removes cache rows no current `rb` can read (an older `rb` sharing the database may, so it is never implicit) and prints rows and bytes.
 
 Run `rb` from the project root. AGE's CSV loaders only read files under the server's `/tmp/age/`, and `compose.yaml` mounts `./var/age-load` there. From anywhere else, set `RB_AGE_LOAD_DIR` to that directory.
 
 | Setting | Default |
 |---|---|
-| `RB_DATABASE_URL` | `postgresql://rb:rb@127.0.0.1:55432/rb` |
-| `RB_AGE_LOAD_DIR` | `var/age-load` |
+| `RB_DATABASE_URL` (`--database-url`) | `postgresql://rb:rb@127.0.0.1:55432/rb` |
+| `RB_AGE_LOAD_DIR` (`--age-load-dir`) | `var/age-load` |
+| `RB_KEEP_RETIRED` (`rb index --keep`) | `2` retired snapshots kept besides the live one (0–20) |
+| `RB_CYPHER_TIMEOUT_MS` (`rb cypher --timeout-ms`, `rb serve --cypher-timeout-ms`) | `2000` (1–30,000) |
+| `RB_SCIP_WORK_DIR` (`--scip-work-dir`) | `var/scip` |
+| `RB_SCIP_REGISTRIES` (`--scip-registries`) | none (extra hosts for the fetch phase, below) |
 
-If 55432 is taken, start the database on another port with `RB_DB_PORT=55433 docker compose up -d --wait` and point `RB_DATABASE_URL` at it.
+The database's default port is 55432. If it is taken, start the database on another port with `RB_DB_PORT=55433 docker compose up -d --wait` and point `RB_DATABASE_URL` at it; the development machine of record runs it on 55433, so the examples and measurements in this repository use `postgresql://rb:rb@127.0.0.1:55433/rb`.
+
+`rb index --profile` also prints the AGE projection's load per label file (rows, CSV bytes, time); wall times are printed only, never stored.
+
+### Snapshots, JSON and the REST API (M5)
+
+The examples in this section were run as printed on 2026-10-07 from the project root, with `RB_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb` and a copy of `fixtures/polyglot-monorepo` committed twice in `$FIXTURE` (the second commit adds a `GET /internal/mfa/status` route that reads `email_log`), indexed as the only repository `m5r_polyglot` and deleted afterwards. Snapshot ids come from the database's sequence and differ on every machine.
+
+```
+$ target/debug/rb index "$FIXTURE" --repo m5r_polyglot --no-scip --profile
+m5r_polyglot: snapshot 15449 live @ 45240eff4a4e — 105 nodes, 174 edges, 28 diagnostics; AGE graph rb_m5r_polyglot_15449; parsed 0 source files; scanned 21 other files as text
+  profile: age Endpoint (Endpoint.csv): 7 rows, 616 bytes, 4.7 ms
+  profile: age File (File.csv): 37 rows, 2204 bytes, 1.7 ms
+  profile: age Owner (Owner.csv): 7 rows, 336 bytes, 1.7 ms
+  profile: age Package (Package.csv): 7 rows, 601 bytes, 1.5 ms
+  profile: age Service (Service.csv): 9 rows, 387 bytes, 2.7 ms
+  profile: age Symbol (Symbol.csv): 34 rows, 3535 bytes, 1.6 ms
+  profile: age Table (Table.csv): 4 rows, 163 bytes, 1.5 ms
+  profile: age CALLS (CALLS.csv): 5 rows, 257 bytes, 1.6 ms
+  profile: age CONSUMES (CONSUMES.csv): 6 rows, 319 bytes, 1.8 ms
+  profile: age CONTAINS (CONTAINS.csv): 11 rows, 497 bytes, 1.7 ms
+  profile: age DEFINED_IN (DEFINED_IN.csv): 34 rows, 1320 bytes, 2.9 ms
+  profile: age DEPENDS_ON (DEPENDS_ON.csv): 8 rows, 389 bytes, 1.5 ms
+  profile: age EXPOSES (EXPOSES.csv): 7 rows, 365 bytes, 1.9 ms
+  profile: age HANDLED_BY (HANDLED_BY.csv): 7 rows, 354 bytes, 1.6 ms
+  profile: age INJECTS (INJECTS.csv): 2 rows, 133 bytes, 1.5 ms
+  profile: age IN_SERVICE (IN_SERVICE.csv): 37 rows, 1403 bytes, 1.9 ms
+  profile: age MIGRATES (MIGRATES.ops.csv): 3 rows, 222 bytes, 1.9 ms
+  profile: age OWNED_BY (OWNED_BY.csv): 48 rows, 1829 bytes, 4.1 ms
+  profile: age QUERIES (QUERIES.ops.csv): 6 rows, 393 bytes, 1.7 ms
+  profile: age total: 19 files, 279 rows, 15323 bytes, 39.2 ms
+  scip: apps/web scip-typescript skipped unpinned: SCIP disabled (--no-scip)
+  scip: packages/shared scip-typescript skipped unpinned: SCIP disabled (--no-scip)
+  scip: services/auth scip-java skipped: SCIP disabled (--no-scip)
+  scip: services/broken scip-java skipped: SCIP disabled (--no-scip)
+  scip: services/notification scip-typescript skipped unpinned: SCIP disabled (--no-scip)
+
+$ target/debug/rb index "$FIXTURE" --repo m5r_polyglot --no-scip --keep 1
+m5r_polyglot: snapshot 15450 live @ 6771067e0a71 — 106 nodes, 176 edges, 28 diagnostics; AGE graph rb_m5r_polyglot_15450; parsed 0 source files; scanned 21 other files as text
+  scip: apps/web scip-typescript skipped unpinned: SCIP disabled (--no-scip)
+  scip: packages/shared scip-typescript skipped unpinned: SCIP disabled (--no-scip)
+  scip: services/auth scip-java skipped: SCIP disabled (--no-scip)
+  scip: services/broken scip-java skipped: SCIP disabled (--no-scip)
+  scip: services/notification scip-typescript skipped unpinned: SCIP disabled (--no-scip)
+
+$ target/debug/rb snapshots
+15450	6771067e0a71	live	parent 15449	AGE graph rb_m5r_polyglot_15450
+15449	45240eff4a4e	retired	parent -	AGE graph -
+```
+
+`--keep 1` kept one retired snapshot beside the live one; only the live one has an AGE graph.
+
+#### `rb diff`
+
+`rb diff [<from>] [<to>]` compares two kept snapshots by natural identity (nodes by kind and key, edges by both ends, kind and provenance), so the node and edge sections are exactly the difference of the two canonical dumps. A selector is a snapshot id or a commit prefix (4–40 hex digits) unique among the kept snapshots; `from` defaults to the parent of `to`, `to` to the live snapshot. It summarises endpoints, table access (`QUERIES`, `MAPS_TO`, `MIGRATES`) and service dependencies with the Service Card's rules, then lists nodes and edges added, removed and changed (edges whose only change is their evidence apart, `--evidence` lists them) and the diagnostics per kind (`--diagnostics` lists them). Moves are not inferred (a renamed symbol is a removal and an addition), nothing is re-indexed, and when the two snapshots were built with different tool versions the header names the keys that differ. Text shows the first 50 rows of each section; `--json` pages every section with `--limit` (1–1,000) and `--offset`.
+
+```
+$ target/debug/rb diff
+diff snapshot 15449 of m5r_polyglot @ 45240eff4a4e → snapshot 15450 of m5r_polyglot @ 6771067e0a71
+endpoints: 1 added, 0 removed
+  + GET /internal/mfa/status  [notification]
+table access: 1 added, 0 removed
+  + services/notification  public.email_log  read
+service dependencies: 0 added, 0 removed
+certainty: no edge changed certainty
+nodes: 1 added, 0 removed, 1 changed
+  + endpoint HTTP GET /internal/mfa/status @services/notification
+  ~ file services/notification/src/server.ts: attrs {"blob":"ea51abb6b895eb6e3610cf6893dc84a4f820950b","lang":"typescript","size":662} → {"blob":"2dfd889e2b7dbf40595a2f605f3ae0d9ead914b6","lang":"typescript","size":805}
+edges: 2 added, 0 removed, 1 changed, 0 evidence only
+  + EXPOSES services/notification -> HTTP GET /internal/mfa/status @services/notification (treesitter)  [exact]
+  + HANDLED_BY HTTP GET /internal/mfa/status @services/notification -> services/notification/src/server.ts (treesitter)  [exact]
+  ~ QUERIES services/notification/src/server.ts -> public.email_log (sql_literal): attrs {"ops":["insert"],"schema_assumed":true} → {"ops":["read","insert"],"schema_assumed":true}; evidence changed (1 → 2 sites)
+diagnostics: no kind changed count
+```
+
+#### `--json`, `--snapshot` and pages
+
+Every question (`find`, `service`, `callers`, `impact`, `table-deps`, `cypher`, `diff`; `rb path` spells it `--format json`) and `status` and `snapshots` take `--json`, which prints the API's envelope: `api`, `repo`, `snapshot` (`id`, `commit_sha`), the normalised `query` with defaults filled in, the `limits` in force, `truncated` (the names of the limits that cut the answer, empty when the answer is complete) and, where rows carry one, a `certainty` histogram, then the `result`. Every question also takes `--snapshot <id>` to answer from a kept retired snapshot instead of the live one. Flat lists (`find`, `service` without a name, `snapshots`) take `--limit` and `--offset` and report `total` and `next_offset` (`null` on the last page).
+
+```
+$ target/debug/rb find mfa --kind endpoint --limit 2 --json
+{
+  "api": 1,
+  "repo": "m5r_polyglot",
+  "snapshot": {
+    "id": 15450,
+    "commit_sha": "6771067e0a71e93f55ab92bf1bb8ff4d11078443"
+  },
+  "query": {
+    "kind": "endpoint",
+    "limit": 2,
+    "offset": 0,
+    "q": "mfa"
+  },
+  "limits": {},
+  "truncated": [],
+  "result": {
+    "total": 4,
+    "offset": 0,
+    "limit": 2,
+    "next_offset": 2,
+    "items": [
+      {
+        "kind": "endpoint",
+        "key": "HTTP POST /internal/mfa/sms @services/notification",
+        "name": "POST /internal/mfa/sms"
+      },
+      {
+        "kind": "endpoint",
+        "key": "HTTP GET /internal/mfa/status @services/notification",
+        "name": "GET /internal/mfa/status"
+      }
+    ]
+  }
+}
+
+$ target/debug/rb find mfa --kind endpoint --limit 2 --offset 2
+endpoint	HTTP POST /internal/mfa/email @services/notification	POST /internal/mfa/email
+endpoint	HTTP POST /internal/mfa/email @services/billing/cmd/billing	POST /internal/mfa/email
+
+$ target/debug/rb find status --kind endpoint --snapshot 15449
+$ target/debug/rb find status --kind endpoint
+endpoint	HTTP GET /internal/mfa/status @services/notification	GET /internal/mfa/status
+```
+
+The route added by the second commit is absent from the retired snapshot and present in the live one. A refused request prints its error envelope on stdout with `--json` (text mode prints `Error: …` on stderr); the exit code and the server's status come from one table:
+
+```
+$ target/debug/rb find mfa --limit 1001 --json
+{
+  "api": 1,
+  "error": {
+    "kind": "invalid_param",
+    "message": "limit must be between 1 and 1000 (got 1001)",
+    "param": "limit"
+  }
+}
+```
+
+(exit code 2)
+
+| Error `kind` | Exit code | HTTP status |
+|---|---|---|
+| `invalid_param` (with `param`) | 2 | 400 |
+| `not_found`, `no_live_snapshot` | 3 | 404 |
+| `snapshot_not_retained` (deleted by retention) | 3 | 410 |
+| `ambiguous` (with `candidates`; never a silent pick) | 4 | 409 |
+| `cypher`, `cypher_timeout` | 5 | 422 |
+| `busy`, `deadline_exceeded` (server only) | — | 503 |
+| `misdirected_request`, `method_not_allowed`, `unsupported_media_type` (server only) | — | 421, 405, 415 |
+| anything else | 1 | 500 |
+
+Limits (a value above a maximum is `invalid_param`, never clamped): `depth` 1 (callers, max 25) and 12 (path, max 25); `hops` 4 (max 8); `nodes` 200,000 reached nodes (Q2, Q3); `tree` 5,000 rendered tree nodes (Q1, Q4); `work` 20,000,000 counted operations per request, so a cut is a function of the snapshot and the parameters, never of machine speed; `rows` 10,000 (Cypher).
+
+#### Cypher guard rails
+
+`rb cypher` (and `POST …/cypher`) runs in a read-only transaction as the role `rb_reader` (migration `0006_reader_role.sql`), which can read the `rb` schema and the graph schemas and nothing else, with a statement timeout of `--timeout-ms` (default 2,000, at most 30,000, env `RB_CYPHER_TIMEOUT_MS`); a query over it is cancelled with an error, never cut short. At most 10,000 rows are returned, then `truncated: rows`. Only the live snapshot has an AGE graph.
+
+```
+$ target/debug/rb cypher "MATCH (s:Service)-[:EXPOSES]->(e:Endpoint) RETURN s.name, count(e)" --cols service,endpoints --timeout-ms 5000
+service	endpoints
+notification	4
+auth-service	2
+billing	2
+
+$ target/debug/rb cypher "MATCH (a), (b), (c), (d), (e) RETURN count(*)" --timeout-ms 100
+Error: cypher query cancelled by its statement timeout of 100 ms (limit `timeout_ms`: --timeout-ms, at most 30000)
+```
+
+(exit code 5)
+
+#### `rb serve`
+
+`rb serve` serves the same answers over HTTP/1.1 until SIGINT or SIGTERM (requests in flight finish). The body of every response is byte-identical to the stdout of the matching `rb … --json` command, and its status maps from that command's exit code (the table above).
+
+- **Loopback only, no authentication:** `--bind` (default `127.0.0.1:55480`; `127.0.0.1:0` picks a free port) must be a loopback address; any other is refused at start-up. Any local process can call the server.
+- **Host check:** a request whose `Host` is not `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>` (or is missing) gets `421`, which defeats DNS rebinding. No `Access-Control-*` header is ever sent; `OPTIONS` and other methods get `405`; `POST …/cypher` needs `Content-Type: application/json` (`415`); an unknown or repeated parameter is `invalid_param`.
+- **Read-only:** every pooled connection is a read-only session and Cypher runs as `rb_reader`. Indexing stays a CLI action: there is no `POST …/index`.
+- **Limits:** `--workers` requests at once (default 4, each on its own connection), `--queue` waiting (default 16; one more gets `503 busy` at once), `--deadline-ms` per request including the queue (default 10,000; past it `503 deadline_exceeded`, never a partial body), `--cypher-timeout-ms` (default 2,000, env `RB_CYPHER_TIMEOUT_MS`; a request's `timeout_ms` may set its own up to 30,000), plus the per-request limits above. The server builds one in-memory index per repository's live snapshot and rebuilds it when the live pointer moves; timings are only in the `Server-Timing` header, never in a body.
+- **Endpoints** (keys go in query parameters, since service, table and symbol keys contain `/`):
+
+| Method and path | Parameters (every question also takes `snapshot`) |
+|---|---|
+| `GET /v1/health` | — |
+| `GET /v1/repos` | — (every repository's status) |
+| `GET /v1/repos/{repo}/status` | — |
+| `GET /v1/repos/{repo}/snapshots` | `limit`, `offset` |
+| `GET /v1/repos/{repo}/find` | `q`, `kind`, `limit`, `offset` |
+| `GET /v1/repos/{repo}/services` | `limit`, `offset` |
+| `GET /v1/repos/{repo}/service` | `name` |
+| `GET /v1/repos/{repo}/callers` | `target`, `depth`, `include_references`, `min_certainty`, `precision`, `pick` |
+| `GET /v1/repos/{repo}/impact` | `target`, `min_certainty`, `precision`, `pick` |
+| `GET /v1/repos/{repo}/table-deps` | `table`, `precision`, `hops` |
+| `GET /v1/repos/{repo}/path` | `endpoint`, `depth`, `hops`, `full`, `precision`, `pick` |
+| `GET /v1/repos/{repo}/diff` | `from`, `to`, `limit`, `offset`, `diagnostics` (no `snapshot`) |
+| `POST /v1/repos/{repo}/cypher` | JSON body `{"query", "columns"?, "timeout_ms"?}` |
+
+```
+$ target/debug/rb serve --bind 0.0.0.0:55480
+Error: refusing to bind 0.0.0.0:55480: the server answers on a loopback address only (127.0.0.0/8 or ::1), since it has no authentication
+
+$ target/debug/rb serve &
+rb serve: listening on http://127.0.0.1:55480
+
+$ curl -s http://127.0.0.1:55480/v1/health
+{
+  "api": 1,
+  "status": "ok"
+}
+
+$ curl -s 'http://127.0.0.1:55480/v1/repos/m5r_polyglot/callers?target=sendCode'
+{
+  "api": 1,
+  "repo": "m5r_polyglot",
+  "snapshot": {
+    "id": 15450,
+    "commit_sha": "6771067e0a71e93f55ab92bf1bb8ff4d11078443"
+  },
+  "query": {
+    "depth": 1,
+    "include_references": false,
+    "min_certainty": "ambiguous",
+    "pick": null,
+    "precision": "cha",
+    "target": "sendCode"
+  },
+  "limits": {
+    "tree": 5000,
+    "work": 20000000
+  },
+  "truncated": [],
+  "certainty": {
+    "heuristic": 1
+  },
+  "result": {
+    "callers": [
+      {
+        "callers": [],
+        "certainty": "heuristic",
+        "dispatch": false,
+        "display": "AuthController#login().",
+        "entry": [
+          "endpoint POST /api/v1/login"
+        ],
+        "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login().",
+        "line": 17,
+        "path": "services/auth/src/main/java/com/acme/auth/AuthController.java",
+        "reference": false,
+        "service": "auth-service"
+      }
+    ],
+    "precision": "cha",
+    "pruned_by_rta": 0,
+    "target": {
+      "display": "MfaClient#sendCode().",
+      "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode().",
+      "line": 9,
+      "path": "services/auth/src/main/java/com/acme/auth/MfaClient.java",
+      "service": "auth-service"
+    },
+    "truncated": []
+  }
+}
+
+$ curl -s 'http://127.0.0.1:55480/v1/repos/m5r_polyglot/callers?target=sendCode' | cmp - <(target/debug/rb callers sendCode --json) && echo identical
+identical
+
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: attacker.example:55480' http://127.0.0.1:55480/v1/health
+421
+
+$ curl -s 'http://127.0.0.1:55480/v1/repos/m5r_polyglot/callers?target=sendCode&dpeth=2'
+{
+  "api": 1,
+  "error": {
+    "kind": "invalid_param",
+    "message": "dpeth is not a parameter of this request (allowed: target, depth, include_references, min_certainty, precision, pick, snapshot)",
+    "param": "dpeth"
+  }
+}
+
+$ curl -s -H 'Content-Type: application/json' -d '{"query": "MATCH (s:Service) RETURN count(s)", "columns": ["services"]}' http://127.0.0.1:55480/v1/repos/m5r_polyglot/cypher
+{
+  "api": 1,
+  "repo": "m5r_polyglot",
+  "snapshot": {
+    "id": 15450,
+    "commit_sha": "6771067e0a71e93f55ab92bf1bb8ff4d11078443"
+  },
+  "query": {
+    "columns": [
+      "services"
+    ],
+    "query": "MATCH (s:Service) RETURN count(s)",
+    "timeout_ms": 2000
+  },
+  "limits": {
+    "rows": 10000
+  },
+  "truncated": [],
+  "result": {
+    "columns": [
+      "services"
+    ],
+    "rows": [
+      [
+        "9"
+      ]
+    ]
+  }
+}
+
+$ curl -s -D - -o /dev/null 'http://127.0.0.1:55480/v1/repos/m5r_polyglot/find?q=mfa&limit=1'
+HTTP/1.1 200 OK
+content-type: application/json
+server-timing: queue;dur=0.0, run;dur=3.5, total;dur=3.5
+content-length: 478
+date: Wed, 07 Oct 2026 02:19:45 GMT
+
+```
+
+The server was then stopped with SIGINT.
+
+#### Retention, `rb gc` and `rb cache prune`
+
+A publish writes the snapshot row, its rows, the AGE graph and the live flip in one transaction, so a failed or killed run leaves at most a `failed` row (written after the rollback). Each run keeps the live snapshot plus the `--keep` newest retired ones (default 2, at most 20, env `RB_KEEP_RETIRED`) and deletes older and `failed` rows; only the live snapshot keeps an AGE graph, and graphs are created and dropped one per transaction under a database-wide lock. Every read command reads the live pointer and the snapshot in one read-only transaction. `rb gc` (never implicit; `--dry-run` lists, `--prefix` limits it to repositories whose names start with the prefix) removes graphs no live snapshot names and `building` rows left by binaries before M5; `rb cache prune --facts|--scip` removes cache rows no current `rb` can read (an older `rb` sharing the database may, so it is never implicit) and prints rows and bytes.
+
+```
+$ target/debug/rb gc --prefix m5r --egress --dry-run
+gc: nothing to remove
+gc: no egress network or proxy
+
+$ target/debug/rb cache prune --facts --scip --dry-run
+facts: would remove 19780 rows, 649322992 bytes
+scip: would remove 0 rows, 0 bytes
+```
+
+`rb gc --egress` also removes the SCIP fetch phase's two Docker networks and any egress proxy an interrupted run left (below). `rb cache prune` removes facts rows of other extractor versions and SCIP index rows of other indexer images; the dry run above counted the facts rows earlier development builds wrote into this shared database.
 
 ### Endpoints and request paths
 
@@ -132,6 +473,10 @@ Each job exports the project's files, runs a fetch phase (`mvn … go-offline` a
 | `--scip-registries <host,…>` (`RB_SCIP_REGISTRIES`) | extra registry hosts the fetch phase may reach over HTTPS (lower-case DNS names; no wildcard, port or IP); configured on the indexing host, never read from the repository, whose own build runs in the fetch phase |
 | `--no-cache` | parse every file without reading cached facts (the facts are still written, so the next plain run reuses them), and re-run every SCIP job and replace its cached outcome |
 
+The egress proxy image's build was re-run as printed on 2026-10-07: its `apk add` layer came from the build cache and nothing was pulled. Its ID is used only to check that the image is present; it is in no cache key or tool configuration.
+
+Known limits measured on two large repositories (contract `tasks/contract-m5.md`, S24): a Maven repository whose only build root is the top-level `pom.xml` is one job with 2 CPUs and 4 GiB (apache/shardingsphere: about 1,086 s in the index phase, and a commit anywhere re-indexes it); npm workspace packages without their own lockfile (`ETARGET` on sibling workspace packages) and lockfiles naming `file:` packages outside the project's build root (`EUSAGE`) fail their fetch and stay heuristic (mattermost: 4 of 11 TypeScript projects indexed). Workspace installs and these build shapes are M6 work.
+
 #### Container runtime
 
 `rb` talks to whatever daemon the Docker CLI's **current context** selects (`docker context show`), and the two images must exist in that daemon. Docker Desktop (`desktop-linux`) is the runtime of record: the e2e tests, the goldens and the public-repo measurements were made on it. If `docker context show` prints something else (another runtime such as colima holds neither image and would let `docker run` pull scip-typescript into its own VM), run `rb` with `DOCKER_CONTEXT=desktop-linux` in the environment, or switch once with `docker context use desktop-linux`. Then, in that context:
@@ -152,7 +497,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55432/rb cargo test --workspace
 ```
 
-Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e.rs` print a notice and pass without running.
+Use the port the database runs on: 55432 by default, 55433 on the development machine of record (`RB_DB_PORT=55433`), where the loop is `var/m5/scripts/verify.sh <tag>` (fmt, clippy, the workspace tests, `rb-store` and `rb-server` with the database, the e2e and API identity suites, a check that no `rb serve` is left listening, and the stub scan; logs under `var/m5/logs/`). Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e.rs` and `api.rs` print `skipping:` and pass without running, which is not a pass.
 
 | Path | Contents |
 |---|---|
@@ -163,9 +508,12 @@ Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e
 | `crates/rb-frameworks` | ORM packs (JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django); route and HTTP-client packs, endpoint normalisation, URL constant folding; Spring DI facts (beans, injection points, scan roots) |
 | `crates/rb-scip` | SCIP: project detection, container jobs (fetch + offline index), index cache key, `index.scip` decoding, symbol parsing |
 | `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → manifest packages → SCIP jobs (cached) → join → endpoints and HTTP stitching → DI resolution, RTA, entry kinds and orphan eligibility → snapshot graph + diagnostics |
-| `crates/rb-store` | migrations, snapshot publish/retention, evidence, AGE projection, read-only Cypher, find/service queries and the card's derived sections, `callers`/`impact`/`path` walks with precision and orphans, Q3's roll-up |
+| `crates/rb-store` | migrations, snapshot publish/retention and `gc`, whole-snapshot reads, evidence, AGE projection, read-only Cypher as `rb_reader`, the prebuilt snapshot index and limits, find/service queries and the card's derived sections, `callers`/`impact`/`path` walks with precision and orphans, Q3's roll-up |
+| `crates/rb-api` | the request layer shared by every `--json` output and the server: parameters and limits, target resolution, the envelope, errors with exit codes and statuses, renderers |
+| `crates/rb-server` | `rb serve`: the axum binding, Host check, read-only connection pool, per-snapshot index cache, workers, queue and deadline |
 | `crates/rb-cli` | the `rb` binary |
 | `docker/scip-java/` | the slim scip-java image |
+| `docker/egress-proxy/` | the fetch phase's egress proxy image (tinyproxy on a pinned Alpine base) |
 | `migrations/` | SQL schema, embedded into the binary |
 | `fixtures/` | golden fixture repositories |
 | `crates/rb-cli/tests/golden/` | reviewed golden outputs (`RB_BLESS=1` rewrites them; review before committing) |

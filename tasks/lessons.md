@@ -257,3 +257,7 @@
 - **Mistake:** the publish COPYed a whole snapshot and committed, leaving the statistics to autovacuum. For up to a minute the planner believed the new `snapshot_id` had one row and planned a nested loop over the whole snapshot: a read that takes 1 s ran for over 10 minutes. The fixtures never showed it (tiny tables, plans cheap either way), and neither did warm benchmark runs (autovacuum had caught up).
 - **Rule:** a transaction that bulk-loads rows a reader will filter by a new key ends with `ANALYZE` of those tables before it commits, so the statistics become visible with the rows. Measure the first read right after a publish, not only warm reads, and test the planner's estimate for the new key.
 
+
+## 2026-10-07: a disk figure is a sum of named parts, or it is not a record
+- **Mistake (found in phase 20):** phase 19 recorded "17 GiB free at the start of phase 16, 13 GiB at the end" and named 1.3 GiB that remained (one of the two parts over-stated: `var/m5/bench/out` is 402 MiB, not 0.6 GiB), while its own verify line ("disk back above its starting level") was ticked. The unnamed 2 GiB were two 1 GiB macOS swap files created during the shardingsphere SCIP run, on the same APFS volume, outside the project.
+- **Rule:** when a step's verify compares free disk, record the before and after in MiB and account for the difference part by part with `du` (project directories, Docker's VM image, `/System/Volumes/VM` swap files by birth time); if the parts do not add up, say how much is unexplained and do not tick the check.
