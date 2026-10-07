@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M5 phase 18: query latency (S25)
+- **No code.** Contract "Benchmark measurements", S25 (`var/m5/scripts/latency.py`, outputs `var/m5/bench/out/{ss,mm}-lat-run{1,2}.*`): a warm `rb serve` on each repository's live SCIP snapshot, 20 warm-up requests, D14's sampling rule, two runs.
+- **Results (client p95, runs 1 and 2):** shardingsphere Q1 1.61/3.33 ms, Q2 95.63/93.73 ms, Q3 7.34/8.23 ms, card 38.42/38.97 ms, Q4 not measurable (no endpoint); mattermost Q1 1.88/1.79 ms, Q2 152.06/151.24 ms, Q4 3.64/3.63 ms (all 66 endpoints), Q3 7.39/7.43 ms, card 66.26/58.3 ms. Every §12.5 latency target met; every response `200`; nothing truncated (the work cap stands).
+- **Index and memory:** first request (index build) 568.5 ms and 630.7 ms; server peak RSS 284 MiB and 249 MiB. Cold CLI per question 416–546 ms p50.
+- Files: `tasks/{contract-m5,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M5 phase 17b: mattermost indexing and storage (S24)
 - **No code.** Contract "Benchmark measurements", S24 for mattermost/mattermost @ `b2ce71db9c18` (`var/m5/bench/out/mm-*`): `--no-scip` fresh 29.2 s (1.51 GiB), cached 19.6 s, incremental 19.6 s (Go file) and 17.9 s (TS file in a SCIP project); SCIP fresh 610.6 s with every fetch (11 scip-typescript jobs, 4 `ok`: `webapp/platform/types`, `e2e-tests/playwright/lib`, `docs/site`, a GitHub action; 7 fail in the fetch: five unpinned workspace packages with `ETARGET` on sibling packages, two of them also refused `github.com` by the egress proxy, and two projects whose lockfiles name `file:` packages outside the build root, so `npm ci` reports `EUSAGE`), cached 24.0 s. §12.5's targets met (with the caveat that SCIP covers little of the TypeScript and none of the Go).
 - **Determinism and parity:** fresh == cached in both modes, empty self-diffs, full AGE parity. **Storage:** 121 MiB per snapshot + 44 MiB AGE; retention's delete 1.27 s; facts cache ≈ 17 % of the repository's snapshots (no D13 gap). S18/S19: byte-identical to `afae548`. M3b's TS interface-method count: not measurable here (53 of 56 `extends` clauses in projects whose fetch failed).

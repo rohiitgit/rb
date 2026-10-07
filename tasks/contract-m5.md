@@ -400,3 +400,26 @@ Release binary of `17410d7` plus amendment 14 (`var/m5/bench/bin/rb-m5`, sha256 
 - **S18 and S19 on mattermost:** the `afae548` binary's `--no-scip` dump equals this binary's (same 235,422 lines, no line differs).
 - **M3b's TypeScript interface-method `IMPLEMENTS`:** not measurable at scale here: mattermost has 56 `interface … extends` clauses, 53 of them in `webapp/channels` and `webapp/platform/shared`, whose SCIP fetch failed; in the indexed projects the dump holds 2 interface-to-interface `IMPLEMENTS` edges (heuristic) and 0 overriding member pairs (`var/m5/scripts/ts_iface.py`). The item stays open for M6 (an interface-heavy repository whose workspace installs).
 
+### S25: query latency (phase 18)
+
+`rb serve` (the release binary of record) on `127.0.0.1:55481`, the repository's live SCIP snapshot; one sequential keep-alive client (`var/m5/scripts/latency.py`); candidate sets from the snapshot's dump, sampled by the M3b rule (sorted bytewise by key, `N = ⌊count/k⌋`, indices `⌊N/2⌋ + i·N`; all when fewer than `k`): Q1 = 200 targets of `CALLS` edges, Q2 = the 20 symbols with the most inbound requiring edges (`CALLS`, `REFERENCES`, `IMPLEMENTS`, `INJECTS`, `MAPS_TO`, `QUERIES`, `HANDLED_BY`), each 10 times, Q4 = up to 200 endpoints, Q3 = 20 tables, the card = every service; default parameters, keys as targets. 20 warm-up requests first (the first one builds the snapshot index). Client time around each request; server time from `Server-Timing` (`run`). p50/p95/max by nearest rank. Two runs per repository on one warm server; then 5 cold CLI invocations per kind (`rb … --json`, each loading the graph). Load averages (1/5/15 min) at each run's start and end.
+
+| Repository | Kind | n | Run 1 client p50 / p95 / max (ms) | Run 2 client p50 / p95 / max (ms) | Server `run` p95 (runs 1, 2) | §12.5 target (p95) | CLI cold p50 |
+|---|---|---|---|---|---|---|---|
+| shardingsphere | Q1 callers, depth 1 | 200 | 1.39 / 1.61 / 10.07 | 1.64 / 3.33 / 10.46 | 1.5, 3.1 | ≤ 50 ms: **met** | 513 ms |
+| shardingsphere | Q2 impact, 20 hubs × 10 (inbound 836, 689, 647, …) | 200 | 34.18 / 95.63 / 124.34 | 32.78 / 93.73 / 118.45 | 94.6, 92.9 | ≤ 500 ms: **met** | 536 ms |
+| shardingsphere | Q4 path | 0 | — | — | — | ≤ 1 s: **not measurable** (no endpoint: no route pack matches this library) | — |
+| shardingsphere | Q3 table-deps | 20 | 4.28 / 7.34 / 24.2 | 4.24 / 8.23 / 16.39 | 7.2, 8.1 | none | 494 ms |
+| shardingsphere | Service Card (all 449 services) | 449 | 28.08 / 38.42 / 56.78 | 27.92 / 38.97 / 59.59 | 38.3, 38.8 | none | 546 ms |
+| mattermost | Q1 callers, depth 1 | 200 | 1.51 / 1.88 / 4.13 | 1.56 / 1.79 / 2.98 | 1.8, 1.7 | ≤ 50 ms: **met** | 430 ms |
+| mattermost | Q2 impact, 20 hubs × 10 (inbound 2,999, 2,348, 2,275, …) | 200 | 62.1 / 152.06 / 172.18 | 63.23 / 151.24 / 190.33 | 149.9, 149.1 | ≤ 500 ms: **met** | 544 ms |
+| mattermost | Q4 path (all 66 endpoints) | 66 | 3.34 / 3.64 / 6.43 | 3.36 / 3.63 / 5.18 | 3.5, 3.4 | ≤ 1 s: **met** (66 samples, fewer than D14's 200: every endpoint) | 449 ms |
+| mattermost | Q3 table-deps | 20 | 3.83 / 7.39 / 14.79 | 3.97 / 7.43 / 7.61 | 7.3, 7.3 | none | 416 ms |
+| mattermost | Service Card (all 66 services) | 66 | 29.99 / 66.26 / 131.37 | 29.24 / 58.3 / 113.74 | 66.1, 58.1 | none | 447 ms |
+
+- **Load:** shardingsphere run 1 2.12/5.00/6.08 → 2.46/4.84/5.99, run 2 2.95/4.86/5.99 → 2.40/4.58/5.85; mattermost run 1 3.59/4.43/5.03 → 2.99/4.24/4.95, run 2 3.20/4.22/4.93 → 3.63/4.26/4.92. Every response `200`.
+- **Index build and memory (D3):** the first request after start-up, which reads the snapshot and builds its index: 568.5 ms (shardingsphere, 74,317 nodes, 193,637 edges) and 630.7 ms (mattermost, 58,521 nodes, 168,929 edges); the server's peak RSS over the whole session (both runs and the warm-up): 284 MiB and 249 MiB (`/usr/bin/time -l`).
+- **Truncation:** no answer was truncated (every `truncated` list empty), so no default-parameter question reached the `work` cap (20,000,000) or any other: the cap stays as calibrated (amendment 4); no re-calibration amendment is needed.
+- **CLI cold time** (embedded mode, the graph loaded per invocation; recorded, no target): 416–546 ms p50, at most 649 ms, about 0.4–0.6 s of graph loading and index building per invocation that the server pays once.
+- **Note:** shardingsphere's Q4 cannot be measured (0 endpoints), so §12.5's Q4 target is measured on mattermost only, with 66 samples.
+
