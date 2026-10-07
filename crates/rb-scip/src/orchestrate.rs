@@ -23,11 +23,16 @@ pub const RECIPE_JAVA: &str = "m5-egress-1";
 /// (D7).
 pub const RECIPE_TS: &str = "m6a-ts-1";
 
-/// The recipe a job's cache key carries.
-pub fn recipe(indexer: Indexer) -> &'static str {
+/// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
+/// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
+/// other budget settings change no index and are not part of it.
+pub fn recipe(indexer: Indexer, budget: &Budget) -> String {
     match indexer {
-        Indexer::ScipJava => RECIPE_JAVA,
-        Indexer::ScipTypescript => RECIPE_TS,
+        Indexer::ScipJava if budget.maven_threads > 1 => {
+            format!("{RECIPE_JAVA}+T{}", budget.maven_threads)
+        }
+        Indexer::ScipJava => RECIPE_JAVA.to_owned(),
+        Indexer::ScipTypescript => RECIPE_TS.to_owned(),
     }
 }
 
@@ -154,13 +159,17 @@ pub struct ScipRun {
     pub elapsed: Duration,
 }
 
-/// Resource budget per phase.
+/// Resource budget per phase, set on the indexing host only (`rb index --scip-cpus`,
+/// `--scip-memory`, `--scip-maven-threads`, `--scip-timeout-secs`; contract M6a D9): the
+/// indexed repository cannot raise its own budget.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Budget {
     pub cpus: f32,
     pub memory: String,
     pub fetch_timeout: Duration,
     pub index_timeout: Duration,
+    /// Maven's reactor threads (`-T`) in both scip-java phases; 1 adds no flag.
+    pub maven_threads: u8,
 }
 
 impl Default for Budget {
@@ -170,6 +179,7 @@ impl Default for Budget {
             memory: "4g".into(),
             fetch_timeout: Duration::from_secs(600),
             index_timeout: Duration::from_secs(900),
+            maven_threads: 1,
         }
     }
 }
@@ -615,12 +625,20 @@ fn java_runs(
     // The fetch phase reads the egress proxy from the settings `run_job` mounts (Maven ignores
     // the proxy environment variables; contract M5 S21).
     let settings = format!("{CLIENT_CONFIG_AT}/settings.xml");
+    // Maven's reactor threads (contract M6a D9), appended to every Maven invocation of both
+    // phases only above 1, so the default runs are `cfa8ab9`'s.
+    let threads: Vec<String> = if budget.maven_threads > 1 {
+        vec!["-T".into(), budget.maven_threads.to_string()]
+    } else {
+        Vec::new()
+    };
     let mvn = |goals: &[&str]| ContainerRun {
         args: ["mvn", "-B", "-q", "-s", settings.as_str()]
             .iter()
             .chain(goals)
             .chain(BUILD_CACHES_OFF.iter())
             .map(|s| (*s).to_owned())
+            .chain(threads.iter().cloned())
             .collect(),
         ..base.clone()
     };
@@ -646,6 +664,7 @@ fn java_runs(
         .iter()
         .chain(BUILD_CACHES_OFF.iter())
         .map(|s| (*s).to_owned())
+        .chain(threads.iter().cloned())
         .collect(),
         ..base
     };
@@ -978,6 +997,7 @@ mod tests {
             memory: "6g".into(),
             fetch_timeout: Duration::from_secs(10),
             index_timeout: Duration::from_secs(20),
+            maven_threads: 1,
         };
         let run = run_job(
             &job,
@@ -1458,8 +1478,11 @@ mod tests {
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m6a-ts-1"));
-        assert_eq!(recipe(Indexer::ScipJava), RECIPE_JAVA);
-        assert_eq!(recipe(Indexer::ScipTypescript), RECIPE_TS);
+        assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
+        assert_eq!(
+            recipe(Indexer::ScipTypescript, &Budget::default()),
+            RECIPE_TS
+        );
         let tmp = tempfile::tempdir().unwrap();
         for (lockfile, entrypoint, fetch_args) in [
             (
@@ -1521,6 +1544,131 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// The full `docker run` argument line of every phase of `job` at `budget`, with this run's
+    /// host paths and container names replaced by placeholders.
+    fn argv_lines(job: &Job, image: &str, budget: &Budget) -> Vec<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(false, false);
+        run_job(
+            job,
+            image,
+            &files(),
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            budget,
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        let tmp = tmp.path().canonicalize().unwrap().display().to_string();
+        fake.runs
+            .borrow()
+            .iter()
+            .map(|r| {
+                let mut a = crate::runner::docker_args(r);
+                if let Some(i) = a.iter().position(|x| x == "--name") {
+                    a[i + 1] = "<name>".into();
+                }
+                a.join(" ")
+                    .replace(&r.workdir.display().to_string(), "<work>")
+                    .replace(&tmp, "<tmp>")
+            })
+            .collect()
+    }
+
+    /// Contract M6a D9, S12: at the default budget every phase's full argument line is the one
+    /// `cfa8ab9`'s code built (recorded from it: the Java runs and a TypeScript root job, whose
+    /// construction differs since only in `cwd`, empty for both), so default runs and their
+    /// cache keys are unchanged.
+    #[test]
+    fn default_budget_argv_is_cfa8ab9s() {
+        let proxy = [
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "npm_config_https_proxy",
+            "npm_config_proxy",
+            "YARN_HTTPS_PROXY",
+            "YARN_HTTP_PROXY",
+        ]
+        .map(|k| format!("-e {k}=http://10.9.8.7:8888"))
+        .join(" ");
+        let off = BUILD_CACHES_OFF.join(" ");
+        let expected: Vec<String> = [
+            "run --rm --name <name> --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -v <work>-egress/client:/rb-egress:ro -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err {PROXY} sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 mvn -B -q -s /rb-egress/settings.xml org.apache.maven.plugins:maven-dependency-plugin:3.11.0:go-offline {OFF}",
+            "run --rm --name <name> --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -v <work>-egress/client:/rb-egress:ro -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err {PROXY} sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 mvn -B -q -s /rb-egress/settings.xml clean verify -DskipTests {OFF}",
+            "run --rm --name <name> --network none --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 scip-java index --build-tool Maven -- --batch-mode --offline clean verify -DskipTests {OFF}",
+            "run --rm --name <name> --platform linux/amd64 --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -v <work>-egress/client:/rb-egress:ro -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false {PROXY} --entrypoint /usr/local/bin/actual-npm sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 ci --no-audit --no-fund --loglevel=error --ignore-scripts --logs-max=0",
+            "run --rm --name <name> --platform linux/amd64 --network none --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 index --output index.scip --no-progress-bar -- . sub",
+        ]
+        .iter()
+        .map(|l| l.replace("{PROXY}", &proxy).replace("{OFF}", &off))
+        .collect();
+        let mut actual = argv_lines(&java_job(Fetch::Maven), JAVA_ID, &Budget::default());
+        let ts_root = Job {
+            root: String::new(),
+            ..ts_job(NodeLock::PackageLock)
+        };
+        actual.extend(argv_lines(
+            &ts_root,
+            SCIP_TYPESCRIPT_IMAGE,
+            &Budget::default(),
+        ));
+        assert_eq!(actual, expected);
+    }
+
+    /// Contract M6a D9, S12: `--scip-maven-threads n` > 1 appends `-T n` to every Maven
+    /// invocation of both phases and gives the Java recipe `+T<n>` (another cache key); 1 does
+    /// neither; the CPU and memory budget reach `docker run`; scip-typescript is untouched.
+    #[test]
+    fn maven_threads_change_the_java_runs_and_their_recipe_only() {
+        let threaded = Budget {
+            cpus: 8.0,
+            memory: "6g".into(),
+            maven_threads: 4,
+            ..Budget::default()
+        };
+        let lines = argv_lines(&java_job(Fetch::Maven), JAVA_ID, &threaded);
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(line.ends_with(" -T 4"), "{line}");
+            assert!(line.contains(" --cpus 8 --memory 6g "), "{line}");
+        }
+        assert_eq!(recipe(Indexer::ScipJava, &threaded), "m5-egress-1+T4");
+        assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
+        assert_eq!(recipe(Indexer::ScipTypescript, &threaded), RECIPE_TS);
+        let files = [("pom.xml", "1")];
+        assert_ne!(
+            crate::project_input_hash(
+                &recipe(Indexer::ScipJava, &threaded),
+                files,
+                &Egress::default()
+            ),
+            crate::project_input_hash(
+                &recipe(Indexer::ScipJava, &Budget::default()),
+                files,
+                &Egress::default()
+            ),
+            "the threaded Java key differs"
+        );
+        let one = Budget {
+            maven_threads: 1,
+            ..threaded.clone()
+        };
+        assert!(
+            argv_lines(&java_job(Fetch::Maven), JAVA_ID, &one)
+                .iter()
+                .all(|l| !l.contains(" -T "))
+        );
+        let ts = argv_lines(
+            &ts_job(NodeLock::PackageLock),
+            SCIP_TYPESCRIPT_IMAGE,
+            &threaded,
+        );
+        assert!(ts.iter().all(|l| !l.contains(" -T ")), "{ts:?}");
     }
 
     /// Contract M6a D7: a scip-typescript job's export is repository-shaped (a link target

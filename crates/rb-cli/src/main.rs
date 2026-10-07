@@ -78,6 +78,23 @@ struct IndexArgs {
     /// over it is killed and recorded as `timeout`. Default: 600 for the fetch, 900 for the index.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     scip_timeout_secs: Option<u64>,
+    /// CPUs each SCIP container may use (0.5-64; default 2). Set on the indexing host, never
+    /// read from the repository; not part of the index's cache key.
+    #[arg(long, env = "RB_SCIP_CPUS", value_parser = parse_scip_cpus)]
+    scip_cpus: Option<f32>,
+    /// Memory each SCIP container may use, as `<n>m` or `<n>g` (512m-64g; default 4g). Set on
+    /// the indexing host only; not part of the index's cache key.
+    #[arg(long, env = "RB_SCIP_MEMORY", value_parser = parse_scip_memory)]
+    scip_memory: Option<String>,
+    /// Maven reactor threads (`-T`) for scip-java's builds (1-16; default 1, which adds no
+    /// flag). Above 1 it is part of the index's cache key, so no cached index crosses thread
+    /// settings. Set on the indexing host only.
+    #[arg(
+        long,
+        env = "RB_SCIP_MAVEN_THREADS",
+        value_parser = clap::value_parser!(u8).range(1..=16)
+    )]
+    scip_maven_threads: Option<u8>,
     /// Extra registry hosts the SCIP fetch phase may reach through its egress proxy, besides
     /// Maven Central and the npm and Yarn registries (comma-separated DNS names, HTTPS only).
     /// Set on the indexing host, never read from the repository: the repository's own build
@@ -766,6 +783,55 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
     }
 }
 
+/// The SCIP budget `rb index`'s flags set (contract M6a D9); every unset flag keeps
+/// `rb_scip::Budget::default()`'s value.
+fn scip_budget(args: &IndexArgs) -> rb_scip::Budget {
+    let mut budget = rb_scip::Budget::default();
+    if let Some(secs) = args.scip_timeout_secs {
+        budget.fetch_timeout = Duration::from_secs(secs);
+        budget.index_timeout = Duration::from_secs(secs);
+    }
+    if let Some(cpus) = args.scip_cpus {
+        budget.cpus = cpus;
+    }
+    if let Some(memory) = &args.scip_memory {
+        budget.memory.clone_from(memory);
+    }
+    if let Some(threads) = args.scip_maven_threads {
+        budget.maven_threads = threads;
+    }
+    budget
+}
+
+/// `--scip-cpus`: a finite number from 0.5 to 64.
+fn parse_scip_cpus(text: &str) -> Result<f32, String> {
+    let cpus: f32 = text.parse().map_err(|e| format!("{e}"))?;
+    if (0.5..=64.0).contains(&cpus) {
+        Ok(cpus)
+    } else {
+        Err("must be from 0.5 to 64".into())
+    }
+}
+
+/// `--scip-memory`: `<n>m` or `<n>g` with `n` digits only, from 512m to 64g; kept as written.
+fn parse_scip_memory(text: &str) -> Result<String, String> {
+    let (digits, unit) = text.split_at(text.len().saturating_sub(1));
+    let mib = match unit {
+        "m" => 1,
+        "g" => 1024,
+        _ => return Err("must be <n>m or <n>g".into()),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("must be <n>m or <n>g".into());
+    }
+    let n: u64 = digits.parse().map_err(|e| format!("{e}"))?;
+    if (512..=64 * 1024).contains(&n.saturating_mul(mib)) {
+        Ok(text.to_owned())
+    } else {
+        Err("must be from 512m to 64g".into())
+    }
+}
+
 /// `rb serve`'s startup sweep (contract M5 amendment 16): drops the AGE graphs that non-live
 /// snapshots still name (left by a publisher killed between its flip and its retention), for
 /// every repository, one graph per transaction under the DDL lock, after the bind address passed
@@ -867,6 +933,7 @@ fn render_text(output: &rb_api::Output, evidence: bool) -> String {
 }
 
 fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<()> {
+    let budget = scip_budget(&args);
     let IndexArgs {
         path,
         repo,
@@ -875,7 +942,10 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         no_cache,
         no_scip,
         scip_work_dir,
-        scip_timeout_secs,
+        scip_timeout_secs: _,
+        scip_cpus: _,
+        scip_memory: _,
+        scip_maven_threads: _,
         scip_registries,
         keep,
         profile,
@@ -948,11 +1018,6 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         }
     }
 
-    let mut budget = rb_scip::Budget::default();
-    if let Some(secs) = scip_timeout_secs {
-        budget.fetch_timeout = Duration::from_secs(secs);
-        budget.index_timeout = Duration::from_secs(secs);
-    }
     let scip = rb_indexer::ScipOptions {
         mode: scip_mode,
         images,
@@ -3030,6 +3095,67 @@ mod tests {
         let egress = rb_scip::Egress::with(&args.scip_registries).unwrap();
         assert!(egress.hosts.contains(&"repo.spring.io".to_owned()));
         assert!(rb_scip::Egress::with(&["*.example.org".to_owned()]).is_err());
+    }
+
+    /// Contract M6a D9, S12: the budget flags at each bound and one beyond; their defaults are
+    /// `cfa8ab9`'s budget; the flags reach `rb_scip::Budget`.
+    #[test]
+    fn scip_budget_flags_are_bounded() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["rb", "index", "."];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Index(args) => scip_budget(&args),
+                _ => panic!("an index command"),
+            })
+        };
+        assert_eq!(parse(&[]).unwrap(), rb_scip::Budget::default());
+        for ok in [
+            &["--scip-cpus", "0.5"][..],
+            &["--scip-cpus", "64"],
+            &["--scip-memory", "512m"],
+            &["--scip-memory", "64g"],
+            &["--scip-memory", "65536m"],
+            &["--scip-maven-threads", "1"],
+            &["--scip-maven-threads", "16"],
+        ] {
+            assert!(parse(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            &["--scip-cpus", "0.4"][..],
+            &["--scip-cpus", "64.5"],
+            &["--scip-cpus", "NaN"],
+            &["--scip-memory", "511m"],
+            &["--scip-memory", "65g"],
+            &["--scip-memory", "65537m"],
+            &["--scip-memory", "4"],
+            &["--scip-memory", "4gb"],
+            &["--scip-memory", "-1g"],
+            &["--scip-maven-threads", "0"],
+            &["--scip-maven-threads", "17"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        let budget = parse(&[
+            "--scip-cpus",
+            "8",
+            "--scip-memory",
+            "6g",
+            "--scip-maven-threads",
+            "4",
+            "--scip-timeout-secs",
+            "30",
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                budget.cpus,
+                budget.memory.as_str(),
+                budget.maven_threads,
+                budget.index_timeout.as_secs()
+            ),
+            (8.0, "6g", 4, 30)
+        );
     }
 
     #[test]

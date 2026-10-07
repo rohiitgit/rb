@@ -831,7 +831,7 @@ Same rules as M5:
   - Lockfiles generated inside the scip-typescript image (`--network none`), the command recorded in `fixtures/README.md`.
   - Files: `rb-cli/tests/e2e.rs`, `fixtures/README.md` (plus the fixture sources and goldens).
   - **Verify:** `scip_ts_workspaces` with containers; the fetch from an emptied per-repository cache twice gives the same stored output; fresh == cached.
-- [ ] **9. Budget flags** (S12; D9).
+- [x] **9. Budget flags** (S12; D9). Done 2026-10-07: `--scip-cpus`/`--scip-memory`/`--scip-maven-threads` (env `RB_SCIP_*`), `Budget::maven_threads`, `-T n` on every Maven invocation of both phases only for n > 1, Java recipe `+T<n>`; default argv of the Java phases and a TypeScript root job pinned to `cfa8ab9`'s (recorded from that code); 4 mutants killed; README; fixture dumps byte-identical.
   - Files: `rb-cli/src/main.rs`, `rb-scip/src/orchestrate.rs`, `rb-scip/src/hash.rs`, `README.md`.
   - **Verify:** default argv equals `cfa8ab9`'s for every phase (unit); bounds rows; the threaded key differs.
 - [ ] **10. shardingsphere: Lombok and the reactor** (S13, S16; no code).
