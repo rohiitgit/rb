@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M5 phase 19: precision and carried measurements (S26)
+- **No code.** Contract "Benchmark measurements", S26 (`var/m5/scripts/{s26,ts_iface,orphans}.py`).
+- **`CONSUMES`:** shardingsphere none; mattermost 0 heuristic, 0 synthetic, 8 `ambiguous`, all read and all false: four Go test sites build `http.NewRequest("GET", "/" or "", nil)` for an in-process handler and are path-matched to both e2e webhook servers' `GET /` (M4a item 10's stated convention; M6 items: in-process requests, the empty URL).
+- **Forms by grep:** holes after a port: 2 (Java tests) and 21 (Go tests), all loopback, no edge; constructor-assigned URL members 0/0; user information with a hole 0/0 HTTP; configs passed by name 0/1 (`dynamic`).
+- **Gate A's cost:** 4 and 302 sites (mattermost: `net/http` 189, `fetch` 66, axios 29), every base unverified, 0 edges lowered from `synthetic`.
+- **DI/RTA/orphans:** no injection point and no `INJECTS` on either; RTA proves 0 of 4,421 and 0 of 38 types; module roles 442 library / 7 service and 50 service / 15 library; orphan-eligible 0 % and 1.08 %; 10 sampled `rb impact` runs on mattermost list 1 orphan, a true one. TS interface-method `IMPLEMENTS`: not measurable (S24). S19's cost: 0 on both.
+- **Clean-up:** clones, per-repository caches (1.1 + 1.0 GiB), `m5b_*` repositories and graphs, 12 SCIP index rows, egress networks removed; `VACUUM` (database 669 MB); 13 GiB free.
+- **Verification** (`var/m5/logs/p19-*`): fmt, clippy clean; 634 unit tests outside e2e and api; `rb-store` with the database 64/64, `rb-server` 8/8; e2e 29/29, api 1/1 (150 sets), no `skipping`; no `rb` listener; stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `tasks/{contract-m5,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M5 phase 18: query latency (S25)
 - **No code.** Contract "Benchmark measurements", S25 (`var/m5/scripts/latency.py`, outputs `var/m5/bench/out/{ss,mm}-lat-run{1,2}.*`): a warm `rb serve` on each repository's live SCIP snapshot, 20 warm-up requests, D14's sampling rule, two runs.
 - **Results (client p95, runs 1 and 2):** shardingsphere Q1 1.61/3.33 ms, Q2 95.63/93.73 ms, Q3 7.34/8.23 ms, card 38.42/38.97 ms, Q4 not measurable (no endpoint); mattermost Q1 1.88/1.79 ms, Q2 152.06/151.24 ms, Q4 3.64/3.63 ms (all 66 endpoints), Q3 7.39/7.43 ms, card 66.26/58.3 ms. Every §12.5 latency target met; every response `200`; nothing truncated (the work cap stands).

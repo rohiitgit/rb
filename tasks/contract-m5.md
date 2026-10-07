@@ -423,3 +423,28 @@ Release binary of `17410d7` plus amendment 14 (`var/m5/bench/bin/rb-m5`, sha256 
 - **CLI cold time** (embedded mode, the graph loaded per invocation; recorded, no target): 416–546 ms p50, at most 649 ms, about 0.4–0.6 s of graph loading and index building per invocation that the server pays once.
 - **Note:** shardingsphere's Q4 cannot be measured (0 endpoints), so §12.5's Q4 target is measured on mattermost only, with 66 samples.
 
+### S26: precision and carried measurements (phase 19)
+
+From each repository's dumps (`var/m5/scripts/s26.py`, `ts_iface.py`, `orphans.py`) and grep over its tracked TS/JS/Java/Go sources; every sampled edge and listed orphan read in the source.
+
+| Item | shardingsphere | mattermost |
+|---|---|---|
+| **M4a 10, `CONSUMES` precision** | 0 `CONSUMES` (4 HTTP sites, all `fetch` in a vendored `mermaid.js`, all `dynamic`) | 0 `heuristic`, 0 `synthetic`; **8 `ambiguous`, all 8 read: all false** — 4 Go test sites build a request for an in-process handler (`http.NewRequest("GET", "/", nil)` in `outgoing_oauth_connection_test.go` 682/729 and `web_test.go` 392; `http.NewRequest(http.MethodGet, "", nil)` in `handlers_test.go` 810 and `imageproxy/local_test.go` 56/79), each path-matched to both e2e Express webhook servers' `GET /`. No heuristic edge exists to sample (the rule's 20 per repository cannot be drawn) |
+| **M4a 11, holes after a port** | `"http://h:" + p` in Java: 2 (both tests, host `127.0.0.1`); the TS forms 0 | Go `fmt.Sprintf("http://localhost:%v", …)`: 21 (tests); the TS forms 0. Every occurrence names a loopback host: no stitch to a service, no edge |
+| **M4a 16, constructor-assigned URL members** | 0 | 0 |
+| **M4a 19, user information with a hole** | 0 | 0 HTTP (2 `postgres://${user}:${password}@…` DSNs in the Playwright containers, no HTTP client) |
+| **M4a 20, configs passed by name** | 0 | 1: `axios(requestOptions)` (`e2e-tests/cypress/utils/report.js:327`), a config object: `dynamic`, no edge |
+| **Gate A's cost (M4a 22, amendment 15's follow-up)** | 4 sites (`fetch` 4), bases verified 0 / unverified 4; edges capped: 0 (all `dynamic`) | 302 sites by carrier: Go `net/http` 189, `fetch` 66, axios 29; verified 0 / **unverified 302**; edges capped from `synthetic`: **0** — no site's stitch could have been `synthetic` (outcomes: 145 unmatched, 123 dynamic, 11 external, 5 self, 18 ambiguous) |
+| **DI (M4b 5)** | 0 injection points (no Spring DI): not measurable | 0 points: not measurable |
+| **RTA yield (M4b 6)** | 4,421 types (SCIP snapshot; 4,885 `--no-scip`), proven 0; first failing rule: `library` 3,399, `test` 1,022 | 38 types, proven 0 (`library` 38) |
+| **Module role (M4b 7)** | services: `library` 442, `service` 7 | `service` 50, `library` 15, `unassigned` 1 |
+| **Module-object approximation (M4b 19)** | no TS/JS type considered | 38 types, none proven, so the approximation decides nothing here |
+| **Orphan-eligible share; `rb impact` orphan runs** | 0 of 53,736 symbols (the `library` role keeps every one): no run possible | 450 of 41,655 (1.08 %); 10 runs sampled by the rule over the 437 callers of eligible symbols: 1 orphan listed (`parseTiers()`, `docs/site/src/components/EditionAvailability/index.tsx:30`, called only by the removed component): **true; 0 false orphans** |
+| **`INJECTS` samples** | none exist | none exist |
+| **TS interface-method `IMPLEMENTS` (M3b)** | no TypeScript | not measurable (S24): 0 overriding pairs in the indexed projects |
+| **S19's cost** | 0 (dump byte-identical to `afae548`) | 0 (byte-identical) |
+
+- **Precision miss, recorded (not blocking: it contradicts no stated rule; closing bar 4):** the 8 false `ambiguous` `CONSUMES` follow M4a open item 10's stated convention (a relative URL is path-matched across every service). Two forms behind them are M6 items: (1) a Go request built for an in-process handler (passed to `ServeHTTP` or an `httptest` recorder) is no network request; (2) an empty URL (`""`) is matched as `/`. Both are test code here; `ambiguous` already says the target is not known.
+- **What the benchmark could not measure (documented gaps):** heuristic `CONSUMES` precision, DI and `INJECTS`, and the TypeScript interface-method count have no instances on these two repositories; the measurements of M4a/M4b on the earlier public repositories stand for them.
+- **Clean-up (D14):** both clones, their per-repository package caches (`var/scip/cache/m5b_shardingsphere` 1.1 GiB, `m5b_mattermost` 1.0 GiB), every `m5b_*` repository with its AGE graphs (one per transaction, `var/m5/scripts/cleanup.sh`), the 12 SCIP index rows the runs wrote, and the egress networks (`rb gc --egress`) were removed, and `VACUUM` run (database 669 MB). The facts-cache rows the runs wrote stay (content-addressed and shared; `rb cache prune --facts` removes them once the extractor changes). Free disk: 17 GiB at the start of phase 16 (before the cold build), 13 GiB at the end (the release `target/` 0.7 GiB and the saved outputs in `var/m5/bench/out` 0.6 GiB remain; the debug build is rebuilt by the verification loop).
+
