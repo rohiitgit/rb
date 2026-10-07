@@ -396,7 +396,9 @@ pub(crate) fn join(
     // compiled type has, and would turn an override's reverse twin into an exact edge. Both
     // indexers relate a class to every supertype, transitively; scip-java relates an interface
     // likewise, scip-typescript 0.4.0 relates an interface to nothing (measured on
-    // `var/fix-pass11`), so a walk through a TypeScript interface is confirmed by its origin.
+    // `var/fix-pass11`), so a walk through a TypeScript interface is confirmed by its origin,
+    // and a walk from one (an interface method's link) by its declared clauses alone
+    // (contract M6a D4).
     let mut types_by_symbol: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     let mut supertypes: BTreeMap<(usize, usize), Vec<String>> = BTreeMap::new();
     let mut related: BTreeMap<(usize, usize), BTreeSet<&str>> = BTreeMap::new();
@@ -444,6 +446,14 @@ pub(crate) fn join(
     let mut implements: Vec<ScipEdge> = Vec::new();
     for (di, (path, doc, facts, by_span)) in docs.iter().enumerate() {
         let heuristic = &keys[path.as_str()];
+        // Whether definition `j` of this document is a scip-typescript interface (contract
+        // M6a D4); a Java interface's walk keeps amendment 78's confirmation.
+        let typescript_interface = |j: usize| {
+            matches!(
+                files[path.as_str()].0,
+                Language::TypeScript | Language::Tsx | Language::JavaScript
+            ) && facts.definitions[j].kind == rb_syntax::DefKind::Interface
+        };
         let replaced = out.keys.get(path);
         let source = |enclosing: Option<usize>| match enclosing {
             Some(i) => Source::Symbol(
@@ -619,12 +629,18 @@ pub(crate) fn join(
                         .is_some_and(|targets| {
                             // A holder that is no type (a top-level function) relates to nothing.
                             related.get(&holder).is_some_and(|related| {
+                                // Contract M6a D4: a scip-typescript interface relates its type
+                                // to nothing, so its declared clauses alone decide the
+                                // direction of a link its method's own symbol information
+                                // carries (sub → super only, measured in P1b).
+                                let confirmed_by =
+                                    (!typescript_interface(holder.1)).then_some(related);
                                 reaches_supertype(
                                     &supertypes,
                                     &types_by_symbol,
                                     holder,
                                     targets,
-                                    related,
+                                    confirmed_by,
                                 )
                             })
                         }),
@@ -1237,15 +1253,17 @@ fn declared_supertypes(
 /// when it is one of the project's matched type definitions (`types_by_symbol`), so an
 /// external or unresolved supertype ends that path, and only when `from`'s own symbol
 /// information relates it to that symbol (`related`, amendment 78), so a clause the compiled
-/// program does not have ends it too. The walk accepts only when it reaches one of `targets`
-/// itself; the index's relationship is exact, so the walk only decides its direction. A
-/// visited set and a depth cap bound it.
+/// program does not have ends it too. `related` is `None` for an origin whose indexer relates
+/// it to nothing (a scip-typescript interface, contract M6a D4): its declared clauses, each
+/// resolved through the index's own type occurrence, are the only steps. The walk accepts only
+/// when it reaches one of `targets` itself; the index's relationship is exact, so the walk only
+/// decides its direction. A visited set and a depth cap bound it.
 fn reaches_supertype(
     supertypes: &BTreeMap<(usize, usize), Vec<String>>,
     types_by_symbol: &BTreeMap<&str, Vec<(usize, usize)>>,
     from: (usize, usize),
     targets: &[(usize, usize)],
-    related: &BTreeSet<&str>,
+    related: Option<&BTreeSet<&str>>,
 ) -> bool {
     const MAX_DEPTH: usize = 64;
     let mut visited = BTreeSet::from([from]);
@@ -1254,7 +1272,7 @@ fn reaches_supertype(
         let mut next = Vec::new();
         for at in frontier {
             for symbol in supertypes.get(&at).map_or(&[][..], Vec::as_slice) {
-                if !related.contains(symbol.as_str()) {
+                if related.is_some_and(|related| !related.contains(symbol.as_str())) {
                     continue;
                 }
                 for &t in types_by_symbol
@@ -6168,5 +6186,195 @@ mod tests {
     fn lombok_removal_grows_linearly() {
         let (small, large) = (lombok_work_for(100), lombok_work_for(400));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    // Contract M6a D4 (S5): scip-typescript relates an interface method to the methods it
+    // overrides (sub → super only, at every depth) and an interface type to nothing (probes P1,
+    // P1b). The walk from an interface method's holder steps onto its declared supertypes,
+    // resolved through the index's own type occurrences, without the origin's (empty) relations.
+
+    const SHAPES: &str = "export interface Base { m(): void; n(x: number): number }\nexport interface Mid extends Base { m(): void; extra(): void }\nexport interface Deep extends Mid { m(): void }\nexport interface Other extends Mid, Base { n(x: number): number }\nexport interface GBase<T> { g(x: T): T }\nexport interface GSub extends GBase<string> { g(x: string): string }\nexport interface Unrelated { m(): void }\nexport interface Prop extends Base { m: () => void }\n";
+
+    /// S5's positive rows: one level, two clauses, depth 3 (both overridden members) and a
+    /// generic super-interface, from the relationships P1b recorded; each needs D4 (at
+    /// `cfa8ab9` every one is refused for want of the interface's own relations).
+    #[test]
+    fn typescript_interface_methods_implement_what_they_override() {
+        let f = "src/`shapes.ts`/";
+        let rels = [
+            (format!("{f}Mid#m()."), format!("{f}Base#m().")),
+            (format!("{f}Deep#m()."), format!("{f}Mid#m().")),
+            (format!("{f}Deep#m()."), format!("{f}Base#m().")),
+            (format!("{f}Other#n()."), format!("{f}Base#n().")),
+            (format!("{f}GSub#g()."), format!("{f}GBase#g().")),
+        ];
+        let rels: Vec<(&str, &str)> = rels.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let joined = hierarchy_joined(Language::TypeScript, &[("shapes.ts", SHAPES)], &rels, &[]);
+        assert_eq!(
+            implements_lines(Language::TypeScript, &joined),
+            [
+                format!("{f}Deep#m(). Implements {f}Base#m()."),
+                format!("{f}Deep#m(). Implements {f}Mid#m()."),
+                format!("{f}GSub#g(). Implements {f}GBase#g()."),
+                format!("{f}Mid#m(). Implements {f}Base#m()."),
+                format!("{f}Other#n(). Implements {f}Base#n()."),
+            ]
+        );
+        assert_eq!(joined.coverage.relationships_dropped, 0);
+        assert_eq!(joined.coverage.supertypes_unresolved, 0);
+    }
+
+    /// S5's negative rows: a relationship whose target's type the source's declared clauses do
+    /// not reach (`Mid#m() → Unrelated#m()`, fabricated), the reverse of an override (`Base#m()
+    /// → Mid#m()`, fabricated: `Base` declares no clause reaching `Mid`), a member with no super
+    /// member (`Mid#extra()`, no relationship), and a property signature (`Prop#m`, not a
+    /// method: no definition, its link dropped) give no edge.
+    #[test]
+    fn typescript_interface_links_the_clauses_do_not_confirm_give_no_edge() {
+        let f = "src/`shapes.ts`/";
+        let rels = [
+            (format!("{f}Mid#m()."), format!("{f}Unrelated#m().")),
+            (format!("{f}Base#m()."), format!("{f}Mid#m().")),
+            (format!("{f}Prop#m."), format!("{f}Base#m().")),
+        ];
+        let rels: Vec<(&str, &str)> = rels.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let joined = hierarchy_joined(Language::TypeScript, &[("shapes.ts", SHAPES)], &rels, &[]);
+        assert!(
+            implements_lines(Language::TypeScript, &joined).is_empty(),
+            "{:?}",
+            implements_lines(Language::TypeScript, &joined)
+        );
+    }
+
+    /// S5: a supertype imported from another file and a namespace-qualified one
+    /// (`extends ns.Base`), each resolved through the index's type occurrence at the written
+    /// name (amendment 26), as scip-typescript emits it (P1b: the imported module's symbol).
+    #[test]
+    fn typescript_interface_methods_implement_imported_and_qualified_supertypes() {
+        let base = "export interface Base { m(): void }\n";
+        let forms = "import { Base } from \"./base\";\nimport * as ns from \"./base\";\nexport interface Imp extends Base { m(): void }\nexport interface Q extends ns.Base { m(): void }\n";
+        let b = "src/`base.ts`/";
+        let f = "src/`forms.ts`/";
+        let rels = [
+            (format!("{f}Imp#m()."), format!("{b}Base#m().")),
+            (format!("{f}Q#m()."), format!("{b}Base#m().")),
+        ];
+        let rels: Vec<(&str, &str)> = rels.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let base_type = format!("{b}Base#");
+        let extra = [
+            ("forms.ts", at_nth(forms, 2, "Base", 0), base_type.as_str()),
+            ("forms.ts", at_nth(forms, 3, "Base", 0), base_type.as_str()),
+        ];
+        let joined = hierarchy_joined(
+            Language::TypeScript,
+            &[("base.ts", base), ("forms.ts", forms)],
+            &rels,
+            &extra,
+        );
+        assert_eq!(
+            implements_lines(Language::TypeScript, &joined),
+            [
+                format!("{f}Imp#m(). Implements {b}Base#m()."),
+                format!("{f}Q#m(). Implements {b}Base#m()."),
+            ]
+        );
+    }
+
+    /// Contract M6a D4's scope: the waiver is for scip-typescript interfaces only. Amendment
+    /// 78's shape with Java interfaces (`§` stands for a backslash): javac reads `interface
+    /// Sup1<T extends Sup2>`, Tree-sitter `interface Sup1 extends Sup2`; scip-java relates
+    /// `Sup2#` to `Sup1#`, each `n()` to the other, `Sup1#` to nothing (as it does for the
+    /// classes of `a_supertype_the_index_does_not_relate_is_not_walked`; positions derived from
+    /// the source). The reverse twin `Sup1#n() → Sup2#n()` stays unconfirmed: no edge.
+    #[test]
+    fn a_java_interface_keeps_its_origin_confirmation() {
+        let src = "package p;\n\ninterface Sup1 /* §u002a/ <T /* */ extends Sup2 /* §u002a/ > /* */ {\n  void n();\n}\n\ninterface Sup2 extends Sup1<Sup2> {\n  void n();\n}\n"
+            .replace('§', "\\");
+        let p = "scip-java maven maven/t11/t11esc 1.0 p/";
+        let occurrences: Vec<Occurrence> = [
+            (at_nth(&src, 2, "Sup1", 0), "Sup1#", 1, Some([2, 0, 4, 1])),
+            (at_nth(&src, 2, "T", 0), "Sup1#[T]", 1, Some([2, 0, 4, 1])),
+            (at_nth(&src, 2, "Sup2", 0), "Sup2#", 0, None),
+            (
+                at_nth(&src, 3, "n", 0),
+                "Sup1#n().",
+                1,
+                Some(between(&src, "void n", 0, ";")),
+            ),
+            (at_nth(&src, 6, "Sup2", 0), "Sup2#", 1, Some([6, 0, 8, 1])),
+            (at_nth(&src, 6, "Sup1", 0), "Sup1#", 0, None),
+            (at_nth(&src, 6, "Sup2", 1), "Sup2#", 0, None),
+            (
+                at_nth(&src, 7, "n", 0),
+                "Sup2#n().",
+                1,
+                Some(between(&src, "void n", 1, ";")),
+            ),
+        ]
+        .into_iter()
+        .map(|(span, d, roles, enclosing)| Occurrence {
+            span,
+            symbol: format!("{p}{d}"),
+            roles,
+            enclosing,
+        })
+        .collect();
+        let kind = |info: SymbolInfo, kind: &str| SymbolInfo {
+            kind: kind.into(),
+            ..info
+        };
+        let symbols = vec![
+            kind(enum_constant(&format!("{p}Sup1#")), "Interface"),
+            kind(
+                implementation(&format!("{p}Sup1#n()."), &format!("{p}Sup2#n().")),
+                "Method",
+            ),
+            kind(
+                implementation(&format!("{p}Sup2#"), &format!("{p}Sup1#")),
+                "Interface",
+            ),
+            kind(
+                implementation(&format!("{p}Sup2#n()."), &format!("{p}Sup1#n().")),
+                "Method",
+            ),
+        ];
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "p/Sup1.java".into(),
+                occurrences,
+                symbols,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let joined = join_sources(Language::Java, &[("p/Sup1.java", &src)], &index);
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(joined.coverage.supertypes_unconfirmed, 1, "Sup1 → Sup2");
+        let implements: Vec<String> = edge_lines(&joined)
+            .into_iter()
+            .filter(|e| e.contains(" Implements "))
+            .collect();
+        assert_eq!(
+            implements,
+            [
+                format!("{p}Sup2# Implements {p}Sup1#"),
+                format!("{p}Sup2#n(). Implements {p}Sup1#n()."),
+            ]
+        );
+    }
+
+    /// Contract M6a D4's scope: a scip-typescript class keeps amendment 78's confirmation (it
+    /// relates its type to every supertype, P1). A clause its symbol information does not
+    /// relate (here `A#` relates to nothing, as for a clause only Tree-sitter reads) does not
+    /// lead the walk on, so `A#m() → B#m()` gives no edge and the clause is counted.
+    #[test]
+    fn a_typescript_class_keeps_its_origin_confirmation() {
+        let src = "export class B { m(): void {} }\nexport class A extends B { m(): void {} }\n";
+        let f = "src/`a.ts`/";
+        let rels = [(format!("{f}A#m()."), format!("{f}B#m()."))];
+        let rels: Vec<(&str, &str)> = rels.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let joined = hierarchy_joined(Language::TypeScript, &[("a.ts", src)], &rels, &[]);
+        assert_eq!(joined.coverage.supertypes_unconfirmed, 1);
+        assert!(implements_lines(Language::TypeScript, &joined).is_empty());
     }
 }

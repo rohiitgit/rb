@@ -814,7 +814,7 @@ Same rules as M5:
   - Fixture sources per the contract's fixture plan (checked against Java's file rules first); goldens predicted from P2b before blessing.
   - Files: `rb-cli/tests/e2e.rs`, `fixtures/README.md` (plus the fixture sources and goldens).
   - **Verify:** `scip_java_lombok` with containers, no `skipping:`; the removal-off mutant fails the status golden and the must-exist list; fresh == cached.
-- [ ] **4. TypeScript interface-method `IMPLEMENTS`** (S5–S7; D4; `PIPELINE` `m6a-2`). Only if P1b found no super→sub relationship.
+- [x] **4. TypeScript interface-method `IMPLEMENTS`** (S5–S7; D4; `PIPELINE` `m6a-2`). Only if P1b found no super→sub relationship. Done 2026-10-07 (P1b: 0): S5's two positive units failed first; the waiver-on-Java mutant survived the amendment-78 unit (classes) and is killed by a new Java-interface unit, the waiver-on-every-TS-type mutant by a TS-class unit (amendment 4); fixture dumps byte-identical; Java SCIP goldens unchanged.
   - Files: `rb-indexer/src/scip.rs`.
   - **Verify:** S5's positive rows fail first; the waiver-on-Java mutant killed by the amendment-78 unit; Java SCIP goldens unchanged.
 - [ ] **5. Workspace membership** (S8; D5).
