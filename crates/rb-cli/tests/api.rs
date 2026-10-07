@@ -81,7 +81,8 @@ fn cli_args(segment: &str, repo: &str, params: &[(&'static str, String)]) -> Vec
 }
 
 /// The same request to the server: a `GET` with a query string, or Cypher's `POST` with its JSON
-/// body (`snapshot` stays in the query string).
+/// body (`snapshot` stays in the query string). `repo` is the path segment as sent (it may be
+/// percent-encoded).
 fn api_call(
     server: &Served,
     segment: &str,
@@ -126,10 +127,16 @@ fn api_call(
 }
 
 /// Runs one set through both surfaces and checks the identity and the status; the parsed body.
-fn same(
+fn same(url: &str, server: &Served, repo: &str, set: &Set, env: &[(&str, &str)]) -> Value {
+    same_as(url, server, repo, repo, set, env)
+}
+
+/// [`same`], with the repository's path segment sent as `path_repo` (an encoded form of `repo`).
+fn same_as(
     url: &str,
     server: &Served,
     repo: &str,
+    path_repo: &str,
     (segment, params): &Set,
     env: &[(&str, &str)],
 ) -> Value {
@@ -137,7 +144,7 @@ fn same(
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let (code, out, err) = rb_exit_env(url, &argv, env);
     assert_eq!(err, "", "rb {argv:?} wrote to stderr");
-    let (status, body) = api_call(server, segment, repo, params);
+    let (status, body) = api_call(server, segment, path_repo, params);
     assert_eq!(
         body,
         out,
@@ -394,17 +401,96 @@ fn api_bodies_equal_cli_json() {
     assert_eq!(v["error"]["kind"], "snapshot_not_retained");
     *statuses.entry(410).or_default() += 1;
 
+    // A `failed` snapshot is `not_found` (amendment 6 (c); evaluator pass 1, Z5): a publish whose
+    // projection cannot be loaded (the CSVs are written where the database cannot see them)
+    // records a `failed` row.
+    let unseen = tempfile::tempdir().unwrap();
+    let (code, _, err) = rb_exit(
+        &url,
+        &[
+            "index",
+            small_path,
+            "--repo",
+            &gone_repo,
+            "--no-scip",
+            "--force",
+            "--age-load-dir",
+            unseen.path().to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0, "{err}");
+    let listed: Value =
+        serde_json::from_str(&rb(&url, &["snapshots", "--repo", &gone_repo, "--json"])).unwrap();
+    let failed = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["status"] == "failed")
+        .unwrap_or_else(|| panic!("no failed row: {listed}"))["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    for set in [
+        ("callers", vec![p("target", "a"), p("snapshot", &failed)]),
+        ("find", vec![p("q", "a"), p("snapshot", &failed)]),
+        (
+            "cypher",
+            vec![p("query", "RETURN 1"), p("snapshot", &failed)],
+        ),
+    ] {
+        let v = same(&url, &server, &gone_repo, &set, &[]);
+        assert_eq!(
+            (v["error"]["kind"].as_str(), v["error"]["message"].as_str()),
+            (
+                Some("not_found"),
+                Some(
+                    format!("snapshot {failed} of {gone_repo:?} is failed and holds no graph")
+                        .as_str()
+                )
+            ),
+            "{set:?}"
+        );
+    }
+
     // Every repository's status, and a repository never indexed.
     let (status, body) = server.call("GET", "/v1/repos", None);
     assert_eq!((status, body), (200, rb(&url, &["status", "--json"])));
     let nope = format!("t_api_nope_{pid}");
-    same(
-        &url,
-        &server,
-        &nope,
-        &("callers", vec![p("target", "x")]),
-        &[],
-    );
+    for set in [
+        ("callers", vec![p("target", "x")]),
+        ("status", vec![]),
+        ("snapshots", vec![]),
+    ] {
+        let v = same(&url, &server, &nope, &set, &[]);
+        assert_eq!(v["error"]["kind"], "not_found", "{set:?}");
+    }
+
+    // Percent-encoded repository segments name the same repository (evaluator pass 1, Z3): `_`
+    // as `%5F` or `%5f`, an unreserved letter encoded, and a name that is not ASCII.
+    let real = &repos[0];
+    let encoded = [
+        real.replace('_', "%5F"),
+        real.replace('_', "%5f"),
+        format!("%{:02X}{}", real.as_bytes()[0], &real[1..]),
+    ];
+    for path_repo in &encoded {
+        for set in [
+            ("status", vec![]),
+            ("callers", vec![p("target", fixtures[0].1)]),
+        ] {
+            let v = same_as(&url, &server, real, path_repo, &set, &[]);
+            assert!(v["error"].is_null(), "{path_repo} {set:?}: {v}");
+        }
+    }
+    let unicode = format!("t_api_\u{e9}t\u{e9}_{pid}");
+    for set in [("status", vec![]), ("callers", vec![p("target", "x")])] {
+        let v = same_as(&url, &server, &unicode, &enc(&unicode), &set, &[]);
+        assert_eq!(
+            v["error"]["message"],
+            format!("repository {unicode:?} is not indexed"),
+            "{set:?}"
+        );
+    }
     // The rows every class of answer must have produced: answers, invalid parameters, not
     // found, ambiguous (at least two fixtures share a name), not retained, Cypher refusals.
     eprintln!("statuses: {statuses:?}");

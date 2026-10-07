@@ -1409,6 +1409,125 @@ fn gc_and_cache_prune_commands() {
     assert!(err.contains("--facts") && err.contains("--scip"), "{err}");
 }
 
+/// Contract M5 amendment 16 (evaluator pass 1, Z2), the evaluator's repro end to end: a session
+/// holds `ACCESS SHARE` on the live graph's vertex table, so the next `rb index`'s retention
+/// waits to drop it; the publisher is killed (SIGKILL) once its flip has committed. The retired
+/// snapshot still names its graph, yet `rb cypher --snapshot` on it is `invalid_param` (D17)
+/// and `rb snapshots` names no graph for it; `rb serve`'s startup sweep then drops the leftover,
+/// leaving one graph, the live snapshot's.
+#[test]
+fn a_publish_killed_after_its_flip_self_heals() {
+    use serde_json::Value;
+    let Some(url) = db_url() else { return };
+    let name = format!("t_flipkill_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let dir = repo_from(&[("src/a.ts", "export function a(): number { return 1; }\n")]);
+    let path = dir.path().to_str().unwrap();
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    let old = live_id(&url, &name);
+    std::fs::write(
+        dir.path().join("src/b.ts"),
+        "export function b(): number { return 2; }\n",
+    )
+    .unwrap();
+    commit_all(dir.path());
+    let graphs = |c: &mut postgres::Client| -> Vec<String> {
+        let mut g: Vec<String> = c
+            .query(
+                "SELECT name::text FROM ag_catalog.ag_graph WHERE name::text ~ $1",
+                &[&format!("^rb_{name}_[0-9]+$")],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        g.sort();
+        g
+    };
+
+    let mut holder = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut held = holder.transaction().unwrap();
+    held.batch_execute(&format!(
+        "LOCK TABLE rb_{name}_{old}._ag_label_vertex IN ACCESS SHARE MODE"
+    ))
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .args(["index", path, "--repo", &name, "--no-scip"])
+        .env("RB_DATABASE_URL", &*url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let new = loop {
+        let live = Store::connect(&url)
+            .unwrap()
+            .live_snapshot(&name)
+            .unwrap()
+            .map(|s| s.id);
+        if let Some(id) = live.filter(|id| *id != old) {
+            break id;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "rb index ended before it was killed"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(120));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    child.kill().unwrap();
+    child.wait().unwrap();
+    held.rollback().unwrap();
+    let mut probe = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let both = vec![format!("rb_{name}_{old}"), format!("rb_{name}_{new}")];
+    assert_eq!(graphs(&mut probe), both, "the leftover the kill leaves");
+
+    let (code, out, _) = rb_exit(
+        &url,
+        &[
+            "cypher",
+            "MATCH (n) RETURN count(n)",
+            "--repo",
+            &name,
+            "--snapshot",
+            &old.to_string(),
+            "--json",
+        ],
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (code, v["error"]["kind"].as_str()),
+        (2, Some("invalid_param")),
+        "{out}"
+    );
+    let listed: Value =
+        serde_json::from_str(&rb(&url, &["snapshots", "--repo", &name, "--json"])).unwrap();
+    let rows: Vec<(i64, Value)> = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["id"].as_i64().unwrap(), s["age_graph"].clone()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (new, Value::String(format!("rb_{name}_{new}"))),
+            (old, Value::Null)
+        ]
+    );
+
+    let server = Served::start(&url, &[]);
+    assert_eq!(graphs(&mut probe), vec![format!("rb_{name}_{new}")]);
+    drop(server);
+    assert_eq!(
+        rb(&url, &["gc", "--dry-run", "--prefix", &name]),
+        "gc: nothing to remove\n"
+    );
+}
+
 /// Contract C11: facts cached under one extractor version are invisible to another.
 #[test]
 fn facts_cache_is_keyed_by_extractor_version() {

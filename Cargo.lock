@@ -2101,6 +2101,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "postgres",
  "rb-api",
  "rb-frameworks",
  "rb-git",

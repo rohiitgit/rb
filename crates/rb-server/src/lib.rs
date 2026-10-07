@@ -3,7 +3,9 @@
 //! Every answer comes from the request layer (`rb-api`), the same code `rb … --json` runs, so the
 //! two bodies cannot differ (invariant 2); this crate only adds HTTP and the server's guard rails:
 //! - **local only (D7):** it binds loopback addresses only, answers only requests whose `Host` is
-//!   its own loopback address and port (`421` otherwise: DNS rebinding), and sends no CORS header;
+//!   its own loopback address and port (`421` otherwise: DNS rebinding; an absolute-form target's
+//!   authority is checked the same way and must equal the one `Host` header, `400` for two
+//!   `Host` headers or a mismatch), and sends no CORS header;
 //!   `OPTIONS` and every method an endpoint does not take are `405`, and the one `POST` (Cypher)
 //!   needs `Content-Type: application/json` (`415`), which a cross-origin page cannot send without
 //!   a preflight that gets no approval;
@@ -233,20 +235,36 @@ impl Server {
         timing: &mut Timing,
     ) -> Result<String, Refusal> {
         let (parts, body) = req.into_parts();
+        // RFC 9112 §3.2: more than one `Host` is a bad request, whatever the values.
+        let hosts = parts.headers.get_all(header::HOST).iter().count();
+        if hosts > 1 {
+            return Err(ApiError::invalid(
+                "Host",
+                format_args!("must be sent once (got {hosts} Host headers)"),
+            )
+            .into());
+        }
+        // An absolute-form target's authority is the request's effective host (RFC 9112
+        // §3.2.2): it must be allowed, and equal to the `Host` header.
+        let authority = parts
+            .uri
+            .authority()
+            .map(|a| a.as_str().to_ascii_lowercase());
+        if let Some(a) = authority.as_ref().filter(|a| !self.hosts.contains(a)) {
+            return Err(self.misdirected(Some(a)).into());
+        }
         let host = parts
             .headers
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
             .map(str::to_ascii_lowercase);
         if !host.as_ref().is_some_and(|h| self.hosts.contains(h)) {
-            return Err(ApiError::new(
-                ErrorKind::MisdirectedRequest,
-                format!(
-                    "this server answers only Host {} (got {})",
-                    self.hosts.join(", "),
-                    host.as_deref()
-                        .map_or("none".to_owned(), |h| format!("{h:?}"))
-                ),
+            return Err(self.misdirected(host.as_deref()).into());
+        }
+        if let Some(a) = authority.filter(|a| Some(a) != host.as_ref()) {
+            return Err(ApiError::invalid(
+                "Host",
+                format_args!("must equal the request target's authority {a:?}"),
             )
             .into());
         }
@@ -296,6 +314,19 @@ impl Server {
         let params = Params::from_pairs(pairs)?;
         let request = rb_api::parse(endpoint, repo.as_deref(), &params, &self.config.settings)?;
         Ok(self.run(request, timing).await?)
+    }
+
+    /// `421` for a host (the `Host` header, or an absolute-form target's authority) that is not
+    /// this server's (D7: DNS rebinding).
+    fn misdirected(&self, host: Option<&str>) -> ApiError {
+        ApiError::new(
+            ErrorKind::MisdirectedRequest,
+            format!(
+                "this server answers only Host {} (got {})",
+                self.hosts.join(", "),
+                host.map_or("none".to_owned(), |h| format!("{h:?}"))
+            ),
+        )
     }
 
     /// Waits for a slot (or refuses at once when the queue is full), then answers in a blocking
@@ -382,9 +413,16 @@ impl Server {
     }
 }
 
-/// The endpoint a path names (`/v1/…`).
+/// The endpoint a path names (`/v1/…`). The path is split on `/` first, then each segment is
+/// percent-decoded exactly once (contract M5 amendment 16): `%5F` names the same repository as
+/// `_`, and an encoded `/` stays inside its segment.
 fn route(path: &str) -> Result<Route, ApiError> {
-    let parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    let decoded = path
+        .trim_end_matches('/')
+        .split('/')
+        .map(decode_segment)
+        .collect::<Result<Vec<String>, ApiError>>()?;
+    let parts: Vec<&str> = decoded.iter().map(String::as_str).collect();
     let api = |endpoint, repo: Option<&str>| {
         Ok(Route::Api {
             endpoint,
@@ -402,6 +440,43 @@ fn route(path: &str) -> Result<Route, ApiError> {
         }
         _ => Err(no_such(path)),
     }
+}
+
+/// One path segment, percent-decoded once (RFC 3986 §2.1); a `%` not followed by two hex digits,
+/// or a result that is not UTF-8, is `invalid_param`.
+fn decode_segment(segment: &str) -> Result<String, ApiError> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let byte = match bytes.get(i + 1..i + 3) {
+                Some(&[hi, lo]) => hex(hi).zip(hex(lo)).map(|(hi, lo)| hi << 4 | lo),
+                _ => None,
+            };
+            let Some(byte) = byte else {
+                return Err(ApiError::invalid(
+                    "path",
+                    format_args!("segment {segment:?} has a malformed percent escape"),
+                ));
+            };
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        ApiError::invalid(
+            "path",
+            format_args!("segment {segment:?} does not decode to UTF-8"),
+        )
+    })
+}
+
+fn hex(digit: u8) -> Option<u8> {
+    char::from(digit).to_digit(16).map(|d| d as u8)
 }
 
 fn no_such(path: &str) -> ApiError {

@@ -760,6 +760,15 @@ Same rules as M4b:
   - [x] Determinism and invariant 1 (fixtures and the four M4b repositories) against the phase-0 baseline, classified: with the HEAD binary, 12 rows differ on seven repositories, each S18 or S19 (b, d) as amendments 8–10 predicted; every dump equals phase 13b's (`var/m5/p20/`). Determinism: the e2e and API suites (amendment 15 (b)).
   - [x] Records: contract amendment 15, the measurement section's phase-19 disk figures corrected, "Open items" (21, with targets and the weaker false results still possible); design §8.3/§8.4/§11/§12.5/§13/§14 as decided and measured; README (`rb serve`, `rb diff`, `rb gc`, `rb cache prune`, `--keep`, `--timeout-ms`, `--json` everywhere, `--snapshot`, pages, `--profile`, egress; ports 55432 default and 55433 here), every example run as printed (`m5r_polyglot`, removed); IMPLEMENT.md; CHANGELOG; lessons (disk accounting).
   - [x] Full verification loop and the stub scan (`var/m5/scripts/verify.sh p20`), then `cargo clean`.
-  - [ ] Evaluator pass 1 (full review), fixed test-first as an amendment.
+  - [x] Evaluator pass 1 (full review, `tasks/eval-m5-pass1.md`: FAIL on Z1, Z2; Z3–Z6 minor, Z7 doc), fixed test-first as amendment 16:
+    - [x] Z1: `status` of a never-indexed repository is `not_found` (`rb-api`; `rb-server` unit on the database; API rows `status`, `snapshots`).
+    - [x] Z2 (a): Cypher reads a graph only for a `live` row; `SnapshotInfo` names a graph only for a `live` row. (b): retention drops every non-live graph (`drop_non_live_graphs`); `rb serve` sweeps every repository at startup (`sweep_graphs`). DB test with a stop-after-flip hook; property test with the stopped publish; e2e with the evaluator's lock + `SIGKILL`.
+    - [x] Z3: path segments percent-decoded once (unit; API rows `%5F`, `%5f`, encoded letter, unicode).
+    - [x] Z4: two `Host` → 400; foreign absolute-form authority → 421; authority ≠ `Host` → 400 (unit).
+    - [x] Z5, Z6: `failed` snapshot rows (API); two and three non-live graphs (DB tests). m16, m17 killed.
+    - [x] Z7: hyper's bare refusals recorded as residue (soundness table, open item 23) and pinned by a test.
+    - [x] Open items 22 (adversarial egress review → M6), 23 (Z7); Z2's window closed for answers.
+    - [x] Mutations 16/16 killed; invariant 1: fixture dumps equal phase 20's; `rb cache prune --facts` (19,783 rows, 649,322,998 bytes).
+    - [x] Verification (`var/m5/scripts/verify.sh ev1`): fmt, clippy; 639 unit; store 65/65; server 12/12; e2e 30/30; api 1/1; no `skipping`, no listener, stub scan clean.
   - [ ] Evaluator pass 2 (verification only, per the contract's closing bar).
   - Commit after each verified phase.

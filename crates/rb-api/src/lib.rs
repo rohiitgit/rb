@@ -805,11 +805,14 @@ fn scip_jobs<S: Serializer>(jobs: &[rb_model::Diagnostic], s: S) -> Result<S::Ok
         .serialize(s)
 }
 
-/// The status of `repo`, or of every repository (inside the read transaction).
+/// The status of `repo`, or of every repository (inside the read transaction); a repository
+/// never indexed is `not_found`, as for every other request naming it (amendment 5 (c)).
 fn status(store: &mut Store, repo: Option<&str>) -> Result<Output, ApiError> {
+    let all = store.repo_names()?;
     let names = match repo {
+        Some(r) if !all.iter().any(|n| n == r) => return Err(not_indexed(r)),
         Some(r) => vec![r.to_owned()],
-        None => store.repo_names()?,
+        None => all,
     };
     let mut reports = Vec::new();
     for name in names {

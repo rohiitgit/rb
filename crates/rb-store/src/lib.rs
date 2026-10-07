@@ -261,6 +261,26 @@ pub(crate) mod hooks {
             None => Ok(()),
         }
     }
+
+    thread_local! {
+        static STOP_AFTER_FLIP: RefCell<bool> = const { RefCell::new(false) };
+    }
+
+    /// Runs `body` with the next publish stopped right after its flip commits, before retention:
+    /// what a publisher killed in that window leaves (contract M5 amendment 16, Z2).
+    pub(crate) fn with_stop_after_flip<T>(body: impl FnOnce() -> T) -> T {
+        STOP_AFTER_FLIP.with(|h| *h.borrow_mut() = true);
+        let out = body();
+        STOP_AFTER_FLIP.with(|h| *h.borrow_mut() = false);
+        out
+    }
+
+    pub(crate) fn after_flip() -> anyhow::Result<()> {
+        if STOP_AFTER_FLIP.with(|h| std::mem::take(&mut *h.borrow_mut())) {
+            anyhow::bail!("stopped after the flip (test hook)");
+        }
+        Ok(())
+    }
 }
 
 use anyhow::{Context, bail};
@@ -354,6 +374,7 @@ pub struct SnapshotInfo {
     pub parent_id: Option<i64>,
     pub status: String,
     pub tool_versions: Value,
+    /// The AGE projection; only a `live` snapshot has one.
     pub age_graph: Option<String>,
 }
 
@@ -722,6 +743,34 @@ impl Store {
         Ok(Some(graph))
     }
 
+    /// Drops every AGE graph of the repository's snapshots but the live one's, one per
+    /// transaction (under the repository row lock, then the DDL lock); returns their names.
+    fn drop_non_live_graphs(&mut self, repo_id: i64) -> anyhow::Result<Vec<String>> {
+        let mut dropped = Vec::new();
+        while let Some(graph) = self.drop_one_graph(repo_id, false)? {
+            dropped.push(graph);
+        }
+        Ok(dropped)
+    }
+
+    /// Drops the AGE graphs that non-live snapshots of `repos` still name, which only a publisher
+    /// killed between its flip and its retention leaves (contract M5 amendment 16): `rb serve`
+    /// runs it at startup for every repository. Unknown names are skipped. Returns the graphs
+    /// dropped.
+    pub fn sweep_graphs(&mut self, repos: &[String]) -> anyhow::Result<Vec<String>> {
+        let mut dropped = Vec::new();
+        for repo in repos {
+            let id = self
+                .client
+                .query_opt("SELECT id FROM rb.repo WHERE name = $1", &[repo])?
+                .map(|r| r.get::<_, i64>(0));
+            if let Some(id) = id {
+                dropped.extend(self.drop_non_live_graphs(id)?);
+            }
+        }
+        Ok(dropped)
+    }
+
     pub fn live_snapshot(&mut self, repo: &str) -> anyhow::Result<Option<SnapshotInfo>> {
         let row = self.client.query_opt(
             &format!("{SNAPSHOT_SELECT} WHERE r.name = $1 AND s.id = r.live_snapshot_id"),
@@ -765,7 +814,8 @@ impl Store {
 
     /// Publishes `graph` as the repo's new live snapshot: the snapshot row, its rows, the AGE
     /// projection and the live flip in one transaction (contract M5 D10, S3), then retention
-    /// (the previous live snapshot's graph is dropped in a transaction of its own). A failed
+    /// (every graph a non-live snapshot names is dropped, each in a transaction of its own: the
+    /// previous live snapshot's, and any a publisher killed before its retention left). A failed
     /// publish leaves nothing of the attempt but a separate `failed` row written after the
     /// rollback; a publisher that dies before its commit leaves no row at all.
     pub fn publish_snapshot(
@@ -803,6 +853,8 @@ impl Store {
                 return Err(err.context(format!("publishing a snapshot of {repo} ({what})")));
             }
         };
+        #[cfg(test)]
+        hooks::after_flip()?;
         let retention = self
             .retain(repo_id)
             .with_context(|| format!("snapshot {snapshot_id} is live; retention failed"))?;
@@ -1011,10 +1063,10 @@ impl Store {
     /// its status (one marked otherwise is reported); a row whose graph could not be dropped is
     /// left for the next run; `building` rows are left to `rb gc`.
     fn retain(&mut self, repo_id: i64) -> anyhow::Result<RetentionReport> {
-        let mut report = RetentionReport::default();
-        while let Some(graph) = self.drop_one_graph(repo_id, false)? {
-            report.graphs_dropped.push(graph);
-        }
+        let mut report = RetentionReport {
+            graphs_dropped: self.drop_non_live_graphs(repo_id)?,
+            ..RetentionReport::default()
+        };
         let keep = self.keep_retired;
         let mut tx = self.begin()?;
         let pointer: Option<i64> = tx
@@ -1413,9 +1465,11 @@ impl Store {
             .isolation_level(postgres::IsolationLevel::RepeatableRead)
             .read_only(true)
             .start()?;
+        // Only the live snapshot has a projection (D10, D17): a graph a non-live row still names
+        // (left by a publisher killed before its retention) is never read.
         let row = tx
             .query_opt(
-                "SELECT age_graph FROM rb.snapshot WHERE id = $1",
+                "SELECT CASE WHEN status = 'live' THEN age_graph END FROM rb.snapshot WHERE id = $1",
                 &[&snapshot_id],
             )?
             .with_context(|| format!("snapshot {snapshot_id} does not exist"))?;
@@ -1497,8 +1551,10 @@ impl Store {
     }
 }
 
-const SNAPSHOT_SELECT: &str =
-    "SELECT s.id, r.name, s.commit_sha, s.status, s.tool_versions, s.age_graph, s.parent_id
+/// A snapshot row; `age_graph` only for a `live` one (contract M5 amendment 16: a graph a
+/// non-live row still names is a leftover for the sweeps, never part of an answer).
+const SNAPSHOT_SELECT: &str = "SELECT s.id, r.name, s.commit_sha, s.status, s.tool_versions,
+                                      CASE WHEN s.status = 'live' THEN s.age_graph END, s.parent_id
                                FROM rb.snapshot s JOIN rb.repo r ON r.id = s.repo_id";
 
 fn snapshot_from_row(r: &postgres::Row) -> SnapshotInfo {

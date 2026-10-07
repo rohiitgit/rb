@@ -410,3 +410,193 @@ fn pooled_connections_are_read_only_sessions() {
     assert!(pooled.session_read_only().unwrap());
     assert!(pooled.ensure_repo("t_server_never", None).is_err());
 }
+
+/// Contract M5 amendment 16 (Z1): `status` of a repository never indexed is `not_found` through
+/// the shared request layer, as `snapshots` and the questions are (amendment 5 (c)). Needs
+/// `RB_TEST_DATABASE_URL`.
+#[test]
+fn status_of_a_repository_never_indexed_is_not_found() {
+    let Ok(url) = std::env::var("RB_TEST_DATABASE_URL") else {
+        eprintln!("skipping: set RB_TEST_DATABASE_URL to run database tests");
+        return;
+    };
+    let config = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        database_url: url,
+        workers: 1,
+        queue: 0,
+        deadline: Duration::from_secs(10),
+        settings: Settings::default(),
+        hold: Duration::ZERO,
+    };
+    let server = Server::new(config, "127.0.0.1:1".parse().unwrap());
+    let name = format!("t_server_never_{}", std::process::id());
+    for endpoint in [Endpoint::Status, Endpoint::Snapshots] {
+        let request =
+            rb_api::parse(endpoint, Some(&name), &Params::new(), &Settings::default()).unwrap();
+        let err = server.work(&request).unwrap_err();
+        assert_eq!(
+            (err.kind, err.message.as_str()),
+            (
+                ErrorKind::NotFound,
+                format!("repository {name:?} is not indexed").as_str()
+            ),
+            "{endpoint:?}"
+        );
+    }
+}
+
+/// Contract M5 amendment 16 (Z3): path segments are percent-decoded exactly once, after the path
+/// is split, so `%5F` names the same repository as `_`, `%2F` stays inside its segment, `%25`
+/// decodes to a literal `%` (never twice), and a malformed escape is `invalid_param`.
+#[test]
+fn path_segments_are_percent_decoded_once() {
+    let repo = |path: &str| match route(path) {
+        Ok(Route::Api { endpoint, repo }) => (endpoint, repo),
+        Ok(Route::Health) => panic!("{path}: health"),
+        Err(e) => panic!("{path}: {}", e.message),
+    };
+    for (path, endpoint, name) in [
+        ("/v1/repos/fx5_a/status", Endpoint::Status, "fx5_a"),
+        ("/v1/repos/fx5%5Fa/status", Endpoint::Status, "fx5_a"),
+        ("/v1/repos/fx5%5fa/callers", Endpoint::Callers, "fx5_a"),
+        ("/v1/repos/%66x5_a/%63allers", Endpoint::Callers, "fx5_a"),
+        ("/v1/repos/a%2Fb/status", Endpoint::Status, "a/b"),
+        ("/v1/repos/%C3%A9t%C3%A9/status", Endpoint::Status, "été"),
+        ("/v1/repos/fx5%255Fa/status", Endpoint::Status, "fx5%5Fa"),
+    ] {
+        assert_eq!(repo(path), (endpoint, Some(name.to_owned())), "{path}");
+    }
+    assert!(matches!(route("/v1/%68ealth"), Ok(Route::Health)));
+    for bad in [
+        "/v1/repos/a%zz/status",
+        "/v1/repos/a%2/status",
+        "/v1/repos/a%/status",
+        "/v1/repos/%FF/status",
+    ] {
+        let err = route(bad)
+            .err()
+            .unwrap_or_else(|| panic!("{bad}: accepted"));
+        assert_eq!(
+            (err.kind, err.param.as_deref()),
+            (ErrorKind::InvalidParam, Some("path")),
+            "{bad}"
+        );
+    }
+}
+
+/// Contract M5 amendment 16 (Z4, RFC 9112 §3.2): a request with more than one `Host` header is
+/// `400`, whatever their order; an absolute-form request's authority is its effective host, so a
+/// foreign one is `421` and an allowed one must equal the `Host` header (`400` otherwise).
+#[test]
+fn host_headers_and_absolute_form_are_strict() {
+    let r = start(|_| {});
+    let own = r.addr.to_string();
+    let port = r.addr.port();
+    let send = |target: &str, hosts: &[String]| {
+        let hosts: String = hosts.iter().map(|h| format!("Host: {h}\r\n")).collect();
+        raw(
+            r.addr,
+            &format!("GET {target} HTTP/1.1\r\n{hosts}Connection: close\r\n\r\n"),
+        )
+    };
+    let evil = "evil.example".to_owned();
+    for hosts in [
+        vec![own.clone(), evil.clone()],
+        vec![evil.clone(), own.clone()],
+        vec![own.clone(), own.clone()],
+    ] {
+        let reply = send("/v1/health", &hosts);
+        assert_eq!(
+            (reply.status, reply.kind().as_str()),
+            (400, "invalid_param"),
+            "{hosts:?}"
+        );
+    }
+    for target in [
+        "http://evil.example/v1/health".to_owned(),
+        format!("http://evil.example:{port}/v1/health"),
+        format!("http://127.0.0.1:{}/v1/health", port.wrapping_add(1)),
+        format!("http://user@127.0.0.1:{port}/v1/health"),
+    ] {
+        let reply = send(&target, std::slice::from_ref(&own));
+        assert_eq!(
+            (reply.status, reply.kind().as_str()),
+            (421, "misdirected_request"),
+            "{target}"
+        );
+    }
+    let reply = send(
+        &format!("http://localhost:{port}/v1/health"),
+        std::slice::from_ref(&own),
+    );
+    assert_eq!(
+        (reply.status, reply.kind().as_str()),
+        (400, "invalid_param"),
+        "an allowed authority that is not the Host"
+    );
+    for (target, host) in [
+        (format!("http://{own}/v1/health"), own.clone()),
+        (
+            format!("http://LOCALHOST:{port}/v1/health"),
+            format!("localhost:{port}"),
+        ),
+    ] {
+        let reply = send(&target, &[host]);
+        assert_eq!(reply.status, 200, "{target}");
+    }
+}
+
+/// Contract M5 amendment 16 (Z7), recorded residue: hyper refuses a request it cannot parse
+/// before the server sees it, with a bare status and no body (no JSON error, no
+/// `Server-Timing`): a request target over 65,534 bytes is `414`, a request with more than 100
+/// headers is `431`, and a malformed request line or header is `400`. (A head that outgrows
+/// hyper's read buffer is `431` too: measured with a 1 MiB header, while a 420,078-byte request
+/// was still read whole and answered. It is not a row here, since the server closes before
+/// reading the rest and the client may then see a reset instead of the reply.)
+#[test]
+fn transport_refusals_are_hyper_bare_statuses() {
+    let r = start(|_| {});
+    let bare = |request: Vec<u8>| -> (String, String) {
+        let mut s = TcpStream::connect(r.addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        // hyper may answer and close before reading the whole request.
+        let _ = s.write_all(&request);
+        let mut bytes = Vec::new();
+        let _ = s.read_to_end(&mut bytes);
+        let text = String::from_utf8(bytes).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        (head.to_owned(), body.to_owned())
+    };
+    let host = format!("Host: {}\r\nConnection: close\r\n", r.addr);
+    let long_target = format!("/v1/repos/x/callers?target={}", "a".repeat(65_535));
+    let many_headers: String = (0..101).map(|i| format!("X-{i}: v\r\n")).collect();
+    for (request, status) in [
+        (format!("GET {long_target} HTTP/1.1\r\n{host}\r\n"), 414),
+        (
+            format!("GET /v1/health HTTP/1.1\r\n{host}{many_headers}\r\n"),
+            431,
+        ),
+        (
+            format!("GET /v1/health HTTP/1.1\r\n{host}Bad Header\r\n\r\n"),
+            400,
+        ),
+        ("GET /v1/health HTTP/9.9\r\n\r\n".to_owned(), 400),
+    ] {
+        let len = request.len();
+        let (head, body) = bare(request.into_bytes());
+        let got: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
+        assert_eq!((got, body.as_str()), (status, ""), "{len} bytes: {head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("server-timing"),
+            "{head}"
+        );
+    }
+    // Just under the target limit, the request reaches the server and gets its JSON answer.
+    let reply = get(
+        &r,
+        &format!("/v1/repos/x/callers?target={}", "a".repeat(65_000)),
+    );
+    assert_eq!(reply.status, 500, "{reply:?}");
+    assert_eq!(reply.kind(), "internal");
+}

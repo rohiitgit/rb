@@ -359,15 +359,16 @@ fn repo_state(c: &mut postgres::Client, repo: &str) -> RepoState {
             .collect()
     };
     let pattern = format!("^rb_{repo}_[0-9]+$");
-    let graphs = c
+    let mut graphs: Vec<String> = c
         .query(
-            "SELECT name::text FROM ag_catalog.ag_graph WHERE name::text ~ $1 ORDER BY 1",
+            "SELECT name::text FROM ag_catalog.ag_graph WHERE name::text ~ $1",
             &[&pattern],
         )
         .unwrap()
         .iter()
         .map(|r| r.get(0))
         .collect();
+    graphs.sort();
     RepoState {
         live_pointer: pointer,
         live: ids("live"),
@@ -397,11 +398,13 @@ impl Rng {
 }
 
 /// Contract M5 S3 (property): random sequences of publishes, failed publishes (an error injected
-/// after the COPY) and `--keep` changes over two repositories. After every step, for each
+/// after the COPY), publishes stopped after their flip (a publisher killed before retention,
+/// amendment 16) and `--keep` changes over two repositories. After every step, for each
 /// repository: the pointer's snapshot exists and is `live`, the retired rows are exactly the
-/// `N` newest (by the keep in force at the last publish), `failed` rows exist only since the last
-/// publish, no `building` row is visible, and `ag_catalog.ag_graph` holds exactly one
-/// `rb_<repo>_*` graph, the live snapshot's (no retired row names a graph).
+/// `N` newest (by the keep in force at the last completed publish) plus those retired since,
+/// `failed` rows exist only since the last completed publish, no `building` row is visible, and
+/// `ag_catalog.ag_graph` holds the live snapshot's graph plus exactly the leftovers of the
+/// stopped publishes since the last completed one: a completed publish leaves one graph.
 #[test]
 fn retention_holds_over_random_sequences() {
     let Some(db) = db() else { return };
@@ -415,17 +418,19 @@ fn retention_holds_over_random_sequences() {
         live: Option<i64>,
         retired: Vec<i64>,
         failed: usize,
+        /// Retired snapshots whose graph a stopped publish left.
+        leftover: Vec<i64>,
     }
     let mut models = [Model::default(), Model::default()];
     let mut store = Store::connect(&db.url).unwrap();
     let mut probe = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
     let mut rng = Rng(0x5eed_2026_1007);
     let mut keep = crate::KEEP_RETIRED;
-    let mut ops = [0usize; 3];
-    for step in 0..48u32 {
+    let mut ops = [0usize; 4];
+    for step in 0..64u32 {
         let r = rng.below(2) as usize;
         let repo = &repos[r];
-        let op = rng.below(4);
+        let op = rng.below(5);
         let graph = sample_graph(2 + (step % 3) as usize, step);
         match op {
             0 | 1 => {
@@ -445,6 +450,7 @@ fn retention_holds_over_random_sequences() {
                 let n = m.retired.len().saturating_sub(keep as usize);
                 m.retired.drain(..n);
                 m.failed = 0;
+                m.leftover.clear();
                 ops[0] += 1;
             }
             2 => {
@@ -466,6 +472,28 @@ fn retention_holds_over_random_sequences() {
                 models[r].failed += 1;
                 ops[1] += 1;
             }
+            3 => {
+                let err = crate::hooks::with_stop_after_flip(|| {
+                    store.publish_snapshot(
+                        repo,
+                        &format!("{step:040}"),
+                        &json!({"step": step}),
+                        &graph,
+                        &[],
+                        &load_dir(),
+                    )
+                })
+                .unwrap_err();
+                assert!(
+                    format!("{err:#}").contains("stopped after the flip"),
+                    "{err:#}"
+                );
+                let m = &mut models[r];
+                m.retired.extend(m.live);
+                m.leftover.extend(m.live);
+                m.live = Some(store.live_snapshot(repo).unwrap().unwrap().id);
+                ops[3] += 1;
+            }
             _ => {
                 keep = rng.below(4) as i64;
                 store.set_keep_retired(keep).unwrap();
@@ -480,12 +508,17 @@ fn retention_holds_over_random_sequences() {
                 retired: m.retired.clone(),
                 failed: m.failed,
                 building: 0,
-                stray_age_graphs: vec![],
-                graphs: m
-                    .live
-                    .map(|id| crate::graph_name(repo, id))
-                    .into_iter()
-                    .collect(),
+                stray_age_graphs: m.leftover.clone(),
+                graphs: {
+                    let mut g: Vec<String> = m
+                        .leftover
+                        .iter()
+                        .chain(&m.live)
+                        .map(|id| crate::graph_name(repo, *id))
+                        .collect();
+                    g.sort();
+                    g
+                },
             };
             assert_eq!(
                 state, expected,
@@ -952,6 +985,135 @@ fn cypher_on_a_retired_snapshot_is_refused() {
     assert_eq!(
         (out.rows, out.truncated),
         (vec![vec!["6".to_owned()]], vec![])
+    );
+}
+
+/// Contract M5 amendment 16 (evaluator pass 1, Z2, Z6): a publisher killed after its flip commits
+/// and before retention leaves the previous live snapshot `retired` but still naming its AGE
+/// graph. Reads ignore that graph (a retired snapshot has no projection, D17, whatever graphs
+/// exist; the snapshot rows report none), the startup sweep of `rb serve` removes every leftover
+/// of the repositories it is given, and the next publish's retention removes every non-live
+/// graph of the repository, not only the one it retired (three here).
+#[test]
+fn a_publish_stopped_after_its_flip_leaves_a_graph_that_reads_ignore_and_sweeps_remove() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("flipstop");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let mut probe = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    let mut step = 0u32;
+    let mut publish = |store: &mut Store, stop: bool| {
+        step += 1;
+        let run = |store: &mut Store| {
+            store.publish_snapshot(
+                &repo,
+                &format!("{step:040}"),
+                &json!({"step": step}),
+                &sample_graph(2, step),
+                &[],
+                &load_dir(),
+            )
+        };
+        if stop {
+            let err = crate::hooks::with_stop_after_flip(|| run(store)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("stopped after the flip"),
+                "{err:#}"
+            );
+            store.live_snapshot(&repo).unwrap().unwrap().id
+        } else {
+            run(store).unwrap().snapshot.id
+        }
+    };
+    let graphs = |probe: &mut postgres::Client, ids: &[i64]| -> (Vec<String>, Vec<String>) {
+        let mut want: Vec<String> = ids.iter().map(|id| crate::graph_name(&repo, *id)).collect();
+        want.sort();
+        (repo_state(probe, &repo).graphs, want)
+    };
+
+    let a = publish(&mut store, false);
+    let b = publish(&mut store, true);
+    let state = repo_state(&mut probe, &repo);
+    assert_eq!(
+        (
+            state.live_pointer,
+            state.retired.clone(),
+            state.stray_age_graphs.clone()
+        ),
+        (Some(b), vec![a], vec![a]),
+        "the evaluator's state: {state:?}"
+    );
+    let (got, want) = graphs(&mut probe, &[a, b]);
+    assert_eq!(got, want);
+
+    // Reads: Cypher on the retired snapshot is refused although its graph exists; the snapshot
+    // rows name no graph for it; the live one answers.
+    let limits = crate::CypherLimits::default();
+    let err = store
+        .cypher(a, "MATCH (n) RETURN count(n)", &["n".into()], limits)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<crate::CypherError>(),
+            Some(crate::CypherError::NoProjection { snapshot }) if *snapshot == a
+        ),
+        "{err:#}"
+    );
+    assert_eq!(store.snapshot(a).unwrap().age_graph, None);
+    let listed: Vec<(i64, Option<String>)> = store
+        .snapshots(&repo)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.id, s.age_graph))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![(b, Some(crate::graph_name(&repo, b))), (a, None)]
+    );
+    assert!(
+        store
+            .cypher(b, "MATCH (n) RETURN count(n)", &["n".into()], limits)
+            .is_ok()
+    );
+
+    // A second stop leaves two leftovers; the startup sweep removes both, one per transaction,
+    // and keeps the live graph.
+    let c = publish(&mut store, true);
+    let (got, want) = graphs(&mut probe, &[a, b, c]);
+    assert_eq!(got, want);
+    let mut swept = store.sweep_graphs(std::slice::from_ref(&repo)).unwrap();
+    swept.sort();
+    let (_, mut leftovers) = graphs(&mut probe, &[a, b]);
+    leftovers.sort();
+    assert_eq!(swept, leftovers);
+    let (got, want) = graphs(&mut probe, &[c]);
+    assert_eq!(got, want);
+    assert!(repo_state(&mut probe, &repo).stray_age_graphs.is_empty());
+    assert!(
+        store
+            .sweep_graphs(std::slice::from_ref(&repo))
+            .unwrap()
+            .is_empty(),
+        "nothing left to sweep"
+    );
+
+    // Two more stops, then a publish that runs its retention: it drops all three non-live
+    // graphs (two leftovers and the previous live one).
+    let d = publish(&mut store, true);
+    let e = publish(&mut store, true);
+    let (got, want) = graphs(&mut probe, &[c, d, e]);
+    assert_eq!(got, want);
+    let f = publish(&mut store, false);
+    let (got, want) = graphs(&mut probe, &[f]);
+    assert_eq!(got, want);
+    let state = repo_state(&mut probe, &repo);
+    assert_eq!(
+        (state.live_pointer, state.stray_age_graphs.len()),
+        (Some(f), 0),
+        "{state:?}"
     );
 }
 
