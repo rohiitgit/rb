@@ -250,7 +250,9 @@ impl Images {
     }
 }
 
-/// Runs `job` in `image` (from [`Images::for_job`]) over `files` (`(root-relative path, bytes)`)
+/// Runs `job` in `image` (from [`Images::for_job`]) over `files` (`(path, bytes)` as the
+/// container sees them under its mount: root-relative for a scip-java job, repository paths for
+/// a scip-typescript job, whose container starts in its root; contract M6a D7)
 /// with `cache_dir` holding the repository's package-manager caches (contract M5 S22: the
 /// caller keys it by repository). `work_dir` names the job (the caller names it after the
 /// job's input hash); this run's export lives next to it in a directory of its own,
@@ -305,6 +307,8 @@ pub fn run_job(
             fetch.name = Some(format!("{name}-fetch"));
         }
         index.name = Some(format!("{name}-index"));
+        // The root's directory exists in a real export; created so the phases can start there.
+        std::fs::create_dir_all(index.host_cwd())?;
         // The fetch phase behind this run's own proxy (contract M5 S21).
         let proxy = ProxySpec {
             name: format!("rb-egress-{instance}"),
@@ -362,7 +366,7 @@ pub fn run_job(
             Err(e) => return Ok(environment(format!("{e:#}"), started)),
         };
         let index_bytes = if outcome.ok() {
-            std::fs::read(work_dir.join("index.scip")).ok()
+            std::fs::read(index.host_cwd().join("index.scip")).ok()
         } else {
             None
         };
@@ -481,6 +485,10 @@ fn typescript_runs(
         platform: Some("linux/amd64".into()),
         workdir,
         mount_at: "/src".into(),
+        // The export is repository-shaped and the container starts in the job's root
+        // (contract M6a D7), so `file:` links outside the root but inside the repository
+        // resolve; scip-typescript's document paths stay relative to the root.
+        cwd: job.root.clone(),
         caches: vec![(npm_cache, "/root/.npm".into())],
         readonly: Vec::new(),
         // npm's update notifier checks the registry and prints a notice unless its cache says it
@@ -590,6 +598,7 @@ fn java_runs(
         platform: None,
         workdir,
         mount_at: "/sources".into(),
+        cwd: String::new(),
         caches: vec![(m2, "/root/.m2".into())],
         readonly: Vec::new(),
         env: vec![(
@@ -744,7 +753,7 @@ mod tests {
                 self.fail_fetch
             };
             if is_index && !fail {
-                std::fs::write(run.workdir.join("index.scip"), b"fake-index")?;
+                std::fs::write(run.host_cwd().join("index.scip"), b"fake-index")?;
             }
             Ok(Outcome {
                 exit_code: Some(if fail { 1 } else { 0 }),
@@ -1512,6 +1521,65 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// Contract M6a D7: a scip-typescript job's export is repository-shaped (a link target
+    /// outside the root keeps its repository path) and both phases start in the job's root,
+    /// where scip-typescript writes `index.scip`; a scip-java job's export is its root.
+    #[test]
+    fn typescript_exports_are_repository_shaped_and_start_in_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("export");
+        export(
+            &[
+                ("apps/web/package.json".into(), b"{}".to_vec()),
+                ("libs/core/package.json".into(), b"{}".to_vec()),
+            ],
+            &dir,
+        )
+        .unwrap();
+        assert!(dir.join("apps/web/package.json").is_file());
+        assert!(dir.join("libs/core/package.json").is_file());
+        let fake = Fake::new(false, false);
+        let run = run_job(
+            &ts_job(NodeLock::PackageLock),
+            SCIP_TYPESCRIPT_IMAGE,
+            &[
+                ("apps/web/package.json".into(), b"{}".to_vec()),
+                ("apps/web/src/a.ts".into(), b"export const a = 1;".to_vec()),
+                ("libs/core/package.json".into(), b"{}".to_vec()),
+            ],
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(run.status, RunStatus::Ok, "the index is read in the root");
+        for r in fake.runs.borrow().iter() {
+            assert_eq!((r.mount_at.as_str(), r.cwd.as_str()), ("/src", "apps/web"));
+            assert!(
+                crate::runner::docker_args(r)
+                    .join(" ")
+                    .contains(" -w /src/apps/web "),
+                "{:?}",
+                crate::runner::docker_args(r)
+            );
+        }
+        let fake = Fake::new(false, false);
+        run_job(
+            &java_job(Fetch::Maven),
+            JAVA_ID,
+            &[("pom.xml".into(), b"<project/>".to_vec())],
+            &tmp.path().join("j"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert!(fake.runs.borrow().iter().all(|r| r.cwd.is_empty()));
     }
 
     /// Contract M3b amendment 49: an `environment` reason is the first line of the docker

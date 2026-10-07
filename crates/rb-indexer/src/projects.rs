@@ -2,7 +2,7 @@
 //! cache, and only on a miss exported and indexed in a container. The indexer never talks to the
 //! database; the caller plugs in the cache, as for syntax facts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use rb_model::FileEntry;
@@ -207,10 +207,19 @@ pub(crate) fn run_projects(
             .filter(|(path, _)| in_root(path, &job.root))
             .map(|(p, b)| (*p, *b))
             .collect();
+        // What the job exports and its key covers (contract M6a D7); a link target outside
+        // the repository leaves the job unsupported before anything is written.
+        let exported = match job_files(&job, &blobs, &read_path) {
+            Ok(files) => files,
+            Err(reason) => {
+                project.status = RunStatus::Unsupported(reason);
+                out.push(project);
+                continue;
+            }
+        };
         let input_hash = rb_scip::project_input_hash(
             rb_scip::recipe(job.indexer),
-            &job.root,
-            under_root.iter().copied(),
+            exported.iter().copied(),
             &options.egress,
         );
         // A row whose status no current run would write (a `timeout` from an older binary) is
@@ -227,9 +236,17 @@ pub(crate) fn run_projects(
                 hit
             }
             None => {
-                let exported = under_root
+                // scip-java's export is its root (root-relative paths); scip-typescript's is
+                // repository-shaped (D7).
+                let exported = exported
                     .iter()
-                    .map(|(path, blob)| Ok((relative(path, &job.root), read_blob(blob)?)))
+                    .map(|(path, blob)| {
+                        let path = match job.indexer {
+                            rb_scip::Indexer::ScipJava => relative(path, &job.root),
+                            rb_scip::Indexer::ScipTypescript => (*path).to_owned(),
+                        };
+                        Ok((path, read_blob(blob)?))
+                    })
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 let run = rb_scip::run_job(
                     &job,
@@ -280,6 +297,110 @@ pub(crate) fn run_projects(
         out.push(project);
     }
     Ok((out, plan.ungrouped))
+}
+
+/// The reason a job whose lockfile links outside the repository is `unsupported`; it names no
+/// path of the host or the repository (contract M6a D7).
+const LINK_OUTSIDE: &str = "link target outside the repository";
+
+/// The files of `job`'s root, and for a scip-typescript job whose root holds a
+/// `package-lock.json` the tracked files (outside any `node_modules`) of each directory the
+/// lockfile links to inside the repository and outside the root ([`link_targets`]). A target
+/// outside the repository is `Err`. Each link target's files are one range of the sorted path
+/// map, so the selection is linear in what it exports.
+pub(crate) fn job_files<'b>(
+    job: &rb_scip::Job,
+    blobs: &BTreeMap<&'b str, &'b str>,
+    read_path: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<Vec<(&'b str, &'b str)>, String> {
+    // The files under `dir`: one range of the sorted paths, each path examined counted.
+    let under = |dir: &str| -> Vec<(&'b str, &'b str)> {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        blobs
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .inspect(|_| rb_frameworks::work::tick(1))
+            .take_while(|(p, _)| p.starts_with(&prefix))
+            .map(|(p, b)| (*p, *b))
+            .collect()
+    };
+    let mut files = under(&job.root);
+    let lockfile = matches!(
+        job.fetch,
+        rb_scip::jobs::Fetch::Npm {
+            lockfile: rb_scip::jobs::NodeLock::PackageLock
+        }
+    )
+    .then(|| read_path(&join_root(&job.root, "package-lock.json")))
+    .flatten();
+    let Some(lockfile) = lockfile else {
+        return Ok(files);
+    };
+    for target in link_targets(&job.root, &lockfile)? {
+        files.extend(
+            under(&target)
+                .into_iter()
+                .filter(|(p, _)| !p.split('/').any(|segment| segment == "node_modules")),
+        );
+    }
+    files.sort_unstable();
+    files.dedup();
+    Ok(files)
+}
+
+/// The directories a `package-lock.json` (v2 or v3) at `root` links to inside the repository
+/// and outside `root`, sorted and distinct (contract M6a D7): every `packages` entry with
+/// `"link": true` whose `resolved` is a relative path, and every `packages` key starting with
+/// `../`, resolved lexically against `root` (`.` and `..` folded, nothing on disk followed). A
+/// target that leaves the repository is `Err` (its path is not reported). A v1 lockfile (no
+/// `packages`) or one that is not JSON names no target. The lockfile is read once, so links
+/// that name each other cannot loop.
+pub(crate) fn link_targets(root: &str, lockfile: &[u8]) -> Result<Vec<String>, String> {
+    let Ok(lock) = serde_json::from_slice::<serde_json::Value>(lockfile) else {
+        return Ok(Vec::new());
+    };
+    let Some(packages) = lock.get("packages").and_then(serde_json::Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = BTreeSet::new();
+    for (key, entry) in packages {
+        rb_frameworks::work::tick(1);
+        let resolved = entry
+            .get("link")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            .then(|| entry.get("resolved").and_then(serde_json::Value::as_str))
+            .flatten()
+            .filter(|r| !r.starts_with('/') && !r.contains(':'));
+        let candidates = [key.starts_with("../").then_some(key.as_str()), resolved];
+        for candidate in candidates.into_iter().flatten() {
+            let mut at: Vec<&str> = if root.is_empty() {
+                Vec::new()
+            } else {
+                root.split('/').collect()
+            };
+            for segment in candidate.split('/') {
+                match segment {
+                    "" | "." => {}
+                    ".." => {
+                        at.pop().ok_or_else(|| LINK_OUTSIDE.to_owned())?;
+                    }
+                    name => at.push(name),
+                }
+            }
+            let dir = at.join("/");
+            if !(dir == root || in_root(&dir, root)) {
+                targets.insert(dir);
+            }
+        }
+    }
+    Ok(targets.into_iter().collect())
 }
 
 /// Contract M3b amendment 64 (`source_encoding`): when a Maven build declares a source encoding
@@ -379,7 +500,7 @@ mod tests {
                 return Ok(outcome.clone());
             }
             if run.network == rb_scip::Network::None && !self.fail {
-                std::fs::write(run.workdir.join("index.scip"), &self.index)?;
+                std::fs::write(run.host_cwd().join("index.scip"), &self.index)?;
             }
             Ok(Outcome {
                 exit_code: Some(i32::from(self.fail)),
@@ -874,5 +995,204 @@ mod tests {
         assert_eq!(owner("lib/a.ts"), Some(""));
         assert_eq!(owner_root("lib/a.ts", ["svc"].into_iter()), None);
         assert!(in_root("svc/a", "svc") && !in_root("svc2/a", "svc") && !in_root("svc", "svc"));
+    }
+
+    // Contract M6a D7 (S10): what a scip-typescript job exports, and its link targets.
+
+    /// A `package-lock.json` (v3) at `tools/e2e` linking `@ws/core` to `../../packages/core`
+    /// (as npm writes a `file:` dependency) and `@ws/lib` to `lib`, inside the root.
+    const E2E_LOCK: &str = r#"{"name": "e2e", "lockfileVersion": 3, "packages": {
+        "": {"dependencies": {"@ws/core": "file:../../packages/core"}},
+        "../../packages/core": {"name": "@ws/core", "version": "1.0.0"},
+        "node_modules/@ws/core": {"resolved": "../../packages/core", "link": true},
+        "node_modules/@ws/lib": {"resolved": "lib", "link": true},
+        "node_modules/left-pad": {"version": "1.3.0", "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"}
+    }}"#;
+
+    fn ts_job(root: &str, lockfile: rb_scip::jobs::NodeLock) -> rb_scip::Job {
+        rb_scip::Job {
+            root: root.into(),
+            indexer: rb_scip::Indexer::ScipTypescript,
+            fetch: rb_scip::jobs::Fetch::Npm { lockfile },
+            projects: vec![".".into()],
+            unpinned: false,
+        }
+    }
+
+    /// A link target inside the repository and outside the root is exported with its tracked
+    /// files (its `package.json` included), never a `node_modules` path; a link inside the
+    /// root, a registry package and the sibling `packages/other` add nothing.
+    #[test]
+    fn a_link_target_inside_the_repository_is_exported() {
+        let paths = [
+            "tools/e2e/package.json",
+            "tools/e2e/package-lock.json",
+            "tools/e2e/src/check.ts",
+            "tools/e2e/lib/index.ts",
+            "packages/core/package.json",
+            "packages/core/src/index.ts",
+            "packages/core/node_modules/dep/index.js",
+            "packages/other/package.json",
+            "README.md",
+        ];
+        let blobs: BTreeMap<&str, &str> = paths.iter().map(|p| (*p, "b")).collect();
+        let read = |path: &str| (path == "tools/e2e/package-lock.json").then(|| E2E_LOCK.into());
+        let job = ts_job("tools/e2e", rb_scip::jobs::NodeLock::PackageLock);
+        let files: Vec<&str> = job_files(&job, &blobs, &read)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            files,
+            [
+                "packages/core/package.json",
+                "packages/core/src/index.ts",
+                "tools/e2e/lib/index.ts",
+                "tools/e2e/package-lock.json",
+                "tools/e2e/package.json",
+                "tools/e2e/src/check.ts",
+            ]
+        );
+        // Without `package-lock.json` (another lockfile, or none) no link is read.
+        let yarn = ts_job("tools/e2e", rb_scip::jobs::NodeLock::Yarn);
+        assert_eq!(job_files(&yarn, &blobs, &read).unwrap().len(), 4);
+        // A v1 lockfile has no `packages`: no link is read either.
+        let v1 = |path: &str| {
+            (path == "tools/e2e/package-lock.json")
+                .then(|| br#"{"lockfileVersion": 1, "dependencies": {"@ws/core": {"version": "file:../../packages/core"}}}"#.to_vec())
+        };
+        assert_eq!(job_files(&job, &blobs, &v1).unwrap().len(), 4);
+    }
+
+    /// A link that leaves the repository makes the job `unsupported` with a reason that names
+    /// no path; nothing is exported, run or cached. Links naming each other are read once.
+    #[test]
+    fn a_link_target_outside_the_repository_is_unsupported() {
+        assert_eq!(
+            link_targets(
+                "web",
+                br#"{"packages": {"node_modules/x": {"resolved": "../../../x", "link": true}}}"#
+            ),
+            Err("link target outside the repository".to_owned())
+        );
+        assert_eq!(
+            link_targets("web", br#"{"packages": {"../../x": {"version": "1.0.0"}}}"#),
+            Err("link target outside the repository".to_owned())
+        );
+        assert_eq!(
+            link_targets(
+                "a/b",
+                br#"{"packages": {
+                    "node_modules/x": {"resolved": "../../c/x", "link": true},
+                    "../../c/x": {"name": "x"},
+                    "../../c/x/node_modules/y": {"resolved": "../../a/b", "link": true},
+                    "node_modules/z": {"resolved": "./../../c/./x/", "link": true}
+                }}"#
+            ),
+            Ok(vec!["c/x".to_owned(), "c/x/node_modules/y".to_owned()])
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            entry("web/package.json", "1"),
+            entry("web/package-lock.json", "2"),
+            entry("web/tsconfig.json", "3"),
+        ];
+        let read = |blob: &str| {
+            Ok(if blob == "2".repeat(40) {
+                br#"{"packages": {"node_modules/x": {"resolved": "../../x", "link": true}}}"#
+                    .to_vec()
+            } else {
+                b"{}".to_vec()
+            })
+        };
+        let fake = Fake::new(index_bytes(), false, true);
+        let mut cache = MemCache::default();
+        let opts = options(tmp.path(), &fake);
+        let (ran, _) = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
+        assert_eq!(
+            ran[0].status,
+            RunStatus::Unsupported("link target outside the repository".into())
+        );
+        assert_eq!((*fake.runs.borrow(), cache.puts), (0, 0));
+        assert!(
+            !tmp.path().join("work").exists()
+                || !tmp.path().join("work").read_dir().unwrap().any(|_| true)
+        );
+    }
+
+    /// The cache key covers every exported file: one byte of a link target's file changes it
+    /// (the job runs again), a file outside the root and every link target does not.
+    #[test]
+    fn a_link_targets_files_are_part_of_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = |core: &str, other: &str| {
+            vec![
+                entry("tools/e2e/package.json", "1"),
+                entry("tools/e2e/package-lock.json", "2"),
+                entry("tools/e2e/tsconfig.json", "3"),
+                entry("packages/core/src/index.ts", core),
+                entry("packages/other/a.ts", other),
+            ]
+        };
+        let read = |blob: &str| {
+            Ok(if blob == "2".repeat(40) {
+                E2E_LOCK.as_bytes().to_vec()
+            } else {
+                b"{}".to_vec()
+            })
+        };
+        let fake = Fake::new(index_bytes(), false, true);
+        let mut cache = MemCache::default();
+        let opts = options(tmp.path(), &fake);
+        let mut run = |files: Vec<FileEntry>| {
+            run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+                .unwrap()
+                .0
+        };
+        assert!(!run(files("4", "5"))[0].cached);
+        assert!(run(files("4", "6"))[0].cached, "outside every target");
+        assert!(
+            !run(files("7", "6"))[0].cached,
+            "a link target's file changed"
+        );
+        assert_eq!(
+            *fake.runs.borrow(),
+            4,
+            "two jobs ran, two fetch-and-index each"
+        );
+    }
+
+    /// Contract M6a S19, invariants 9 and 10: the export selection reads each lockfile entry
+    /// once and each target's files as one range of the sorted paths (counted: 4× the files
+    /// and links → at most 5× the work).
+    fn selection_work_for(n: usize) -> u64 {
+        let mut paths = vec![
+            "app/package.json".to_owned(),
+            "app/package-lock.json".to_owned(),
+        ];
+        let mut entries = Vec::new();
+        for i in 0..n {
+            paths.push(format!("app/src/f{i}.ts"));
+            paths.push(format!("libs/l{i}/package.json"));
+            paths.push(format!("libs/l{i}/index.ts"));
+            paths.push(format!("other/o{i}.ts"));
+            entries.push(format!(
+                r#""node_modules/l{i}": {{"resolved": "../libs/l{i}", "link": true}}"#
+            ));
+        }
+        let lock = format!(r#"{{"packages": {{{}}}}}"#, entries.join(", "));
+        let blobs: BTreeMap<&str, &str> = paths.iter().map(|p| (p.as_str(), "b")).collect();
+        let read = |path: &str| (path == "app/package-lock.json").then(|| lock.as_bytes().to_vec());
+        let job = ts_job("app", rb_scip::jobs::NodeLock::PackageLock);
+        rb_frameworks::work::take();
+        assert_eq!(job_files(&job, &blobs, &read).unwrap().len(), 3 * n + 2);
+        rb_frameworks::work::take()
+    }
+
+    #[test]
+    fn export_selection_grows_linearly() {
+        let (small, large) = (selection_work_for(100), selection_work_for(400));
+        assert!(large <= small * 5, "{small} -> {large}");
     }
 }

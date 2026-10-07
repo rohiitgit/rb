@@ -28,9 +28,13 @@ pub struct ContainerRun {
     pub image: String,
     /// `linux/amd64` when the image has no native variant (scip-typescript on arm64).
     pub platform: Option<String>,
-    /// Host directory mounted read-write at `mount_at`, and the container's working directory.
+    /// Host directory mounted read-write at `mount_at`.
     pub workdir: PathBuf,
     pub mount_at: String,
+    /// The container's working directory, relative to `mount_at` (`""`: `mount_at` itself).
+    /// A scip-typescript job's export is repository-shaped and starts in its root (contract
+    /// M6a D7); a scip-java job's export is its root.
+    pub cwd: String,
     /// Extra mounts `(host, container)`: dependency caches shared between the two phases.
     pub caches: Vec<(PathBuf, String)>,
     /// Read-only mounts `(host, container)`: the egress client configuration.
@@ -43,6 +47,17 @@ pub struct ContainerRun {
     /// Command and arguments; `None` uses the image's entrypoint and passes only `args`.
     pub entrypoint: Option<String>,
     pub args: Vec<String>,
+}
+
+impl ContainerRun {
+    /// The host directory the container starts in: `workdir` joined with `cwd`.
+    pub fn host_cwd(&self) -> PathBuf {
+        if self.cwd.is_empty() {
+            self.workdir.clone()
+        } else {
+            self.workdir.join(&self.cwd)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +131,11 @@ pub fn docker_args(run: &ContainerRun) -> Vec<String> {
         "-v".into(),
         format!("{}:{}", run.workdir.display(), run.mount_at),
         "-w".into(),
-        run.mount_at.clone(),
+        if run.cwd.is_empty() {
+            run.mount_at.clone()
+        } else {
+            format!("{}/{}", run.mount_at, run.cwd)
+        },
     ]);
     for (host, inside) in &run.caches {
         a.extend(["-v".into(), format!("{}:{}", host.display(), inside)]);
@@ -411,6 +430,7 @@ mod tests {
             platform: Some("linux/amd64".into()),
             workdir: PathBuf::from("/tmp/checkout"),
             mount_at: "/src".into(),
+            cwd: String::new(),
             caches: vec![(PathBuf::from("/tmp/npm-cache"), "/root/.npm".into())],
             readonly: Vec::new(),
             env: vec![("NODE_OPTIONS".into(), "--max-old-space-size=4096".into())],
@@ -426,6 +446,21 @@ mod tests {
             args,
             "run --rm --platform linux/amd64 --network none --cpus 2 --memory 4g -v /tmp/checkout:/src -w /src -v /tmp/npm-cache:/root/.npm -e NODE_OPTIONS=--max-old-space-size=4096 sourcegraph/scip-typescript@sha256:0000 index --output index.scip"
         );
+        // Contract M6a D7: a scip-typescript job's export is repository-shaped; the container
+        // starts in its root, under the same mount.
+        let in_root = ContainerRun {
+            cwd: "apps/web".into(),
+            ..run.clone()
+        };
+        assert!(
+            docker_args(&in_root)
+                .join(" ")
+                .contains(" -v /tmp/checkout:/src -w /src/apps/web "),
+            "{:?}",
+            docker_args(&in_root)
+        );
+        assert_eq!(in_root.host_cwd(), PathBuf::from("/tmp/checkout/apps/web"));
+        assert_eq!(run.host_cwd(), PathBuf::from("/tmp/checkout"));
         // Contract M5 S21: the fetch phase attaches only to the internal fetch network, with
         // no resolver of its own, and its egress client files mounted read-only.
         let fetch = ContainerRun {
@@ -485,6 +520,7 @@ mod tests {
             platform: None,
             workdir: dir.to_path_buf(),
             mount_at: "/src".into(),
+            cwd: String::new(),
             caches: Vec::new(),
             readonly: Vec::new(),
             env: Vec::new(),

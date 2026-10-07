@@ -3088,6 +3088,7 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
         platform: None,
         workdir: dir.join("work"),
         mount_at: "/sources".into(),
+        cwd: String::new(),
         caches: Vec::new(),
         readonly: Vec::new(),
         env: rb_scip::egress::proxy_env(&address),
