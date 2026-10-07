@@ -458,7 +458,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - **M6j DI breadth:** Guice, Dagger, NestJS, Spring XML and Kotlin beans, .NET over Tier B.
   - **Deferred beyond M6:** scip-clang, `rust-analyzer scip`, scip-dotnet (1,253 MB compressed image), the SCIP incremental below a single-root reactor (contract-m5 2), authentication/remote binding/`POST …/index` and move detection (contract-m5 19, 20: only if asked for). **Dropped:** Groovy registrants (contract-m5 14, Groovy part). Residue items 15, 16, 23 and the not-planned 21 stay recorded.
 
-## M6a SCIP coverage on Java and TypeScript: contract written, not started
+## M6a SCIP coverage on Java and TypeScript: in progress (phases 0–9 by the generator; 10–12 later)
 
 - **Contract:** `tasks/contract-m6a.md` (2026-10-07), S1–S20, invariants 1–11, D1–D12, forks F1–F7. Phases 0–12 are in `tasks/todo.md`.
 - **Soundness claims and closing bar, stated up front:**
@@ -472,3 +472,6 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Decided in the contract:** D1 Lombok's marker as the only identification, removal before the unchanged checks; D3 new counters only when non-zero (invariant 1 on every unrelated dump); D4 the TypeScript interface waiver gated by a phase-0 directionality measurement; D5 workspace membership; D6 root fetch; D7 repository-shaped exports with link targets; D8 per-indexer recipes (Java's key unchanged, so cached Java indexes stay valid); D9 host-side budget flags; D10 the start-up order; D11 measurement repositories (apache/shardingsphere and mattermost/mattermost at M5's pins, a second Lombok repository by rule); D12 every M5 open item's target.
 - **Forks for the orchestrator:** F1 gin groups in M6b (recommended) vs M6a; F2 open item 5 in M6a with a decided fallback; F3 the TypeScript interface waiver; F4 threads and flags vs per-module jobs; F5 no nodes for generated members; F6 the M6 split; F7 git hosts for mattermost's measurement from the indexing host only.
 - **New dependencies:** none. No migration.
+
+### Status
+- **Phase 0 (preflight, 2026-10-07):** done. Baseline binary `var/m6a/base/rb-cfa8ab9` (HEAD's code = `cfa8ab9`'s); invariant-1 baselines in `var/m6a/base/{noscip,scip}/`; P1b: 0 super→sub member relationships over 13 forms (D4 is built); P2b: every generated definition is enclosed exactly by a `lombok/Generated#` marker span, S2's shadow placement confirmed, 11 generated references not at a marker (multi-line `<init>` spans of builders, `@UtilityClass`'s exception), none on a Tree-sitter token; F2's `npm ci` link check passes (item 5 stays); `ts-workspaces` lockfiles generated in the scip-typescript image offline; mattermost's workspace patterns all literal; second Lombok repository elunez/eladmin @ `55fbf705`; `--scip-memory 6g` fits beside Postgres. Verify loop at baseline: 639 unit, `rb-store` 65/65, `rb-server` 12/12, e2e 30/30, api 1/1. Amendment 1 (layout check moved to phase 7).

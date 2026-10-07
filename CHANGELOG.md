@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M6a phase 0: preflight (no code)
+- **Baseline:** HEAD's code equals `cfa8ab9`'s (only records changed), so its release build is the invariant-1 binary `var/m6a/base/rb-cfa8ab9` (sha256 `69800d61…f009b`); `--no-scip` fixture dumps equal M5 phase 20's byte for byte; SCIP dumps and status lines saved (`var/m6a/base/{noscip,scip}/`, scripts `var/m6a/scripts/{fixture_dumps,verify}.sh`).
+- **P1b** (D4's gate, scip-typescript 0.4.0, `--network none`, 13 interface forms plus a cross-package supertype): every member relationship runs sub → super; super → sub count **0**, so D4 is built.
+- **P2b** (D1, scip-java 0.13.1 on Lombok 1.18.34, 22 documents): every generated definition's enclosing range equals a `lombok/Generated#` reference span (class annotation, field annotation, field declarator to its separator, a whole annotation with arguments, `@UtilityClass`'s `class … }` span); S2's shadow placement confirmed (`Named#getName()` defined at `Explicit`'s name); 11 generated references lie off any marker (multi-line `<init>` spans in builder bodies, `@UtilityClass`'s exception past the class's last line), none on a Tree-sitter token (recorded residue); `lombok.addLombokGeneratedAnnotation = false` leaves its 3 documents rejected.
+- **F2:** `npm ci --offline` in the scip-typescript image installs a `file:../../packages/core` link outside the working directory but inside the mount; item 5 stays in M6a. The `ts-workspaces` lockfiles were generated there (`actual-npm install --package-lock-only --ignore-scripts --offline`, `--network none`).
+- **D5/D11:** mattermost's workspace patterns are all literal (no widening); second Lombok repository elunez/eladmin @ `55fbf705` (Apache-2.0, 7.5 MB, Lombok 1.18.30); `--scip-memory 6g` fits beside Postgres in the 7.75 GiB VM.
+- **Amendment 1:** S10's layout check runs on phase 7's real change instead of a scratch build.
+- **Verification** (`var/m6a/logs/p0-*`, code unchanged): fmt, clippy clean; 639 unit tests outside e2e and api; `rb-store` 65/65, `rb-server` 12/12; e2e 30/30, api 1/1 (150 sets), no `skipping`; no listener; stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `tasks/{contract-m6a,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) Close M5 (evaluator pass 2: VERDICT PASS)
 - Records only, no code change. Evaluator pass 2 (`tasks/eval-m5-pass2.md`, verification only, against `5cb1a2c`): Z1–Z7 hold end to end with controls unchanged — Z2's lock + `kill -9` repro run twice without a hook (Cypher on the retired snapshot `invalid_param` on both surfaces, no graph named for it, `rb gc --dry-run` lists the leftover; healed once by `rb serve`'s startup sweep, once by the next publish); Z1, Z3, Z4 and Z7 by raw-socket probes; Z5 through a real `failed` snapshot.
 - 12 mutants of amendment 16's conditions from a clean build: 12 killed (one, sweeping only the first repository, only through the e2e when other repositories exist: N2).

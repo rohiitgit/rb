@@ -794,7 +794,7 @@ Same rules as M5:
 
 `PIPELINE` becomes `m6a-1` in phase 2, `m6a-2` in phase 4, `m6a-3` in phase 6. `RECIPE` is split in phase 6 (`RECIPE_JAVA` unchanged, `RECIPE_TS` `m6a-ts-1`).
 
-- [ ] **0. Preflight** (no code).
+- [x] **0. Preflight** (no code). Done 2026-10-07: contract "Checked in phase 0" and amendment 1; outputs `var/m6a/phase0/`, baselines `var/m6a/base/`; verify baseline `var/m6a/logs/p0-*` (639 unit, store 65, server 12, e2e 30, api 1).
   - Read the contract (soundness section first), `tasks/lessons.md`, contract-m5 amendment 17 and its open items.
   - `df`, `docker context show`, `docker image inspect` for `rb-scip-java:0.13.1`, the scip-typescript digest and `rb-egress-proxy:1.11.3`; `var/m6a/{scripts,phase0,base,bench,logs}`; `verify.sh` from M5's with M6a paths.
   - Build the `cfa8ab9` release binary in a scratch target directory (`var/m6a/base/rb-cfa8ab9`, sha256 recorded); dump the three fixtures `--no-scip` and with SCIP (the e2e's fixed identity and date): the invariant-1 baseline.
