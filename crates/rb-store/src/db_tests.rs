@@ -1025,3 +1025,66 @@ fn read_only_sessions_refuse_writes() {
     // Reads, including a read transaction, work as before.
     ro.read_tx(|s| s.repo_names()).unwrap();
 }
+
+/// Contract M5 amendment 14 (found by the benchmark, S24): a publish leaves the planner's
+/// statistics covering the snapshot it made live. Before, the rows of a new snapshot were
+/// invisible to the statistics until autovacuum's next analyze (up to a minute later), so the
+/// planner estimated one row for `snapshot_id = <new>` and `load_graph`'s evidence query ran as a
+/// nested loop of every evidence row over every node of the snapshot: on shardingsphere (244,220
+/// evidence rows, 74,214 nodes) a dump or a question right after `rb index` did not finish in ten
+/// minutes, and in about 1 s once the statistics caught up. Here the first snapshot is analyzed
+/// (autovacuum caught up), then a second one is published; its rows must be estimated at no less
+/// than half their real count in each table a snapshot read filters by `snapshot_id`.
+#[test]
+fn a_publish_leaves_statistics_that_cover_the_new_snapshot() {
+    let Some(db) = db() else { return };
+    let scratch = ScratchDb::create(&db.url, "stats");
+    let mut store = Store::connect(&scratch.url).unwrap();
+    let repo = repo_name("stats");
+    let first = store
+        .publish_snapshot(
+            &repo,
+            "c1",
+            &json!({}),
+            &sample_graph(400, 0),
+            &sample_diagnostics(),
+            &load_dir(),
+        )
+        .unwrap();
+    let mut c = postgres::Client::connect(&scratch.url, postgres::NoTls).unwrap();
+    c.batch_execute("ANALYZE rb.node, rb.edge, rb.edge_evidence, rb.diagnostic")
+        .unwrap();
+    let second = store
+        .publish_snapshot(
+            &repo,
+            "c2",
+            &json!({}),
+            &sample_graph(400, 1),
+            &sample_diagnostics(),
+            &load_dir(),
+        )
+        .unwrap();
+    assert_ne!(first.snapshot.id, second.snapshot.id);
+    let id = second.snapshot.id;
+    for table in ["node", "edge", "edge_evidence", "diagnostic"] {
+        let actual: i64 = c
+            .query_one(
+                &format!("SELECT count(*) FROM rb.{table} WHERE snapshot_id = $1"),
+                &[&id],
+            )
+            .unwrap()
+            .get(0);
+        let plan: serde_json::Value = c
+            .query_one(
+                &format!("EXPLAIN (FORMAT JSON) SELECT * FROM rb.{table} WHERE snapshot_id = {id}"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let estimated = plan[0]["Plan"]["Plan Rows"].as_f64().unwrap();
+        assert!(
+            actual > 0 && estimated * 2.0 >= actual as f64,
+            "rb.{table}: {estimated} rows estimated for the new snapshot, {actual} present"
+        );
+    }
+}

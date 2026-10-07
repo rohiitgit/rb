@@ -252,3 +252,8 @@
 ## 2026-10-07: an allow-list the adversary can extend is no allow-list
 - **Mistake (caught while designing, amendment 12):** the contract let the fetch phase's registry allow-list be extended by `rb.toml`, which `rb` reads from the repository being indexed; the repository's own build is exactly what the egress guard contains, so it could have allowed its own exfiltration host.
 - **Rule:** for every input to a security control, ask who writes it; configuration that widens a guard comes from the operator's side (flags, host environment), never from the data the guard is applied to, and is validated in the form the guard matches literally.
+
+## 2026-10-07: a bulk load is not readable until the planner's statistics cover it
+- **Mistake:** the publish COPYed a whole snapshot and committed, leaving the statistics to autovacuum. For up to a minute the planner believed the new `snapshot_id` had one row and planned a nested loop over the whole snapshot: a read that takes 1 s ran for over 10 minutes. The fixtures never showed it (tiny tables, plans cheap either way), and neither did warm benchmark runs (autovacuum had caught up).
+- **Rule:** a transaction that bulk-loads rows a reader will filter by a new key ends with `ANALYZE` of those tables before it commits, so the statistics become visible with the rows. Measure the first read right after a publish, not only warm reads, and test the planner's estimate for the new key.
+

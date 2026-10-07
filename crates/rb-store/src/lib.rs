@@ -985,6 +985,12 @@ impl Store {
             "UPDATE rb.repo SET live_snapshot_id = $2 WHERE id = $1",
             &[&repo_id, &snapshot_id],
         )?;
+        // The planner's statistics must cover the new snapshot when it becomes visible: with
+        // statistics from before the COPY, `snapshot_id = <new>` is estimated at one row and a
+        // snapshot read joins as a nested loop over the whole snapshot (contract M5 amendment
+        // 14). ANALYZE counts this transaction's own rows and its statistics commit with the flip.
+        tx.batch_execute("ANALYZE rb.node, rb.edge, rb.edge_evidence, rb.diagnostic")
+            .context("analyzing the snapshot tables")?;
         tx.commit()?;
         Ok((snapshot_id, projection))
     }
