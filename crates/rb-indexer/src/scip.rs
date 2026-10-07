@@ -150,6 +150,10 @@ pub(crate) struct Coverage {
     pub lombok_removed: usize,
     /// Accepted documents with at least one such removal (contract M6a D3).
     pub documents_lombok: usize,
+    /// Documents whose path, joined to the project's root and folded, leaves the root
+    /// (scip-typescript indexing a link target's sources through the link; contract M6a D7):
+    /// ignored, the link target's own job owning its files.
+    pub documents_outside_root: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -199,6 +203,10 @@ pub(crate) fn join(
     let mut indexed: BTreeSet<String> = BTreeSet::new();
     let mut docs: Vec<Doc<'_>> = Vec::new();
     for (doc, lombok) in index.documents.iter().zip(&without_lombok) {
+        if leaves_root(&doc.path) {
+            out.coverage.documents_outside_root += 1;
+            continue;
+        }
         let path = repo_path(&doc.path);
         let Some(&(_, facts)) = files.get(path.as_str()) else {
             continue;
@@ -1129,6 +1137,23 @@ fn definition_disagreement(facts: &FileFacts, occurrences: &[rb_scip::Occurrence
     })
 }
 
+/// Whether a document path, relative to its project's root, leaves the root once `.` and `..`
+/// are folded (contract M6a D7).
+fn leaves_root(path: &str) -> bool {
+    let mut depth = 0usize;
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => return true,
+            },
+            _ => depth += 1,
+        }
+    }
+    false
+}
+
 /// Contract M6a D1: `doc` without the occurrences Lombok marks as generated, with how many were
 /// removed; `None` when it holds no marker (it is then judged exactly as before M6a). The
 /// markers are the spans of `doc`'s reference occurrences of `@lombok.Generated`
@@ -1510,6 +1535,7 @@ mod tests {
                 documents_rejected_reasons: BTreeMap::new(),
                 lombok_removed: 0,
                 documents_lombok: 0,
+                documents_outside_root: 0,
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -3171,6 +3197,7 @@ mod tests {
                 documents_rejected_reasons: BTreeMap::new(),
                 lombok_removed: 0,
                 documents_lombok: 0,
+                documents_outside_root: 0,
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();
@@ -6376,5 +6403,47 @@ mod tests {
         let joined = hierarchy_joined(Language::TypeScript, &[("a.ts", src)], &rels, &[]);
         assert_eq!(joined.coverage.supertypes_unconfirmed, 1);
         assert!(implements_lines(Language::TypeScript, &joined).is_empty());
+    }
+
+    /// Contract M6a D7 (S10): a document whose path, joined to the project's root and
+    /// folded, leaves the root (scip-typescript indexing a link target's sources through the
+    /// link) is ignored and counted; the root's own documents are joined as before.
+    #[test]
+    fn documents_outside_the_root_are_ignored_and_counted() {
+        let src = "export function a(): number { return b(); }\nexport function b(): number { return 1; }\n";
+        let p = "scip-typescript npm app 1.0.0 src/`a.ts`/";
+        let document = |path: &str| Document {
+            path: path.into(),
+            occurrences: vec![
+                occ_at(tok(src, "a()", 0), &format!("{p}a()."), 1),
+                occ_at(tok(src, "b()", 0), &format!("{p}b()."), 0),
+                occ_at(tok(src, "b()", 1), &format!("{p}b()."), 1),
+            ],
+            ..Default::default()
+        };
+        let index = ScipIndex {
+            documents: vec![
+                document("src/a.ts"),
+                document("../core/src/a.ts"),
+                document("src/../../core/src/b.ts"),
+            ],
+            ..Default::default()
+        };
+        let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let files = BTreeMap::from([
+            ("app/src/a.ts", (Language::TypeScript, &facts)),
+            ("core/src/a.ts", (Language::TypeScript, &facts)),
+        ]);
+        let keys: BTreeMap<&str, Vec<String>> = files
+            .keys()
+            .map(|path| (*path, rb_syntax::symbol_keys(path, &facts)))
+            .collect();
+        let joined = join(&index, "app", &files, &keys, &[Language::TypeScript]);
+        assert_eq!(joined.coverage.documents_outside_root, 2);
+        assert_eq!(
+            joined.documented,
+            BTreeSet::from(["app/src/a.ts".to_owned()])
+        );
+        assert_eq!(edge_lines(&joined), [format!("{p}a(). Calls {p}b().")]);
     }
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M6a phase 7b: link-target and outside-root counters (S10; D3, D7)
+- **Counters:** `ScipProject::link_targets` (link-target directories with an exported file) → `scip_status` `link_targets` at the top level (any status) → `rb status` `, <n> link targets` after the status; `Coverage::documents_outside_root` (a document whose path, joined to the root and folded, leaves it: ignored, not looked up) → coverage `documents_outside_root` → `, <n> documents outside the root` after the rejected documents. Each written and printed only when non-zero.
+- **Tests (new):** `scip::documents_outside_the_root_are_ignored_and_counted` (`../core/…` and `src/../../core/…` ignored and counted, the root's document joined as before); `lib::link_targets_and_documents_outside_the_root_are_written_only_when_non_zero`; the CLI status-line rows; `projects` units assert `link_targets` (1 for `packages/core`).
+- **Mutation:** a path above the root not detected → killed. Restored and byte-compared.
+- **Invariant 1:** fixture dumps with and without SCIP byte-identical to `var/m6a/base`.
+- **Verification** (`var/m6a/logs/p7b-*`): fmt, clippy clean; 671 unit tests outside e2e and api; `rb-store` 66/66, `rb-server` 12/12; e2e 31/31, api 1/1, no `skipping`; no listener; stub scan: only `rb-sql/src/lib.rs:1111`.
+- Files: `crates/rb-indexer/src/{projects,scip,lib}.rs`, `crates/rb-cli/src/main.rs`; records `tasks/todo.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M6a phase 7a: repository-shaped scip-typescript exports and in-repository link targets (S10; D7)
 - **Runner:** `ContainerRun::cwd` (relative to the mount; `-w <mount>/<cwd>`), `ContainerRun::host_cwd`.
 - **Orchestration:** a scip-typescript job's export keeps repository paths under the work directory mounted at `/src`, both phases start in `/src/<root>`, and `index.scip` is read there; scip-typescript's document paths stay relative to the root. scip-java is unchanged (its export is its root).

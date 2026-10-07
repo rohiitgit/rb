@@ -911,9 +911,13 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
     if let Some(phase) = p.status.phase() {
         detail["phase"] = phase.as_str().into();
     }
-    // Contract M6a D3, D5: only for a grouped workspace root, so other jobs dump as before.
+    // Contract M6a D3, D5, D7: only for a grouped workspace root or a job with link targets,
+    // so other jobs dump as before.
     if p.workspace_members > 0 {
         detail["workspace_members"] = p.workspace_members.into();
+    }
+    if p.link_targets > 0 {
+        detail["link_targets"] = p.link_targets.into();
     }
     if let rb_scip::RunStatus::Timeout { budget_secs, .. } = &p.status {
         detail["budget_secs"] = (*budget_secs).into();
@@ -950,6 +954,7 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
         for (key, n) in [
             ("lombok_removed", c.lombok_removed),
             ("documents_lombok", c.documents_lombok),
+            ("documents_outside_root", c.documents_outside_root),
         ] {
             if n > 0 {
                 detail["coverage"][key] = n.into();
@@ -1328,6 +1333,7 @@ mod tests {
                 stderr_tail: String::new(),
                 unpinned: false,
                 workspace_members: 0,
+                link_targets: 0,
             }],
             ..Content::default()
         };
@@ -1420,6 +1426,7 @@ mod tests {
             stderr_tail: String::new(),
             unpinned: false,
             workspace_members: 0,
+            link_targets: 0,
         }
     }
 
@@ -1669,6 +1676,32 @@ mod tests {
         // The phase that failed is recorded, as for a timeout (contract M3b amendment 56).
         assert_eq!(d.detail["phase"], "fetch");
         assert!(d.detail.get("budget_secs").is_none(), "{}", d.detail);
+    }
+
+    /// Contract M6a D3, D7: a job's exported link targets (top level, any status) and the
+    /// documents it ignored outside its root (coverage) are written only when non-zero.
+    #[test]
+    fn link_targets_and_documents_outside_the_root_are_written_only_when_non_zero() {
+        let mut project = ok_project("tools/e2e", "scip-typescript", vec![]);
+        let plain = scip_status(&project, Some(&scip::Coverage::default()));
+        assert!(
+            plain.detail.get("link_targets").is_none(),
+            "{}",
+            plain.detail
+        );
+        assert!(
+            plain.detail["coverage"]
+                .get("documents_outside_root")
+                .is_none()
+        );
+        project.link_targets = 2;
+        let outside = scip::Coverage {
+            documents_outside_root: 3,
+            ..Default::default()
+        };
+        let d = scip_status(&project, Some(&outside));
+        assert_eq!(d.detail["link_targets"], 2);
+        assert_eq!(d.detail["coverage"]["documents_outside_root"], 3);
     }
 
     /// Contract M6a D3, D5: a grouped workspace root's member count is written to its

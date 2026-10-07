@@ -1239,6 +1239,10 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
     if let Some(members) = d.detail["workspace_members"].as_u64() {
         let _ = write!(line, ", workspace {members} members");
     }
+    // Exported link targets outside the root (contract M6a D7), only when there are any.
+    if let Some(targets) = d.detail["link_targets"].as_u64() {
+        let _ = write!(line, ", {targets} link targets");
+    }
     if let Some(c) = d.detail.get("coverage") {
         let n = |k: &str| c[k].as_u64().unwrap_or(0);
         let _ = write!(
@@ -1278,6 +1282,15 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
                     .collect();
                 let _ = write!(line, " ({})", reasons.join(", "));
             }
+        }
+        // Documents of a link target's sources the job ignored (contract M6a D7), when there
+        // are any.
+        if n("documents_outside_root") > 0 {
+            let _ = write!(
+                line,
+                ", {} documents outside the root",
+                n("documents_outside_root")
+            );
         }
         // Occurrences removed as Lombok-generated before the agreement checks (contract M6a
         // D1, D3), when there are any.
@@ -2891,6 +2904,24 @@ mod tests {
             "scip: . scip-typescript failed (fetch phase), workspace 7 members"
         );
         assert!(!scip_status_line(&rejected).contains("workspace"));
+        // Contract M6a D7: link targets after the status, documents outside the root with the
+        // coverage, each only when non-zero.
+        let linked = diagnostic(json!({
+            "indexer": "scip-typescript", "status": "ok", "unpinned": false, "image": "sha256:1",
+            "link_targets": 1,
+            "coverage": {"definitions_without_occurrence": 0, "documents_rejected": 0,
+                         "documents_rejected_reasons": {}, "documents_outside_root": 2},
+        }));
+        let line = scip_status_line(&linked);
+        assert!(
+            line.starts_with("scip: . scip-typescript ok, 1 link targets, definitions matched")
+                && line.contains(
+                    ", documents rejected 0, 2 documents outside the root, relationships dropped"
+                ),
+            "{line}"
+        );
+        assert!(!scip_status_line(&rejected).contains("link targets"));
+        assert!(!scip_status_line(&rejected).contains("outside the root"));
         // Contract M3b amendment 67: a snapshot written before a field existed (the evaluator's
         // `fp3_class_validator`, before amendments 62 and 64) omits it instead of printing 0.
         let old = diagnostic(json!({

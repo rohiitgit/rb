@@ -145,6 +145,9 @@ pub struct ScipProject {
     pub unpinned: bool,
     /// Workspace members grouped into this job (contract M6a D5); 0 for any other job.
     pub workspace_members: usize,
+    /// Link-target directories outside the root whose files the job exported (contract M6a
+    /// D7).
+    pub link_targets: usize,
 }
 
 /// Whether jobs run at all.
@@ -184,6 +187,7 @@ pub(crate) fn run_projects(
             stderr_tail: String::new(),
             unpinned: job.unpinned,
             workspace_members: plan.members.get(&job.root).map_or(0, Vec::len),
+            link_targets: 0,
         };
         let runner = match mode {
             Mode::Skip(reason) => {
@@ -210,7 +214,10 @@ pub(crate) fn run_projects(
         // What the job exports and its key covers (contract M6a D7); a link target outside
         // the repository leaves the job unsupported before anything is written.
         let exported = match job_files(&job, &blobs, &read_path) {
-            Ok(files) => files,
+            Ok(selected) => {
+                project.link_targets = selected.link_targets;
+                selected.files
+            }
             Err(reason) => {
                 project.status = RunStatus::Unsupported(reason);
                 out.push(project);
@@ -299,6 +306,13 @@ pub(crate) fn run_projects(
     Ok((out, plan.ungrouped))
 }
 
+/// The files a job exports and its cache key covers (contract M6a D7), with repository paths.
+pub(crate) struct JobFiles<'b> {
+    pub files: Vec<(&'b str, &'b str)>,
+    /// Link-target directories with at least one exported file.
+    pub link_targets: usize,
+}
+
 /// The reason a job whose lockfile links outside the repository is `unsupported`; it names no
 /// path of the host or the repository (contract M6a D7).
 const LINK_OUTSIDE: &str = "link target outside the repository";
@@ -312,7 +326,7 @@ pub(crate) fn job_files<'b>(
     job: &rb_scip::Job,
     blobs: &BTreeMap<&'b str, &'b str>,
     read_path: &dyn Fn(&str) -> Option<Vec<u8>>,
-) -> Result<Vec<(&'b str, &'b str)>, String> {
+) -> Result<JobFiles<'b>, String> {
     // The files under `dir`: one range of the sorted paths, each path examined counted.
     let under = |dir: &str| -> Vec<(&'b str, &'b str)> {
         let prefix = if dir.is_empty() {
@@ -340,18 +354,26 @@ pub(crate) fn job_files<'b>(
     .then(|| read_path(&join_root(&job.root, "package-lock.json")))
     .flatten();
     let Some(lockfile) = lockfile else {
-        return Ok(files);
+        return Ok(JobFiles {
+            files,
+            link_targets: 0,
+        });
     };
+    let mut exported_targets = 0;
     for target in link_targets(&job.root, &lockfile)? {
-        files.extend(
-            under(&target)
-                .into_iter()
-                .filter(|(p, _)| !p.split('/').any(|segment| segment == "node_modules")),
-        );
+        let target_files: Vec<(&str, &str)> = under(&target)
+            .into_iter()
+            .filter(|(p, _)| !p.split('/').any(|segment| segment == "node_modules"))
+            .collect();
+        exported_targets += usize::from(!target_files.is_empty());
+        files.extend(target_files);
     }
     files.sort_unstable();
     files.dedup();
-    Ok(files)
+    Ok(JobFiles {
+        files,
+        link_targets: exported_targets,
+    })
 }
 
 /// The directories a `package-lock.json` (v2 or v3) at `root` links to inside the repository
@@ -1038,11 +1060,9 @@ mod tests {
         let blobs: BTreeMap<&str, &str> = paths.iter().map(|p| (*p, "b")).collect();
         let read = |path: &str| (path == "tools/e2e/package-lock.json").then(|| E2E_LOCK.into());
         let job = ts_job("tools/e2e", rb_scip::jobs::NodeLock::PackageLock);
-        let files: Vec<&str> = job_files(&job, &blobs, &read)
-            .unwrap()
-            .into_iter()
-            .map(|(p, _)| p)
-            .collect();
+        let selected = job_files(&job, &blobs, &read).unwrap();
+        assert_eq!(selected.link_targets, 1, "packages/core");
+        let files: Vec<&str> = selected.files.into_iter().map(|(p, _)| p).collect();
         assert_eq!(
             files,
             [
@@ -1056,13 +1076,13 @@ mod tests {
         );
         // Without `package-lock.json` (another lockfile, or none) no link is read.
         let yarn = ts_job("tools/e2e", rb_scip::jobs::NodeLock::Yarn);
-        assert_eq!(job_files(&yarn, &blobs, &read).unwrap().len(), 4);
+        assert_eq!(job_files(&yarn, &blobs, &read).unwrap().files.len(), 4);
         // A v1 lockfile has no `packages`: no link is read either.
         let v1 = |path: &str| {
             (path == "tools/e2e/package-lock.json")
                 .then(|| br#"{"lockfileVersion": 1, "dependencies": {"@ws/core": {"version": "file:../../packages/core"}}}"#.to_vec())
         };
-        assert_eq!(job_files(&job, &blobs, &v1).unwrap().len(), 4);
+        assert_eq!(job_files(&job, &blobs, &v1).unwrap().files.len(), 4);
     }
 
     /// A link that leaves the repository makes the job `unsupported` with a reason that names
@@ -1150,7 +1170,9 @@ mod tests {
                 .unwrap()
                 .0
         };
-        assert!(!run(files("4", "5"))[0].cached);
+        let first = run(files("4", "5"));
+        assert!(!first[0].cached);
+        assert_eq!(first[0].link_targets, 1);
         assert!(run(files("4", "6"))[0].cached, "outside every target");
         assert!(
             !run(files("7", "6"))[0].cached,
@@ -1186,7 +1208,10 @@ mod tests {
         let read = |path: &str| (path == "app/package-lock.json").then(|| lock.as_bytes().to_vec());
         let job = ts_job("app", rb_scip::jobs::NodeLock::PackageLock);
         rb_frameworks::work::take();
-        assert_eq!(job_files(&job, &blobs, &read).unwrap().len(), 3 * n + 2);
+        assert_eq!(
+            job_files(&job, &blobs, &read).unwrap().files.len(),
+            3 * n + 2
+        );
         rb_frameworks::work::take()
     }
 
