@@ -4,17 +4,19 @@
 use sha2::{Digest, Sha256};
 
 /// SHA-256 (hex) over the sorted `(path, blob)` pairs of every file at or below `root`, plus the
-/// build root's own lockfiles and manifests, which are already among them, the fetch recipe
-/// ([`crate::RECIPE`]; contract M3b amendment 47), so an index an older recipe produced is a
-/// miss, and the fetch phase's allow-list (contract M5 S21), so a fetch that failed on a host
-/// outside it is retried once the host is allowed. Files outside the root do not affect the
-/// key: an indexer only reads its build root.
+/// build root's own lockfiles and manifests, which are already among them, the job's fetch
+/// recipe (`recipe`, [`crate::orchestrate::recipe`]; contract M3b amendment 47, per indexer
+/// since contract M6a D8), so an index an older recipe produced is a miss, and the fetch
+/// phase's allow-list (contract M5 S21), so a fetch that failed on a host outside it is retried
+/// once the host is allowed. Files outside the root do not affect the key: an indexer only
+/// reads its build root.
 pub fn project_input_hash<'a>(
+    recipe: &str,
     root: &str,
     files: impl IntoIterator<Item = (&'a str, &'a str)>,
     egress: &crate::Egress,
 ) -> String {
-    let recipe = format!("{}\nallow {}", crate::RECIPE, egress.hosts.join(" "));
+    let recipe = format!("{recipe}\nallow {}", egress.hosts.join(" "));
     input_hash(root, files, &recipe)
 }
 
@@ -49,7 +51,7 @@ mod tests {
     use super::*;
 
     fn key<'a>(root: &str, files: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
-        project_input_hash(root, files, &crate::Egress::default())
+        project_input_hash(crate::RECIPE_JAVA, root, files, &crate::Egress::default())
     }
 
     #[test]
@@ -109,7 +111,7 @@ mod tests {
                 files,
                 &format!(
                     "{}\nallow registry.npmjs.org registry.yarnpkg.com repo.maven.apache.org repo1.maven.org",
-                    crate::RECIPE
+                    crate::RECIPE_JAVA
                 )
             )
         );
@@ -124,10 +126,35 @@ mod tests {
     fn the_allow_list_is_part_of_the_key() {
         let files = [("svc/pom.xml", "1"), ("svc/src/A.java", "2")];
         let wider = crate::Egress::with(&["repo.spring.io".to_owned()]).unwrap();
-        assert_ne!(key("svc", files), project_input_hash("svc", files, &wider));
+        assert_ne!(
+            key("svc", files),
+            project_input_hash(crate::RECIPE_JAVA, "svc", files, &wider)
+        );
         assert_eq!(
-            project_input_hash("svc", files, &wider),
-            project_input_hash("svc", files, &wider)
+            project_input_hash(crate::RECIPE_JAVA, "svc", files, &wider),
+            project_input_hash(crate::RECIPE_JAVA, "svc", files, &wider)
+        );
+    }
+
+    /// Contract M6a D8, invariant 7: splitting the recipe per indexer leaves every scip-java
+    /// key as it was, so cached Java indexes stay valid. The value is what `cfa8ab9`'s
+    /// `project_input_hash` computed for this input (printed by that code before the split);
+    /// scip-typescript's recipe gives another key for the same input.
+    #[test]
+    fn the_java_key_is_pinned_across_the_recipe_split() {
+        let files = [
+            ("svc/pom.xml", "1"),
+            ("svc/src/A.java", "2"),
+            ("other/x", "3"),
+        ];
+        assert_eq!(crate::RECIPE_JAVA, "m5-egress-1");
+        assert_eq!(
+            key("svc", files),
+            "2798679d0e57cc5894dbc558e3436d8ec515b9342e08f601bfb31cc263e9bb0c"
+        );
+        assert_ne!(
+            project_input_hash(crate::RECIPE_TS, "svc", files, &crate::Egress::default()),
+            key("svc", files)
         );
     }
 }

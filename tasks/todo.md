@@ -821,7 +821,7 @@ Same rules as M5:
   - *Derived:* the job list from the file list and the root manifests; ungrouped reasons.
   - Files: `rb-scip/src/jobs.rs`, `rb-scip/src/lib.rs`, `rb-indexer/src/projects.rs` (manifest reader).
   - **Verify:** S8's rows; the two mutations killed; `polyglot-monorepo`'s jobs unchanged (unit and SCIP golden).
-- [ ] **6. Workspace fetch and index; per-indexer recipes** (S9; D6, D8; `PIPELINE` `m6a-3`, `RECIPE_TS` `m6a-ts-1`).
+- [x] **6. Workspace fetch and index; per-indexer recipes** (S9; D6, D8; `PIPELINE` `m6a-3`, `RECIPE_TS` `m6a-ts-1`). Done 2026-10-07: `RECIPE_JAVA`/`RECIPE_TS`/`recipe(indexer)`; the Java key of a fixed input pinned to `cfa8ab9`'s value (`2798679d…bb0c`, printed by that code before the split); grouped-job argv unit; 2 mutants killed; fixture dumps byte-identical with every TypeScript job re-run under its new key (no W rows).
   - Files: `rb-scip/src/orchestrate.rs`, `rb-scip/src/hash.rs`, `rb-scip/src/jobs.rs`, `rb-indexer/src/projects.rs`.
   - **Verify:** the pinned Java hash equals `cfa8ab9`'s; argv units; e2e SCIP goldens unchanged except rows classified W.
 - [ ] **7. Repository-shaped export and link targets** (S10; D7).

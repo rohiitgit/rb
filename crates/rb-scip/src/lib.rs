@@ -20,7 +20,9 @@ pub mod hash;
 pub use hash::project_input_hash;
 pub mod orchestrate;
 
-pub use orchestrate::{Budget, Images, Phase, RECIPE, RunStatus, ScipRun, image_for, run_job};
+pub use orchestrate::{
+    Budget, Images, Phase, RECIPE_JAVA, RECIPE_TS, RunStatus, ScipRun, image_for, recipe, run_job,
+};
 pub mod symbol;
 
 pub use symbol::{Package, last_descriptor_name, may_name, package, type_symbol_of};

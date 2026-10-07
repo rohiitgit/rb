@@ -207,8 +207,12 @@ pub(crate) fn run_projects(
             .filter(|(path, _)| in_root(path, &job.root))
             .map(|(p, b)| (*p, *b))
             .collect();
-        let input_hash =
-            rb_scip::project_input_hash(&job.root, under_root.iter().copied(), &options.egress);
+        let input_hash = rb_scip::project_input_hash(
+            rb_scip::recipe(job.indexer),
+            &job.root,
+            under_root.iter().copied(),
+            &options.egress,
+        );
         // A row whose status no current run would write (a `timeout` from an older binary) is
         // a miss (contract M3b amendment 31).
         let cached = cache.get(&input_hash, &project.image)?.and_then(|entry| {

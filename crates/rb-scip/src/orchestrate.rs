@@ -9,13 +9,27 @@ use crate::egress::{CLIENT_CONFIG_AT, Egress, PROXY_IMAGE};
 use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_JAVA_IMAGE, SCIP_TYPESCRIPT_IMAGE};
 use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
 
-/// The fetch and index recipe, part of every index's cache key (contract M3b amendment 47).
-/// Bump it whenever the container commands, the images' invocation or the export rules change:
-/// an index produced by another recipe is then a cache miss, never served as "cached".
-/// `m5-egress-1`: the fetch phase behind the egress proxy, per-repository dependency caches and
-/// the Develocity/Gradle Enterprise build caches off in both Maven phases (contract M5 S21,
-/// S22).
-pub const RECIPE: &str = "m5-egress-1";
+/// scip-java's fetch and index recipe, part of each of its jobs' cache keys (contract M3b
+/// amendment 47; one per indexer since contract M6a D8). Bump it whenever scip-java's container
+/// commands, its image's invocation or its export rules change: an index produced by another
+/// recipe is then a cache miss, never served as "cached". `m5-egress-1`: the fetch phase behind
+/// the egress proxy, per-repository dependency caches and the Develocity/Gradle Enterprise
+/// build caches off in both Maven phases (contract M5 S21, S22). Unchanged by M6a, so cached
+/// Java indexes stay valid (a unit pins the key of a fixed input).
+pub const RECIPE_JAVA: &str = "m5-egress-1";
+
+/// scip-typescript's recipe (contract M6a D8), bumped like [`RECIPE_JAVA`]. `m6a-ts-1`:
+/// workspace roots fetch and index their members (D5, D6) and exports are repository-shaped
+/// (D7).
+pub const RECIPE_TS: &str = "m6a-ts-1";
+
+/// The recipe a job's cache key carries.
+pub fn recipe(indexer: Indexer) -> &'static str {
+    match indexer {
+        Indexer::ScipJava => RECIPE_JAVA,
+        Indexer::ScipTypescript => RECIPE_TS,
+    }
+}
 
 /// The Develocity and Gradle Enterprise Maven extensions' build caches, off in both Maven
 /// phases (contract M5 S22): a cache hit skips `javac`, so its sources get no SCIP document
@@ -1424,6 +1438,78 @@ mod tests {
                     .contains(&("npm_config_update_notifier".into(), "false".into())),
                 "{lockfile:?}: {:?}",
                 fetch.env
+            );
+        }
+    }
+
+    /// Contract M6a D6, D8: a grouped workspace job fetches at its root with today's
+    /// commands (`npm ci` for `package-lock.json`, `yarn install --frozen-lockfile` for
+    /// `yarn.lock`, scripts off) and indexes every member's `tsconfig.json` directory after
+    /// `--`, in the job's (sorted) order; the recipes are per indexer.
+    #[test]
+    fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
+        assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m6a-ts-1"));
+        assert_eq!(recipe(Indexer::ScipJava), RECIPE_JAVA);
+        assert_eq!(recipe(Indexer::ScipTypescript), RECIPE_TS);
+        let tmp = tempfile::tempdir().unwrap();
+        for (lockfile, entrypoint, fetch_args) in [
+            (
+                NodeLock::PackageLock,
+                "/usr/local/bin/actual-npm",
+                vec![
+                    "ci",
+                    "--no-audit",
+                    "--no-fund",
+                    "--loglevel=error",
+                    "--ignore-scripts",
+                    "--logs-max=0",
+                ],
+            ),
+            (
+                NodeLock::Yarn,
+                "yarn",
+                vec![
+                    "install",
+                    "--frozen-lockfile",
+                    "--non-interactive",
+                    "--ignore-scripts",
+                ],
+            ),
+        ] {
+            let job = Job {
+                root: String::new(),
+                indexer: Indexer::ScipTypescript,
+                fetch: Fetch::Npm { lockfile },
+                projects: vec!["packages/app".into(), "packages/core".into()],
+                unpinned: false,
+            };
+            let fake = Fake::new(false, false);
+            run_job(
+                &job,
+                SCIP_TYPESCRIPT_IMAGE,
+                &files(),
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &Egress::default(),
+                &fake,
+            )
+            .unwrap();
+            let runs = fake.runs.borrow();
+            assert_eq!(runs.len(), 2, "one fetch at the root, one index");
+            assert_eq!(runs[0].entrypoint.as_deref(), Some(entrypoint));
+            assert_eq!(runs[0].args, fetch_args, "{lockfile:?}");
+            assert_eq!(
+                runs[1].args,
+                [
+                    "index",
+                    "--output",
+                    "index.scip",
+                    "--no-progress-bar",
+                    "--",
+                    "packages/app",
+                    "packages/core"
+                ]
             );
         }
     }
