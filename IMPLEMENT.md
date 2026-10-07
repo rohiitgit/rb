@@ -443,6 +443,32 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Evaluator pass 1 fixed (amendment 16): `status` of a never-indexed repository is `not_found`; a publisher killed between its flip and its retention can no longer make Cypher answer on a retired snapshot (reads decide from the status row), and the leftover graph is dropped by the next publish or `rb serve`'s startup sweep; path segments percent-decoded once; duplicate `Host` and foreign absolute-form authorities refused; `failed`-snapshot and multi-graph retention rows (mutants m16, m17 killed); hyper's bare transport refusals recorded as residue; adversarial egress review carried to M6. 16 mutants killed; invariant 1 holds; stale facts rows pruned.
   - [x] M5 closed (contract amendment 17): evaluator pass 2 (`tasks/eval-m5-pass2.md`, verification only, against `5cb1a2c`) VERDICT PASS — Z1–Z7 hold end to end (the lock + `kill -9` repro healed once by `rb serve`, once by the next publish), 12/12 mutants of amendment 16 killed from a clean build, the verification loop green twice (639 unit, store 65/65, server 12/12, e2e 30/30 with containers, api 1/1), invariant 1 held (fixtures equal phase 20's; spring-petclinic the one S19 (d) row against `afae548`), fresh == cached on spring-petclinic, shardingsphere and mattermost (both equal to their phase-17 dumps), API ≡ CLI on 29 own parameter sets. Notes N1, N2 (non-blocking) are open items 24, 25 (M6).
 
-## M6 Breadth: next
+## M6 Breadth: split into M6a–M6j (planned 2026-10-07)
 
-- Not started. Scope in design §13 (scip-python/go/clang/rust-analyzer; Kotlin/C#; OpenAPI/gRPC packs; gateway configs; message topics; architecture-rule checks), plus what M4b and M5 moved there. Carried in from M5: open items 1–14, 17–20, 22, 24 and 25 of `tasks/contract-m5.md` (amendment 17 lists them by milestone; 22 is the adversarial review of the fetch phase's egress); residue items 15, 16, 23 and the not-planned item 21 stay recorded.
+- **Split** (design §13, one row per sub-milestone with scope and exit criteria; each gets its own contract when it starts, soundness claims and closing bar up front, evaluator pass 1 full and pass 2 verification-only). Ordered by value and dependency: harden what exists first, then new languages, then packs, then the rules engine, then the remaining languages and DI frameworks.
+  - **M6a SCIP coverage on Java and TypeScript:** contract-m5 open items 1, 3, 4, 5, 8, 24, 25.
+  - **M6b Request-path precision:** gin groups as parameters, Express construction chains, contract-m5 6, 7, 10 (part), 11, 12, contract-m4a 14 (part), 16, 19, 20, 21 (rest).
+  - **M6c DI, RTA and orphan precision:** contract-m5 9 (part), 10 (part), 13, 17 (contract-m4b 5, 6, 7, 19); contract-m4b 4, 8, 14, 16, 17.
+  - **M6d Go and Python SCIP:** scip-go (image built locally), scip-python (pinned by digest after measuring), contract-m4b 13, Python lockfiles, contract-m5 22 (egress review) and 9 (Go at scale).
+  - **M6e Build and lockfile breadth:** Gradle, pnpm/Yarn lockfiles and workspaces, contract-m4b 22, contract-m5 18.
+  - **M6f Contract packs:** OpenAPI, gRPC, contract-m4b 9.
+  - **M6g Topology and configuration packs:** message topics, gateway configs, compose/k8s hosts, Spring YAML and active profiles (contract-m4a 3, 10, 13, 18).
+  - **M6h Architecture rules as a CI gate.**
+  - **M6i Kotlin and C# syntax** (contract-m5 14, Kotlin part).
+  - **M6j DI breadth:** Guice, Dagger, NestJS, Spring XML and Kotlin beans, .NET over Tier B.
+  - **Deferred beyond M6:** scip-clang, `rust-analyzer scip`, scip-dotnet (1,253 MB compressed image), the SCIP incremental below a single-root reactor (contract-m5 2), authentication/remote binding/`POST …/index` and move detection (contract-m5 19, 20: only if asked for). **Dropped:** Groovy registrants (contract-m5 14, Groovy part). Residue items 15, 16, 23 and the not-planned 21 stay recorded.
+
+## M6a SCIP coverage on Java and TypeScript: contract written, not started
+
+- **Contract:** `tasks/contract-m6a.md` (2026-10-07), S1–S20, invariants 1–11, D1–D12, forks F1–F7. Phases 0–12 are in `tasks/todo.md`.
+- **Soundness claims and closing bar, stated up front:**
+  - a scip-java document is accepted only when every existing agreement check passes on what remains after removing the occurrences Lombok marks as generated (`@lombok.Generated`'s span, measured in probe P2), so no exact edge has a generated member as its source, target or anchor;
+  - a TypeScript interface-method `IMPLEMENTS` needs scip-typescript's own member relationship and the declared-clause walk (probe P1: scip-typescript relates interface methods, sub to super only, and interface types to nothing);
+  - workspace grouping (a root lockfile and an allow-list of glob forms) changes only which job indexes a project, and a job exports exactly its root plus in-repository link targets, all in its cache key;
+  - the budget flags never change an index (measured), and a threaded Maven build has its own cache key;
+  - `rb serve` writes nothing before its bind check.
+
+  Residue per claim (generated members' callers stay unanchored; builds without the marker stay rejected; pnpm, Yarn ≥ 2 and Yarn links stay as today). Pass 1 full, pass 2 verification-only.
+- **Decided in the contract:** D1 Lombok's marker as the only identification, removal before the unchanged checks; D3 new counters only when non-zero (invariant 1 on every unrelated dump); D4 the TypeScript interface waiver gated by a phase-0 directionality measurement; D5 workspace membership; D6 root fetch; D7 repository-shaped exports with link targets; D8 per-indexer recipes (Java's key unchanged, so cached Java indexes stay valid); D9 host-side budget flags; D10 the start-up order; D11 measurement repositories (apache/shardingsphere and mattermost/mattermost at M5's pins, a second Lombok repository by rule); D12 every M5 open item's target.
+- **Forks for the orchestrator:** F1 gin groups in M6b (recommended) vs M6a; F2 open item 5 in M6a with a decided fallback; F3 the TypeScript interface waiver; F4 threads and flags vs per-module jobs; F5 no nodes for generated members; F6 the M6 split; F7 git hosts for mattermost's measurement from the indexing host only.
+- **New dependencies:** none. No migration.

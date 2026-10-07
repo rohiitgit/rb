@@ -777,6 +777,87 @@ Same rules as M4b:
 - [x] Evaluator pass 2 (verification only, against `5cb1a2c`): Z1–Z7 repros and controls end to end (Z2's lock + `kill -9` twice, healed by `rb serve` and by the next publish), 12 mutants of amendment 16 from a clean build (12 killed), `verify.sh` twice green, invariant 1 (fixtures = phase 20; spring-petclinic: the one S19 (d) row against `afae548`), fresh == cached on spring-petclinic and both benchmark repositories (each equal to its phase-17 dump), API ≡ CLI on 29 own sets, no host paths, docs vs code (N1, N2: non-blocking, open items 24, 25).
 - [x] M5 closed 2026-10-07 (contract amendment 17: final S1–S28/invariant table, review history of passes 1–2, §12.5 summary, open items by milestone with the M6 review list and item 22); design §13, README, IMPLEMENT.md, CHANGELOG updated.
 
-# M6 Breadth (design §13)
+# M6 Breadth (design §13: split into M6a–M6j)
 
-- [ ] Not started. Scope in design §13, plus the items M4b and M5 moved there (contract-m5 amendment 17: open items 1–14, 17–20, 22, 24, 25). Its contract is written first.
+- [x] Split planned (2026-10-07): design §13 has one row per sub-milestone (scope and exit criteria) and a "deferred beyond M6, or dropped" row; every item design §13's M6 row, contract-m4b and contract-m5 (amendment 17) moved to M6 is assigned there (contract-m6a D12 restates contract-m5's items).
+- [x] M6a contract written (2026-10-07): `tasks/contract-m6a.md`: soundness claims and closing bar up front; S1–S20, invariants 1–11, D1–D12, forks F1–F7; planner probes P1 (scip-typescript interface relationships) and P2 (scip-java on Lombok) recorded. Not started.
+
+## M6a phases (contract `tasks/contract-m6a.md`)
+
+Same rules as M5:
+- Each phase has at most 5 hand-edited source files. Fixture sources, blessed goldens and guard data are listed separately in the changelog and reviewed on their own.
+- Each phase is test-first: the new units fail, or do not compile, before the change (the failure recorded).
+- Each phase ends with its verification step: fmt, `clippy --workspace --all-targets -D warnings`, the touched crates' unit tests counted from a log holding both streams (`> log 2>&1`), and the e2e suite with `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb` (with containers wherever the phase touches SCIP: `docker image inspect` first, no `skipping:`).
+- Any golden that changes gets a classified line diff before `RB_BLESS=1`; any dump change is classified L, T or W (contract invariant 1).
+- Mutation runs follow M4a's harness rules: fresh mtime, restored bytes checked, a `test result:` line per mutant, stopped with SIGINT, `"$@"`, `command -v` for every tool.
+- Environment: never `npm`/`npx` on the host (lockfiles are generated inside the pinned scip-typescript image); Docker context `desktop-linux`; no image pull (none is needed); `df` before every build, clone and container step, floor 6 GiB for large-repository steps and 2 GiB otherwise; one-off builds use a `CARGO_TARGET_DIR` under the scratchpad, removed afterwards; disk figures accounted part by part in MiB.
+
+`PIPELINE` becomes `m6a-1` in phase 2, `m6a-2` in phase 4, `m6a-3` in phase 6. `RECIPE` is split in phase 6 (`RECIPE_JAVA` unchanged, `RECIPE_TS` `m6a-ts-1`).
+
+- [ ] **0. Preflight** (no code).
+  - Read the contract (soundness section first), `tasks/lessons.md`, contract-m5 amendment 17 and its open items.
+  - `df`, `docker context show`, `docker image inspect` for `rb-scip-java:0.13.1`, the scip-typescript digest and `rb-egress-proxy:1.11.3`; `var/m6a/{scripts,phase0,base,bench,logs}`; `verify.sh` from M5's with M6a paths.
+  - Build the `cfa8ab9` release binary in a scratch target directory (`var/m6a/base/rb-cfa8ab9`, sha256 recorded); dump the three fixtures `--no-scip` and with SCIP (the e2e's fixed identity and date): the invariant-1 baseline.
+  - P1b (D4's form table) and P2b (the Lombok annotation matrix, S2's shadow file, `lombok.addLombokGeneratedAnnotation = false`) with the images present, `--network none` for P1b and a scratch `.m2` for P2b; raw relationships and positions recorded; P1b's super→sub count (0 or stop: F3).
+  - The layout check of S10 (a scratch build with only the repository-shaped export; `ts-express-prisma` and `polyglot-monorepo` SCIP dumps vs the baseline) and the `npm ci` link-target check (F2's fallback).
+  - The second Lombok repository by D11's rule (GitHub API sizes, pom read, one fetch attempt); D5's glob forms counted on mattermost's and the candidates' manifests; the largest `--scip-memory` the VM holds beside Postgres.
+  - **Verify:** the contract gains "Checked in phase 0" with every finding and its source; a deviation from a decision is an amendment before code.
+- [ ] **1. `rb serve` start-up order and the two-repository sweep** (S14, S15; D10).
+  - Files: `rb-cli/src/main.rs`, `rb-store/src/db_tests.rs`, `rb-cli/tests/e2e.rs`.
+  - **Verify:** S14's e2e fails first (the refused start sweeps); the "first repository only" mutant is killed by the `rb-store` test alone; loop green.
+- [ ] **2. Lombok removal and counters** (S1, S2 units, S3; D1–D3; `PIPELINE` `m6a-1`).
+  - *Derived:* marker spans per scip-java document; removed occurrences; `lombok_removed`, `documents_lombok` (written only when non-zero).
+  - *Invariants:* 2, 3; S1 (i) over every fixture document.
+  - Files: `rb-indexer/src/scip.rs`, `rb-indexer/src/lib.rs` (coverage JSON), `rb-cli/src/main.rs` (status line).
+  - **Verify:** S1 (a)–(e) fail first; the four S1 mutations killed; fixture dumps and SCIP goldens unchanged.
+- [ ] **3. `java-lombok` fixture** (S2 end to end, S4).
+  - Fixture sources per the contract's fixture plan (checked against Java's file rules first); goldens predicted from P2b before blessing.
+  - Files: `rb-cli/tests/e2e.rs`, `fixtures/README.md` (plus the fixture sources and goldens).
+  - **Verify:** `scip_java_lombok` with containers, no `skipping:`; the removal-off mutant fails the status golden and the must-exist list; fresh == cached.
+- [ ] **4. TypeScript interface-method `IMPLEMENTS`** (S5–S7; D4; `PIPELINE` `m6a-2`). Only if P1b found no super→sub relationship.
+  - Files: `rb-indexer/src/scip.rs`.
+  - **Verify:** S5's positive rows fail first; the waiver-on-Java mutant killed by the amendment-78 unit; Java SCIP goldens unchanged.
+- [ ] **5. Workspace membership** (S8; D5).
+  - *Derived:* the job list from the file list and the root manifests; ungrouped reasons.
+  - Files: `rb-scip/src/jobs.rs`, `rb-scip/src/lib.rs`, `rb-indexer/src/projects.rs` (manifest reader).
+  - **Verify:** S8's rows; the two mutations killed; `polyglot-monorepo`'s jobs unchanged (unit and SCIP golden).
+- [ ] **6. Workspace fetch and index; per-indexer recipes** (S9; D6, D8; `PIPELINE` `m6a-3`, `RECIPE_TS` `m6a-ts-1`).
+  - Files: `rb-scip/src/orchestrate.rs`, `rb-scip/src/hash.rs`, `rb-scip/src/jobs.rs`, `rb-indexer/src/projects.rs`.
+  - **Verify:** the pinned Java hash equals `cfa8ab9`'s; argv units; e2e SCIP goldens unchanged except rows classified W.
+- [ ] **7. Repository-shaped export and link targets** (S10; D7).
+  - Files: `rb-scip/src/orchestrate.rs`, `rb-scip/src/runner.rs` (working directory apart from the mount), `rb-scip/src/hash.rs`, `rb-indexer/src/projects.rs`, `rb-indexer/src/scip.rs` (`documents_outside_root`).
+  - **Verify:** S10's units; the layout leaves the TypeScript fixtures' SCIP dumps unchanged (phase 0's check repeated on the real change).
+- [ ] **8. `ts-workspaces` fixture** (S11).
+  - Lockfiles generated inside the scip-typescript image (`--network none`), the command recorded in `fixtures/README.md`.
+  - Files: `rb-cli/tests/e2e.rs`, `fixtures/README.md` (plus the fixture sources and goldens).
+  - **Verify:** `scip_ts_workspaces` with containers; the fetch from an emptied per-repository cache twice gives the same stored output; fresh == cached.
+- [ ] **9. Budget flags** (S12; D9).
+  - Files: `rb-cli/src/main.rs`, `rb-scip/src/orchestrate.rs`, `rb-scip/src/hash.rs`, `README.md`.
+  - **Verify:** default argv equals `cfa8ab9`'s for every phase (unit); bounds rows; the threaded key differs.
+- [ ] **10. shardingsphere: Lombok and the reactor** (S13, S16; no code).
+  - `cargo clean`; release binary copied out; `df` ≥ 6 GiB; shallow fetch of the pin.
+  - `cfa8ab9` binary SCIP fresh (baseline, fills the cache) → M6a binary cached (S16 after) → M6a threaded fresh ×2 (S13); `--no-scip` with both binaries (invariant 1).
+  - Every remaining rejected document classified; 40 sampled exact `CALLS` read; clean-up and disk accounted.
+  - **Verify:** S13's three dumps identical (or D9's withdrawal amendment); S16's records complete.
+- [ ] **11. Second Lombok repository and mattermost** (S16, S17; no code).
+  - 11a: the second Lombok repository (`cfa8ab9` fresh, M6a cached).
+  - 11b: mattermost `cfa8ab9` SCIP fresh and M6a SCIP fresh (default allow-list; F7's extra run only if the grouped fetch fails on git hosts alone); every interface-method `IMPLEMENTS` read; the 56 clauses accounted for.
+  - **Verify:** fresh == cached on each; records complete; clean-up and disk accounted.
+- [ ] **12. Records** (S18–S20; no code except the classifier script under `var/`).
+  - Invariant 1: every fixture and measurement-repository dump against the phase-0 baseline, every row classified L, T or W by `var/m6a/scripts/classify.py`; the growth tests (S19) present in the suite.
+  - Design §5.2 (budget flags, workspace jobs, export layout), §5.3 (D1, D4) and §13 (M6a built, pending evaluator); README (flags, workspaces, Lombok coverage line); open items with their sub-milestone.
+  - **Verify:** `verify.sh` green; then evaluator pass 1 (full review), fixes test-first as amendments, evaluator pass 2 (verification only).
+  - Commit after each verified phase.
+
+## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
+
+- [ ] M6b Request-path precision (gin groups as parameters, Express construction chains, in-process Go requests and empty URLs, axios configurations, constructor-assigned members, user information with a hole, S19's over-capping, TypeScript client breadth).
+- [ ] M6c DI, RTA and orphan precision (registrants, gate M on main sources, RTA yield, module roles and objects, rule (e), autowired non-beans, inherited Spring Data methods, Lombok qualifiers, generics and custom qualifiers).
+- [ ] M6d Go and Python SCIP (scip-go image built locally, scip-python pinned by digest after measuring, fetch phases behind the proxy, Go/Python fixtures, the adversarial egress review).
+- [ ] M6e Build and lockfile breadth (Gradle, pnpm/Yarn lockfiles and workspaces, `go.work`, Maven classifiers, tsconfig include/exclude, source encoding).
+- [ ] M6f Contract packs (OpenAPI, gRPC, generated interfaces, MyBatis XML).
+- [ ] M6g Topology and configuration packs (message topics, gateways, compose/k8s hosts, Spring YAML and active profiles).
+- [ ] M6h Architecture rules as a CI gate (`rb check` in Cypher).
+- [ ] M6i Kotlin and C# syntax.
+- [ ] M6j DI breadth (Guice, Dagger, NestJS, Spring XML and Kotlin beans, .NET over Tier B).
+- Deferred beyond M6: scip-clang, `rust-analyzer scip`, scip-dotnet, the SCIP incremental below a single-root reactor, authentication/remote binding/`POST …/index` and move detection (only if asked for). Dropped: Groovy registrants.
