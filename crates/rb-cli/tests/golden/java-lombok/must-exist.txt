@@ -1,0 +1,10 @@
+# Precision guards for the java-lombok fixture (contract M6a S4), checked against the SCIP dump.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# Exact calls between hand-written members of documents D1 accepted.
+CALLS scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Use#run(). -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#greet(). [exact]
+CALLS scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#greet(). -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#helper(). [exact]
+CALLS scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Use#run(). -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Money#plus(). [exact]
+# S2: the generated Named#getName() is defined at Explicit's name; Explicit keeps its own key.
+CALLS scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Shadow#run(). -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Explicit#getName(). [exact]
+# S1 (f): a hand-written method annotated @lombok.Generated stays.
+CALLS scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Marked#use(). -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Marked#value(). [exact]

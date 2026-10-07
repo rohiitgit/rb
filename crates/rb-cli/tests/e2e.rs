@@ -3391,6 +3391,74 @@ fn scip_java_spring_jpa() {
     assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
 }
 
+/// Contract M6a S2, S4: the Lombok fixture, built by scip-java with Lombok 1.18.34 fetched from
+/// Maven Central through the egress proxy. Every document is accepted once D1 removes the
+/// generated occurrences (the status golden carries `documents rejected 0` and the
+/// `lombok-generated` count); the hand-written calls are exact (must-exist), no edge targets a
+/// generated member (must-not-exist), every code edge of the project is exact, and the call
+/// through `new Explicit()` resolves to `Explicit`'s own definition although scip-java defines
+/// `Named`'s generated getter at the same name (S2). Fresh, cached and `--no-cache` runs dump
+/// identically. Needs Docker, the image and the network on a cold Maven cache.
+#[test]
+fn scip_java_lombok() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "java-lombok";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_sciplombok_{}", std::process::id());
+    let other = format!("t_sciplombok2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!("scip_java_lombok: first index {:.1?}", started.elapsed());
+    assert!(first.contains("scip: . scip-java ok"), "{first}");
+    // The guards are evaluated before the status golden and printed, so a run without D1
+    // shows both the rejections and the missing edges.
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!("scip_java_lombok guard failures:\n{}", failures.join("\n"));
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-greet.txt",
+        &rb(&url, &["callers", "User.greet", "--repo", &name]),
+    );
+    let package = "scip-java maven maven/com.acme/lombok-demo 1.0.0 ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "src/", ".") >= 5,
+        "{dump}"
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("scip: . scip-java ok (cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        fresh.contains("scip: . scip-java ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    // Another repository name for the same commit dumps identically (contract M6a S18).
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 /// Contract M3b S10 and invariant 4: a monorepo mixing a Maven project that indexes, one that
 /// fails to build on purpose (`services/broken`), and TypeScript packages. `rb index` succeeds,
 /// the failed project keeps its stderr tail and stays heuristic, the others are exact.

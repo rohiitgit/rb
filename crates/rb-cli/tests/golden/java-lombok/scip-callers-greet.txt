@@ -1,0 +1,4 @@
+callers of com/acme/lombok/User#greet().  src/main/java/com/acme/lombok/User.java:14  [lombok-demo]
+precision=cha
+  com/acme/lombok/Use#run().  src/main/java/com/acme/lombok/Use.java:4  [lombok-demo]  exact
+certainty: exact 1

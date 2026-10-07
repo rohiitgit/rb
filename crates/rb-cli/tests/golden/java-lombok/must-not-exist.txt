@@ -1,0 +1,25 @@
+# Precision guards for the java-lombok fixture (contract M6a S4), checked against the SCIP dump.
+# No code edge has a Lombok-generated member as its target (they are not nodes: fork F5).
+CALLS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Named#getName().
+REFERENCES * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Named#getName().
+IMPLEMENTS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Named#getName().
+CALLS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#getName().
+REFERENCES * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#getName().
+IMPLEMENTS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#getName().
+CALLS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#setName().
+REFERENCES * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#setName().
+IMPLEMENTS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/User#setName().
+CALLS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Account#getId().
+REFERENCES * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Account#getId().
+IMPLEMENTS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Account#getId().
+CALLS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Account#setId().
+REFERENCES * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Account#setId().
+IMPLEMENTS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Account#setId().
+CALLS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Money#builder().
+REFERENCES * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Money#builder().
+IMPLEMENTS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Money#builder().
+CALLS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Money#withAmount().
+REFERENCES * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Money#withAmount().
+IMPLEMENTS * -> scip-java maven maven/com.acme/lombok-demo 1.0.0 com/acme/lombok/Money#withAmount().
+# Every code edge of the project is exact: no heuristic call remains in an accepted document.
+CALLS * -> * [heuristic]

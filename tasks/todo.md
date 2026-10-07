@@ -810,7 +810,7 @@ Same rules as M5:
   - *Invariants:* 2, 3; S1 (i) over every fixture document.
   - Files: `rb-indexer/src/scip.rs`, `rb-indexer/src/lib.rs` (coverage JSON), `rb-cli/src/main.rs` (status line).
   - **Verify:** S1 (a)–(e) fail first; the four S1 mutations killed; fixture dumps and SCIP goldens unchanged.
-- [ ] **3. `java-lombok` fixture** (S2 end to end, S4).
+- [x] **3. `java-lombok` fixture** (S2 end to end, S4). Done 2026-10-07: fixture checked against Java's file rules (one public type per file; `Named`/`Explicit` package-private in `Shadow.java`); `scip_java_lombok` with containers (Lombok fetched through the proxy), no `skipping`; `lombok-generated 234 in 6 documents` equals `var/m6a/scripts/p2b_check.py` on the real index; removal-off mutant fails the guards and the status golden; fresh == cached == `--no-cache` == a second name.
   - Fixture sources per the contract's fixture plan (checked against Java's file rules first); goldens predicted from P2b before blessing.
   - Files: `rb-cli/tests/e2e.rs`, `fixtures/README.md` (plus the fixture sources and goldens).
   - **Verify:** `scip_java_lombok` with containers, no `skipping:`; the removal-off mutant fails the status golden and the must-exist list; fresh == cached.

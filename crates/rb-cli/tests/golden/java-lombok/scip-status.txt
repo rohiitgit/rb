@@ -1,0 +1,2 @@
+  code: no heuristic references to own code (0 external); 9 exact calls (scip)
+  scip: . scip-java ok, definitions matched 19/19 (0 by name), definitions without occurrence 0, references matched 9, external 0, undocumented 13, local 0, unanchored 6, unmatched 0, unconverted 0, documents rejected 0, lombok-generated 234 in 6 documents, relationships dropped 10 (0 in project, 0 anonymous)
