@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026-10-07] (wall clock) M5 phase 16: benchmark set-up (S23)
+- **No code.** Contract amendment 13 and the new "Benchmark measurements" section (hardware of record, S23's table).
+- **Pins** (amendment 1) fetched with `git fetch --depth 1 origin <sha>` under `var/m5/bench/`, one repository at a time: apache/shardingsphere @ `b09dfffcf9e5` (clone 335 MiB) and mattermost/mattermost @ `b2ce71db9c18` (782 MiB; counted, then removed until its turn).
+- **Counted lines** (`git ls-files` by extension, blank lines excluded): shardingsphere 720,005 (Java 708,960; Python 8,123; JS 2,922), below S23's "about 1 M" (the bytes/33 estimate over-counted Java); mattermost 1,698,802 (Go 818,222; TS 793,519; JS 85,891; Python 1,170). Build roots: Maven (446 `pom.xml`, `mvnw`); npm (15 `package.json`, 6 locks, `webapp/` a workspace root) and Go (8 `go.mod`).
+- **Binary of record:** `17410d7` built `--release` (1 min 25 s from a clean `target/`), sha256 `65cc11fe…8d70d`. Disk 16 GiB free after the build and the first clone.
+- Files: `tasks/{contract-m5,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-07] (wall clock) M5 phase 15: fetch-phase egress and per-repository caches (S21, S22)
 - **Proxy image** (`docker/egress-proxy/`, F2's constraint): the local Alpine 3.24.2 base by digest plus `tinyproxy=1.11.3-r0`, run as `tinyproxy`; built `rb-egress-proxy:1.11.3`, ID `sha256:9e2f31c4e334fb7870d4cdbc86f82d86c22dc7a6c0730884d2acdc09dd62c035`, 13,831,923 bytes. No image was pulled.
 - **`rb_scip::egress`** (new): `Egress` (the built-in allow-list `repo.maven.apache.org`, `repo1.maven.org`, `registry.npmjs.org`, `registry.yarnpkg.com` plus validated extra hosts), the tinyproxy configuration (`FilterDefaultDeny Yes`, `FilterURLs On`, `FilterType fnmatch`, `ConnectPort 443`, `LogLevel Connect`) and filter (`host:443` lines), Maven's `settings.xml`, the proxy environment for npm/Yarn/pnpm, and the refusals read from the proxy's log.
