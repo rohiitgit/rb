@@ -834,20 +834,16 @@ Same rules as M5:
 - [x] **9. Budget flags** (S12; D9). Done 2026-10-07: `--scip-cpus`/`--scip-memory`/`--scip-maven-threads` (env `RB_SCIP_*`), `Budget::maven_threads`, `-T n` on every Maven invocation of both phases only for n > 1, Java recipe `+T<n>`; default argv of the Java phases and a TypeScript root job pinned to `cfa8ab9`'s (recorded from that code); 4 mutants killed; README; fixture dumps byte-identical.
   - Files: `rb-cli/src/main.rs`, `rb-scip/src/orchestrate.rs`, `rb-scip/src/hash.rs`, `README.md`.
   - **Verify:** default argv equals `cfa8ab9`'s for every phase (unit); bounds rows; the threaded key differs.
-- [ ] **10. shardingsphere: Lombok and the reactor** (S13, S16; no code).
-  - `cargo clean`; release binary copied out; `df` ≥ 6 GiB; shallow fetch of the pin.
-  - `cfa8ab9` binary SCIP fresh (baseline, fills the cache) → M6a binary cached (S16 after) → M6a threaded fresh ×2 (S13); `--no-scip` with both binaries (invariant 1).
-  - Every remaining rejected document classified; 40 sampled exact `CALLS` read; clean-up and disk accounted.
-  - **Verify:** S13's three dumps identical (or D9's withdrawal amendment); S16's records complete.
-- [ ] **11. Second Lombok repository and mattermost** (S16, S17; no code).
-  - 11a: the second Lombok repository (`cfa8ab9` fresh, M6a cached).
-  - 11b: mattermost `cfa8ab9` SCIP fresh and M6a SCIP fresh (default allow-list; F7's extra run only if the grouped fetch fails on git hosts alone); every interface-method `IMPLEMENTS` read; the 56 clauses accounted for.
-  - **Verify:** fresh == cached on each; records complete; clean-up and disk accounted.
-- [ ] **12. Records** (S18–S20; no code except the classifier script under `var/`).
-  - Invariant 1: every fixture and measurement-repository dump against the phase-0 baseline, every row classified L, T or W by `var/m6a/scripts/classify.py`; the growth tests (S19) present in the suite.
-  - Design §5.2 (budget flags, workspace jobs, export layout), §5.3 (D1, D4) and §13 (M6a built, pending evaluator); README (flags, workspaces, Lombok coverage line); open items with their sub-milestone.
-  - **Verify:** `verify.sh` green; then evaluator pass 1 (full review), fixes test-first as amendments, evaluator pass 2 (verification only).
-  - Commit after each verified phase.
+- [x] **10. shardingsphere: Lombok and the reactor** (S13, S16; no code). Done 2026-10-09: base SCIP fresh wall 3062.77s (`ok` 2950.5s) → M6a cached 72.7s (rejected 0, 107,101 removals in 3,951 docs); newly accepted 3,889 / rejected 0; 40/40 sample read in source. Threaded ×2 fresh (`-T4`): both `failed (index phase)` identically modulo the allowed `stderr_tail` row → flag stays (D9). `--no-scip` pair byte-identical (74214/233242). Oct-7 attempt died at the floor under load 43; retry under load ~4 completed.
+  - **Verify:** S13 three dumps identical modulo `stderr_tail` (or D9 withdrawal — not needed); S16 records complete.
+- [x] **11. Second Lombok repository and mattermost** (S16, S17; no code). Done 2026-10-09.
+  - 11a eladmin: Lombok 1.18.30 unmarked (residue); base fresh == M6a cached == M6a fresh, byte-identical.
+  - 11b mattermost: base 11 jobs/4 ok → M6a 5 jobs/3 ok, 4 ok with `--scip-registries` (F7 both outcomes; cypress git+ssh ok 57.4s); webapp `EBADENGINE` (new residue → M6e); interface `IMPLEMENTS` sets identical (T = 0; 55 clauses all in unindexed webapp); full row accounting UNACCOUNTED 0.
+  - **Verify:** fresh == cached on each (eladmin 3-way, mattermost `--no-cache --force`); records complete.
+- [x] **12. Records** (S18–S20; no code except classifier scripts under `var/`). Done 2026-10-09.
+  - Invariant 1: fixtures `--no-scip` identical except `ts-workspaces` (3 amendment-7 W rows); SCIP identical except `java-lombok` (L-only) and `ts-workspaces` (T+W-only); measurement repos per S16–S18 notes; D7 quadratic mutant bites (D1/D5 logged).
+  - Contract amendments 8–11 + measurement section; CHANGELOG; IMPLEMENT.md; design §13 (M6a measured, webapp-engines → M6e); lessons (4); this todo.
+  - **Verify:** `verify.sh p10-12` green (674/66/12/32/1, no `skipping:`); then evaluator pass 1 (full review), fixes test-first as amendments, evaluator pass 2 (verification only).
 
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 

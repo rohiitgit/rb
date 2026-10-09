@@ -277,3 +277,19 @@
 ## 2026-10-07: a test step that depends on a side effect of a run must not assume the run happened
 - **Mistake (caught by the verify loop, M6a phase 8):** `scip_ts_workspaces` deleted the per-repository package cache with `remove_dir_all(...).unwrap()` before its cold fetch. Alone it passed (the first index ran a container, which created the cache); in the full suite the first index was served from the database's index cache (rows outlive test runs), no fetch ran, the directory did not exist, and the test panicked.
 - **Rule:** when a test manipulates state that only a non-cached run creates (a package cache, a work directory, a container), make the step idempotent (`exists()` before removing) and force the run that must happen (`--no-cache`), then run the test once warm and once from an emptied database cache before blessing.
+
+## 2026-10-09: a background bench run must outlive the tool call that started it
+- **Mistake:** a ~31 min `rb index` was started in background with `&` at the end of a command whose tail (`sleep 5; cat …`) kept the tool call alive past its 60 s timeout; the timeout killed the whole process group, the run died 90 s in, and its watchdog exited silently (its `.armed` file already existed). A relaunch attempt then failed invisibly (`setsid` does not exist on macOS) and its watchdog exited at once (stale `.armed`).
+- **Rule:** start long runs with `nohup … & disown`, delete any stale guard files (`.armed`) first, and return from the starting call immediately (no trailing sleep); verify liveness from a later call (`tail` of the watch log, `ps`, container list). Never let a starting call run into its timeout. Check for the platform's detachment primitives (`setsid` is Linux-only) before relying on them.
+
+## 2026-10-09: an indexer's marker behaviour is per version, measured per version
+- **Mistake (caught by measuring):** the Lombok marker rule was probed on 1.18.34 only; the second measurement repository resolves 1.18.30, whose index holds zero `lombok/Generated#` occurrences, so D1 removed nothing there. Had the phase assumed "Lombok marks", the zero would have read as a removal bug.
+- **Rule:** when a rule depends on a tool's emitted metadata, check the metadata's presence in every measured index (bytewise symbol search of the cached row) before interpreting a zero count, and record the producing versions (here: 1.18.30 unmarked, 1.18.34/1.18.44 marked). A zero with absent metadata is the residue case, not a failure.
+
+## 2026-10-09: a cached failure replays; a second fresh execution needs `--no-cache --force`
+- **Mistake (caught before recording):** the second threaded shardingsphere run finished in 24 s with the first run's failure: `failed` outcomes are cached (only `stderr_tail` may vary), so a plain rerun proves the cache, not the build. Determinism of the failure itself needed `--no-cache --force` (22 min), which reproduced it row-for-row.
+- **Rule:** when the claim is "two fresh runs agree", force both past the cache (`--no-cache --force` into distinct repositories); a cache-hit rerun only proves replay. Name which run was fresh in the record.
+
+## 2026-10-09: host load is part of the disk profile, not just headroom
+- **Mistake (measured):** the Oct-7 shardingsphere fetch died at the 6.1 GiB floor from 16.4 GiB under load 43; the identical run from 16.1 GiB under load ~4 completed with the floor never below 10.5 GiB. Free space alone did not explain the first death (macOS swap under memory pressure shares the same APFS pool).
+- **Rule:** a large-repository run's preconditions are headroom AND load: record both in every `.meta`, refuse to start a 30 min run above ~15 load, and never attribute a floor kill to downloads without the load line.
