@@ -64,6 +64,104 @@ pub(crate) fn bindings<'t>(
     out
 }
 
+/// A member write before its enclosing definition is resolved (contract M6b S1).
+pub(crate) struct RawMemberWrite<'t> {
+    pub member: String,
+    pub value: Node<'t>,
+    pub node: Node<'t>,
+    pub ctor: bool,
+}
+
+/// Every `this.x = <value>` write (TS/JS `member_expression`, Java `field_access` on
+/// `this`), in source order. Any right-hand side counts as a write (compound
+/// assignments included: they read and write); the value summary is resolved by the
+/// caller. Bare-field writes (`x = …`) are not members: they may be locals.
+pub(crate) fn member_writes<'t>(
+    language: Language,
+    root: Node<'t>,
+    source: &[u8],
+) -> Vec<RawMemberWrite<'t>> {
+    if !matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Java
+    ) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        // `=` and compound assignments (`+=`, `||=`, `??=`): every kind reads and
+        // writes, so every kind counts for single-assignment.
+        if (node.kind() == "assignment_expression"
+            || node.kind() == "augmented_assignment_expression")
+            && let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+        {
+            let member = match language {
+                Language::Java => (left.kind() == "field_access"
+                    && left
+                        .child_by_field_name("object")
+                        .is_some_and(|o| o.kind() == "this"))
+                .then(|| left.child_by_field_name("field"))
+                .flatten()
+                .filter(|n| n.kind() == "identifier"),
+                _ => (left.kind() == "member_expression"
+                    && left
+                        .child_by_field_name("object")
+                        .is_some_and(|o| o.kind() == "this"))
+                .then(|| left.child_by_field_name("property"))
+                .flatten()
+                .filter(|n| n.kind() == "property_identifier"),
+            };
+            if let Some(name) = member {
+                out.push(RawMemberWrite {
+                    member: text(name, source),
+                    value: right,
+                    ctor: in_constructor(node, source),
+                    node,
+                });
+            }
+        }
+        let mut c = node.walk();
+        let children: Vec<Node<'t>> = node.children(&mut c).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    out
+}
+
+/// Whether `node` sits directly in a constructor: the nearest enclosing function-like
+/// node is a `method_definition` named `constructor` (TS/JS) or a
+/// `constructor_declaration` (Java). A write inside a nested function is not one: the
+/// callback may run after construction (the safe direction for single-assignment).
+fn in_constructor(node: Node<'_>, source: &[u8]) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "constructor_declaration" => return true,
+            "method_definition" => {
+                return n
+                    .child_by_field_name("name")
+                    .is_some_and(|name| text(name, source) == "constructor");
+            }
+            "function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "arrow_function"
+            | "function_definition"
+            | "method_declaration"
+            | "lambda_expression"
+            | "function_literal"
+            | "func_literal" => return false,
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    false
+}
+
 /// Node kinds that end a declaration's visibility: the nearest such ancestor of the declaring
 /// node. Python names are function-scoped; blocks are listed for the other languages.
 fn scope_kinds(language: Language) -> &'static [&'static str] {
@@ -1278,6 +1376,156 @@ mod tests {
                 format!("{} = {init}{constant}", b.name)
             })
             .collect()
+    }
+
+    /// `member = <value> @<enclosing-def-start-line>[!]`, in source order: every
+    /// `this.x` write (contract M6b S1). `!` marks a constructor write. Spans are
+    /// asserted separately (below), with needles derived from the source.
+    fn write_rows(language: Language, src: &str) -> Vec<String> {
+        fn template(t: &crate::StrTemplate) -> String {
+            let parts: Vec<String> = t
+                .parts
+                .iter()
+                .map(|p| match p {
+                    crate::TemplatePart::Lit { text } => text.clone(),
+                    crate::TemplatePart::Hole { expr, .. } => format!("{{{expr}}}"),
+                })
+                .collect();
+            format!("'{}'", parts.join(""))
+        }
+        let facts = extract(language, src.as_bytes()).unwrap();
+        facts
+            .member_writes
+            .iter()
+            .map(|w| {
+                let value = match &w.value {
+                    None => "-".to_owned(),
+                    Some(crate::Init::Template { template: t }) => template(t),
+                    Some(crate::Init::Name { text, .. }) => format!("name {text}"),
+                    Some(crate::Init::Call { chain }) => {
+                        let c = &facts.chains[*chain];
+                        let links: Vec<&str> = c.links.iter().map(|l| l.name.as_str()).collect();
+                        format!(
+                            "call {}{}",
+                            c.root
+                                .as_deref()
+                                .map(|r| format!("{r}."))
+                                .unwrap_or_default(),
+                            links.join(".")
+                        )
+                    }
+                    Some(_) => "other".to_owned(),
+                };
+                let enclosing = w
+                    .enclosing
+                    .map(|i| facts.definitions[i].span[0].to_string())
+                    .unwrap_or_else(|| "-".to_owned());
+                let ctor = if w.ctor { "!" } else { "" };
+                format!("{} = {value} @{enclosing}{ctor}", w.member)
+            })
+            .collect()
+    }
+
+    /// Spans of `facts.member_writes`, in source order.
+    fn write_spans(language: Language, src: &str) -> Vec<crate::Span> {
+        extract(language, src.as_bytes())
+            .unwrap()
+            .member_writes
+            .iter()
+            .map(|w| w.span)
+            .collect()
+    }
+
+    /// The span of the `occurrence`th line holding the full assignment `needle`
+    /// (needles are single-line): `[start_row, start_col, end_row, end_col]`.
+    fn span_of(src: &str, needle: &str, occurrence: usize) -> crate::Span {
+        let mut seen = 0;
+        for (row, line) in src.split('\n').enumerate() {
+            let mut from = 0;
+            while let Some(at) = line[from..].find(needle) {
+                if seen == occurrence {
+                    let col = (from + at) as i32;
+                    return [row as i32, col, row as i32, col + needle.len() as i32];
+                }
+                seen += 1;
+                from += at + 1;
+            }
+        }
+        panic!("needle {needle:?} occurrence {occurrence} not in source");
+    }
+
+    #[test]
+    fn typescript_member_writes_cover_every_right_hand_side() {
+        let src = "class C {\n  constructor(base: string) {\n    this.svc = `${base}/x`;\n  }\n  reset(s: string) {\n    this.svc = s;\n    this.n = 1;\n    this.m = make(s);\n  }\n}\n";
+        // TypeScript constructors are not definitions (their parameters sit in the
+        // class), so the constructor write is class-enclosed; `!` still marks it.
+        assert_eq!(
+            write_rows(Language::TypeScript, src),
+            [
+                "svc = '{base}/x' @0!",
+                "svc = name s @4",
+                "n = - @4",
+                "m = call make @4",
+            ]
+        );
+        assert_eq!(
+            write_spans(Language::TypeScript, src),
+            [
+                span_of(src, "this.svc = `${base}/x`", 0),
+                span_of(src, "this.svc = s", 0),
+                span_of(src, "this.n = 1", 0),
+                span_of(src, "this.m = make(s)", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn typescript_member_write_shapes_that_are_not_members() {
+        let src =
+            "class C {\n  go(o: O) {\n    o.x = 1;\n    this.x += 1;\n    this.a.b = 2;\n  }\n}\n";
+        // `o.x` is not on `this`; `this.a.b` writes `b`, not a member of `this`.
+        // `+=` still writes `x` (a read and a write: the safe direction for counting).
+        assert_eq!(write_rows(Language::TypeScript, src), ["x = - @1"]);
+        assert_eq!(
+            write_spans(Language::TypeScript, src),
+            [span_of(src, "this.x += 1", 0)]
+        );
+    }
+
+    #[test]
+    fn java_member_writes_and_skipped_shapes() {
+        let src = "class C {\n  String s;\n  C(String b) {\n    this.s = b;\n  }\n  void m() {\n    this.s = \"x\";\n    helper = this.s;\n    s = \"y\";\n  }\n}\n";
+        // `helper = …` and the bare-field `s = …` are not member writes.
+        assert_eq!(
+            write_rows(Language::Java, src),
+            ["s = name b @2!", "s = 'x' @5"]
+        );
+        assert_eq!(
+            write_spans(Language::Java, src),
+            [
+                span_of(src, "this.s = b", 0),
+                span_of(src, "this.s = \"x\"", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn go_and_python_have_no_member_writes() {
+        assert!(
+            extract(Language::Go, b"package p\nfunc (c C) M() {\n\tc.x = 1\n}\n")
+                .unwrap()
+                .member_writes
+                .is_empty()
+        );
+        assert!(
+            extract(
+                Language::Python,
+                b"class C:\n\tdef m(self):\n\t\tself.x = 1\n"
+            )
+            .unwrap()
+            .member_writes
+            .is_empty()
+        );
     }
 
     #[test]

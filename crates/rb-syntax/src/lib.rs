@@ -393,6 +393,25 @@ pub enum Init {
     },
 }
 
+/// A member write `this.x = <value>` (TS/JS) or `this.x = <value>` (Java), in source
+/// order (contract M6b S1). The value is summarised as an initialiser when it has a
+/// foldable shape; `None` for anything else (still a write for single-assignment
+/// counting in phase 6). `enclosing` is the innermost definition (a constructor check
+/// reads its kind); writes in anonymous scopes resolve through `nearest_kept` like
+/// every other fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberWrite {
+    pub member: String,
+    pub value: Option<Init>,
+    pub enclosing: Option<usize>,
+    /// The write sits in a constructor: a TS/JS `method_definition` named `constructor`
+    /// or a Java `constructor_declaration` (TypeScript constructors are not definitions:
+    /// their parameters sit in the class, so the kind cannot be read back later).
+    #[serde(default)]
+    pub ctor: bool,
+    pub span: Span,
+}
+
 /// Everything extracted from one blob. Definitions are sorted by position (a Go method's parent
 /// may be a type declared later in the file).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -419,6 +438,9 @@ pub struct FileFacts {
     /// Outermost call expressions with their chained calls, in source order.
     #[serde(default)]
     pub chains: Vec<CallChain>,
+    /// Member writes `this.x = <value>` (TS/JS, Java), in source order (contract M6b S1).
+    #[serde(default)]
+    pub member_writes: Vec<MemberWrite>,
     /// Every token of a name that may hold a configured object, in source order (contract M4a
     /// amendment 14).
     #[serde(default)]
@@ -771,6 +793,17 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         package: imports::package(language, root, source),
         bindings,
         chains,
+        member_writes: bindings::member_writes(language, root, source)
+            .into_iter()
+            .map(|w| MemberWrite {
+                member: w.member,
+                value: calls::init(language, w.value, source, &chain_index),
+                enclosing: enclosing(w.node.start_byte(), &starts, &ends, &lexical_parent)
+                    .map(|i| nearest_kept(i, &kept, &lexical_parent)),
+                ctor: w.ctor,
+                span: span(w.node),
+            })
+            .collect(),
         name_tokens,
         default_export: imports::default_export(language, root, source),
         module_objects: imports::module_objects(language, root, source),
