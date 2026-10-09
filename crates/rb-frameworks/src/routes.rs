@@ -97,8 +97,10 @@ pub struct RouterDecl {
     pub kind: RouterKind,
     /// The binding's span (its identity in the file).
     pub span: Span,
-    /// Index into `FileFacts::bindings` of the binding ([`binding_identity`]).
-    pub binding: usize,
+    /// Index into `FileFacts::bindings` of the binding ([`binding_identity`]);
+    /// `None` for an anonymous default-exported construction, identified as
+    /// `{file}#default` (contract M6b S3).
+    pub binding: Option<usize>,
     /// Bound at the top level of the file, so other modules may import it.
     pub top_level: bool,
 }
@@ -590,11 +592,13 @@ fn express_names(facts: &FileFacts) -> ExpressNames {
 
 /// The router kind a binding's initialiser creates, if any.
 fn router_kind(names: &ExpressNames, chain: &CallChain) -> Option<RouterKind> {
-    let links: Vec<&str> = chain.links.iter().map(|l| l.name.as_str()).collect();
-    match (chain.root.as_deref(), links.as_slice()) {
-        (None, [f]) if names.module.contains(*f) => Some(RouterKind::App),
-        (None, [f]) if names.router.contains(*f) => Some(RouterKind::Router),
-        (Some(m), ["Router"]) if names.module.contains(m) => Some(RouterKind::Router),
+    // Only the first link decides: a construction followed by any links (`Router()`,
+    // `Router().use(…)`, `express()`) binds; the rest are mounts and routes on it.
+    let first = chain.links.first()?;
+    match (chain.root.as_deref(), first.name.as_str()) {
+        (None, f) if names.module.contains(f) => Some(RouterKind::App),
+        (None, f) if names.router.contains(f) => Some(RouterKind::Router),
+        (Some(m), "Router") if names.module.contains(m) => Some(RouterKind::Router),
         _ => None,
     }
 }
@@ -605,21 +609,47 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
         return;
     }
     let mut binding_router: HashMap<usize, usize> = HashMap::new(); // binding → router
+    // Init-chain span → router, so a chain-built binding's own links (`api.use(…)`)
+    // resolve to it below.
+    let mut chain_router: HashMap<Span, usize> = HashMap::new();
     for (bi, b) in facts.bindings.iter().enumerate() {
         if b.member {
             continue;
         }
-        if let Some(kind) = init_chain(facts, b).and_then(|c| router_kind(&names, c)) {
+        if let Some(chain) = init_chain(facts, b)
+            && let Some(kind) = router_kind(&names, chain)
+        {
+            chain_router.insert(chain.span, out.routers.len());
             binding_router.insert(bi, out.routers.len());
             out.routers.push(RouterDecl {
                 name: b.name.clone(),
                 kind,
                 span: b.span,
-                binding: bi,
+                binding: Some(bi),
                 top_level: b.scope.is_none(),
             });
         }
     }
+    // The anonymous default-exported router construction, if any (contract M6b S3):
+    // the default-exported chain starting with a Router construction. Only one
+    // default export exists per module, so at most one.
+    let default_router: Option<usize> = facts.default_export_expr.and_then(|span| {
+        facts
+            .chains
+            .iter()
+            .find(|c| c.span == span)
+            .filter(|c| router_kind(&names, c) == Some(RouterKind::Router))
+            .map(|c| {
+                out.routers.push(RouterDecl {
+                    name: "default".to_owned(),
+                    kind: RouterKind::Router,
+                    span: c.span,
+                    binding: None,
+                    top_level: true,
+                });
+                out.routers.len() - 1
+            })
+    });
     let router_names: HashSet<String> = out.routers.iter().map(|r| r.name.clone()).collect();
     let router_at = |name: &str, at: Span| -> Option<usize> {
         if !router_names.contains(name) {
@@ -629,39 +659,45 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
         binding_router.get(&bi).copied()
     };
     for chain in &facts.chains {
-        let Some(root) = chain.root.as_deref() else {
-            continue;
+        // The router this chain registers on: a bound name, the chain-built binding
+        // whose init this chain is, or the anonymous default export's own
+        // construction. Anything else (including unexported inline constructions)
+        // registers nowhere.
+        let router = match chain.root.as_deref() {
+            Some(root) => router_at(root, chain.span),
+            None => chain_router.get(&chain.span).copied().or_else(|| {
+                default_router.filter(|_| Some(chain.span) == facts.default_export_expr)
+            }),
         };
-        let Some(router) = router_at(root, chain.span) else {
+        let Some(router) = router else {
             continue;
         };
         let links = &chain.links;
-        // `use(prefix?, child…)` mounts.
-        if links.len() == 1 && links[0].name == "use" {
-            let args = &links[0].args;
-            let (prefix, children) = match args.first() {
-                Some(a @ Arg::Template { .. }) => (literal(a), &args[1..]),
-                _ => (Some(String::new()), &args[..]),
-            };
-            for child in children {
-                if let Arg::Name { text, .. } = child {
-                    out.mounts.push(Mount {
-                        parent: router,
-                        prefix: prefix.clone(),
-                        child: text.clone(),
-                        child_local: router_at(text, chain.span),
-                        span: chain.span,
-                    });
-                }
-            }
-            continue;
-        }
-        // `verb(path, …handlers)` and `route(path).verb(h).verb(h2)`.
+        // `use(prefix?, child…)` mounts on any link; `verb(path, …handlers)` and
+        // `route(path).verb(h).verb(h2)` routes.
         let (path, verbs) = match links.first() {
             Some(l) if l.name == "route" && links.len() > 1 => (l.args.first(), &links[1..]),
             _ => (None, &links[..]),
         };
         for link in verbs {
+            if link.name == "use" {
+                let (prefix, children) = match link.args.first() {
+                    Some(a @ Arg::Template { .. }) => (literal(a), &link.args[1..]),
+                    _ => (Some(String::new()), &link.args[..]),
+                };
+                for child in children {
+                    if let Arg::Name { text, .. } = child {
+                        out.mounts.push(Mount {
+                            parent: router,
+                            prefix: prefix.clone(),
+                            child: text.clone(),
+                            child_local: router_at(text, chain.span),
+                            span: chain.span,
+                        });
+                    }
+                }
+                continue;
+            }
             if !EXPRESS_VERBS.contains(&link.name.as_str()) {
                 continue;
             }
@@ -1086,7 +1122,7 @@ public class AuthController {
                     .find(|b| b.name == "app")
                     .unwrap()
                     .span,
-                binding: facts.bindings.iter().position(|b| b.name == "app").unwrap(),
+                binding: Some(facts.bindings.iter().position(|b| b.name == "app").unwrap()),
                 top_level: true,
             }]
         );
@@ -1131,6 +1167,82 @@ public class AuthController {
                 "authRouter.post(\"/login\", async (req, res) => { res.json(1); })"
             )
         );
+    }
+
+    /// S3: a binding whose init chain starts with a Router construction binds, and
+    /// every `use` link on any chain is a mount (not only single-link chains).
+    #[test]
+    fn express_chain_built_routers_bind_with_their_mounts() {
+        let src = "import { Router } from \"express\";\nimport tags from \"./tags\";\nconst api = Router().use(tags).use(\"/v2\", tags);\napi.get(\"/ping\", h);\n";
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let r = routes(Language::TypeScript, &facts);
+        assert_eq!(r.routers.len(), 1);
+        assert_eq!(r.routers[0].name, "api");
+        assert_eq!(r.routers[0].kind, RouterKind::Router);
+        assert!(r.routers[0].binding.is_some());
+        assert_eq!(r.mounts.len(), 2);
+        assert_eq!(
+            r.mounts
+                .iter()
+                .map(|m| (m.parent, m.prefix.clone(), m.child.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (0, Some(String::new()), "tags".to_owned()),
+                (0, Some("/v2".to_owned()), "tags".to_owned())
+            ]
+        );
+        assert_eq!(
+            summary(Language::TypeScript, src),
+            ["GET /ping router api name h"]
+        );
+    }
+
+    /// S3: `export default Router().use(…)` binds an anonymous top-level router named
+    /// `default`; an unexported inline construction binds nothing.
+    #[test]
+    fn express_anonymous_default_routers_bind() {
+        let src = "import { Router } from \"express\";\nimport api from \"./api\";\nexport default Router().use('/api', api);\n";
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let r = routes(Language::TypeScript, &facts);
+        assert_eq!(r.routers.len(), 1);
+        assert_eq!(r.routers[0].name, "default");
+        assert_eq!(r.routers[0].binding, None);
+        assert!(r.routers[0].top_level);
+        assert_eq!(r.mounts.len(), 1);
+        assert_eq!(
+            (
+                r.mounts[0].parent,
+                r.mounts[0].prefix.clone(),
+                r.mounts[0].child.as_str()
+            ),
+            (0, Some("/api".to_owned()), "api")
+        );
+        // No default export: the same construction binds nothing.
+        let inline = "import { Router } from \"express\";\nRouter().get('/x', h);\n";
+        let facts = extract(Language::TypeScript, inline.as_bytes()).unwrap();
+        let r = routes(Language::TypeScript, &facts);
+        assert!(r.routers.is_empty());
+        assert!(r.routes.is_empty());
+    }
+
+    /// S13: one `use` chain with n links costs linear work: 4× the links makes at
+    /// most 5× the counted steps.
+    #[test]
+    fn express_use_chains_grow_linearly() {
+        let work = |n: usize| {
+            let mut src = "import { Router } from \"express\";\nconst api = Router()".to_owned();
+            for i in 0..n {
+                src.push_str(&format!(".use('/u{i}', c{i})"));
+            }
+            src.push_str(";\n");
+            let facts = rb_syntax::extract(Language::TypeScript, src.as_bytes()).unwrap();
+            crate::work::take();
+            let r = routes(Language::TypeScript, &facts);
+            assert_eq!(r.mounts.len(), n);
+            crate::work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
     #[test]

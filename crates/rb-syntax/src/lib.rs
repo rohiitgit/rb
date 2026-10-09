@@ -449,6 +449,11 @@ pub struct FileFacts {
     /// class or function `export default class X`/`function f` declares (contract M4b S1).
     #[serde(default)]
     pub default_export: Option<String>,
+    /// TS/JS: the span of a default-exported call that is not a plain name
+    /// (`export default Router().use(…)`; contract M6b S3). The route pack matches it
+    /// against a call chain to bind anonymous default-exported routers.
+    #[serde(default)]
+    pub default_export_expr: Option<Span>,
     /// TS/JS: the module specifiers whose whole module object the file takes, in source order:
     /// `import * as m`, `export * from`, `export * as m from`, `require(…)` and `import(…)`;
     /// `*` for a `require`/`import` whose argument is not a plain string (evaluator pass 1, Y7).
@@ -806,6 +811,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             .collect(),
         name_tokens,
         default_export: imports::default_export(language, root, source),
+        default_export_expr: imports::default_export_expr(language, root, source),
         module_objects: imports::module_objects(language, root, source),
         mentions,
     })

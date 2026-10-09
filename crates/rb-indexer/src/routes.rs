@@ -190,15 +190,14 @@ fn mount_targets<'a>(
         };
         let Some(exported) = exported else { continue };
         for &target in files {
+            // A default import names the target's default export; an anonymous
+            // default-exported construction is named `default` (contract M6b S3).
             let exported = if exported == "default" {
-                match inputs
+                inputs
                     .files
                     .get(target)
                     .and_then(|(_, f)| f.default_export.as_deref())
-                {
-                    Some(name) => name,
-                    None => continue,
-                }
+                    .unwrap_or("default")
             } else {
                 exported
             };
@@ -362,7 +361,9 @@ fn param_compositions<'a>(
                 path: (*path2).to_owned(),
                 span: chain.span,
             };
-            if found.len() == 1 && let Some(gids) = by_key.get(found[0].as_str()) {
+            if found.len() == 1
+                && let Some(gids) = by_key.get(found[0].as_str())
+            {
                 for &(file, func, pos) in gids {
                     let entry = out.entry((file, func, pos)).or_default();
                     entry.sites += 1;
@@ -493,7 +494,12 @@ pub(crate) fn add_endpoints(
                         paths.push((format!("{p}/{}", r.path), certainty, None, Vec::new()));
                     }
                     if prefixes.unknown {
-                        let router = router_id(file.routers[i].binding);
+                        // An anonymous default-exported router is identified by the
+                        // file (contract M6b S3).
+                        let router = match file.routers[i].binding {
+                            Some(binding) => router_id(binding),
+                            None => format!("{path}#default"),
+                        };
                         paths.push((
                             r.path.clone(),
                             Certainty::Heuristic,
@@ -1402,6 +1408,38 @@ mod tests {
         };
         let (small, large) = (work(200), work(800));
         assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// S3 end to end (the node-express-realworld shape): a chain-built router mounted
+    /// through an anonymous default export composes across two files; certainty stays
+    /// heuristic and no `prefix_unknown` remains.
+    #[test]
+    fn express_chains_through_anonymous_defaults_compose() {
+        let tags = "import { Router } from \"express\";\nconst router = Router();\nfunction list(req, res) {}\nrouter.get(\"/tags\", list);\nexport default router;\n";
+        let routes = "import { Router } from \"express\";\nimport tags from \"./tags\";\nconst api = Router().use(tags);\nexport default Router().use('/api', api);\n";
+        let main = "import express from \"express\";\nimport routes from \"./routes\";\nconst app = express();\napp.use(routes);\n";
+        let built = build(
+            &[
+                ("web/tags.ts", Language::TypeScript, tags),
+                ("web/routes.ts", Language::TypeScript, routes),
+                ("web/main.ts", Language::TypeScript, main),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built),
+            [
+                "EXPOSES web -> HTTP GET /api/tags @web [heuristic]",
+                "HANDLED_BY HTTP GET /api/tags @web -> rb-heuristic . . . `web/tags.ts`/list(). [heuristic]",
+            ]
+        );
+        assert!(
+            !diagnostics(&built)
+                .iter()
+                .any(|d| d.starts_with("route_prefix_unknown")),
+            "{:?}",
+            diagnostics(&built)
+        );
     }
 
     #[test]

@@ -75,6 +75,39 @@ pub(crate) fn default_export(language: Language, root: Node<'_>, source: &[u8]) 
         })
 }
 
+/// TS/JS: the span of a default-exported call that is not a plain name
+/// (`export default Router().use(…)`; contract M6b S3). `None` for names,
+/// declarations, other expressions, and other languages. The route pack matches it
+/// against a call chain to bind anonymous default-exported routers.
+pub(crate) fn default_export_expr(
+    language: Language,
+    root: Node<'_>,
+    _source: &[u8],
+) -> Option<crate::Span> {
+    if !matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript
+    ) {
+        return None;
+    }
+    let mut c = root.walk();
+    root.named_children(&mut c)
+        .filter(|n| n.kind() == "export_statement")
+        .find(|n| {
+            let mut ec = n.walk();
+            n.children(&mut ec).any(|t| t.kind() == "default")
+        })
+        .and_then(|export| {
+            if export.child_by_field_name("declaration").is_some() {
+                return None;
+            }
+            export
+                .child_by_field_name("value")
+                .filter(|v| v.kind() == "call_expression")
+                .map(crate::span)
+        })
+}
+
 /// TS/JS: the module specifiers whose module object is taken (evaluator pass 1, Y7): a
 /// namespace import, `export *` (with or without `as`), and `require`/`import()` calls, whose
 /// argument is recorded as `*` when it is not a plain string literal.
@@ -398,6 +431,54 @@ mod default_export_tests {
             Some("r")
         );
         assert_eq!(of(Language::Java, "class K {}\n"), None);
+    }
+
+    #[test]
+    fn default_exported_expressions_by_form() {
+        let span_of = |src: &str, needle: &str| {
+            let start = src.find(needle).expect(needle);
+            let pos = |byte: usize| {
+                let before = &src[..byte];
+                let row = before.matches('\n').count() as i32;
+                (row, (byte - before.rfind('\n').map_or(0, |i| i + 1)) as i32)
+            };
+            let (a, b) = (pos(start), pos(start + needle.len()));
+            [a.0, a.1, b.0, b.1]
+        };
+        let of = |src: &str| {
+            extract(Language::TypeScript, src.as_bytes())
+                .unwrap()
+                .default_export_expr
+        };
+        // An anonymous router construction records its span; names record none.
+        let chained =
+            "import { Router } from 'express';\nexport default Router().use('/api', api);\n";
+        assert_eq!(
+            of(chained),
+            Some(span_of(chained, "Router().use('/api', api)"))
+        );
+        for src in [
+            "const health = Router();\nexport default health;\n",
+            "export default class Svc {}\n",
+            "export default 42;\n",
+            "export default { a: 1 };\n",
+            "function f() { return 1; }\n",
+        ] {
+            assert_eq!(of(src), None, "{src}");
+        }
+        // Other languages record none.
+        assert_eq!(
+            extract(Language::JavaScript, "export default foo();\n".as_bytes())
+                .unwrap()
+                .default_export_expr,
+            Some(span_of("export default foo();\n", "foo()"))
+        );
+        assert_eq!(
+            extract(Language::Java, "class K {}\n".as_bytes())
+                .unwrap()
+                .default_export_expr,
+            None
+        );
     }
 }
 

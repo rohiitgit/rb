@@ -91,7 +91,8 @@ use serde_json::{Value, json};
 /// its declared clauses alone (D4); `m6a-3` npm and Yarn workspaces are indexed by their root's
 /// job (D5, D6).
 /// `m6b-1` gin groups passed as parameters compose from their call sites (S2).
-pub const PIPELINE: &str = "m6b-1";
+/// `m6b-2` Express construction chains and anonymous default-exported routers (S3).
+pub const PIPELINE: &str = "m6b-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
