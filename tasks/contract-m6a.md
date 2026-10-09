@@ -1,6 +1,6 @@
 # M6a contract: SCIP coverage on Java and TypeScript — Lombok-generated members, TypeScript interface-method `IMPLEMENTS`, npm/Yarn workspace installs, in-repository `file:` packages, the reactor budget, `rb serve`'s sweep order (draft, planner, 2026-10-07)
 
-**Status:** contract written 2026-10-07; not started.
+**Status:** contract written 2026-10-07; built (phases 0–12); evaluator pass 1 (full review, `tasks/eval-m6a-pass1.md`: PASS with minor Z1, Z2) fixed test-first as amendment 12; evaluator pass 2 (verification only, `tasks/eval-m6a-pass2.md`) PASS; **M6a is closed** (amendment 13). Open items carried forward below.
 
 Written before any code. M6a is done only when every assertion below is backed by a passing test or a recorded measurement. "Verified facts" are what was read in the code, the goldens or the records at commit `cfa8ab9` (M5 closed; `PIPELINE` `m5-3`, `RECIPE` `m5-egress-1`), plus two probes the planner ran on 2026-10-07 in its scratchpad against the images already on this machine (P1, P2 below; phase 0 re-runs them and keeps the raw outputs under `var/m6a/phase0/`).
 

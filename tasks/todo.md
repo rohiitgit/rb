@@ -843,7 +843,7 @@ Same rules as M5:
 - [x] **12. Records** (S18–S20; no code except classifier scripts under `var/`). Done 2026-10-09.
   - Invariant 1: fixtures `--no-scip` identical except `ts-workspaces` (3 amendment-7 W rows); SCIP identical except `java-lombok` (L-only) and `ts-workspaces` (T+W-only); measurement repos per S16–S18 notes; D7 quadratic mutant bites (D1/D5 logged).
   - Contract amendments 8–11 + measurement section; CHANGELOG; IMPLEMENT.md; design §13 (M6a measured, webapp-engines → M6e); lessons (4); this todo.
-  - **Verify:** `verify.sh p10-12` green (674/66/12/32/1, no `skipping:`); then evaluator pass 1 (full review), fixes test-first as amendments, evaluator pass 2 (verification only).
+  - **Verify:** `verify.sh p10-12` green (674/66/12/32/1, no `skipping:`); evaluator pass 1 PASS (Z1 fixed as amendment 12, `z1-fix` loop green 676/66/12/32/1); evaluator pass 2 PASS. **M6a closed 2026-10-09** (contract amendment 13). Next: M6b (contract to be written when it starts).
 
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 

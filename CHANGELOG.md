@@ -1,6 +1,8 @@
 # Changelog
 
-## [2026-10-09] (wall clock) M6a evaluator pass 1 fix (Z1) + amendment 12
+## [2026-10-09] (wall clock) M6a CLOSED (evaluator passes 1–2)
+- Pass 1 (`tasks/eval-m6a-pass1.md`): PASS — baseline reproduced, S1–S20 re-derived, 6/7 mutants killed; Z1 (fixed as amendment 12), Z2 (note).
+- Pass 2 (`tasks/eval-m6a-pass2.md`): PASS — Z1 holds, suite green, invariant 1 re-derived with a fresh HEAD release, M1/M4/M6 killed; O1 + wall-clock flake non-blocking. Contract amendment 13. Next: M6b.
 - **Fix:** workspace member discovery walks past shadowing siblings (`crates/rb-scip/src/jobs.rs`): the scan continues while the string prefix holds, `is_under` decides per candidate. Tests first: `a_sibling_sorting_between_a_root_and_its_members_does_not_shadow_them` (failed before the fix), `workspace_membership_with_shadowing_siblings_grows_linearly` (S19). Z2 (link-to-root `""`) kept-and-counted, no change. Contract amendment 12.
 - **Verification** (`var/m6a/logs/z1-fix-*`): fmt, clippy clean; 676 unit (674 + 2), `rb-store` 66/66, `rb-server` 12/12, e2e 32/32, api 1/1, no `skipping:`; no listener; stub scan only `rb-sql/src/lib.rs:1111`. e2e goldens unchanged (no fixture has a shadowing sibling).
 - Files: `crates/rb-scip/src/jobs.rs`; records `tasks/{contract-m6a,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
