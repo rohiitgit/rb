@@ -293,3 +293,7 @@
 ## 2026-10-09: host load is part of the disk profile, not just headroom
 - **Mistake (measured):** the Oct-7 shardingsphere fetch died at the 6.1 GiB floor from 16.4 GiB under load 43; the identical run from 16.1 GiB under load ~4 completed with the floor never below 10.5 GiB. Free space alone did not explain the first death (macOS swap under memory pressure shares the same APFS pool).
 - **Rule:** a large-repository run's preconditions are headroom AND load: record both in every `.meta`, refuse to start a 30 min run above ~15 load, and never attribute a floor kill to downloads without the load line.
+
+## 2026-10-09: a sorted scan with a segment-aware predicate breaks on the string boundary
+- **Mistake:** workspace member discovery scanned sorted package roots with `take_while(is_under)`, asserting "roots strictly under follow it in sorted order". A sibling (`mods-old`) sorts between the root and its members (`-` below `/`), so the scan stopped early and members fell back to unpinned jobs (evaluator pass 1, Z1).
+- **Rule:** when a scan over sorted paths uses a segment-aware predicate (`is_under`, "strictly under"), the `take_while` boundary must be the *string* predicate (shared prefix ⇒ contiguous run) with the segment check as a per-item filter — never the reverse. Test with a sibling whose post-root character sorts below `/` (`-`, `.`, `+`), plus a growth shape with such siblings.

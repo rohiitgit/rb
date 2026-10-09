@@ -287,11 +287,18 @@ fn workspaces<'a>(
             ungrouped("workspace_glob_unsupported");
             continue;
         };
-        // The package roots strictly under `root` follow it in sorted order.
+        // The package roots strictly under `root` share its string prefix (`""` for the
+        // top), so they form one contiguous run in sorted order; but siblings such as
+        // `mods-old` sort between the root and its members (`-` is below `/`), so the
+        // scan continues while the string prefix holds and `is_under` decides per
+        // candidate (a `take_while(is_under)` stops at the first such sibling and
+        // shadows every later member: evaluator pass 1, Z1). Each candidate is still
+        // examined once per enclosing workspace root, so the S19 bound holds.
         let mut members = Vec::new();
         for candidate in package_roots[k + 1..]
             .iter()
-            .take_while(|c| is_under(c, root))
+            .take_while(|c| root.is_empty() || c.starts_with(root.as_str()))
+            .filter(|c| is_under(c, root))
         {
             tick(1);
             if out.member_of.contains_key(candidate.as_str()) {
@@ -817,6 +824,35 @@ mod tests {
         );
     }
 
+    /// A sibling whose name sorts between a workspace root and its members
+    /// (`mods-old` between `mods` and `mods/app`: `-` is below `/`) must not shadow
+    /// the members: the scan continues while the string prefix holds and `is_under`
+    /// decides per candidate (evaluator pass 1, Z1).
+    #[test]
+    fn a_sibling_sorting_between_a_root_and_its_members_does_not_shadow_them() {
+        let files = [
+            "mods/package.json",
+            "mods/package-lock.json",
+            "mods/app/package.json",
+            "mods/app/tsconfig.json",
+            "mods-old/package.json",
+            "mods-old/tsconfig.json",
+        ];
+        assert_eq!(
+            workspace_summary(
+                &files,
+                &[("mods/package.json", r#"{"workspaces": ["app"]}"#)]
+            ),
+            (
+                vec![
+                    "scip-typescript mods npm(PackageLock) [app] {app}".to_owned(),
+                    "scip-typescript mods-old npm(None) [.] unpinned".to_owned(),
+                ],
+                Vec::<String>::new(),
+            )
+        );
+    }
+
     /// Every pattern outside D5's allow-list leaves the whole root ungrouped (today's jobs),
     /// counted with its reason.
     #[test]
@@ -1005,6 +1041,46 @@ mod tests {
     #[test]
     fn workspace_membership_grows_linearly() {
         let (small, large) = (membership_work_for(100), membership_work_for(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// S19 with shadowing siblings (evaluator pass 1, Z1): each workspace root has
+    /// a non-member sibling sorting between it and its members (`rt-old{i}` between
+    /// `rt` and `rt/pkgs/…`), which the scan must walk past; 4× the roots → at most
+    /// 5× the counted steps.
+    fn shadowed_membership_work_for(n: usize) -> u64 {
+        let mut files = vec![
+            "rt/package.json".to_owned(),
+            "rt/package-lock.json".to_owned(),
+        ];
+        let mut patterns = vec!["\"deep/**\"".to_owned(), "\"wild/*\"".to_owned()];
+        for i in 0..n {
+            for dir in [
+                format!("rt/pkgs/p{i}"),
+                format!("rt/deep/d{i}/x"),
+                format!("rt/wild/w{i}"),
+                format!("rt-old{i}"),
+            ] {
+                files.push(format!("{dir}/package.json"));
+                files.push(format!("{dir}/tsconfig.json"));
+            }
+            patterns.push(format!("\"pkgs/p{i}\""));
+        }
+        let manifest = format!("{{\"workspaces\": [{}]}}", patterns.join(", "));
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        let read = |path: &str| (path == "rt/package.json").then(|| manifest.as_bytes().to_vec());
+        work::take();
+        let plan = jobs(&files, &read);
+        assert_eq!(plan.members["rt"].len(), 3 * n);
+        work::take()
+    }
+
+    #[test]
+    fn workspace_membership_with_shadowing_siblings_grows_linearly() {
+        let (small, large) = (
+            shadowed_membership_work_for(100),
+            shadowed_membership_work_for(400),
+        );
         assert!(large <= small * 5, "{small} -> {large}");
     }
 }

@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026-10-09] (wall clock) M6a evaluator pass 1 fix (Z1) + amendment 12
+- **Fix:** workspace member discovery walks past shadowing siblings (`crates/rb-scip/src/jobs.rs`): the scan continues while the string prefix holds, `is_under` decides per candidate. Tests first: `a_sibling_sorting_between_a_root_and_its_members_does_not_shadow_them` (failed before the fix), `workspace_membership_with_shadowing_siblings_grows_linearly` (S19). Z2 (link-to-root `""`) kept-and-counted, no change. Contract amendment 12.
+- **Verification** (`var/m6a/logs/z1-fix-*`): fmt, clippy clean; 676 unit (674 + 2), `rb-store` 66/66, `rb-server` 12/12, e2e 32/32, api 1/1, no `skipping:`; no listener; stub scan only `rb-sql/src/lib.rs:1111`. e2e goldens unchanged (no fixture has a shadowing sibling).
+- Files: `crates/rb-scip/src/jobs.rs`; records `tasks/{contract-m6a,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-09] (wall clock) M6a phases 10–12: public-repository measurements (S13, S16–S18), records
 - **No code change** (measurements + records only; HEAD stays `78e08da`). Contract amendments 8–11, measurement section "Measured (phases 10–12)".
 - **Phase 10, shardingsphere @ `b09dfffcf9e5`:** base fresh wall 3062.77s (`ok` 2950.5s; fetch ~20min cold m2, index ~29min, join/publish ~2min; load 4–11); rejected 3889 (118 + 3771) as hypothesised. M6a cached 72.7s: rejected 0, `lombok-generated 107101 in 3951 documents`, exact CALLS 27364 → 68500, IMPLEMENTS 8932 → 17787. Newly accepted 3889 / rejected 0; 40/40 sample read in source, no false edge. S13: two fresh `--scip-cpus 8 --scip-memory 6g --scip-maven-threads 4` runs both `failed (index phase)` (maven-compiler-plugin on `parser-sql-engine-mysql` under `-T4`; default fine): dumps identical modulo the one allowed `stderr_tail` row → flag stays (D9 residue); §12.5 900s missed with profile. (Oct-7 base attempt died at the 6.1G floor from 16.4G under load 43; retry from 16.1G under load ~4 completed.)
