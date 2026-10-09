@@ -845,6 +845,21 @@ Same rules as M5:
   - Contract amendments 8–11 + measurement section; CHANGELOG; IMPLEMENT.md; design §13 (M6a measured, webapp-engines → M6e); lessons (4); this todo.
   - **Verify:** `verify.sh p10-12` green (674/66/12/32/1, no `skipping:`); evaluator pass 1 PASS (Z1 fixed as amendment 12, `z1-fix` loop green 676/66/12/32/1); evaluator pass 2 PASS. **M6a closed 2026-10-09** (contract amendment 13). Next: M6b (contract to be written when it starts).
 
+## M6b Request-path precision (contract `tasks/contract-m6b.md`, draft 2026-10-09; not started)
+
+- [ ] **0. Preflight.** Pins/digests, `3562b95` baseline binary + fixture dumps, phase-0 shape checks (gin call-site args, express chains, ftgo members, mattermost sinks); `var/m6b/{scripts,base,bench,logs}`; `verify.sh`.
+- [ ] **1. Facts** (S1). Member-assignment facts, new-library gates, sink patterns; fingerprinted; e2e unchanged.
+- [ ] **2. gin parameter groups** (S2). One identity per (router site, call site), `heuristic` max; `PIPELINE m6b-1`.
+- [ ] **3. Express chains** (S3). Chain-built + anonymous-default routers; keys as S2.
+- [ ] **4. In-process + empty URL** (S4). `http_in_process` / `http_empty_url` buckets; sum test.
+- [ ] **5. axios folding** (S5). Same-file spreads, unique cross-file constants, by-name configs, contested-external, ordered Spring statements.
+- [ ] **6. Constructor members** (S6). Single-assignment proof + folding (TS/JS + Java).
+- [ ] **7. userinfo holes** (S7). Post-`@` literal host; certainty capped.
+- [ ] **8. Discovery narrowing** (S8). Import-resolved + single-literal lifts, counted.
+- [ ] **9. Client breadth** (S9). got/ky/superagent/undici fetch-class; HttpClient + member forms heuristic-capped.
+- [ ] **10. Measurements** (S11). `--no-scip` both binaries on gin/express/ftgo/mattermost/microservices/piggymetrics; classified diffs.
+- [ ] **11. Records + evaluator.** S12–S14; fixtures/goldens (S10) with the fixture phase; pass 1 (full), fixes, pass 2 (verification-only).
+
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 
 - [ ] M6b Request-path precision (gin groups as parameters, Express construction chains, in-process Go requests and empty URLs, axios configurations, constructor-assigned members, user information with a hole, S19's over-capping, TypeScript client breadth).
