@@ -90,7 +90,8 @@ use serde_json::{Value, json};
 /// (contract M6a D1); `m6a-2` a scip-typescript interface method's `IMPLEMENTS` is confirmed by
 /// its declared clauses alone (D4); `m6a-3` npm and Yarn workspaces are indexed by their root's
 /// job (D5, D6).
-pub const PIPELINE: &str = "m6a-3";
+/// `m6b-1` gin groups passed as parameters compose from their call sites (S2).
+pub const PIPELINE: &str = "m6b-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

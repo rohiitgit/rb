@@ -6,12 +6,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rb_frameworks::endpoint::{endpoint_key, endpoint_name, norm_path, prefix_unknown_key};
-use rb_frameworks::routes::{FileRoutes, Handler, RouteBase, RouterKind, binding_identity};
+use rb_frameworks::routes::{
+    FileRoutes, FileScope, Framework, Handler, RouteBase, RouterKind, binding_identity,
+    gin_group_prefix,
+};
 use rb_model::{
     Attrs, Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
     Provenance, Span,
 };
-use rb_syntax::{FileFacts, Language};
+use rb_syntax::{Arg, FileFacts, Init, Language};
 use serde_json::json;
 
 use crate::resolve::Index;
@@ -224,6 +227,9 @@ struct Registration {
     /// More than one handler candidate: `ambiguous` with this count.
     candidates: usize,
     at: Evidence,
+    /// Call sites a parameter group's prefix was composed from (contract M6b S2):
+    /// the registration's file and span stay in `at`.
+    composed_from: Vec<Evidence>,
 }
 
 /// An endpoint the stage added, as stitching reads it (contract M4a S13).
@@ -260,6 +266,150 @@ struct Endpoint {
     registrations: Vec<Registration>,
 }
 
+/// A gin parameter group's call-site compositions (contract M6b S2).
+#[derive(Default)]
+struct ParamCompose {
+    /// Composed prefixes with every call site's evidence, by prefix.
+    composed: BTreeMap<String, Vec<Evidence>>,
+    /// Call sites seen for the group.
+    sites: usize,
+    /// Some site did not resolve or fold: the `prefix_unknown` node stays.
+    failed: bool,
+}
+
+/// Fold the group argument a call site passes: a `Group(…)` call folds through the
+/// caller's bindings; a name follows its initialiser's call chain. Anything else is
+/// unresolvable (the unknown node stays as the fallback).
+fn fold_group_arg(scope: &FileScope<'_>, arg: Option<&Arg>) -> Option<String> {
+    let chain = match arg {
+        Some(Arg::Other { span }) => scope.chain_at(*span)?,
+        Some(Arg::Name { text, span }) => {
+            let init = scope.binding_at(text, *span)?.init.clone()?;
+            match init {
+                Init::Call { chain } => scope.facts.chains.get(chain)?,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    gin_group_prefix(scope.facts, chain).flatten()
+}
+
+/// gin parameter groups composed from their call sites: `(callee file, func def,
+/// param position)` → compositions. One identity per (router site, call site); the
+/// endpoint key stays path-based, so identical compositions merge (contract M6b D1).
+fn param_compositions<'a>(
+    inputs: &Inputs<'a, '_>,
+) -> BTreeMap<(&'a str, usize, u32), ParamCompose> {
+    type GroupId<'a> = (&'a str, usize, u32);
+    let mut groups: BTreeSet<GroupId<'a>> = BTreeSet::new();
+    // Func simple name → group ids (the resolution prefilter); func key → group ids.
+    let mut by_name: BTreeMap<&'a str, Vec<GroupId<'a>>> = BTreeMap::new();
+    let mut by_key: BTreeMap<&'a str, Vec<GroupId<'a>>> = BTreeMap::new();
+    for (&path, file) in inputs.routes {
+        let facts = inputs.files[path].1;
+        for r in &file.routes {
+            rb_frameworks::work::tick(1);
+            if r.framework != Framework::Gin {
+                continue;
+            }
+            let RouteBase::Unknown(b) = r.base else {
+                continue;
+            };
+            let Some(binding) = facts.bindings.get(b) else {
+                continue;
+            };
+            let (Some(func), Some(pos)) = (binding.scope, binding.parameter) else {
+                continue;
+            };
+            let (Some(def), Some(func_key)) =
+                (facts.definitions.get(func), inputs.keys[path].get(func))
+            else {
+                continue;
+            };
+            let gid = (path, func, pos);
+            groups.insert(gid);
+            by_name.entry(def.name.as_str()).or_default().push(gid);
+            by_key.entry(func_key.as_str()).or_default().push(gid);
+        }
+    }
+    let mut out: BTreeMap<GroupId<'a>, ParamCompose> = BTreeMap::new();
+    if groups.is_empty() {
+        return out;
+    }
+    for (path2, (language, facts)) in inputs.files {
+        if *language != Language::Go {
+            continue;
+        }
+        let scope = FileScope::new(facts);
+        for chain in &facts.chains {
+            rb_frameworks::work::tick(1);
+            let Some(last) = chain.links.last() else {
+                continue;
+            };
+            if !by_name.contains_key(last.name.as_str()) {
+                continue;
+            }
+            rb_frameworks::work::tick(1);
+            let text = match &chain.root {
+                Some(root) => format!("{root}.{}", last.name),
+                None => last.name.clone(),
+            };
+            let found = inputs
+                .index
+                .handler_targets(path2, chain.enclosing, &text, last.span);
+            let site = Evidence {
+                path: (*path2).to_owned(),
+                span: chain.span,
+            };
+            if found.len() == 1 && let Some(gids) = by_key.get(found[0].as_str()) {
+                for &(file, func, pos) in gids {
+                    let entry = out.entry((file, func, pos)).or_default();
+                    entry.sites += 1;
+                    // One level only: distinct prefixes are bounded by the call
+                    // sites, so no prefix cap is needed (unlike mounts, which
+                    // multiply across levels).
+                    match last.args.get(pos as usize) {
+                        Some(arg) => match fold_group_arg(&scope, Some(arg)) {
+                            Some(prefix) => {
+                                entry.composed.entry(prefix).or_default().push(site.clone())
+                            }
+                            None => entry.failed = true,
+                        },
+                        None => entry.failed = true,
+                    }
+                }
+                continue;
+            }
+            // Ambiguous, unresolvable, or resolved elsewhere: a same-named group may
+            // still be the target, so its unknown node stays (safe direction).
+            let targets_group =
+                found.is_empty() || found.iter().any(|k| by_key.contains_key(k.as_str()));
+            if targets_group && let Some(gids) = by_name.get(last.name.as_str()) {
+                for &gid in gids {
+                    let entry = out.entry(gid).or_default();
+                    entry.sites += 1;
+                    entry.failed = true;
+                }
+            }
+        }
+    }
+    // Groups no call site reached: the unknown node stays, as today.
+    for gid in &groups {
+        out.entry(*gid).or_default();
+    }
+    out
+}
+
+/// Join a composed prefix with a route path (the frameworks `join` semantics).
+fn join_prefix(prefix: &str, path: &str) -> String {
+    match (prefix.is_empty(), path.is_empty()) {
+        (true, _) => path.to_owned(),
+        (_, true) => prefix.to_owned(),
+        _ => format!("{prefix}/{path}"),
+    }
+}
+
 /// Adds every endpoint with its edges; returns the route diagnostics and the endpoints, in key
 /// order.
 pub(crate) fn add_endpoints(
@@ -267,6 +417,8 @@ pub(crate) fn add_endpoints(
     inputs: &Inputs<'_, '_>,
 ) -> anyhow::Result<(Vec<Diagnostic>, Vec<EndpointRef>)> {
     let mut composer = Composer::new(inputs);
+    // gin parameter groups composed from their call sites (contract M6b S2).
+    let param_composed = param_compositions(inputs);
     let mut endpoints: BTreeMap<String, Endpoint> = BTreeMap::new();
     let mut diagnostics = Vec::new();
     let diag = |kind: &str, path: &str, span: Span, detail: serde_json::Value| Diagnostic {
@@ -288,22 +440,47 @@ pub(crate) fn add_endpoints(
         };
         for r in &file.routes {
             rb_frameworks::work::tick(1);
-            // Full paths with their certainty, and the router when the prefix is unknown (the
-            // path is then the tail below that router).
-            let mut paths: Vec<(String, Certainty, Option<String>)> = Vec::new();
+            // Full paths with their certainty, the router when the prefix is unknown
+            // (the path is then the tail below that router), and the call sites a
+            // composed prefix comes from.
+            let mut paths: Vec<(String, Certainty, Option<String>, Vec<Evidence>)> = Vec::new();
             match r.base {
                 RouteBase::Root => match inputs.context_paths.get(&service) {
                     Some(ctx) if r.framework == rb_frameworks::routes::Framework::Spring => {
-                        paths.push((format!("{ctx}/{}", r.path), Certainty::Synthetic, None));
+                        paths.push((
+                            format!("{ctx}/{}", r.path),
+                            Certainty::Synthetic,
+                            None,
+                            Vec::new(),
+                        ));
                     }
-                    _ => paths.push((r.path.clone(), Certainty::Exact, None)),
+                    _ => paths.push((r.path.clone(), Certainty::Exact, None, Vec::new())),
                 },
                 RouteBase::Unknown(receiver) => {
-                    paths.push((
-                        r.path.clone(),
-                        Certainty::Heuristic,
-                        Some(router_id(receiver)),
-                    ));
+                    let mut unknown = true;
+                    if r.framework == Framework::Gin
+                        && let Some(binding) = inputs.files[path].1.bindings.get(receiver)
+                        && let (Some(func), Some(pos)) = (binding.scope, binding.parameter)
+                        && let Some(comp) = param_composed.get(&(path, func, pos))
+                    {
+                        for (prefix, sites) in &comp.composed {
+                            paths.push((
+                                join_prefix(prefix, &r.path),
+                                Certainty::Heuristic,
+                                None,
+                                sites.clone(),
+                            ));
+                        }
+                        unknown = comp.sites == 0 || comp.failed;
+                    }
+                    if unknown {
+                        paths.push((
+                            r.path.clone(),
+                            Certainty::Heuristic,
+                            Some(router_id(receiver)),
+                            Vec::new(),
+                        ));
+                    }
                 }
                 RouteBase::Router(i) => {
                     let (prefixes, _) = composer.prefixes((path, i), 0);
@@ -313,16 +490,21 @@ pub(crate) fn add_endpoints(
                         } else {
                             Certainty::Exact
                         };
-                        paths.push((format!("{p}/{}", r.path), certainty, None));
+                        paths.push((format!("{p}/{}", r.path), certainty, None, Vec::new()));
                     }
                     if prefixes.unknown {
                         let router = router_id(file.routers[i].binding);
-                        paths.push((r.path.clone(), Certainty::Heuristic, Some(router)));
+                        paths.push((
+                            r.path.clone(),
+                            Certainty::Heuristic,
+                            Some(router),
+                            Vec::new(),
+                        ));
                     }
                 }
             }
             let method = r.method.clone();
-            if paths.iter().any(|(_, _, router)| router.is_some()) {
+            if paths.iter().any(|(_, _, router, _)| router.is_some()) {
                 diagnostics.push(diag(
                     "route_prefix_unknown",
                     path,
@@ -348,7 +530,7 @@ pub(crate) fn add_endpoints(
                     json!({ "framework": r.framework.as_str(), "handler": text }),
                 ));
             }
-            for (full, path_certainty, router) in paths {
+            for (full, path_certainty, router, composed_from) in paths {
                 let norm = norm_path(&full);
                 let key = match &router {
                     Some(router) => prefix_unknown_key(&method, &norm, &service, router),
@@ -376,6 +558,7 @@ pub(crate) fn add_endpoints(
                         path: path.to_owned(),
                         span: r.span,
                     },
+                    composed_from,
                 });
             }
         }
@@ -496,7 +679,7 @@ fn add_endpoint(
     edge.evidence = e
         .registrations
         .iter()
-        .map(|r| r.at.clone())
+        .flat_map(|r| std::iter::once(r.at.clone()).chain(r.composed_from.iter().cloned()))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -524,6 +707,7 @@ fn add_endpoint(
             }
             h.spans.extend(span);
             h.evidence.insert(r.at.clone());
+            h.evidence.extend(r.composed_from.iter().cloned());
         }
     }
     for (dst, h) in handled {
@@ -1020,6 +1204,204 @@ mod tests {
             .find(|e| e.kind == EdgeKind::HandledBy && e.evidence.len() == 2)
             .expect("a's two registrations are one edge with two evidence rows");
         assert!(a.attrs.is_empty());
+    }
+
+    /// S2: a group passed to a parameterised register function composes from the
+    /// call site; the endpoint key is path-based, its certainty heuristic, and both
+    /// sites are evidence. Unreached registrations stay `prefix_unknown`.
+    #[test]
+    fn gin_parameter_groups_compose_from_their_call_sites() {
+        let src = "package main\nimport \"github.com/gin-gonic/gin\"\nfunc Register(router *gin.RouterGroup) {\n\trouter.GET(\"/login\", Login)\n}\nfunc Login(c *gin.Context) {\n}\nfunc main() {\n\tr := gin.Default()\n\tv1 := r.Group(\"/api\")\n\tRegister(v1.Group(\"/users\"))\n}\n";
+        let built = build(&[("svc/main.go", Language::Go, src)], &[]);
+        assert_eq!(
+            edges(&built),
+            [
+                "EXPOSES svc -> HTTP GET /api/users/login @svc [heuristic]",
+                "HANDLED_BY HTTP GET /api/users/login @svc -> rb-heuristic . . . `svc/main.go`/Login(). [heuristic]",
+            ]
+        );
+        assert!(
+            !diagnostics(&built)
+                .iter()
+                .any(|d| d.starts_with("route_prefix_unknown")),
+            "{:?}",
+            diagnostics(&built)
+        );
+        // Both sites are evidence on the composed edge.
+        let exposes = built
+            .graph
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Exposes)
+            .unwrap();
+        assert_eq!(exposes.evidence.len(), 2);
+    }
+
+    /// S2 across packages: the callee resolves through its import (never by bare
+    /// name); the endpoint lives in the callee's service.
+    #[test]
+    fn gin_parameter_groups_compose_across_packages() {
+        let main = "package main\nimport (\n\t\"example.com/svc/users\"\n\t\"github.com/gin-gonic/gin\"\n)\nfunc main() {\n\tr := gin.Default()\n\tv1 := r.Group(\"/api\")\n\tusers.UsersRegister(v1.Group(\"/users\"))\n}\n";
+        let routers = "package users\nimport \"github.com/gin-gonic/gin\"\nfunc UsersRegister(router *gin.RouterGroup) {\n\trouter.GET(\"/login\", Login)\n}\nfunc Login(c *gin.Context) {\n}\n";
+        let facts: Vec<(String, Language, FileFacts)> = [
+            ("app/main.go", Language::Go, main),
+            ("users/routers.go", Language::Go, routers),
+        ]
+        .iter()
+        .map(|(p, l, src)| {
+            (
+                (*p).to_owned(),
+                *l,
+                rb_syntax::extract(*l, src.as_bytes()).unwrap(),
+            )
+        })
+        .collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
+            .iter()
+            .map(|(p, l, f)| (p.as_str(), (*l, f)))
+            .collect();
+        let keys: BTreeMap<&str, Vec<String>> = by_path
+            .iter()
+            .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+            .collect();
+        let routes: BTreeMap<&str, FileRoutes> = by_path
+            .iter()
+            .map(|(p, (l, f))| (*p, rb_frameworks::routes::routes(*l, f)))
+            .collect();
+        let go: BTreeMap<String, String> =
+            BTreeMap::from([("".to_owned(), "example.com/svc".to_owned())]);
+        let index = Index::new(&by_path, &go, &keys);
+        let mut b = GraphBuilder::new();
+        let service_of = |p: &str| p.split('/').next().unwrap_or(p).to_owned();
+        for (path, (_, f)) in &by_path {
+            b.add_node(NodeKey::new(NodeKind::File, *path), *path, Attrs::new())
+                .unwrap();
+            let s = NodeKey::new(NodeKind::Service, service_of(path));
+            if !b.has_node(&s) {
+                b.add_node(s, service_of(path), Attrs::new()).unwrap();
+            }
+            crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
+        }
+        let (exact, context_paths, config_unread) =
+            (BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
+        let inputs = Inputs {
+            files: &by_path,
+            routes: &routes,
+            keys: &keys,
+            index: &index,
+            exact_handlers: &exact,
+            service_of: &service_of,
+            context_paths: &context_paths,
+            config_unread: &config_unread,
+        };
+        let (diagnostics, _) = add_endpoints(&mut b, &inputs).unwrap();
+        let built = Built {
+            graph: b.finish().unwrap(),
+            diagnostics,
+            endpoints: Vec::new(),
+        };
+        assert_eq!(
+            edges(&built),
+            [
+                "EXPOSES users -> HTTP GET /api/users/login @users [heuristic]",
+                "HANDLED_BY HTTP GET /api/users/login @users -> rb-heuristic . . . `users/routers.go`/Login(). [heuristic]",
+            ]
+        );
+    }
+
+    /// S2 fallback: a dynamic group argument folds to nothing, so the unknown node
+    /// stays (and is counted); no composed edge appears.
+    #[test]
+    fn gin_parameter_groups_with_dynamic_arguments_stay_unknown() {
+        let src = "package main\nimport \"github.com/gin-gonic/gin\"\nfunc Register(router *gin.RouterGroup) {\n\trouter.GET(\"/login\", Login)\n}\nfunc Login(c *gin.Context) {\n}\nfunc setup(prefix string) {\n\tr := gin.Default()\n\tRegister(r.Group(prefix))\n}\nfunc main() {\n\tsetup(\"/x\")\n}\n";
+        let built = build(&[("svc/main.go", Language::Go, src)], &[]);
+        assert_eq!(
+            edges(&built),
+            [
+                "EXPOSES svc -> HTTP GET /login @svc ?router=svc/main.go#Register.router [heuristic]",
+                "HANDLED_BY HTTP GET /login @svc ?router=svc/main.go#Register.router -> rb-heuristic . . . `svc/main.go`/Login(). [heuristic]",
+            ]
+        );
+        assert!(
+            diagnostics(&built)
+                .iter()
+                .any(|d| d.starts_with("route_prefix_unknown")),
+            "{:?}",
+            diagnostics(&built)
+        );
+    }
+
+    /// S2 is linear in call sites: four times the sites makes at most five times the
+    /// work. Parsing, keys, routes and the M3a index are built outside the counted
+    /// part; the composition walk is counted, not timed.
+    #[test]
+    fn param_group_composition_grows_linearly() {
+        let work = |n: usize| {
+            let mut caller =
+                "package main\nimport \"github.com/gin-gonic/gin\"\nfunc main() {\n\tr := gin.Default()\n"
+                    .to_owned();
+            for i in 0..n {
+                caller.push_str(&format!("\tRegister(r.Group(\"/p{i}\"))\n"));
+            }
+            caller.push_str("}\n");
+            let callee = "package main\nimport \"github.com/gin-gonic/gin\"\nfunc Register(router *gin.RouterGroup) {\n\trouter.GET(\"/login\", Login)\n}\nfunc Login(c *gin.Context) {\n}\n";
+            let facts: Vec<(String, Language, FileFacts)> = [
+                ("svc/caller.go", Language::Go, caller.as_str()),
+                ("svc/callee.go", Language::Go, callee),
+            ]
+            .iter()
+            .map(|(p, l, src)| {
+                (
+                    (*p).to_owned(),
+                    *l,
+                    rb_syntax::extract(*l, src.as_bytes()).unwrap(),
+                )
+            })
+            .collect();
+            let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
+                .iter()
+                .map(|(p, l, f)| (p.as_str(), (*l, f)))
+                .collect();
+            let keys: BTreeMap<&str, Vec<String>> = by_path
+                .iter()
+                .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+                .collect();
+            let routes: BTreeMap<&str, FileRoutes> = by_path
+                .iter()
+                .map(|(p, (l, f))| (*p, rb_frameworks::routes::routes(*l, f)))
+                .collect();
+            let go = BTreeMap::new();
+            let index = Index::new(&by_path, &go, &keys);
+            let mut b = GraphBuilder::new();
+            let service_of = |p: &str| p.split('/').next().unwrap_or(p).to_owned();
+            for (path, (_, f)) in &by_path {
+                b.add_node(NodeKey::new(NodeKind::File, *path), *path, Attrs::new())
+                    .unwrap();
+                let s = NodeKey::new(NodeKind::Service, service_of(path));
+                if !b.has_node(&s) {
+                    b.add_node(s, service_of(path), Attrs::new()).unwrap();
+                }
+                crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
+            }
+            let (exact, context_paths, config_unread) =
+                (BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
+            let inputs = Inputs {
+                files: &by_path,
+                routes: &routes,
+                keys: &keys,
+                index: &index,
+                exact_handlers: &exact,
+                service_of: &service_of,
+                context_paths: &context_paths,
+                config_unread: &config_unread,
+            };
+            rb_frameworks::work::take();
+            let (_, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
+            assert_eq!(endpoints.len(), n);
+            rb_frameworks::work::take()
+        };
+        let (small, large) = (work(200), work(800));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
     #[test]

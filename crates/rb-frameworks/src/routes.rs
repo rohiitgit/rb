@@ -299,7 +299,7 @@ fn init_chain<'f>(facts: &'f FileFacts, b: &Binding) -> Option<&'f CallChain> {
 }
 
 /// A template with no hole, as its text.
-pub(crate) fn literal(arg: &Arg) -> Option<String> {
+pub fn literal(arg: &Arg) -> Option<String> {
     match arg {
         Arg::Template { template } => match template.parts.as_slice() {
             [] => Some(String::new()),
@@ -777,6 +777,18 @@ fn gin_chain_prefix(
     Some(prefix)
 }
 
+/// The prefix a call chain stands for as a gin group argument: its receiver composed
+/// with every link, which must all be `Group(literal)` (contract M6b S2). The endpoint
+/// stage folds the group a call site passes to a parameterised register function with
+/// this. `Some(Some(p))` known, `Some(None)` a gin group of unknown prefix, `None`
+/// not gin at all.
+pub fn gin_group_prefix(facts: &FileFacts, chain: &CallChain) -> Option<Option<String>> {
+    let scope = FileScope::new(facts);
+    let gin = go_import_name(&scope, "github.com/gin-gonic/gin")?;
+    let mut seen = HashSet::new();
+    gin_chain_prefix(&scope, &gin, chain, chain.links.len(), &mut seen)
+}
+
 fn gin(facts: &FileScope<'_>, out: &mut FileRoutes) {
     let Some(gin) = go_import_name(facts, "github.com/gin-gonic/gin") else {
         return;
@@ -1172,6 +1184,27 @@ public class AuthController {
             summary(Language::Go, &aliased)
                 .contains(&"POST /billing/invoices/{}/pay root name payInvoice".to_owned())
         );
+    }
+
+    /// S2's foldable argument: a `Group(literal)` chain folds through the caller's
+    /// bindings; a dynamic prefix stays unknown-but-gin; a non-group chain is not gin.
+    /// The join is raw (`/api` + `/users`); `norm_path` cleans it downstream, as for
+    /// `gin()`'s own paths.
+    #[test]
+    fn gin_group_argument_chains_fold() {
+        let src = "package main\nimport \"github.com/gin-gonic/gin\"\nfunc main() {\n\tr := gin.Default()\n\tv1 := r.Group(\"/api\")\n\tusers.UsersRegister(v1.Group(\"/users\"))\n\tdyn := r.Group(prefix)\n\tusers.OtherRegister(dyn)\n}\n";
+        let facts = rb_syntax::extract(Language::Go, src.as_bytes()).unwrap();
+        let groups: Vec<String> = facts
+            .chains
+            .iter()
+            .filter(|c| c.links.last().is_some_and(|l| l.name == "Group"))
+            .map(|c| match gin_group_prefix(&facts, c) {
+                Some(Some(p)) => format!("={p}"),
+                Some(None) => "?".to_owned(),
+                None => "-".to_owned(),
+            })
+            .collect();
+        assert_eq!(groups, ["=/api", "=/api//users", "?"]);
     }
 
     /// A group of unknown prefix is identified by its receiver binding, qualified by the
