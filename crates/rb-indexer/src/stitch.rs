@@ -98,6 +98,9 @@ pub(crate) struct Site {
     pub method: Option<String>,
     /// `None` when the URL is not a string or a name.
     pub url: Option<Folded>,
+    /// The request value reaches an in-process sink (contract M6b S4): never
+    /// stitched, whatever the URL folds to.
+    pub in_process: bool,
     /// A Spring property the URL folded is also set by a configuration file M4a does not read
     /// (a profile, YAML or bootstrap file), so the folded value may not be the deployed one
     /// (evaluator pass 1, P7).
@@ -144,8 +147,9 @@ struct Outcome {
     links: Vec<Link>,
     /// Candidates of a `too_ambiguous` site.
     candidates: usize,
-    /// Why an `unmatched` site is unmatched, when a rule removed its only path match
-    /// (`catch_all_only`, contract M4b S20).
+    /// Why an `unmatched` site is unmatched: a rule that removed its only
+    /// path match (`catch_all_only`, contract M4b S20), or an S4 exclusion
+    /// (`in_process`, `empty_url`, contract M6b S4).
     detail: Option<&'static str>,
 }
 
@@ -410,6 +414,9 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 client: call.kind,
                 method: call.method.clone(),
                 url,
+                // A request that never leaves the process (contract M6b
+                // S4): unmatched, never an edge.
+                in_process: file_clients.in_process.contains(&call.span),
                 config_overridden: folding.take_asked(),
                 base_from_bean: from_bean.is_some(),
                 base_verified,
@@ -650,9 +657,30 @@ impl<'e> Stitcher<'e> {
 
     /// The bucket and edges of one site (S13, S14).
     fn site(&self, site: &Site) -> Outcome {
+        // An in-process request never leaves the process (contract M6b S4):
+        // never stitched, whatever the URL folds to.
+        if site.in_process {
+            return Outcome {
+                detail: Some("in_process"),
+                ..Outcome::bucket(Bucket::Unmatched)
+            };
+        }
         let Some(folded) = &site.url else {
             return Outcome::bucket(Bucket::Dynamic);
         };
+        // An empty URL is never path-matched (contract M6b S4): no literal
+        // text and no holes. `""` normalises to `/` below, so this check
+        // comes first.
+        if folded
+            .pieces
+            .iter()
+            .all(|p| matches!(p, Piece::Lit(l) if l.is_empty()))
+        {
+            return Outcome {
+                detail: Some("empty_url"),
+                ..Outcome::bucket(Bucket::Unmatched)
+            };
+        }
         let url = client_url(&folded.pieces);
         // A host hole next to an FQDN fragment names no service (amendment 12, Q2).
         if url.host_external.is_some() {
@@ -904,10 +932,24 @@ pub(crate) fn add_consumes(
     let mut merged: BTreeMap<(NodeKey, usize), Merged> = BTreeMap::new();
     let mut diagnostics = Vec::new();
     let mut counts: BTreeMap<Bucket, usize> = Bucket::ALL.iter().map(|&k| (k, 0)).collect();
+    let mut in_process = 0;
+    let mut empty_url = 0;
     for site in sites {
         let outcome = stitcher.site(site);
         *counts.entry(outcome.bucket).or_default() += 1;
-        if let Some(kind) = outcome.bucket.diagnostic() {
+        match outcome.detail {
+            Some("in_process") => in_process += 1,
+            Some("empty_url") => empty_url += 1,
+            _ => {}
+        }
+        // Contract M6b S4 (D4): in-process and empty-URL sites are
+        // `unmatched` with their own diagnostic kinds, never silent drops.
+        let kind = match outcome.detail {
+            Some("in_process") => Some("http_in_process"),
+            Some("empty_url") => Some("http_empty_url"),
+            _ => outcome.bucket.diagnostic(),
+        };
+        if let Some(kind) = kind {
             let mut detail = json!({ "client": site.client.as_str() });
             if let Some(url) = &site.url {
                 detail["url"] = render(url).into();
@@ -977,6 +1019,21 @@ pub(crate) fn add_consumes(
             "bases".into(),
             json!({ "verified": bases(true), "unverified": bases(false) }),
         );
+        // Contract M6b S4 (D3, invariant 4): the `unmatched` bucket splits
+        // into plain-unmatched and the exclusions, so the buckets still sum
+        // to the sites. The split counts ride along only when non-zero, so
+        // unrelated dumps stay byte-identical.
+        if in_process > 0 || empty_url > 0 {
+            let plain =
+                detail["unmatched"].as_u64().unwrap_or(0) - in_process as u64 - empty_url as u64;
+            detail.insert("unmatched".into(), plain.into());
+            if in_process > 0 {
+                detail.insert("http_in_process".into(), in_process.into());
+            }
+            if empty_url > 0 {
+                detail.insert("http_empty_url".into(), empty_url.into());
+            }
+        }
         diagnostics.push(Diagnostic {
             kind: "http_coverage".into(),
             path: None,
@@ -1075,6 +1132,7 @@ mod tests {
             client: ClientKind::Fetch,
             method: method.map(str::to_owned),
             url: url.map(|(t, o)| folded(t, o)),
+            in_process: false,
             config_overridden: false,
             base_from_bean: false,
             base_verified: None,
@@ -1639,6 +1697,137 @@ mod tests {
         let none = call("http://notification/nothing/here");
         assert_eq!(one(&eps, &none).0, Bucket::Unmatched);
         assert_eq!(detail(&eps, &none), None);
+    }
+
+    /// Contract M6b S4: an in-process request is `unmatched` and never
+    /// stitched — even with a foreign absolute URL that is otherwise the
+    /// `synthetic` row. Its diagnostic kind is its own (`http_in_process`,
+    /// D4), not `http_unmatched`.
+    #[test]
+    fn in_process_requests_are_unmatched() {
+        let eps = endpoints();
+        let sunk = Site {
+            in_process: true,
+            ..site(
+                AUTH,
+                Some("POST"),
+                Some(("http://notification:3000/internal/mfa/email", Literal)),
+                1,
+            )
+        };
+        assert_eq!(one(&eps, &sunk), (Bucket::Unmatched, vec![]));
+        assert_eq!(detail(&eps, &sunk), Some("in_process"));
+        let mut b = GraphBuilder::new();
+        let diagnostics =
+            add_consumes(&mut b, std::slice::from_ref(&sunk), &eps, &services()).unwrap();
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_in_process")
+            .unwrap();
+        assert_eq!(diagnostic.detail["detail"], "in_process");
+        assert!(diagnostics.iter().all(|d| d.kind != "http_unmatched"));
+    }
+
+    /// Contract M6b S4: an empty URL is never path-matched — not even to
+    /// `/`, which today is what `""` normalises to. Its diagnostic kind is
+    /// its own (`http_empty_url`, D4).
+    #[test]
+    fn empty_urls_are_never_path_matched() {
+        let mut eps = endpoints();
+        eps.push(ep("GET", "/", NOTIFICATION));
+        let empty = site(WEB, Some("GET"), Some(("", Literal)), 1);
+        assert_eq!(one(&eps, &empty), (Bucket::Unmatched, vec![]));
+        assert_eq!(detail(&eps, &empty), Some("empty_url"));
+        // The control: a literal `/` still matches.
+        let slash = site(WEB, Some("GET"), Some(("/", Literal)), 2);
+        assert_eq!(one(&eps, &slash).0, Bucket::Heuristic);
+        assert_eq!(detail(&eps, &slash), None);
+    }
+
+    /// Contract M6b S4: a site that is both in-process and empty counts as
+    /// in-process — the sink evidence dominates.
+    #[test]
+    fn in_process_beats_empty_url() {
+        let eps = endpoints();
+        let sunk = Site {
+            in_process: true,
+            ..site(WEB, Some("GET"), Some(("", Literal)), 1)
+        };
+        assert_eq!(one(&eps, &sunk), (Bucket::Unmatched, vec![]));
+        assert_eq!(detail(&eps, &sunk), Some("in_process"));
+    }
+
+    /// Contract M6b S4, invariant 4 and D3: every exclusion lands in exactly
+    /// one counted bucket (`unmatched`), the split counts ride along only
+    /// when non-zero, and the buckets still sum to the sites.
+    #[test]
+    fn s4_exclusions_are_counted_but_only_when_non_zero() {
+        let eps = endpoints();
+        let sunk = Site {
+            in_process: true,
+            ..site(
+                AUTH,
+                Some("POST"),
+                Some(("http://notification:3000/internal/mfa/email", Literal)),
+                1,
+            )
+        };
+        let empty = site(WEB, Some("GET"), Some(("", Literal)), 2);
+        let plain = site(WEB, Some("GET"), Some(("/nowhere", Literal)), 3);
+        let sites = vec![sunk, empty, plain];
+        let mut b = GraphBuilder::new();
+        for e in &eps {
+            b.add_node(
+                NodeKey::new(NodeKind::Endpoint, e.key.clone()),
+                &e.key,
+                Attrs::new(),
+            )
+            .unwrap();
+        }
+        for s in &sites {
+            if !b.has_node(&s.src) {
+                b.add_node(s.src.clone(), "f", Attrs::new()).unwrap();
+            }
+        }
+        let diagnostics = add_consumes(&mut b, &sites, &eps, &services()).unwrap();
+        let kinds: Vec<&str> = diagnostics.iter().map(|d| d.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "http_in_process",
+                "http_empty_url",
+                "http_unmatched",
+                "http_coverage"
+            ]
+        );
+        let coverage = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_coverage")
+            .unwrap();
+        assert_eq!(
+            coverage.detail,
+            json!({"sites": 3, "synthetic": 0, "heuristic": 0, "ambiguous": 0, "too_ambiguous": 0,
+                   "unmatched": 1, "self": 0, "external": 0, "dynamic": 0,
+                   "http_in_process": 1, "http_empty_url": 1,
+                   "bases": {"verified": 0, "unverified": 0}})
+        );
+        // Invariant 4, extended: the buckets plus the S4 split sum to the sites.
+        let total: u64 = Bucket::ALL
+            .iter()
+            .map(|b| coverage.detail[b.as_str()].as_u64().unwrap())
+            .sum::<u64>()
+            + coverage.detail["http_in_process"].as_u64().unwrap_or(0)
+            + coverage.detail["http_empty_url"].as_u64().unwrap_or(0);
+        assert_eq!(total, sites.len() as u64);
+        // D3: no S4 site, no S4 counter.
+        let mut b = GraphBuilder::new();
+        let diagnostics = add_consumes(&mut b, &sites[2..], &eps, &services()).unwrap();
+        let coverage = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_coverage")
+            .unwrap();
+        assert!(coverage.detail.get("http_in_process").is_none());
+        assert!(coverage.detail.get("http_empty_url").is_none());
     }
 
     /// Evaluator pass 1, P1 (the evaluator's repros, folded URLs): a hole in the port keeps a

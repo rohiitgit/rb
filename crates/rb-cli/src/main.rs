@@ -1205,8 +1205,9 @@ fn code_line(r: &rb_store::ResolutionCoverage) -> String {
     }
 }
 
-/// The `rb status` HTTP line (contract M4a S14): endpoints, the services exposing them, and the
-/// client call sites per bucket, zero buckets omitted, in a fixed order.
+/// The `rb status` HTTP line (contract M4a S14, M6b S4): endpoints, the services exposing them,
+/// and the client call sites per bucket, zero buckets omitted, in a fixed order. The S4
+/// exclusions subdivide `unmatched` and print with it.
 fn http_line(c: &rb_store::HttpCoverage) -> String {
     const ORDER: &[(&str, &str)] = &[
         ("synthetic", "synthetic"),
@@ -1214,6 +1215,8 @@ fn http_line(c: &rb_store::HttpCoverage) -> String {
         ("ambiguous", "ambiguous"),
         ("too_ambiguous", "too ambiguous"),
         ("unmatched", "unmatched"),
+        ("http_in_process", "in-process"),
+        ("http_empty_url", "empty-url"),
         ("external", "external"),
         ("dynamic", "dynamic"),
         ("self", "self"),

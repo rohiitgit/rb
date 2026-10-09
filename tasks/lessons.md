@@ -297,3 +297,15 @@
 ## 2026-10-09: a sorted scan with a segment-aware predicate breaks on the string boundary
 - **Mistake:** workspace member discovery scanned sorted package roots with `take_while(is_under)`, asserting "roots strictly under follow it in sorted order". A sibling (`mods-old`) sorts between the root and its members (`-` below `/`), so the scan stopped early and members fell back to unpinned jobs (evaluator pass 1, Z1).
 - **Rule:** when a scan over sorted paths uses a segment-aware predicate (`is_under`, "strictly under"), the `take_while` boundary must be the *string* predicate (shared prefix ⇒ contiguous run) with the segment check as a per-item filter — never the reverse. Test with a sibling whose post-root character sorts below `/` (`-`, `.`, `+`), plus a growth shape with such siblings.
+
+## 2026-10-10: never `git checkout --` a file with uncommitted work; verify the restore path first
+- **Mistake:** during phase-4 mutant runs, `git checkout -- crates/rb-frameworks/src/clients.rs` (meant to revert a mutant) discarded the whole phase's uncommitted implementation. Restored from a `/tmp` backup, verified by the test suite — but the backup's freshness had to be established after the fact.
+- **Rule:** revert mutants by re-applying the saved bytes (`cp` back the pre-mutant copy), never by `git checkout --`. Before any destructive command, confirm the restore source exists and is current (`diff` it against the tree if unsure). Keep one clearly-named pre-mutant copy per file under `/tmp` for the duration of the mutation runs.
+
+## 2026-10-10: Go's `httptest` lives at `net/http/httptest`, and a wrong import path fails silent
+- **Mistake (caught by tests):** the S4 sink walk looked up `net/httptest`; Go's package is `net/http/httptest`, so no recorder chain was ever recognised and three tests came back empty. The import gate returned `None` exactly as designed for a missing import — the design worked, the constant was wrong.
+- **Rule:** import-path constants get a positive unit each (a probe asserting the alias resolves), and a failing sink test is debugged by printing the gate's inputs (the resolved import names, the recognised chain indices) before doubting the walk.
+
+## 2026-10-10: a shared DB container bind-mounts its own checkout's `var/`
+- **Mistake (environment):** this workspace's e2e failed on AGE loads because the running compose database (started from the original checkout) bind-mounts that checkout's `var/age-load`, not this workspace's. Replacing this workspace's (gitignored) `var/age-load` with a symlink to the mounted directory fixed it.
+- **Rule:** when e2e fails on loader paths with a shared database, inspect the container's mounts (`docker inspect … .Mounts`) and point the workspace's gitignored load dir at the mounted source. Never restart or move the shared database for a workspace-local problem.

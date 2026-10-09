@@ -92,7 +92,8 @@ use serde_json::{Value, json};
 /// job (D5, D6).
 /// `m6b-1` gin groups passed as parameters compose from their call sites (S2).
 /// `m6b-2` Express construction chains and anonymous default-exported routers (S3).
-pub const PIPELINE: &str = "m6b-2";
+/// `m6b-3` in-process and empty-URL Go requests are `unmatched`, never edges (S4).
+pub const PIPELINE: &str = "m6b-3";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

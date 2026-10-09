@@ -687,7 +687,8 @@ impl Store {
                  JOIN rb.edge m ON m.snapshot_id = dg.snapshot_id AND m.src = dg.file_id
                                AND m.kind = 'IN_SERVICE'
                  WHERE dg.snapshot_id = $1 AND m.dst = $2
-                   AND dg.kind IN ('http_unmatched', 'http_self', 'http_external',
+                   AND dg.kind IN ('http_unmatched', 'http_in_process', 'http_empty_url',
+                                   'http_self', 'http_external',
                                    'http_url_dynamic', 'http_too_ambiguous')",
                 &[&snapshot_id, &id],
             )?

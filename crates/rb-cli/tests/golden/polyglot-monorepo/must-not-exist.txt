@@ -22,6 +22,11 @@ HANDLED_BY * -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/Au
 EXPOSES * -> HTTP POST /internal/mfa/push @services/notification
 # Contract M4a item 5 (M4b S22): a relative call whose only path match is its own service's /sms.
 CONSUMES rb-heuristic . . . `services/notification/src/selfcheck.ts`/smsCheck(). -> *
+# Contract M6b S4: a request served in-process never stitches, whatever its URL.
+CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main_test.go`/TestServeMfaInProcess(). -> *
+CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main_test.go`/TestProxyNotifyInProcess(). -> *
+# Contract M6b S4: an empty URL is never path-matched.
+CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main_test.go`/TestEmptyRequestURL(). -> *
 # UserDao's only point is an external JdbcTemplate: no edge (bucket external).
 INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao# -> *
 # Contract M4b F2: no INJECTS reaches synthetic.

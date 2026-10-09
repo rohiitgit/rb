@@ -10,8 +10,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rb_syntax::{
-    Arg, Binding, CallChain, Decoration, DefKind, FileFacts, Init, Language, Span, StrTemplate,
-    TemplatePart, TokenRole,
+    Arg, Binding, CallChain, CallLink, Decoration, DefKind, FileFacts, Init, Language, Span,
+    StrTemplate, TemplatePart, TokenRole,
 };
 
 use crate::endpoint::norm_method;
@@ -134,6 +134,10 @@ pub struct AxiosInstance {
 pub struct FileClients {
     pub calls: Vec<ClientCall>,
     pub axios_instances: Vec<AxiosInstance>,
+    /// Spans of the file's `NewRequest` call chains whose request value
+    /// reaches an in-process sink (contract M6b S4), in source order. The
+    /// indexer turns these sites `unmatched`, never edges.
+    pub in_process: BTreeSet<Span>,
 }
 
 /// Every client call site of one file, in source order per pack.
@@ -2016,11 +2020,12 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
                 };
                 (Some(norm_method(m)), link.args.first())
             }
-            "NewRequest" if on_package && link.args.len() >= 2 => {
-                (go_method(&link.args[0]), link.args.get(1))
-            }
-            "NewRequestWithContext" if on_package && link.args.len() >= 3 => {
-                (go_method(&link.args[1]), link.args.get(2))
+            name @ ("NewRequest" | "NewRequestWithContext") if go_new_request(&http, chain) => {
+                if name == "NewRequest" {
+                    (go_method(&link.args[0]), link.args.get(1))
+                } else {
+                    (go_method(&link.args[1]), link.args.get(2))
+                }
             }
             _ => continue,
         };
@@ -2048,6 +2053,382 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             base_verified: (!bare).then_some(false),
         });
     }
+    // A request that never leaves the process is no client call (contract M6b
+    // S4); the indexer buckets these spans `unmatched`, never edges.
+    out.in_process = go_in_process(facts, &http, import_name("net/http/httptest").as_deref());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Go in-process requests (contract M6b S4)
+
+/// How deep the sink walk follows a request through same-file helpers before
+/// it stops (contract invariant 8: bounded work).
+const MAX_SINK_DEPTH: usize = 8;
+
+/// A `net/http` request construction: `NewRequest` (method, URL, body) or
+/// `NewRequestWithContext` (context, method, URL, body) on the `net/http`
+/// import. The same gate as the client sites in [`go_http`], so a marked
+/// span is always a site.
+fn go_new_request(http: &str, chain: &CallChain) -> bool {
+    let (Some(root), [link]) = (chain.root.as_deref(), chain.links.as_slice()) else {
+        return false;
+    };
+    root == http
+        && match link.name.as_str() {
+            "NewRequest" => link.args.len() >= 2,
+            "NewRequestWithContext" => link.args.len() >= 3,
+            _ => false,
+        }
+}
+
+/// Whether `inner` lies within `outer` (start and end comparisons).
+fn within(inner: Span, outer: Span) -> bool {
+    (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
+}
+
+/// The bindings `binding_index_at` could resolve `name` to in `def`: the
+/// same-named ones in the definition, its ancestors and the file scope.
+/// Anything else is disjoint from the definition, so its extent can never
+/// hold a site in it.
+fn resolve_candidates(
+    facts: &FileScope<'_>,
+    by_scope: &HashMap<(Option<usize>, &str), Vec<usize>>,
+    def: Option<usize>,
+    name: &str,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut scope = def;
+    loop {
+        if let Some(found) = by_scope.get(&(scope, name)) {
+            crate::work::tick(found.len());
+            out.extend(found.iter().copied());
+        }
+        match scope {
+            Some(d) => scope = facts.facts.definitions[d].parent,
+            None => break,
+        }
+    }
+    out
+}
+
+/// What `name` means at `at`: `binding_index_at`'s filter (the visible
+/// extent holds the site) and maximum (the innermost declaration wins) over
+/// the candidates — the same answer, without scanning every same-named
+/// binding per site.
+fn resolve_at(facts: &FileScope<'_>, candidates: &[usize], at: Span) -> Option<usize> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|&bi| {
+            let v = facts.bindings[bi].visible;
+            (v[0], v[1]) <= (at[0], at[1]) && (at[0], at[1]) <= (v[2], v[3])
+        })
+        .max_by_key(|&bi| {
+            let v = facts.bindings[bi].visible;
+            (v[0], v[1])
+        })
+}
+
+/// What `name` means at `at` in `def`, cached per (definition, name):
+/// each distinct pair scans once no matter how many sites name it, which
+/// keeps the sink walk linear.
+fn winner(
+    facts: &FileScope<'_>,
+    by_scope: &HashMap<(Option<usize>, &str), Vec<usize>>,
+    resolved: &mut HashMap<(Option<usize>, String), Vec<usize>>,
+    def: Option<usize>,
+    name: &str,
+    at: Span,
+) -> Option<usize> {
+    let candidates = resolved
+        .entry((def, name.to_owned()))
+        .or_insert_with(|| resolve_candidates(facts, by_scope, def, name));
+    resolve_at(facts, candidates, at)
+}
+
+/// A recorder value in a call: a recorder-bound name, or a recorder
+/// construction inline.
+fn with_recorder(
+    facts: &FileScope<'_>,
+    by_scope: &HashMap<(Option<usize>, &str), Vec<usize>>,
+    resolved: &mut HashMap<(Option<usize>, String), Vec<usize>>,
+    recorder_bindings: &HashSet<usize>,
+    recorder_chains: &HashSet<usize>,
+    def: Option<usize>,
+    link: &CallLink,
+) -> bool {
+    link.args.iter().any(|other| match other {
+        Arg::Name { text, span } => winner(facts, by_scope, resolved, def, text, *span)
+            .is_some_and(|o| recorder_bindings.contains(&o)),
+        Arg::Other { span } => recorder_chains
+            .iter()
+            .any(|&r| within(facts.chains[r].span, *span)),
+        _ => false,
+    })
+}
+
+/// Spans of the `http.NewRequest` call chains whose request value reaches an
+/// in-process sink (contract M6b S4).
+///
+/// The allow-list, each matched on positively identified forms only:
+/// - the request's name is an argument of a `ServeHTTP` call (any receiver:
+///   a `ServeHTTP` method means a handler);
+/// - the request's name is passed to the same call as an `httptest` recorder
+///   value (a binding built by `httptest.NewRecorder`/`NewResponseRecorder`,
+///   or one built inline), as in a direct handler invocation;
+/// - the request's name is passed to a handler registered on a `ServeMux`
+///   (`Handle`/`HandleFunc` with two arguments on the package functions or a
+///   `ServeMux`-typed or `NewServeMux`-built receiver, mirroring the route
+///   pack's gate; a `HandlerFunc` conversion names its function).
+///   Registration is file-global: any direct call of the registered handler
+///   in the file is in-process (the handler runs in-process with that
+///   request).
+///
+/// The walk starts at each `NewRequest` site and follows the request's name
+/// through same-file helper calls (a positional bare-name argument into a
+/// uniquely named plain function), up to [`MAX_SINK_DEPTH`] deep, with a
+/// visited set. Every use site must resolve to the request's own binding
+/// ([`FileScope::binding_index_at`]), so a shadowing same-named local can
+/// only stop the walk, never mark. A request also passed to `Do` keeps its
+/// edge (sent both ways: the network wins).
+///
+/// Out of scope by construction: a hand-rolled recorder (no recognised
+/// construction); a request held in a member (`s.req`); a request built and
+/// served across files; a reassigned request name (the first binding wins);
+/// a multi-value passthrough (`f(http.NewRequest(…))`, uncompilable except
+/// into a `(*Request, error)` pair, which no sink shape takes by parts).
+fn go_in_process(facts: &FileScope<'_>, http: &str, httptest: Option<&str>) -> BTreeSet<Span> {
+    let mut new_requests = Vec::new();
+    let mut recorder_chains: HashSet<usize> = HashSet::new();
+    // `http.HandlerFunc(f)` conversions by span, for mux registrations.
+    let mut handlerfuncs: Vec<(Span, String)> = Vec::new();
+    let mut by_enclosing: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
+    for (i, chain) in facts.chains.iter().enumerate() {
+        crate::work::tick(1);
+        if go_new_request(http, chain) {
+            new_requests.push(i);
+        }
+        if httptest.is_some_and(|h| {
+            chain.root.as_deref() == Some(h)
+                && matches!(chain.links.as_slice(), [link]
+                    if matches!(link.name.as_str(), "NewRecorder" | "NewResponseRecorder"))
+        }) {
+            recorder_chains.insert(i);
+        }
+        if chain.root.as_deref() == Some(http)
+            && let [link] = chain.links.as_slice()
+            && link.name == "HandlerFunc"
+            && let Some(Arg::Name { text, .. }) = link.args.first()
+        {
+            handlerfuncs.push((chain.span, text.clone()));
+        }
+        by_enclosing.entry(chain.enclosing).or_default().push(i);
+    }
+    if new_requests.is_empty() {
+        return BTreeSet::new();
+    }
+    // Bindings built by a recorder chain, and handlers registered on a mux.
+    let mut recorder_bindings: HashSet<usize> = HashSet::new();
+    for (bi, b) in facts.bindings.iter().enumerate() {
+        crate::work::tick(1);
+        if matches!(&b.init, Some(Init::Call { chain }) if recorder_chains.contains(chain)) {
+            recorder_bindings.insert(bi);
+        }
+    }
+    let is_mux = |root: &str, at: Span| {
+        root == http
+            || facts.binding_at(root, at).is_some_and(|b| {
+                b.type_name == format!("{http}.ServeMux")
+                    || matches!(&b.init, Some(Init::Call { chain }) if facts.chains.get(*chain).is_some_and(|c| {
+                        c.root.as_deref() == Some(http)
+                            && c.links.len() == 1
+                            && c.links[0].name == "NewServeMux"
+                    }))
+            })
+    };
+    let mut mux_handlers: HashSet<String> = HashSet::new();
+    for chain in facts.chains.iter() {
+        crate::work::tick(1);
+        let Some(last) = chain.links.last() else {
+            continue;
+        };
+        if !matches!(last.name.as_str(), "Handle" | "HandleFunc") || last.args.len() != 2 {
+            continue;
+        }
+        let Some(root) = chain.root.as_deref() else {
+            continue;
+        };
+        if !is_mux(root, chain.span) {
+            continue;
+        }
+        for arg in &last.args[1..] {
+            match arg {
+                Arg::Name { text, .. } => {
+                    mux_handlers.insert(text.clone());
+                }
+                Arg::Other { span } => {
+                    // `mux.Handle(p, http.HandlerFunc(f))` names `f`.
+                    mux_handlers.extend(
+                        handlerfuncs
+                            .iter()
+                            .filter(|(at, _)| within(*at, *span))
+                            .map(|(_, name)| name.clone()),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    // Non-member bindings by (scope, name): the same index
+    // `binding_index_at` walks, grouped once (one pass, linear). A visit
+    // resolves a name from the scopes that can win for it — its own
+    // definition, its ancestors, the file — instead of scanning every
+    // same-named binding per site (which made the walk quadratic in the
+    // file). The filter and the maximum are `binding_index_at`'s own, so
+    // the answer is identical; a winner always lives in one of these
+    // scopes (anything else is disjoint from the definition).
+    let mut by_scope: HashMap<(Option<usize>, &str), Vec<usize>> = HashMap::new();
+    for (bi, b) in facts.bindings.iter().enumerate() {
+        crate::work::tick(1);
+        if !b.member {
+            by_scope
+                .entry((b.scope, b.name.as_str()))
+                .or_default()
+                .push(bi);
+        }
+    }
+    // Plain same-file functions by name, and their parameters by position.
+    let mut funcs: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (di, d) in facts.facts.definitions.iter().enumerate() {
+        crate::work::tick(1);
+        if d.kind == DefKind::Function {
+            funcs.entry(d.name.as_str()).or_default().push(di);
+        }
+    }
+    let mut params: HashMap<(usize, u32), Vec<usize>> = HashMap::new();
+    for (bi, b) in facts.bindings.iter().enumerate() {
+        crate::work::tick(1);
+        if let (Some(scope), Some(position)) = (b.scope, b.parameter) {
+            params.entry((scope, position)).or_default().push(bi);
+        }
+    }
+    // A request-carrying name: a non-member binding whose statement holds a
+    // `NewRequest` chain and no sibling chain (`req, err := …`; a wrapper or
+    // a `range` puts a sibling chain in the statement, and stays out). One
+    // pass over the bindings and, per candidate, one over the chains: linear
+    // in the file per `NewRequest` site.
+    let mut sunk: HashSet<usize> = HashSet::new();
+    let mut net: HashSet<usize> = HashSet::new();
+    let mut visited: HashSet<(Option<usize>, usize)> = HashSet::new();
+    // (definition, binding, request chains, depth).
+    let mut work: Vec<(Option<usize>, usize, Vec<usize>, usize)> = Vec::new();
+    for &nr in &new_requests {
+        let span = facts.chains[nr].span;
+        let enclosing = facts.chains[nr].enclosing;
+        for (bi, b) in facts.bindings.iter().enumerate() {
+            crate::work::tick(1);
+            if b.member || !within(span, b.span) {
+                continue;
+            }
+            let mut siblings = 0;
+            for (ci, c) in facts.chains.iter().enumerate() {
+                crate::work::tick(1);
+                if ci != nr && within(c.span, b.span) && !within(c.span, span) {
+                    siblings += 1;
+                }
+            }
+            if siblings == 0 && visited.insert((enclosing, bi)) {
+                work.push((enclosing, bi, vec![nr], 0));
+            }
+        }
+    }
+    // What a name means in the visited definition, cached per
+    // (definition, name): each distinct pair scans once no matter how many
+    // sites name it, which keeps the walk linear.
+    let mut resolved: HashMap<(Option<usize>, String), Vec<usize>> = HashMap::new();
+    while let Some((def, binding, requests, depth)) = work.pop() {
+        let Some(members) = by_enclosing.get(&def) else {
+            continue;
+        };
+        for &ci in members {
+            let chain = &facts.chains[ci];
+            // A callee the mux rule can name: a bare `h(…)` or `r.m(…)`.
+            let callee = if chain.links.len() == 1 {
+                match &chain.root {
+                    None => chain.links[0].name.clone(),
+                    Some(root) => format!("{root}.{}", chain.links[0].name),
+                }
+            } else {
+                String::new()
+            };
+            for link in &chain.links {
+                for (k, arg) in link.args.iter().enumerate() {
+                    crate::work::tick(1);
+                    // The request by name (resolving to its own binding), by
+                    // inline construction, or not at all.
+                    let carried = matches!(arg, Arg::Name { text, span }
+                        if winner(facts, &by_scope, &mut resolved, def, text, *span) == Some(binding));
+                    let inline: Vec<usize> = new_requests
+                        .iter()
+                        .copied()
+                        .filter(|&n| {
+                            matches!(arg, Arg::Other { span } if within(facts.chains[n].span, *span))
+                        })
+                        .collect();
+                    if link.name == "ServeHTTP" && carried {
+                        sunk.extend(requests.iter().copied());
+                    }
+                    if link.name == "Do" && carried {
+                        net.extend(requests.iter().copied());
+                    }
+                    if carried {
+                        if with_recorder(
+                            facts,
+                            &by_scope,
+                            &mut resolved,
+                            &recorder_bindings,
+                            &recorder_chains,
+                            def,
+                            link,
+                        ) {
+                            sunk.extend(requests.iter().copied());
+                        }
+                        if mux_handlers.contains(&callee) {
+                            sunk.extend(requests.iter().copied());
+                        }
+                        // Through a same-file helper: a positional bare-name
+                        // argument into a uniquely named plain function.
+                        if depth < MAX_SINK_DEPTH
+                            && chain.root.is_none()
+                            && chain.links.len() == 1
+                            && let Some([target]) = funcs.get(link.name.as_str()).map(Vec::as_slice)
+                            && let Some([param]) =
+                                params.get(&(*target, k as u32)).map(Vec::as_slice)
+                            && visited.insert((Some(*target), *param))
+                        {
+                            work.push((Some(*target), *param, requests.clone(), depth + 1));
+                        }
+                    }
+                    for n in inline {
+                        if with_recorder(
+                            facts,
+                            &by_scope,
+                            &mut resolved,
+                            &recorder_bindings,
+                            &recorder_chains,
+                            def,
+                            link,
+                        ) {
+                            sunk.insert(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sunk.difference(&net)
+        .map(|&n| facts.chains[n].span)
+        .collect()
 }
 
 /// `<root>.<name>(lit, args…)` at `span` — Go's `fmt.Sprintf`, Java's `String.format` — as a
@@ -3345,5 +3726,181 @@ mod tests {
         );
         let no_import = src.replace("\t\"net/http\"\n", "");
         assert!(calls(Language::Go, &no_import).is_empty());
+    }
+
+    /// The span of `needle`'s first occurrence, derived from the source, never
+    /// hand-counted (single-line needles only; columns are bytes, as extracted).
+    fn span_of(src: &str, needle: &str) -> Span {
+        let start = src.find(needle).unwrap();
+        let row = src[..start].matches('\n').count() as i32;
+        let line_start = src[..start].rfind('\n').map_or(0, |i| i + 1);
+        let end = start + needle.len();
+        assert!(
+            !src[start..end].contains('\n'),
+            "needle spans lines: {needle}"
+        );
+        [
+            row,
+            (start - line_start) as i32,
+            row,
+            (end - line_start) as i32,
+        ]
+    }
+
+    /// Spans of the file's `NewRequest` call chains whose request value reaches
+    /// an in-process sink (contract M6b S4).
+    fn in_process(src: &str) -> BTreeSet<Span> {
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        clients(Language::Go, &facts).in_process
+    }
+
+    /// Contract M6b S4: a request passed to `ServeHTTP` never stitches,
+    /// whether the handler is a `HandlerFunc` value (mattermost's API handler
+    /// tests) or a mux (its web test). A request the file sends over the
+    /// network (`Do`) is no in-process site.
+    #[test]
+    fn go_in_process_serve_http() {
+        let src = "package main\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n)\nfunc outgoing() {\n\treq, err := http.NewRequest(\"GET\", \"/api\", nil)\n\t_ = err\n\thttpRecorder := httptest.NewRecorder()\n\thandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})\n\thandler.ServeHTTP(httpRecorder, req)\n}\nfunc web() {\n\treq, err := http.NewRequest(\"GET\", \"/web\", nil)\n\t_ = err\n\tres := httptest.NewRecorder()\n\trouter.ServeHTTP(res, req)\n\t_ = res\n}\nfunc live(client *http.Client) {\n\treq, err := http.NewRequest(\"GET\", \"http://orders/orders/1\", nil)\n\t_ = err\n\tclient.Do(req)\n}\n";
+        // Each site has its own URL, so each span is addressed unambiguously.
+        assert_eq!(
+            in_process(src),
+            BTreeSet::from([
+                span_of(src, "http.NewRequest(\"GET\", \"/api\", nil)"),
+                span_of(src, "http.NewRequest(\"GET\", \"/web\", nil)"),
+            ]),
+            "{:?}",
+            in_process(src)
+        );
+    }
+
+    /// Contract M6b S4: a request handed to a handler alongside an
+    /// `httptest` recorder never stitches (mattermost's image-proxy tests,
+    /// `proxy.GetImage(recorder, request, …)`). A direct call with no
+    /// recorder in it is no sink (mattermost's CSRF test passes its request
+    /// to a method with no recorder; only its empty URL excludes it).
+    #[test]
+    fn go_in_process_recorder_co_pass() {
+        let src = "package main\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n)\nfunc image() {\n\trecorder := httptest.NewRecorder()\n\trequest, _ := http.NewRequest(http.MethodGet, \"/image.png\", nil)\n\tproxy.GetImage(recorder, request, \"http://mock/image.png\")\n\t_ = recorder\n}\nfunc check() {\n\tr, _ := http.NewRequest(http.MethodGet, \"/csrf\", nil)\n\tif !checkToken(r) {\n\t}\n}\nfunc checkToken(r *http.Request) bool {\n\treturn true\n}\n";
+        assert_eq!(
+            in_process(src),
+            BTreeSet::from([span_of(
+                src,
+                "http.NewRequest(http.MethodGet, \"/image.png\", nil)"
+            )]),
+            "{:?}",
+            in_process(src)
+        );
+    }
+
+    /// Contract M6b S4: a request passed to a handler registered on a
+    /// `ServeMux` never stitches. Registration is file-global: any direct
+    /// call of the registered handler in the file is in-process (the handler
+    /// runs in-process with that request). Without the registration the same
+    /// direct call is no sink.
+    #[test]
+    fn go_in_process_mux_registered_handler() {
+        let served = "package main\nimport \"net/http\"\nfunc echo(w http.ResponseWriter, r *http.Request) {}\nfunc served() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/echo\", echo)\n\treq, _ := http.NewRequest(\"POST\", \"http://orders/echo\", nil)\n\techo(nil, req)\n}\n";
+        assert_eq!(
+            in_process(served),
+            BTreeSet::from([span_of(
+                served,
+                "http.NewRequest(\"POST\", \"http://orders/echo\", nil)"
+            )]),
+            "{:?}",
+            in_process(served)
+        );
+        let direct = "package main\nimport \"net/http\"\nfunc echo(w http.ResponseWriter, r *http.Request) {}\nfunc direct() {\n\treq, _ := http.NewRequest(\"POST\", \"http://orders/direct\", nil)\n\techo(nil, req)\n}\n";
+        assert!(in_process(direct).is_empty(), "{:?}", in_process(direct));
+    }
+
+    /// Contract M6b S4, residue: a request sent both in-process and over the
+    /// network keeps its network edge — the sink marks, the `Do` unmarks.
+    #[test]
+    fn go_in_process_network_send_keeps_the_edge() {
+        let src = "package main\nimport \"net/http\"\nfunc both(client *http.Client, mux *http.ServeMux) {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/orders/1\", nil)\n\tclient.Do(req)\n\tmux.ServeHTTP(nil, req)\n}\n";
+        assert!(in_process(src).is_empty(), "{:?}", in_process(src));
+    }
+
+    /// Contract M6b S4: the walk follows a request through a same-file
+    /// helper (`top` builds, `helper` serves). A shadowed same-named local
+    /// and an unrelated same-named string stay out: use sites must resolve
+    /// to the request's own binding.
+    #[test]
+    fn go_in_process_through_a_helper() {
+        let src = "package main\nimport \"net/http\"\nfunc helper(req *http.Request) {\n\tmux.ServeHTTP(nil, req)\n}\nfunc top() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/x\", nil)\n\thelper(req)\n}\nfunc shadowed() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/y\", nil)\n\t_ = req\n}\nfunc other() {\n\treq := \"not a request\"\n\tserve(nil, req)\n}\nfunc serve(w http.ResponseWriter, r *http.Request) {}\n";
+        assert_eq!(
+            in_process(src),
+            BTreeSet::from([span_of(
+                src,
+                "http.NewRequest(\"GET\", \"http://orders/x\", nil)"
+            )]),
+            "{:?}",
+            in_process(src)
+        );
+    }
+
+    /// Contract M6b S4: a request wrapped before naming (`x := wrap(…)`)
+    /// is not seeded — the name holds the wrapper's result, not the request
+    /// (safe direction: the site stays stitched).
+    #[test]
+    fn go_in_process_wrapped_requests_are_not_seeded() {
+        let src = "package main\nimport \"net/http\"\nfunc wrap(r *http.Request) *http.Request {\n\treturn r\n}\nfunc top() {\n\tx := wrap(http.NewRequest(\"GET\", \"http://orders/x\", nil))\n\tmux.ServeHTTP(nil, x)\n}\n";
+        assert!(in_process(src).is_empty(), "{:?}", in_process(src));
+    }
+
+    /// Contract M6b S4, invariant 9: n helpers each serving the same request
+    /// costs linear work — 4× the helpers makes at most 5× the counted
+    /// steps. Counted, not timed, so machine load cannot fail it.
+    #[test]
+    fn go_in_process_grows_linearly() {
+        fn work(n: usize) -> u64 {
+            let mut src = "package main\nimport \"net/http\"\n".to_owned();
+            for i in 0..n {
+                src.push_str(&format!(
+                    "func f{i}(req *http.Request) {{ mux.ServeHTTP(nil, req) }}\n"
+                ));
+            }
+            src.push_str(
+                "func top() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/x\", nil)\n",
+            );
+            for i in 0..n {
+                src.push_str(&format!("\tf{i}(req)\n"));
+            }
+            src.push_str("}\n");
+            let facts = extract(Language::Go, src.as_bytes()).unwrap();
+            crate::work::take();
+            let found = clients(Language::Go, &facts).in_process;
+            assert_eq!(found.len(), 1);
+            crate::work::take()
+        }
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// Contract M6b S4: mutually delegating helpers terminate (visited set)
+    /// in bounded counted work. Without the visited set this input revisits
+    /// every level three times per level and blows past the bound (measured:
+    /// 124 ops with it, 9,958 without).
+    #[test]
+    fn go_in_process_cycles_terminate() {
+        let src = "package main\nimport \"net/http\"\nfunc a(req *http.Request) {\n\tb(req)\n\tb(req)\n\tb(req)\n}\nfunc b(req *http.Request) {\n\ta(req)\n\ta(req)\n\ta(req)\n}\nfunc top() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/x\", nil)\n\ta(req)\n}\n";
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        crate::work::take();
+        let found = clients(Language::Go, &facts).in_process;
+        let ops = crate::work::take();
+        assert!(found.is_empty(), "{found:?}");
+        assert!(ops < 1000, "{ops} counted operations");
+    }
+
+    /// A dot import of `net/http` (and of `net/httptest`) is outside the
+    /// import gate, as for the client sites themselves (S11): no sink is
+    /// recognised there.
+    #[test]
+    fn go_in_process_needs_qualified_imports() {
+        let src = "package main\nimport (\n\t. \"net/http\"\n\t. \"net/http/httptest\"\n)\nfunc t() {\n\treq, _ := NewRequest(\"GET\", \"/x\", nil)\n\trec := NewRecorder()\n\tServeHTTP(rec, req)\n}\n";
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        let out = clients(Language::Go, &facts);
+        assert!(out.calls.is_empty());
+        assert!(out.in_process.is_empty());
     }
 }

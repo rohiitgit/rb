@@ -3,7 +3,7 @@
   "repo": "<repo>",
   "snapshot": {
     "id": "<live>",
-    "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223"
+    "commit_sha": "4f3059fe304c473187b9812002663064fa40246c"
   },
   "query": {
     "kind": null,
