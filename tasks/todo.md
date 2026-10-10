@@ -875,7 +875,7 @@ Same rules as M6b:
 `PIPELINE` becomes `m6c-1` at the first dump change and is bumped on each later one.
 
 - [x] **0. Preflight** (no code). Done 2026-10-10 (amendment 1): baseline binary `var/m6c/base/rb-10a9ad5` (sha256 `264fec11…`; HEAD code == `10a9ad5`); fixture dumps `--no-scip` identical to goldens where pinned (polyglot/lombok/workspaces), others recorded; SCIP hashes equal M6a's recorded values (e2e drives SCIP goldens); full-SHA pins by API (petclinic org corrected); shape checks on shallow checkouts, removed after reading (realworld Gradle → app-class signal; jhipster @Import/@Bean/@Qualifier, no tsconfig paths; microservices plugin + 8 app classes; eladmin/lombok.config vacuous; fixtures have no test dirs/paths/configs). Forks F1–F7 confirmed. Images verified; DB 0 repos; disk accounted.
-- [ ] **1. Registrants** (S1). `@Bean`-method joins for `@Import`-named configs (ambiguous, `origin` set).
+- [x] **1. Registrants** (S1). Done 2026-10-10 (amendment 2): `bean_method_registrants` (import-named configs' assignable `@Bean` methods join as `origin: registrant`; Y4's residue closed, its test updated as predicted). Tests first (9 shape rows, failed first); 7 mutants killed. No fixture `@Import`-named configs: e2e byte-identical, no `PIPELINE` bump. Files: `rb-indexer/src/di.rs`.
 - [ ] **2. Gate M main-only** (S2). Test-path class literals stop capping; lifts counted.
 - [ ] **3. Deployable roles** (S3). spring-boot-maven-plugin or `@SpringBootApplication` ⇒ service; yield measured.
 - [ ] **4. Module objects** (S4). tsconfig `paths` + package `exports` exact resolution (RTA + Tier B); keeps counted.

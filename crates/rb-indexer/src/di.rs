@@ -338,6 +338,7 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
     }
     let registrants = registrants(index, &per_file);
     let literal_registrants = literal_registrants(index, &per_file);
+    let bean_registrants = bean_method_registrants(index, &per_file);
 
     let mut out = Resolution {
         fragments: per_file
@@ -394,6 +395,7 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                 unread_by_type: &unread_by_type,
                 registrants: &registrants,
                 literal_registrants: &literal_registrants,
+                bean_registrants: &bean_registrants,
                 surface,
                 gate_m: &gate_m,
             };
@@ -433,6 +435,9 @@ struct PointContext<'c, 'a> {
     /// Per type: the main-source classes assignable to it that a main-source class literal
     /// names, candidates beside the scanned beans (contract M5 S19 (g)).
     literal_registrants: &'c BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>>,
+    /// Per type: the main-source `@Bean` methods assignable to it whose declaring class a
+    /// main-source `@Import` names, candidates beside the scanned beans (contract M6c S1).
+    bean_registrants: &'c BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>>,
     surface: bool,
     gate_m: &'c dyn Fn(&str) -> bool,
 }
@@ -529,6 +534,86 @@ fn literal_registrants<'a>(
 /// The bean's class or interface name (gate M), or a `@Bean` method's return type.
 fn bean_name_for_gate(b: &BeanAt<'_, '_>) -> String {
     simple(&b.bean.type_name).to_owned()
+}
+
+/// Per type: the main-source `@Bean` methods assignable to it whose declaring
+/// class a main-source `@Import` names (contract M6c S1, M5 open item 13).
+/// Like class-literal registrants they join beside scanned beans (ambiguous);
+/// collections, candidate-less points and unnamed configs are unchanged.
+/// Literals in test sources register nothing.
+fn bean_method_registrants<'a>(
+    index: &Index<'a>,
+    per_file: &[(&'a str, &'a FileFacts, FileDi)],
+) -> BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>> {
+    // Simple names of classes a main-source `@Import` names (`X.class` args).
+    let mut imported: BTreeSet<&str> = BTreeSet::new();
+    for &(_, facts, _) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+        for def in &facts.definitions {
+            work::tick(1);
+            for d in def
+                .decorations
+                .iter()
+                .filter(|d| {
+                    rb_frameworks::routes::is_annotation(
+                        facts,
+                        d,
+                        "org.springframework.context.annotation",
+                        "Import",
+                    )
+                })
+                .flat_map(|d| {
+                    d.args.iter().map(|a| a.value.as_str()).chain(
+                        d.args
+                            .iter()
+                            .flat_map(|a| a.items.iter().map(|i| i.value.as_str())),
+                    )
+                })
+            {
+                if let Some(base) = d.strip_suffix(".class") {
+                    imported.insert(base.rsplit('.').next().unwrap_or(base));
+                }
+            }
+        }
+    }
+    let mut out: BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>> = BTreeMap::new();
+    if imported.is_empty() {
+        return out;
+    }
+    for &(path, facts, _) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+        for (i, def) in facts.definitions.iter().enumerate() {
+            work::tick(1);
+            if def.kind != rb_syntax::DefKind::Class || !imported.contains(def.name.as_str()) {
+                continue;
+            }
+            for (m, method) in facts.definitions.iter().enumerate().filter(|(_, d)| {
+                d.kind == rb_syntax::DefKind::Method
+                    && d.parent == Some(i)
+                    && d.decorations.iter().any(|d| {
+                        rb_frameworks::routes::is_annotation(
+                            facts,
+                            d,
+                            "org.springframework.context.annotation",
+                            "Bean",
+                        )
+                    })
+            }) {
+                let written = method.return_type.as_deref().unwrap_or_default();
+                let head = written.split('<').next().unwrap_or_default().trim();
+                let mut start = index.type_candidates(path, Some(i), head);
+                start.extend(
+                    facts
+                        .references
+                        .iter()
+                        .filter(|r| r.kind == rb_syntax::RefKind::Class && r.enclosing == Some(m))
+                        .flat_map(|r| index.type_candidates(path, Some(m), &r.name)),
+                );
+                for t in assignable(index, &start) {
+                    out.entry(t).or_default().insert((path, m));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resolution) {
@@ -683,9 +768,11 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
     }
 
     let collection = p.wrapper == Some(Wrapper::Collection);
-    // Classes a class literal registers (S19 (g)): candidates beside the scanned beans (a point
-    // left with no scanned bean is unresolved before any edge, as before); a collection keeps
-    // its scanned beans (the registrant still caps it, gate M).
+    // Classes a class literal registers (S19 (g)), and `@Bean` methods of an
+    // `@Import`-named config (contract M6c S1): candidates beside the scanned
+    // beans (a point left with no scanned bean is unresolved before any edge,
+    // as before); a collection keeps its scanned beans (the registrant still
+    // caps it, gate M).
     let registered: Vec<Sym<'_>> = if collection {
         Vec::new()
     } else {
@@ -696,6 +783,11 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         types
             .iter()
             .flat_map(|t| ctx.literal_registrants.get(t).into_iter().flatten())
+            .chain(
+                types
+                    .iter()
+                    .flat_map(|t| ctx.bean_registrants.get(t).into_iter().flatten()),
+            )
             .copied()
             .filter(|c| !scanned.contains(c))
             .collect::<BTreeSet<_>>()
@@ -1359,6 +1451,204 @@ mod tests {
         );
     }
 
+    /// Contract M6c S1 (M5 open item 13): an `@Import`-named config's `@Bean`
+    /// methods join a point's candidates beside the scanned beans, so the
+    /// point is `ambiguous` over all of them and no tie-breaker runs past
+    /// them. A collection, a point with no scanned candidate, an unnamed
+    /// config and an `@Import` naming an unrelated class change nothing.
+    #[test]
+    fn bean_method_registrants_join_as_candidates() {
+        let app = |import: &str| {
+            format!(
+                "package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.context.annotation.Import;\n@SpringBootApplication {import} public class App {{}}\n"
+            )
+        };
+        let main = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
+        );
+        let config = "package com.other;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\n@Configuration public class SmsConfig {\n@Bean public com.acme.Notifier sms() { return null; }\n}\n";
+        let attrs = |origin: &str, n: usize| {
+            format!(
+                r#"{{"candidates":{n},"capped_by":["mention"],"origin":"{origin}","resolution":"ambiguous","sites":1,"via":"constructor"}}"#
+            )
+        };
+        // The repro: one scanned bean and the imported config's `@Bean` method.
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert_eq!(
+            r.edges,
+            [
+                format!(
+                    "Alerts# -> EmailNotifier# [ambiguous] {}",
+                    attrs("stereotype", 2)
+                ),
+                format!(
+                    "Alerts# -> SmsConfig#sms(). [ambiguous] {}",
+                    attrs("registrant", 2)
+                ),
+            ]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
+        // Two scanned beans, one `@Primary`: no primary pick past the registrant.
+        let main2 = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Component @Primary class PushNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
+        );
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main2),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert_eq!(r.edges.len(), 3);
+        assert!(
+            r.edges
+                .iter()
+                .any(|e| e.starts_with("Alerts# -> SmsConfig#sms(). [ambiguous]"))
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
+        // A collection holds the scanned beans; the registrant only caps.
+        let mainc = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(List<Notifier> n) {} }\n",
+        );
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &mainc),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert_eq!(
+            r.edges,
+            [r#"Alerts# -> EmailNotifier# [heuristic] {"capped_by":["mention"],"collection":true,"origin":"stereotype","resolution":"collection","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        // No scanned candidate: unresolved as before (no edge to the registrant alone).
+        let mainu =
+            src("public interface Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n");
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &mainu),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert!(r.edges.is_empty(), "{:?}", r.edges);
+        assert_eq!(r.buckets, BTreeMap::from([("unresolved", 1)]));
+        // An unnamed config: the plain row (its `@Bean` method joins nothing).
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert_eq!(
+            r.edges,
+            [r#"Alerts# -> EmailNotifier# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        // An `@Import` naming an unrelated class: the plain row.
+        let unrelated = "package com.other;\npublic class Audit {}\n";
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.Audit.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+            ("src/main/java/com/other/U.java", unrelated),
+        ]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]), "{:?}", r.edges);
+        // An array `@Import` names each class: the config joins, the audit does not.
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import({com.other.SmsConfig.class, com.other.Audit.class})"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+            ("src/main/java/com/other/U.java", unrelated),
+        ]);
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert!(
+            r.edges.iter().any(|e| e.contains("SmsConfig#sms().")),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(
+            r.buckets,
+            BTreeMap::from([("ambiguous", 1)]),
+            "{:?}",
+            r.edges
+        );
+        // A plain method of a named config (no `@Bean`) joins nothing.
+        let plain_method = "package com.other;\nimport org.springframework.context.annotation.Configuration;\n@Configuration public class PlainConfig {\npublic com.acme.Notifier helper() { return null; }\n}\n";
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.PlainConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", plain_method),
+        ]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]), "{:?}", r.edges);
+        // An `@Import` only in a test source registers nothing (it still caps
+        // by `mention`, as before — narrowing that is S2).
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+        ]);
+        assert_eq!(
+            r.edges,
+            [r#"Alerts# -> EmailNotifier# [heuristic] {"capped_by":["mention"],"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]));
+        // A scanned config's `@Bean` method is already a candidate: it joins
+        // once (no duplicate registrant edge), ambiguous with the bean.
+        let local = "package com.acme;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\n@Configuration public class LocalConfig {\n@Bean public Notifier sms() { return null; }\n}\n";
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.acme.LocalConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/acme/C.java", local),
+        ]);
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert!(
+            r.edges
+                .iter()
+                .filter(|e| e.contains("LocalConfig#sms()."))
+                .count()
+                == 1,
+            "{:?}",
+            r.edges
+        );
+        assert!(
+            r.edges.iter().all(|e| e.contains(r#""candidates":2"#)),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(
+            r.buckets,
+            BTreeMap::from([("ambiguous", 1)]),
+            "{:?}",
+            r.edges
+        );
+    }
+
     /// Contract M5 S19 (g) (M4b open item 23 (a)): a main-source class named by a class literal
     /// (`@Import(X.class)`) and assignable to the injected type is a candidate beside the scanned
     /// beans, so the point is `ambiguous` over all of them and no tie-breaker (`@Primary`, the
@@ -1488,13 +1778,10 @@ mod tests {
         let main = src(
             "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
         );
-        let edge = |r: &Run| -> String {
-            assert_eq!(r.edges.len(), 1, "{:?}", r.edges);
-            r.edges[0].clone()
-        };
         // A class named by a class literal and assignable is a candidate since contract M5
         // S19 (g) (`registrants_named_by_a_class_literal_are_candidates`); a configuration class
-        // whose `@Bean` method returns the type still only caps (residue, amendment 10).
+        // whose `@Bean` method returns the type joins as a registrant since contract M6c S1
+        // (`bean_method_registrants_join_as_candidates`) — the residue above, closed.
         for (other, import) in [
             (
                 "package com.other;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.context.annotation.Primary;\n@Configuration public class SmsConfig { @Bean @Primary com.acme.Notifier sms() { return null; } }\n",
@@ -1511,12 +1798,20 @@ mod tests {
                 ("src/main/java/com/acme/A.java", &main),
                 ("src/main/java/com/other/S.java", other),
             ]);
-            let e = edge(&r);
+            assert_eq!(r.edges.len(), 2, "{other}: {:?}", r.edges);
             assert!(
-                e.contains("EmailNotifier#") && e.contains(r#""capped_by":["mention"]"#),
-                "{other}: {e}"
+                r.edges[0].contains("EmailNotifier#")
+                    && r.edges[0].contains(r#""capped_by":["mention"]"#),
+                "{other}: {:?}",
+                r.edges
             );
-            assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]), "{other}");
+            assert!(
+                r.edges[1].contains("SmsConfig#sms().")
+                    && r.edges[1].contains(r#""origin":"registrant""#),
+                "{other}: {:?}",
+                r.edges
+            );
+            assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]), "{other}");
         }
         // Control: the same class, named nowhere, registers nothing.
         let app = app("");
