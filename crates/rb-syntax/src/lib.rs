@@ -393,6 +393,12 @@ pub enum Init {
     },
 }
 
+/// `true` for `serde(default)` on facts that predated the field, all of
+/// which were `this` writes.
+fn default_true() -> bool {
+    true
+}
+
 /// A member write `this.x = <value>` (TS/JS) or `this.x = <value>` (Java), in source
 /// order (contract M6b S1). The value is summarised as an initialiser when it has a
 /// foldable shape; `None` for anything else (still a write for single-assignment
@@ -403,6 +409,10 @@ pub enum Init {
 pub struct MemberWrite {
     pub member: String,
     pub value: Option<Init>,
+    /// The written object is `this` (contract M6b S6: anything else still
+    /// counts for single-assignment, but never folds).
+    #[serde(default = "default_true")]
+    pub on_this: bool,
     pub enclosing: Option<usize>,
     /// The write sits in a constructor: a TS/JS `method_definition` named `constructor`
     /// or a Java `constructor_declaration` (TypeScript constructors are not definitions:
@@ -802,7 +812,10 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             .into_iter()
             .map(|w| MemberWrite {
                 member: w.member,
-                value: calls::init(language, w.value, source, &chain_index),
+                value: w
+                    .value
+                    .and_then(|v| calls::init(language, v, source, &chain_index)),
+                on_this: w.on_this,
                 enclosing: enclosing(w.node.start_byte(), &starts, &ends, &lexical_parent)
                     .map(|i| nearest_kept(i, &kept, &lexical_parent)),
                 ctor: w.ctor,

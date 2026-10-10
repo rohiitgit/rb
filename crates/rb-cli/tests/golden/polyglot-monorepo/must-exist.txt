@@ -26,6 +26,10 @@ CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /in
 # Contract M6b S5: a config passed by name reads the object it names, so the
 # service base restricts the call to notification's endpoint alone.
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendViaCfg(). -> HTTP POST /internal/mfa/email @services/notification [synthetic]
+# Contract M6b S6: a member assigned once in a constructor folds, so the
+# host restricts the call to notification's endpoint alone. (Heuristic, not
+# synthetic: a `fetch` word in broken/pom.xml caps fetch repo-wide.)
+CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/NotifyClient#ping(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
 # Contract M4b S8: a Feign client is a bean under @EnableFeignClients, a @Repository class a stereotype.
 INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient# [heuristic] {"origin":"feign","resolution":"unique"}
 INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao# [heuristic] {"origin":"stereotype","resolution":"unique"}

@@ -1,1 +1,1 @@
-  http: 7 routes in 3 services; 14 client calls: 3 synthetic, 2 heuristic, 1 ambiguous, 2 in-process, 1 empty-url, 2 external, 1 dynamic, 2 self
+  http: 7 routes in 3 services; 15 client calls: 3 synthetic, 3 heuristic, 1 ambiguous, 2 in-process, 1 empty-url, 2 external, 1 dynamic, 2 self

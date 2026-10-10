@@ -20,3 +20,15 @@ export function resendViaCfg(email: string) {
 export function resendExternal(email: string) {
   return axios.post("/internal/mfa/email", { email }, { ...extOpts });
 }
+
+// Contract M6b S6: a member assigned once in a constructor folds wherever
+// it is read.
+export class NotifyClient {
+  private svc: string;
+  constructor() {
+    this.svc = "http://notification";
+  }
+  async ping() {
+    return fetch(`${this.svc}/internal/mfa/email`, { method: "POST" });
+  }
+}

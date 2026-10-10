@@ -67,15 +67,23 @@ pub(crate) fn bindings<'t>(
 /// A member write before its enclosing definition is resolved (contract M6b S1).
 pub(crate) struct RawMemberWrite<'t> {
     pub member: String,
-    pub value: Node<'t>,
+    /// The right-hand side, when the write is an assignment with one.
+    pub value: Option<Node<'t>>,
+    /// The written object is `this` (contract M6b S6: anything else still
+    /// counts — an alias may name `this` — but never folds).
+    pub on_this: bool,
     pub node: Node<'t>,
     pub ctor: bool,
 }
 
-/// Every `this.x = <value>` write (TS/JS `member_expression`, Java `field_access` on
-/// `this`), in source order. Any right-hand side counts as a write (compound
+/// Every `Y.x = <value>` write (TS/JS `member_expression`, Java `field_access` on any
+/// object), in source order. Any right-hand side counts as a write (compound
 /// assignments included: they read and write); the value summary is resolved by the
-/// caller. Bare-field writes (`x = …`) are not members: they may be locals.
+/// caller. Whether the object is `this` is recorded with the write (contract M6b S6:
+/// only a `this` write folds, but any write to the name counts for single-assignment).
+/// Bare-field writes (`x = …`) are not members: they may be locals. Update
+/// (`this.x++`), `delete`, destructuring and for-in/of member targets are writes with
+/// no value (also contract M6b S6).
 pub(crate) fn member_writes<'t>(
     language: Language,
     root: Node<'t>,
@@ -90,45 +98,203 @@ pub(crate) fn member_writes<'t>(
     let mut out = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        // `=` and compound assignments (`+=`, `||=`, `??=`): every kind reads and
-        // writes, so every kind counts for single-assignment.
-        if (node.kind() == "assignment_expression"
-            || node.kind() == "augmented_assignment_expression")
-            && let (Some(left), Some(right)) = (
-                node.child_by_field_name("left"),
-                node.child_by_field_name("right"),
-            )
-        {
-            let member = match language {
-                Language::Java => (left.kind() == "field_access"
-                    && left
-                        .child_by_field_name("object")
-                        .is_some_and(|o| o.kind() == "this"))
-                .then(|| left.child_by_field_name("field"))
-                .flatten()
-                .filter(|n| n.kind() == "identifier"),
-                _ => (left.kind() == "member_expression"
-                    && left
-                        .child_by_field_name("object")
-                        .is_some_and(|o| o.kind() == "this"))
-                .then(|| left.child_by_field_name("property"))
-                .flatten()
-                .filter(|n| n.kind() == "property_identifier"),
-            };
-            if let Some(name) = member {
-                out.push(RawMemberWrite {
-                    member: text(name, source),
-                    value: right,
-                    ctor: in_constructor(node, source),
-                    node,
-                });
+        match node.kind() {
+            // `=` and compound assignments (`+=`, `||=`, `??=`): every kind reads and
+            // writes, so every kind counts for single-assignment.
+            "assignment_expression" | "augmented_assignment_expression" => {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if let Some((member, on_this)) = member_target(language, left, source) {
+                        out.push(RawMemberWrite {
+                            member,
+                            value: Some(right),
+                            on_this,
+                            ctor: in_constructor(node, source),
+                            node,
+                        });
+                    } else if left.kind() != "identifier" {
+                        // A destructuring target: every member it names is
+                        // written (the main loop records nested assignments
+                        // with their own spans).
+                        pattern_targets(language, left, source, &mut out);
+                    }
+                }
             }
+            // `this.x++`, `++this.x`: a read and a write with no value.
+            "update_expression" => {
+                if let Some((member, on_this, target)) = update_target(language, node, source) {
+                    out.push(RawMemberWrite {
+                        member,
+                        value: None,
+                        on_this,
+                        ctor: in_constructor(node, source),
+                        node: target,
+                    });
+                }
+            }
+            // `delete this.x`.
+            "unary_expression" => {
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| text(op, source) == "delete")
+                    && let Some((member, on_this, target)) = update_target(language, node, source)
+                {
+                    out.push(RawMemberWrite {
+                        member,
+                        value: None,
+                        on_this,
+                        ctor: in_constructor(node, source),
+                        node: target,
+                    });
+                }
+            }
+            // `for (this.x of …)`.
+            "for_in_statement" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    if let Some((member, on_this)) = member_target(language, left, source) {
+                        out.push(RawMemberWrite {
+                            member,
+                            value: None,
+                            on_this,
+                            ctor: in_constructor(node, source),
+                            node: left,
+                        });
+                    } else if left.kind() != "identifier" {
+                        pattern_targets(language, left, source, &mut out);
+                    }
+                }
+            }
+            _ => {}
         }
         let mut c = node.walk();
         let children: Vec<Node<'t>> = node.children(&mut c).collect();
         stack.extend(children.into_iter().rev());
     }
     out
+}
+
+/// The member a `member_expression` (TS/JS) or `field_access` (Java) names,
+/// with whether its object is `this` (`this.a.b` names `b`, not on `this`).
+fn member_target(language: Language, node: Node<'_>, source: &[u8]) -> Option<(String, bool)> {
+    match language {
+        Language::Java => {
+            if node.kind() != "field_access" {
+                return None;
+            }
+            let field = node
+                .child_by_field_name("field")
+                .filter(|n| n.kind() == "identifier")?;
+            let object = node.child_by_field_name("object")?;
+            Some((text(field, source), object.kind() == "this"))
+        }
+        _ => {
+            if node.kind() != "member_expression" {
+                return None;
+            }
+            let property = node
+                .child_by_field_name("property")
+                .filter(|n| n.kind() == "property_identifier")?;
+            let object = node.child_by_field_name("object")?;
+            Some((text(property, source), object.kind() == "this"))
+        }
+    }
+}
+
+/// The member an update or `delete` writes: the first member operand, with
+/// the member node for a precise span.
+fn update_target<'t>(
+    language: Language,
+    node: Node<'t>,
+    source: &[u8],
+) -> Option<(String, bool, Node<'t>)> {
+    let mut c = node.walk();
+    let target = node.named_children(&mut c).find(|n| {
+        matches!(
+            (language, n.kind()),
+            (Language::Java, "field_access")
+                | (
+                    Language::TypeScript | Language::Tsx | Language::JavaScript,
+                    "member_expression"
+                )
+        )
+    })?;
+    let (member, on_this) = member_target(language, target, source)?;
+    Some((member, on_this, target))
+}
+
+/// Member targets of a destructuring pattern: every member it names is
+/// written. Computed keys and subscript objects are reads, and anything
+/// inside a nested function, class, assignment or loop is recorded by the
+/// main loop with its own span — none of those are descended into.
+fn pattern_targets<'t>(
+    language: Language,
+    node: Node<'t>,
+    source: &[u8],
+    out: &mut Vec<RawMemberWrite<'t>>,
+) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "arrow_function"
+            | "method_definition"
+            | "class_declaration"
+            | "class_body"
+            | "class_expression"
+            | "lambda_expression"
+            | "assignment_expression"
+            | "augmented_assignment_expression"
+            | "update_expression"
+            | "unary_expression"
+            | "for_in_statement"
+            | "for_statement" => continue,
+            // A computed key is read, not written: `{[this.k]: v}` reads `k`.
+            "pair_pattern" => {
+                let mut c = node.walk();
+                let mut named: Vec<Node<'_>> = node
+                    .named_children(&mut c)
+                    .filter(|n| !matches!(n.kind(), "comment" | "line_comment" | "block_comment"))
+                    .collect();
+                if let Some(first) = named.first()
+                    && member_target(language, *first, source).is_some()
+                    && named.len() > 1
+                {
+                    named.remove(0);
+                }
+                stack.extend(named);
+            }
+            // An assignment default is read; only its target is written.
+            "assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    stack.push(left);
+                } else {
+                    let mut c = node.walk();
+                    stack.extend(node.named_children(&mut c));
+                }
+            }
+            // An element write names no member of its own.
+            "subscript_expression" => continue,
+            _ => {
+                if let Some((member, on_this)) = member_target(language, node, source) {
+                    out.push(RawMemberWrite {
+                        member,
+                        value: None,
+                        on_this,
+                        ctor: in_constructor(node, source),
+                        node,
+                    });
+                } else {
+                    let mut c = node.walk();
+                    stack.extend(node.children(&mut c));
+                }
+            }
+        }
+    }
 }
 
 /// Whether `node` sits directly in a constructor: the nearest enclosing function-like
@@ -1379,8 +1545,10 @@ mod tests {
     }
 
     /// `member = <value> @<enclosing-def-start-line>[!]`, in source order: every
-    /// `this.x` write (contract M6b S1). `!` marks a constructor write. Spans are
-    /// asserted separately (below), with needles derived from the source.
+    /// `this.x` write (contract M6b S1). `!` marks a constructor write, `~`
+    /// a write whose object is not `this` (contract M6b S6: it counts, but
+    /// never folds). Spans are asserted separately (below), with needles
+    /// derived from the source.
     fn write_rows(language: Language, src: &str) -> Vec<String> {
         fn template(t: &crate::StrTemplate) -> String {
             let parts: Vec<String> = t
@@ -1421,7 +1589,8 @@ mod tests {
                     .map(|i| facts.definitions[i].span[0].to_string())
                     .unwrap_or_else(|| "-".to_owned());
                 let ctor = if w.ctor { "!" } else { "" };
-                format!("{} = {value} @{enclosing}{ctor}", w.member)
+                let this = if w.on_this { "" } else { "~" };
+                format!("{} = {value} @{enclosing}{ctor}{this}", w.member)
             })
             .collect()
     }
@@ -1480,31 +1649,74 @@ mod tests {
     }
 
     #[test]
-    fn typescript_member_write_shapes_that_are_not_members() {
+    fn member_writes_cover_non_this_objects() {
         let src =
             "class C {\n  go(o: O) {\n    o.x = 1;\n    this.x += 1;\n    this.a.b = 2;\n  }\n}\n";
-        // `o.x` is not on `this`; `this.a.b` writes `b`, not a member of `this`.
-        // `+=` still writes `x` (a read and a write: the safe direction for counting).
-        assert_eq!(write_rows(Language::TypeScript, src), ["x = - @1"]);
+        // `o.x` is not on `this` (it counts, marked `~`, but never folds);
+        // `this.a.b` writes `b`, not a member of `this`. `+=` still writes
+        // `x` (a read and a write: the safe direction for counting).
+        assert_eq!(
+            write_rows(Language::TypeScript, src),
+            ["x = - @1~", "x = - @1", "b = - @1~"]
+        );
         assert_eq!(
             write_spans(Language::TypeScript, src),
-            [span_of(src, "this.x += 1", 0)]
+            [
+                span_of(src, "o.x = 1", 0),
+                span_of(src, "this.x += 1", 0),
+                // `=`-family keeps the statement span, as before.
+                span_of(src, "this.a.b = 2", 0),
+            ]
+        );
+    }
+
+    /// Contract M6b S6: every write form counts for single-assignment, on
+    /// `this` or not (`~` marks a non-`this` object); only `=`-family carries
+    /// a value. Update, delete, destructuring and for-in/of writes are
+    /// writes with no value.
+    #[test]
+    fn member_write_shapes_beyond_plain_assignment() {
+        let src = "class C {\n  go(o: O) {\n    o.x = 1;\n    this.x++;\n    ++this.y;\n    delete this.z;\n    [this.d] = arr;\n    ({p: this.e} = obj);\n    for (this.f of arr) {}\n  }\n}\n";
+        assert_eq!(
+            write_rows(Language::TypeScript, src),
+            [
+                "x = - @1~",
+                "x = - @1",
+                "y = - @1",
+                "z = - @1",
+                "d = - @1",
+                "e = - @1",
+                "f = - @1",
+            ]
+        );
+        assert_eq!(
+            write_spans(Language::TypeScript, src),
+            [
+                span_of(src, "o.x = 1", 0),
+                span_of(src, "this.x", 0),
+                span_of(src, "this.y", 0),
+                span_of(src, "this.z", 0),
+                span_of(src, "this.d", 0),
+                span_of(src, "this.e", 0),
+                span_of(src, "this.f", 0),
+            ]
         );
     }
 
     #[test]
     fn java_member_writes_and_skipped_shapes() {
-        let src = "class C {\n  String s;\n  C(String b) {\n    this.s = b;\n  }\n  void m() {\n    this.s = \"x\";\n    helper = this.s;\n    s = \"y\";\n  }\n}\n";
+        let src = "class C {\n  String s;\n  C(String b) {\n    this.s = b;\n  }\n  void m() {\n    this.s = \"x\";\n    this.s++;\n    helper = this.s;\n    s = \"y\";\n  }\n}\n";
         // `helper = …` and the bare-field `s = …` are not member writes.
         assert_eq!(
             write_rows(Language::Java, src),
-            ["s = name b @2!", "s = 'x' @5"]
+            ["s = name b @2!", "s = 'x' @5", "s = - @5"]
         );
         assert_eq!(
             write_spans(Language::Java, src),
             [
                 span_of(src, "this.s = b", 0),
                 span_of(src, "this.s = \"x\"", 0),
+                span_of(src, "this.s", 2),
             ]
         );
     }

@@ -253,10 +253,10 @@ impl<'a, 'i> Folding<'a, 'i> {
         })
     }
 
-    fn value(&self, file: usize, v: &UrlValue) -> Option<Folded> {
+    fn value(&self, folder: &mut fold::Folder<'_>, file: usize, v: &UrlValue) -> Option<Folded> {
         match v {
-            UrlValue::Template(t) => Some(fold::fold_template(self, file, t)),
-            UrlValue::Name { text, span } => Some(fold::fold_name(self, file, text, *span)),
+            UrlValue::Template(t) => Some(folder.fold_template(file, t)),
+            UrlValue::Name { text, span } => Some(folder.fold_name(file, text, *span)),
             UrlValue::Unknown | UrlValue::Contested(_) => None,
         }
     }
@@ -347,6 +347,10 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                         }))
         });
     let mut out = Vec::new();
+    // One folder for the run: per-file indexes, member proofs and clean
+    // folds amortize across sites (a fresh step budget per fold, as with a
+    // fresh folder per call).
+    let mut folder = rb_frameworks::fold::Folder::new(&folding);
     for (&path, file_clients) in &clients {
         let file = folding.ids[path];
         let facts = inputs.files[path].1;
@@ -386,7 +390,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 },
                 None => stated,
             };
-            let url = folding.value(file, &call.url);
+            let url = folding.value(&mut folder, file, &call.url);
             let base_candidates = match (&base, &url) {
                 (Some((base_file, UrlValue::Contested(values))), Some(url)) if joins_base(url) => {
                     let mut candidates: Vec<Folded> = Vec::new();
@@ -405,17 +409,19 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                                 &mut objects,
                             );
                             candidates.extend(
-                                objects.iter().filter_map(|o| folding.value(*base_file, o)),
+                                objects
+                                    .iter()
+                                    .filter_map(|o| folding.value(&mut folder, *base_file, o)),
                             );
                         }
-                        candidates.extend(folding.value(*base_file, v));
+                        candidates.extend(folding.value(&mut folder, *base_file, v));
                     }
                     candidates
                 }
                 _ => Vec::new(),
             };
             let url = url.map(|url| match &base {
-                Some((base_file, b)) => join(folding.value(*base_file, b), url),
+                Some((base_file, b)) => join(folding.value(&mut folder, *base_file, b), url),
                 None => url,
             });
             let src = match call.source {

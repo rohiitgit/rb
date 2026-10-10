@@ -13,9 +13,10 @@ UPSTREAM
     ← payInvoice().  services/billing/cmd/billing/main.go:20  [billing]  [heuristic]
       ⇐ entered at POST /billing/invoices/{}/pay  [billing]  [heuristic]
         client payInvoice().  apps/web/src/api/billing.ts:2  [@acme/web]  [heuristic]  (suffix match)
+  client NotifyClient#ping().  apps/web/src/api/mfa.ts:31  [@acme/web]  [heuristic]  (host notification)
   client resend().  apps/web/src/api/mfa.ts:5  [@acme/web]  [ambiguous]  (2 candidates)
 ENDPOINT  POST /internal/mfa/email  [notification]
 DOWNSTREAM
   services/notification/src/server.ts (top-level code)  [notification]  [exact]
     → QUERIES public.email_log (insert)  [exact]
-certainty: exact 3, synthetic 3, heuristic 7, ambiguous 1
+certainty: exact 3, synthetic 3, heuristic 8, ambiguous 1

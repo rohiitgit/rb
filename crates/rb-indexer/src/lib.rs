@@ -95,7 +95,8 @@ use serde_json::{Value, json};
 /// `m6b-3` in-process and empty-URL Go requests are `unmatched`, never edges (S4).
 /// `m6b-4` axios and certainty folding: cross-file spreads, by-name configs, ordered Spring
 /// statements (S5).
-pub const PIPELINE: &str = "m6b-4";
+/// `m6b-5` constructor-assigned members fold from their single write (S6).
+pub const PIPELINE: &str = "m6b-5";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

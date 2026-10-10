@@ -313,3 +313,11 @@
 ## 2026-10-10: axios verbs take data before config — a config in arg 1 is data
 - **Mistake (caught by e2e):** the S5 fixture wrote `axios.post(url, { ...extOpts })`, putting the spread config in the data position (`post`/`put`/`patch` take `(url, data, config)`); the site stitched exactly like the config-less control, and the stitch unit drafted the same way failed first for the same reason. Only `get`/`delete`/`head`/`options` take `(url, config)`.
 - **Rule:** when a fixture or unit exercises a request config, match the verb's arity first (`get(url, config)` for two-arg configs, `post(url, data, config)` for three); assert the pack-level `base=` rendering in the unit before trusting the stitch-level bucket. A config-shaped second argument to a three-arg verb is data, silently.
+
+## 2026-10-10: per-site folder rebuilds fail growth ratios — amortize per file
+- **Mistake (caught by the growth test):** the S6 member proof built its per-file index inside a fold that production runs per site: 25→100 members measured 15×. The scopes cache had the same latent shape (a fresh `Folder` per fold); no existing growth test exercised it because none folded densely.
+- **Rule:** per-file work (lookup indexes, proof tables, clean-fold memo) belongs in one `Folder` shared across a file's folds, with a fresh step budget per fold so budget semantics are unchanged. Growth-test the shared shape production runs; a per-call folder in the test measures construction, not the walk.
+
+## 2026-10-10: insert-only edits anchored on single unique lines
+- **Mistake (repeated):** several `edit` calls spanned existing code that the replacement then dropped (a test body, a function signature line, a loop header) — each caught by `git diff`/build, each repaired by hand. Multi-line `oldString` is most dangerous at its edges.
+- **Rule:** prefer pure insertions (`oldString` = one unique anchor line, `newString` = anchor + new content). When replacing, re-read the region first and keep `oldString` minimal; `git diff --stat` after every batch of edits, before running anything.
