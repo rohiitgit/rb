@@ -79,6 +79,9 @@ pub(crate) struct Resolution {
     pub buckets: BTreeMap<&'static str, usize>,
     /// Gate → points it capped.
     pub gates: BTreeMap<&'static str, usize>,
+    /// Points the S2 narrowing freed: capped under the broad mention rule but
+    /// plain under the narrowed one (contract M6c S2, invariant 4).
+    pub mention_lifted: usize,
     pub diagnostics: Vec<Diagnostic>,
     /// The interfaces Spring Data repositories extend, by simple name, in every Java file
     /// (fragment interfaces for RTA's rule (h), D3).
@@ -217,20 +220,36 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
             .di_surface
             .iter()
             .any(|(path, _)| !is_test_path(path));
-    // Gate M (S6): names with a mention outside the allowed roles in any parsed Java file, or
-    // in an unparsed non-inert file.
+    // Gate M (S6, narrowed by S2): names with a mention outside the allowed
+    // roles in any parsed Java file — except `ClassLiteral` mentions in test
+    // paths, which register nothing in the application's context (contract
+    // M6c S2) — or in an unparsed non-inert file.
     let mut mentioned: BTreeSet<&str> = BTreeSet::new();
-    for (_, facts, _) in &per_file {
+    let mut mentioned_broad: BTreeSet<&str> = BTreeSet::new();
+    for (path, facts, _) in &per_file {
+        let test = is_test_path(path);
         for (name, roles) in &facts.mentions {
             work::tick(1);
             if roles.iter().any(|r| !MENTION_ALLOWED.contains(r)) {
-                mentioned.insert(name.as_str());
+                mentioned_broad.insert(name.as_str());
+                if !test
+                    || roles
+                        .iter()
+                        .any(|r| !MENTION_ALLOWED.contains(r) && *r != MentionRole::ClassLiteral)
+                {
+                    mentioned.insert(name.as_str());
+                }
             }
         }
     }
     let gate_m = |name: &str| {
         inputs.unparsed.words_unread
             || mentioned.contains(name)
+            || inputs.unparsed.words.contains(name)
+    };
+    let gate_m_broad = |name: &str| {
+        inputs.unparsed.words_unread
+            || mentioned_broad.contains(name)
             || inputs.unparsed.words.contains(name)
     };
 
@@ -398,6 +417,7 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                 bean_registrants: &bean_registrants,
                 surface,
                 gate_m: &gate_m,
+                gate_m_broad: &gate_m_broad,
             };
             if test {
                 *out.buckets.get_mut("test").unwrap() += 1;
@@ -440,6 +460,10 @@ struct PointContext<'c, 'a> {
     bean_registrants: &'c BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>>,
     surface: bool,
     gate_m: &'c dyn Fn(&str) -> bool,
+    /// The broad mention rule (test-path class literals included): points it
+    /// would cap but `gate_m` frees are counted, never capped (contract M6c
+    /// S2, invariant 4).
+    gate_m_broad: &'c dyn Fn(&str) -> bool,
 }
 
 fn site_diagnostic(kind: &str, path: &str, span: Span, ty: &str, detail: &str) -> Diagnostic {
@@ -766,6 +790,16 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
     {
         gates.insert("mention");
     }
+    // Points the S2 narrowing frees: the broad rule would cap them, but the
+    // narrowed one does not (contract M6c S2, invariant 4).
+    let mention_broad = (ctx.gate_m_broad)(simple(&p.element))
+        || candidates
+            .iter()
+            .any(|&i| (ctx.gate_m_broad)(&bean_name_for_gate(&ctx.beans[i])))
+        || types
+            .iter()
+            .flat_map(|t| ctx.registrants.get(t).into_iter().flatten())
+            .any(|name| (ctx.gate_m_broad)(name));
 
     let collection = p.wrapper == Some(Wrapper::Collection);
     // Classes a class literal registers (S19 (g)), and `@Bean` methods of an
@@ -908,6 +942,9 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         "capped"
     };
     bucket(out, label);
+    if mention_broad && label == "plain" {
+        out.mention_lifted += 1;
+    }
     for g in &gates {
         *out.gates.entry(g).or_default() += 1;
     }
@@ -1001,15 +1038,21 @@ pub(crate) fn add_injects(b: &mut GraphBuilder, r: Resolution) -> anyhow::Result
     }
     let mut diagnostics = r.diagnostics;
     let points: usize = r.buckets.values().sum();
+    let mut detail = json!({
+        "points": points,
+        "buckets": r.buckets,
+        "gates": r.gates,
+    });
+    // Contract M6c S2 (D3, invariant 4): lifted points ride along only when
+    // non-zero, so unrelated dumps stay byte-identical.
+    if r.mention_lifted > 0 {
+        detail["mention_lifted"] = r.mention_lifted.into();
+    }
     diagnostics.push(Diagnostic {
         kind: "di_coverage".into(),
         path: None,
         span: None,
-        detail: json!({
-            "points": points,
-            "buckets": r.buckets,
-            "gates": r.gates,
-        }),
+        detail,
     });
     Ok(diagnostics)
 }
@@ -1038,6 +1081,8 @@ mod tests {
         buckets: BTreeMap<&'static str, usize>,
         gates: BTreeMap<&'static str, usize>,
         diagnostics: Vec<String>,
+        lifted: usize,
+        coverage: Value,
     }
 
     fn run_with(files: &[(&str, &str)], services: &[(&str, &str, bool)], unparsed: RawScan) -> Run {
@@ -1106,6 +1151,7 @@ mod tests {
             crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
         }
         let (buckets, gates) = (r.buckets.clone(), r.gates.clone());
+        let lifted = r.mention_lifted;
         let diagnostics = add_injects(&mut b, r).unwrap();
         let g = b.finish().unwrap();
         let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
@@ -1144,6 +1190,13 @@ mod tests {
                 .iter()
                 .map(|d| format!("{} {}", d.kind, d.detail))
                 .collect(),
+            lifted,
+            coverage: r
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == "di_coverage")
+                .map(|d| d.detail.clone())
+                .unwrap_or(Value::Null),
         }
     }
 
@@ -1599,8 +1652,8 @@ mod tests {
             ("src/main/java/com/other/S.java", plain_method),
         ]);
         assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]), "{:?}", r.edges);
-        // An `@Import` only in a test source registers nothing (it still caps
-        // by `mention`, as before — narrowing that is S2).
+        // An `@Import` only in a test source registers nothing (and since
+        // contract M6c S2 caps nothing either: the plain row).
         let r = run(&[
             ("src/main/java/com/acme/App.java", &app("")),
             ("src/main/java/com/acme/A.java", &main),
@@ -1612,9 +1665,9 @@ mod tests {
         ]);
         assert_eq!(
             r.edges,
-            [r#"Alerts# -> EmailNotifier# [heuristic] {"capped_by":["mention"],"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#.to_owned()]
+            [r#"Alerts# -> EmailNotifier# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#.to_owned()]
         );
-        assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]));
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
         // A scanned config's `@Bean` method is already a candidate: it joins
         // once (no duplicate registrant edge), ambiguous with the bean.
         let local = "package com.acme;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\n@Configuration public class LocalConfig {\n@Bean public Notifier sms() { return null; }\n}\n";
@@ -1647,6 +1700,78 @@ mod tests {
             "{:?}",
             r.edges
         );
+    }
+
+    /// Contract M6c S2 (M4b open item 5): a class literal in a test source no
+    /// longer caps a main-source point — whether it names a registrant, the
+    /// bean, or the injected type; every other disallowed role still caps
+    /// everywhere, and main-source literals cap as before. Each point the
+    /// narrowing frees is counted (`mention_lifted`).
+    #[test]
+    fn test_source_class_literals_stop_capping() {
+        let app = |import: &str| {
+            format!(
+                "package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.context.annotation.Import;\n@SpringBootApplication {import} public class App {{}}\n"
+            )
+        };
+        let main = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
+        );
+        let sms = "package com.other;\nimport org.springframework.context.annotation.Primary;\n@Primary public class SmsNotifier implements com.acme.Notifier {}\n";
+        let plain = "Alerts# -> EmailNotifier# [heuristic] {\"origin\":\"stereotype\",\"resolution\":\"unique\",\"sites\":1,\"via\":\"constructor\"}";
+        // A test literal naming a registrant frees the point (was capped).
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", sms),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                &app("@Import(com.other.SmsNotifier.class)"),
+            ),
+        ]);
+        assert_eq!(r.edges, [plain.to_owned()]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        assert_eq!(r.lifted, 1);
+        assert_eq!(r.coverage["mention_lifted"], 1);
+        // A test literal naming the bean frees it too.
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                &app("@Import(com.acme.EmailNotifier.class)"),
+            ),
+        ]);
+        assert_eq!(r.edges, [plain.to_owned()]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        assert_eq!(r.lifted, 1);
+        assert_eq!(r.coverage["mention_lifted"], 1);
+        // A test literal naming the injected type frees it too.
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                &app("@Import(com.acme.Notifier.class)"),
+            ),
+        ]);
+        assert_eq!(r.edges, [plain.to_owned()]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        assert_eq!(r.lifted, 1);
+        assert_eq!(r.coverage["mention_lifted"], 1);
+        // Any other disallowed role in a test source still caps (an argument
+        // is `Other`).
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                "package com.acme;\nclass AlertsTest { void t() { check(EmailNotifier); } }\n",
+            ),
+        ]);
+        assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]));
+        assert_eq!(r.lifted, 0);
+        assert!(r.coverage.get("mention_lifted").is_none());
     }
 
     /// Contract M5 S19 (g) (M4b open item 23 (a)): a main-source class named by a class literal
@@ -1743,7 +1868,8 @@ mod tests {
         ]);
         assert!(r.edges.is_empty(), "{:?}", r.edges);
         assert_eq!(r.buckets, BTreeMap::from([("unresolved", 1)]));
-        // The literal only in a test source: no candidate, the point is capped by `mention`.
+        // The literal only in a test source: no candidate, and since contract
+        // M6c S2 no cap either — the plain row.
         let main = src(
             "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
         );
@@ -1760,7 +1886,7 @@ mod tests {
         assert_eq!(
             r.edges,
             [
-                r#"Alerts# -> EmailNotifier# [heuristic] {"capped_by":["mention"],"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#
+                r#"Alerts# -> EmailNotifier# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#
             ]
         );
     }
