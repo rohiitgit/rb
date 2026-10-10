@@ -87,6 +87,9 @@ pub(crate) struct Resolution {
     /// Points whose qualifier a `lombok.config` chain restored and whose
     /// qualifier filter kept candidates (contract M6c S8, invariant 4).
     pub lombok_narrowed: usize,
+    /// Points that picked the single bean in exact type-arg agreement
+    /// (contract M6c S9, invariant 4).
+    pub type_args_narrowed: usize,
     pub diagnostics: Vec<Diagnostic>,
     /// The interfaces Spring Data repositories extend, by simple name, in every Java file
     /// (fragment interfaces for RTA's rule (h), D3).
@@ -124,6 +127,9 @@ struct BeanAt<'a, 'b> {
     package: &'a str,
     /// Types it is assignable to (itself and its resolved supertypes, transitively).
     types: BTreeSet<Sym<'a>>,
+    /// Its declared supertype clauses as (simple raw name, raw args), for
+    /// exact type-arg agreement (contract M6c S9).
+    clauses: Vec<(String, Vec<String>)>,
     /// A `@Bean` method whose return type did not resolve: assignable through the types it
     /// creates (gate `bean_type_inferred`).
     inferred: bool,
@@ -339,6 +345,11 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                 service: service.clone(),
                 package,
                 types: assignable(index, &start),
+                clauses: facts.definitions[bean.definition]
+                    .supertypes
+                    .iter()
+                    .map(|s| (simple(&s.name).to_owned(), s.type_args.clone()))
+                    .collect(),
                 inferred,
             });
         }
@@ -694,6 +705,22 @@ fn bean_method_consumers<'a>(
     out
 }
 
+/// Whether a bean's declared supertype clauses agree exactly with a point
+/// (contract M6c S9): a clause naming the point's raw type with pairwise
+/// equal simple args. Bare wildcards never agree; every other wildcard, bound
+/// or nesting already differs textually (marked point args, raw bean args),
+/// so equality alone refuses them.
+fn args_agree(point_raw: &str, point_args: &[String], clauses: &[(String, Vec<String>)]) -> bool {
+    clauses.iter().any(|(raw, args)| {
+        raw == point_raw
+            && args.len() == point_args.len()
+            && args
+                .iter()
+                .zip(point_args)
+                .all(|(b, p)| !b.contains('?') && simple(b) == *p)
+    })
+}
+
 fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resolution) {
     let inputs = ctx.inputs;
     let index = inputs.index;
@@ -943,6 +970,24 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
                 "qualifier",
             ));
             return;
+        }
+    }
+    // Exact type-arg agreement (contract M6c S9): the one bean whose declared
+    // clause names the point's raw type with pairwise equal simple args.
+    // Wildcards, bounds, nesting and disagreement pick nothing, as before.
+    if !collection && chosen.len() > 1 && !p.type_args.is_empty() {
+        let agreeing: Vec<usize> = chosen
+            .iter()
+            .copied()
+            .filter(|&i| {
+                work::tick(1);
+                args_agree(simple(&p.type_name), &p.type_args, &ctx.beans[i].clauses)
+            })
+            .collect();
+        if agreeing.len() == 1 {
+            chosen = agreeing;
+            resolution = "type_args";
+            out.type_args_narrowed += 1;
         }
     }
     if !collection && !undecided && chosen.len() > 1 {
@@ -1238,6 +1283,10 @@ pub(crate) fn add_injects(b: &mut GraphBuilder, r: Resolution) -> anyhow::Result
     if r.lombok_narrowed > 0 {
         detail["lombok_narrowed"] = r.lombok_narrowed.into();
     }
+    // Contract M6c S9 (D3, invariant 4): exact type-arg picks, likewise.
+    if r.type_args_narrowed > 0 {
+        detail["type_args_narrowed"] = r.type_args_narrowed.into();
+    }
     diagnostics.push(Diagnostic {
         kind: "di_coverage".into(),
         path: None,
@@ -1275,6 +1324,7 @@ mod tests {
         diagnostics: Vec<String>,
         lifted: usize,
         narrowed: usize,
+        type_args_narrowed: usize,
         coverage: Value,
     }
 
@@ -1356,6 +1406,7 @@ mod tests {
         let (buckets, gates) = (r.buckets.clone(), r.gates.clone());
         let lifted = r.mention_lifted;
         let narrowed = r.lombok_narrowed;
+        let type_args_narrowed = r.type_args_narrowed;
         let spring_data = r.spring_data.clone();
         // Tier B first, as in `assemble`: the inherited producer must see the
         // edges Tier B links itself to avoid doubling them.
@@ -1427,6 +1478,7 @@ mod tests {
                 .collect(),
             lifted,
             narrowed,
+            type_args_narrowed,
             coverage: r
                 .diagnostics
                 .iter()
@@ -1995,6 +2047,63 @@ mod tests {
         assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
     }
 
+    /// Contract M6c S9: a point picks the single bean in exact simple-name
+    /// type-arg agreement (capped by the generic gate, counted); wildcards,
+    /// bounds, nesting and disagreement stay ambiguous.
+    #[test]
+    fn exact_type_arg_agreement_picks_one() {
+        let stores = "interface Store<T> {}\n@Component class StringStore implements Store<String> {}\n@Component class IntStore implements Store<Integer> {}\n";
+        // Agreement: the `String` point picks `StringStore` alone.
+        let r = one(&format!(
+            "{stores}@Service class Catalog {{ Catalog(Store<String> store) {{}} }}\n"
+        ));
+        assert_eq!(
+            r.edges,
+            [r#"Catalog# -> StringStore# [heuristic] {"capped_by":["generic"],"origin":"stereotype","resolution":"type_args","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]));
+        assert_eq!(r.type_args_narrowed, 1);
+        // Disagreement keeps both.
+        let r = one(&format!(
+            "{stores}@Service class Catalog {{ Catalog(Store<Long> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 0);
+        // A wildcard, a bound and nesting never agree.
+        for arg in ["?", "? extends String", "List<String>"] {
+            let r = one(&format!(
+                "{stores}@Service class Catalog {{ Catalog(Store<{arg}> store) {{}} }}\n"
+            ));
+            assert_eq!(r.edges.len(), 2, "{arg}: {:?}", r.edges);
+            assert_eq!(r.type_args_narrowed, 0, "{arg}");
+        }
+        // Qualified clause args agree by simple name.
+        let r = one(&format!(
+            "{stores}@Component class QBox implements com.acme.Store<com.acme.Sms> {{}}\n@Service class Catalog {{ Catalog(Store<Sms> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 1, "{:?}", r.edges);
+        assert!(r.edges[0].contains("QBox#"), "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 1);
+        // A nested bean clause never agrees, even for a non-nested point.
+        let r = one(&format!(
+            "{stores}@Component class NBox implements Store<List<X>> {{}}\n@Service class Catalog {{ Catalog(Store<List> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 3, "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 0);
+        // Bare wildcards never agree, even with each other.
+        let r = one(&format!(
+            "{stores}@Component class WBox implements Store<?> {{}}\n@Service class Catalog {{ Catalog(Store<?> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 3, "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 0);
+        // A nested point never agrees, even with a raw clause of that name.
+        let r = one(&format!(
+            "{stores}@Component class ListBox implements Store<List> {{}}\n@Service class Catalog {{ Catalog(Store<List<X>> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 3, "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 0);
+    }
+
     /// Contract M6c S8: a field qualifier a `lombok.config` chain lists rides
     /// the generated parameter, narrows to the qualified bean, and counts;
     /// unlisted chains keep the old capped-ambiguous row.
@@ -2083,6 +2192,29 @@ mod tests {
             let r = one(&body);
             // Every call edged: the walk ran, the ratio below is not vacuous.
             assert_eq!(r.calls.len(), n, "{n}");
+            work::take()
+        }
+        let (small, large) = (work_for(25), work_for(100));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Invariant 9: exact type-arg agreement grows linearly (counted, 4× → ≤
+    /// 5×): one clause scan per candidate of each generic point.
+    #[test]
+    fn type_arg_agreement_grows_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut body = String::from(
+                "interface Store<T> {}\n@Component class StringStore implements Store<String> {}\n@Component class IntStore implements Store<Integer> {}\n",
+            );
+            for i in 0..n {
+                body += &format!(
+                    "@Service class Catalog{i} {{ Catalog{i}(Store<String> store) {{}} }}\n"
+                );
+            }
+            work::take();
+            let r = one(&body);
+            // Every point agreed: the walk ran, the ratio below is not vacuous.
+            assert_eq!(r.type_args_narrowed, n, "{n}");
             work::take()
         }
         let (small, large) = (work_for(25), work_for(100));
@@ -2353,17 +2485,19 @@ mod tests {
                 r.edges
             );
         };
-        // Y5: generically distinct candidates.
+        // Y5: generically distinct candidates. Predicted update (M6c S9a):
+        // exact type-arg agreement picks the single bean (capped by the
+        // generic gate, counted) instead of staying ambiguous.
         let stores = "interface Store<T> {}\n@Component class StringStore implements Store<String> {}\n@Component @Primary class IntStore implements Store<Integer> {}\n";
         let r = one(&format!(
             "{stores}@Service class Catalog {{ Catalog(Store<String> store) {{}} }}\n"
         ));
-        several(&r, 2);
-        assert!(
-            r.edges[0].contains(r#""capped_by":["generic"]"#),
-            "{:?}",
-            r.edges
+        assert_eq!(
+            r.edges,
+            [r#"Catalog# -> StringStore# [heuristic] {"capped_by":["generic"],"origin":"stereotype","resolution":"type_args","sites":1,"via":"constructor"}"#.to_owned()]
         );
+        assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]));
+        assert_eq!(r.type_args_narrowed, 1);
         // A wrapper whose element has type arguments of its own.
         let r = one(&format!(
             "{stores}@Service class Catalog {{ Catalog(Optional<Store<String>> store) {{}} }}\n"

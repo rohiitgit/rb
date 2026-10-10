@@ -377,3 +377,11 @@
 ## 2026-10-11: a shadowing exact match hides the mechanism a mutant removes
 - **Mistake:** the S8 stop-drop mutant survived because the test's nearer `=` shadowed the farther entries anyway — the stop boundary never decided anything.
 - **Rule:** when pinning precedence/shielding, use the weakest nearby form (`+=`, not `=`) so only the mechanism under test decides the outcome. Same family as the same-key-merge lesson.
+
+## 2026-10-11: survivors can prove checks redundant — remove, don't duplicate-cover
+- **Mistake (recovered):** two S9a refusal checks survived their mutants. Tracing showed the `?` mark plus exact equality already refuses every shape but bare-`?`-vs-`?` — the checks were unobservable by construction.
+- **Rule:** when a survivor analysis shows the mechanism already enforces the property, remove the redundant check (one load-bearing refusal + the `WBox` row) instead of keeping defense-in-depth that no test can bite. Joint coverage (S2 precedent) is for provably inseparable arms, not redundant ones.
+
+## 2026-10-11: print the input before theorizing about the pipeline
+- **Mistake:** the S9a `WBox` failure (0 points) triggered theories about caches, pollution, merges and parallelism across a dozen experiments — the row had lost its parameter name (`Catalog(Store<?>)`) in an edit, so no binding existed. The byte dump (`WREAL`) found it in one run.
+- **Rule:** a mysteriously empty result gets an input byte-dump first, theories second. And verify script edits by reading them back immediately (`{{}}`/`\\n` mangling hides in heredocs).

@@ -154,6 +154,11 @@ pub struct InjectionPoint {
     pub wrapper: Option<Wrapper>,
     /// The injected type has type arguments that are not a wrapper's (gate `generic`).
     pub generic: bool,
+    /// The declared type arguments as simple names, for exact-agreement picks
+    /// (contract M6c S9): empty unless every argument is a bare simple name —
+    /// a wildcard, bound, qualification or nesting anywhere empties the whole
+    /// list, so those points never agree.
+    pub type_args: Vec<String>,
     /// The point's `@Qualifier` literal.
     pub qualifier: Option<String>,
     /// The qualifier rides a Lombok-generated parameter because the nearest
@@ -812,6 +817,15 @@ fn point(
         })
         .map(|d| d.name.clone())
         .collect();
+    // Exact-agreement arguments (contract M6c S9): the declared args as
+    // simple names, wildcards marked (nesting empties the whole list, so
+    // nested points never agree). The indexer refuses wildcards, bounds,
+    // qualifications and nesting at decision time.
+    let type_args = if !b.nested_type_args {
+        b.type_args.clone()
+    } else {
+        Vec::new()
+    };
     Some(InjectionPoint {
         owner,
         owner_is_bean,
@@ -821,6 +835,7 @@ fn point(
         element,
         wrapper,
         generic,
+        type_args,
         qualifier: qualifier_of(facts, &b.decorations),
         copied_qualifier: false,
         by_name: None,
@@ -836,15 +851,23 @@ fn unwrap(facts: &FileFacts, b: &Binding) -> Option<(Option<Wrapper>, String, bo
     // A wrapper's element with type arguments of its own is a generic point too (evaluator
     // pass 1, Y5).
     let nested = b.nested_type_args;
+    // A bounded wildcard's mark is for agreement only (contract M6c S9);
+    // resolution still uses the bound, as before (a bare `?` stays `?`).
+    let unmark = |a: &str| {
+        a.strip_prefix('?')
+            .filter(|s| !s.is_empty())
+            .unwrap_or(a)
+            .to_owned()
+    };
     if b.array {
         return Some((
             Some(Wrapper::Collection),
-            b.type_args.first()?.clone(),
+            unmark(b.type_args.first()?),
             nested,
         ));
     }
     let t = b.type_name.as_str();
-    let one = || (b.type_args.len() == 1).then(|| b.type_args[0].clone());
+    let one = || (b.type_args.len() == 1).then(|| unmark(&b.type_args[0]));
     if ["List", "Set", "Collection"]
         .iter()
         .any(|n| is_type(facts, t, JAVA_UTIL, n))
@@ -857,7 +880,7 @@ fn unwrap(facts: &FileFacts, b: &Binding) -> Option<(Option<Wrapper>, String, bo
     if is_type(facts, t, JAVA_UTIL, "Map") {
         return Some(match b.type_args.as_slice() {
             [k, v] if is_scalar(k) && simple(k) == "String" => {
-                (Some(Wrapper::Collection), v.clone(), nested)
+                (Some(Wrapper::Collection), unmark(v), nested)
             }
             _ => (None, t.to_owned(), true),
         });

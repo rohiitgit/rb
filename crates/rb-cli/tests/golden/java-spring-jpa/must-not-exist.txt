@@ -34,3 +34,5 @@ INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java
 CALLS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService#authenticate(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository#
 # Contract M6c S8: the service class itself is never an injection target.
 INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/MailService.java`/MailService#
+# Contract M6c S9: the disagreeing bean is never picked.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/Channel.java`/Campaigns# -> rb-heuristic . . . `src/main/java/com/acme/auth/Channel.java`/EmailChannel#

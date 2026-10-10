@@ -881,9 +881,11 @@ pub fn discovery_resolved(facts: &FileFacts) -> bool {
         let (q, s) = split_type(&b.type_name);
         resolves(q, s)
             || b.type_args.iter().any(|a| {
-                // Type arguments are recorded as simple names: only an import
-                // can resolve them.
-                DISCOVERY_TYPES.contains(&a.as_str())
+                // Type arguments are recorded as simple names (a bounded
+                // wildcard keeps its `?` mark, stripped for resolution here):
+                // only an import can resolve them.
+                let a = a.strip_prefix('?').unwrap_or(a);
+                DISCOVERY_TYPES.contains(&a)
                     && facts.imports.iter().any(|i| {
                         !i.is_static
                             && discovery_package(&i.module)

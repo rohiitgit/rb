@@ -111,7 +111,9 @@ use serde_json::{Value, json};
 /// (M6c S7).
 /// `m6c-4` Lombok qualifiers: a field qualifier a `lombok.config` chain lists
 /// rides the generated parameter and narrows, counted (M6c S8).
-pub const PIPELINE: &str = "m6c-4";
+/// `m6c-5` exact type-arg agreement: the single bean in simple-name agreement
+/// picks at `heuristic`, capped by the generic gate, counted (M6c S9a).
+pub const PIPELINE: &str = "m6c-5";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

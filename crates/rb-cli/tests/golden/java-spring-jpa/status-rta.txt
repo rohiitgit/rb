@@ -1,1 +1,1 @@
-  rta: 1 of 12 implementing types never instantiated (2 dispatch edges prunable)
+  rta: 1 of 14 implementing types never instantiated (2 dispatch edges prunable)

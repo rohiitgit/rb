@@ -595,6 +595,9 @@ fn simple_type(node: Node<'_>, source: &[u8]) -> Option<String> {
                 .filter(|n| !is_annotation(*n))
                 .last()
                 .and_then(|bound| simple_type(bound, source))
+                // A bounded wildcard keeps its `?` mark, so agreement can
+                // refuse it (contract M6c S9); a bare `?` stays `?`.
+                .map(|bound| format!("?{bound}"))
                 .unwrap_or_else(|| "?".to_owned()),
         ),
         "scoped_type_identifier" | "nested_type_identifier" | "qualified_type" => node
@@ -2123,7 +2126,8 @@ mod parameter_tests {
                 "ns: Notifier",
                 "m: String,Sink",
                 "o: List",
-                "p: Repo",
+                // Contract M6c S9: a bounded wildcard keeps its `?` mark.
+                "p: ?Repo",
                 "arr: Notifier[]",
                 "s: Notifier",
                 "vs: Notifier[]"

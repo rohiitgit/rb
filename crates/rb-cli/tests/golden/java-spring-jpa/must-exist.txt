@@ -37,3 +37,6 @@ CALLS rb-heuristic . . . `src/main/java/com/acme/auth/SignupService.java`/Signup
 # Contract M6c S8: the `lombok.config`-listed field qualifier rides the
 # generated parameter and narrows to the qualified bean.
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/MailService.java`/MailService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/PlainHasher# [heuristic] {"origin":"stereotype","qualifier":"plainHasher","resolution":"qualifier","via":"constructor"}
+# Contract M6c S9: exact type-arg agreement picks the single bean (capped by
+# the generic gate, counted).
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/Channel.java`/Campaigns# -> rb-heuristic . . . `src/main/java/com/acme/auth/Channel.java`/SmsChannel# [heuristic] {"capped_by":["generic"],"origin":"stereotype","resolution":"type_args","via":"constructor"}
