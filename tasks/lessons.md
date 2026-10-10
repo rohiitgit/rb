@@ -333,3 +333,7 @@
 ## 2026-10-10: cargo swallows eprintln — run test binaries directly for probes
 - **Mistake (repeated):** `cargo test -- --nocapture` showed no probe output three times; the test binary run directly (`./target/debug/deps/<hash> <filter> --nocapture`) printed immediately.
 - **Rule:** debug-print through the test binary's path (find the fresh hash by `ls -t`), not through cargo. Delete probe tests before committing (they also shift unit counts).
+
+## 2026-10-10: evaluator pass 1 must probe configuration surfaces and allow-list edges
+- **Finding (fixed):** the S9 battery passed with plain sites through reconfigured calls (`superagent.use`, `got`/`ky` `hooks`) because no probe exercised them; the S8 allow-list missed a corpus-evidenced routing type (`ReactorLoadBalancer`).
+- **Rule:** for every new client form, probe its configuration surfaces (plugins, interceptors, hooks, custom transports, by-name/spread options) expecting caps; for every narrowing allow-list, probe its boundary types (same-name foreign types, unresolved imports, sibling types in the same tree) expecting both caps and lifts. Survivors that force new rows are the mechanism working — record them as such.

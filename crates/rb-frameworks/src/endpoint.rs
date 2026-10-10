@@ -976,6 +976,9 @@ mod tests {
         ] {
             assert_eq!(read(&pieces), kept("users", "/x"), "{pieces:?}");
         }
+        // Evaluator pass 1: a literal `@` with no hole is an ordinary
+        // authority — the host after it, unchanged behaviour.
+        assert_eq!(read(&[lit("http://a@b/x")]), kept("b", "/x"));
         // A port after the host still parses, and a second hole after it is
         // a port hole as before.
         assert_eq!(

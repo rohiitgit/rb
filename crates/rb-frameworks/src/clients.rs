@@ -817,13 +817,15 @@ pub fn discovery_text(path: &str, text: &str) -> bool {
 }
 
 /// Simple names of types that configure service discovery or load balancing
-/// (contract M6b S8): Spring Cloud LoadBalancer's and Ribbon's configuration
-/// types, the type entries of [`DISCOVERY_WORDS`]. Any other spelling — a
-/// comment, a UI string, an unrelated class from the same package tree — is
-/// not positively identified evidence.
+/// (contract M6b S8; evaluator pass 1, E2): Spring Cloud LoadBalancer's and
+/// Ribbon's configuration types (the type entries of [`DISCOVERY_WORDS`])
+/// plus the load-balancer itself, which routes through instance suppliers. Any
+/// other spelling — a comment, a UI string, an unrelated class from the same
+/// package tree — is not positively identified evidence.
 const DISCOVERY_TYPES: &[&str] = &[
     "LoadBalancerClient",
     "LoadBalancerClients",
+    "ReactorLoadBalancer",
     "RibbonClient",
     "RibbonClients",
     "ServiceInstanceListSupplier",
@@ -1266,6 +1268,17 @@ fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
         Some(Arg::Object { .. }) => method_entry(args.get(1)).unwrap_or(Some("GET".to_owned())),
         Some(_) => None,
     };
+    // Options that reconfigure the request (evaluator pass 1, E1):
+    // interceptor `hooks` everywhere, a custom `agent` transport for `got`.
+    // Only inline objects read: a spread may hide either, and a name may hide
+    // anything, so both cap.
+    let configured_opts = |keys: &[&str], args: &[Arg]| match args.get(1) {
+        None => false,
+        Some(Arg::Object { entries, .. }) => entries
+            .iter()
+            .any(|e| e.key == "..." || keys.contains(&e.key.as_str())),
+        Some(_) => true,
+    };
     // A verb-site method (`del` is `superagent`'s `delete` alias).
     let verb_method = |verb: &str| {
         Some(if verb == "del" {
@@ -1274,6 +1287,11 @@ fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
             norm_method(verb)
         })
     };
+    // A `superagent` plugin (`.use`) reconfigures the request (evaluator pass
+    // 1, E1): any `use` link past the call itself caps the site. A leading
+    // `use` is no site at all (the module call is missed, and the token
+    // hooks).
+    let plugin = |chain: &CallChain| chain.links.iter().skip(1).any(|l| l.name == "use");
     for chain in &facts.chains {
         let Some(first) = chain.links.first() else {
             continue;
@@ -1282,12 +1300,21 @@ fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
             if first.args.is_empty() {
                 continue;
             }
-            if is_lib(&got, &first.name, chain.span) || is_lib(&ky, &first.name, chain.span) {
+            if is_lib(&got, &first.name, chain.span) {
                 out.calls.push(site(
                     chain,
                     opts_method(&first.args),
                     first.args.first(),
-                    false,
+                    configured_opts(&["hooks", "agent"], &first.args),
+                ));
+                continue;
+            }
+            if is_lib(&ky, &first.name, chain.span) {
+                out.calls.push(site(
+                    chain,
+                    opts_method(&first.args),
+                    first.args.first(),
+                    configured_opts(&["hooks"], &first.args),
                 ));
                 continue;
             }
@@ -1298,7 +1325,7 @@ fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
                     _ => (None, None),
                 };
                 if url.is_some() {
-                    out.calls.push(site(chain, method, url, false));
+                    out.calls.push(site(chain, method, url, plugin(chain)));
                 }
                 continue;
             }
@@ -1307,7 +1334,7 @@ fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
                     chain,
                     opts_method(&first.args),
                     first.args.first(),
-                    false,
+                    configured_opts(&["dispatcher"], &first.args),
                 ));
                 continue;
             }
@@ -1339,15 +1366,30 @@ fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
             continue;
         }
         let root = chain.root.as_deref().unwrap_or_default();
-        if (is_lib(&got, root, chain.span) && GOT_KY_VERBS.contains(&first.name.as_str()))
-            || (is_lib(&ky, root, chain.span) && GOT_KY_VERBS.contains(&first.name.as_str()))
-            || (is_lib(&sa, root, chain.span) && SUPERAGENT_VERBS.contains(&first.name.as_str()))
-        {
+        if is_lib(&got, root, chain.span) && GOT_KY_VERBS.contains(&first.name.as_str()) {
             out.calls.push(site(
                 chain,
                 verb_method(&first.name),
                 first.args.first(),
-                false,
+                configured_opts(&["hooks", "agent"], &first.args),
+            ));
+            continue;
+        }
+        if is_lib(&ky, root, chain.span) && GOT_KY_VERBS.contains(&first.name.as_str()) {
+            out.calls.push(site(
+                chain,
+                verb_method(&first.name),
+                first.args.first(),
+                configured_opts(&["hooks"], &first.args),
+            ));
+            continue;
+        }
+        if is_lib(&sa, root, chain.span) && SUPERAGENT_VERBS.contains(&first.name.as_str()) {
+            out.calls.push(site(
+                chain,
+                verb_method(&first.name),
+                first.args.first(),
+                plugin(chain),
             ));
             continue;
         }
@@ -4548,6 +4590,10 @@ mod tests {
             "import org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier;\nclass S {\nServiceInstanceListSupplier s;\n}\n",
             // A fully qualified return type (contract M5 S19 (a)'s row).
             "class Lb {\n@Bean org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier s() { return null; }\n}\n",
+            // Evaluator pass 1: the load-balancer itself routes through
+            // instance suppliers, so its types resolve too.
+            "import org.springframework.cloud.loadbalancer.core.ReactorLoadBalancer;\nclass S {\nReactorLoadBalancer lb;\n}\n",
+            "class S {\norg.springframework.cloud.loadbalancer.core.ReactorLoadBalancer lb;\n}\n",
         ] {
             assert!(resolved(src), "{src}");
         }
@@ -4568,6 +4614,12 @@ mod tests {
             "import static org.springframework.cloud.loadbalancer.annotation.*;\n@LoadBalancerClient\nclass A {}\n",
             // A bare annotation with no import to resolve through.
             "@LoadBalancerClient\nclass A {}\n",
+            // Evaluator pass 1: the same simple name from another package is
+            // not discovery configuration.
+            "import com.example.LoadBalancerClient;\n@LoadBalancerClient\nclass A {}\n",
+            // Evaluator pass 1: an import that binds nothing used is not
+            // evidence either (unused imports never cap).
+            "import org.springframework.cloud.loadbalancer.annotation.Other;\n@LoadBalancerClient\nclass A {}\n",
         ] {
             assert!(!resolved(src), "{src}");
         }
@@ -4776,6 +4828,27 @@ mod tests {
         );
     }
 
+    /// Evaluator pass 1 (S9): a `superagent` plugin (`.use`) and `got`/`ky`
+    /// interceptor or transport options (`hooks`, `agent`) reconfigure the
+    /// request — capped even on the module. Unreadable (by-name) options cap
+    /// too.
+    #[test]
+    fn evaluator_pass1_reconfigured_fetch_class_calls_are_capped() {
+        let src = "import got from \"got\";\nimport ky from \"ky\";\nimport request from \"superagent\";\nimport { request as urequest } from \"undici\";\nexport async function f(plugin: any, opts: any) {\n  await request.get(\"http://orders/a\").use(plugin);\n  await got(\"http://orders/b\", { hooks: {} });\n  await got.get(\"http://orders/c\", { agent: {} });\n  await ky.post(\"http://orders/d\", { hooks: {} });\n  await ky(\"http://orders/e\", opts);\n  await urequest(\"http://orders/f\", { dispatcher: {} });\n  await got(\"http://orders/g\", { ...opts });\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "fetch GET 'http://orders/a' unverified",
+                "fetch GET 'http://orders/b' unverified",
+                "fetch GET 'http://orders/c' unverified",
+                "fetch POST 'http://orders/d' unverified",
+                "fetch ? 'http://orders/e' unverified",
+                "fetch GET 'http://orders/f' unverified",
+                "fetch GET 'http://orders/g' unverified",
+            ]
+        );
+    }
+
     /// Contract M6b S9: instances built by `got.extend`, `ky.extend`,
     /// `ky.create` and `superagent.agent` are configured carriers — their
     /// calls stitch, but never above `heuristic`.
@@ -4840,6 +4913,14 @@ mod tests {
         // The control: a destructured verb of another module is no axios member.
         let other = "import { get } from \"./api\";\nexport async function f() {\n  await get(\"/a\");\n}\n";
         assert!(calls(Language::TypeScript, other).is_empty());
+        // Evaluator pass 1: a verb destructured from a local instance reads
+        // the instance's base (capped: the destructured carrier has no Gate-A
+        // proof).
+        let inst = "import axios from \"axios\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nconst { get } = api;\nexport async function f() {\n  await get(\"/x\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, inst),
+            ["axios GET '/x' base='http://orders' unverified"]
+        );
     }
 
     /// Contract M6b S9: the repository-wide token scan covers the new
@@ -5245,6 +5326,15 @@ mod tests {
             "{:?}",
             in_process(src)
         );
+    }
+
+    /// Evaluator pass 1 (S4): a hand-rolled recorder (an own `ResponseWriter`
+    /// implementation, not `httptest`) is not a recognised sink — a request
+    /// served through it stays stitched.
+    #[test]
+    fn go_in_process_hand_rolled_recorder_is_not_a_sink() {
+        let src = "package main\nimport \"net/http\"\ntype R struct { h http.Header }\nfunc (r *R) Header() http.Header { return r.h }\nfunc (r *R) Write(b []byte) (int, error) { return len(b), nil }\nfunc (r *R) WriteHeader(int) {}\nfunc handler(w http.ResponseWriter, r *http.Request) {}\nfunc t() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/x\", nil)\n\trec := &R{}\n\thandler(rec, req)\n}\n";
+        assert!(in_process(src).is_empty(), "{:?}", in_process(src));
     }
 
     /// Contract M6b S4: a request wrapped before naming (`x := wrap(…)`)
