@@ -230,6 +230,7 @@ pub struct ClientUrl {
 pub fn client_url(pieces: &[Piece]) -> ClientUrl {
     let mut out = ClientUrl::default();
     let mut pieces: Vec<Piece> = merge(pieces);
+    strip_userinfo_hole(&mut pieces);
     if pieces.first() == Some(&Piece::Hole) {
         out.base_unknown = true;
         pieces.remove(0);
@@ -497,6 +498,77 @@ fn merge(pieces: &[Piece]) -> Vec<Piece> {
         }
     }
     out
+}
+
+/// `scheme://user…hole…@host`: drops the userinfo (with its holes) through
+/// the last `@` in the authority, keeping `scheme://host` (contract M6b S7).
+/// The unknown-ness stays confined to the userinfo: the host after `@`
+/// parses (and matches, and earns certainty) exactly as if written
+/// literally, and credentials never enter the pieces. A hole with no `@`
+/// after it in the authority (a port hole), a hole for the host itself, and
+/// a leading base hole are today's rules, untouched: only a hole strictly
+/// before the last authority-`@` strips.
+fn strip_userinfo_hole(pieces: &mut Vec<Piece>) {
+    let Some(Piece::Lit(first)) = pieces.first().cloned() else {
+        return;
+    };
+    // Where the authority starts: after a valid `scheme://`, or `//`.
+    // Anything else has no authority to strip.
+    let start = first
+        .find("://")
+        .filter(|&i| {
+            first[..i]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+                && i > 0
+        })
+        .map(|i| i + 3)
+        .or_else(|| first.starts_with("//").then_some(2));
+    let Some(start) = start else {
+        return;
+    };
+    // The last `@` in the authority (before any `/`, `?` or `#` literal
+    // text), and the first hole there: only a hole strictly before the `@`
+    // is userinfo.
+    let mut at: Option<(usize, usize)> = None;
+    let mut hole: Option<usize> = None;
+    let mut authority = true;
+    for (i, piece) in pieces.iter().enumerate() {
+        if !authority {
+            break;
+        }
+        match piece {
+            Piece::Hole => {
+                hole.get_or_insert(i);
+            }
+            Piece::Lit(text) => {
+                let scan = if i == 0 {
+                    &text[start..]
+                } else {
+                    text.as_str()
+                };
+                let end = scan.find(['/', '?', '#']).unwrap_or(scan.len());
+                for (j, c) in scan[..end].char_indices() {
+                    if c == '@' {
+                        let base = if i == 0 { start } else { 0 };
+                        at = Some((i, base + j));
+                    }
+                }
+                if end < scan.len() {
+                    authority = false;
+                }
+            }
+        }
+    }
+    let (at_piece, at_byte) = match at {
+        Some(at) if hole.is_some_and(|h| h < at.0) => at,
+        _ => return,
+    };
+    let mut kept = first[..start].to_owned();
+    if let Piece::Lit(text) = &pieces[at_piece] {
+        kept.push_str(&text[at_byte + 1..]);
+    }
+    pieces.splice(..=at_piece, [Piece::Lit(kept)]);
 }
 
 /// `host:port` → `(host, Some(port))`; IPv6 literals keep their brackets.
@@ -833,10 +905,19 @@ mod tests {
             (u.host.as_deref(), u.port.as_deref(), u.host_dynamic),
             (Some("users"), Some("3000"), false)
         );
-        // A hole in user information: the host after `@` is not literal text before the hole.
-        for rest in ["@users/x", "@users:3000/x"] {
+        // A hole in user information: the literal host after `@` is kept
+        // (contract M6b S7) — only the userinfo is unknown.
+        for (rest, host, port) in [
+            ("@users/x", "users", None),
+            ("@users:3000/x", "users", Some("3000")),
+        ] {
             let u = client_url(&[lit("http://admin:"), Piece::Hole, lit(rest)]);
-            assert!(u.host_dynamic && u.host.is_none(), "{rest}");
+            assert_eq!(u.host.as_deref(), Some(host), "{rest}");
+            assert_eq!(u.port.as_deref(), port, "{rest}");
+            assert!(
+                !u.host_dynamic && u.host_external.is_none() && !u.base_unknown,
+                "{rest}"
+            );
             assert_eq!(u.path, "/x", "{rest}");
         }
         // A hole inside the host: unknown.
@@ -855,6 +936,106 @@ mod tests {
                 u.host_external.as_deref()
             ),
             (Some("[::1]"), false, None)
+        );
+    }
+
+    /// Contract M6b S7: `scheme://user…hole…@host` matches within the
+    /// literal host — the userinfo (with its holes) is dropped, never
+    /// stored, and never poisons the host. Certainty is what the rest earns:
+    /// no flag is set by the userinfo. A hole in the host itself, and a hole
+    /// with no `@` after it, keep today's rules.
+    #[test]
+    fn a_hole_in_userinfo_keeps_the_literal_host() {
+        let read = |pieces: &[Piece]| {
+            let u = client_url(pieces);
+            (
+                u.host,
+                u.port,
+                u.host_dynamic,
+                u.host_external,
+                u.base_unknown,
+                u.path,
+                u.flags.partial,
+            )
+        };
+        let kept = |host: &str, path: &str| {
+            (
+                Some(host.to_owned()),
+                None,
+                false,
+                None,
+                false,
+                path.to_owned(),
+                false,
+            )
+        };
+        // The contract's row, plus user text with a colon.
+        for pieces in [
+            vec![lit("http://u:"), Piece::Hole, lit("@users/x")],
+            vec![lit("http://user:secret:"), Piece::Hole, lit("@users/x")],
+        ] {
+            assert_eq!(read(&pieces), kept("users", "/x"), "{pieces:?}");
+        }
+        // A port after the host still parses, and a second hole after it is
+        // a port hole as before.
+        assert_eq!(
+            read(&[lit("http://u:"), Piece::Hole, lit("@users:8080/x")]),
+            (
+                Some("users".to_owned()),
+                Some("8080".to_owned()),
+                false,
+                None,
+                false,
+                "/x".to_owned(),
+                false,
+            )
+        );
+        assert_eq!(
+            read(&[
+                lit("http://u:"),
+                Piece::Hole,
+                lit("@users:"),
+                Piece::Hole,
+                lit("/x")
+            ]),
+            (
+                Some("users".to_owned()),
+                None,
+                false,
+                None,
+                false,
+                "/x".to_owned(),
+                false,
+            )
+        );
+        // A hole for the host itself: unknown, as before.
+        assert_eq!(
+            read(&[
+                lit("http://u:"),
+                Piece::Hole,
+                lit("@"),
+                Piece::Hole,
+                lit("/x")
+            ]),
+            (None, None, true, None, true, "/x".to_owned(), false)
+        );
+        // Multiple `@`: the last one wins, as with literal authorities.
+        assert_eq!(
+            read(&[lit("http://a@u:"), Piece::Hole, lit("@users/x")]),
+            kept("users", "/x")
+        );
+        // No `@` after the hole: today's rules (a port hole here).
+        assert_eq!(
+            read(&[lit("http://users:"), Piece::Hole, lit("/x")]),
+            (
+                Some("users".to_owned()),
+                None,
+                false,
+                None,
+                false,
+                "/x".to_owned(),
+                false,
+            )
         );
     }
 
@@ -895,9 +1076,17 @@ mod tests {
                 vec![lit("http://10.0."), Piece::Hole, lit(".5:8080/x")],
                 external("10.0.{?}.5", "/x"),
             ),
+            // A hole in user information with a dotted host after `@`: the
+            // host is literal (contract M6b S7) — the stitcher's host rule,
+            // not the hole rule, decides it names no service.
             (
                 vec![lit("http://admin:"), Piece::Hole, lit("@api.stripe.com/x")],
-                external("api.stripe.com", "/x"),
+                (
+                    None,
+                    false,
+                    Some("api.stripe.com".to_owned()),
+                    "/x".to_owned(),
+                ),
             ),
             // No dot in the literal host text: unknown.
             (
@@ -916,9 +1105,11 @@ mod tests {
                 vec![lit("http://orders-"), Piece::Hole, lit("/x")],
                 unknown("/x"),
             ),
+            // A hole in user information with a port after `@`: the literal
+            // host and port are kept (contract M6b S7).
             (
                 vec![lit("http://admin:"), Piece::Hole, lit("@users:3000/x")],
-                unknown("/x"),
+                (None, false, Some("users".to_owned()), "/x".to_owned()),
             ),
         ] {
             assert_eq!(read(&pieces), want, "{pieces:?}");

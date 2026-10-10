@@ -96,7 +96,8 @@ use serde_json::{Value, json};
 /// `m6b-4` axios and certainty folding: cross-file spreads, by-name configs, ordered Spring
 /// statements (S5).
 /// `m6b-5` constructor-assigned members fold from their single write (S6).
-pub const PIPELINE: &str = "m6b-5";
+/// `m6b-6` userinfo holes match within the literal host (S7).
+pub const PIPELINE: &str = "m6b-6";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

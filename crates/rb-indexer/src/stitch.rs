@@ -2765,6 +2765,23 @@ mod tests {
             .collect()
     }
 
+    /// Contract M6b S7, from source: `scheme://user…hole…@host` matches
+    /// within the literal host — here a template hole for the password with
+    /// a service host after `@` stitches exactly as the literal URL would.
+    #[test]
+    fn userinfo_holes_match_within_the_literal_host() {
+        let ts = "import axios from \"axios\";\nexport async function f(token: string) {\n  await axios.get(`http://deploy:${token}@orders/orders/1`);\n}\n";
+        let eps = vec![ep("GET", "/orders/{id}", "orders")];
+        assert_eq!(
+            stitched(
+                &[("web/src/a.ts", Language::TypeScript, ts)],
+                &eps,
+                &["web", "orders"],
+            ),
+            ["web/src/a.ts 2 synthetic -> HTTP GET /orders/{} @orders [synthetic]".to_owned(),]
+        );
+    }
+
     /// Contract M4a amendment 12 (evaluator pass 2, Q2) from source: a hole next to a literal
     /// host fragment with a dot, as a template literal, a concatenation, Java `String.format`
     /// and `+`, and Go `fmt.Sprintf` and `+`, is external whatever path follows; a bare host
