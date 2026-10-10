@@ -568,8 +568,10 @@ pub fn assemble(
     let mut b = GraphBuilder::new();
 
     // Services: one per project, plus the root as `unassigned` if files lie outside all projects.
+    let app_services = app_services(boundaries, &content.facts);
+    let deployable = deployable_services(boundaries, &app_services);
     for p in boundaries.projects() {
-        b.add_node(service_key(&p.dir), &p.name, service_attrs(p))?;
+        b.add_node(service_key(&p.dir), &p.name, service_attrs(p, &deployable))?;
     }
     let unassigned = service_key(boundaries::ROOT_DIR);
 
@@ -802,12 +804,7 @@ pub fn assemble(
         })
         .collect();
     // Spring DI (contract M4b S4–S8): `INJECTS` from injection points to beans.
-    let deployable: BTreeSet<String> = boundaries
-        .projects()
-        .iter()
-        .filter(|p| p.deployable)
-        .map(|p| p.dir.clone())
-        .collect();
+    // (`deployable` computed above: manifest-detected plus `@SpringBootApplication` modules.)
     let depends = di::package_dependencies(&manifest_edges);
     let mut resolution = di::resolve(&di::Inputs {
         files: &content.facts,
@@ -1029,12 +1026,62 @@ fn add_owners(
     Ok(())
 }
 
+/// Services holding a main-source `@SpringBootApplication` class: deployable
+/// even when their manifests say otherwise (contract M6c S3) — a Maven module
+/// inheriting its build from a parent pom, Gradle without the plugin text.
+/// Test sources never count: a test application class runs nothing in the
+/// deployed context.
+fn app_services(
+    boundaries: &Boundaries,
+    facts: &BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)>,
+) -> BTreeSet<String> {
+    facts
+        .iter()
+        .filter(|(path, (language, facts))| {
+            rb_frameworks::work::tick(1);
+            *language == rb_syntax::Language::Java
+                && !rb_model::is_test_path(path)
+                && facts.definitions.iter().any(|d| {
+                    d.kind == rb_syntax::DefKind::Class
+                        && d.decorations.iter().any(|deco| {
+                            rb_frameworks::routes::is_annotation(
+                                facts,
+                                deco,
+                                "org.springframework.boot.autoconfigure",
+                                "SpringBootApplication",
+                            )
+                        })
+                })
+        })
+        .filter_map(|(path, _)| {
+            rb_frameworks::work::tick(1);
+            boundaries.project_for(path).map(|p| p.dir.clone())
+        })
+        .collect()
+}
+
+/// Services runnable in production: manifest-detected deployables plus modules
+/// holding a main-source `@SpringBootApplication` class (contract M6c S3).
+/// One predicate feeds service roles, the DI classpath and RTA alike, so a
+/// module is never `role=service` without being deployable, or vice versa.
+fn deployable_services(
+    boundaries: &Boundaries,
+    app_services: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    boundaries
+        .projects()
+        .iter()
+        .filter(|p| p.deployable || app_services.contains(&p.dir))
+        .map(|p| p.dir.clone())
+        .collect()
+}
+
 fn service_key(dir: &str) -> NodeKey {
     NodeKey::new(NodeKind::Service, dir)
 }
 
-fn service_attrs(p: &Project) -> Attrs {
-    let role = if p.deployable {
+fn service_attrs(p: &Project, deployable: &BTreeSet<String>) -> Attrs {
+    let role = if deployable.contains(&p.dir) {
         ServiceRole::Service
     } else {
         ServiceRole::Library
@@ -1513,6 +1560,150 @@ mod tests {
         .clone();
         assert_eq!(calls(&g), [(main, helper, Provenance::Heuristic)]);
         assert_eq!(files_without_document(&diagnostics), 0);
+    }
+
+    /// Contract M6c S3: a module holding a main-source `@SpringBootApplication`
+    /// class is deployable even when its manifests say otherwise (a Maven
+    /// module inheriting its build, Gradle without the plugin text). A module
+    /// without one, and an app class in test sources, stay library.
+    #[test]
+    fn spring_boot_application_class_makes_a_library_deployable() {
+        let app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public class App {}\n",
+        )
+        .unwrap();
+        let plain = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\npublic class Plain {}\n",
+        )
+        .unwrap();
+        let test_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public class TestApp {}\n",
+        )
+        .unwrap();
+        let ts_app = rb_syntax::extract(
+            rb_syntax::Language::TypeScript,
+            b"import { SpringBootApplication } from 'org.springframework.boot.autoconfigure';\n@SpringBootApplication class App {}\n",
+        )
+        .unwrap();
+        let meth_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nclass Holder {\n@SpringBootApplication void m() {}\n}\n",
+        )
+        .unwrap();
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: [
+                "svc/pom.xml",
+                "svc/src/main/java/com/acme/App.java",
+                "other/pom.xml",
+                "other/src/main/java/com/acme/Plain.java",
+                "testonly/pom.xml",
+                "testonly/src/test/java/com/acme/TestApp.java",
+                "tslib/package.json",
+                "tslib/src/app.ts",
+                "meth/pom.xml",
+                "meth/src/main/java/com/acme/Holder.java",
+            ]
+            .into_iter()
+            .map(entry)
+            .collect(),
+            skipped: vec![],
+        };
+        let library = |dir: &str, manifest: &str| {
+            let mut p = project(dir, manifest);
+            p.deployable = false;
+            p
+        };
+        let boundaries = Boundaries::new(
+            vec![
+                library("svc", "svc/pom.xml"),
+                library("other", "other/pom.xml"),
+                library("testonly", "testonly/pom.xml"),
+                library("tslib", "tslib/package.json"),
+                library("meth", "meth/pom.xml"),
+            ],
+            vec![],
+        );
+        let content = Content {
+            facts: BTreeMap::from([
+                (
+                    "svc/src/main/java/com/acme/App.java",
+                    (rb_syntax::Language::Java, &app),
+                ),
+                (
+                    "other/src/main/java/com/acme/Plain.java",
+                    (rb_syntax::Language::Java, &plain),
+                ),
+                (
+                    "testonly/src/test/java/com/acme/TestApp.java",
+                    (rb_syntax::Language::Java, &test_app),
+                ),
+                (
+                    "tslib/src/app.ts",
+                    (rb_syntax::Language::TypeScript, &ts_app),
+                ),
+                (
+                    "meth/src/main/java/com/acme/Holder.java",
+                    (rb_syntax::Language::Java, &meth_app),
+                ),
+            ]),
+            ..Content::default()
+        };
+        let (g, _) = assemble(&manifest, None, &boundaries, &content).unwrap();
+        let role = |key: &str| {
+            g.nodes().iter().find(|n| n.key == key).unwrap().attrs["role"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(role("svc"), "service");
+        assert_eq!(role("other"), "library");
+        assert_eq!(role("testonly"), "library");
+        assert_eq!(role("tslib"), "library");
+        assert_eq!(role("meth"), "library");
+    }
+
+    /// Contract M6c S3, invariant 9: one app class per module costs linear
+    /// work — 4× the modules makes at most 5× the counted steps. Counted, not
+    /// timed, so machine load cannot fail it.
+    #[test]
+    fn app_services_grows_linearly() {
+        fn work(n: usize) -> u64 {
+            let srcs: Vec<String> = (0..n)
+                .map(|i| format!("package m{i};\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public class App{i} {{}}\n"))
+                .collect();
+            let facts: Vec<rb_syntax::FileFacts> = srcs
+                .iter()
+                .map(|s| rb_syntax::extract(rb_syntax::Language::Java, s.as_bytes()).unwrap())
+                .collect();
+            let paths: Vec<String> = (0..n)
+                .map(|i| format!("m{i}/src/main/java/m{i}/App{i}.java"))
+                .collect();
+            let map: BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)> = paths
+                .iter()
+                .zip(&facts)
+                .map(|(p, f)| (p.as_str(), (rb_syntax::Language::Java, f)))
+                .collect();
+            let boundaries = Boundaries::new(
+                (0..n)
+                    .map(|i| {
+                        let mut p = project(&format!("m{i}"), &format!("m{i}/pom.xml"));
+                        p.deployable = false;
+                        p
+                    })
+                    .collect(),
+                vec![],
+            );
+            rb_frameworks::work::take();
+            let found = app_services(&boundaries, &map);
+            assert_eq!(found.len(), n);
+            rb_frameworks::work::take()
+        }
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
     /// Contract M3b amendment 15: a TypeScript file the index has no document for (excluded by
