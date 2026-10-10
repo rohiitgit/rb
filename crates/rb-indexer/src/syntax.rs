@@ -80,10 +80,12 @@ pub(crate) const RAW_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 /// The raw-text scan ([`rb_frameworks::clients::raw_scan`]) of every file the plan does not
 /// parse — a language with no grammar, a generated file, one too large to parse — except
 /// binary blobs (a NUL byte in the first 8000, as Git decides); the blob is read as lossy
-/// UTF-8. Parsed files are read for discovery only
-/// ([`rb_frameworks::clients::discovery_text`], contract M5 S19 (a)): their tokens decide the
-/// hooks, but a fully qualified load-balancer type or a JSON key path is no token. Returns the
-/// merged findings and the number of files scanned as text (parsed ones not counted).
+/// UTF-8. Parsed files contribute discovery evidence only
+/// ([`rb_frameworks::clients::discovery_text`] for the broad count,
+/// [`rb_frameworks::clients::single_literal_discovery`] for the narrowed cap,
+/// contract M6b S8): their tokens decide the hooks, but a fully qualified
+/// load-balancer type or a JSON key path is no token. Returns the merged
+/// findings and the number of files scanned as text (parsed ones not counted).
 pub(crate) fn scan_unparsed(
     files: &[FileEntry],
     plan: &[(&FileEntry, Language)],
@@ -95,11 +97,15 @@ pub(crate) fn scan_unparsed(
     for f in files.iter().filter(|f| !f.binary) {
         if parsed.contains(f.path.as_str()) {
             // Parsed files are under the parser's byte cap, far below the scan's.
-            if !out.discovery {
-                out.discovery = rb_frameworks::clients::discovery_text(
-                    &f.path,
-                    &String::from_utf8_lossy(&blob(&f.blob_sha)?),
-                );
+            // Their words no longer cap (contract M6b S8, D7): the broad text
+            // is kept for the lift count, and only single-literal keys cap.
+            let raw = blob(&f.blob_sha)?;
+            let text = String::from_utf8_lossy(&raw);
+            if !out.discovery_parsed {
+                out.discovery_parsed = rb_frameworks::clients::discovery_text(&f.path, &text);
+            }
+            if !out.discovery_literal {
+                out.discovery_literal = rb_frameworks::clients::single_literal_discovery(&text);
             }
             continue;
         }
@@ -384,11 +390,14 @@ mod tests {
         assert_eq!(scanned, 4);
     }
 
-    /// Contract M5 S19 (a): parsed files are read for the discovery vocabulary too (a fully
-    /// qualified Spring Cloud LoadBalancer type in Java needs no import or annotation), but are
-    /// not counted as scanned and give no hooks (their tokens decide those).
+    /// Contract M6b S8 (D7): parsed files no longer cap on discovery words —
+    /// their text contributes the broad vocabulary for the lift count only
+    /// (`discovery_parsed`) plus single-literal key evidence
+    /// (`discovery_literal`). Raw files still cap (`discovery`). Parsed files
+    /// are not counted as scanned and give no hooks (their tokens decide
+    /// those).
     #[test]
-    fn parsed_files_are_read_for_discovery() {
+    fn parsed_files_narrow_discovery_to_resolved_evidence() {
         let file = |path: &str| FileEntry {
             blob_sha: path.into(),
             ..entry(path, 10)
@@ -399,6 +408,10 @@ mod tests {
                 &b"class Lb { @Bean org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier s() { return null; } }\n"[..],
             ),
             ("p/A.java", b"class A { void fetch() {} }\n"),
+            (
+                "web/Cfg.ts",
+                &b"export const c = { spring: { cloud: { discovery: {} } } };\n"[..],
+            ),
         ]);
         let blob = |sha: &str| {
             blobs
@@ -411,10 +424,34 @@ mod tests {
             scan_unparsed(files, &plan, &blob).unwrap()
         };
         let (found, scanned) = scan(&[file("p/A.java")]);
-        assert!(!found.discovery && found.hooks.is_empty() && found.words.is_empty());
+        assert!(
+            !found.discovery
+                && !found.discovery_parsed
+                && !found.discovery_literal
+                && found.hooks.is_empty()
+                && found.words.is_empty()
+        );
         assert_eq!(scanned, 0);
+        // A fully qualified type is broad-vocabulary evidence, but neither a
+        // cap nor single-literal keys (facts resolve it downstream).
         let (found, scanned) = scan(&[file("p/A.java"), file("p/Lb.java")]);
-        assert!(found.discovery && found.hooks.is_empty() && found.words.is_empty());
+        assert!(
+            !found.discovery
+                && found.discovery_parsed
+                && !found.discovery_literal
+                && found.hooks.is_empty()
+                && found.words.is_empty()
+        );
+        assert_eq!(scanned, 0);
+        // Keys co-occurring in one literal are narrowed evidence too.
+        let (found, scanned) = scan(&[file("web/Cfg.ts")]);
+        assert!(
+            !found.discovery
+                && found.discovery_parsed
+                && found.discovery_literal
+                && found.hooks.is_empty()
+                && found.words.is_empty()
+        );
         assert_eq!(scanned, 0);
     }
 

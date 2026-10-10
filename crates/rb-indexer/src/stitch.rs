@@ -116,8 +116,15 @@ pub(crate) struct Site {
     pub base_verified: Option<bool>,
     /// The repository configures service discovery or a load balancer, which may bind the
     /// service a host names to any instance: a host-by-name match (F1) is never `synthetic`,
-    /// and its edge says `discovery: configured` (contract M4a amendment 17, W4).
+    /// and its edge says `discovery: configured` (contract M4a amendment 17, W4). This is the
+    /// narrowed rule (contract M6b S8): raw-file evidence, parsed-file
+    /// single-literal keys, or import-resolved known types.
     pub discovery: bool,
+    /// The broad rule (contract M5 S19 (a)): parsed-file discovery words and
+    /// unresolved Java imports included. Compared against [`Site::discovery`]
+    /// to count the sites narrowing lifted (`discovery_lifted`, invariant 6);
+    /// never caps.
+    pub discovery_broad: bool,
     /// The values a contested base joined to the URL may take, folded (contract M5 S19 (f)):
     /// one naming an external host makes the site external. Empty when the base is decided or
     /// unknown with no stated value, or does not apply (an absolute URL).
@@ -329,23 +336,20 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
     }
     // A file without facts may hook a kind too, or configure discovery (amendment 17), as may
     // Java code naming Spring Cloud LoadBalancer or Ribbon by an import or a fully qualified
-    // annotation.
+    // annotation. Contract M6b S8 (D7) narrows the parsed-file evidence to positively resolved
+    // forms — a type use resolving through imports to a discovery package
+    // ([`rb_frameworks::clients::discovery_resolved`]) or a fully qualified
+    // use — and single-literal JSON keys
+    // ([`rb_frameworks::clients::single_literal_discovery`]); raw-text hits
+    // stay capped. The broad rule is kept to count the lifted sites.
     hooked.extend(inputs.unparsed.hooks.iter().copied());
-    let discovery_package = rb_frameworks::clients::discovery_package;
-    let discovery = inputs.unparsed.discovery
-        || inputs.files.values().any(|(language, facts)| {
-            *language == Language::Java
-                && (facts.imports.iter().any(|i| discovery_package(&i.module))
-                    || facts
-                        .definitions
-                        .iter()
-                        .flat_map(|d| &d.decorations)
-                        .any(|d| {
-                            d.name
-                                .rsplit_once('.')
-                                .is_some_and(|(q, _)| discovery_package(q))
-                        }))
-        });
+    let (broad, discovery) = rb_frameworks::clients::discovery_flags(
+        inputs.unparsed,
+        inputs
+            .files
+            .values()
+            .map(|(language, facts)| (*language, *facts)),
+    );
     let mut out = Vec::new();
     // One folder for the run: per-file indexes, member proofs and clean
     // folds amortize across sites (a fresh step budget per fold, as with a
@@ -445,6 +449,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 base_from_bean: from_bean.is_some(),
                 base_verified,
                 discovery,
+                discovery_broad: broad,
                 base_candidates,
             });
         }
@@ -829,6 +834,9 @@ impl<'e> Stitcher<'e> {
         }
         // A host naming a service may be bound to other instances by discovery (W4).
         let rebound = site.discovery && !matches!(scope, Scope::Any);
+        // ... unless narrowing lifted the cap (contract M6b S8): broad
+        // evidence with no positively resolved form.
+        let lifted = site.discovery_broad && !site.discovery && !matches!(scope, Scope::Any);
         if rebound {
             attrs.insert("discovery".into(), "configured".into());
         }
@@ -883,7 +891,7 @@ impl<'e> Stitcher<'e> {
                 attrs,
             }],
             candidates: 1,
-            detail: None,
+            detail: lifted.then_some("discovery_lifted"),
         }
     }
 
@@ -958,12 +966,16 @@ pub(crate) fn add_consumes(
     let mut counts: BTreeMap<Bucket, usize> = Bucket::ALL.iter().map(|&k| (k, 0)).collect();
     let mut in_process = 0;
     let mut empty_url = 0;
+    let mut lifted = 0;
     for site in sites {
         let outcome = stitcher.site(site);
         *counts.entry(outcome.bucket).or_default() += 1;
         match outcome.detail {
             Some("in_process") => in_process += 1,
             Some("empty_url") => empty_url += 1,
+            // Contract M6b S8 (invariant 6): a stitched host match the broad
+            // rule would have capped but the narrowed rule lifts.
+            Some("discovery_lifted") => lifted += 1,
             _ => {}
         }
         // Contract M6b S4 (D4): in-process and empty-URL sites are
@@ -1057,6 +1069,12 @@ pub(crate) fn add_consumes(
             if empty_url > 0 {
                 detail.insert("http_empty_url".into(), empty_url.into());
             }
+        }
+        // Contract M6b S8 (D3, invariant 6): the lifted-site count rides
+        // along only when non-zero. Lifted sites already count in their
+        // buckets, so the buckets still sum to the sites.
+        if lifted > 0 {
+            detail.insert("discovery_lifted".into(), lifted.into());
         }
         diagnostics.push(Diagnostic {
             kind: "http_coverage".into(),
@@ -1161,6 +1179,7 @@ mod tests {
             base_from_bean: false,
             base_verified: None,
             discovery: false,
+            discovery_broad: false,
             base_candidates: Vec::new(),
         }
     }
@@ -1852,6 +1871,93 @@ mod tests {
             .unwrap();
         assert!(coverage.detail.get("http_in_process").is_none());
         assert!(coverage.detail.get("http_empty_url").is_none());
+    }
+
+    /// Contract M6b S8 (D7, invariant 6): narrowing lifts the discovery cap
+    /// only where no positive evidence reaches — a host-by-name match with
+    /// broad evidence but no resolved evidence is `synthetic` again, and each
+    /// such site is counted (`discovery_lifted`, non-zero-only). A site the
+    /// narrowed rule still reaches stays capped; a host-less suffix match was
+    /// never capped, so neither counts.
+    #[test]
+    fn discovery_narrowing_lifts_and_counts() {
+        let eps = endpoints();
+        let lifted = Site {
+            discovery: false,
+            discovery_broad: true,
+            ..site(
+                AUTH,
+                Some("POST"),
+                Some(("http://notification:3000/internal/mfa/email", Literal)),
+                1,
+            )
+        };
+        // The cap lifts: synthetic again, marked for the count.
+        assert_eq!(one(&eps, &lifted).0, Bucket::Synthetic);
+        assert_eq!(detail(&eps, &lifted), Some("discovery_lifted"));
+        // The control: positive evidence still caps.
+        let capped = Site {
+            discovery: true,
+            ..lifted.clone()
+        };
+        let (bucket, links) = one(&eps, &capped);
+        assert_eq!(bucket, Bucket::Heuristic);
+        assert!(
+            links[0].contains("\"discovery\":\"configured\""),
+            "{links:?}"
+        );
+        assert_eq!(detail(&eps, &capped), None);
+        // A host-less suffix match never rebounds: narrowing changes nothing
+        // there and counts nothing.
+        let suffix = Site {
+            discovery: false,
+            discovery_broad: true,
+            ..site(
+                WEB,
+                Some("POST"),
+                Some(("{?}/invoices/{?}/pay", Literal)),
+                2,
+            )
+        };
+        assert_eq!(one(&eps, &suffix).0, Bucket::Heuristic);
+        assert_eq!(detail(&eps, &suffix), None);
+        // The count rides along only when non-zero (D3).
+        let nodes = |b: &mut GraphBuilder, sites: &[Site]| {
+            for e in &eps {
+                if !b.has_node(&NodeKey::new(NodeKind::Endpoint, e.key.clone())) {
+                    b.add_node(
+                        NodeKey::new(NodeKind::Endpoint, e.key.clone()),
+                        &e.key,
+                        Attrs::new(),
+                    )
+                    .unwrap();
+                }
+            }
+            for s in sites {
+                if !b.has_node(&s.src) {
+                    b.add_node(s.src.clone(), "f", Attrs::new()).unwrap();
+                }
+            }
+        };
+        let sites = vec![lifted.clone(), capped.clone(), suffix.clone()];
+        let mut b = GraphBuilder::new();
+        nodes(&mut b, &sites);
+        let diagnostics = add_consumes(&mut b, &sites, &eps, &services()).unwrap();
+        let coverage = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_coverage")
+            .unwrap();
+        assert_eq!(coverage.detail["discovery_lifted"], 1);
+        // No lifted site, no counter.
+        let rest = vec![capped, suffix];
+        let mut b = GraphBuilder::new();
+        nodes(&mut b, &rest);
+        let diagnostics = add_consumes(&mut b, &rest, &eps, &services()).unwrap();
+        let coverage = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_coverage")
+            .unwrap();
+        assert!(coverage.detail.get("discovery_lifted").is_none());
     }
 
     /// Evaluator pass 1, P1 (the evaluator's repros, folded URLs): a hole in the port keeps a

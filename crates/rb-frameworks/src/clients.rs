@@ -460,9 +460,20 @@ pub fn feign_config_key(key: &str) -> bool {
 pub struct RawScan {
     /// The client kinds some such file may reconfigure: every site of them is capped.
     pub hooks: BTreeSet<ClientKind>,
-    /// Some such file configures service discovery or load balancing, which may bind a
+    /// Some file without facts configures service discovery or load balancing, which may bind a
     /// service name to any host: no host-by-name stitch (F1) is `synthetic`.
+    /// Parsed files no longer feed this (contract M6b S8): their text feeds
+    /// `discovery_parsed` (broad, counted only) and `discovery_literal`
+    /// (narrowed, caps) instead.
     pub discovery: bool,
+    /// Some parsed file's text spells a discovery key path or word
+    /// ([`discovery_text`], contract M5 S19 (a)): the broad rule, kept for the
+    /// S8 lift count only — it never caps (contract M6b S8).
+    pub discovery_parsed: bool,
+    /// Some parsed file holds discovery key segments inside one
+    /// brace-delimited span ([`single_literal_discovery`]): the narrowed text
+    /// evidence, which caps (contract M6b S8, D7).
+    pub discovery_literal: bool,
     /// DI-surface findings (contract M4b S6 gate D) as `(path, what)`
     /// ([`crate::di::surface_text`]).
     pub di_surface: Vec<(String, String)>,
@@ -688,6 +699,198 @@ pub fn discovery_text(path: &str, text: &str) -> bool {
     }
     let normalised = text.to_ascii_lowercase().replace('_', ".");
     DISCOVERY_WORDS.iter().any(|w| has_word(&normalised, w)) || json_discovery(text)
+}
+
+/// Simple names of types that configure service discovery or load balancing
+/// (contract M6b S8): Spring Cloud LoadBalancer's and Ribbon's configuration
+/// types, the type entries of [`DISCOVERY_WORDS`]. Any other spelling — a
+/// comment, a UI string, an unrelated class from the same package tree — is
+/// not positively identified evidence.
+const DISCOVERY_TYPES: &[&str] = &[
+    "LoadBalancerClient",
+    "LoadBalancerClients",
+    "RibbonClient",
+    "RibbonClients",
+    "ServiceInstanceListSupplier",
+];
+
+/// The qualifier and simple name of a type as written (`a.b.C` → (`a.b`,
+/// `C`); `C` → (`None`, `C`)), cut at any type arguments (`C<X>` → `C`).
+fn split_type(name: &str) -> (Option<&str>, &str) {
+    let bare = name.split('<').next().unwrap_or(name).trim();
+    match bare.rsplit_once('.') {
+        Some((q, s)) => (Some(q), s),
+        None => (None, bare),
+    }
+}
+
+/// Whether a parsed file positively resolves discovery or load-balancer
+/// configuration (contract M6b S8, D7): a use of a [`DISCOVERY_TYPES`] name —
+/// an annotation or decorator, a supertype head, a declared field or parameter
+/// type (type arguments included) or a method return type — that resolves
+/// through imports to a discovery package (an explicit single-type import
+/// binding it, or an on-demand import of a discovery package, which cannot
+/// attribute the use, so stays capped), or is fully qualified under a
+/// discovery package. Static imports bind members, never types. A bare use
+/// with no import to resolve through is not evidence (it may be the
+/// repository's own type of that name); neither is a type nested in another
+/// type's arguments outside a binding's recorded ones.
+pub fn discovery_resolved(facts: &FileFacts) -> bool {
+    let resolves = |qual: Option<&str>, simple: &str| {
+        if !DISCOVERY_TYPES.contains(&simple) {
+            return false;
+        }
+        if let Some(q) = qual {
+            return discovery_package(q);
+        }
+        facts.imports.iter().any(|i| {
+            !i.is_static
+                && discovery_package(&i.module)
+                && (i.names.iter().any(|n| n.local == simple) || i.wildcard)
+        })
+    };
+    facts.definitions.iter().any(|d| {
+        d.decorations.iter().any(|deco| {
+            let (q, s) = split_type(&deco.name);
+            resolves(q, s)
+        }) || d.supertypes.iter().any(|s| {
+            let (q, sm) = split_type(&s.name);
+            resolves(q, sm)
+        }) || d.return_type.as_ref().is_some_and(|r| {
+            let (q, sm) = split_type(r);
+            resolves(q, sm)
+        })
+    }) || facts.bindings.iter().any(|b| {
+        let (q, s) = split_type(&b.type_name);
+        resolves(q, s)
+            || b.type_args.iter().any(|a| {
+                // Type arguments are recorded as simple names: only an import
+                // can resolve them.
+                DISCOVERY_TYPES.contains(&a.as_str())
+                    && facts.imports.iter().any(|i| {
+                        !i.is_static
+                            && discovery_package(&i.module)
+                            && (i.names.iter().any(|n| n.local == *a) || i.wildcard)
+                    })
+            })
+    })
+}
+
+/// Whether a parsed file's facts positively resolve discovery or
+/// load-balancer configuration (contract M6b S8, D7): Java only — the known
+/// types are Java types — with a use resolving through imports (see
+/// [`discovery_resolved`]).
+pub fn discovery_facts(language: Language, facts: &FileFacts) -> bool {
+    language == Language::Java && discovery_resolved(facts)
+}
+
+/// The broad discovery rule against the narrowed one, `(broad, narrowed)`
+/// (contract M6b S8, D7; invariant 6). Broad is raw-file evidence
+/// (`unparsed.discovery`), parsed-file discovery words
+/// (`unparsed.discovery_parsed`), or an unresolved Java import naming a
+/// discovery package; narrowed is raw-file evidence, parsed-file
+/// single-literal keys (`unparsed.discovery_literal`), or import-resolved
+/// known types ([`discovery_facts`]). A split (broad without narrowed) is
+/// what the stitcher's `discovery_lifted` count counts.
+pub fn discovery_flags<'a>(
+    unparsed: &RawScan,
+    files: impl IntoIterator<Item = (Language, &'a FileFacts)>,
+) -> (bool, bool) {
+    let mut broad_java = false;
+    let mut resolved = false;
+    for (language, facts) in files {
+        resolved |= discovery_facts(language, facts);
+        if language != Language::Java {
+            continue;
+        }
+        broad_java |= facts.imports.iter().any(|i| discovery_package(&i.module))
+            || facts
+                .definitions
+                .iter()
+                .flat_map(|d| &d.decorations)
+                .any(|d| {
+                    d.name
+                        .rsplit_once('.')
+                        .is_some_and(|(q, _)| discovery_package(q))
+                });
+    }
+    let broad = unparsed.discovery || unparsed.discovery_parsed || broad_java;
+    let narrowed = unparsed.discovery || unparsed.discovery_literal || resolved;
+    (broad, narrowed)
+}
+
+/// Whether one brace-delimited span of `text` holds key segments spelling a
+/// discovery key path ([`json_discovery`]'s segments, contract M6b S8):
+/// `spring`, `cloud` and `discovery` or `loadbalancer` co-occurring inside a
+/// single object literal. Nested literals count — their keys sit inside the
+/// outer literal too, so each popped span's segments merge into its parent —
+/// while sibling literals and brace-free key lists never combine. A single
+/// linear pass with a brace stack, so 4× the input costs ~4× the counted work
+/// (invariant 9). Unbalanced text can only cap (an unclosed span is checked at
+/// the end); a stray `}` may split a span (documented residue, as with the
+/// structure-free rule this narrows).
+pub fn single_literal_discovery(text: &str) -> bool {
+    fn hit(segments: &HashSet<String>) -> bool {
+        segments.contains("spring")
+            && segments.contains("cloud")
+            && (segments.contains("discovery") || segments.contains("loadbalancer"))
+    }
+    // The key rule mirrors [`json_key_segments`]: a run of identifier
+    // characters followed, past quotes, backslashes and spaces, by a `:` that
+    // is not `::`.
+    let bytes = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'$' | b'.');
+    let mut stack: Vec<HashSet<String>> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        crate::work::tick(1);
+        let c = bytes[i];
+        if c == b'{' {
+            stack.push(HashSet::new());
+            i += 1;
+            continue;
+        }
+        if c == b'}' {
+            if let Some(top) = stack.pop() {
+                if hit(&top) {
+                    return true;
+                }
+                if let Some(parent) = stack.last_mut() {
+                    parent.extend(top);
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if !ident(c) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        let mut j = i;
+        while j < bytes.len() && matches!(bytes[j], b'"' | b'\'' | b'\\' | b' ' | b'\t') {
+            j += 1;
+        }
+        if bytes.get(j) == Some(&b':')
+            && bytes.get(j + 1) != Some(&b':')
+            && let Some(top) = stack.last_mut()
+        {
+            for seg in text[start..i].split('.') {
+                let seg: String = seg
+                    .chars()
+                    .filter(|c| !matches!(c, '-' | '_'))
+                    .flat_map(char::to_lowercase)
+                    .collect();
+                if !seg.is_empty() {
+                    top.insert(seg);
+                }
+            }
+        }
+    }
+    stack.into_iter().any(|segments| hit(&segments))
 }
 
 /// The raw-text scan of one file without token facts (contract M4a amendment 17, evaluator
@@ -3801,6 +4004,225 @@ mod tests {
         ] {
             assert!(!discovery_text(path, text), "{path}: {text}");
         }
+    }
+
+    /// Contract M6b S8 (D7): a discovery word in parsed code caps only when a
+    /// use of a known discovery/load-balancer type resolves through imports to
+    /// a discovery package (an explicit single-type import, or an on-demand
+    /// one — unresolved, so capped), or is fully qualified under one. Bare
+    /// words in comments, unused imports, unrelated types from the same
+    /// package tree, static imports and Eureka's keys do not resolve.
+    #[test]
+    fn discovery_resolved_types_through_imports() {
+        use rb_syntax::Language::Java;
+        let resolved = |src: &str| {
+            let facts = extract(Java, src.as_bytes()).unwrap();
+            discovery_resolved(&facts)
+        };
+        for src in [
+            // An imported annotation, used.
+            "import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\n@LoadBalancerClient(name = \"orders\")\nclass Lb {}\n",
+            // Fully qualified, no import (contract M5 S19 (a)'s case, narrowed
+            // to a known type).
+            "@org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient(name = \"orders\")\nclass Lb {}\n",
+            // On-demand: the use cannot be attributed, so capped.
+            "import org.springframework.cloud.loadbalancer.annotation.*;\n@LoadBalancerClient(name = \"orders\")\nclass Lb {}\n",
+            // Ribbon's configuration type, imported and used.
+            "import org.springframework.cloud.netflix.ribbon.RibbonClient;\n@RibbonClient(name = \"orders\")\nclass R {}\n",
+            // A supertype head through its import.
+            "import org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier;\nclass S implements ServiceInstanceListSupplier {}\n",
+            // A declared field type through its import.
+            "import org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier;\nclass S {\nServiceInstanceListSupplier s;\n}\n",
+            // A fully qualified return type (contract M5 S19 (a)'s row).
+            "class Lb {\n@Bean org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier s() { return null; }\n}\n",
+        ] {
+            assert!(resolved(src), "{src}");
+        }
+        for src in [
+            // A bare word in a comment resolves to nothing.
+            "// the ribbon loadbalancerclient balances\nclass A {}\n",
+            // An import with no use configures nothing.
+            "import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\nclass A {}\n",
+            // An unrelated type from the same package tree is not evidence.
+            "import org.springframework.cloud.loadbalancer.foo.Other;\n@Other\nclass A {}\n",
+            // Eureka resolves names to registered instances (F1's
+            // convention): not discovery configuration.
+            "import org.springframework.cloud.client.discovery.EnableDiscoveryClient;\n@EnableDiscoveryClient\nclass A {}\n",
+            // `@LoadBalanced` is not a discovery type (contract M5 S19 (a)'s
+            // negative row).
+            "import org.springframework.cloud.client.loadbalancer.LoadBalanced;\nclass B {\n@LoadBalanced Object rt;\n}\n",
+            // A type use cannot come from a static import.
+            "import static org.springframework.cloud.loadbalancer.annotation.*;\n@LoadBalancerClient\nclass A {}\n",
+            // A bare annotation with no import to resolve through.
+            "@LoadBalancerClient\nclass A {}\n",
+        ] {
+            assert!(!resolved(src), "{src}");
+        }
+    }
+
+    /// Contract M6b S8: the facts rule is Java-only — the known types are
+    /// Java types. A Java-shaped import in another language resolves nothing.
+    #[test]
+    fn discovery_facts_are_java_only() {
+        use rb_syntax::Language::{Java, TypeScript};
+        let java = extract(
+            Java,
+            b"import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\n@LoadBalancerClient\nclass Lb {}\n",
+        )
+        .unwrap();
+        assert!(discovery_facts(Java, &java));
+        let ts = extract(
+            TypeScript,
+            b"import { LoadBalancerClient } from \"org.springframework.cloud.loadbalancer.annotation\";\nconst x: LoadBalancerClient = y;\n",
+        )
+        .unwrap();
+        // The facts alone resolve (the import binds the name) ...
+        assert!(discovery_resolved(&ts));
+        // ... but outside Java they are not evidence.
+        assert!(!discovery_facts(TypeScript, &ts));
+    }
+
+    /// Contract M6b S8: the broad rule against the narrowed rule, side by
+    /// side. Broad is raw-file evidence, parsed-file discovery words, or an
+    /// unresolved Java import; narrowed is raw-file evidence, parsed-file
+    /// single-literal keys, or import-resolved known types. A split (broad
+    /// without narrowed) is what `discovery_lifted` counts downstream.
+    #[test]
+    fn discovery_flags_splits_broad_and_narrowed() {
+        use rb_syntax::Language::{Java, TypeScript};
+        let java_used = extract(
+            Java,
+            b"import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\n@LoadBalancerClient\nclass Lb {}\n",
+        )
+        .unwrap();
+        let java_bare_import = extract(
+            Java,
+            b"import org.springframework.cloud.netflix.ribbon.RibbonClient;\nclass R {}\n",
+        )
+        .unwrap();
+        let ts = extract(TypeScript, b"export const x = 1;\n").unwrap();
+        let java_plain = extract(Java, b"class A {}\n").unwrap();
+        fn files<'a>(
+            j: &'a rb_syntax::FileFacts,
+            t: &'a rb_syntax::FileFacts,
+        ) -> Vec<(rb_syntax::Language, &'a rb_syntax::FileFacts)> {
+            vec![(Java, j), (TypeScript, t)]
+        }
+        // Nothing anywhere: no evidence either way.
+        assert_eq!(
+            discovery_flags(
+                &RawScan::default(),
+                files(&java_plain, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (false, false)
+        );
+        // Resolved types narrow without broadening beyond the import (which
+        // already broadens): both hold.
+        assert_eq!(
+            discovery_flags(
+                &RawScan::default(),
+                files(&java_used, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (true, true)
+        );
+        // A bare import broadens (unresolved) but resolves nothing: split.
+        assert_eq!(
+            discovery_flags(
+                &RawScan::default(),
+                files(&java_bare_import, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (true, false)
+        );
+        // Parsed-file words broaden without resolving: split.
+        assert_eq!(
+            discovery_flags(
+                &RawScan {
+                    discovery_parsed: true,
+                    ..RawScan::default()
+                },
+                files(&java_plain, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (true, false)
+        );
+        // Raw-file evidence stays capped under both rules.
+        assert_eq!(
+            discovery_flags(
+                &RawScan {
+                    discovery: true,
+                    ..RawScan::default()
+                },
+                files(&java_bare_import, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (true, true)
+        );
+        // Single-literal keys narrow without the broad words.
+        assert_eq!(
+            discovery_flags(
+                &RawScan {
+                    discovery_literal: true,
+                    ..RawScan::default()
+                },
+                files(&java_plain, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (false, true)
+        );
+    }
+    /// Contract M6b S8 (D7): JSON-style keys cap parsed-file text only when
+    /// they co-occur inside one brace-delimited span — nested literals count
+    /// (their keys sit inside the outer literal too), while sibling literals
+    /// and brace-free key lists do not combine.
+    #[test]
+    fn single_literal_discovery_needs_one_literal() {
+        for text in [
+            // One flat literal.
+            "const c = { spring: 1, cloud: 2, discovery: 3 };\n",
+            // Nested: every key sits inside the outer literal.
+            "const c = { spring: { cloud: { discovery: { x: 1 } } } };\n",
+            // `SPRING_APPLICATION_JSON` in code (contract M5 S19 (a)'s shape).
+            "process.env.SPRING_APPLICATION_JSON = JSON.stringify({ spring: { cloud: { 'load-balancer': { x: 1 } } } });\n",
+            // Escaped JSON in a string still sits inside the outer braces.
+            "{\"env\":[{\"name\":\"X\",\"value\":\"{\\\"spring\\\":{\\\"cloud\\\":{\\\"consul\\\":{\\\"discovery\\\":{}}}}}\"}]}",
+            // Dotted keys in one literal.
+            "{ \"spring.cloud\": { \"consul\": { \"discovery\": true } } }",
+        ] {
+            assert!(single_literal_discovery(text), "{text}");
+        }
+        for text in [
+            // The same three keys in three sibling literals stay separate.
+            "const a = { spring: 1 };\nconst b = { cloud: 2 };\nconst c = { discovery: 3 };\n",
+            // Key lists without braces are not one literal.
+            "spring:\ncloud:\ndiscovery:\n",
+            // Eureka's keys are not discovery configuration.
+            "{\"eureka\":{\"client\":{\"serviceUrl\":{\"defaultZone\":\"http://r/eureka\"}}}}",
+            // `discovery` as a value is not a key.
+            "{\"name\":\"discovery\",\"cloud\":\"x\"}",
+            // Two of three is not a discovery path.
+            "{ spring: 1, cloud: 2 }",
+        ] {
+            assert!(!single_literal_discovery(text), "{text}");
+        }
+    }
+
+    /// Contract M6b S8, invariant 9: one brace-delimited literal per line
+    /// costs linear work — 4× the literals makes at most 5× the counted
+    /// steps. Counted, not timed, so machine load cannot fail it. The input
+    /// never hits, so the scan runs end to end (an early hit would measure a
+    /// constant).
+    #[test]
+    fn single_literal_discovery_grows_linearly() {
+        fn work(n: usize) -> u64 {
+            let mut text = String::new();
+            for i in 0..n {
+                text.push_str(&format!(
+                    "const c{i} = {{ spring: {{ cloud: {{ x: {i} }} }} }};\n"
+                ));
+            }
+            crate::work::take();
+            assert!(!single_literal_discovery(&text));
+            crate::work::take()
+        }
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
     /// Contract M5 S19 (b) (M4a open item 22 (c)): XML comments are read, so a hook in a

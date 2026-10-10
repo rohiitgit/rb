@@ -97,7 +97,9 @@ use serde_json::{Value, json};
 /// statements (S5).
 /// `m6b-5` constructor-assigned members fold from their single write (S6).
 /// `m6b-6` userinfo holes match within the literal host (S7).
-pub const PIPELINE: &str = "m6b-6";
+/// `m6b-7` discovery narrowing: parsed-file words cap only through
+/// import-resolved known types or single-literal keys (S8).
+pub const PIPELINE: &str = "m6b-7";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
