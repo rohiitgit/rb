@@ -337,3 +337,7 @@
 ## 2026-10-10: evaluator pass 1 must probe configuration surfaces and allow-list edges
 - **Finding (fixed):** the S9 battery passed with plain sites through reconfigured calls (`superagent.use`, `got`/`ky` `hooks`) because no probe exercised them; the S8 allow-list missed a corpus-evidenced routing type (`ReactorLoadBalancer`).
 - **Rule:** for every new client form, probe its configuration surfaces (plugins, interceptors, hooks, custom transports, by-name/spread options) expecting caps; for every narrowing allow-list, probe its boundary types (same-name foreign types, unresolved imports, sibling types in the same tree) expecting both caps and lifts. Survivors that force new rows are the mechanism working — record them as such.
+
+## 2026-10-10: zsh does not word-split — arrays for argv, never strings
+- **Mistake (repeated 3×):** `set -- $spec`, unquoted `$ARGS`, and `echo ===` produced mangled URLs/flags and syntax errors in measurement scripts.
+- **Rule:** in zsh pass argv as arrays (`args=(...)`, `"${args[@]}"`) or functions with positional params; never unquoted string expansion, never `echo ===`. Verify each script's first real effect (clone lands, binary runs) before the batch.
