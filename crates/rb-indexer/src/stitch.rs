@@ -2682,6 +2682,7 @@ mod tests {
         // the bases of injected clients (contract M4b S21).
         let deployable: BTreeSet<String> = by_path.keys().map(|p| service_of(p)).collect();
         let depends = BTreeMap::new();
+        let empty_manifests: BTreeMap<&str, String> = BTreeMap::new();
         let resolution = crate::di::resolve(&crate::di::Inputs {
             files: &by_path,
             keys: &keys,
@@ -2690,6 +2691,7 @@ mod tests {
             deployable: &deployable,
             depends: &depends,
             unparsed,
+            manifests: &empty_manifests,
         });
         let inputs = Inputs {
             files: &by_path,

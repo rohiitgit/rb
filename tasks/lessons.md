@@ -369,3 +369,11 @@
 ## 2026-10-10: Tier B defers to SCIP on exact files — so must every heuristic producer
 - **Mistake:** the S7 producer edged SCIP-documented files and failed the M3b S7 assert (`heuristic code edge in a SCIP-ok project`): `add_edges` skips `exact_files`, but the new producer did not know about the set.
 - **Rule:** every heuristic edge producer takes the exact-files set and skips it. The pre-gate bless failure is the kill proof for the gate-drop mutant.
+
+## 2026-10-11: accumulation order decides what `+=` means — pin the primary use
+- **Mistake:** the first S8 chain reader accumulated nearest-first, so a root `=` wiped nearer `+=` additions — breaking the primary `+=` pattern (base list at root, extras below). Caught by writing the accumulation test, which failed.
+- **Rule:** apply config chains root-first (`=` replaces, `+=` appends, `!` clears) and pin the root-`=`-plus-subdir-`+=` shape explicitly; it is the reason `+=` exists.
+
+## 2026-10-11: a shadowing exact match hides the mechanism a mutant removes
+- **Mistake:** the S8 stop-drop mutant survived because the test's nearer `=` shadowed the farther entries anyway — the stop boundary never decided anything.
+- **Rule:** when pinning precedence/shielding, use the weakest nearby form (`+=`, not `=`) so only the mechanism under test decides the outcome. Same family as the same-key-merge lesson.

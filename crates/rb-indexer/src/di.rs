@@ -46,6 +46,8 @@ pub(crate) struct Inputs<'a> {
     pub depends: &'a BTreeMap<String, BTreeSet<String>>,
     /// The raw-text scan of the files without facts (gate D's findings, gate M's words).
     pub unparsed: &'a RawScan,
+    /// Manifest texts by path, for the `lombok.config` chain (contract M6c S8).
+    pub manifests: &'a BTreeMap<&'a str, String>,
 }
 
 /// The coverage buckets (S7, amendment 2), in the order `rb status` prints them.
@@ -82,6 +84,9 @@ pub(crate) struct Resolution {
     /// Points the S2 narrowing freed: capped under the broad mention rule but
     /// plain under the narrowed one (contract M6c S2, invariant 4).
     pub mention_lifted: usize,
+    /// Points whose qualifier a `lombok.config` chain restored and whose
+    /// qualifier filter kept candidates (contract M6c S8, invariant 4).
+    pub lombok_narrowed: usize,
     pub diagnostics: Vec<Diagnostic>,
     /// The interfaces Spring Data repositories extend, by simple name, in every Java file
     /// (fragment interfaces for RTA's rule (h), D3).
@@ -206,11 +211,17 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
         .map(|(path, (_, facts))| (*path, *facts))
         .collect();
     let bases = rb_frameworks::repository_bases(java.iter().flat_map(|(_, f)| &f.definitions));
+    // The `lombok.config` chain for Lombok-copied qualifiers (contract M6c S8).
+    let lombok = spring::LombokConfigs::build(inputs.manifests);
     let per_file: Vec<(&'a str, &'a FileFacts, FileDi)> = java
         .iter()
         .map(|&(path, facts)| {
             work::tick(1);
-            (path, facts, spring::di(Language::Java, facts, &bases))
+            (
+                path,
+                facts,
+                spring::di(Language::Java, facts, &bases, path, &lombok),
+            )
         })
         .collect();
 
@@ -917,6 +928,11 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         chosen.retain(|&i| named(i, q) || ctx.beans[i].bean.qualifiers.iter().any(|x| x == q));
         qualifier = Some(q.clone());
         resolution = "qualifier";
+        if p.copied_qualifier && !chosen.is_empty() {
+            // A `lombok.config`-restored qualifier that kept candidates: each
+            // narrowed point counted (contract M6c S8, invariant 4).
+            out.lombok_narrowed += 1;
+        }
         if chosen.is_empty() {
             bucket(out, "unresolved");
             out.diagnostics.push(site_diagnostic(
@@ -1217,6 +1233,11 @@ pub(crate) fn add_injects(b: &mut GraphBuilder, r: Resolution) -> anyhow::Result
     if r.mention_lifted > 0 {
         detail["mention_lifted"] = r.mention_lifted.into();
     }
+    // Contract M6c S8 (D3, invariant 4): narrowed Lombok-qualifier points,
+    // likewise non-zero-only.
+    if r.lombok_narrowed > 0 {
+        detail["lombok_narrowed"] = r.lombok_narrowed.into();
+    }
     diagnostics.push(Diagnostic {
         kind: "di_coverage".into(),
         path: None,
@@ -1253,10 +1274,16 @@ mod tests {
         gates: BTreeMap<&'static str, usize>,
         diagnostics: Vec<String>,
         lifted: usize,
+        narrowed: usize,
         coverage: Value,
     }
 
-    fn run_with(files: &[(&str, &str)], services: &[(&str, &str, bool)], unparsed: RawScan) -> Run {
+    fn run_with(
+        files: &[(&str, &str)],
+        services: &[(&str, &str, bool)],
+        unparsed: RawScan,
+        manifests: &[(&str, &str)],
+    ) -> Run {
         let facts: Vec<(String, FileFacts)> = files
             .iter()
             .map(|(p, src)| {
@@ -1297,6 +1324,10 @@ mod tests {
                     .insert(d.to_owned());
             }
         }
+        let manifests: BTreeMap<&str, String> = manifests
+            .iter()
+            .map(|(p, t)| (*p, (*t).to_owned()))
+            .collect();
         let r = resolve(&Inputs {
             files: &by_path,
             keys: &keys,
@@ -1305,6 +1336,7 @@ mod tests {
             deployable: &deployable,
             depends: &depends,
             unparsed: &unparsed,
+            manifests: &manifests,
         });
         let short = |k: &str| {
             k.rsplit_once("`/")
@@ -1323,6 +1355,7 @@ mod tests {
         }
         let (buckets, gates) = (r.buckets.clone(), r.gates.clone());
         let lifted = r.mention_lifted;
+        let narrowed = r.lombok_narrowed;
         let spring_data = r.spring_data.clone();
         // Tier B first, as in `assemble`: the inherited producer must see the
         // edges Tier B links itself to avoid doubling them.
@@ -1393,6 +1426,7 @@ mod tests {
                 .map(|d| format!("{} {}", d.kind, d.detail))
                 .collect(),
             lifted,
+            narrowed,
             coverage: r
                 .diagnostics
                 .iter()
@@ -1403,7 +1437,7 @@ mod tests {
     }
 
     fn run(files: &[(&str, &str)]) -> Run {
-        run_with(files, &[], RawScan::default())
+        run_with(files, &[], RawScan::default(), &[])
     }
 
     const APP: (&str, &str) = (
@@ -1515,7 +1549,7 @@ mod tests {
             di_surface: vec![("src/main/kotlin/C.kt".into(), "raw Bean".into())],
             ..RawScan::default()
         };
-        let r = run_with(&[APP, ("src/main/java/com/acme/A.java", &s)], &[], raw);
+        let r = run_with(&[APP, ("src/main/java/com/acme/A.java", &s)], &[], raw, &[]);
         assert_eq!(gate(&r), ["surface"]);
         // Gate D ignores test sources (amendment 3).
         let t = "package com.acme;\nimport org.springframework.context.annotation.FilterType;\nclass T {}\n";
@@ -1532,7 +1566,7 @@ mod tests {
             words: BTreeSet::from(["Repo".to_owned()]),
             ..RawScan::default()
         };
-        let r = run_with(&[APP, ("src/main/java/com/acme/A.java", &s)], &[], raw);
+        let r = run_with(&[APP, ("src/main/java/com/acme/A.java", &s)], &[], raw, &[]);
         assert_eq!(gate(&r), ["mention"]);
         // Controls stay plain: a logger, `new` in a test, an unrelated `@Import`.
         let r = run(&[
@@ -1559,6 +1593,7 @@ mod tests {
             ],
             &[("svc", "", true), ("lib", "", false)],
             RawScan::default(),
+            &[],
         );
         assert_eq!(gate(&r), ["classpath_unknown"]);
         // On the classpath, it is a second candidate.
@@ -1570,6 +1605,7 @@ mod tests {
             ],
             &[("svc", "lib", true), ("lib", "", false)],
             RawScan::default(),
+            &[],
         );
         assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
         // A deployable service is never on another's classpath, nor a gate.
@@ -1581,6 +1617,7 @@ mod tests {
             ],
             &[("svc", "lib", true), ("lib", "", true)],
             RawScan::default(),
+            &[],
         );
         assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
     }
@@ -1956,6 +1993,49 @@ mod tests {
             r.edges
         );
         assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
+    }
+
+    /// Contract M6c S8: a field qualifier a `lombok.config` chain lists rides
+    /// the generated parameter, narrows to the qualified bean, and counts;
+    /// unlisted chains keep the old capped-ambiguous row.
+    #[test]
+    fn lombok_listed_qualifiers_narrow_and_count() {
+        let beans = "interface Hasher {}\n@Component class Bcrypt implements Hasher {}\n@Component(\"plain\") class Plain implements Hasher {}\n";
+        let svc = "import lombok.RequiredArgsConstructor;\n@Service @RequiredArgsConstructor class Mail { @Qualifier(\"plain\") private final Hasher hasher; }\n";
+        let files = [
+            APP,
+            (
+                "src/main/java/com/acme/A.java",
+                &src(&format!("{beans}{svc}")),
+            ),
+        ];
+        let listed: &[(&str, &str)] = &[(
+            "lombok.config",
+            "lombok.copyableAnnotations = [Qualifier]\n",
+        )];
+        let r = run_with(&files, &[], RawScan::default(), listed);
+        assert_eq!(
+            r.edges,
+            [r#"Mail# -> Plain# [heuristic] {"origin":"stereotype","qualifier":"plain","resolution":"qualifier","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        assert_eq!(r.narrowed, 1);
+        assert_eq!(r.coverage["lombok_narrowed"], 1);
+        // Unlisted: the old row (recorded annotation, no qualifier).
+        let r = run(&files);
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert!(
+            r.edges.iter().all(|e| e.contains("[ambiguous]")),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(
+            r.buckets,
+            BTreeMap::from([("ambiguous", 1)]),
+            "{:?}",
+            r.coverage
+        );
+        assert_eq!(r.narrowed, 0);
     }
 
     /// Contract M6c S7: an allow-listed Spring Data member name called on a
@@ -2532,6 +2612,7 @@ mod tests {
             deployable: &empty,
             depends: &depends,
             unparsed: &raw,
+            manifests: &BTreeMap::new(),
         });
         assert_eq!(r.injections.len(), n);
         work::take()

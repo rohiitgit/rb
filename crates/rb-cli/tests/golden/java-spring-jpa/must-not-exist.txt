@@ -32,3 +32,5 @@ INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java
 # Contract M6c S7: the declared `findByEmail` is edged by Tier B itself (to the
 # method), never duplicated to the interface.
 CALLS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService#authenticate(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository#
+# Contract M6c S8: the service class itself is never an injection target.
+INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/MailService.java`/MailService#

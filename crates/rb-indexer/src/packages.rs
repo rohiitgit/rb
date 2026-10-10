@@ -24,6 +24,9 @@ pub(crate) fn is_input(path: &str) -> bool {
             | "npm-shrinkwrap.json"
             | "go.mod"
             | "pom.xml"
+            // `lombok.config` texts feed qualifier-copying resolution (contract
+            // M6c S8); the packages stage ignores unknown basenames.
+            | "lombok.config"
             // `tsconfig.json` texts feed exact alias resolution (contract M6c
             // S4); the packages stage ignores unknown basenames.
             | "tsconfig.json"
@@ -1107,6 +1110,15 @@ mod tests {
         assert!(is_input("svc/tsconfig.json"));
         assert!(is_input("tsconfig.json"));
         assert!(!is_input("svc/tsconfig.json.bak"));
+    }
+
+    /// Contract M6c S8: `lombok.config` texts reach the manifest readers that
+    /// feed qualifier-copying resolution.
+    #[test]
+    fn lombok_config_is_a_manifest_input() {
+        assert!(is_input("svc/lombok.config"));
+        assert!(is_input("lombok.config"));
+        assert!(!is_input("svc/lombok.config.bak"));
     }
 
     const LOCK: &str = r#"{

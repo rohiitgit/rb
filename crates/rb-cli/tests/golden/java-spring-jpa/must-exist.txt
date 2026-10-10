@@ -34,3 +34,6 @@ INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java`/Ema
 # interface with `inherited`.
 CALLS rb-heuristic . . . `src/main/java/com/acme/auth/SignupService.java`/SignupService#register(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository# [heuristic] {"inherited":true}
 CALLS rb-heuristic . . . `src/main/java/com/acme/auth/SignupService.java`/SignupService#lookup(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository# [heuristic] {"inherited":true}
+# Contract M6c S8: the `lombok.config`-listed field qualifier rides the
+# generated parameter and narrows to the qualified bean.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/MailService.java`/MailService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/PlainHasher# [heuristic] {"origin":"stereotype","qualifier":"plainHasher","resolution":"qualifier","via":"constructor"}

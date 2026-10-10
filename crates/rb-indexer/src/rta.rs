@@ -757,6 +757,7 @@ mod tests {
         let service_of = |p: &str| p.split('/').next().unwrap_or_default().to_owned();
         let deployable = BTreeSet::from(["svc".to_owned()]);
         let depends = BTreeMap::new();
+        let empty_manifests: BTreeMap<&str, String> = BTreeMap::new();
         let resolution = crate::di::resolve(&crate::di::Inputs {
             files: &by_path,
             keys: &keys,
@@ -765,6 +766,7 @@ mod tests {
             deployable: &deployable,
             depends: &depends,
             unparsed: &unparsed,
+            manifests: &empty_manifests,
         });
         let considered = implementing_types(&b.edge_sources(EdgeKind::Implements), &by_path, &keys);
         let manifests: BTreeMap<&str, String> =

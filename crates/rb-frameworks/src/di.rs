@@ -13,6 +13,7 @@ use rb_syntax::{
 };
 
 use crate::routes::is_annotation;
+use crate::work;
 
 const STEREOTYPE: &str = "org.springframework.stereotype";
 const WEB: &str = "org.springframework.web.bind.annotation";
@@ -155,6 +156,11 @@ pub struct InjectionPoint {
     pub generic: bool,
     /// The point's `@Qualifier` literal.
     pub qualifier: Option<String>,
+    /// The qualifier rides a Lombok-generated parameter because the nearest
+    /// `lombok.config` chain positively lists its annotation under
+    /// `copyableAnnotations` (contract M6c S8); the indexer counts these
+    /// narrowings.
+    pub copied_qualifier: bool,
     /// `@Resource`: the bean name it resolves by first (`name`, else the field or property
     /// name).
     pub by_name: Option<String>,
@@ -470,11 +476,15 @@ fn is_constructor(defs: &[Definition], i: usize, class: usize) -> bool {
 }
 
 /// The DI facts of one file (S2, S3, S6 gate D). `repository_bases` is M2b's
-/// [`crate::repository_bases`] over every Java file.
+/// [`crate::repository_bases`] over every Java file; `path` and `lombok`
+/// locate the nearest `lombok.config` chain for Lombok-copied qualifiers
+/// (contract M6c S8).
 pub fn di(
     language: Language,
     facts: &FileFacts,
     repository_bases: &BTreeMap<String, usize>,
+    path: &str,
+    lombok: &LombokConfigs,
 ) -> FileDi {
     let mut out = FileDi::default();
     if language != Language::Java {
@@ -495,7 +505,7 @@ pub fn di(
                 let is_bean = beans.contains(&i);
                 if is_bean {
                     out.beans.push(stereotype_bean(facts, i));
-                    constructor_points(facts, i, &scopes, &mut out);
+                    constructor_points(facts, i, &scopes, path, lombok, &mut out);
                 } else if !foreign(facts, &def.decorations).is_empty()
                     || def.decorations.iter().any(|d| stereotype(facts, d))
                 {
@@ -812,6 +822,7 @@ fn point(
         wrapper,
         generic,
         qualifier: qualifier_of(facts, &b.decorations),
+        copied_qualifier: false,
         by_name: None,
         annotations,
         span: b.span,
@@ -926,6 +937,8 @@ fn constructor_points<'f>(
     facts: &'f FileFacts,
     class: usize,
     scopes: &Scopes<'f>,
+    path: &str,
+    lombok: &LombokConfigs,
     out: &mut FileDi,
 ) {
     let defs = &facts.definitions;
@@ -979,9 +992,10 @@ fn constructor_points<'f>(
             return;
         }
     }
-    for (b, lombok) in chosen.into_iter().flatten() {
-        if lombok {
-            out.points.extend(lombok_point(facts, b, class));
+    for (b, generated) in chosen.into_iter().flatten() {
+        if generated {
+            out.points
+                .extend(lombok_point(facts, b, class, path, lombok));
         } else {
             out.points
                 .extend(point(facts, b, class, true, Form::Constructor));
@@ -989,10 +1003,180 @@ fn constructor_points<'f>(
     }
 }
 
-/// A Lombok-generated constructor parameter: the field's type and name, its non-inert
-/// annotations recorded (Lombok copies them only as `lombok.config` says), no qualifier.
-fn lombok_point(facts: &FileFacts, field: &Binding, class: usize) -> Option<InjectionPoint> {
+/// A `lombok.config` reader (contract M6c S8): the `copyableAnnotations` list
+/// each Java file sees through nearest-enclosing bubbling.
+#[derive(Debug, Default)]
+pub struct LombokConfigs {
+    /// Directory → its `lombok.config` text (`""` is the repository root).
+    files: BTreeMap<String, String>,
+}
+
+impl LombokConfigs {
+    /// Builds the reader from manifest texts by path (only `lombok.config`
+    /// entries are kept; everything else ignored). Never fails: an unreadable
+    /// chain reads as unread at query time, never here.
+    pub fn build(manifests: &BTreeMap<&str, String>) -> Self {
+        let mut files = BTreeMap::new();
+        for (path, text) in manifests {
+            if path.rsplit('/').next().unwrap_or(path) != "lombok.config" {
+                continue;
+            }
+            let dir = match path.rfind('/') {
+                Some(i) => path[..i].to_owned(),
+                None => String::new(),
+            };
+            files.insert(dir, text.clone());
+        }
+        LombokConfigs { files }
+    }
+
+    /// The annotations listed under `copyableAnnotations` for the file at
+    /// `path`, or `None` when the chain is unread: no file found, a file that
+    /// does not parse, or no entry for the key (contract M6c D8). Files apply
+    /// from the repository root down, so a nearer `=`/`!` overrides farther
+    /// ones and `+=` accumulates; the nearest `config.stopBubbling` file
+    /// shields everything above it.
+    pub fn copyable(&self, path: &str) -> Option<BTreeSet<String>> {
+        // Nearest first to find the boundary, then apply root-first.
+        let mut chain: Vec<&String> = Vec::new();
+        for dir in dirs(path) {
+            work::tick(1);
+            let Some(text) = self.files.get(&dir) else {
+                continue;
+            };
+            chain.push(text);
+            if is_stop(text) {
+                break;
+            }
+        }
+        let mut out: Option<BTreeSet<String>> = None;
+        for text in chain.into_iter().rev() {
+            for op in parse_lombok_config(text)? {
+                match op {
+                    LombokOp::Set(set) => out = Some(set),
+                    LombokOp::Add(set) => {
+                        out.get_or_insert_with(BTreeSet::new).extend(set);
+                    }
+                    LombokOp::Clear => out = Some(BTreeSet::new()),
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the annotation `name` (as written) is positively listed for the
+    /// file at `path`: a simple-name match against the chain's entries.
+    pub fn copies(&self, path: &str, name: &str) -> bool {
+        self.copyable(path)
+            .is_some_and(|set| set.iter().any(|e| simple(e) == simple(name)))
+    }
+}
+
+/// Directories from the file's own outward (`a/b` for `a/b/C.java`, ending at
+/// the repository root `""`).
+fn dirs(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut dir = match path.rfind('/') {
+        Some(i) => path[..i].to_owned(),
+        None => String::new(),
+    };
+    loop {
+        out.push(dir.clone());
+        if dir.is_empty() {
+            break;
+        }
+        dir = match dir.rfind('/') {
+            Some(i) => dir[..i].to_owned(),
+            None => String::new(),
+        };
+    }
+    out
+}
+
+/// One `copyableAnnotations` directive: `key = [...]` sets, `key += [...]`
+/// appends, bare `key !` clears.
+enum LombokOp {
+    Set(BTreeSet<String>),
+    Add(BTreeSet<String>),
+    Clear,
+}
+
+/// Whether the text stops bubbling (`config.stopBubbling = true`, tolerant of
+/// spacing; anything else on the line is ignored here and fails parsing only
+/// if it sits on the `copyableAnnotations` key).
+fn is_stop(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("config.stopBubbling") && line.contains("true")
+    })
+}
+
+/// The `copyableAnnotations` directives of one `lombok.config` text, in order;
+/// `None` when a line on the key is unparseable. Other keys are ignored.
+fn parse_lombok_config(text: &str) -> Option<Vec<LombokOp>> {
+    const KEY: &str = "lombok.copyableAnnotations";
+    let mut ops = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(KEY) {
+            let rest = rest.trim();
+            if let Some(add) = rest.strip_prefix("+=") {
+                ops.push(LombokOp::Add(split_list(add)?));
+            } else if rest == "!" {
+                ops.push(LombokOp::Clear);
+            } else {
+                ops.push(LombokOp::Set(split_list(rest.strip_prefix('=')?)?));
+            }
+        }
+    }
+    Some(ops)
+}
+
+/// One `[...]` list (or a single bare value) of annotation names.
+fn split_list(value: &str) -> Option<BTreeSet<String>> {
+    let value = value.trim();
+    if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+        return Some(
+            inner
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect::<BTreeSet<String>>(),
+        );
+    }
+    if value.is_empty()
+        || value.starts_with('[')
+        || value.contains([' ', ',', '=', '!', '(', ')', '{', '}', ';', '"'])
+    {
+        return None;
+    }
+    Some(BTreeSet::from([value.to_owned()]))
+}
+
+/// A Lombok-generated constructor parameter: the field's type and name. The
+/// field's qualifier rides the parameter only when `lombok.config` positively
+/// lists its annotation (contract M6c S8); otherwise it stays on the field,
+/// recorded as an unread annotation with no qualifier, exactly as before.
+fn lombok_point(
+    facts: &FileFacts,
+    field: &Binding,
+    class: usize,
+    path: &str,
+    lombok: &LombokConfigs,
+) -> Option<InjectionPoint> {
     let mut p = point(facts, field, class, true, Form::Constructor)?;
+    let copied = field
+        .decorations
+        .iter()
+        .find(|d| is_qualifier(facts, d))
+        .is_some_and(|d| lombok.copies(path, &d.name));
+    if copied {
+        p.copied_qualifier = true;
+        return Some(p);
+    }
     p.qualifier = None;
     p.annotations = field
         .decorations
@@ -1393,9 +1577,13 @@ mod tests {
     }
 
     fn file_di(src: &str) -> (FileFacts, FileDi) {
+        file_di_at(src, "src/Test.java", &LombokConfigs::default())
+    }
+
+    fn file_di_at(src: &str, path: &str, lombok: &LombokConfigs) -> (FileFacts, FileDi) {
         let facts = facts_of(src);
         let bases = crate::repository_bases(&facts.definitions);
-        let out = di(Language::Java, &facts, &bases);
+        let out = di(Language::Java, &facts, &bases, path, lombok);
         (facts, out)
     }
 
@@ -1434,7 +1622,12 @@ mod tests {
 
     /// `owner.form name: element (wrapper) q=… by=… @…` per point.
     fn points(src: &str) -> Vec<String> {
-        let (facts, out) = file_di(src);
+        points_with(src, "src/Test.java", &LombokConfigs::default())
+    }
+
+    /// As [`points`], with an explicit path and `lombok.config` chain.
+    fn points_with(src: &str, path: &str, lombok: &LombokConfigs) -> Vec<String> {
+        let (facts, out) = file_di_at(src, path, lombok);
         out.points
             .iter()
             .map(|p| {
@@ -1645,6 +1838,162 @@ mod tests {
             )),
             Vec::<String>::new()
         );
+    }
+
+    /// Contract M6c S8: the `lombok.config` chain reads nearest-first with
+    /// `=`/`+=`/bare-`!`, `config.stopBubbling` stops the walk, and anything
+    /// unreadable or absent reads as unread.
+    #[test]
+    fn lombok_configs_read_nearest_chain() {
+        let maps = |files: &[(&str, &str)]| {
+            LombokConfigs::build(&files.iter().map(|(p, t)| (*p, (*t).to_owned())).collect())
+        };
+        let full = maps(&[
+            (
+                "lombok.config",
+                "lombok.copyableAnnotations = [com.foo.Base]\n",
+            ),
+            (
+                "svc/lombok.config",
+                "# nearer wins\nlombok.copyableAnnotations += [com.acme.Qualifier]\n",
+            ),
+        ]);
+        assert!(full.copies("svc/src/A.java", "Qualifier"));
+        assert!(full.copies("svc/src/A.java", "com.acme.Qualifier"));
+        assert!(full.copies("svc/src/A.java", "Base"));
+        assert!(!full.copies("other/src/A.java", "Qualifier"));
+        // `=` replaces: the root list is gone where the nearer file sets nothing.
+        let bare = maps(&[(
+            "lombok.config",
+            "lombok.copyableAnnotations = [com.foo.Base]\n",
+        )]);
+        assert!(bare.copies("svc/src/A.java", "Base"));
+        // `+=` accumulates onto what root-ward files set.
+        let acc = maps(&[
+            (
+                "lombok.config",
+                "lombok.copyableAnnotations = [com.foo.Base]\n",
+            ),
+            (
+                "svc/lombok.config",
+                "lombok.copyableAnnotations += [com.acme.Qualifier]\n",
+            ),
+        ]);
+        assert!(acc.copies("svc/src/A.java", "Base"));
+        assert!(acc.copies("svc/src/A.java", "Qualifier"));
+        assert!(!acc.copies("other/src/A.java", "Qualifier"));
+        // Bare `!` clears the list root-ward files set.
+        let cleared = maps(&[
+            (
+                "lombok.config",
+                "lombok.copyableAnnotations = [com.foo.Base]\n",
+            ),
+            ("svc/lombok.config", "lombok.copyableAnnotations !\n"),
+        ]);
+        assert!(!cleared.copies("svc/src/A.java", "Base"));
+        assert!(cleared.copyable("svc/src/A.java").is_some());
+        // `stopBubbling` in the nearer file shields everything above it.
+        let stopped = maps(&[
+            (
+                "lombok.config",
+                "lombok.copyableAnnotations = [com.foo.Base]\n",
+            ),
+            (
+                "svc/lombok.config",
+                "config.stopBubbling = true\nlombok.copyableAnnotations += [com.acme.Qualifier]\n",
+            ),
+        ]);
+        assert!(stopped.copies("svc/src/A.java", "Qualifier"));
+        assert!(!stopped.copies("svc/src/A.java", "Base"));
+        assert!(stopped.copies("other/src/A.java", "Base"));
+        // Unreadable chains stay unread: no file, no entry, garbage on the key.
+        assert!(maps(&[]).copyable("svc/src/A.java").is_none());
+        assert!(
+            maps(&[("lombok.config", "lombok.otherKey = [x]\n")])
+                .copyable("svc/src/A.java")
+                .is_none()
+        );
+        assert!(
+            maps(&[("lombok.config", "lombok.copyableAnnotations ???\n")])
+                .copyable("svc/src/A.java")
+                .is_none()
+        );
+        assert!(
+            maps(&[("lombok.config", "lombok.copyableAnnotations = [unclosed\n")])
+                .copyable("svc/src/A.java")
+                .is_none()
+        );
+    }
+
+    /// Contract M6c S8: a field qualifier rides the Lombok-generated parameter
+    /// only when the chain positively lists it; otherwise the old row (recorded
+    /// annotation, no qualifier).
+    #[test]
+    fn lombok_copied_qualifiers_ride_the_parameter() {
+        let imports = "import lombok.RequiredArgsConstructor;\n";
+        let body = "@Service @RequiredArgsConstructor class A { @Qualifier(\"x\") private final Repo repo; }\n";
+        let row = |lombok: &LombokConfigs| {
+            points_with(
+                &with_imports(&format!("{imports}{body}")),
+                "svc/src/main/java/com/acme/A.java",
+                lombok,
+            )
+        };
+        let listed = LombokConfigs::build(
+            &[(
+                "svc/lombok.config",
+                "lombok.copyableAnnotations += [org.springframework.beans.factory.annotation.Qualifier]\n".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(row(&listed), ["A.constructor repo: Repo q=x"]);
+        // Simple names list too.
+        let simple = LombokConfigs::build(
+            &[(
+                "lombok.config",
+                "lombok.copyableAnnotations = [Qualifier]\n".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(row(&simple), ["A.constructor repo: Repo q=x"]);
+        // Unlisted, and unread chains: the old row.
+        let other = LombokConfigs::build(
+            &[(
+                "lombok.config",
+                "lombok.copyableAnnotations = [com.foo.Other]\n".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(row(&other), ["A.constructor repo: Repo @Qualifier"]);
+        assert_eq!(
+            row(&LombokConfigs::default()),
+            ["A.constructor repo: Repo @Qualifier"]
+        );
+    }
+
+    /// Invariant 9: chain reads grow linearly in lookups (counted, 4× → ≤ 5×);
+    /// the walk is bounded by directory depth, config count never by points.
+    #[test]
+    fn lombok_chain_reads_grow_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let collected: BTreeMap<&str, String> = [(
+                "svc/lombok.config",
+                "lombok.copyableAnnotations = [Qualifier]\n".to_owned(),
+            )]
+            .into_iter()
+            .collect();
+            let maps = LombokConfigs::build(&collected);
+            work::take();
+            for i in 0..n {
+                assert!(maps.copies(&format!("svc/src/p{i}/A.java"), "Qualifier"));
+            }
+            work::take()
+        }
+        let (small, large) = (work_for(50), work_for(200));
+        assert!(large <= small * 5, "{small} -> {large}");
     }
 
     #[test]

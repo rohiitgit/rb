@@ -1,25 +1,26 @@
 auth-service  (path: ., deployable)
 ├─ Detected by: maven
 ├─ Manifests: pom.xml
-├─ Files: 21 (java 17, other 2, python 1, sql 1)
+├─ Files: 23 (java 18, other 3, python 1, sql 1)
 ├─ Owners: none
 ├─ File ownership
-│    unowned    21 files  100%
+│    unowned    23 files  100%
 ├─ APIs (1)
 │    POST /auth/api/v1/login  → AuthController#login().  [synthetic]
 ├─ Calls APIs of: none
 ├─ APIs called by: none
-├─ Packages (3)
+├─ Packages (4)
+│    org.projectlombok/lombok ?  [unresolved]
 │    org.springframework.boot/spring-boot-starter-data-jpa ?  [unresolved]
 │    org.springframework.boot/spring-boot-starter-validation ?  [unresolved]
 │    org.springframework.boot/spring-boot-starter-web ?  [unresolved]
 ├─ Database tables (1)
 │    public.users  delete, insert, read, update  [exact]  (schema assumed)
-├─ Dependencies (0 services, 3 packages)
-│    packages: 3
+├─ Dependencies (0 services, 4 packages)
+│    packages: 4
 ├─ Depended on by: none
 ├─ Shares tables with: none
 └─ Call graph (edges within the service)
-     63 symbols · CALLS 10, IMPLEMENTS 23, INJECTS 13, REFERENCES 2
-     certainty: heuristic 95.8%, ambiguous 4.2%
+     64 symbols · CALLS 10, IMPLEMENTS 23, INJECTS 14, REFERENCES 2
+     certainty: heuristic 95.9%, ambiguous 4.1%
      entry points: endpoint 1, lifecycle 2, main 1

@@ -109,7 +109,9 @@ use serde_json::{Value, json};
 /// `m6c-3` inherited Spring Data calls: allow-listed member names on
 /// repository-typed receivers link to the interface node with `inherited`
 /// (M6c S7).
-pub const PIPELINE: &str = "m6c-3";
+/// `m6c-4` Lombok qualifiers: a field qualifier a `lombok.config` chain lists
+/// rides the generated parameter and narrows, counted (M6c S8).
+pub const PIPELINE: &str = "m6c-4";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -826,6 +828,7 @@ pub fn assemble(
         deployable: &deployable,
         depends: &depends,
         unparsed: &content.unparsed,
+        manifests: &content.manifests,
     });
     let fragments = resolution.fragments.clone();
     let points = std::mem::take(&mut resolution.points);
