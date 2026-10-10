@@ -25,3 +25,7 @@ IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/Log
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/LogAuditSink# -> * {"impl_instantiated":false}
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/UserRepositoryCustomImpl.java`/UserRepositoryCustomImpl#touch(). -> * {"impl_instantiated":false}
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/UserRepositoryCustomImpl.java`/UserRepositoryCustomImpl# -> * {"impl_instantiated":false}
+# Contract M6c S6: the returned class and the validator are never targets
+# themselves (the `@Bean` method is the target for the class).
+INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/JwtFilter.java`/JwtFilter#
+INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java`/EmailValidator#

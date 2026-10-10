@@ -26,3 +26,7 @@ IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/Kaf
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/KafkaAuditSink#record(). -> rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditSink#record(). [heuristic] {"impl_instantiated":false}
 # Contract M4b S15: a parent-managed starter is declared, its version unresolved.
 DEPENDS_ON . -> maven/org.springframework.boot/spring-boot-starter-web@? [exact] {"version_from":"unresolved"}
+# Contract M6c S6: an object a `@Bean` method returns resolves from the method,
+# a `ConstraintValidator` from its class — both plain `heuristic` edges.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditConfig#jwtFilter(). -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher# [heuristic] {"origin":"stereotype","resolution":"unique","via":"field"}
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java`/EmailValidator# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher# [heuristic] {"origin":"stereotype","resolution":"unique","via":"field"}

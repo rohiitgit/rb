@@ -358,6 +358,9 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
     let registrants = registrants(index, &per_file);
     let literal_registrants = literal_registrants(index, &per_file);
     let bean_registrants = bean_method_registrants(index, &per_file);
+    // Classes a `@Bean` method's returned object may be of, per returning
+    // method (contract M6c S6).
+    let bean_consumers = bean_method_consumers(index, &beans);
 
     let mut out = Resolution {
         fragments: per_file
@@ -415,6 +418,7 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                 registrants: &registrants,
                 literal_registrants: &literal_registrants,
                 bean_registrants: &bean_registrants,
+                bean_consumers: &bean_consumers,
                 surface,
                 gate_m: &gate_m,
                 gate_m_broad: &gate_m_broad,
@@ -458,6 +462,9 @@ struct PointContext<'c, 'a> {
     /// Per type: the main-source `@Bean` methods assignable to it whose declaring class a
     /// main-source `@Import` names, candidates beside the scanned beans (contract M6c S1).
     bean_registrants: &'c BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>>,
+    /// Per class: the main-source `@Bean` methods whose returned object may be
+    /// of it, consumers beside the scanned beans (contract M6c S6).
+    bean_consumers: &'c BTreeMap<Sym<'a>, Vec<usize>>,
     surface: bool,
     gate_m: &'c dyn Fn(&str) -> bool,
     /// The broad mention rule (test-path class literals included): points it
@@ -640,12 +647,57 @@ fn bean_method_registrants<'a>(
     out
 }
 
+/// Per class, the main-source `@Bean` methods whose returned object may be of
+/// it (contract M6c S6): its symbol lies on the method's assignable closure or
+/// among the types its body creates (resolved as in `resolve` above, so no new
+/// fact kind is needed). The class's points resolve from each returning method.
+fn bean_method_consumers<'a>(
+    index: &Index<'a>,
+    beans: &[BeanAt<'a, '_>],
+) -> BTreeMap<Sym<'a>, Vec<usize>> {
+    let mut out: BTreeMap<Sym<'a>, Vec<usize>> = BTreeMap::new();
+    for (i, b) in beans.iter().enumerate() {
+        if b.bean.origin != Origin::BeanMethod {
+            continue;
+        }
+        work::tick(1);
+        let mut syms = b.types.clone();
+        for c in &b.bean.created {
+            for t in index.type_candidates(b.path, Some(b.bean.definition), c) {
+                syms.insert(t);
+            }
+        }
+        for t in syms {
+            out.entry(t).or_default().push(i);
+        }
+    }
+    out
+}
+
 fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resolution) {
     let inputs = ctx.inputs;
     let index = inputs.index;
     let defs = &ctx.facts.definitions;
     let bucket = |out: &mut Resolution, b: &'static str| *out.buckets.get_mut(b).unwrap() += 1;
-    if !p.owner_is_bean {
+    // New consumers (contract M6c S6): a `ConstraintValidator` implementation
+    // resolves from its class; a class a `@Bean` method returns resolves from
+    // each returning method. Anything else without a bean owner stays
+    // `not_a_bean`, as before.
+    let is_class = defs[p.owner].kind == rb_syntax::DefKind::Class;
+    let validator = !p.owner_is_bean
+        && is_class
+        && defs[p.owner].supertypes.iter().any(|s| {
+            s.implements && s.name.rsplit('.').next().unwrap_or(&s.name) == "ConstraintValidator"
+        });
+    let bean_methods: &[usize] = if !p.owner_is_bean && !validator && is_class {
+        ctx.bean_consumers
+            .get(&(ctx.path, p.owner))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    } else {
+        &[]
+    };
+    if !p.owner_is_bean && !validator && bean_methods.is_empty() {
         bucket(out, "not_a_bean");
         out.diagnostics.push(site_diagnostic(
             "di_not_a_bean",
@@ -656,6 +708,9 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         ));
         return;
     }
+    // S6 edges enter at `heuristic`, never above (D6, F2): the consumer link
+    // itself is unproven, so even several candidates stay heuristic.
+    let s6 = !p.owner_is_bean;
     let roots = ctx.roots;
     let components = roots.and_then(|r| r.components.as_ref());
     // The consumer must itself be scanned.
@@ -927,9 +982,11 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         return;
     }
     // Conditionals among the consumer, the candidates and those narrowing removed.
+    let consumer_conditional =
+        consumer_conditional || bean_methods.iter().any(|&i| ctx.beans[i].bean.conditional);
     let conditional =
         consumer_conditional || candidates.iter().any(|&i| ctx.beans[i].bean.conditional);
-    let certainty = if several {
+    let certainty = if several && !s6 {
         Certainty::Ambiguous
     } else {
         Certainty::Heuristic
@@ -957,7 +1014,21 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             (b.path.to_owned(), b.bean.definition),
         );
     }
-    let src = inputs.keys[ctx.path][p.owner].clone();
+    // One bucket count per point, one edge per (consumer, candidate): a
+    // `@Bean`-returned class resolves once per returning method.
+    let srcs: Vec<String> = if bean_methods.is_empty() {
+        vec![inputs.keys[ctx.path][p.owner].clone()]
+    } else {
+        bean_methods
+            .iter()
+            .map(|&i| {
+                let b = &ctx.beans[i];
+                inputs.keys[b.path][b.bean.definition].clone()
+            })
+            .collect()
+    };
+    // This call's injections start here; `out` accumulates across points.
+    let base = out.injections.len();
     let targets = chosen
         .iter()
         .map(|&i| {
@@ -995,7 +1066,7 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             );
         }
         out.injections.push(Injection {
-            src: src.clone(),
+            src: String::new(),
             dst: inputs.keys[path][definition].clone(),
             certainty,
             attrs,
@@ -1004,6 +1075,16 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
                 span: p.span,
             },
         });
+    }
+    // One bucket count per point above; fan out only this call's injections.
+    let made = out.injections.split_off(base);
+    out.injections.reserve(made.len() * srcs.len());
+    for src in &srcs {
+        for m in &made {
+            let mut e = m.clone();
+            e.src = src.clone();
+            out.injections.push(e);
+        }
     }
 }
 
@@ -1700,6 +1781,60 @@ mod tests {
             "{:?}",
             r.edges
         );
+    }
+
+    /// Contract M6c S6 (M4b open item 4): injection points of `@Bean`-returned
+    /// objects and of `ConstraintValidator` implementations resolve to
+    /// candidates as new `heuristic` edges; nothing else changes bucket. The
+    /// `@Bean`-method point resolves once per returning method (one bucket
+    /// count, one edge per method); several candidates stay `heuristic`, never
+    /// `ambiguous`.
+    #[test]
+    fn non_bean_consumers_resolve_as_heuristic_edges() {
+        // A validator's member resolves from the validator class; a plain
+        // non-bean class's member stays `not_a_bean`.
+        let r = one(
+            "interface Payload {}\n@Component class Dep {}\nclass MyValidator implements ConstraintValidator<Payload, String> { @Autowired Dep d; }\nclass Plain { @Autowired Dep d; }\n",
+        );
+        assert_eq!(
+            r.edges,
+            [r#"MyValidator# -> Dep# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"field"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("not_a_bean", 1), ("plain", 1)]));
+        // An object a `@Bean` method returns resolves from the method, once
+        // per returning method; two candidates stay heuristic.
+        let r = one(
+            "interface Filter {}\n@Component class Dep {}\n@Component class Other {}\nclass JwtFilter implements Filter { @Autowired Dep d; }\n@Configuration class Cfg { @Bean Filter filter() { return new JwtFilter(); } @Bean Filter backup() { return new JwtFilter(); } }\n@Service class NeedsOther { @Autowired Other o; }\n",
+        );
+        assert_eq!(r.edges.len(), 3, "{:?}", r.edges);
+        assert!(
+            r.edges.iter().any(|e| e
+                == r#"Cfg#filter(). -> Dep# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"field"}"#),
+            "{:?}",
+            r.edges
+        );
+        assert!(
+            r.edges.iter().any(|e| e
+                == r#"Cfg#backup(). -> Dep# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"field"}"#),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 2)]));
+        // Two candidates for a validator's member: the `ambiguous` bucket, but
+        // the edges stay `heuristic` (D6: no Gate-A-style proof is attempted).
+        let r = one(
+            "interface P {}\n@Component class D1 implements P {}\n@Component class D2 implements P {}\nclass V implements ConstraintValidator<P, String> { @Autowired P p; }\n",
+        );
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert!(
+            r.edges.iter().all(|e| e.contains("[heuristic]")
+                && e.contains(r#""resolution":"ambiguous""#)
+                && e.contains(r#""candidates":2"#)
+                && e.starts_with("V# -> D")),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
     }
 
     /// Contract M6c S2 (M4b open item 5): a class literal in a test source no

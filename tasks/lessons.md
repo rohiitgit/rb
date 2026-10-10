@@ -353,3 +353,11 @@
 ## 2026-10-10: expose the level, don't mirror the walk
 - **Mistake (avoided):** the first S5 sketch mirrored `levels()` order in a second function to answer "did resolution reach on-demand". A second walk drifts from the first the moment either changes.
 - **Rule:** when a decision needs to know which branch a search took, return the branch from the search (here `levels()` returns its winning `TypeLevel`). One walk, no drift. The `callable=false` path never touches `members()`, so the extra return is recursion-safe by construction.
+
+## 2026-10-10: fan out only the current call's slice of a shared accumulator
+- **Mistake:** the S6 edge fan-out did `std::mem::take(&mut out.injections)` and re-sourced every injection — but `out` accumulates across points, so one point's consumers overwrote all previous points' sources (caught by the test: `NeedsOther → Dep` with `sites: 2`).
+- **Rule:** when post-processing an accumulator inside a per-item call, `split_off` the length taken before the call's own pushes and fan out only that suffix.
+
+## 2026-10-10: `fixture_repo` copies `git ls-files` — stage new fixture files first
+- **Mistake:** the S6 bless ran with two new fixture files untracked, so the e2e indexed a partial fixture (tracked edit present, new files absent) and blessed wrong goldens; caught by the Integr's card counts (+1 symbol instead of +5).
+- **Rule:** `git add` new fixture files before any bless run, and sanity-check the blessed diff's file/symbol counts against the fixture change before classifying.

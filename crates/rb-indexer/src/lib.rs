@@ -103,7 +103,10 @@ use serde_json::{Value, json};
 /// HttpClient and axios member forms capped (S9).
 /// `m6c-1` module objects: tsconfig `paths` + package `exports`/`main`
 /// exact resolution for Tier B and RTA (M6c S4).
-pub const PIPELINE: &str = "m6c-1";
+/// `m6c-2` non-bean consumers: `@Bean`-returned objects resolve from each
+/// returning method, `ConstraintValidator`s from their class, always at
+/// `heuristic` (M6c S6).
+pub const PIPELINE: &str = "m6c-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
