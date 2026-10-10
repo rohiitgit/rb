@@ -30,6 +30,19 @@ CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendViaCfg(). -> HTTP PO
 # external candidate takes the call out of stitching entirely.
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendExternal(). -> HTTP POST /internal/mfa/email @services/notification
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendExternal(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
+# Contract M6b S9: configured carriers, HttpClient and axios member forms are
+# capped — never synthetic — and their absolute hosts never reach the billing
+# decoy.
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaGotExtended(). -> HTTP POST /internal/mfa/email @services/notification [synthetic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaKyExtended(). -> HTTP POST /internal/mfa/email @services/notification [synthetic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaAgent(). -> HTTP POST /internal/mfa/email @services/notification [synthetic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/MailClient#send(). -> HTTP POST /internal/mfa/email @services/notification [synthetic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/resendViaMember(). -> HTTP POST /internal/mfa/email @services/notification [synthetic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaGotExtended(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaKyExtended(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaAgent(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/MailClient#send(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/resendViaMember(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
 # Contract M6b S4: a request served in-process never stitches, whatever its URL.
 CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main_test.go`/TestServeMfaInProcess(). -> *
 CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main_test.go`/TestProxyNotifyInProcess(). -> *

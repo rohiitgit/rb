@@ -30,6 +30,21 @@ CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendViaCfg(). -> HTTP PO
 # host restricts the call to notification's endpoint alone. (Heuristic, not
 # synthetic: a `fetch` word in broken/pom.xml caps fetch repo-wide.)
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/NotifyClient#ping(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+# Contract M6b S9: fetch-class libraries stitch like fetch with hook proofs
+# (heuristic here, not synthetic: a `fetch` word in broken/pom.xml caps fetch
+# repo-wide, as above).
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/fetchHealthViaGot(). -> HTTP GET /health @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaGot(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaGotExtended(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/fetchHealthViaKy(). -> HTTP GET /health @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaKyExtended(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/fetchHealthViaSuperagent(). -> HTTP GET /health @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaAgent(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/fetchHealthViaUndici(). -> HTTP GET /health @services/notification [heuristic]
+# Contract M6b S9 (D8): Angular HttpClient and axios member forms enter capped
+# at heuristic.
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/MailClient#send(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/resendViaMember(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
 # Contract M4b S8: a Feign client is a bean under @EnableFeignClients, a @Repository class a stereotype.
 INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient# [heuristic] {"origin":"feign","resolution":"unique"}
 INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao# [heuristic] {"origin":"stereotype","resolution":"unique"}

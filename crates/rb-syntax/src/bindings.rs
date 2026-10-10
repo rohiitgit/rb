@@ -35,6 +35,10 @@ pub(crate) struct RawBinding<'t> {
     pub modifiers: Vec<String>,
     /// Java: the declarator has an initialiser.
     pub initialised: bool,
+    /// TS/JS: an object pattern destructured from this object (`const { get }
+    /// = axios` holds `axios.get`; a `require("module")` call holds the
+    /// module), per local name (contract M6b S9).
+    pub destructured_from: Option<String>,
 }
 
 /// Every binding in the file, in source order.
@@ -470,6 +474,7 @@ fn push<'t>(
             nested_type_args: false,
             modifiers: Vec::new(),
             initialised: false,
+            destructured_from: None,
         });
     }
     name.is_some()
@@ -753,6 +758,38 @@ fn type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
+/// The object an object pattern destructures (`const { get } = axios` holds
+/// `axios.get` under each local name): a name, a member path as written, or
+/// the module of a single-string `require("module")` call (contract M6b S9).
+/// Anything else (a call, an array, a conditional) stays sourceless, as
+/// before.
+fn destructured_object(value: Node<'_>, source: &[u8]) -> Option<String> {
+    match value.kind() {
+        "identifier" | "member_expression" => Some(text(value, source)),
+        "call_expression" => {
+            let callee = value.child_by_field_name("function")?;
+            if !(callee.kind() == "identifier" && text(callee, source) == "require") {
+                return None;
+            }
+            let args = value.child_by_field_name("arguments")?;
+            let mut c = args.walk();
+            let mut named = args
+                .named_children(&mut c)
+                .filter(|a| !matches!(a.kind(), "comment"));
+            let arg = named.next()?;
+            if named.next().is_some() || arg.kind() != "string" {
+                return None;
+            }
+            Some(
+                text(arg, source)
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_owned(),
+            )
+        }
+        _ => None,
+    }
+}
+
 /// Every identifier inside a destructuring pattern (`{ a, b: c }`, `[x, y]`, `a, b`).
 fn pattern_names<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
     match node.kind() {
@@ -993,9 +1030,19 @@ fn ecmascript<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) 
                 });
                 // Only a plain name takes the initialiser.
                 let init = value.filter(|_| name.kind() == "identifier");
+                // An object pattern destructured from a name holds that
+                // object's member under each local name (contract M6b S9).
+                let destructured_from = if name.kind() == "object_pattern" {
+                    value.and_then(|v| destructured_object(v, source))
+                } else {
+                    None
+                };
                 for n in names {
                     let pushed = push(out, Some(n), ty.clone(), false, node, node, source);
                     initialised(out, pushed, init, constant);
+                    if let (Some(d), Some(b)) = (&destructured_from, out.last_mut()) {
+                        b.destructured_from = Some(d.clone());
+                    }
                     if let (Some(h), Some(b)) = (hoisted, out.last_mut()) {
                         b.from = h;
                         b.from_start = true;
@@ -1516,6 +1563,7 @@ mod tests {
                         )
                     }
                     Some(crate::Init::Name { text, .. }) => format!("name {text}"),
+                    Some(crate::Init::Member { object, .. }) => format!("member {object}"),
                     Some(crate::Init::New {
                         type_name,
                         args,
@@ -1570,6 +1618,7 @@ mod tests {
                     None => "-".to_owned(),
                     Some(crate::Init::Template { template: t }) => template(t),
                     Some(crate::Init::Name { text, .. }) => format!("name {text}"),
+                    Some(crate::Init::Member { object, .. }) => format!("member {object}"),
                     Some(crate::Init::Call { chain }) => {
                         let c = &facts.chains[*chain];
                         let links: Vec<&str> = c.links.iter().map(|l| l.name.as_str()).collect();
@@ -1776,6 +1825,26 @@ mod tests {
         assert_eq!(
             facts.chains[chain].span[1] as usize,
             start - src[..start].rfind('\n').unwrap() - 1
+        );
+    }
+
+    /// Contract M6b S9: an object pattern destructured from a name holds that
+    /// object's member under each local name (`member <object>`); anything
+    /// else destructured (a call, an array, a conditional) takes no
+    /// initialiser, as before.
+    #[test]
+    fn typescript_destructured_member_inits() {
+        let src = "import axios from \"axios\";\nconst { get } = axios;\nconst { post } = require(\"axios\");\nconst { del } = ax.sub;\nconst { a } = mk();\nconst [b] = arr;\nconst { c } = cond ? x : y;\n";
+        assert_eq!(
+            inits(Language::TypeScript, src),
+            [
+                "get = member axios const",
+                "post = member axios const",
+                "del = member ax.sub const",
+                "a = - const",
+                "b = - const",
+                "c = - const",
+            ]
         );
     }
 

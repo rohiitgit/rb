@@ -325,3 +325,11 @@
 ## 2026-10-10: a growth test on hitting input measures a constant
 - **Mistake (caught by a surviving mutant):** the S8 single-literal growth test used hitting input, so the scan early-returned after the first line at both sizes and a scan-to-EOF quadratic mutant survived (ratio ~1×). The first quadratic mutant (quadratic in nesting, not input size) survived for the same reason the test was blind: it scaled the wrong dimension.
 - **Rule:** growth inputs must force the full walk (no-hit input for early-exit scans), and the mutant must be quadratic in the scaled dimension (input size, not depth). Record both numbers: correct code within the bound, the quadratic mutant past it (S8: mutant 693,100 → 11,503,300 vs the 5× bound).
+
+## 2026-10-10: e2e materialises only git-tracked fixture files, and dump goldens live in structure_goldens
+- **Mistake (caught by a too-fast pass):** the S9 fixture file was untracked, so `fixture_repo` (which copies `git ls-files`) silently excluded it and `polyglot_monorepo` passed in 3s testing nothing new. Separately, `polyglot_monorepo` covers only guards/determinism — `dump.jsonl`, `status-*`, cards and finds are compared by `polyglot_monorepo_structure_goldens`.
+- **Rule:** `git add` fixture files before their first e2e run (staging suffices for `ls-files`); after guards go green, run the structure/scip/diff/path/caller tests for the golden churn, classify every hunk before `RB_BLESS=1`, and re-run the full suite green. A passing e2e faster than the fixture's known index time deserves suspicion, not celebration.
+
+## 2026-10-10: cargo swallows eprintln — run test binaries directly for probes
+- **Mistake (repeated):** `cargo test -- --nocapture` showed no probe output three times; the test binary run directly (`./target/debug/deps/<hash> <filter> --nocapture`) printed immediately.
+- **Rule:** debug-print through the test binary's path (find the fresh hash by `ls -t`), not through cargo. Delete probe tests before committing (they also shift unit counts).

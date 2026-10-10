@@ -362,9 +362,10 @@ impl<'l> Folder<'l> {
                 let (f, clean) = self.name(file, primary, at, depth);
                 (relabel(f, Origin::Constant), clean)
             }
-            Some(Init::Call { .. } | Init::New { .. } | Init::Object { .. }) | None => {
-                (Folded::hole(), true)
-            }
+            Some(
+                Init::Call { .. } | Init::New { .. } | Init::Object { .. } | Init::Member { .. },
+            )
+            | None => (Folded::hole(), true),
         }
     }
 }
@@ -1141,6 +1142,34 @@ mod tests {
             (
                 "const S = \"/outer\";\nfunction f() { let S = x; get(S); }\n",
                 "{?} [unresolved]",
+            ),
+        ];
+        for (src, want) in cases {
+            let files = Files::new(&[(Language::TypeScript, "a", src)]);
+            assert_eq!(fold_last_call(&files), want, "{src}");
+        }
+    }
+
+    /// Contract M6b S9: a destructured member never folds (a hole, like no
+    /// initialiser) — the pack reads it as a member call, the folder does not
+    /// follow it, even when the object would fold.
+    #[test]
+    fn destructured_members_stay_holes() {
+        let cases = [
+            // The object would fold, but the member does not follow it.
+            (
+                "const config = \"http://a\";\nconst { base } = config;\nget(base);\n",
+                "{?} [unresolved]",
+            ),
+            // Through a name indirection, still a hole.
+            (
+                "import axios from \"axios\";\nconst { get } = axios;\nconst u = get;\nget(u);\n",
+                "{?} [unresolved]",
+            ),
+            // An object source folds to a hole either way.
+            (
+                "const config = { base: \"http://a\" };\nconst { base } = config;\nget(base + \"/x\");\n",
+                "{?}/x [literal]",
             ),
         ];
         for (src, want) in cases {

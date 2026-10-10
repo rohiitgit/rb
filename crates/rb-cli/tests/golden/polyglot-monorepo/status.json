@@ -3,7 +3,7 @@
   "repo": "<repo>",
   "snapshot": {
     "id": "<live>",
-    "commit_sha": "20a7f31f9a7fe9ac75e738be6a9359696671f9e7"
+    "commit_sha": "b9b990373146294a722fda273fa36a7bcae61ca2"
   },
   "query": {},
   "limits": {},
@@ -12,12 +12,12 @@
     "name": "<repo>",
     "live": {
       "id": "<live>",
-      "commit_sha": "20a7f31f9a7fe9ac75e738be6a9359696671f9e7",
+      "commit_sha": "b9b990373146294a722fda273fa36a7bcae61ca2",
       "age_graph": "rb_<repo>_<live>"
     },
-    "nodes": 117,
-    "edges": 194,
-    "diagnostics": 33,
+    "nodes": 129,
+    "edges": 218,
+    "diagnostics": 34,
     "snapshots": 1,
     "coverage": {
       "sql": {
@@ -29,19 +29,19 @@
       "code": {
         "resolved": 8,
         "ambiguous": 0,
-        "unresolved": 22,
-        "external": 48,
+        "unresolved": 28,
+        "external": 57,
         "exact_calls": 0
       },
       "http": {
         "routes": 7,
         "services": 3,
-        "sites": 15,
+        "sites": 25,
         "buckets": {
           "ambiguous": 1,
           "dynamic": 1,
           "external": 2,
-          "heuristic": 3,
+          "heuristic": 13,
           "http_empty_url": 1,
           "http_in_process": 2,
           "self": 2,

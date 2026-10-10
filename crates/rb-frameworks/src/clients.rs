@@ -148,6 +148,8 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             fetch(facts, &mut out);
             axios(facts, &mut out, &Gate::new(facts.facts));
+            fetch_class(facts, &mut out);
+            http_client(facts, &mut out);
         }
         Language::Java => {
             let bases = SpringBases::new(facts, Gate::new(facts.facts));
@@ -319,6 +321,16 @@ pub fn global_hooks(language: Language, facts: &FileFacts) -> Vec<ClientKind> {
                 out.push(ClientKind::Fetch);
             }
             let (names, requires) = module_names(facts, "axios", &["default"], true);
+            // A module name read as a destructured member's object (`const {
+            // get } = axios`) reconfigures nothing (contract M6b S9): the
+            // pack reads the member call, capped, at that binding.
+            let member_src = |t: &rb_syntax::NameToken| {
+                crate::work::tick(1);
+                facts.bindings.iter().any(|b| {
+                    matches!(&b.init, Some(Init::Member { object, .. }) if object == &t.name)
+                        && within(t.span, b.span)
+                })
+            };
             if any_token(&|t| match &t.role {
                 // The module named outside its import or `require` declarations (amendment
                 // 17): `import x = require(…)`, `require(…).default`, a destructured or bare
@@ -327,12 +339,112 @@ pub fn global_hooks(language: Language, facts: &FileFacts) -> Vec<ClientKind> {
                     is_module(&t.name, "axios") && !declared(&["axios"], &requires, t)
                 }
                 TokenRole::Callee => false,
+                // Reading a request member to call or alias it (`axios.get`,
+                // `const get = axios.get`) reconfigures nothing; reading or
+                // writing anything else (`axios.defaults`, `axios.default`)
+                // may.
+                TokenRole::Member { name } => {
+                    names.contains(&t.name)
+                        && !(AXIOS_VERBS.contains(&name.as_str()) || name == "request")
+                }
                 TokenRole::Receiver { call } => {
                     names.contains(&t.name) && !AXIOS_MODULE_CALLS.contains(&call.as_str())
                 }
-                _ => names.contains(&t.name) && !declared(&["axios"], &requires, t),
+                _ => {
+                    names.contains(&t.name) && !declared(&["axios"], &requires, t) && !member_src(t)
+                }
             }) {
                 out.push(ClientKind::Axios);
+            }
+            // Fetch-class libraries and `HttpClient` (contract M6b S9): every
+            // token of a module binding outside its allow-listed roles hooks
+            // `fetch` — the module named outside its declarations, a receiver
+            // of anything but a verb or configuration call, aliasing,
+            // exporting, passing. A direct call is the pack's site.
+            // `got.paginate`/`got.stream` read without returning a response:
+            // allow-listed, not sites (residue).
+            for (module, exported, verbs, config, extra) in [
+                (
+                    "got",
+                    &["default"] as &[&str],
+                    GOT_KY_VERBS,
+                    &["extend"] as &[&str],
+                    &["paginate", "stream"] as &[&str],
+                ),
+                (
+                    "ky",
+                    &["default"] as &[&str],
+                    GOT_KY_VERBS,
+                    &["extend", "create"] as &[&str],
+                    &[] as &[&str],
+                ),
+                (
+                    "ky-universal",
+                    &["default"] as &[&str],
+                    GOT_KY_VERBS,
+                    &["extend", "create"] as &[&str],
+                    &[] as &[&str],
+                ),
+                (
+                    "superagent",
+                    &["default"] as &[&str],
+                    SUPERAGENT_VERBS,
+                    &["agent"] as &[&str],
+                    &[] as &[&str],
+                ),
+                (
+                    "undici",
+                    &["request"] as &[&str],
+                    &["request"] as &[&str],
+                    &[] as &[&str],
+                    &[] as &[&str],
+                ),
+            ] {
+                let (names, requires) = module_names(facts, module, exported, true);
+                if any_token(&|t| match &t.role {
+                    TokenRole::Callee => false,
+                    TokenRole::Member { name } => {
+                        names.contains(&t.name) && !verbs.contains(&name.as_str())
+                    }
+                    TokenRole::Receiver { call } => {
+                        names.contains(&t.name)
+                            && !verbs.contains(&call.as_str())
+                            && !config.contains(&call.as_str())
+                            && !extra.contains(&call.as_str())
+                    }
+                    _ => {
+                        names.contains(&t.name)
+                            && !declared(&[module], &requires, t)
+                            && !member_src(t)
+                    }
+                }) {
+                    out.push(ClientKind::Fetch);
+                }
+            }
+            // `HttpClient` providers and interceptors configure every client
+            // (contract M6b S9): any non-import mention of their names hooks
+            // `fetch`. The `HttpClient` name itself never hooks (its import
+            // and type mentions are the normal injection use).
+            if facts
+                .imports
+                .iter()
+                .any(|i| is_module(&i.module, "@angular/common/http"))
+                && [
+                    "HTTP_INTERCEPTORS",
+                    "HttpInterceptor",
+                    "HttpHandler",
+                    "provideHttpClient",
+                    "withInterceptors",
+                    "withInterceptorsFromDi",
+                ]
+                .iter()
+                .any(|n| {
+                    facts.mentions.get(*n).is_some_and(|roles| {
+                        roles.iter().any(|r| *r != rb_syntax::MentionRole::Import)
+                    })
+                })
+            {
+                out.push(ClientKind::Fetch);
             }
         }
         Language::Go => {
@@ -517,7 +629,10 @@ pub fn text_words(text: &str) -> BTreeSet<String> {
 /// [`rb_syntax::surface_names`]) and a qualified `feign.` use; Go's process-wide clients, in Go
 /// files only ([`raw_scan`]).
 const RAW_SURFACE: &[(ClientKind, &[&str])] = &[
-    (ClientKind::Fetch, &["fetch"]),
+    (
+        ClientKind::Fetch,
+        &["fetch", "got", "ky", "superagent", "undici"],
+    ),
     (ClientKind::Axios, &["axios"]),
     (
         ClientKind::Feign,
@@ -1024,6 +1139,318 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// fetch-class libraries: got, ky, superagent, undici, and Angular HttpClient
+// (contract M6b S9)
+
+/// TS/JS HTTP client modules that enter as fetch-class sites.
+const FETCH_CLASS_MODULES: &[&str] = &["got", "ky", "ky-universal", "superagent", "undici"];
+
+/// Verbs of `got` and `ky`.
+const GOT_KY_VERBS: &[&str] = &["get", "post", "put", "patch", "head", "delete", "options"];
+
+/// Verbs of `superagent` (`del` is its `delete` alias).
+const SUPERAGENT_VERBS: &[&str] = &[
+    "get", "post", "put", "patch", "head", "delete", "options", "del",
+];
+
+/// A configured carrier: a name bound to `got.extend`, `ky.extend` /
+/// `ky.create` or `superagent.agent`, with the verbs it takes.
+#[derive(Clone, Copy)]
+enum Carrier {
+    Got,
+    Ky,
+    Superagent,
+}
+
+impl Carrier {
+    fn verbs(self) -> &'static [&'static str] {
+        match self {
+            Carrier::Got | Carrier::Ky => GOT_KY_VERBS,
+            Carrier::Superagent => SUPERAGENT_VERBS,
+        }
+    }
+}
+
+/// The object a callee-name binding destructures (`const { get } = axios`):
+/// the object as written and the binding, when the call's name resolves to
+/// that binding (contract M6b S9). Covers `Init::Member` (`const { get } =
+/// axios`, `const { get } = require("axios")`) and a member path kept as a
+/// name (`const get = axios.get`).
+fn member_object(facts: &FileScope<'_>, chain: &CallChain, name: &str) -> Option<(String, usize)> {
+    let bi = facts.binding_index_at(name, chain.span)?;
+    match &facts.bindings[bi].init {
+        Some(Init::Member { object, .. }) => Some((object.clone(), bi)),
+        Some(Init::Name { text, .. }) => text
+            .rsplit_once('.')
+            .map(|(object, _)| (object.to_owned(), bi)),
+        _ => None,
+    }
+}
+
+/// `got`, `ky`, `superagent` and `undici` as fetch-class sites (contract M6b
+/// S9): module verbs and direct calls with import/`require` gates (the
+/// `undici` `request` name, or its namespace's `request` member), destructured
+/// members, and calls on configured carriers (`got.extend`, `ky.extend` /
+/// `ky.create`, `superagent.agent` results). Carrier and member sites never
+/// rise above `heuristic`; an `undici` pool or client is no fetch-class shape
+/// (residue).
+fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
+    let got = module_names(facts, "got", &["default"], true);
+    let ky = {
+        let (mut names, mut requires) = module_names(facts, "ky", &["default"], true);
+        let (u_names, u_requires) = module_names(facts, "ky-universal", &["default"], true);
+        names.extend(u_names);
+        requires.extend(u_requires);
+        (names, requires)
+    };
+    let sa = module_names(facts, "superagent", &["default"], true);
+    let undici = module_names(facts, "undici", &["request"], true);
+    // `name` at `at` is one of the module's local names, not shadowed by a
+    // parameter or variable in effect there (as for `is_axios`); the `require`
+    // binding is the module.
+    let is_lib = |names: &(Vec<String>, HashSet<usize>), name: &str, at: Span| {
+        names.0.iter().any(|n| n == name)
+            && facts
+                .binding_index_at(name, at)
+                .is_none_or(|bi| names.1.contains(&bi))
+    };
+    // A destructured object is the module itself (`const { get } =
+    // require("got")`, with no import) or one of its local names; a shadowed
+    // module name resolves to the shadowing binding, never the module.
+    let is_lib_or_module =
+        |names: &(Vec<String>, HashSet<usize>), modules: &[&str], object: &str, at: Span| {
+            is_lib(names, object, at)
+                || modules.iter().any(|m| is_module(object, m))
+                    && facts.binding_index_at(object, at).is_none()
+        };
+    // Configured carriers: `const api = got.extend(…)` and kin.
+    let mut carriers: HashMap<usize, Carrier> = HashMap::new();
+    for (bi, b) in facts.bindings.iter().enumerate().filter(|(_, b)| !b.member) {
+        let Some(c) = init_chain(facts, b) else {
+            continue;
+        };
+        if let (Some(root), [link]) = (c.root.as_deref(), c.links.as_slice()) {
+            let carrier = if is_lib(&got, root, c.span) && link.name == "extend" {
+                Some(Carrier::Got)
+            } else if is_lib(&ky, root, c.span) && matches!(link.name.as_str(), "extend" | "create")
+            {
+                Some(Carrier::Ky)
+            } else if is_lib(&sa, root, c.span) && link.name == "agent" {
+                Some(Carrier::Superagent)
+            } else {
+                None
+            };
+            if let Some(carrier) = carrier {
+                carriers.insert(bi, carrier);
+            }
+        }
+    }
+    // A fetch-class site: `url` from the verb's first argument, `capped` for
+    // configured carriers and destructured members (contract M6b S9, D8).
+    let site =
+        |chain: &CallChain, method: Option<String>, url: Option<&Arg>, capped: bool| ClientCall {
+            kind: ClientKind::Fetch,
+            method,
+            url: UrlValue::of(url),
+            base: None,
+            instance: None,
+            span: chain.span,
+            source: chain.enclosing,
+            injected: None,
+            base_verified: capped.then_some(false),
+        };
+    // A direct call's method from its options (`got(url, { method })`,
+    // `request(url, { method })`), `GET` by default as for `fetch`.
+    let opts_method = |args: &[Arg]| match args.get(1) {
+        None => Some("GET".to_owned()),
+        Some(Arg::Object { .. }) => method_entry(args.get(1)).unwrap_or(Some("GET".to_owned())),
+        Some(_) => None,
+    };
+    // A verb-site method (`del` is `superagent`'s `delete` alias).
+    let verb_method = |verb: &str| {
+        Some(if verb == "del" {
+            "DELETE".to_owned()
+        } else {
+            norm_method(verb)
+        })
+    };
+    for chain in &facts.chains {
+        let Some(first) = chain.links.first() else {
+            continue;
+        };
+        if chain.root.is_none() {
+            if first.args.is_empty() {
+                continue;
+            }
+            if is_lib(&got, &first.name, chain.span) || is_lib(&ky, &first.name, chain.span) {
+                out.calls.push(site(
+                    chain,
+                    opts_method(&first.args),
+                    first.args.first(),
+                    false,
+                ));
+                continue;
+            }
+            if is_lib(&sa, &first.name, chain.span) {
+                let (method, url) = match first.args.as_slice() {
+                    [url] => (Some("GET".to_owned()), Some(url)),
+                    [m, url] => (literal(m).map(|m| norm_method(&m)), Some(url)),
+                    _ => (None, None),
+                };
+                if url.is_some() {
+                    out.calls.push(site(chain, method, url, false));
+                }
+                continue;
+            }
+            if is_lib(&undici, &first.name, chain.span) {
+                out.calls.push(site(
+                    chain,
+                    opts_method(&first.args),
+                    first.args.first(),
+                    false,
+                ));
+                continue;
+            }
+            // Destructured members (`const { get } = got`): capped.
+            if let Some((object, bi)) = member_object(facts, chain, &first.name) {
+                let at = facts.bindings[bi].span;
+                let mut capped = |method: Option<String>, url: Option<&Arg>| {
+                    out.calls.push(site(chain, method, url, true));
+                };
+                if (is_lib_or_module(&got, &["got"], &object, at)
+                    || is_lib_or_module(&ky, &["ky", "ky-universal"], &object, at))
+                    && GOT_KY_VERBS.contains(&first.name.as_str())
+                    || is_lib_or_module(&sa, &["superagent"], &object, at)
+                        && SUPERAGENT_VERBS.contains(&first.name.as_str())
+                {
+                    capped(verb_method(&first.name), first.args.first());
+                } else if is_lib_or_module(&undici, &["undici"], &object, at)
+                    && first.name == "request"
+                {
+                    capped(opts_method(&first.args), first.args.first());
+                } else if let Some(carrier) = facts
+                    .binding_index_at(&object, at)
+                    .and_then(|oi| carriers.get(&oi))
+                    && carrier.verbs().contains(&first.name.as_str())
+                {
+                    capped(verb_method(&first.name), first.args.first());
+                }
+            }
+            continue;
+        }
+        let root = chain.root.as_deref().unwrap_or_default();
+        if (is_lib(&got, root, chain.span) && GOT_KY_VERBS.contains(&first.name.as_str()))
+            || (is_lib(&ky, root, chain.span) && GOT_KY_VERBS.contains(&first.name.as_str()))
+            || (is_lib(&sa, root, chain.span) && SUPERAGENT_VERBS.contains(&first.name.as_str()))
+        {
+            out.calls.push(site(
+                chain,
+                verb_method(&first.name),
+                first.args.first(),
+                false,
+            ));
+            continue;
+        }
+        if is_lib(&undici, root, chain.span) && first.name == "request" && !first.args.is_empty() {
+            out.calls.push(site(
+                chain,
+                opts_method(&first.args),
+                first.args.first(),
+                false,
+            ));
+            continue;
+        }
+        // Calls on a configured carrier: capped.
+        if let Some(carrier) = facts
+            .binding_index_at(root, chain.span)
+            .and_then(|bi| carriers.get(&bi))
+            && carrier.verbs().contains(&first.name.as_str())
+        {
+            out.calls.push(site(
+                chain,
+                verb_method(&first.name),
+                first.args.first(),
+                true,
+            ));
+        }
+    }
+}
+
+/// Angular `HttpClient` calls (contract M6b S9, D8): verbs and
+/// `request(method, url)` on a receiver typed `HttpClient` — a constructor
+/// parameter property, field or local — with the `@angular/common/http`
+/// import present. Every site is capped at `heuristic`: repository providers
+/// and interceptors are a global hook, and per-instance proof is later scope.
+fn http_client(facts: &FileScope<'_>, out: &mut FileClients) {
+    if !facts.imports.iter().any(|i| {
+        is_module(&i.module, "@angular/common/http")
+            && i.names.iter().any(|n| n.name == "HttpClient")
+    }) {
+        return;
+    }
+    // Whether the receiver is typed `HttpClient`: a member of the call's class
+    // or a local in effect at the call.
+    let typed = |root: &str, chain: &CallChain| {
+        if let Some(member) = root.strip_prefix("this.") {
+            if member.contains('.') {
+                return false;
+            }
+            facts.members(member).iter().any(|&bi| {
+                let b = &facts.bindings[bi];
+                b.type_name == "HttpClient" && {
+                    let mut enclosing = chain.enclosing;
+                    while let Some(d) = enclosing {
+                        if Some(d) == b.scope {
+                            return true;
+                        }
+                        enclosing = facts.definitions[d].parent;
+                    }
+                    b.scope.is_none()
+                }
+            })
+        } else if root.contains('.') {
+            false
+        } else {
+            facts
+                .binding_index_at(root, chain.span)
+                .is_some_and(|bi| facts.bindings[bi].type_name == "HttpClient")
+        }
+    };
+    for chain in &facts.chains {
+        let Some(first) = chain.links.first() else {
+            continue;
+        };
+        let Some(root) = chain.root.as_deref() else {
+            continue;
+        };
+        if !typed(root, chain) || first.args.is_empty() {
+            continue;
+        }
+        let (method, url) = if first.name == "request" {
+            match first.args.as_slice() {
+                [m, url, ..] => (literal(m).map(|m| norm_method(&m)), Some(url)),
+                _ => continue,
+            }
+        } else if AXIOS_VERBS.contains(&first.name.as_str()) {
+            (Some(norm_method(&first.name)), first.args.first())
+        } else {
+            continue;
+        };
+        out.calls.push(ClientCall {
+            kind: ClientKind::Fetch,
+            method,
+            url: UrlValue::of(url),
+            base: None,
+            instance: None,
+            span: chain.span,
+            source: chain.enclosing,
+            injected: None,
+            base_verified: Some(false),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // axios (S9)
 
 const AXIOS_VERBS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
@@ -1138,6 +1565,70 @@ fn verdict(plain: bool, base_from_carrier: bool) -> Option<bool> {
     }
 }
 
+/// A call to an axios member outside the module object (contract M6b S9): a
+/// destructured verb (`const { get } = axios`, `const { get } =
+/// require("axios")`, `const get = axios.get`, including from a local
+/// instance) or an inline `require("axios")` chain. Capped: no Gate-A proof
+/// for the destructured carrier in S9 scope.
+fn axios_member(
+    facts: &FileScope<'_>,
+    chain: &CallChain,
+    link: &rb_syntax::CallLink,
+    names: &[String],
+    requires: &HashSet<usize>,
+    instances: &HashMap<usize, (Option<UrlValue>, bool)>,
+) -> Option<ClientCall> {
+    // An inline `require("axios")` chain: `require("axios").get(…)`.
+    if link.name == "require"
+        && let Some(next) = chain.links.get(1)
+        && let Some(m) = link.args.first().and_then(literal)
+        && is_module(&m, "axios")
+        && let Some(mut call) = axios_request(facts, chain, next, None, None)
+    {
+        call.base_verified = Some(false);
+        return Some(call);
+    }
+    if !AXIOS_VERBS.contains(&link.name.as_str()) && link.name != "request" {
+        return None;
+    }
+    let is_axios_at = |name: &str, at: Span| {
+        names.iter().any(|n| n == name)
+            && facts
+                .binding_index_at(name, at)
+                .is_none_or(|bi| requires.contains(&bi))
+            // The module itself (`const { get } = require("axios")`, with no
+            // import); a shadowed module name resolves to its binding, never
+            // the module.
+            || is_module(name, "axios") && facts.binding_index_at(name, at).is_none()
+    };
+    let bound = facts.binding_index_at(&link.name, chain.span)?;
+    let b = &facts.bindings[bound];
+    // The axios object the name destructures, shadow-checked where it is
+    // read: the module (capped) or a local instance (its base and verdict).
+    let (base, carrier): (Option<UrlValue>, Option<(bool, bool)>) = match &b.init {
+        Some(Init::Member { object, .. }) if is_axios_at(object, b.span) => (None, None),
+        Some(Init::Member { object, .. }) => match facts
+            .binding_index_at(object, b.span)
+            .and_then(|bi| instances.get(&bi))
+        {
+            Some((base, verified)) => (base.clone(), Some((*verified, base.is_some()))),
+            None => return None,
+        },
+        Some(Init::Name { text, .. }) => match text.rsplit_once('.') {
+            Some((object, _)) if is_axios_at(object, b.span) => (None, None),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut call = axios_request(facts, chain, link, base, None)?;
+    if let Some((plain, from_carrier)) = carrier {
+        call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
+    } else {
+        call.base_verified = Some(false);
+    }
+    Some(call)
+}
+
 fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
     let (names, requires) = module_names(facts, "axios", &["default"], true);
     // `name` at `at` is the axios module: one of its local names, not shadowed by a parameter
@@ -1172,7 +1663,15 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
     let imported: HashSet<&str> = facts
         .imports
         .iter()
-        .filter(|i| !is_module(&i.module, "axios"))
+        .filter(|i| {
+            !is_module(&i.module, "axios")
+                // Fetch-class modules resolve through `fetch_class`, not the
+                // axios imported-instance fallback (contract M6b S9: no
+                // axios-instance double).
+                && !FETCH_CLASS_MODULES
+                    .iter()
+                    .any(|m| is_module(&i.module, m))
+        })
         .flat_map(|i| {
             i.names
                 .iter()
@@ -1216,6 +1715,10 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
                     url => axios_call(facts, chain, None, None, url, None, first.args.get(1)),
                 };
                 out.calls.push(call);
+            } else if let Some(call) =
+                axios_member(facts, chain, first, &names, &requires, &instances)
+            {
+                out.calls.push(call);
             }
             continue;
         }
@@ -1235,6 +1738,16 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
                 call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
                 out.calls.push(call);
             }
+            continue;
+        }
+        // Calls through the namespace's `default` member (`axios.default.get(…)`,
+        // contract M6b S9): the module object under interop, capped.
+        if let Some(default) = root.strip_suffix(".default")
+            && is_axios(default, chain.span)
+            && let Some(mut call) = axios_request(facts, chain, first, None, None)
+        {
+            call.base_verified = Some(false);
+            out.calls.push(call);
             continue;
         }
         // The module itself (a bare module client), a local instance (its Gate A verdict), or
@@ -4223,6 +4736,189 @@ mod tests {
         }
         let (small, large) = (work(100), work(400));
         assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// Contract M6b S9: `got`, `ky`, `superagent` and `undici` enter as
+    /// fetch-class sites — module verbs and direct calls with import/require
+    /// gates. `superagent.del` is `DELETE`; a direct `got`/`ky` call reads its
+    /// method from the options like `fetch`. Each row is exactly one site: no
+    /// axios-instance double (the `imported` fallback skips the new modules).
+    #[test]
+    fn fetch_class_library_sites() {
+        let src = "import got from \"got\";\nimport ky from \"ky\";\nimport request from \"superagent\";\nimport { request as urequest } from \"undici\";\nimport * as undici from \"undici\";\nexport async function f() {\n  await got.get(\"http://orders/a\");\n  await got(\"http://orders/b\", { method: \"POST\" });\n  await ky.post(\"http://orders/c\");\n  await ky(\"http://orders/d\");\n  await request.get(\"http://orders/e\");\n  await request(\"DELETE\", \"http://orders/f\");\n  await request.del(\"http://orders/g\");\n  await urequest(\"http://orders/h\", { method: \"POST\" });\n  await undici.request(\"http://orders/i\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "fetch GET 'http://orders/a'",
+                "fetch POST 'http://orders/b'",
+                "fetch POST 'http://orders/c'",
+                "fetch GET 'http://orders/d'",
+                "fetch GET 'http://orders/e'",
+                "fetch DELETE 'http://orders/f'",
+                "fetch DELETE 'http://orders/g'",
+                "fetch POST 'http://orders/h'",
+                "fetch GET 'http://orders/i'",
+            ]
+        );
+        // The controls: a shadowed module name and an unimported name give
+        // nothing, and an undici `Client` is not a fetch-class shape.
+        let shadowed = "import got from \"got\";\nexport async function f(got: any) {\n  await got.get(\"http://orders/a\");\n}\n";
+        assert!(calls(Language::TypeScript, shadowed).is_empty());
+        let plain = "export async function f() {\n  await got.get(\"http://orders/a\");\n}\n";
+        assert!(calls(Language::TypeScript, plain).is_empty());
+        let pooled = "import { Pool } from \"undici\";\nconst pool = new Pool(\"http://orders\");\nexport async function f() {\n  const r = await pool.request({ path: \"/a\", method: \"GET\" });\n}\n";
+        assert!(calls(Language::TypeScript, pooled).is_empty());
+        // A destructured member is a capped site, like the module's own.
+        let destructured = "const { get } = require(\"got\");\nexport async function f() {\n  await get(\"http://orders/x\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, destructured),
+            ["fetch GET 'http://orders/x' unverified"]
+        );
+    }
+
+    /// Contract M6b S9: instances built by `got.extend`, `ky.extend`,
+    /// `ky.create` and `superagent.agent` are configured carriers — their
+    /// calls stitch, but never above `heuristic`.
+    #[test]
+    fn configured_instances_are_capped() {
+        let src = "import got from \"got\";\nimport ky from \"ky\";\nimport request from \"superagent\";\nconst api = got.extend({ prefixUrl: \"http://orders\" });\nconst kapi = ky.create({ prefixUrl: \"http://orders\" });\nconst agent = request.agent();\nexport async function f() {\n  await api.get(\"/a\");\n  await kapi.post(\"/b\");\n  await agent.get(\"http://orders/c\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "fetch GET '/a' unverified",
+                "fetch POST '/b' unverified",
+                "fetch GET 'http://orders/c' unverified",
+            ]
+        );
+        // A non-verb on a carrier is no site.
+        let other = "import got from \"got\";\nconst api = got.extend({});\nexport async function f() {\n  await api.unknown(\"/a\");\n}\n";
+        assert!(calls(Language::TypeScript, other).is_empty());
+    }
+
+    /// Contract M6b S9 (D8): Angular `HttpClient` calls enter capped at
+    /// `heuristic` — injected (a constructor parameter property or field) or
+    /// local, verbs and `request(method, url)`. Without the
+    /// `@angular/common/http` import the same shape gives nothing (it may be
+    /// the repository's own type of that name).
+    #[test]
+    fn http_client_sites_are_capped() {
+        let src = "import { HttpClient } from \"@angular/common/http\";\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.get(\"http://orders/a\");\n  }\n  send(x: string) {\n    return this.http.post(\"http://orders/b\", { x });\n  }\n  remove(id: string) {\n    return this.http.request(\"delete\", \"http://orders/c\");\n  }\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "fetch GET 'http://orders/a' unverified",
+                "fetch POST 'http://orders/b' unverified",
+                "fetch DELETE 'http://orders/c' unverified",
+            ]
+        );
+        let own = "class HttpClient {\n  get(u: string) { return u; }\n}\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.get(\"http://orders/a\");\n  }\n}\n";
+        assert!(calls(Language::TypeScript, own).is_empty());
+        // An import from the module that does not name `HttpClient` gates
+        // nothing out: the type may still be the repository's own.
+        let other_import = "import { HttpHeaders } from \"@angular/common/http\";\nclass HttpClient {\n  get(u: string) { return u; }\n}\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.get(\"http://orders/a\");\n  }\n}\n";
+        assert!(calls(Language::TypeScript, other_import).is_empty());
+        // A `request` with no URL is no site; an unknown verb is no site.
+        let nourl = "import { HttpClient } from \"@angular/common/http\";\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.request(\"delete\");\n  }\n  jsonp(url: string) {\n    return this.http.jsonp(url, \"cb\");\n  }\n}\n";
+        assert!(calls(Language::TypeScript, nourl).is_empty());
+    }
+
+    /// Contract M6b S9: the axios member forms enter capped at `heuristic` —
+    /// destructured verbs (from the module or a `require`), an inline
+    /// `require("axios")` chain, and calls through `axios.default`.
+    #[test]
+    fn axios_member_forms_are_capped() {
+        let src = "import axios from \"axios\";\nconst { get } = axios;\nconst { post } = require(\"axios\");\nexport async function f() {\n  await get(\"/a\");\n  await post(\"/b\", { x: 1 });\n  await require(\"axios\").put(\"/c\", { x: 1 });\n  await axios.default.delete(\"/d\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios GET '/a' unverified",
+                "axios POST '/b' unverified",
+                "axios PUT '/c' unverified",
+                "axios DELETE '/d' unverified",
+            ]
+        );
+        // The control: a destructured verb of another module is no axios member.
+        let other = "import { get } from \"./api\";\nexport async function f() {\n  await get(\"/a\");\n}\n";
+        assert!(calls(Language::TypeScript, other).is_empty());
+    }
+
+    /// Contract M6b S9: the repository-wide token scan covers the new
+    /// libraries' configuration surfaces. Imports, plain calls and configured
+    /// instances (allow-listed, per-site capped) are clean; any other role of
+    /// a module name, and any `HttpClient` provider/interceptor use, hooks
+    /// `fetch`.
+    #[test]
+    fn global_hooks_of_new_libraries() {
+        use ClientKind::Fetch;
+        let hooks = |src: &str| {
+            global_hooks(
+                Language::TypeScript,
+                &extract(Language::TypeScript, src.as_bytes()).unwrap(),
+            )
+        };
+        for clean in [
+            "import got from \"got\";\ngot.get(\"/a\");\ngot(\"/b\");\nconst api = got.extend({});\napi.get(\"/c\");\nfor await (const r of got.paginate(\"/d\")) {}\n",
+            "import ky from \"ky\";\nimport kyU from \"ky-universal\";\nky.post(\"/a\");\nconst k = ky.create({});\nk.get(\"/b\");\nkyU.get(\"/c\");\n",
+            "import request from \"superagent\";\nrequest.get(\"/a\");\nrequest(\"DELETE\", \"/b\");\nconst agent = request.agent();\nagent.get(\"/c\");\n",
+            "import { request } from \"undici\";\nimport * as undici from \"undici\";\nrequest(\"/a\");\nundici.request(\"/b\");\n",
+            "import { HttpClient } from \"@angular/common/http\";\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.get(\"/a\");\n  }\n}\n",
+            // A destructured member's object, and a request member read to
+            // alias it, reconfigure nothing (contract M6b S9).
+            "import axios from \"axios\";\nconst { get } = axios;\nget(\"/a\");\n",
+            "import axios from \"axios\";\nconst get = axios.get;\nget(\"/a\");\n",
+            "import got from \"got\";\nconst { get } = require(\"got\");\nget(\"/a\");\n",
+            // Reading a request member to alias it reconfigures nothing.
+            "import got from \"got\";\nconst get = got.get;\nget(\"/a\");\n",
+        ] {
+            assert!(hooks(clean).is_empty(), "{clean}");
+        }
+        for tainted in [
+            // A bare configuration reference stands in for its use.
+            "import got from \"got\";\nconst e = got.extend;\n",
+            "const ky = require(\"ky\");\nmodule.exports = { ky };\n",
+            // `superagent` re-exported or aliased.
+            "import request from \"superagent\";\nexport { request };\n",
+            "import kyU from \"ky-universal\";\nexport { kyU };\n",
+            // HttpClient providers and interceptors configure every client.
+            "import { HTTP_INTERCEPTORS } from \"@angular/common/http\";\nexport const providers = [{ provide: HTTP_INTERCEPTORS, useClass: X, multi: true }];\n",
+            "import { HttpInterceptor } from \"@angular/common/http\";\nexport class AuthInterceptor implements HttpInterceptor {}\n",
+            "import { provideHttpClient, withInterceptors } from \"@angular/common/http\";\nexport const providers = [provideHttpClient(withInterceptors([x]))];\n",
+        ] {
+            assert_eq!(hooks(tainted), [Fetch], "{tainted}");
+        }
+    }
+
+    /// Contract M6b S9: unparsed files taint `fetch` on the new libraries'
+    /// words; prose and lockfiles stay inert, and `request` alone (far too
+    /// common) never taints.
+    #[test]
+    fn raw_scan_new_library_words() {
+        use ClientKind::Fetch;
+        for (path, text) in [
+            ("w/x.vue", "import got from 'got'; got.get(u);"),
+            ("w/x.svelte", "import ky from 'ky'; ky.post(u);"),
+            ("w/x.html", "const request = require('superagent');"),
+            ("w/x.js", "const { request } = require('undici');"),
+        ] {
+            assert_eq!(
+                raw_scan(path, Some(text))
+                    .hooks
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                [Fetch],
+                "{path}: {text}"
+            );
+        }
+        for (path, text) in [
+            ("w/x.js", "request.get(u);"),
+            ("README.md", "got ky superagent undici"),
+            ("w/package-lock.json", "\"node_modules/got\""),
+        ] {
+            assert!(
+                raw_scan(path, Some(text)).hooks.is_empty(),
+                "{path}: {text}"
+            );
+        }
     }
 
     /// Contract M5 S19 (b) (M4a open item 22 (c)): XML comments are read, so a hook in a

@@ -381,6 +381,14 @@ pub enum Init {
         text: String,
         span: Span,
     },
+    /// A member of a destructured object (contract M6b S9): `const { get } =
+    /// axios` holds `axios.get` under the local name. The object as written
+    /// (a name, a member path, or a `require("module")` module); the member is
+    /// the binding's own name. Never folded (a hole, like no initialiser).
+    Member {
+        object: String,
+        span: Span,
+    },
     /// `a ?? 'lit'` or `a || 'lit'`: the name `a` with a default string.
     Fallback {
         primary: String,
@@ -744,8 +752,16 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                     point(to.column),
                 ],
                 init: b
-                    .value
-                    .and_then(|v| calls::init(language, v, source, &chain_index)),
+                    .destructured_from
+                    .clone()
+                    .map(|object| Init::Member {
+                        object,
+                        span: span(b.node),
+                    })
+                    .or_else(|| {
+                        b.value
+                            .and_then(|v| calls::init(language, v, source, &chain_index))
+                    }),
                 constant: b.constant,
                 decorations: if language == Language::Java {
                     decorations::decorations(language, b.node, source)
