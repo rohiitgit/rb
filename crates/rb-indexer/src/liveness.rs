@@ -422,13 +422,16 @@ fn own_rule<'a>(inputs: &Inputs<'a>, path: &'a str, i: usize, entry: bool) -> Op
 }
 
 /// Whether a declared supertype of `start`, or of any repository type they reach through
-/// their supertypes, may be no repository type: it resolves to none, or its Tier B resolution
-/// is not certain (contract M5 S19 (e), M4b open item 21): not unique, or the declaring file
-/// may take the head's name from outside the repository ([`Index::imported_from_outside`]: a
-/// library import of that name, or an on-demand import of a package outside it).
+/// their supertypes, may be no repository type (contract M5 S19 (e), narrowed by M6c S5/D5,
+/// M4b open item 21): an ambiguous head, an unresolvable one, or one whose resolution
+/// actually reached an on-demand import that names no repository type. A head uniquely
+/// resolved at an earlier level (lexical, same file, single-type import, same package) counts
+/// in-repo even beside an outside binding of the same name; dotted names keep the old
+/// presence rule (their container path has no level).
 /// Breadth-first with a visited set, at most [`crate::di::MAX_SUPERTYPE_DEPTH`] levels; a chain
 /// longer than that counts as reaching an external type (conservative).
 fn external_supertype<'a>(inputs: &Inputs<'a>, start: &[(&'a str, usize)]) -> bool {
+    use crate::resolve::TypeLevel;
     let mut seen: BTreeSet<(&'a str, usize)> = start.iter().copied().collect();
     let mut level: Vec<(&'a str, usize)> = start.to_vec();
     for _ in 0..crate::di::MAX_SUPERTYPE_DEPTH {
@@ -438,8 +441,22 @@ fn external_supertype<'a>(inputs: &Inputs<'a>, start: &[(&'a str, usize)]) -> bo
             for s in &d.supertypes {
                 work::tick(1);
                 let found = inputs.index.type_candidates(path, d.parent, &s.name);
+                if found.len() != 1 {
+                    return true;
+                }
                 let head = s.name.split('.').next().unwrap_or(&s.name);
-                if found.len() != 1 || inputs.index.imported_from_outside(path, head) {
+                let outside = match inputs.index.type_level(path, d.parent, &s.name) {
+                    // Dotted names keep the old presence rule.
+                    None => inputs.index.imported_from_outside(path, head),
+                    // Only an on-demand resolution can still be external, and only
+                    // while the file has an outside wildcard binding.
+                    Some(TypeLevel::ImportOnDemand) => inputs.index.on_demand_from_outside(path),
+                    // Local, single-import and same-package resolutions — and, by
+                    // construction unreachable here, a miss beside a unique hit —
+                    // count in-repo.
+                    Some(_) => false,
+                };
+                if outside {
                     return true;
                 }
                 next.extend(found.into_iter().filter(|t| seen.insert(*t)));
@@ -1049,23 +1066,26 @@ public class Svc {
         );
         // Control: the head resolves to the same package, nothing imported.
         assert_eq!(row(&[], &auth("")), "eligible");
-        // The head imported from a library, although the package has the same name.
+        // Predicted update (M6c S5/D5): the head resolves to the same package,
+        // so an outside single import of the same name no longer counts.
         assert_eq!(
             row(
                 &[],
                 &auth("import org.springframework.web.servlet.BaseInterceptor;\n")
             ),
-            ""
+            "eligible"
         );
-        // An on-demand import of a library package.
+        // Predicted update (M6c S5/D5): same-package resolution beside an
+        // on-demand import of a library package counts in-repo.
         assert_eq!(
             row(&[], &auth("import org.springframework.web.servlet.*;\n")),
-            ""
+            "eligible"
         );
-        // A repository package that has no type of that name: the import names a library's.
+        // Predicted update (M6c S5/D5): the single import misses, the
+        // same-package level hits, so the head counts in-repo.
         assert_eq!(
             row(&[sub], &auth("import com.acme.sub.BaseInterceptor;\n")),
-            ""
+            "eligible"
         );
         // On-demand and single imports of repository packages are no doubt.
         assert_eq!(row(&[sub], &auth("import com.acme.sub.*;\n")), "eligible");
@@ -1079,7 +1099,8 @@ public class Svc {
             "package com.acme;\nabstract class BaseInterceptor implements Local {}\n",
         );
         assert_eq!(row(&[twin], &auth("")), "");
-        // Depth 2: the doubtful head is the base's own supertype.
+        // Depth 2: the middle head resolves to the same package, so the
+        // predicted update (M6c S5/D5) keeps nothing doubtful: eligible.
         let mid = "package com.acme;\nimport org.springframework.web.servlet.Middle;\npublic abstract class BaseInterceptor extends Middle {}\n";
         let middle = (
             "svc/src/main/java/com/acme/Middle.java",
@@ -1092,7 +1113,10 @@ public class Svc {
         ];
         let plain = auth("");
         files.push(("svc/src/main/java/com/acme/AuthInterceptor.java", &plain));
-        assert_eq!(attrs(&run(&files), "AuthInterceptor#tokenPresent()."), "");
+        assert_eq!(
+            attrs(&run(&files), "AuthInterceptor#tokenPresent()."),
+            "eligible"
+        );
         // A cycle with no doubtful head terminates and keeps nothing.
         let cycle =
             "package com.acme;\npublic abstract class BaseInterceptor extends AuthInterceptor {}\n";
@@ -1107,6 +1131,93 @@ public class Svc {
         assert_eq!(
             attrs(&run(&files), "AuthInterceptor#tokenPresent()."),
             "eligible"
+        );
+    }
+
+    /// Contract M6c S5 (D5): a supertype head counts external only when its
+    /// resolution actually reached an on-demand import. A unique same-package
+    /// or single-import resolution counts in-repo even beside an outside
+    /// binding of the same head; a unique on-demand resolution still counts
+    /// external while an outside wildcard binds the head, and a miss stays
+    /// external.
+    #[test]
+    fn supertype_heads_resolved_in_repo_count_in_repo() {
+        const PROBE: &str = "package com.acme;\nclass Probe { boolean probe(AuthInterceptor i) { return i.preHandle(null); } }\n";
+        let local = "package com.acme;\npublic abstract class BaseInterceptor implements Local {}\ninterface Local {}\n";
+        let auth = |imports: &str| {
+            format!(
+                "package com.acme;\n{imports}public class AuthInterceptor extends BaseInterceptor {{\n  public boolean preHandle(Object a) {{ return tokenPresent(a); }}\n  private boolean tokenPresent(Object r) {{ return r != null; }}\n}}\n"
+            )
+        };
+        let row = |extra: &[(&str, &str)], auth: &str| -> String {
+            let mut files = vec![
+                ("svc/src/main/java/com/acme/BaseInterceptor.java", local),
+                ("svc/src/main/java/com/acme/AuthInterceptor.java", auth),
+                ("svc/src/main/java/com/acme/Probe.java", PROBE),
+            ];
+            files.extend_from_slice(extra);
+            attrs(&run(&files), "AuthInterceptor#tokenPresent().")
+        };
+        // Same-package resolution beside an outside single import: in-repo.
+        assert_eq!(
+            row(
+                &[],
+                &auth("import org.springframework.web.servlet.BaseInterceptor;\n")
+            ),
+            "eligible"
+        );
+        // Same-package resolution beside an outside on-demand import: in-repo.
+        assert_eq!(
+            row(&[], &auth("import org.springframework.web.servlet.*;\n")),
+            "eligible"
+        );
+        // Single-import resolution beside an outside on-demand import: in-repo.
+        // (`sub` holds a BaseInterceptor, so the single import wins.)
+        let single = (
+            "svc/src/main/java/com/acme/sub/Single.java",
+            "package com.acme.sub;\npublic abstract class BaseInterceptor {}\n",
+        );
+        assert_eq!(
+            row(
+                &[single],
+                &auth("import com.acme.sub.BaseInterceptor;\nimport org.foo.*;\n")
+            ),
+            "eligible"
+        );
+        // Unique on-demand resolution with an outside wildcard binding: external.
+        // (No same-package BaseInterceptor here, so resolution reaches imports.)
+        let sub = (
+            "svc/src/main/java/com/acme/sub/Base.java",
+            "package com.acme.sub;\npublic abstract class BaseInterceptor {}\n",
+        );
+        let r = run(&[
+            (
+                "svc/src/main/java/com/acme/AuthInterceptor.java",
+                &auth("import com.acme.sub.*;\nimport org.foo.*;\n"),
+            ),
+            sub,
+            ("svc/src/main/java/com/acme/Probe.java", PROBE),
+        ]);
+        assert_eq!(attrs(&r, "AuthInterceptor#tokenPresent()."), "");
+        // Unique on-demand resolution beside an outside single binding (which
+        // misses): in-repo — the single import names nothing.
+        let r = run(&[
+            (
+                "svc/src/main/java/com/acme/AuthInterceptor.java",
+                &auth("import com.acme.sub.*;\nimport org.foo.BaseInterceptor;\n"),
+            ),
+            sub,
+            ("svc/src/main/java/com/acme/Probe.java", PROBE),
+        ]);
+        assert_eq!(attrs(&r, "AuthInterceptor#tokenPresent()."), "eligible");
+        // A miss with an outside single binding stays external.
+        assert_eq!(
+            row(
+                &[],
+                &auth("import org.foo.Missing;\n")
+                    .replace("extends BaseInterceptor", "extends Missing")
+            ),
+            ""
         );
     }
 
@@ -1178,6 +1289,41 @@ public class Svc {
     #[test]
     fn eligibility_grows_linearly() {
         let (small, large) = (work_for(100), work_for(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Invariant 9: the level-tracked rule-(e) walk grows linearly (counted,
+    /// 4× → ≤ 5×). Each head resolves twice (candidates + level), both walks
+    /// first-win over the same levels.
+    #[test]
+    fn rule_e_level_walk_grows_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut bases = String::from("package com.acme;\n");
+            for i in 0..n {
+                bases += &format!("class B{i} {{}}\n");
+            }
+            let mut owned: Vec<(String, String)> =
+                vec![("svc/src/main/java/com/acme/Bases.java".to_owned(), bases)];
+            for i in 0..n {
+                owned.push((
+                    format!("svc/src/main/java/com/acme/C{i}.java"),
+                    format!(
+                        "package com.acme;\nimport org.foo.B{i};\npublic class C{i} extends B{i} {{\n  private void h{i}() {{}}\n}}\n"
+                    ),
+                ));
+            }
+            let refs: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(p, s)| (p.as_str(), s.as_str()))
+                .collect();
+            work::take();
+            let r = run(&refs);
+            // Every head resolves in-repo, so the helper stays eligible: the
+            // walk ran, the ratio below is not vacuous.
+            assert_eq!(attrs(&r, "C0#h0()."), "eligible", "{n}");
+            work::take()
+        }
+        let (small, large) = (work_for(25), work_for(100));
         assert!(large <= small * 5, "{small} -> {large}");
     }
 }

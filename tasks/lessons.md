@@ -349,3 +349,7 @@
 ## 2026-10-10: a surviving mutant can indict the test, not the code
 - **Mistake:** the exports-exact-drop mutant survived because the test's exact-vs-`./*` case also resolves through the longest-match loop — the exact-first loop looked redundant. It is not: `./a` vs the longer pattern `./a*` resolves differently.
 - **Rule:** when a mutant survives, check whether the test lacks the discriminating shape before touching the code; add the minimal shape (`./a`-vs-`./a*`) that only the mechanism under test decides.
+
+## 2026-10-10: expose the level, don't mirror the walk
+- **Mistake (avoided):** the first S5 sketch mirrored `levels()` order in a second function to answer "did resolution reach on-demand". A second walk drifts from the first the moment either changes.
+- **Rule:** when a decision needs to know which branch a search took, return the branch from the search (here `levels()` returns its winning `TypeLevel`). One walk, no drift. The `callable=false` path never touches `members()`, so the extra return is recursion-safe by construction.
