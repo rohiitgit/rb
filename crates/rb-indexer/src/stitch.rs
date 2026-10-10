@@ -389,10 +389,28 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
             let url = folding.value(file, &call.url);
             let base_candidates = match (&base, &url) {
                 (Some((base_file, UrlValue::Contested(values))), Some(url)) if joins_base(url) => {
-                    values
-                        .iter()
-                        .filter_map(|v| folding.value(*base_file, v))
-                        .collect()
+                    let mut candidates: Vec<Folded> = Vec::new();
+                    for v in values {
+                        // A spread the pack could not read (contract M6b S5):
+                        // its object through the unique declaration, if any.
+                        if let UrlValue::Name { text, span } = v {
+                            let mut seen = HashSet::new();
+                            let mut objects = Vec::new();
+                            rb_frameworks::fold::object_values(
+                                &folding,
+                                *base_file,
+                                text,
+                                *span,
+                                &mut seen,
+                                &mut objects,
+                            );
+                            candidates.extend(
+                                objects.iter().filter_map(|o| folding.value(*base_file, o)),
+                            );
+                        }
+                        candidates.extend(folding.value(*base_file, v));
+                    }
+                    candidates
                 }
                 _ => Vec::new(),
             };
@@ -2782,7 +2800,8 @@ mod tests {
     /// Contract M4a amendment 12 (evaluator pass 2, Q1) from source: a base stated in the
     /// call's request config, or configured on a Spring client instance, decides the host; an
     /// external one is never path-matched, and a call overriding an instance's base never
-    /// relies on that instance's base (the evaluator's false `synthetic`).
+    /// relies on that instance's base (the evaluator's false `synthetic`). Contract M6b S5: a
+    /// config passed by name that names nothing readable is dynamic instead.
     #[test]
     fn bases_stated_at_the_call_or_on_the_instance_decide_the_host() {
         let calls = "import axios from \"axios\";\nimport { shared } from \"./http\";\nexport const api = axios.create({ baseURL: \"http://orders\" });\nexport async function f(body: unknown, cfg: object) {\n  await api.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.post(\"/charges\", body, { baseURL: \"https://api.stripe.com\" });\n  await api.get(\"/orders/1\");\n  await api.get(\"/orders/1\", cfg);\n  await shared.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/orders/1\");\n}\n";
@@ -2811,7 +2830,9 @@ mod tests {
                 // Both instances are exported, so their bases are never verified (Gate A,
                 // amendment 14): `heuristic`.
                 "web/src/calls.ts 7 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
-                "web/src/calls.ts 8 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
+                // A config passed by name that names nothing readable is dynamic
+                // (contract M6b S5), never suffix-matched.
+                "web/src/calls.ts 8 dynamic",
                 "web/src/calls.ts 9 external",
                 "web/src/calls.ts 10 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
             ]
@@ -3509,9 +3530,12 @@ mod tests {
     /// Contract M5 S19 (f) (M4a open item 21, part), from source: a stated base that cannot be
     /// decided but names an external host among its candidates is external, whatever the path
     /// (evaluator pass 3's `t10` with a resolvable spread, a `baseURL` before such a spread, a
-    /// nested spread, and `j07`'s two Spring bases); with only internal candidates, or none
-    /// (`t25`'s unreadable config, a spread of a parameter), the path is matched by suffix as
-    /// before. A URL that is absolute ignores the base and its candidates.
+    /// nested spread, and `j07`'s two Spring bases, now later-wins but still external through
+    /// the decided host); with only internal candidates the path is matched by suffix as
+    /// before. Contract M6b S5: a config passed by name that resolves to nothing readable is
+    /// dynamic (`t25`'s unreadable config), never suffix-matched; a spread it cannot read names
+    /// its value for cross-file resolution. A URL that is absolute ignores the base and its
+    /// candidates.
     #[test]
     fn contested_bases_with_an_external_candidate_are_external() {
         let ts = "import axios from \"axios\";\nconst api10 = axios.create({ baseURL: \"http://orders\" });\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst nested = { ...stripeOpts, timeout: 1 };\nconst ordersOpts = { baseURL: \"http://orders\" };\nexport async function f(cfg) {\n  await api10.get(\"/orders/1\", { ...stripeOpts });\n  await api10.get(\"/orders/1\", cfg);\n  await api10.get(\"/orders/1\", { baseURL: \"http://orders\", ...stripeOpts });\n  await api10.get(\"/orders/1\", { ...nested });\n  await api10.get(\"/orders/1\", { ...ordersOpts });\n  await api10.get(\"/orders/1\", { ...cfg });\n  await api10.get(\"http://orders/orders/1\", { ...stripeOpts });\n}\n";
@@ -3540,14 +3564,41 @@ mod tests {
             ),
             [
                 "pay/src/main/java/p/C7.java 7 external".to_owned(),
-                format!("pay/src/main/java/p/C8.java 7 {suffix}"),
+                // Later-wins restricts to the billing host, whose endpoints
+                // hold no such path: the suffix edge is gone.
+                "pay/src/main/java/p/C8.java 7 unmatched".to_owned(),
                 "web/src/t.ts 6 external".to_owned(),
-                format!("web/src/t.ts 7 {suffix}"),
+                "web/src/t.ts 7 dynamic".to_owned(),
                 "web/src/t.ts 8 external".to_owned(),
                 "web/src/t.ts 9 external".to_owned(),
                 format!("web/src/t.ts 10 {suffix}"),
                 format!("web/src/t.ts 11 {suffix}"),
                 "web/src/t.ts 12 heuristic -> HTTP GET /orders/{} @orders [heuristic] base=unverified match=exact".to_owned(),
+            ]
+        );
+    }
+
+    /// Contract M6b S5, from source: a spread from an imported const reads
+    /// its `baseURL` through the unique declaration. With an external base
+    /// among the candidates the site is external (no edge); with a service
+    /// base the relative path stitches as before.
+    #[test]
+    fn contested_cross_file_spreads() {
+        let opts = "export const extOpts = { baseURL: \"https://api.stripe.com\" };\nexport const orderOpts = { baseURL: \"http://orders\" };\n";
+        let use_ = "import axios from \"axios\";\nimport { extOpts, orderOpts } from \"./opts\";\nexport async function f() {\n  await axios.get(\"/a\", { ...extOpts });\n  await axios.get(\"/b\", { ...orderOpts });\n}\n";
+        let eps = vec![ep("GET", "/a", "orders"), ep("GET", "/b", "orders")];
+        assert_eq!(
+            stitched_bases(
+                &[
+                    ("web/opts.ts", Language::TypeScript, opts),
+                    ("web/use.ts", Language::TypeScript, use_),
+                ],
+                &eps,
+                &["web", "orders"],
+            ),
+            [
+                "web/use.ts 3 external".to_owned(),
+                "web/use.ts 4 heuristic -> HTTP GET /b @orders [heuristic] base=unresolved match=suffix".to_owned(),
             ]
         );
     }

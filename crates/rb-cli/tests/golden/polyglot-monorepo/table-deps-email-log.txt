@@ -10,6 +10,6 @@ precision=cha
 │      endpoint POST /internal/mfa/email  [exact]
 │      entry points: top-level 1
 └─ Through APIs (3)
-     @acme/web (apps/web)  via POST /api/v1/login of auth-service, then POST /internal/mfa/email of notification  [heuristic]
+     @acme/web (apps/web)  via POST /internal/mfa/email of notification  [synthetic]
      auth-service (services/auth)  via POST /internal/mfa/email of notification  [synthetic]
      billing (services/billing/cmd/billing)  via POST /internal/mfa/email of notification  [synthetic]

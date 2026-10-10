@@ -13,7 +13,7 @@ notification  (path: services/notification, deployable)
 ├─ Calls APIs of: none
 ├─ APIs called by (3)
 │    @acme/web  (apps/web)
-│      POST /internal/mfa/email  [ambiguous]  1 site
+│      POST /internal/mfa/email  [synthetic]  2 sites
 │    auth-service  (services/auth)
 │      POST /internal/mfa/email  [synthetic]  1 site
 │    billing  (services/billing/cmd/billing)
@@ -26,7 +26,7 @@ notification  (path: services/notification, deployable)
 ├─ Dependencies (0 services, 1 package)
 │    packages: 1
 ├─ Depended on by (3)
-│    @acme/web (apps/web)  via http  [ambiguous]  POST /internal/mfa/email
+│    @acme/web (apps/web)  via http  [synthetic]  POST /internal/mfa/email
 │    auth-service (services/auth)  via http  [synthetic]  POST /internal/mfa/email
 │    billing (services/billing/cmd/billing)  via http  [synthetic]  POST /internal/mfa/email
 ├─ Shares tables with: none

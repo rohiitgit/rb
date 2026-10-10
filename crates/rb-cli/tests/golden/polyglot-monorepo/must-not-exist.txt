@@ -22,6 +22,14 @@ HANDLED_BY * -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/Au
 EXPOSES * -> HTTP POST /internal/mfa/push @services/notification
 # Contract M4a item 5 (M4b S22): a relative call whose only path match is its own service's /sms.
 CONSUMES rb-heuristic . . . `services/notification/src/selfcheck.ts`/smsCheck(). -> *
+# Contract M6b S5: a config passed by name reads the object it names, so the
+# service base restricts the call to notification's endpoint alone (not the
+# billing decoy, which an unknown base would also match).
+CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendViaCfg(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
+# Contract M6b S5: a spread from an imported const reads its `baseURL`, so an
+# external candidate takes the call out of stitching entirely.
+CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendExternal(). -> HTTP POST /internal/mfa/email @services/notification
+CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendExternal(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
 # Contract M6b S4: a request served in-process never stitches, whatever its URL.
 CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main_test.go`/TestServeMfaInProcess(). -> *
 CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main_test.go`/TestProxyNotifyInProcess(). -> *

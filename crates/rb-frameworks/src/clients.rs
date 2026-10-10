@@ -10,8 +10,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rb_syntax::{
-    Arg, Binding, CallChain, CallLink, Decoration, DefKind, FileFacts, Init, Language, Span,
-    StrTemplate, TemplatePart, TokenRole,
+    Arg, Binding, CallChain, CallLink, Decoration, DefKind, FileFacts, Init, Language, ObjectEntry,
+    Span, StrTemplate, TemplatePart, TokenRole,
 };
 
 use crate::endpoint::norm_method;
@@ -62,7 +62,7 @@ pub enum UrlValue {
 }
 
 impl UrlValue {
-    fn of(arg: Option<&Arg>) -> Self {
+    pub(crate) fn of(arg: Option<&Arg>) -> Self {
         match arg {
             Some(Arg::Template { template }) => UrlValue::Template(template.clone()),
             Some(Arg::Name { text, span }) => UrlValue::Name {
@@ -956,7 +956,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
             && link.name == "create"
         {
             let verified = plain_config(link.args.first()) && gate.unchanged(bi, AXIOS_REQUESTS);
-            let base = create_base(link.args.first());
+            let base = create_base(facts, link.args.first());
             out.axios_instances.push(AxiosInstance {
                 name: b.name.clone(),
                 base: base.clone(),
@@ -984,9 +984,31 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
         // `axios(url | config)`, `axios(url, config)`.
         if chain.root.is_none() {
             if is_axios(&first.name, chain.span) && !first.args.is_empty() {
+                // A config passed by name reads the object it names
+                // (contract M6b S5).
+                let resolved;
                 let call = match first.args.first() {
                     Some(config @ Arg::Object { .. }) => {
                         config_call(facts, chain, None, None, config)
+                    }
+                    Some(Arg::Name { span, .. }) => {
+                        resolved =
+                            config_entries(facts, first.args.first()).map(|entries| Arg::Object {
+                                span: *span,
+                                entries: entries.to_vec(),
+                            });
+                        match resolved.as_ref() {
+                            Some(config) => config_call(facts, chain, None, None, config),
+                            None => axios_call(
+                                facts,
+                                chain,
+                                None,
+                                None,
+                                first.args.first(),
+                                None,
+                                first.args.get(1),
+                            ),
+                        }
                     }
                     url => axios_call(facts, chain, None, None, url, None, first.args.get(1)),
                 };
@@ -1004,7 +1026,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
             && let Some(link) = chain.links.get(1)
         {
             let plain = plain_config(first.args.first());
-            let base = create_base(first.args.first());
+            let base = create_base(facts, first.args.first());
             let from_carrier = base.is_some();
             if let Some(mut call) = axios_request(facts, chain, link, base, None) {
                 call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
@@ -1067,31 +1089,98 @@ fn axios_request(
     if verb != "request" {
         return None;
     }
+    // A config passed by name reads the object it names (contract M6b S5).
+    let resolved;
     Some(match link.args.first() {
         Some(config @ Arg::Object { .. }) => config_call(facts, chain, base, instance, config),
+        Some(Arg::Name { span, .. }) => {
+            resolved = config_entries(facts, link.args.first()).map(|entries| Arg::Object {
+                span: *span,
+                entries: entries.to_vec(),
+            });
+            match resolved.as_ref() {
+                Some(config) => config_call(facts, chain, base, instance, config),
+                None => unknown_request(facts, chain, base, instance),
+            }
+        }
         // A config that cannot be read: no URL, method or base, and not plain.
-        _ => ClientCall {
-            method: None,
-            url: UrlValue::Unknown,
-            base: Some(UrlValue::Unknown),
-            base_verified: Some(false),
-            ..axios_call(facts, chain, base, instance, None, None, None)
-        },
+        _ => unknown_request(facts, chain, base, instance),
     })
 }
 
-/// The base an `axios.create(config)` states (its last `baseURL`). A spread anywhere in the
-/// config makes the instance's carrier not plain ([`plain_config`]; spreads are never folded),
-/// so a spread after `baseURL` that may replace it leaves the base unverified.
-fn create_base(config: Option<&Arg>) -> Option<UrlValue> {
-    let Some(Arg::Object { entries, .. }) = config else {
-        return None;
-    };
-    entries
-        .iter()
-        .rev()
-        .find(|e| e.key == "baseURL")
-        .map(|e| UrlValue::of(Some(&e.value)))
+/// `request(config)` with a config that cannot be read: no URL, method or
+/// base, and not plain.
+fn unknown_request(
+    facts: &FileScope<'_>,
+    chain: &CallChain,
+    base: Option<UrlValue>,
+    instance: Option<String>,
+) -> ClientCall {
+    ClientCall {
+        method: None,
+        url: UrlValue::Unknown,
+        base: Some(UrlValue::Unknown),
+        base_verified: Some(false),
+        ..axios_call(facts, chain, base, instance, None, None, None)
+    }
+}
+
+/// The base an `axios.create(config)` states. An inline object or one named
+/// by a same-file binding reads its last `baseURL`, contested by a later
+/// spread as in [`config_base`]; a name that is not an object here (a URL
+/// string, a parameter) is kept for the indexer, which folds it; anything
+/// else states no base. A spread anywhere in the config makes the
+/// instance's carrier not plain ([`plain_config`]; spreads are never
+/// folded), so a spread after `baseURL` that may replace it leaves the base
+/// unverified.
+fn create_base(facts: &FileScope<'_>, config: Option<&Arg>) -> Option<UrlValue> {
+    if let Some(entries) = config_entries(facts, config) {
+        return match entries
+            .iter()
+            .rev()
+            .find(|e| e.key == "baseURL" || e.key == "...")
+        {
+            Some(e) if e.key == "baseURL" => Some(UrlValue::of(Some(&e.value))),
+            Some(_) => {
+                let mut candidates = Vec::new();
+                object_base_candidates(facts, entries, &mut HashSet::new(), &mut candidates);
+                Some(if candidates.is_empty() {
+                    UrlValue::Unknown
+                } else {
+                    UrlValue::Contested(candidates)
+                })
+            }
+            None => None,
+        };
+    }
+    match config? {
+        Arg::Name { text, span } => Some(UrlValue::Name {
+            text: text.clone(),
+            span: *span,
+        }),
+        _ => None,
+    }
+}
+
+/// The entries of a config object: inline, or named by a same-file object
+/// binding (contract M6b S5). Anything else (a parameter, an import, a call)
+/// is unreadable here; spreads it cannot read are named for the indexer by
+/// [`object_base_candidates`].
+fn config_entries<'a>(
+    facts: &'a FileScope<'_>,
+    config: Option<&'a Arg>,
+) -> Option<&'a [ObjectEntry]> {
+    match config? {
+        Arg::Object { entries, .. } => Some(entries),
+        Arg::Name { text, span } => match facts.binding_index_at(text, *span) {
+            Some(bi) => match &facts.bindings[bi].init {
+                Some(Init::Object { entries }) => Some(entries),
+                _ => None,
+            },
+            None => None,
+        },
+        _ => None,
+    }
 }
 
 /// The base a request config states (contract M4a amendment 12, Q1): `None` when the call has
@@ -1099,42 +1188,43 @@ fn create_base(config: Option<&Arg>) -> Option<UrlValue> {
 /// base applies; otherwise the stated base, [`UrlValue::Unknown`] when it cannot be read (a
 /// config that is not an object literal, a `baseURL` that is not a string or a name), and
 /// [`UrlValue::Contested`] when a spread may set it and the file states values it may take
-/// (contract M5 S19 (f): [`object_base_candidates`]).
+/// (contract M5 S19 (f): [`object_base_candidates`]). A config named by a same-file object
+/// binding reads its entries (contract M6b S5).
 fn config_base(facts: &FileScope<'_>, config: Option<&Arg>) -> Option<UrlValue> {
-    match config? {
-        Arg::Object { entries, .. } => {
-            match entries
-                .iter()
-                .rev()
-                .find(|e| e.key == "baseURL" || e.key == "...")
-            {
-                Some(e) if e.key == "baseURL" => Some(UrlValue::of(Some(&e.value))),
-                Some(_) => {
-                    let mut candidates = Vec::new();
-                    object_base_candidates(facts, entries, &mut HashSet::new(), &mut candidates);
-                    Some(if candidates.is_empty() {
-                        UrlValue::Unknown
-                    } else {
-                        UrlValue::Contested(candidates)
-                    })
-                }
-                None => None,
-            }
+    let config = config?;
+    let Some(entries) = config_entries(facts, Some(config)) else {
+        return Some(UrlValue::Unknown);
+    };
+    match entries
+        .iter()
+        .rev()
+        .find(|e| e.key == "baseURL" || e.key == "...")
+    {
+        Some(e) if e.key == "baseURL" => Some(UrlValue::of(Some(&e.value))),
+        Some(_) => {
+            let mut candidates = Vec::new();
+            object_base_candidates(facts, entries, &mut HashSet::new(), &mut candidates);
+            Some(if candidates.is_empty() {
+                UrlValue::Unknown
+            } else {
+                UrlValue::Contested(candidates)
+            })
         }
-        _ => Some(UrlValue::Unknown),
+        None => None,
     }
 }
 
 /// How many spread bindings [`object_base_candidates`] follows for one config.
-const MAX_SPREADS: usize = 4;
+pub(crate) const MAX_SPREADS: usize = 4;
 
 /// The `baseURL` values an object literal's entries may leave in effect (contract M5 S19 (f)),
 /// added to `out` in source order without repeats: from the last `baseURL` entry on, that
 /// entry's value and, for each later spread naming a binding initialised with an object literal
 /// (`const stripeOpts = { baseURL: … }`), the values of that object, followed the same way
-/// through its own spreads (a visited set and [`MAX_SPREADS`] bound the walk). A spread
-/// of anything else (a parameter, a call) names no value. Only readable values (a string or a
-/// name) are candidates.
+/// through its own spreads (a visited set and [`MAX_SPREADS`] bound the walk). A spread of
+/// anything else names its value (contract M6b S5): a parameter, an import or an unresolved
+/// name stays a name for the indexer, which folds it through its unique declaration. Only
+/// readable values (a string or a name) are candidates.
 fn object_base_candidates(
     facts: &FileScope<'_>,
     entries: &[rb_syntax::ObjectEntry],
@@ -1160,18 +1250,58 @@ fn object_base_candidates(
             continue;
         };
         let Some(bi) = facts.binding_index_at(text, *span) else {
+            // Not bound here (an import, a parameter): name it for the
+            // indexer, which folds it through its unique declaration.
+            let value = UrlValue::Name {
+                text: text.clone(),
+                span: *span,
+            };
+            if !out.iter().any(|v| same_value(v, &value)) {
+                out.push(value);
+            }
             continue;
         };
         if let Some(Init::Object { entries }) = &facts.bindings[bi].init
             && seen.insert(bi)
         {
             object_base_candidates(facts, entries, seen, out);
+        } else if facts.bindings[bi].init.is_none()
+            && !out
+                .iter()
+                .any(|v| matches!(v, UrlValue::Name { text: t, .. } if t == text))
+        {
+            // Bound but unreadable here (a parameter): same, name it.
+            out.push(UrlValue::Name {
+                text: text.clone(),
+                span: *span,
+            });
         }
     }
 }
 
+/// A config passed by name that names nothing readable here and no string
+/// (contract M6b S5): a parameter, an import, or anything not an object or a
+/// string literal. Its call is dynamic (below), never suffix-matched on its
+/// tail; a name that folds to a URL keeps today's handling.
+fn unreadable_config(facts: &FileScope<'_>, config: Option<&Arg>) -> bool {
+    let Some(Arg::Name { text, span }) = config else {
+        return false;
+    };
+    if config_entries(facts, config).is_some() {
+        return false;
+    }
+    !matches!(
+        facts
+            .binding_index_at(text, *span)
+            .and_then(|bi| facts.bindings[bi].init.as_ref()),
+        Some(Init::Template { .. })
+    )
+}
+
 /// An axios call with its URL argument (`url`), its method (`None`: from the config, default
 /// GET) and its request config: a base the config states replaces the instance's `base`.
+/// A config passed by name that names nothing readable makes the call dynamic, whatever the
+/// URL (contract M6b S5).
 fn axios_call(
     facts: &FileScope<'_>,
     chain: &CallChain,
@@ -1186,6 +1316,27 @@ fn axios_call(
         Some(Arg::Object { .. }) => method_entry(config).unwrap_or(Some("GET".to_owned())),
         Some(_) => None,
     });
+    // A config passed by name reads the object it names (contract M6b S5):
+    // its entries decide the base and Gate A plainness below.
+    let resolved;
+    let config = match config {
+        Some(Arg::Name { span, .. }) => match config_entries(facts, config) {
+            Some(entries) => {
+                resolved = Arg::Object {
+                    span: *span,
+                    entries: entries.to_vec(),
+                };
+                Some(&resolved)
+            }
+            None => config,
+        },
+        _ => config,
+    };
+    let url = if unreadable_config(facts, config) {
+        None
+    } else {
+        url
+    };
     ClientCall {
         kind: ClientKind::Axios,
         method,
@@ -1675,6 +1826,11 @@ impl<'s, 'f> SpringBases<'s, 'f> {
     /// configures is injected: its base is left to the indexer, which reads the `@Bean` method
     /// its injection point resolves to (contract M4b S21; such an instance is never a plain
     /// carrier, so its base is never verified).
+    ///
+    /// Contract M6b S5: configuring statements are ordered by source position, later wins.
+    /// A statement the file cannot read keeps the agreed-or-contested rule (its value could
+    /// be anywhere). Any second configuring statement already fails the carrier scan, so a
+    /// later-wins base never reaches `synthetic`.
     fn of(&self, receiver: Option<usize>) -> SpringBase {
         let unknown = SpringBase {
             value: UrlValue::Unknown,
@@ -1685,53 +1841,100 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             return unknown;
         };
         let b = &self.facts.bindings[bi];
-        let mut facts: Vec<BaseFact> = Vec::new();
+        // (source position, what was stated), the initialiser first.
+        let mut stated: Vec<(Span, BaseFact)> = Vec::new();
+        let mut unreadable = false;
         match &b.init {
             Some(Init::Call { chain }) => {
                 if let Some(c) = self.facts.chains.get(*chain) {
-                    facts.push(chain_base(self.facts, c, c.links.len()));
+                    match chain_base(self.facts, c, c.links.len()) {
+                        fact @ (BaseFact::Stated(_) | BaseFact::Fresh) => {
+                            stated.push((c.span, fact));
+                        }
+                        BaseFact::Unreadable => unreadable = true,
+                    }
                 }
             }
             // A constructor argument (a request factory, converters) sets no root URI.
-            Some(Init::New { .. }) => facts.push(BaseFact::Fresh),
-            Some(_) => facts.push(BaseFact::Unreadable),
+            Some(Init::New { .. }) => stated.push((b.span, BaseFact::Fresh)),
+            Some(_) => unreadable = true,
             None => {}
         }
         for &ci in self.configured.get(&bi).into_iter().flatten() {
             let c = &self.facts.chains[ci];
-            facts.push(chain_base(self.facts, c, c.links.len()));
+            match chain_base(self.facts, c, c.links.len()) {
+                fact @ (BaseFact::Stated(_) | BaseFact::Fresh) => {
+                    stated.push((c.span, fact));
+                }
+                BaseFact::Unreadable => unreadable = true,
+            }
         }
-        if facts.is_empty() {
+        if stated.is_empty() && !unreadable {
             return SpringBase {
                 injected: true,
                 ..unknown
             };
         }
-        let Some(value) = agreed(&facts) else {
+        if unreadable {
             // Several bases, or one that cannot be read: the stated ones are the candidates
             // (contract M5 S19 (f)).
-            let mut candidates: Vec<UrlValue> = Vec::new();
-            for f in &facts {
-                if let BaseFact::Stated(v) = f
-                    && *v != UrlValue::Unknown
-                    && !candidates.iter().any(|c| same_value(c, v))
-                {
-                    candidates.push(v.clone());
-                }
-            }
+            return self.contested(&stated, unknown);
+        }
+        // Every statement read: agreement as before, else the later statement wins.
+        let values: Vec<&UrlValue> = stated
+            .iter()
+            .filter_map(|(_, f)| match f {
+                BaseFact::Stated(v) => Some(v),
+                BaseFact::Fresh | BaseFact::Unreadable => None,
+            })
+            .collect();
+        let Some(first) = values.first() else {
             return SpringBase {
-                value: if candidates.is_empty() {
-                    UrlValue::Unknown
-                } else {
-                    UrlValue::Contested(candidates)
-                },
+                value: UrlValue::Unknown,
                 ..unknown
             };
         };
+        if values.iter().all(|v| same_value(v, first)) {
+            return SpringBase {
+                value: (*first).clone(),
+                injected: false,
+                read: true,
+            };
+        }
+        stated.sort_by_key(|(span, _)| (span[0], span[1], span[2], span[3]));
+        let last = stated.iter().rev().find_map(|(_, f)| match f {
+            BaseFact::Stated(v) if *v != UrlValue::Unknown => Some(v.clone()),
+            _ => None,
+        });
+        match last {
+            Some(value) => SpringBase {
+                value,
+                injected: false,
+                read: true,
+            },
+            None => self.contested(&stated, unknown),
+        }
+    }
+
+    /// The stated values as candidates (contract M5 S19 (f)): contested when
+    /// they name anything readable, unknown otherwise.
+    fn contested(&self, stated: &[(Span, BaseFact)], unknown: SpringBase) -> SpringBase {
+        let mut candidates: Vec<UrlValue> = Vec::new();
+        for (_, f) in stated {
+            if let BaseFact::Stated(v) = f
+                && *v != UrlValue::Unknown
+                && !candidates.iter().any(|c| same_value(c, v))
+            {
+                candidates.push(v.clone());
+            }
+        }
         SpringBase {
-            value,
-            injected: false,
-            read: true,
+            value: if candidates.is_empty() {
+                UrlValue::Unknown
+            } else {
+                UrlValue::Contested(candidates)
+            },
+            ..unknown
         }
     }
 }
@@ -1754,7 +1957,7 @@ fn agreed(facts: &[BaseFact]) -> Option<UrlValue> {
 }
 
 /// Two URL values with the same text (spans aside).
-fn same_value(a: &UrlValue, b: &UrlValue) -> bool {
+pub(crate) fn same_value(a: &UrlValue, b: &UrlValue) -> bool {
     match (a, b) {
         (UrlValue::Template(x), UrlValue::Template(y)) => {
             x.parts.len() == y.parts.len()
@@ -2732,17 +2935,18 @@ mod tests {
                 "axios POST '/charges' base='https://api.stripe.com'",
                 "axios POST '/charges' base='http://orders'",
                 "axios GET '/a' base='http://orders'",
-                // A request config that is not a plain object literal (a variable, a spread)
-                // may hold an `adapter`: not plain, whatever the base (amendment 15).
-                "axios GET '/b' base=? unverified",
-                "axios GET '/c' base=? unverified",
+                // A request config passed by name that names nothing readable
+                // is dynamic (contract M6b S5); a spread it cannot read names
+                // its value for cross-file resolution.
+                "axios GET ? base=? unverified",
+                "axios GET '/c' base=?[cfg] unverified",
                 "axios GET '/d' base='https://x.io' unverified",
                 "axios GET '/e' base=?",
                 "axios GET '/f' base=B",
                 "axios POST '/h'",
-                "axios PUT '/i' base=? unverified",
+                "axios PUT ? base=? unverified",
                 "axios ? ? base=? unverified",
-                "axios ? '/j' base=? unverified",
+                "axios ? ? base=? unverified",
                 "axios DELETE '/k' base='https://api.stripe.com'",
                 "axios GET '/l' base='https://api.stripe.com' instance=shared",
                 "axios GET '/m' instance=shared",
@@ -2775,7 +2979,7 @@ mod tests {
                 "rest_template GET '/v' base='http://visits' unverified",
                 "web_client GET '/v1/charges' base='https://api.stripe.com' unverified",
                 // Two bases: contested, with both as candidates (contract M5 S19 (f)).
-                "web_client GET '/z' base=?['http://a'|'http://b'] unverified",
+                "web_client GET '/z' base='http://b' unverified",
                 "web_client GET '/u' base='http://users' unverified",
             ]
         );
@@ -2885,7 +3089,7 @@ mod tests {
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
-                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base=?['http://orders'|'https://api.stripe.com'] unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios POST '/orders/1' base='http://orders' unverified",
@@ -2977,7 +3181,7 @@ mod tests {
             calls(Language::TypeScript, ts),
             [
                 "axios GET '/orders/1' base='http://orders'",
-                "axios POST '/orders' base='http://orders' unverified",
+                "axios POST '/orders' base=?['http://orders'|o] unverified",
                 "axios GET '/r'",
             ]
         );
@@ -3046,7 +3250,7 @@ mod tests {
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
-                "axios GET 'http://orders/orders/1' unverified",
+                "axios GET 'http://orders/orders/1' base=cfg unverified",
                 "axios GET 'http://orders/orders/1' unverified",
                 "axios GET 'http://orders/orders/1' unverified",
                 "axios GET '/orders/1' base='http://orders'",
@@ -3628,12 +3832,100 @@ mod tests {
         );
     }
 
+    /// Contract M6b S5: an `axios.create` whose last base-setting entry is
+    /// a spread is contested, like a request config; a spread before the
+    /// last `baseURL` is shadowed (later properties win in the literal).
+    /// `create(cfg)` reads a same-file object or URL it names, and states
+    /// no base otherwise (as before).
+    #[test]
+    fn axios_create_spread_bases() {
+        let src = "import axios from \"axios\";\nimport { extOpts } from \"./opts\";\nconst API = \"http://gateway\";\nconst local = { baseURL: \"http://orders\" };\nexport async function f() {\n  const spreadOnly = axios.create({ ...local });\n  const shadowed = axios.create({ ...local, baseURL: \"http://a\" });\n  const overriding = axios.create({ baseURL: \"http://b\", ...local });\n  const imported = axios.create({ ...extOpts });\n  const byName = axios.create(local);\n  const byString = axios.create(API);\n  const byParam = axios.create(cfg);\n  await spreadOnly.get(\"/s\");\n  await shadowed.get(\"/s\");\n  await overriding.get(\"/o\");\n  await imported.get(\"/i\");\n  await byName.get(\"/n\");\n  await byString.get(\"/u\");\n  await byParam.get(\"/p\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios GET '/s' base=?['http://orders'] unverified",
+                "axios GET '/s' base='http://a' unverified",
+                "axios GET '/o' base=?['http://b'|'http://orders'] unverified",
+                "axios GET '/i' base=?[extOpts] unverified",
+                "axios GET '/n' base='http://orders' unverified",
+                "axios GET '/u' base=API unverified",
+                "axios GET '/p' base=cfg unverified",
+            ]
+        );
+    }
+
+    /// Contract M6b S5: a config passed by name reads the object it names —
+    /// `axios(cfg)` parses `url`/`method`/`baseURL` from its entries, and a
+    /// request config in an object binding replaces the instance's base. A
+    /// name that folds to a URL stays a URL; one that names nothing readable
+    /// is dynamic, never suffix-matched on its tail.
+    #[test]
+    fn axios_by_name_configs() {
+        let src = "import axios from \"axios\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nconst API = \"http://gateway/orders/1\";\nconst cfg = { url: \"/x\", method: \"post\", baseURL: \"http://pay\" };\nconst rcfg = { url: \"/r\", method: \"delete\" };\nconst headers = { headers: {} };\nexport async function f(params) {\n  await axios(cfg);\n  await axios(API);\n  await axios(params);\n  await axios.request(rcfg);\n  await axios.request(params);\n  await api.get(\"/h\", headers);\n  await api.get(\"/u\", API);\n  await api.get(\"/p\", params);\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios POST '/x' base='http://pay'",
+                "axios GET API",
+                "axios GET params",
+                "axios DELETE '/r'",
+                "axios ? ? base=? unverified",
+                "axios GET '/h' base='http://orders'",
+                "axios GET '/u' base=? unverified",
+                "axios GET ? base=? unverified",
+            ]
+        );
+    }
+
+    /// Contract M6b S5: a spread the file cannot read names its value for
+    /// the indexer, which folds it through a uniquely resolved declaration
+    /// (a same-file object is expanded here as before).
+    #[test]
+    fn object_spread_names_unreadable_forms() {
+        let src = "import axios from \"axios\";\nimport { extOpts } from \"./opts\";\nconst local = { baseURL: \"http://orders\" };\nexport async function f(cfg) {\n  await axios.get(\"/a\", { ...local });\n  await axios.get(\"/b\", { ...extOpts });\n  await axios.get(\"/c\", { ...cfg });\n  await axios.get(\"/d\", { ...missing });\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios GET '/a' base=?['http://orders'] unverified",
+                "axios GET '/b' base=?[extOpts] unverified",
+                "axios GET '/c' base=?[cfg] unverified",
+                "axios GET '/d' base=?[missing] unverified",
+            ]
+        );
+    }
+
+    /// Contract M6b S5: Spring configuring statements are ordered by source
+    /// position, later wins. An unreadable statement anywhere keeps the
+    /// agreed-or-contested rule (its value could be anywhere).
+    #[test]
+    fn spring_configuring_statements_later_wins() {
+        let two = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C {\n  private final RestTemplate rt = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  C() { rt.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://users\")); }\n  String m() { return rt.getForObject(\"/x\", String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, two),
+            ["rest_template GET '/x' base='https://users' unverified"]
+        );
+        // One statement: as before.
+        let one = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nclass C {\n  private final RestTemplate rt = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  String m() { return rt.getForObject(\"/x\", String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, one),
+            ["rest_template GET '/x' base='http://orders' unverified"]
+        );
+        // An unreadable statement keeps the contested rule.
+        let mixed = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C {\n  private final RestTemplate rt;\n  C(RestTemplateBuilder b) { this.rt = b.build(); }\n  void n() { rt.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://users\")); }\n  String m() { return rt.getForObject(\"/x\", String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, mixed),
+            ["rest_template GET '/x' base=?['https://users'] unverified"]
+        );
+    }
+
     /// Contract M5 S19 (f) (M4a open item 21, part): a base that cannot be decided names the
     /// values the file states it may take. An axios request config whose last base-setting
     /// entry is a spread: the spread's object literal (one held by a binding, followed through
-    /// nested spreads) and the `baseURL` before it; a Spring client configured with two
-    /// bases: both. An unreadable config (`cfg`, t25) or a spread of a parameter names none,
-    /// and a `baseURL` after the spread decides the base.
+    /// nested spreads) and the `baseURL` before it. Contract M6b S5: a spread nothing here
+    /// resolves names its value for the indexer (which folds it through its unique
+    /// declaration), and Spring configuring statements are ordered by source position instead
+    /// (later wins), so `j07` now reads the setter's base while the contested rule stays for
+    /// any unreadable statement.
     #[test]
     fn contested_bases_name_their_candidates() {
         let ts = "import axios from \"axios\";\nconst api10 = axios.create({ baseURL: \"http://orders\" });\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst nested = { ...stripeOpts, timeout: 1 };\nconst ordersOpts = { baseURL: \"http://orders\" };\nconst self = { ...self };\nexport async function f(cfg) {\n  await api10.get(\"/orders/1\", { ...stripeOpts });\n  await api10.get(\"/orders/1\", cfg);\n  await api10.get(\"/orders/1\", { baseURL: \"http://orders\", ...stripeOpts });\n  await api10.get(\"/orders/1\", { ...stripeOpts, baseURL: \"http://orders\" });\n  await api10.get(\"/orders/1\", { ...nested });\n  await api10.get(\"/orders/1\", { ...ordersOpts });\n  await api10.get(\"/orders/1\", { ...self });\n  await api10.get(\"/orders/1\", { ...cfg });\n}\n";
@@ -3641,21 +3933,19 @@ mod tests {
             calls(Language::TypeScript, ts),
             [
                 "axios GET '/orders/1' base=?['https://api.stripe.com'] unverified",
-                "axios GET '/orders/1' base=? unverified",
+                "axios GET ? base=? unverified",
                 "axios GET '/orders/1' base=?['http://orders'|'https://api.stripe.com'] unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base=?['https://api.stripe.com'] unverified",
                 "axios GET '/orders/1' base=?['http://orders'] unverified",
-                "axios GET '/orders/1' base=? unverified",
-                "axios GET '/orders/1' base=? unverified",
+                "axios GET '/orders/1' base=?[self] unverified",
+                "axios GET '/orders/1' base=?[cfg] unverified",
             ]
         );
         let j07 = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C7 {\n  private final RestTemplate rt7 = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  C7() { rt7.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://api.stripe.com\")); }\n  String j07() { return rt7.getForObject(\"/orders/1\", String.class); }\n}\n";
         assert_eq!(
             calls(Language::Java, j07),
-            [
-                "rest_template GET '/orders/1' base=?['http://orders'|'https://api.stripe.com'] unverified"
-            ]
+            ["rest_template GET '/orders/1' base='https://api.stripe.com' unverified"]
         );
     }
 

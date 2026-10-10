@@ -9,8 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use rb_syntax::{Binding, DefKind, FileFacts, Init, Language, Span, StrTemplate, TemplatePart};
+use rb_syntax::{
+    Arg, Binding, DefKind, FileFacts, Init, Language, ObjectEntry, Span, StrTemplate, TemplatePart,
+};
 
+use crate::clients::{MAX_SPREADS, UrlValue};
 use crate::endpoint::Piece;
 use crate::routes::FileScope;
 
@@ -297,6 +300,90 @@ pub(crate) fn local_binding(
         // The innermost enclosing type wins.
         .max_by_key(|(_, b)| b.scope)
         .map(|(i, _)| i)
+}
+
+/// The `baseURL` values a spread name may leave in effect, read through its
+/// declaration (contract M6b S5): a same-file object binding's entries, or —
+/// through [`Lookup::external`] — a uniquely resolved declaration's object
+/// entries, with spreads followed the same way (visited set, the pack's
+/// [`MAX_SPREADS`](crate::clients::MAX_SPREADS) bound). A name that folds to
+/// a string, resolves ambiguously or not at all, or names no object
+/// contributes nothing here (strings fold through the normal path; anything
+/// else is a hole there too).
+///
+/// Values come back as written: entry values keep their defining spans, so
+/// the caller folds them where it folds everything else (usually the use
+/// site; a literal needs no context, a name resolves where it is visible).
+pub fn object_values(
+    lookup: &dyn Lookup,
+    file: usize,
+    name: &str,
+    at: Span,
+    seen: &mut HashSet<(usize, Span)>,
+    out: &mut Vec<UrlValue>,
+) {
+    crate::work::tick(1);
+    if seen.len() >= MAX_SPREADS {
+        return;
+    }
+    let scope = FileScope::new(lookup.facts(file));
+    if let Some(bi) = scope.binding_index_at(name, at)
+        && let Some(Init::Object { entries }) = &scope.bindings[bi].init
+    {
+        let key = (file, scope.bindings[bi].span);
+        if seen.insert(key) {
+            object_entries(lookup, file, entries, seen, out);
+        }
+        return;
+    }
+    let Some((target, bi)) = lookup.external(file, name, at) else {
+        return;
+    };
+    let facts = lookup.facts(target);
+    let key = (target, facts.bindings[bi].span);
+    if !seen.insert(key) {
+        return;
+    }
+    if let Some(Init::Object { entries }) = &facts.bindings[bi].init {
+        object_entries(lookup, target, entries, seen, out);
+    }
+}
+
+/// The `baseURL` values `entries` may leave in effect: its literals and
+/// names from the last `baseURL` on, and its spreads through
+/// [`object_values`].
+fn object_entries(
+    lookup: &dyn Lookup,
+    file: usize,
+    entries: &[ObjectEntry],
+    seen: &mut HashSet<(usize, Span)>,
+    out: &mut Vec<UrlValue>,
+) {
+    let from = entries
+        .iter()
+        .rposition(|e| e.key == "baseURL")
+        .unwrap_or(0);
+    for e in &entries[from..] {
+        crate::work::tick(1);
+        if e.key == "baseURL" {
+            push_value(out, &UrlValue::of(Some(&e.value)));
+            continue;
+        }
+        if e.key != "..." {
+            continue;
+        }
+        let Arg::Name { text, span } = &e.value else {
+            continue;
+        };
+        object_values(lookup, file, text, *span, seen, out);
+    }
+}
+
+/// A readable value, once, without repeats.
+fn push_value(out: &mut Vec<UrlValue>, value: &UrlValue) {
+    if *value != UrlValue::Unknown && !out.iter().any(|v| crate::clients::same_value(v, value)) {
+        out.push(value.clone());
+    }
 }
 
 /// Resolves `${k}` / `${k:default}` placeholders in a Spring string.
@@ -694,20 +781,33 @@ mod tests {
             let (head, member) = name
                 .rsplit_once('.')
                 .map_or((None, name), |(h, m)| (Some(h), m));
-            let target = match head {
+            let mut targets = Vec::new();
+            match head {
                 // TS: a named import.
                 None => {
-                    let import = facts
+                    for import in facts
                         .imports
                         .iter()
-                        .find(|i| i.names.iter().any(|n| n.local == name))?;
-                    let module = import.module.trim_start_matches("./");
-                    self.files.iter().position(|(_, _, p)| *p == module)?
+                        .filter(|i| i.names.iter().any(|n| n.local == name))
+                    {
+                        let module = import.module.trim_start_matches("./");
+                        if let Some(target) = self.files.iter().position(|(_, _, p)| *p == module) {
+                            targets.push(target);
+                        }
+                    }
                 }
                 // Java `Type.CONST` / Go `pkg.Const`: a file named like the qualifier.
-                Some(h) => self.files.iter().position(|(_, _, p)| *p == h)?,
+                Some(h) => {
+                    if let Some(target) = self.files.iter().position(|(_, _, p)| *p == h) {
+                        targets.push(target);
+                    }
+                }
+            }
+            // Like the real resolution: an ambiguous name resolves nowhere.
+            let [target] = targets.as_slice() else {
+                return None;
             };
-            Some((target, self.top_level(target, member)?))
+            Some((*target, self.top_level(*target, member)?))
         }
         fn property(&self, _file: usize, key: &str) -> Option<String> {
             self.properties.get(key).cloned()
@@ -1079,5 +1179,194 @@ mod tests {
         assert_eq!(p.get("esc").map(String::as_str), Some("tab\there A"));
         assert_eq!(p.get("empty").map(String::as_str), Some(""));
         assert_eq!(p.len(), 6);
+    }
+
+    /// Renders `baseURL` values as written: literals quoted, names bare.
+    fn shown_values(values: &[crate::clients::UrlValue]) -> Vec<String> {
+        values
+            .iter()
+            .map(|v| match v {
+                crate::clients::UrlValue::Template(t) => format!(
+                    "'{}'",
+                    t.parts
+                        .iter()
+                        .map(|p| match p {
+                            TemplatePart::Lit { text } => text.clone(),
+                            TemplatePart::Hole { expr, .. } => format!("{{{expr}}}"),
+                        })
+                        .collect::<String>()
+                ),
+                crate::clients::UrlValue::Name { text, .. } => text.clone(),
+                crate::clients::UrlValue::Unknown => "?".into(),
+                crate::clients::UrlValue::Contested(_) => "contested".into(),
+            })
+            .collect()
+    }
+
+    /// The `baseURL` values the spread `...{name}` in file 0 may leave, read
+    /// through a uniquely resolved declaration (contract M6b S5).
+    fn spread_values(files: &Files, file: usize, name: &str) -> Vec<String> {
+        let facts = files.facts(file);
+        let span = facts
+            .chains
+            .iter()
+            .flat_map(|c| &c.links)
+            .flat_map(|l| &l.args)
+            .find_map(|a| match a {
+                rb_syntax::Arg::Name { text, span } if text == name => Some(*span),
+                _ => None,
+            })
+            .unwrap();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        object_values(files, file, name, span, &mut seen, &mut out);
+        shown_values(&out)
+    }
+
+    /// Contract M6b S5: a spread name resolves through a unique declaration
+    /// to the object it holds, across files. An ambiguous or missing target,
+    /// a cycle, a string (which folds through the normal path) and a
+    /// parameter name contribute nothing here.
+    #[test]
+    fn object_values_resolve_through_unique_declarations() {
+        let files = Files::new(&[
+            (
+                Language::TypeScript,
+                "use",
+                "import { sharedOpts } from \"./opts\";\nimport { multi } from \"./multi\";\nget(sharedOpts, multi);\n",
+            ),
+            (
+                Language::TypeScript,
+                "opts",
+                "export const sharedOpts = { baseURL: \"http://orders\" };\n",
+            ),
+            (
+                Language::TypeScript,
+                "multi",
+                "import { deep } from \"./deep\";\nexport const multi = { ...deep, retries: 1 };\n",
+            ),
+            (
+                Language::TypeScript,
+                "deep",
+                "export const deep = { baseURL: \"https://api.stripe.com\" };\n",
+            ),
+        ]);
+        assert_eq!(spread_values(&files, 0, "sharedOpts"), ["'http://orders'"]);
+        // Through two files of spreads.
+        assert_eq!(
+            spread_values(&files, 0, "multi"),
+            ["'https://api.stripe.com'"]
+        );
+        // A string constant folds normally, so it contributes no object value.
+        let strings = Files::new(&[
+            (
+                Language::TypeScript,
+                "use",
+                "import { API } from \"./consts\";\nget(API);\n",
+            ),
+            (
+                Language::TypeScript,
+                "consts",
+                "export const API = \"http://orders\";\n",
+            ),
+        ]);
+        assert!(spread_values(&strings, 0, "API").is_empty());
+        // Ambiguous (the same local imported twice — the extractor keeps
+        // both, the real resolution resolves neither), missing and cyclic
+        // targets: none.
+        let ambiguous = Files::new(&[
+            (
+                Language::TypeScript,
+                "use",
+                "import { dup } from \"./a\";\nimport { dup } from \"./b\";\nget(dup);\n",
+            ),
+            (
+                Language::TypeScript,
+                "a",
+                "export const dup = { baseURL: \"http://a\" };\n",
+            ),
+            (
+                Language::TypeScript,
+                "b",
+                "export const dup = { baseURL: \"http://b\" };\n",
+            ),
+        ]);
+        assert!(spread_values(&ambiguous, 0, "dup").is_empty());
+        let cyclic = Files::new(&[
+            (
+                Language::TypeScript,
+                "use",
+                "import { ca } from \"./ca\";\nget(ca);\n",
+            ),
+            (
+                Language::TypeScript,
+                "ca",
+                "import { cb } from \"./cb\";\nexport const ca = { ...cb };\n",
+            ),
+            (
+                Language::TypeScript,
+                "cb",
+                "import { ca } from \"./ca\";\nexport const cb = { ...ca };\n",
+            ),
+        ]);
+        assert!(spread_values(&cyclic, 0, "ca").is_empty());
+    }
+
+    /// Contract M6b S5, invariant 9: n distinct spread names cost linear
+    /// work — 4× the names makes at most 5× the counted steps, the same
+    /// pattern the stitcher runs (one expansion per contested name).
+    #[test]
+    fn object_values_grow_linearly() {
+        fn work(n: usize) -> u64 {
+            // Only the mock's paths need `'static`; the sources are borrowed.
+            let mut paths: Vec<&'static str> = Vec::new();
+            let mut sources: Vec<String> = Vec::new();
+            let mut use_src = String::new();
+            for i in 0..n {
+                use_src.push_str(&format!("import {{ o{i} }} from \"./o{i}\";\n"));
+            }
+            use_src.push_str("get(");
+            for i in 0..n {
+                use_src.push_str(&format!("o{i}, "));
+            }
+            use_src.push_str(");\n");
+            sources.push(use_src);
+            paths.push("use");
+            for i in 0..n {
+                paths.push(Box::leak(format!("o{i}").into_boxed_str()));
+                sources.push(format!(
+                    "export const o{i} = {{ baseURL: \"http://o{i}\" }};\n"
+                ));
+            }
+            let refs: Vec<(Language, &'static str, &str)> = paths
+                .iter()
+                .zip(sources.iter())
+                .map(|(p, s)| (Language::TypeScript, *p, s.as_str()))
+                .collect();
+            let files = Files::new(&refs);
+            let facts = files.facts(0);
+            let names: Vec<(String, Span)> = facts
+                .chains
+                .iter()
+                .flat_map(|c| &c.links)
+                .flat_map(|l| &l.args)
+                .filter_map(|a| match a {
+                    rb_syntax::Arg::Name { text, span } => Some((text.clone(), *span)),
+                    _ => None,
+                })
+                .collect();
+            crate::work::take();
+            let mut total = 0;
+            for (name, span) in &names {
+                let mut seen = HashSet::new();
+                let mut out = Vec::new();
+                object_values(&files, 0, name, *span, &mut seen, &mut out);
+                total += out.len();
+            }
+            assert_eq!(total, n);
+            crate::work::take()
+        }
+        let (small, large) = (work(25), work(100));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 }

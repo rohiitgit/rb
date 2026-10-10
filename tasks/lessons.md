@@ -309,3 +309,7 @@
 ## 2026-10-10: a shared DB container bind-mounts its own checkout's `var/`
 - **Mistake (environment):** this workspace's e2e failed on AGE loads because the running compose database (started from the original checkout) bind-mounts that checkout's `var/age-load`, not this workspace's. Replacing this workspace's (gitignored) `var/age-load` with a symlink to the mounted directory fixed it.
 - **Rule:** when e2e fails on loader paths with a shared database, inspect the container's mounts (`docker inspect … .Mounts`) and point the workspace's gitignored load dir at the mounted source. Never restart or move the shared database for a workspace-local problem.
+
+## 2026-10-10: axios verbs take data before config — a config in arg 1 is data
+- **Mistake (caught by e2e):** the S5 fixture wrote `axios.post(url, { ...extOpts })`, putting the spread config in the data position (`post`/`put`/`patch` take `(url, data, config)`); the site stitched exactly like the config-less control, and the stitch unit drafted the same way failed first for the same reason. Only `get`/`delete`/`head`/`options` take `(url, config)`.
+- **Rule:** when a fixture or unit exercises a request config, match the verb's arity first (`get(url, config)` for two-arg configs, `post(url, data, config)` for three); assert the pack-level `base=` rendering in the unit before trusting the stitch-level bucket. A config-shaped second argument to a three-arg verb is data, silently.

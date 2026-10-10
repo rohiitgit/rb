@@ -1,5 +1,5 @@
 .	acme	library	8 files
-apps/web	@acme/web	service	7 files
+apps/web	@acme/web	service	8 files
 gateway	edge-gateway	service	1 file
 packages/shared	@acme/shared	library	3 files
 services/auth	auth-service	service	7 files

@@ -1,1 +1,1 @@
-  code: 27.6% of references to own code resolved (8 resolved, 0 ambiguous, 21 unresolved; 46 external); 0 exact calls (scip)
+  code: 27.6% of references to own code resolved (8 resolved, 0 ambiguous, 21 unresolved; 48 external); 0 exact calls (scip)

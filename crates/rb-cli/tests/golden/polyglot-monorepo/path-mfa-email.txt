@@ -2,6 +2,7 @@ Request path: POST /internal/mfa/email  [notification]
 precision=cha
 Statically possible paths from the call graph and HTTP stitching, not a trace of one request.
 UPSTREAM
+  client resendViaCfg().  apps/web/src/api/mfa.ts:13  [@acme/web]  [synthetic]  (host notification)
   client MfaClient#sendCode().  services/auth/src/main/java/com/acme/auth/MfaClient.java:9  [auth-service]  [synthetic]  (host notification)
     ← AuthController#login().  services/auth/src/main/java/com/acme/auth/AuthController.java:17  [auth-service]  [heuristic]
       ⇐ entered at POST /api/v1/login  [auth-service]  [exact, branch heuristic]
@@ -12,9 +13,9 @@ UPSTREAM
     ← payInvoice().  services/billing/cmd/billing/main.go:20  [billing]  [heuristic]
       ⇐ entered at POST /billing/invoices/{}/pay  [billing]  [heuristic]
         client payInvoice().  apps/web/src/api/billing.ts:2  [@acme/web]  [heuristic]  (suffix match)
-  client resend().  apps/web/src/api/mfa.ts:4  [@acme/web]  [ambiguous]  (2 candidates)
+  client resend().  apps/web/src/api/mfa.ts:5  [@acme/web]  [ambiguous]  (2 candidates)
 ENDPOINT  POST /internal/mfa/email  [notification]
 DOWNSTREAM
   services/notification/src/server.ts (top-level code)  [notification]  [exact]
     → QUERIES public.email_log (insert)  [exact]
-certainty: exact 3, synthetic 2, heuristic 7, ambiguous 1
+certainty: exact 3, synthetic 3, heuristic 7, ambiguous 1
