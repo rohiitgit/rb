@@ -228,7 +228,8 @@ fn is_builtin(language: Language, name: &str) -> bool {
 }
 
 /// What a qualifier such as `this.repo` or `util` stands for.
-enum Container<'a> {
+/// A call qualifier's receiver.
+pub(crate) enum Container<'a> {
     Types(Vec<Sym<'a>>),
     Module(Vec<&'a str>),
 }
@@ -1012,7 +1013,7 @@ impl<'a> Index<'a> {
     }
 
     /// What the dotted qualifier `q` of a member call stands for, or `None` when unknown.
-    fn container(
+    pub(crate) fn container(
         &self,
         path: &'a str,
         scope: Option<usize>,
@@ -1148,8 +1149,10 @@ impl<'a> Index<'a> {
         (!found.is_empty()).then_some(Container::Types(found))
     }
 
-    /// Candidates of a call reference, each with the edge it gives.
-    fn call(
+    /// Candidates of a call reference, each with the edge it gives. Shared
+    /// with the inherited-call producer (contract M6c S7), which must not
+    /// double an edge Tier B links itself.
+    pub(crate) fn call(
         &self,
         path: &'a str,
         scope: Option<usize>,

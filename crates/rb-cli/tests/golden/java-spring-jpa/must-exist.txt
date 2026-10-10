@@ -30,3 +30,7 @@ DEPENDS_ON . -> maven/org.springframework.boot/spring-boot-starter-web@? [exact]
 # a `ConstraintValidator` from its class — both plain `heuristic` edges.
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditConfig#jwtFilter(). -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher# [heuristic] {"origin":"stereotype","resolution":"unique","via":"field"}
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java`/EmailValidator# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher# [heuristic] {"origin":"stereotype","resolution":"unique","via":"field"}
+# Contract M6c S7: inherited Spring Data operations resolve to the repository
+# interface with `inherited`.
+CALLS rb-heuristic . . . `src/main/java/com/acme/auth/SignupService.java`/SignupService#register(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository# [heuristic] {"inherited":true}
+CALLS rb-heuristic . . . `src/main/java/com/acme/auth/SignupService.java`/SignupService#lookup(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository# [heuristic] {"inherited":true}

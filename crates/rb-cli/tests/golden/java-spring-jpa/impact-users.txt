@@ -4,13 +4,15 @@ breaks: requiring edges into it (3):
   1  User#  src/main/java/com/acme/auth/User.java:7  [auth-service]  exact
   1  UserRepository#  src/main/java/com/acme/auth/UserRepository.java:6  [auth-service]  synthetic
   1  UserRepository#findByEmail().  src/main/java/com/acme/auth/UserRepository.java:7  [auth-service]  synthetic
-affects: reaches those through calls or references (2):
+affects: reaches those through calls or references (4):
   2  DefaultAuthService#authenticate().  src/main/java/com/acme/auth/DefaultAuthService.java:21  [auth-service]  heuristic
+  2  SignupService#register().  src/main/java/com/acme/auth/SignupService.java:14  [auth-service]  heuristic
+  2  SignupService#lookup().  src/main/java/com/acme/auth/SignupService.java:18  [auth-service]  heuristic
   3  AuthController#login().  src/main/java/com/acme/auth/AuthController.java:31  [auth-service]  heuristic
 endpoints: handled by the removed or impacted code (1):
   4  POST /auth/api/v1/login  [auth-service]  heuristic
 orphans: not computed (not a symbol)
 tests (0):
-services: auth-service 5
+services: auth-service 7
 owners: -
-certainty: exact 1, synthetic 2, heuristic 2
+certainty: exact 1, synthetic 2, heuristic 4

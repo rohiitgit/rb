@@ -106,7 +106,10 @@ use serde_json::{Value, json};
 /// `m6c-2` non-bean consumers: `@Bean`-returned objects resolve from each
 /// returning method, `ConstraintValidator`s from their class, always at
 /// `heuristic` (M6c S6).
-pub const PIPELINE: &str = "m6c-2";
+/// `m6c-3` inherited Spring Data calls: allow-listed member names on
+/// repository-typed receivers link to the interface node with `inherited`
+/// (M6c S7).
+pub const PIPELINE: &str = "m6c-3";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -826,7 +829,18 @@ pub fn assemble(
     });
     let fragments = resolution.fragments.clone();
     let points = std::mem::take(&mut resolution.points);
+    let spring_data = resolution.spring_data.clone();
     diagnostics.extend(di::add_injects(&mut b, resolution)?);
+    // Inherited Spring Data calls (contract M6c S7): allow-listed member
+    // names on repository-typed receivers link to the interface node.
+    diagnostics.extend(di::add_inherited_calls(
+        &mut b,
+        &index,
+        &content.facts,
+        &keys,
+        &spring_data,
+        &exact_files,
+    )?);
     // RTA (contract M4b S9, D4): after every `IMPLEMENTS` producer (SCIP, Tier B).
     let considered =
         rta::implementing_types(&b.edge_sources(EdgeKind::Implements), &content.facts, &keys);

@@ -361,3 +361,11 @@
 ## 2026-10-10: `fixture_repo` copies `git ls-files` — stage new fixture files first
 - **Mistake:** the S6 bless ran with two new fixture files untracked, so the e2e indexed a partial fixture (tracked edit present, new files absent) and blessed wrong goldens; caught by the Integr's card counts (+1 symbol instead of +5).
 - **Rule:** `git add` new fixture files before any bless run, and sanity-check the blessed diff's file/symbol counts against the fixture change before classifying.
+
+## 2026-10-10: same-key edges merge — isolate negative cases in their own method
+- **Mistake:** the S7 allow-list-drop mutant survived because the non-listed `customAudit` call shared its method with the listed `save` call: both edges have the same (source, kind, target, attrs) and merge in the builder, so the extra edge was invisible.
+- **Rule:** when a test pins the absence of an edge, give the negative case a source no positive case shares (its own method). Merged evidence is invisible to edge-list asserts.
+
+## 2026-10-10: Tier B defers to SCIP on exact files — so must every heuristic producer
+- **Mistake:** the S7 producer edged SCIP-documented files and failed the M3b S7 assert (`heuristic code edge in a SCIP-ok project`): `add_edges` skips `exact_files`, but the new producer did not know about the set.
+- **Rule:** every heuristic edge producer takes the exact-files set and skips it. The pre-gate bless failure is the kill proof for the gate-drop mutant.

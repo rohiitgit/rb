@@ -29,3 +29,6 @@ IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/UserRepositoryCustomI
 # themselves (the `@Bean` method is the target for the class).
 INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/JwtFilter.java`/JwtFilter#
 INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java`/EmailValidator#
+# Contract M6c S7: the declared `findByEmail` is edged by Tier B itself (to the
+# method), never duplicated to the interface.
+CALLS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService#authenticate(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository#

@@ -18,10 +18,10 @@ use rb_model::{
     Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
     Provenance, Span,
 };
-use rb_syntax::{FileFacts, Language, MentionRole};
+use rb_syntax::{FileFacts, Language, MentionRole, RefKind};
 use serde_json::{Value, json};
 
-use crate::resolve::Index;
+use crate::resolve::{Container, Index};
 
 /// Supertype levels followed for assignability (invariant 8, as M3a).
 pub(crate) const MAX_SUPERTYPE_DEPTH: usize = 64;
@@ -86,6 +86,9 @@ pub(crate) struct Resolution {
     /// The interfaces Spring Data repositories extend, by simple name, in every Java file
     /// (fragment interfaces for RTA's rule (h), D3).
     pub fragments: BTreeSet<String>,
+    /// Every Spring Data repository bean, as `(path, definition)` (contract M6c
+    /// S7): receivers typed by one resolve inherited calls to it.
+    pub spring_data: Vec<(String, usize)>,
     /// The main-source injection points and the beans they resolve to uniquely, for the bases
     /// of injected HTTP clients (contract M4b S21).
     pub points: Points,
@@ -374,6 +377,12 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
     for b in BUCKETS {
         out.buckets.insert(b, 0);
     }
+    // Every Spring Data repository bean, for inherited-call receivers (S7).
+    out.spring_data = beans
+        .iter()
+        .filter(|b| b.bean.origin == Origin::SpringData)
+        .map(|b| (b.path.to_owned(), b.bean.definition))
+        .collect();
     let mut classpaths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (path, facts, d) in &per_file {
         let test = is_test_path(path);
@@ -1088,6 +1097,85 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
     }
 }
 
+/// Spring Data member names resolved through the repository interface
+/// (contract M6c S7): any other unresolved member stays unresolved, as before.
+const INHERITED_CALLS: &[&str] = &["save", "find", "get", "delete", "count", "exists"];
+
+/// Links inherited Spring Data calls (contract M6c S7): a call of an
+/// allow-listed name on a receiver typed by a Spring Data repository bean,
+/// which Tier B leaves unlinked (the member is inherited, never declared),
+/// links to the repository interface node with `inherited`, heuristic. Calls
+/// Tier B links itself, other receivers and other names stay as they are.
+pub(crate) fn add_inherited_calls<'a>(
+    b: &mut GraphBuilder,
+    index: &Index<'a>,
+    files: &BTreeMap<&'a str, (Language, &'a FileFacts)>,
+    keys: &BTreeMap<&'a str, Vec<String>>,
+    spring_data: &[(String, usize)],
+    // Files SCIP documents exactly (contract M3b S7): scip-java owns their
+    // calls, including inherited ones, so no heuristic edge may touch them.
+    exact: &BTreeSet<&'a str>,
+) -> anyhow::Result<Vec<Diagnostic>> {
+    let repos: BTreeSet<(&str, usize)> =
+        spring_data.iter().map(|(p, i)| (p.as_str(), *i)).collect();
+    for (&path, (language, facts)) in files {
+        if *language != Language::Java || exact.contains(path) {
+            continue;
+        }
+        let source = |enclosing: Option<usize>| match enclosing {
+            Some(i) => NodeKey::new(NodeKind::Symbol, keys[path][i].clone()),
+            None => NodeKey::new(NodeKind::File, path),
+        };
+        for r in &facts.references {
+            if r.kind != RefKind::Call {
+                continue;
+            }
+            let Some(q) = r.qualifier.as_deref() else {
+                continue;
+            };
+            if !INHERITED_CALLS.iter().any(|p| r.name.starts_with(p)) {
+                continue;
+            }
+            work::tick(1);
+            // Never double an edge Tier B links itself (a declared member).
+            if !index
+                .call(path, r.enclosing, &r.name, Some(q), Some(r.span))
+                .is_empty()
+            {
+                continue;
+            }
+            let mut targets = BTreeSet::new();
+            if let Some(Container::Types(types)) =
+                index.container(path, r.enclosing, q, Some(r.span))
+            {
+                for t in types {
+                    if repos.contains(&(t.0, t.1)) {
+                        targets.insert(keys[t.0][t.1].clone());
+                    }
+                }
+            }
+            for dst in targets {
+                let mut attrs = serde_json::Map::new();
+                attrs.insert("inherited".into(), true.into());
+                b.add_edge(
+                    NewEdge::new(
+                        source(r.enclosing),
+                        EdgeKind::Calls,
+                        NodeKey::new(NodeKind::Symbol, dst),
+                        Provenance::Heuristic,
+                        Certainty::Heuristic,
+                    )
+                    .attrs(attrs)
+                    .evidence(Evidence {
+                        path: path.to_owned(),
+                        span: r.span,
+                    }),
+                )?;
+            }
+        }
+    }
+    Ok(Vec::new())
+}
 /// Adds the `INJECTS` edges (one per `(owner, bean)`: the best site's certainty and attributes,
 /// every site as evidence, `sites = n`; invariant 3), the `di_*` diagnostics and one
 /// `di_coverage`.
@@ -1159,6 +1247,8 @@ mod tests {
     /// the descriptor), the buckets and the gates.
     struct Run {
         edges: Vec<String>,
+        /// `CALLS` edges, Tier B's and inherited (contract M6c S7).
+        calls: Vec<String>,
         buckets: BTreeMap<&'static str, usize>,
         gates: BTreeMap<&'static str, usize>,
         diagnostics: Vec<String>,
@@ -1233,9 +1323,39 @@ mod tests {
         }
         let (buckets, gates) = (r.buckets.clone(), r.gates.clone());
         let lifted = r.mention_lifted;
-        let diagnostics = add_injects(&mut b, r).unwrap();
+        let spring_data = r.spring_data.clone();
+        // Tier B first, as in `assemble`: the inherited producer must see the
+        // edges Tier B links itself to avoid doubling them.
+        let mut diagnostics = crate::resolve::add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
+        diagnostics.extend(add_injects(&mut b, r).unwrap());
+        // Inherited calls run after the injections, as in `assemble` (no
+        // exact files without SCIP).
+        add_inherited_calls(
+            &mut b,
+            &index,
+            &by_path,
+            &keys,
+            &spring_data,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let g = b.finish().unwrap();
         let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+        let mut calls: Vec<String> = g
+            .edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| {
+                format!(
+                    "{} -> {} [{}] {}",
+                    short(&key(e.src)),
+                    short(&key(e.dst)),
+                    e.certainty.as_str(),
+                    Value::Object(e.attrs.clone())
+                )
+            })
+            .collect();
+        calls.sort();
         let mut edges: Vec<String> = g
             .edges()
             .iter()
@@ -1264,6 +1384,7 @@ mod tests {
         };
         Run {
             edges,
+            calls,
             buckets: r.buckets.into_iter().filter(|(_, n)| *n > 0).collect(),
             gates: r.gates,
             diagnostics: r
@@ -1835,6 +1956,57 @@ mod tests {
             r.edges
         );
         assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
+    }
+
+    /// Contract M6c S7: an allow-listed Spring Data member name called on a
+    /// repository-typed receiver resolves to the repository interface node
+    /// with `inherited`; any other unresolved member stays unresolved, and a
+    /// member Tier B links itself is never doubled.
+    #[test]
+    fn inherited_spring_data_calls_resolve_to_the_interface() {
+        let repo = "interface User {}\ninterface UserRepository extends org.springframework.data.jpa.repository.JpaRepository<User, Long> {}\n";
+        let svc = "@Service class Signup { @Autowired UserRepository users; void register(User u) { users.save(u); } void lookup(long id) { users.findById(id); } void audit(User u) { users.customAudit(u); } }\n";
+        let helper = "@Component class Helper {}\n@Service class Other { @Autowired Helper helper; void run() { helper.save(null); } }\n";
+        let r = one(&format!("{repo}{svc}{helper}"));
+        assert_eq!(
+            r.calls,
+            [
+                r#"Signup#lookup(). -> UserRepository# [heuristic] {"inherited":true}"#.to_owned(),
+                r#"Signup#register(). -> UserRepository# [heuristic] {"inherited":true}"#
+                    .to_owned(),
+            ]
+        );
+        // A declared member is edged by Tier B itself, never doubled.
+        let strict = "interface User {}\ninterface StrictRepo extends org.springframework.data.jpa.repository.JpaRepository<User, Long> { User save(User u); }\n@Service class S { @Autowired StrictRepo r; void go(User u) { r.save(u); } }\n";
+        let r = one(strict);
+        assert_eq!(r.calls.len(), 1, "{:?}", r.calls);
+        assert!(
+            !r.calls[0].contains("inherited") && r.calls[0].contains("StrictRepo#save()."),
+            "{:?}",
+            r.calls
+        );
+    }
+
+    /// Invariant 9: inherited-call resolution grows linearly (counted, 4× → ≤
+    /// 5×): one Tier B probe per allow-listed qualified call, each first-win.
+    #[test]
+    fn inherited_calls_grow_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut body = String::from(
+                "interface User {}\ninterface UserRepository extends org.springframework.data.jpa.repository.JpaRepository<User, Long> {}\n@Service class Signup { @Autowired UserRepository users;\n",
+            );
+            for i in 0..n {
+                body += &format!("  void register{i}(User u) {{ users.save(u); }}\n");
+            }
+            body += "}\n";
+            work::take();
+            let r = one(&body);
+            // Every call edged: the walk ran, the ratio below is not vacuous.
+            assert_eq!(r.calls.len(), n, "{n}");
+            work::take()
+        }
+        let (small, large) = (work_for(25), work_for(100));
+        assert!(large <= small * 5, "{small} -> {large}");
     }
 
     /// Contract M6c S2 (M4b open item 5): a class literal in a test source no

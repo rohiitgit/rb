@@ -1,10 +1,10 @@
 auth-service  (path: ., deployable)
 ├─ Detected by: maven
 ├─ Manifests: pom.xml
-├─ Files: 20 (java 16, other 2, python 1, sql 1)
+├─ Files: 21 (java 17, other 2, python 1, sql 1)
 ├─ Owners: none
 ├─ File ownership
-│    unowned    20 files  100%
+│    unowned    21 files  100%
 ├─ APIs (1)
 │    POST /auth/api/v1/login  → AuthController#login().  [synthetic]
 ├─ Calls APIs of: none
@@ -20,6 +20,6 @@ auth-service  (path: ., deployable)
 ├─ Depended on by: none
 ├─ Shares tables with: none
 └─ Call graph (edges within the service)
-     59 symbols · CALLS 8, IMPLEMENTS 23, INJECTS 12, REFERENCES 2
-     certainty: heuristic 95.6%, ambiguous 4.4%
+     63 symbols · CALLS 10, IMPLEMENTS 23, INJECTS 13, REFERENCES 2
+     certainty: heuristic 95.8%, ambiguous 4.2%
      entry points: endpoint 1, lifecycle 2, main 1
