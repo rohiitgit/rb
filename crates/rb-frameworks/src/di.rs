@@ -1140,8 +1140,10 @@ fn parse_lombok_config(text: &str) -> Option<Vec<LombokOp>> {
     const KEY: &str = "lombok.copyableAnnotations";
     let mut ops = Vec::new();
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        // Inline trailing comments strip, as Lombok itself strips them (a
+        // `#` cannot occur inside an annotation name or directive).
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
             continue;
         }
         if let Some(rest) = line.strip_prefix(KEY) {
@@ -1946,6 +1948,13 @@ mod tests {
                 .copyable("svc/src/A.java")
                 .is_none()
         );
+        // Evaluator pass 1, H1: inline trailing comments strip (as Lombok
+        // itself strips them), so a commented directive still applies.
+        let commented = maps(&[(
+            "lombok.config",
+            "# copy qualifiers\nlombok.copyableAnnotations = [com.foo.Base] # the base\n",
+        )]);
+        assert!(commented.copies("svc/src/A.java", "Base"));
     }
 
     /// Contract M6c S8: a field qualifier rides the Lombok-generated parameter

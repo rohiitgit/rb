@@ -1059,7 +1059,9 @@ fn add_owners(
 /// even when their manifests say otherwise (contract M6c S3) — a Maven module
 /// inheriting its build from a parent pom, Gradle without the plugin text.
 /// Test sources never count: a test application class runs nothing in the
-/// deployed context.
+/// deployed context. The carrier must be runnable itself (concrete and
+/// top-level or static, as for bean classes): an abstract or
+/// non-static-nested carrier never flips (evaluator pass 1, C5).
 fn app_services(
     boundaries: &Boundaries,
     facts: &BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)>,
@@ -1072,6 +1074,11 @@ fn app_services(
                 && !rb_model::is_test_path(path)
                 && facts.definitions.iter().any(|d| {
                     d.kind == rb_syntax::DefKind::Class
+                        && !d.modifiers.iter().any(|m| m == "abstract")
+                        && d.parent.is_none_or(|p| {
+                            facts.definitions[p].kind == rb_syntax::DefKind::Interface
+                                || d.modifiers.iter().any(|m| m == "static")
+                        })
                         && d.decorations.iter().any(|deco| {
                             rb_frameworks::routes::is_annotation(
                                 facts,
@@ -1622,6 +1629,18 @@ mod tests {
             b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nclass Holder {\n@SpringBootApplication void m() {}\n}\n",
         )
         .unwrap();
+        // Evaluator pass 1, C5: an abstract or non-static-nested carrier can
+        // never be the application — no flip.
+        let abstract_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public abstract class AbsApp {}\n",
+        )
+        .unwrap();
+        let nested_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nclass Outer {\n@SpringBootApplication class Inner {}\n}\n",
+        )
+        .unwrap();
         let manifest = Manifest {
             commit_sha: "c".repeat(40),
             files: [
@@ -1635,6 +1654,10 @@ mod tests {
                 "tslib/src/app.ts",
                 "meth/pom.xml",
                 "meth/src/main/java/com/acme/Holder.java",
+                "abs/pom.xml",
+                "abs/src/main/java/com/acme/AbsApp.java",
+                "nest/pom.xml",
+                "nest/src/main/java/com/acme/Outer.java",
             ]
             .into_iter()
             .map(entry)
@@ -1653,6 +1676,8 @@ mod tests {
                 library("testonly", "testonly/pom.xml"),
                 library("tslib", "tslib/package.json"),
                 library("meth", "meth/pom.xml"),
+                library("abs", "abs/pom.xml"),
+                library("nest", "nest/pom.xml"),
             ],
             vec![],
         );
@@ -1678,6 +1703,14 @@ mod tests {
                     "meth/src/main/java/com/acme/Holder.java",
                     (rb_syntax::Language::Java, &meth_app),
                 ),
+                (
+                    "abs/src/main/java/com/acme/AbsApp.java",
+                    (rb_syntax::Language::Java, &abstract_app),
+                ),
+                (
+                    "nest/src/main/java/com/acme/Outer.java",
+                    (rb_syntax::Language::Java, &nested_app),
+                ),
             ]),
             ..Content::default()
         };
@@ -1693,6 +1726,8 @@ mod tests {
         assert_eq!(role("testonly"), "library");
         assert_eq!(role("tslib"), "library");
         assert_eq!(role("meth"), "library");
+        assert_eq!(role("abs"), "library");
+        assert_eq!(role("nest"), "library");
     }
 
     /// Contract M6c S3, invariant 9: one app class per module costs linear

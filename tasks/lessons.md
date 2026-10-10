@@ -385,3 +385,7 @@
 ## 2026-10-11: print the input before theorizing about the pipeline
 - **Mistake:** the S9a `WBox` failure (0 points) triggered theories about caches, pollution, merges and parallelism across a dozen experiments — the row had lost its parameter name (`Catalog(Store<?>)`) in an edit, so no binding existed. The byte dump (`WREAL`) found it in one run.
 - **Rule:** a mysteriously empty result gets an input byte-dump first, theories second. And verify script edits by reading them back immediately (`{{}}`/`\\n` mangling hides in heredocs).
+
+## 2026-10-11: shape checks must cover root manifests, not just the code dir
+- **Mistake:** phase-0 recorded "no tsconfig paths/exports in jhipster's webapp" — true of the webapp dir, false of the repo: the ROOT `tsconfig.json` carries a full `paths` map with a `"*"` catch-all. S4's repo leg looked vacuous until measurement proved it substantive (+14 exact references).
+- **Rule:** when scoping manifest-driven features, enumerate the manifests (`find -name <manifest>`) at the repo root first, then check their CONTENT everywhere — never generalize from the code directory alone.
