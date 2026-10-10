@@ -862,9 +862,34 @@ Same rules as M5:
 - [x] **10. Measurements** (S11). Done 2026-10-10 (`var/m6b/bench/phase10.md`): `--no-scip --no-cache --force` with base `rb-3562b95` and head `rb-m6b-p9` (release, built this phase), one repo at a time, clones removed each, DB batch-removed + `VACUUM` (0 repos). gin: 19 unknown→26 composed, 44 unmatched+2 dynamic→33 in-process+18 self (sampled in source); express: 19 unknown→19 composed `/api` keys; ftgo: 4 dynamic→3 heuristic+1 ambiguous-over-3 (all read, genuine); mattermost: 8 ambiguous edges removed, 145 unmatched→106+32 in-process+7 empty, 123 dynamic→119+4 in-process (imageproxy prod sink read), empty 8/8 CSRF `""` (read); microservices + piggymetrics byte-identical. S8 calibration: `discovery_lifted` 0 on all six + fixtures (0 unintended lifts).
 - [x] **11. Records + evaluator.** S12–S14; fixtures/goldens (S10) with the fixture phase; pass 1 (full), fixes, pass 2 (verification-only). Done 2026-10-10: pass 1 (`tasks/eval-m6b-pass1.md`, VERDICT PASS with fixes E1 reconfigured-caps + E2 ReactorLoadBalancer); pass 2 (`tasks/eval-m6b-pass2.md`, VERDICT PASS — 732/66/12/32/1 green, 58 mutants re-killed, no re-bless, E1/E2 trigger grep confirms phase-10 records). Contract amendment 11: **M6b closed.**
 
+## M6c DI, RTA and orphan precision (contract `tasks/contract-m6c.md`, written 2026-10-10; forks F1–F7 recommendations for the orchestrator, confirmation at phase 0 start; not started)
+
+Same rules as M6b:
+- Each phase has at most 5 hand-edited source files. Fixture sources, blessed goldens and guard data are listed separately in the changelog and reviewed on their own.
+- Each phase is test-first: the new units fail, or do not compile, before the change (the failure recorded).
+- Each phase ends with its verification step: fmt, `clippy --workspace --all-targets -D warnings`, the touched crates' unit tests counted from a log holding both streams (`> log 2>&1`), and the e2e suite with `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb` (with containers wherever the phase touches SCIP: `docker image inspect` first, no `skipping:`).
+- Any golden that changes gets a classified line diff before `RB_BLESS=1`; any dump change is classified L, T or W (contract invariant 1).
+- Mutation runs follow M4a's harness rules: fresh mtime, restored bytes checked, a `test result:` line per mutant, stopped with SIGINT, `"$@"`, `command -v` for every tool.
+- Environment: never `npm`/`npx` on the host (lockfiles are generated inside the pinned scip-typescript image); Docker context `desktop-linux`; no image pull (none is needed); `df` before every build, clone and container step, floor 6 GiB for large-repository steps and 2 GiB otherwise; one-off builds use a `CARGO_TARGET_DIR` under the scratchpad, removed afterwards; disk figures accounted part by part in MiB.
+
+`PIPELINE` becomes `m6c-1` at the first dump change and is bumped on each later one.
+
+- [ ] **0. Preflight** (no code). Baseline binary `var/m6c/base/rb-10a9ad5` + fixture dumps (must equal M6b's closing state); fork confirmations; full-SHA pins by API; calibration counts (gate-M test mentions, deployable poms, alias shapes, on-demand heads, validator/bean-method points, inherited calls, lombok.configs, generic/custom points); shape checks on shallow checkouts (removed after reading).
+- [ ] **1. Registrants** (S1). `@Bean`-method joins for `@Import`-named configs (ambiguous, `origin` set).
+- [ ] **2. Gate M main-only** (S2). Test-path class literals stop capping; lifts counted.
+- [ ] **3. Deployable roles** (S3). spring-boot-maven-plugin or `@SpringBootApplication` ⇒ service; yield measured.
+- [ ] **4. Module objects** (S4). tsconfig `paths` + package `exports` exact resolution (RTA + Tier B); keeps counted.
+- [ ] **5. Rule (e) levels** (S5). On-demand counts only at on-demand level; newly eligible counted.
+- [ ] **6. Non-bean consumers** (S6). `@Bean`-method + validator points as new heuristic edges, each listed.
+- [ ] **7. Inherited Spring Data** (S7). Allow-listed names → interface node + `inherited`.
+- [ ] **8. Lombok qualifiers** (S8). Nearest-chain `copyableAnnotations` reading; picks counted.
+- [ ] **9. Generics + custom qualifiers** (S9). Exact agreement picks; unique meta-annotation resolution; picks counted.
+- [ ] **10. Measurements** (S11). `--no-scip` both binaries on realworld/jhipster/petclinic/microservices/piggymetrics/eladmin; classified diffs + INJECTS samples.
+- [ ] **11. Records + evaluator.** S12–S14; fixtures/goldens (S10) with the fixture phases; pass 1 (full), fixes, pass 2 (verification-only).
+
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 
-- [ ] M6b Request-path precision (gin groups as parameters, Express construction chains, in-process Go requests and empty URLs, axios configurations, constructor-assigned members, user information with a hole, S19's over-capping, TypeScript client breadth).
+- [x] M6b Request-path precision (closed 2026-10-10, amendment 11; passes 1–2 PASS).
 - [ ] M6c DI, RTA and orphan precision (registrants, gate M on main sources, RTA yield, module roles and objects, rule (e), autowired non-beans, inherited Spring Data methods, Lombok qualifiers, generics and custom qualifiers).
 - [ ] M6d Go and Python SCIP (scip-go image built locally, scip-python pinned by digest after measuring, fetch phases behind the proxy, Go/Python fixtures, the adversarial egress review).
 - [ ] M6e Build and lockfile breadth (Gradle, pnpm/Yarn lockfiles and workspaces, `go.work`, Maven classifiers, tsconfig include/exclude, source encoding).
