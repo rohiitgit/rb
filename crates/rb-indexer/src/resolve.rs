@@ -351,6 +351,32 @@ fn is_callable(kind: DefKind) -> bool {
 }
 
 impl<'a> Index<'a> {
+    /// Exact manifest resolution for bare specifiers (contract M6c S4).
+    /// Default (no manifests) resolves nothing, as before.
+    pub(crate) fn with_aliases(mut self, aliases: crate::rta::AliasMaps) -> Self {
+        self.modules = self.modules.with_aliases(aliases);
+        self.imports = Self::resolve_imports(self.files, &self.modules);
+        self
+    }
+
+    fn resolve_imports(
+        files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
+        modules: &Modules<'a>,
+    ) -> BTreeMap<&'a str, Vec<Vec<&'a str>>> {
+        let mut imports = BTreeMap::new();
+        for (&path, (_, facts)) in files {
+            imports.insert(
+                path,
+                facts
+                    .imports
+                    .iter()
+                    .map(|i| modules.resolve(path, i))
+                    .collect(),
+            );
+        }
+        imports
+    }
+
     pub(crate) fn new(
         files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
         go_modules: &'a BTreeMap<String, String>,
@@ -358,7 +384,6 @@ impl<'a> Index<'a> {
     ) -> Self {
         let modules = Modules::new(files, go_modules);
         let mut scopes = BTreeMap::new();
-        let mut imports = BTreeMap::new();
         let mut raw_locals: BTreeMap<&str, BTreeMap<&str, Vec<&Binding>>> = BTreeMap::new();
         let mut defs_by_name: BTreeMap<&str, BTreeMap<&str, Vec<usize>>> = BTreeMap::new();
         let mut fields: BTreeMap<&str, BTreeMap<(usize, &str), Vec<&Binding>>> = BTreeMap::new();
@@ -407,15 +432,8 @@ impl<'a> Index<'a> {
                 table.entry(d.name.as_str()).or_default().push(i);
             }
             scopes.insert(path, sc);
-            imports.insert(
-                path,
-                facts
-                    .imports
-                    .iter()
-                    .map(|i| modules.resolve(path, i))
-                    .collect(),
-            );
         }
+        let imports = Self::resolve_imports(files, &modules);
         Index {
             files,
             modules,

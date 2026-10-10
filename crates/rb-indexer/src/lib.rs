@@ -101,7 +101,9 @@ use serde_json::{Value, json};
 /// import-resolved known types or single-literal keys (S8).
 /// `m6b-8` client breadth: got/ky/superagent/undici fetch-class sites,
 /// HttpClient and axios member forms capped (S9).
-pub const PIPELINE: &str = "m6b-8";
+/// `m6c-1` module objects: tsconfig `paths` + package `exports`/`main`
+/// exact resolution for Tier B and RTA (M6c S4).
+pub const PIPELINE: &str = "m6c-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -785,6 +787,10 @@ pub fn assemble(
         .map(|(path, text)| (*path, text.as_str()))
         .collect();
     let index = resolve::Index::new(&content.facts, &content.go_modules, &keys);
+    // Exact manifest resolution for bare specifiers (contract M6c S4), shared
+    // by Tier B and RTA (F4).
+    let aliases = rta::AliasMaps::build(&content.manifests);
+    let index = index.with_aliases(aliases.clone());
     diagnostics.extend(resolve::add_edges(&mut b, &index, &exact_files)?);
     // Endpoints (contract M4a S4–S8): Spring's context path from each service's
     // `application.properties`; a YAML file that sets one is counted as unread.
@@ -829,6 +835,7 @@ pub fn assemble(
             unparsed: &content.unparsed,
             words: &content.words,
             fragments: &fragments,
+            aliases: &aliases,
         },
         &considered,
     );

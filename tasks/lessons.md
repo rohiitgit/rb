@@ -341,3 +341,11 @@
 ## 2026-10-10: zsh does not word-split — arrays for argv, never strings
 - **Mistake (repeated 3×):** `set -- $spec`, unquoted `$ARGS`, and `echo ===` produced mangled URLs/flags and syntax errors in measurement scripts.
 - **Rule:** in zsh pass argv as arrays (`args=(...)`, `"${args[@]}"`) or functions with positional params; never unquoted string expansion, never `echo ===`. Verify each script's first real effect (clone lands, binary runs) before the batch.
+
+## 2026-10-10: SCIP symbol keys quote the basename, not the path
+- **Mistake:** the new S4 must-exist guard wrote the nested callee as ``src/`models/user.ts`/helper()``; the real key is ``src/models/`user.ts`/helper()`` (directory + backticked basename). The SCIP test failed on the guard while the edge existed.
+- **Rule:** never hand-write a guard key for a nested path: dump the fixture once and copy the key byte-for-byte (or simulate `guard_failures` against the dump before blessing).
+
+## 2026-10-10: a surviving mutant can indict the test, not the code
+- **Mistake:** the exports-exact-drop mutant survived because the test's exact-vs-`./*` case also resolves through the longest-match loop — the exact-first loop looked redundant. It is not: `./a` vs the longer pattern `./a*` resolves differently.
+- **Rule:** when a mutant survives, check whether the test lacks the discriminating shape before touching the code; add the minimal shape (`./a`-vs-`./a*`) that only the mechanism under test decides.

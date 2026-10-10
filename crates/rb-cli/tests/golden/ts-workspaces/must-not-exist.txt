@@ -9,3 +9,6 @@ IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Mid#extra(). -> *
 CALLS scip-typescript npm e2e-tools 1.0.0 src/`check.ts`/check(). -> scip-typescript npm @ws/core 1.0.0 src/`index.ts`/run().
 # Every code edge of a SCIP-ok project is exact.
 CALLS * -> * [heuristic]
+# Contract M6c S4: an unresolvable bare specifier (`express`, absent here)
+# leaves no edge.
+CALLS scip-typescript npm legacy 1.0.0 src/`ext.ts`/ext(). -> *

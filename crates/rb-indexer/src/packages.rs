@@ -19,7 +19,14 @@ pub(crate) fn is_input(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     matches!(
         name,
-        "package.json" | "package-lock.json" | "npm-shrinkwrap.json" | "go.mod" | "pom.xml"
+        "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "go.mod"
+            | "pom.xml"
+            // `tsconfig.json` texts feed exact alias resolution (contract M6c
+            // S4); the packages stage ignores unknown basenames.
+            | "tsconfig.json"
     )
 }
 
@@ -1091,6 +1098,15 @@ mod tests {
             .map(|d| format!("{} {}", d.kind, d.path.as_deref().unwrap_or("-")))
             .collect();
         (edges, diagnostics)
+    }
+
+    /// Contract M6c S4: `tsconfig.json` texts reach the manifest readers that
+    /// feed exact alias resolution.
+    #[test]
+    fn tsconfig_json_is_a_manifest_input() {
+        assert!(is_input("svc/tsconfig.json"));
+        assert!(is_input("tsconfig.json"));
+        assert!(!is_input("svc/tsconfig.json.bak"));
     }
 
     const LOCK: &str = r#"{
