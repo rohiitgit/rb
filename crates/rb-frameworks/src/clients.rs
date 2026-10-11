@@ -5545,6 +5545,54 @@ mod tests {
         assert!(calls(Language::Python, annotated).is_empty());
     }
 
+    /// S13: n `requests`/`httpx` call sites (module verbs, session verbs)
+    /// cost linear work: 4× the sites makes at most 5× the counted steps.
+    /// Counted, not timed, so machine load cannot fail it.
+    #[test]
+    fn python_client_sites_grow_linearly() {
+        let source = |n: usize| {
+            let mut src =
+                "import requests\nimport httpx\ns = requests.Session()\nc = httpx.Client()\n\ndef f():\n"
+                    .to_owned();
+            for i in 0..n {
+                src.push_str(&format!(
+                    "    requests.get(\"http://a/{i}\")\n    s.post(\"http://b/{i}\")\n    c.put(\"http://c/{i}\")\n"
+                ));
+            }
+            src
+        };
+        let work = |n: usize| {
+            let found = calls(Language::Python, &source(n));
+            assert_eq!(found.len(), 3 * n);
+            crate::work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// S13: n methods calling `self.` session members cost linear work: 4×
+    /// the methods makes at most 5× the counted steps. Counted, not timed.
+    #[test]
+    fn python_member_sites_grow_linearly() {
+        let source = |n: usize| {
+            let mut src = "import requests\nimport httpx\n\nclass C:\n    def __init__(self):\n        self.client = httpx.Client(base_url=\"http://orders\")\n        self.session = requests.Session()\n"
+                .to_owned();
+            for i in 0..n {
+                src.push_str(&format!(
+                    "    def m{i}(self):\n        self.client.get(\"http://a/{i}\")\n        self.session.post(\"http://b/{i}\")\n"
+                ));
+            }
+            src
+        };
+        let work = |n: usize| {
+            let found = calls(Language::Python, &source(n));
+            assert_eq!(found.len(), 2 * n);
+            crate::work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
     /// Contract M6b S9 (D8): Angular `HttpClient` calls enter capped at
     /// `heuristic` — injected (a constructor parameter property or field) or
     /// local, verbs and `request(method, url)`. Without the

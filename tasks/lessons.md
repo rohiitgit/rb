@@ -417,3 +417,31 @@
 ## 2026-10-11: e2e `rb()` shells `target/debug/rb`, which `cargo test` does not refresh
 - **Mistake (recovered, ~1 h):** two fixture bless runs failed on rows the fixed code produces; manual runs with the same binary passed. Root cause chain: `cargo test` builds the test harness (which printed NEW guard text, looking current) but `rb()` shells `target/debug/rb`, refreshed only by explicit `cargo build -p rb-cli` — last run before the fixes. Suspected cache poisoning, fixture staleness, and guard-key typos (one real: endpoint keys carry the `HTTP` prefix) before finding it.
 - **Rule:** always `cargo build -p rb-cli` after touching anything the binary embeds, before any e2e run. When an e2e result contradicts a manual run of the "same" binary, check binary mtimes first (`ls -la target/debug/rb`), mechanism second.
+
+## 2026-10-11: no heavy builds while an e2e container phase runs
+- **Mistake (recovered, ~2 h):** two `cargo test -p rb-frameworks` runs during the p12 e2e's SCIP suites starved the emulated scip-python fetch: one egress probe got HTTP 200 with curl exit 28 (timeout), and pip's wheel reads timed out (`ReadTimeoutError: files.pythonhosted.org`), failing the shop fetch — which then CACHED as `failed` and replayed into the re-run. The 32 unaffected passes stayed valid (contention fails, it does not forge goldens).
+- **Rule:** while any e2e/api suite with containers runs, the tree is read-only for builds: no `cargo` invocations beyond reading logs. Reads and `.md` edits are free; compiles wait. When a container-phase failure shows a timeout signature (curl 28, pip read timeouts), suspect contention first and re-run the test alone before theorizing.
+
+## 2026-10-11: a cached fetch failure replays — read its tail, overwrite on the same layout
+- **Mistake (recovered):** the shop failure replayed as `failed (cached)` in the re-run. The diagnosis came from `rb.scip_index.stderr_tail` (the pip traceback, not the status line). The first overwrite attempt used a nested copy (`fixtures/…` under `/tmp/x/`), which hashes differently — the input hash covers job-relative paths, so only the same layout overwrites the row.
+- **Rule:** a `failed` scip row is diagnosed from its `stderr_tail` and cleared by a successful `--no-cache --force` run over the SAME directory layout (write-only cache), never by deleting the row; confirm the row reads `ok` afterwards. Name manual repos `t_*` so the e2e start-up clean-up removes them.
+
+## 2026-10-11: a vacuous comparison proves nothing — assert non-empty first
+- **Mistake (caught before recording):** the first invariant-1 sweep passed invalid repo names (dashes); every index failed, every dump was empty, and all seven fixtures compared SAME. The second run asserted byte counts and found three real diffs.
+- **Rule:** any dump-comparison script prints byte counts and asserts non-zero before diffing; an all-SAME result over empty files is a harness bug, not a pass.
+
+## 2026-10-11: pip's 15 s default timeout is marginal through the emulated stack
+- **Mistake (avoided by measuring):** one fixture fetch read `19 s ok` / `87 s ok` / `33 s` and `54 s` read-timeout failures across four attempts — same packages, same proxy. The failures are slow-pipe reads (`files.pythonhosted.org`), not dead servers.
+- **Rule:** bulk-transfer tool timeouts are sized from measurements, not defaults: `PIP_TIMEOUT=60` (env, pinnable like F7's Go env) with a recipe bump (`m6d-py-4`) so stale rows cannot serve. Do not touch unmeasured tools (Poetry showed no flake).
+
+## 2026-10-11: a growth-test shape measures one walk — isolate it
+- **Mistake (caught by the numbers):** the chi ratio test with one shared closure name measured 15.6× AFTER the sweep fix: the dominant cost was the shared `binding_index_at` same-name extent scan (pre-existing, all packs alike), not the chi walk. Distinct names isolate the new walk (the `packs_grow_linearly` precedent).
+- **Rule:** a ratio test for a new walk uses distinct names/bindings; a same-name shape measures shared machinery and is recorded as an observation (with numbers), not asserted. If the numbers do not move after the fix, the test measures the wrong thing — re-derive before re-fixing.
+
+## 2026-10-11: a mutant harness asserts the mutation landed — after patching
+- **Mistake (caught at once):** my harness asserted `new in s` BEFORE `s.replace`, rejecting all four multi-line mutants as "new text missing".
+- **Rule:** the count assertion guards the anchor; the landed assertion (`new in s`) runs AFTER the replacement. A "PATCH FAILED" on a known-good anchor means the guard is inverted — read the traceback, not the tree.
+
+## 2026-10-11: `for x in vec` across if/else branches moves
+- **Mistake (caught by the compiler):** computing per-router prefixes in `if cyclic {} else {}` moved `routers` in the first branch.
+- **Rule:** iterate by reference (`for r in &routers`) when more than one branch consumes the collection; the compiler error is the signal, not the design.

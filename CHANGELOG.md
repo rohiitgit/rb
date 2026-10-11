@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026-10-11] (wall clock) M6d CLOSED (evaluator passes 1–2)
+- Pass 1 (amendment 14): 3 parallel evaluators, 2 blocking + 9 non-blocking findings; blockers fixed test-first (tool_versions `scip_go`/`scip_python` identities, absolute-path `replace` never joins a service) + claim-breaking hardening (chi `Handle` args, double-include expansion, dispatcher `url=`/`method=` kwargs, `gomod/` split pin, `GOTOOLCHAIN`/`GOFLAGS` in fetch env); rest recorded with reasons.
+- Phase 12 (amendment 15): S13 growth audit found chi (15.85×) and FastAPI (18×) superlinear — fixed test-first (per-file function sweep; adjacency + memoised levels + cycle gate), 4 ratio tests + 1 cycle pin, 6/6 mutants killed; requests/httpx + member packs linear as built. `PIP_TIMEOUT=60` with `RECIPE_PY m6d-py-4` (measured pip read-timeout flake through the emulated stack). Invariant 1 vs `027a54f`: 4/7 fixtures identical, rest added-only W rows + 1 explained shift; two-name determinism everywhere.
+- Pass 2 (`tasks/eval-m6d-pass2.md`): VERDICT PASS — every finding's repro + controls, suite (fmt, clippy, 765 unit + 25 cli-bin, store 66, server 12, e2e 34/34, api 1/1 over 150 sets), 22/22 mutants re-killed (p1/p2/p3/p12/eval1 scripts), invariant 1, determinism; no `skipping:`, no listener, stub scan clean.
+- **Verification** (`var/m6d/logs/close-*`): fmt, clippy clean; unit 765 + 25 cli-bin; `rb-store` 66/66, `rb-server` 12/12; e2e 34/34, api 1/1. The M3a wall-clock test flaked twice under load 7-10 and passes alone (M3b-cited).
+- Files: `crates/rb-frameworks/src/{routes,clients}.rs`, `crates/rb-scip/src/orchestrate.rs`; records `tasks/{contract-m6d,eval-m6d-pass2,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `README.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-09] (wall clock) M6a CLOSED (evaluator passes 1–2)
 - Pass 1 (`tasks/eval-m6a-pass1.md`): PASS — baseline reproduced, S1–S20 re-derived, 6/7 mutants killed; Z1 (fixed as amendment 12), Z2 (note).
 - Pass 2 (`tasks/eval-m6a-pass2.md`): PASS — Z1 holds, suite green, invariant 1 re-derived with a fresh HEAD release, M1/M4/M6 killed; O1 + wall-clock flake non-blocking. Contract amendment 13. Next: M6b.

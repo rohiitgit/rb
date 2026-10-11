@@ -912,14 +912,15 @@ Same rules as M6b/M6c:
   - [x] **9a. chi + FastAPI route packs.** Done 2026-10-11 (amendment 10): chi verbs/nested-Route/Group/With/Method/Handle + FastAPI decorators/prefixes/includes; tests first + 11 mutants killed. Files: `rb-frameworks/src/routes.rs` (+ 1-line `kwarg` share in `clients.rs`).
 - [x] **10. Egress review** (S10). Done 2026-10-11 (amendment 12): probe suite re-run green on the final 7-host allow-list; per-tool posture recorded; verdict no finding, no code change.
 - [x] **11. Measurements** (S11). Done 2026-10-11 (amendment 13, record `var/m6d/bench/phase11.md`): --no-scip both binaries both repos (identical graphs, classified +W-only diffs, read samples); scip-go 6/9 ok + scip-python ok with two measurement-driven fetch fixes (GCS redirect host, requires-python flag + recipe bump); classified SCIP diffs + samples; deterministic. Files: `rb-scip/src/egress.rs`, `hash.rs`, `orchestrate.rs`, `rb-cli/tests/e2e.rs`.
-- [ ] **12. Records + evaluator.** S12–S14; pass 1 (full), fixes, pass 2 (verification-only).
+- [x] **12. Records + evaluator.** S12–S14; pass 1 (full), fixes, pass 2 (verification-only).
   - [x] **Pass 1 + fixes.** Done 2026-10-11 (amendment 14): 3 parallel evaluators, 2 blocking + 9 non-blocking findings; blockers fixed test-first (tool_versions identities, absolute replace) + claim-breaking hardening (chi Handle, double-include expansion, dispatcher kwargs, gomod split pin, GOTOOLCHAIN env); rest recorded with reasons.
+  - [x] **Phase 12 (records + pass 2).** Done 2026-10-11 (amendment 15): S13 growth audit found chi (15.85×) and FastAPI (18×) superlinear — fixed test-first (per-file function sweep `FuncCache`/`ChiState`; adjacency + memoised levels + cycle gate; 4 ratio tests + 1 cycle pin, 6/6 mutants); requests/httpx + member packs linear as built; same-name shadowing cost recorded. `PIP_TIMEOUT=60` with `RECIPE_PY m6d-py-4` (measured pip read-timeout flake). Contention incident recovered (2 p12 e2e failures from parallel builds; poisoned scip row overwritten uncontended; both re-green). Invariant 1 vs `027a54f`: 4/7 identical, rest added-only W + 1 explained shift; two-name determinism. Pass 2 (`tasks/eval-m6d-pass2.md`): VERDICT PASS (suite 765+25/66/12/34/150, 22/22 mutants, no `skipping:`). **M6d closed 2026-10-11.**
 
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 
 - [x] M6b Request-path precision (closed 2026-10-10, amendment 11; passes 1–2 PASS).
 - [x] M6c DI, RTA and orphan precision (closed 2026-10-11, amendments 1–15; passes 1–2 PASS).
-- [ ] M6d Go and Python SCIP (scip-go image built locally, scip-python pinned by digest after measuring, fetch phases behind the proxy, Go/Python fixtures, the adversarial egress review).
+- [x] M6d Go and Python SCIP (scip-go image built locally, scip-python pinned by digest after measuring, fetch phases behind the proxy, Go/Python fixtures, the adversarial egress review).
 - [ ] M6e Build and lockfile breadth (Gradle, pnpm/Yarn lockfiles and workspaces, `go.work`, Maven classifiers, tsconfig include/exclude, source encoding).
 - [ ] M6f Contract packs (OpenAPI, gRPC, generated interfaces, MyBatis XML).
 - [ ] M6g Topology and configuration packs (message topics, gateways, compose/k8s hosts, Spring YAML and active profiles).

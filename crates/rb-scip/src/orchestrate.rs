@@ -35,7 +35,9 @@ pub const RECIPE_GO: &str = "m6d-go-1";
 /// the fetch installs lockfile-driven environments (S4; `m6d-py-1`
 /// fetched nothing). `m6d-py-3`: pip ignores `requires-python` (S11 — the
 /// image's 3.10 predates some lockfiles' floors; versions stay pinned).
-pub const RECIPE_PY: &str = "m6d-py-3";
+/// `m6d-py-4`: pip reads with a 60 s socket timeout (phase 12 — the 15 s
+/// default trips on slow wheel reads through the emulated stack).
+pub const RECIPE_PY: &str = "m6d-py-4";
 
 /// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
 /// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
@@ -801,7 +803,15 @@ fn python_runs(
         caches,
         readonly: Vec::new(),
         // pip's update notice depends on the cache's state (contract M5 S22).
-        env: vec![("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into())],
+        // `PIP_TIMEOUT` (phase 12: pip's 15 s default read timeout trips on
+        // slow wheel reads through the emulated stack — measured 19 s ok /
+        // 87 s ok / 33 s and 54 s read-timeout failures on one fixture fetch,
+        // so 60 s of headroom without masking real outages, which the fetch
+        // budget still bounds).
+        env: vec![
+            ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
+            ("PIP_TIMEOUT".into(), "60".into()),
+        ],
         network: Network::Fetch,
         cpus: budget.cpus,
         memory: budget.memory.clone(),
@@ -1092,7 +1102,8 @@ mod tests {
                     && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
                     && lines[0].contains(fetch)
                     && lines[0].contains(cache)
-                    && lines[0].contains("-e PIP_DISABLE_PIP_VERSION_CHECK=1"),
+                    && lines[0].contains("-e PIP_DISABLE_PIP_VERSION_CHECK=1")
+                    && lines[0].contains("-e PIP_TIMEOUT=60"),
                 "{lockfile:?}: {}",
                 lines[0]
             );
@@ -1756,7 +1767,7 @@ mod tests {
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m6a-ts-1"));
-        assert_eq!(RECIPE_PY, "m6d-py-3");
+        assert_eq!(RECIPE_PY, "m6d-py-4");
         assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
         assert_eq!(
             recipe(Indexer::ScipTypescript, &Budget::default()),
