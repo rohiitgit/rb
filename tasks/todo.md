@@ -910,7 +910,7 @@ Same rules as M6b/M6c:
 - [x] **8. Python member idioms** (S8). Done 2026-10-11 (amendment 9): self/cls member receivers (construction-first, annotation fallback, conflict-dynamic) + session-typed locals; all capped. Tests first + 9 mutants killed; mixed scratch stitches member/typed sites; no golden moves. Files: `rb-frameworks/src/clients.rs`.
 - [x] **9. Fixtures + guards** (S9). Done 2026-10-11 (amendments 10–11): chi/FastAPI packs (9a) + fixtures with per-class guards, IMPLEMENTS join branch, e2e fns + goldens (9b). Tests first + 15 mutants killed; full suite green. Files: `rb-frameworks/src/routes.rs`, `rb-indexer/src/scip.rs`, `rb-cli/tests/e2e.rs` + fixtures/goldens.
   - [x] **9a. chi + FastAPI route packs.** Done 2026-10-11 (amendment 10): chi verbs/nested-Route/Group/With/Method/Handle + FastAPI decorators/prefixes/includes; tests first + 11 mutants killed. Files: `rb-frameworks/src/routes.rs` (+ 1-line `kwarg` share in `clients.rs`).
-- [ ] **10. Egress review** (S10). Probe suite green on the final allow-list.
+- [x] **10. Egress review** (S10). Done 2026-10-11 (amendment 12): probe suite re-run green on the final 7-host allow-list; per-tool posture recorded; verdict no finding, no code change.
 - [ ] **11. Measurements** (S11). mattermost Go + Python repo; classified diffs + read samples.
 - [ ] **12. Records + evaluator.** S12–S14; pass 1 (full), fixes, pass 2 (verification-only).
 
