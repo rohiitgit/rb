@@ -916,12 +916,38 @@ Same rules as M6b/M6c:
   - [x] **Pass 1 + fixes.** Done 2026-10-11 (amendment 14): 3 parallel evaluators, 2 blocking + 9 non-blocking findings; blockers fixed test-first (tool_versions identities, absolute replace) + claim-breaking hardening (chi Handle, double-include expansion, dispatcher kwargs, gomod split pin, GOTOOLCHAIN env); rest recorded with reasons.
   - [x] **Phase 12 (records + pass 2).** Done 2026-10-11 (amendment 15): S13 growth audit found chi (15.85×) and FastAPI (18×) superlinear — fixed test-first (per-file function sweep `FuncCache`/`ChiState`; adjacency + memoised levels + cycle gate; 4 ratio tests + 1 cycle pin, 6/6 mutants); requests/httpx + member packs linear as built; same-name shadowing cost recorded. `PIP_TIMEOUT=60` with `RECIPE_PY m6d-py-4` (measured pip read-timeout flake). Contention incident recovered (2 p12 e2e failures from parallel builds; poisoned scip row overwritten uncontended; both re-green). Invariant 1 vs `027a54f`: 4/7 identical, rest added-only W + 1 explained shift; two-name determinism. Pass 2 (`tasks/eval-m6d-pass2.md`): VERDICT PASS (suite 765+25/66/12/34/150, 22/22 mutants, no `skipping:`). **M6d closed 2026-10-11.**
 
+## M6e Build and lockfile breadth (contract `tasks/contract-m6e.md`, written 2026-10-11; forks F1–F6 decided with reasons; started 2026-10-11)
+
+Same rules as M6d:
+- Each phase has at most 5 hand-edited source files. Fixture sources, blessed goldens and guard data are listed separately in the changelog and reviewed on their own.
+- Each phase is test-first: the new units fail, or do not compile, before the change (the failure recorded).
+- Each phase ends with its verification step: fmt, `clippy --workspace --all-targets -D warnings`, the touched crates' unit tests counted from a log holding both streams (`> log 2>&1`), and the e2e suite with `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb` (with containers wherever the phase touches SCIP: `docker image inspect` first, no `skipping:`).
+- Any golden that changes gets a classified line diff before `RB_BLESS=1`; any dump change is classified L, T or W (contract invariant 1).
+- Mutation runs follow M4a's harness rules: fresh mtime, restored bytes checked, a `test result:` line per mutant, stopped with SIGINT, `"$@"`, `command -v` for every tool.
+- Environment: never `npm`/`npx`/`pip`/`go`/`gradle` on the host (lockfiles and environments are generated inside the pinned images); Docker context `desktop-linux`; no image pull except the measured Gradle distribution (none is needed otherwise); `df` before every build, clone and container step, floor 6 GiB for large-repository steps and 2 GiB otherwise; one-off builds use a `CARGO_TARGET_DIR` under the scratchpad, removed afterwards; disk figures accounted part by part in MiB; no builds during e2e container phases.
+
+`PIPELINE` becomes `m6e-1` at the first dump change and is bumped on each later one.
+
+- [x] **0. Preflight** (no code). Done 2026-10-11 (amendment 1): baseline binary `var/m6e/base/rb-de4f5c1` (sha256 recorded; HEAD code == `de4f5c1`); fixture dumps with it, `--no-scip`, all non-empty; full-SHA pins (jcommander Gradle-KTS, ofetch pnpm-lock); yarn-classic/go.work public samples: none in reach (recorded gap); shape checks (Gradle detection/unsupported, Maven-only image, 8-host egress, npm/go/pom-only versions, npm+Yarn-v1 grouping, no exclude/go.work/classifier/include readers; fixtures N3-clean); scip-java Gradle interface from primary docs + `--help` (`--build-tool=<gradle>`, default `clean compileTestJava …`, detection files); Gradle 8.14.6 pin + dist sha (8.x line over 9.x, recorded reason); image tooling (yarn 1.22.22 classic → Berry versions-only; pnpm 10.17.1); fixture dep versions read (commons-lang3 3.20.0, semver 7.8.5, is-odd 3.0.1); Maven encoding precedence from plugin docs with 2 points flagged for S11 measurement; images verified; DB 3 pre-existing + 7 `t_p0_*` (auto-cleaned next e2e); disk 11G free.
+- [ ] **1. Gradle image** (S1). Dockerfile Gradle (pinned dist + sha, versions verified), image rebuilt locally, size recorded; wiring constants; tests first + mutants; stdlib smoke.
+- [ ] **2. Gradle fetch + index** (S2). `Fetch::Gradle` recipes (fetch resolves, index offline `--build-tool Gradle`), Gradle hosts allow-listed, per-repo `gradle` cache, `unsupported` lifted; probe suite extended; tests first + mutants; smoke indexes a scratch build.
+- [ ] **3. Gradle versions** (S3). Catalog + both-DSL literal readers + diagnostics; tests first + mutants.
+- [ ] **4. Gradle fixture + guards** (S4). `java-gradle-catalog` fixture, per-class guards, e2e fns + goldens; tests first + mutants.
+- [ ] **5. pnpm/yarn lockfile readers** (S5). Hand-rolled line readers (v1 + Berry + pnpm), governance; tests first + mutants.
+- [ ] **6. pnpm workspaces + yarn links** (S6). Grouping, `file:`/`link:` targets, Berry jobs `unsupported`; tests first + mutants.
+- [ ] **7. TS lockfile fixture** (S7). `ts-pnpm-yarn` fixture, per-format version pins, goldens; tests first + mutants.
+- [ ] **8. go.work + exclude** (S8). Workspace joins/replaces, excluded→`?`; tests first + mutants.
+- [ ] **9. Maven classifiers** (S9). Full-key duplicates; tests first + mutants.
+- [ ] **10. tsconfig scoping + encodings + N3** (S10–S12). Membership reader (no edge moves), five-source encoding precedence, line-start `-->`/`>>>>>>>` rejection after 0-calibration; tests first + mutants.
+- [ ] **11. Measurements** (S13). jcommander + ofetch (+ yarn/go.work/classifier/tsconfig where shapes occur); classified diffs + samples; deterministic.
+- [ ] **12. Records + evaluator.** S14–S16; pass 1 (full), fixes, pass 2 (verification-only).
+
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 
 - [x] M6b Request-path precision (closed 2026-10-10, amendment 11; passes 1–2 PASS).
 - [x] M6c DI, RTA and orphan precision (closed 2026-10-11, amendments 1–15; passes 1–2 PASS).
 - [x] M6d Go and Python SCIP (scip-go image built locally, scip-python pinned by digest after measuring, fetch phases behind the proxy, Go/Python fixtures, the adversarial egress review).
-- [ ] M6e Build and lockfile breadth (Gradle, pnpm/Yarn lockfiles and workspaces, `go.work`, Maven classifiers, tsconfig include/exclude, source encoding).
+- [ ] M6e Build and lockfile breadth (contract written 2026-10-11, phases above; Gradle, pnpm/Yarn lockfiles and workspaces, `go.work`, Maven classifiers, tsconfig include/exclude, source encoding).
 - [ ] M6f Contract packs (OpenAPI, gRPC, generated interfaces, MyBatis XML).
 - [ ] M6g Topology and configuration packs (message topics, gateways, compose/k8s hosts, Spring YAML and active profiles).
 - [ ] M6h Architecture rules as a CI gate (`rb check` in Cypher).
