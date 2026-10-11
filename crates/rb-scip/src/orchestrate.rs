@@ -33,8 +33,9 @@ pub const RECIPE_GO: &str = "m6d-go-1";
 /// scip-python's recipe (contract M6d S2/S4): environment resolution, then
 /// `scip-python index` offline. Bumped like [`RECIPE_JAVA`]. `m6d-py-2`:
 /// the fetch installs lockfile-driven environments (S4; `m6d-py-1`
-/// fetched nothing).
-pub const RECIPE_PY: &str = "m6d-py-2";
+/// fetched nothing). `m6d-py-3`: pip ignores `requires-python` (S11 — the
+/// image's 3.10 predates some lockfiles' floors; versions stay pinned).
+pub const RECIPE_PY: &str = "m6d-py-3";
 
 /// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
 /// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
@@ -730,8 +731,13 @@ fn go_runs(
         readonly: Vec::new(),
         // Contract M6d S3: the checksum database lives outside the
         // allow-list, so verification is off; `go.sum` still verifies the
-        // modules it pins. `GOFLAGS=-mod=mod` rides from the image.
-        env: vec![("GOSUMDB".into(), "off".into())],
+        // modules it pins. `GOFLAGS=-mod=mod` rides from the image. The
+        // proxy is pinned (no `,direct` git fallback outside the
+        // allow-list; S11: it would only fail closed, slowly).
+        env: vec![
+            ("GOSUMDB".into(), "off".into()),
+            ("GOPROXY".into(), "https://proxy.golang.org".into()),
+        ],
         network: Network::Fetch,
         cpus: budget.cpus,
         memory: budget.memory.clone(),
@@ -801,10 +807,29 @@ fn python_runs(
     };
     let args: Vec<String> = match lockfile {
         PythonLock::Poetry => ["poetry", "install", "--no-root", "--no-interaction"].to_vec(),
-        PythonLock::Requirements => {
-            ["pip", "install", "--no-deps", "-r", "requirements.txt"].to_vec()
-        }
-        PythonLock::None => ["pip", "install", "--no-deps", "-e", "."].to_vec(),
+        // `--ignore-requires-python`: the image's interpreter (3.10) predates
+        // some lockfiles' floors (S11: a `>=3.14` floor fails the fetch
+        // otherwise); versions stay pinned, and what the older runtime cannot
+        // parse stays a counted gap. Never `--no-deps`-less: transitive trees
+        // stay out.
+        PythonLock::Requirements => [
+            "pip",
+            "install",
+            "--no-deps",
+            "--ignore-requires-python",
+            "-r",
+            "requirements.txt",
+        ]
+        .to_vec(),
+        PythonLock::None => [
+            "pip",
+            "install",
+            "--no-deps",
+            "--ignore-requires-python",
+            "-e",
+            ".",
+        ]
+        .to_vec(),
     }
     .iter()
     .map(|s| (*s).to_owned())
@@ -1003,7 +1028,9 @@ mod tests {
     /// Contract M6d S1: a Go job fetches with `go mod download` on the fetch
     /// network (module cache mounted) and indexes with `scip-go` offline.
     /// Contract M6d S3: the fetch pins `GOSUMDB=off` (the checksum database
-    /// is outside the allow-list; `go.sum` still verifies when present).
+    /// is outside the allow-list; `go.sum` still verifies when present) and
+    /// `GOPROXY` to the module proxy (S11: no `,direct` git fallback outside
+    /// the allow-list).
     #[test]
     fn go_job_runs_download_then_scip_go() {
         let lines = argv_lines(&go_job(), "sha256:go", &Budget::default());
@@ -1013,7 +1040,8 @@ mod tests {
                 && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
                 && lines[0].contains("go mod download")
                 && lines[0].contains("/root/go/pkg/mod")
-                && lines[0].contains("-e GOSUMDB=off"),
+                && lines[0].contains("-e GOSUMDB=off")
+                && lines[0].contains("-e GOPROXY=https://proxy.golang.org"),
             "{}",
             lines[0]
         );
@@ -1041,12 +1069,12 @@ mod tests {
             ),
             (
                 PythonLock::Requirements,
-                "pip install --no-deps -r requirements.txt",
+                "pip install --no-deps --ignore-requires-python -r requirements.txt",
                 "/root/.cache/pip",
             ),
             (
                 PythonLock::None,
-                "pip install --no-deps -e .",
+                "pip install --no-deps --ignore-requires-python -e .",
                 "/root/.cache/pip",
             ),
         ] {
@@ -1379,7 +1407,7 @@ mod tests {
             *fake.proxies.borrow(),
             [
                 format!(
-                    "start rb-egress-{instance} files.pythonhosted.org:443,proxy.golang.org:443,pypi.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443"
+                    "start rb-egress-{instance} files.pythonhosted.org:443,proxy.golang.org:443,pypi.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443,storage.googleapis.com:443"
                 ),
                 format!("stop rb-egress-{instance}"),
             ]
@@ -1722,7 +1750,7 @@ mod tests {
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m6a-ts-1"));
-        assert_eq!(RECIPE_PY, "m6d-py-2");
+        assert_eq!(RECIPE_PY, "m6d-py-3");
         assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
         assert_eq!(
             recipe(Indexer::ScipTypescript, &Budget::default()),

@@ -23,9 +23,12 @@ pub const PROXY_CONFIG_AT: &str = "/etc/tinyproxy";
 pub const CLIENT_CONFIG_AT: &str = "/rb-egress";
 
 /// The registries the built-in recipes fetch from: Maven Central (both of its host names),
-/// the npm and Yarn registries, the Go module proxy (contract M6d S3) and PyPI with its
-/// file host (contract M6d S4). The fixtures' fetches reach only `repo.maven.apache.org` and
-/// `registry.npmjs.org` (measured through an open proxy, contract M5 amendment 12).
+/// the npm and Yarn registries, the Go module proxy (contract M6d S3) with the Google-hosted
+/// bucket it redirects large downloads to (measured in S11: `go mod download` serves module
+/// zips from signed `storage.googleapis.com` URLs; refusing it fails closed on real modules),
+/// and PyPI with its file host (contract M6d S4). The fixtures' fetches reach only
+/// `repo.maven.apache.org` and `registry.npmjs.org` (measured through an open proxy, contract
+/// M5 amendment 12).
 pub const REGISTRIES: &[&str] = &[
     "files.pythonhosted.org",
     "proxy.golang.org",
@@ -34,6 +37,7 @@ pub const REGISTRIES: &[&str] = &[
     "registry.yarnpkg.com",
     "repo.maven.apache.org",
     "repo1.maven.org",
+    "storage.googleapis.com",
 ];
 
 /// The fetch phase's allow-list: [`REGISTRIES`] plus the extra hosts the indexing host
@@ -186,7 +190,8 @@ mod tests {
                 "registry.yarnpkg.com",
                 "repo.maven.apache.org",
                 "repo.spring.io",
-                "repo1.maven.org"
+                "repo1.maven.org",
+                "storage.googleapis.com"
             ]
         );
         for bad in [
@@ -222,7 +227,7 @@ mod tests {
         }
         assert_eq!(
             e.proxy_filter(),
-            "files.pythonhosted.org:443\nproxy.golang.org:443\npypi.org:443\nregistry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\n"
+            "files.pythonhosted.org:443\nproxy.golang.org:443\npypi.org:443\nregistry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\nstorage.googleapis.com:443\n"
         );
         let tmp = tempfile::tempdir().unwrap();
         e.write_config(tmp.path()).unwrap();

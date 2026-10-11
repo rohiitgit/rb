@@ -3079,6 +3079,7 @@ echo "gosum $(code https://sum.golang.org/)"
 echo "pypi $(code https://pypi.org/pypi/requests/json)"
 echo "files $(code https://files.pythonhosted.org/)"
 echo "testpypi $(code https://test.pypi.org/simple/)"
+echo "gcs $(code https://storage.googleapis.com/)"
 echo "host $(code https://example.com/)"
 echo "plain $(code -x "$http_proxy" http://repo.maven.apache.org/maven2/)"
 echo "ip $(code https://1.1.1.1/)"
@@ -3141,8 +3142,10 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
     );
     assert_eq!(result("pypi"), "200 exit=0");
     // Contract M6d S4: the file host answers (its root is a 404), while the
-    // same-org test index stays refused.
+    // same-org test index stays refused. S11: the Go proxy's storage bucket
+    // answers (its root is a 400).
     assert_eq!(result("files"), "404 exit=0");
+    assert_eq!(result("gcs"), "400 exit=0");
     assert!(
         result("testpypi").starts_with("000 exit=") && result("testpypi") != "000 exit=0",
         "testpypi: {}",

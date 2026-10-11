@@ -911,7 +911,7 @@ Same rules as M6b/M6c:
 - [x] **9. Fixtures + guards** (S9). Done 2026-10-11 (amendments 10–11): chi/FastAPI packs (9a) + fixtures with per-class guards, IMPLEMENTS join branch, e2e fns + goldens (9b). Tests first + 15 mutants killed; full suite green. Files: `rb-frameworks/src/routes.rs`, `rb-indexer/src/scip.rs`, `rb-cli/tests/e2e.rs` + fixtures/goldens.
   - [x] **9a. chi + FastAPI route packs.** Done 2026-10-11 (amendment 10): chi verbs/nested-Route/Group/With/Method/Handle + FastAPI decorators/prefixes/includes; tests first + 11 mutants killed. Files: `rb-frameworks/src/routes.rs` (+ 1-line `kwarg` share in `clients.rs`).
 - [x] **10. Egress review** (S10). Done 2026-10-11 (amendment 12): probe suite re-run green on the final 7-host allow-list; per-tool posture recorded; verdict no finding, no code change.
-- [ ] **11. Measurements** (S11). mattermost Go + Python repo; classified diffs + read samples.
+- [x] **11. Measurements** (S11). Done 2026-10-11 (amendment 13, record `var/m6d/bench/phase11.md`): --no-scip both binaries both repos (identical graphs, classified +W-only diffs, read samples); scip-go 6/9 ok + scip-python ok with two measurement-driven fetch fixes (GCS redirect host, requires-python flag + recipe bump); classified SCIP diffs + samples; deterministic. Files: `rb-scip/src/egress.rs`, `hash.rs`, `orchestrate.rs`, `rb-cli/tests/e2e.rs`.
 - [ ] **12. Records + evaluator.** S12–S14; pass 1 (full), fixes, pass 2 (verification-only).
 
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
