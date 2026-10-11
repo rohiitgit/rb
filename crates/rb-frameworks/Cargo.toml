@@ -11,6 +11,8 @@ rb-sql.workspace = true
 rb-syntax.workspace = true
 # `package.json` dependency entries in the raw-text scan (contract M4a amendment 17).
 serde_json.workspace = true
+tree-sitter.workspace = true
+tree-sitter-proto.workspace = true
 
 [features]
 # The growth tests' operation counter (`work`), for dependants' tests (contract M4a amendment 12).

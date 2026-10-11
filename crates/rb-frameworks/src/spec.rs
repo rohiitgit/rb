@@ -176,10 +176,137 @@ fn scalar(rest: &str) -> String {
         .to_owned()
 }
 
+/// One RPC: its name, whether either side streams (recorded from the RPC text — the grammar
+/// exposes no node kind for `stream`), and its name span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtoRpc {
+    pub name: String,
+    pub stream: bool,
+    pub span: rb_syntax::Span,
+}
+
+/// One proto service: its package, name, RPCs and name span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtoService {
+    pub package: String,
+    pub name: String,
+    pub rpcs: Vec<ProtoRpc>,
+    pub span: rb_syntax::Span,
+}
+
+/// A `.proto` file, by file name.
+pub fn is_proto_input(path: &str) -> bool {
+    path.rsplit('/').next().unwrap_or(path).ends_with(".proto")
+}
+
+/// Reads a `.proto` file's services: package (first `package` clause), service names and RPC
+/// names with spans from the tree. Never fails: garbage yields no services, and an RPC
+/// outside a service is ignored. The walk is bounded (depth cap 64, counted).
+pub fn proto_services(text: &str) -> Vec<ProtoService> {
+    let mut parser = tree_sitter::Parser::new();
+    let Ok(()) = parser.set_language(&tree_sitter_proto::LANGUAGE.into()) else {
+        return Vec::new();
+    };
+    let Some(tree) = parser.parse(text, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut package = String::new();
+    walk(tree.root_node(), text.as_bytes(), 0, &mut package, &mut out);
+    out
+}
+
+fn span_of(node: tree_sitter::Node) -> rb_syntax::Span {
+    let (s, e) = (node.start_position(), node.end_position());
+    [s.row as i32, s.column as i32, e.row as i32, e.column as i32]
+}
+
+fn node_text<'a>(node: tree_sitter::Node, bytes: &'a [u8]) -> &'a str {
+    node.utf8_text(bytes).unwrap_or_default()
+}
+
+fn walk(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    depth: usize,
+    package: &mut String,
+    out: &mut Vec<ProtoService>,
+) {
+    if depth > 64 {
+        return;
+    }
+    tick(1);
+    match node.kind() {
+        "package" => {
+            if package.is_empty() {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "full_ident" {
+                        package.push_str(node_text(child, bytes));
+                        break;
+                    }
+                }
+            }
+        }
+        "service" => {
+            let mut name = String::new();
+            let mut span = [0, 0, 0, 0];
+            let mut rpcs = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "service_name" => {
+                        name = node_text(child, bytes).to_owned();
+                        span = span_of(child);
+                    }
+                    "rpc" => {
+                        let mut rpc_name = String::new();
+                        let mut rpc_span = [0, 0, 0, 0];
+                        let mut rcursor = child.walk();
+                        for grand in child.children(&mut rcursor) {
+                            if grand.kind() == "rpc_name" {
+                                rpc_name = node_text(grand, bytes).to_owned();
+                                rpc_span = span_of(grand);
+                                break;
+                            }
+                        }
+                        if !rpc_name.is_empty() {
+                            let stream = node_text(child, bytes)
+                                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                .any(|w| w == "stream");
+                            rpcs.push(ProtoRpc {
+                                name: rpc_name,
+                                stream,
+                                span: rpc_span,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !name.is_empty() {
+                out.push(ProtoService {
+                    package: package.clone(),
+                    name,
+                    rpcs,
+                    span,
+                });
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(child, bytes, depth + 1, package, out);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::work;
+    use rb_syntax::Span;
 
     /// Contract M6f S1: JSON specs pin paths, methods and operation IDs; `servers`,
     /// `webhooks`, `components`, `$ref`s and unknown method keys contribute nothing.
@@ -302,6 +429,65 @@ mod tests {
             work::take()
         };
         let (small, large) = (work(100), work(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M6f S2: `.proto` services pin their package, name and RPCs; streaming is
+    /// recorded from the RPC text (the grammar exposes no node kind for it); anything else
+    /// contributes nothing and never fails.
+    #[test]
+    fn proto_services_pin_package_names_and_rpcs() {
+        let text = "syntax = \"proto3\";\npackage acme;\n\nservice Users {\n  rpc Get (GetReq) returns (GetResp);\n  rpc Watch (stream W) returns (stream W);\n}\n\nservice Empty {}\n\nmessage GetReq {}\n";
+        let services = proto_services(text);
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].package, "acme");
+        assert_eq!(services[0].name, "Users");
+        assert_eq!(
+            services[0]
+                .rpcs
+                .iter()
+                .map(|r| (r.name.as_str(), r.stream))
+                .collect::<Vec<_>>(),
+            [("Get", false), ("Watch", true)]
+        );
+        assert!(services[1].rpcs.is_empty());
+        // Positions are never hand-counted: spans come from the tree.
+        let span_of = |span: &Span| {
+            let lines: Vec<&str> = text.split('\n').collect();
+            let off = |row: i32, col: i32| {
+                lines[..row as usize]
+                    .iter()
+                    .map(|l| l.len() + 1)
+                    .sum::<usize>()
+                    + col as usize
+            };
+            off(span[0], span[1])..off(span[2], span[3])
+        };
+        let span = services[0].rpcs[0].span;
+        assert_eq!(&text[span_of(&span)], "Get");
+        assert_eq!(proto_services("syntax = \"proto3\";\nmessage A {}\n"), []);
+        assert_eq!(proto_services("))) garbage ((("), []);
+        assert!(is_proto_input("svc/a.proto"));
+        assert!(!is_proto_input("svc/a.prot"));
+        assert!(!is_proto_input("svc/proto"));
+    }
+
+    /// Contract M6f S2, invariant 5: reading 4× the services costs at most 5× the operations.
+    #[test]
+    fn proto_reading_grows_linearly() {
+        let work = |n: usize| {
+            let mut text = String::from("syntax = \"proto3\";\npackage p;\n");
+            for i in 0..n {
+                text.push_str(&format!(
+                    "service S{i} {{\n  rpc M{i} (A) returns (B);\n}}\n"
+                ));
+            }
+            work::take();
+            let services = proto_services(&text);
+            assert_eq!(services.len(), n);
+            work::take()
+        };
+        let (small, large) = (work(50), work(200));
         assert!(large <= small * 5, "{small} -> {large}");
     }
 }
