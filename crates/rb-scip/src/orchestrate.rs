@@ -324,6 +324,33 @@ pub fn run_job(
     runner: &dyn Runner,
 ) -> anyhow::Result<ScipRun> {
     let started = std::time::Instant::now();
+    if let Fetch::Npm { lockfile } = &job.fetch {
+        // A Yarn Berry root never fetches: the image holds classic yarn 1.22.22
+        // (measured in preflight), so a Berry install would fail on its lockfile;
+        // versions still pin from it (contract M6e S5). Before anything is exported.
+        if *lockfile == NodeLock::Yarn {
+            let lock = if job.root.is_empty() {
+                "yarn.lock".to_owned()
+            } else {
+                format!("{}/yarn.lock", job.root)
+            };
+            if files
+                .iter()
+                .find(|(p, _)| p == &lock)
+                .is_some_and(|(_, b)| crate::jobs::is_yarn_berry(b))
+            {
+                return Ok(ScipRun {
+                    status: RunStatus::Unsupported(
+                        "Yarn Berry installs need a Berry binary; the image holds classic yarn 1.22.22"
+                            .into(),
+                    ),
+                    index: None,
+                    stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                });
+            }
+        }
+    }
     let instance = format!(
         "{}-{}-{}",
         work_dir
@@ -1105,6 +1132,63 @@ mod tests {
             projects: Vec::new(),
             unpinned: false,
         }
+    }
+
+    /// Contract M6e S6: a Yarn Berry root never fetches (the image holds
+    /// classic yarn 1.22.22, measured in preflight): `unsupported` with the
+    /// reason, before anything is exported or run.
+    #[test]
+    fn berry_jobs_are_unsupported_and_export_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(false, false);
+        let files = vec![
+            ("apps/web/package.json".to_owned(), b"{}".to_vec()),
+            (
+                "apps/web/yarn.lock".to_owned(),
+                b"__metadata:\n  version: 8\n".to_vec(),
+            ),
+        ];
+        let run = run_job(
+            &ts_job(NodeLock::Yarn),
+            "sha256:ts",
+            &files,
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(
+            run.status,
+            RunStatus::Unsupported(
+                "Yarn Berry installs need a Berry binary; the image holds classic yarn 1.22.22"
+                    .into()
+            )
+        );
+        assert!(fake.runs.borrow().is_empty());
+        assert!(!tmp.path().join("w").exists(), "nothing is exported");
+        // A classic lockfile still runs.
+        let files = vec![
+            ("apps/web/package.json".to_owned(), b"{}".to_vec()),
+            (
+                "apps/web/yarn.lock".to_owned(),
+                b"# yarn lockfile v1\n".to_vec(),
+            ),
+        ];
+        let run = run_job(
+            &ts_job(NodeLock::Yarn),
+            "sha256:ts",
+            &files,
+            &tmp.path().join("w2"),
+            &tmp.path().join("c2"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert!(!matches!(run.status, RunStatus::Unsupported(_)));
+        assert!(!fake.runs.borrow().is_empty());
     }
 
     fn go_job() -> Job {

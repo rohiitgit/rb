@@ -103,8 +103,7 @@ pub struct Job {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ungrouped {
     pub root: String,
-    /// `workspace_glob_unsupported`, `workspace_without_lockfile`,
-    /// `workspace_lockfile_unsupported` (only `pnpm-lock.yaml`), `yarn_berry` or
+    /// `workspace_glob_unsupported`, `workspace_without_lockfile`, `yarn_berry` or
     /// `manifest_unreadable` (a `package.json` that is not JSON, or a `workspaces` value of
     /// another shape).
     pub reason: &'static str,
@@ -332,7 +331,15 @@ fn workspaces<'a>(
             .map(workspace_patterns)
         {
             Some(Ok(Some(patterns))) => patterns,
-            Some(Ok(None)) => continue,
+            // pnpm workspaces declare members in `pnpm-workspace.yaml`
+            // (contract M6e S6); a root with neither is a plain root.
+            Some(Ok(None)) => match read(&join(root, "pnpm-workspace.yaml"))
+                .as_deref()
+                .map(pnpm_workspace_patterns)
+            {
+                Some(Some(patterns)) => patterns,
+                _ => continue,
+            },
             Some(Err(())) | None => {
                 ungrouped("manifest_unreadable");
                 continue;
@@ -348,8 +355,7 @@ fn workspaces<'a>(
             }
             NodeLock::Yarn
         } else if has(&join(root, "pnpm-lock.yaml")) {
-            ungrouped("workspace_lockfile_unsupported");
-            continue;
+            NodeLock::Pnpm
         } else {
             ungrouped("workspace_without_lockfile");
             continue;
@@ -412,7 +418,8 @@ fn workspace_patterns(bytes: &[u8]) -> Result<Option<Vec<String>>, ()> {
 
 /// A Yarn ≥ 2 lockfile: its first line that is neither blank nor a `#` comment starts
 /// `__metadata:` (Yarn v1's lockfiles start with `# yarn lockfile v1` and entries).
-fn is_yarn_berry(text: &[u8]) -> bool {
+/// `pub(crate)` for the fetch phase's Berry refusal (contract M6e S6).
+pub(crate) fn is_yarn_berry(text: &[u8]) -> bool {
     String::from_utf8_lossy(text)
         .lines()
         .map(str::trim)
@@ -420,7 +427,38 @@ fn is_yarn_berry(text: &[u8]) -> bool {
         .is_some_and(|l| l.starts_with("__metadata:"))
 }
 
-/// One segment of an allowed workspace pattern (contract M6a D5).
+/// `pnpm-workspace.yaml`'s `packages:` globs, hand-read (contract M6e S6: no YAML
+/// parser; the glob allow-list below validates). `None` when the file declares
+/// none (a scalar or missing `packages:` is not a workspace).
+fn pnpm_workspace_patterns(bytes: &[u8]) -> Option<Vec<String>> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out: Option<Vec<String>> = None;
+    for line in text.lines() {
+        if line.starts_with([' ', '\t']) {
+            if let Some(patterns) = out.as_mut()
+                && let Some(item) = line.trim().strip_prefix("- ")
+            {
+                let item = item.trim().trim_matches('\'').trim_matches('"');
+                if !item.is_empty() {
+                    patterns.push(item.to_owned());
+                }
+            }
+            continue;
+        }
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        if out.is_some() {
+            // Any second top-level key ends the list.
+            break;
+        }
+        if body == "packages:" {
+            out = Some(Vec::new());
+        }
+    }
+    out
+}
 enum Segment {
     Literal(String),
     /// `*`: exactly one directory.
@@ -1049,8 +1087,9 @@ mod tests {
     }
 
     /// A root without `package-lock.json` or `yarn.lock` (`polyglot-monorepo`'s shape: npm
-    /// would resolve every member afresh), a Yarn ≥ 2 lockfile and a pnpm lockfile are not
-    /// grouped, each with its reason; the jobs are today's.
+    /// would resolve every member afresh) and a Yarn ≥ 2 lockfile are not
+    /// grouped, each with its reason; pnpm roots group through `pnpm-workspace.yaml`
+    /// (contract M6e S6); the jobs are today's.
     #[test]
     fn a_workspace_without_a_supported_lockfile_is_ungrouped() {
         let polyglot = [
@@ -1101,7 +1140,7 @@ mod tests {
         );
         assert_eq!(
             ungrouped("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
-            [" workspace_lockfile_unsupported"]
+            Vec::<String>::new()
         );
         assert_eq!(
             ungrouped(
@@ -1109,6 +1148,68 @@ mod tests {
                 "# yarn lockfile v1\n\n\"a@1\":\n  version \"1\"\n"
             ),
             Vec::<String>::new()
+        );
+    }
+
+    /// Contract M6e S6: pnpm workspaces group like npm ones — members come from
+    /// `pnpm-workspace.yaml` `packages:` globs through the same allow-list engine, and the
+    /// root job fetches with pnpm from its lockfile. A root with a pnpm lockfile but no
+    /// workspace file is a plain single-package job (no reason recorded).
+    #[test]
+    fn pnpm_workspace_file_patterns() {
+        assert_eq!(
+            pnpm_workspace_patterns(b"packages:\n  - 'a/*'\n  - b/c\n"),
+            Some(vec!["a/*".to_owned(), "b/c".to_owned()])
+        );
+        assert_eq!(
+            pnpm_workspace_patterns(b"# comment\npackages:\n"),
+            Some(vec![])
+        );
+        assert_eq!(pnpm_workspace_patterns(b"packages: ['a']\n"), None);
+        assert_eq!(pnpm_workspace_patterns(b"other: 1\n"), None);
+    }
+
+    #[test]
+    fn pnpm_workspaces_group_through_the_workspace_file() {
+        let files = [
+            "package.json",
+            "pnpm-workspace.yaml",
+            "pnpm-lock.yaml",
+            "packages/a/package.json",
+            "packages/a/tsconfig.json",
+            "packages/b/package.json",
+            "packages/b/tsconfig.json",
+            "legacy/package.json",
+            "legacy/tsconfig.json",
+        ];
+        let (jobs, ungrouped) = workspace_summary(
+            &files,
+            &[
+                ("package.json", r#"{"name": "root"}"#),
+                ("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n"),
+            ],
+        );
+        assert_eq!(
+            jobs,
+            vec![
+                "scip-typescript  npm(Pnpm) [packages/a,packages/b] {packages/a,packages/b}"
+                    .to_owned(),
+                "scip-typescript legacy npm(None) [.] unpinned".to_owned(),
+            ]
+        );
+        assert!(ungrouped.is_empty(), "{ungrouped:?}");
+        // No workspace file: plain roots keep today's jobs (the root lock
+        // alone groups nothing and records no reason).
+        let (jobs, ungrouped) =
+            workspace_summary(&files, &[("package.json", r#"{"name": "root"}"#)]);
+        assert!(ungrouped.is_empty(), "{ungrouped:?}");
+        assert_eq!(
+            jobs,
+            vec![
+                "scip-typescript legacy npm(None) [.] unpinned".to_owned(),
+                "scip-typescript packages/a npm(None) [.] unpinned".to_owned(),
+                "scip-typescript packages/b npm(None) [.] unpinned".to_owned(),
+            ]
         );
     }
 

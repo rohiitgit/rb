@@ -352,22 +352,25 @@ pub(crate) fn job_files<'b>(
             .collect()
     };
     let mut files = under(&job.root);
-    let lockfile = matches!(
-        job.fetch,
+    // Link targets outside the root but inside the repository: npm lockfile
+    // links, or Yarn `file:`/`link:` dependencies (contract M6e S6).
+    let targets: Vec<String> = match &job.fetch {
         rb_scip::jobs::Fetch::Npm {
-            lockfile: rb_scip::jobs::NodeLock::PackageLock
-        }
-    )
-    .then(|| read_path(&join_root(&job.root, "package-lock.json")))
-    .flatten();
-    let Some(lockfile) = lockfile else {
-        return Ok(JobFiles {
-            files,
-            link_targets: 0,
-        });
+            lockfile: rb_scip::jobs::NodeLock::PackageLock,
+        } => match read_path(&join_root(&job.root, "package-lock.json")) {
+            Some(lockfile) => link_targets(&job.root, &lockfile)?,
+            None => Vec::new(),
+        },
+        rb_scip::jobs::Fetch::Npm {
+            lockfile: rb_scip::jobs::NodeLock::Yarn,
+        } => match read_path(&join_root(&job.root, "package.json")) {
+            Some(manifest) => yarn_file_targets(&job.root, &manifest)?,
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
     };
     let mut exported_targets = 0;
-    for target in link_targets(&job.root, &lockfile)? {
+    for target in targets {
         let target_files: Vec<(&str, &str)> = under(&target)
             .into_iter()
             .filter(|(p, _)| !p.split('/').any(|segment| segment == "node_modules"))
@@ -381,6 +384,32 @@ pub(crate) fn job_files<'b>(
         files,
         link_targets: exported_targets,
     })
+}
+
+/// Resolve one link candidate lexically against `root` (`.` and `..` folded,
+/// nothing on disk followed): `None` when it stays under the root (already
+/// exported), the directory when it names an in-repository target outside it,
+/// `Err` when it leaves the repository (its path is not reported).
+fn resolve_link(root: &str, candidate: &str) -> Result<Option<String>, String> {
+    if candidate.starts_with('/') {
+        return Err(LINK_OUTSIDE.to_owned());
+    }
+    let mut at: Vec<&str> = if root.is_empty() {
+        Vec::new()
+    } else {
+        root.split('/').collect()
+    };
+    for segment in candidate.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                at.pop().ok_or_else(|| LINK_OUTSIDE.to_owned())?;
+            }
+            name => at.push(name),
+        }
+    }
+    let dir = at.join("/");
+    Ok((!(dir == root || in_root(&dir, root))).then_some(dir))
 }
 
 /// The directories a `package-lock.json` (v2 or v3) at `root` links to inside the repository
@@ -409,22 +438,49 @@ pub(crate) fn link_targets(root: &str, lockfile: &[u8]) -> Result<Vec<String>, S
             .filter(|r| !r.starts_with('/') && !r.contains(':'));
         let candidates = [key.starts_with("../").then_some(key.as_str()), resolved];
         for candidate in candidates.into_iter().flatten() {
-            let mut at: Vec<&str> = if root.is_empty() {
-                Vec::new()
-            } else {
-                root.split('/').collect()
-            };
-            for segment in candidate.split('/') {
-                match segment {
-                    "" | "." => {}
-                    ".." => {
-                        at.pop().ok_or_else(|| LINK_OUTSIDE.to_owned())?;
-                    }
-                    name => at.push(name),
-                }
+            if let Some(dir) = resolve_link(root, candidate)? {
+                targets.insert(dir);
             }
-            let dir = at.join("/");
-            if !(dir == root || in_root(&dir, root)) {
+        }
+    }
+    Ok(targets.into_iter().collect())
+}
+
+/// The directories a `package.json` at `root` names through Yarn `file:`/`link:`
+/// dependencies, inside the repository and outside `root`, sorted and distinct
+/// (contract M6e S6): every `dependencies`/`devDependencies`/`peerDependencies`/
+/// `optionalDependencies` value starting with `file:` or `link:`, resolved
+/// lexically like [`link_targets`]. `portal:` stays out (residue); an absolute
+/// local path fails closed (unlike registry URLs, it names a real dependency).
+fn yarn_file_targets(root: &str, manifest: &[u8]) -> Result<Vec<String>, String> {
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = BTreeSet::new();
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(deps) = manifest.get(section).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (_name, range) in deps {
+            rb_frameworks::work::tick(1);
+            let Some(range) = range.as_str() else {
+                continue;
+            };
+            let Some(path) = range
+                .strip_prefix("file:")
+                .or_else(|| range.strip_prefix("link:"))
+            else {
+                continue;
+            };
+            if path.contains(':') {
+                continue;
+            }
+            if let Some(dir) = resolve_link(root, path)? {
                 targets.insert(dir);
             }
         }
@@ -1090,6 +1146,58 @@ mod tests {
                 .then(|| br#"{"lockfileVersion": 1, "dependencies": {"@ws/core": {"version": "file:../../packages/core"}}}"#.to_vec())
         };
         assert_eq!(job_files(&job, &blobs, &v1).unwrap().files.len(), 4);
+    }
+
+    /// Contract M6e S6: Yarn `file:`/`link:` dependencies resolve in-repository
+    /// like npm link targets (lexically, nothing on disk followed): their files
+    /// export with the job and count; a target leaving the repository is
+    /// `unsupported`; `portal:` stays out (residue) and absolute paths fail
+    /// closed (unlike registry URLs, an absolute local path is a real dep).
+    #[test]
+    fn yarn_file_link_targets_resolve_in_repository() {
+        let manifest = r#"{"dependencies": {"core": "file:../../packages/core", "linked": "link:../../packages/linked", "tarball": "file:../../pkgs/a.tgz", "ported": "portal:../../packages/ported"}}"#;
+        let paths = [
+            "tools/e2e/package.json",
+            "tools/e2e/yarn.lock",
+            "tools/e2e/src/check.ts",
+            "packages/core/package.json",
+            "packages/core/src/index.ts",
+            "packages/core/node_modules/dep/index.js",
+            "packages/linked/package.json",
+            "packages/linked/src/index.ts",
+            "packages/ported/package.json",
+            "packages/ported/src/index.ts",
+        ];
+        let blobs: BTreeMap<&str, &str> = paths.iter().map(|p| (*p, "b")).collect();
+        let read =
+            |path: &str| (path == "tools/e2e/package.json").then(|| manifest.as_bytes().to_vec());
+        let job = ts_job("tools/e2e", rb_scip::jobs::NodeLock::Yarn);
+        let selected = job_files(&job, &blobs, &read).unwrap();
+        assert_eq!(selected.link_targets, 2, "core + linked");
+        let files: Vec<&str> = selected.files.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            files,
+            [
+                "packages/core/package.json",
+                "packages/core/src/index.ts",
+                "packages/linked/package.json",
+                "packages/linked/src/index.ts",
+                "tools/e2e/package.json",
+                "tools/e2e/src/check.ts",
+                "tools/e2e/yarn.lock",
+            ]
+        );
+        // An absolute local path fails closed; a target leaving the
+        // repository is unsupported.
+        for manifest in [
+            r#"{"dependencies": {"remote": "file:/opt/lib"}}"#,
+            r#"{"dependencies": {"outside": "file:../../../../escape"}}"#,
+        ] {
+            let read = |path: &str| {
+                (path == "tools/e2e/package.json").then(|| manifest.as_bytes().to_vec())
+            };
+            assert!(job_files(&job, &blobs, &read).is_err());
+        }
     }
 
     /// A link that leaves the repository makes the job `unsupported` with a reason that names
