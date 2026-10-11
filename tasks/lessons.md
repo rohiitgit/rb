@@ -401,3 +401,7 @@
 ## 2026-10-11: append contract amendments anchored on the previous amendment's tail, never the shared header
 - **Mistake (twice):** the edit anchored on `## Amendments\n\n<N>. **...**` and replaced the next amendment's opener with the new text — once deleting amendment 4's opener (caught by grep before commit), once inverting amendments 5/6 (repaired by swapping the single-line blocks).
 - **Rule:** anchor amendment appends on the previous amendment's unique TAIL text (its last sentence), and verify with `grep -n "phase N)"` that numbering and order are chronological before committing.
+
+## 2026-10-11: mutant scripts must assert the mutation landed (and quote zsh safely)
+- **Mistake (recovered):** three mutant runs were vacuous — two replaced text with itself (no-op "survivors"/"kills"), one anchor matched nothing after `cargo fmt` rewrapped the line; plus `echo ===` keeps breaking zsh commands (unquoted `==`).
+- **Rule:** every mutant case asserts `count == 1` (already done) AND re-reads the file to confirm `new in text` before running tests; never `echo ===` (use `---`); re-check anchors after any fmt pass.

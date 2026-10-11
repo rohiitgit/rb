@@ -24,6 +24,12 @@ pub(crate) fn is_input(path: &str) -> bool {
             | "npm-shrinkwrap.json"
             | "go.mod"
             | "pom.xml"
+            // `pyproject.toml` direct dependencies feed `py/` package edges;
+            // `poetry.lock`/`uv.lock` pin their versions (contract M6d S6).
+            // `requirements.txt`/`Pipfile` files are noticed, never read.
+            | "pyproject.toml"
+            | "poetry.lock"
+            | "uv.lock"
             // `lombok.config` texts feed qualifier-copying resolution (contract
             // M6c S8); the packages stage ignores unknown basenames.
             | "lombok.config"
@@ -402,8 +408,361 @@ fn go_mod(text: &str) -> GoMod {
     out
 }
 
-/// A minimal XML element: name, direct text, children, and where its start tag begins.
+/// A PEP 503 canonical project name: lowercased with every run of `-_.`
+/// folded to one `-`.
+fn pep503(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut in_sep = false;
+    for c in name.to_lowercase().chars() {
+        if c == '-' || c == '_' || c == '.' {
+            if !in_sep {
+                out.push('-');
+                in_sep = true;
+            }
+        } else {
+            out.push(c);
+            in_sep = false;
+        }
+    }
+    out
+}
+
+/// Whether `name` is shaped like a dependency name (leading alphanumerics,
+/// then alphanumerics and `-_.`).
+fn valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// A PEP 508 requirement string: (canonical name, declared spec as written,
+/// raw name length for evidence). Extras stay out of the name, markers after
+/// `;` and URL targets after `@` never become versions; a parenthesised spec
+/// is tolerated. `None` for anything without a leading name.
+fn pep508(req: &str) -> Option<(String, String, usize)> {
+    let head = req.split(';').next()?.trim();
+    if head.is_empty() {
+        return None;
+    }
+    // A direct reference (`name[extras]@url`): the version is never pinned.
+    if let Some((name, _)) = head.split_once('@') {
+        let name = name.split('[').next()?.trim();
+        if !valid_name(name) {
+            return None;
+        }
+        return Some((pep503(name), String::new(), name.len()));
+    }
+    let len = head
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .map(|(i, c)| i + c.len_utf8())
+        .last()?;
+    let name = &head[..len];
+    if !valid_name(name) {
+        return None;
+    }
+    let mut rest = head[len..].trim_start();
+    if let Some(after) = rest.strip_prefix('[') {
+        rest = after.find(']').map(|end| &after[end + 1..])?.trim_start();
+    }
+    let rest = rest.trim();
+    let declared = rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(rest)
+        .trim()
+        .to_owned();
+    Some((pep503(name), declared, len))
+}
+
+/// One direct runtime dependency from a `pyproject.toml`, with its evidence span.
+struct PyDep {
+    name: String,
+    declared: String,
+    span: Span,
+}
+
+/// The span of TOML key `key` at/after `from` (bare, single- or
+/// double-quoted); the key's own characters. Deterministic for any text.
+fn key_span(text: &str, key: &str, from: usize) -> Span {
+    let spellings = [key.to_string(), format!("\"{key}\""), format!("'{key}'")];
+    let mut found: Option<(usize, usize)> = None;
+    for spelling in &spellings {
+        let mut at = from;
+        while let Some(i) = text.get(at..).and_then(|rest| rest.find(spelling.as_str())) {
+            let start = at + i;
+            at = start + 1;
+            let after = &text[start + spelling.len()..];
+            let is_bare = !spelling.starts_with(['"', '\'']);
+            let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
+            // A key is followed by `=`; a bare key also starts its line.
+            if !after.trim_start_matches([' ', '\t']).starts_with('=') {
+                continue;
+            }
+            if is_bare && start != 0 && !text[line_start..start].trim().is_empty() {
+                continue;
+            }
+            let inner = if is_bare {
+                (start, start + key.len())
+            } else {
+                (start + 1, start + 1 + key.len())
+            };
+            if found.is_none_or(|(s, _)| inner.0 < s) {
+                found = Some(inner);
+            }
+            break;
+        }
+    }
+    match found {
+        Some((start, end)) => span_of(text, start, end),
+        None => span_of(text, from, from),
+    }
+}
+
+/// Direct runtime dependencies: `[project].dependencies` (PEP 508 strings)
+/// and `[tool.poetry.dependencies]` (constraints or inline tables; `python`
+/// is the runtime). Poetry groups, extras and optional dependencies are out
+/// of scope (contract M6d S6). Unparseable entries name no dependency.
+fn pyproject_deps(text: &str) -> Vec<PyDep> {
+    let table: toml::Table = match toml::from_str(text) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Some(deps) = table
+        .get("project")
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_array())
+    {
+        let from = text.find("[project]").unwrap_or(0);
+        for item in deps {
+            let Some(req) = item.as_str() else {
+                continue;
+            };
+            let Some((name, declared, len)) = pep508(req) else {
+                continue;
+            };
+            let start = text[from..].find(req).map(|i| from + i).unwrap_or(from);
+            out.push(PyDep {
+                name,
+                declared,
+                span: span_of(text, start, start + len),
+            });
+        }
+    }
+    if let Some(deps) = table
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        let from = text.find("[tool.poetry.dependencies]").unwrap_or(0);
+        for (key, value) in deps {
+            if key == "python" {
+                continue;
+            }
+            // A constraint string, an inline table's `version`, or the first
+            // of several: anything else (a bare git/path/url table, an empty
+            // list) declares no pin.
+            let declared = match value {
+                toml::Value::String(s) => s.clone(),
+                toml::Value::Table(t) => t
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                toml::Value::Array(items) => items
+                    .iter()
+                    .find_map(|item| match item {
+                        toml::Value::String(s) => Some(s.clone()),
+                        toml::Value::Table(t) => {
+                            t.get("version").and_then(|v| v.as_str()).map(str::to_owned)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                _ => continue,
+            };
+            out.push(PyDep {
+                name: pep503(key),
+                declared,
+                span: key_span(text, key, from),
+            });
+        }
+    }
+    out
+}
+
+/// name → version for registry-source `[[package]]` entries; `Err` when the
+/// TOML does not parse or names no packages. A git/directory/editable/url
+/// source never pins (contract M6d S6: lockfiles pin, never infer).
+fn poetry_lock(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|_| "invalid TOML".to_owned())?;
+    let mut out = BTreeMap::new();
+    let pkgs = table
+        .get("package")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| "no packages".to_owned())?;
+    for entry in pkgs {
+        let (Some(name), Some(version)) = (
+            entry.get("name").and_then(|n| n.as_str()),
+            entry.get("version").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let pinnable = match entry.get("source") {
+            None => true,
+            Some(source) => source
+                .get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t == "legacy"),
+        };
+        if pinnable {
+            out.insert(pep503(name), version.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// name → version for registry-source `[[package]]` entries of a `uv.lock`
+/// (same pinnability rule as [`poetry_lock`]: a `registry` source, or none).
+fn uv_lock(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|_| "invalid TOML".to_owned())?;
+    let mut out = BTreeMap::new();
+    let pkgs = table
+        .get("package")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| "no packages".to_owned())?;
+    for entry in pkgs {
+        let (Some(name), Some(version)) = (
+            entry.get("name").and_then(|n| n.as_str()),
+            entry.get("version").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let pinnable = match entry.get("source") {
+            None => true,
+            Some(source) => source
+                .as_table()
+                .is_some_and(|s| s.contains_key("registry")),
+        };
+        if pinnable {
+            out.insert(pep503(name), version.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// Which lockfile's versions pin a service's Python dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockSource {
+    Poetry,
+    Uv,
+}
+
+/// A lockfile relevant to a service: one that pins, or one noticed but never
+/// read (contract M4b: `Pipfile`/`requirements` pinning is residue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PyLock {
+    Read(String, LockSource),
+    Unread(String),
+}
+
+/// The `[tool.uv.workspace] members` of a `pyproject.toml`, if any.
+fn uv_workspace_members(text: &str) -> Vec<String> {
+    toml::from_str::<toml::Table>(text)
+        .ok()
+        .and_then(|t| {
+            t.get("tool")?
+                .get("uv")?
+                .get("workspace")?
+                .get("members")?
+                .as_array()
+                .cloned()
+        })
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Whether workspace member pattern `member` (`backend`, `packages/*`)
+/// selects `rel` (the service directory relative to the workspace root).
+fn workspace_member(member: &str, rel: &str) -> bool {
+    if let Some(prefix) = member.strip_suffix("/*") {
+        rel.strip_prefix(prefix)
+            .is_some_and(|r| !r.is_empty() && !r.trim_start_matches('/').contains('/'))
+    } else {
+        member.trim_end_matches('/') == rel
+    }
+}
+
+/// The lockfile governing `service_dir` (the `here` form: `""` for the root):
+/// a same-directory `poetry.lock` (winning ties), then `uv.lock`, then an
+/// unread shape; then the nearest ancestor `uv.lock` whose workspace lists
+/// the service, then ancestors' unread shapes. A `poetry.lock` above never
+/// governs below (poetry has no workspaces).
+fn py_lockfile_for(
+    service_dir: &str,
+    paths: &BTreeSet<&str>,
+    texts: &BTreeMap<&str, String>,
+) -> Option<PyLock> {
+    let at = |dir: &str, name: &str| {
+        let prefix = dir_prefix(dir);
+        let path = format!("{prefix}{name}");
+        paths.contains(path.as_str()).then_some(path)
+    };
+    const UNREAD: [&str; 3] = ["requirements.txt", "Pipfile.lock", "Pipfile"];
+    if let Some(path) = at(service_dir, "poetry.lock") {
+        return Some(PyLock::Read(path, LockSource::Poetry));
+    }
+    if let Some(path) = at(service_dir, "uv.lock") {
+        return Some(PyLock::Read(path, LockSource::Uv));
+    }
+    for name in UNREAD {
+        if let Some(path) = at(service_dir, name) {
+            return Some(PyLock::Unread(path));
+        }
+    }
+    let mut dir = parent_dir(service_dir);
+    while let Some(d) = dir {
+        if let Some(path) = at(d, "uv.lock") {
+            let manifest = if d.is_empty() {
+                "pyproject.toml".to_owned()
+            } else {
+                format!("{d}/pyproject.toml")
+            };
+            let rel = if d.is_empty() {
+                service_dir.to_owned()
+            } else {
+                service_dir
+                    .strip_prefix(&format!("{d}/"))
+                    .unwrap_or(service_dir)
+                    .to_owned()
+            };
+            let member = texts
+                .get(manifest.as_str())
+                .map(|t| {
+                    uv_workspace_members(t)
+                        .iter()
+                        .any(|m| workspace_member(m, &rel))
+                })
+                .unwrap_or(false);
+            if member {
+                return Some(PyLock::Read(path, LockSource::Uv));
+            }
+        }
+        for name in UNREAD {
+            if let Some(path) = at(d, name) {
+                return Some(PyLock::Unread(path));
+            }
+        }
+        dir = parent_dir(d);
+    }
+    None
+}
 #[derive(Debug, Default)]
+/// A minimal XML element: name, direct text, children, and where its start tag begins.
 struct Element {
     name: String,
     text: String,
@@ -923,6 +1282,80 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                 ("declared", &dep.declared),
                                 ("replaced", &replaced),
                                 ("scope", dep.scope),
+                                ("version_from", from),
+                            ]),
+                            evidence: evidence(dep.span),
+                        });
+                    }
+                }
+                "pyproject.toml" => {
+                    let deps = pyproject_deps(text);
+                    if deps.is_empty() {
+                        continue;
+                    }
+                    // The governing lockfile, read once per service.
+                    let lock = match py_lockfile_for(&here, inputs.paths, inputs.texts) {
+                        Some(PyLock::Read(path, source)) => {
+                            let reader = match source {
+                                LockSource::Poetry => poetry_lock,
+                                LockSource::Uv => uv_lock,
+                            };
+                            let from = match source {
+                                LockSource::Poetry => "poetry_lock",
+                                LockSource::Uv => "uv_lock",
+                            };
+                            match inputs.texts.get(path.as_str()).map(|t| reader(t)) {
+                                Some(Ok(packages)) => Some((path, packages, from)),
+                                Some(Err(reason)) => {
+                                    diagnostics.push(diagnostic(
+                                        "lockfile_unreadable",
+                                        &path,
+                                        None,
+                                        json!({ "service": service, "reason": reason }),
+                                    ));
+                                    None
+                                }
+                                None => None,
+                            }
+                        }
+                        Some(PyLock::Unread(path)) => {
+                            diagnostics.push(diagnostic(
+                                "lockfile_unread",
+                                &path,
+                                None,
+                                json!({ "service": service }),
+                            ));
+                            None
+                        }
+                        None => None,
+                    };
+                    for dep in deps {
+                        let (version, from) = match &lock {
+                            Some((path, packages, from)) => match packages.get(&dep.name) {
+                                Some(v) => (v.clone(), *from),
+                                None => {
+                                    diagnostics.push(diagnostic(
+                                        "lockfile_missing_entry",
+                                        m,
+                                        Some(dep.span),
+                                        json!({ "service": service, "name": dep.name, "lockfile": path }),
+                                    ));
+                                    (String::new(), "unresolved")
+                                }
+                            },
+                            None => (String::new(), "unresolved"),
+                        };
+                        edges.push(ManifestEdge {
+                            service: service.to_owned(),
+                            target: Target::Package(Package {
+                                manager: "py",
+                                name: dep.name.clone(),
+                                version,
+                            }),
+                            certainty: Certainty::Exact,
+                            attrs: attrs(&[
+                                ("declared", &dep.declared),
+                                ("scope", "runtime"),
                                 ("version_from", from),
                             ]),
                             evidence: evidence(dep.span),
@@ -1474,5 +1907,345 @@ mod tests {
         assert_eq!(got, ["a", "b", "c", "d"]);
         let got: Vec<String> = classpath("d", &depends).into_iter().collect();
         assert_eq!(got, ["d"]);
+    }
+
+    /// Contract M6d S6: PEP 508 requirement strings split into a canonical
+    /// name and the declared spec as written; extras, markers and URL targets
+    /// never become versions; anything else names no dependency.
+    #[test]
+    fn pep508_requirements_split_names_and_specs() {
+        let req = |s: &str| pep508(s).map(|(n, d, _)| (n, d));
+        assert_eq!(
+            req("fastapi[standard]>=0.141.1,<1.0.0"),
+            Some(("fastapi".into(), ">=0.141.1,<1.0.0".into()))
+        );
+        assert_eq!(req("Requests>=2"), Some(("requests".into(), ">=2".into())));
+        assert_eq!(req("foo_bar.baz"), Some(("foo-bar-baz".into(), "".into())));
+        assert_eq!(
+            req("pwdlib[argon2,bcrypt]>=0.3.1"),
+            Some(("pwdlib".into(), ">=0.3.1".into()))
+        );
+        assert_eq!(
+            req("pyjwt>=2.15.0,<3.0.0; python_version >= '3.9'"),
+            Some(("pyjwt".into(), ">=2.15.0,<3.0.0".into()))
+        );
+        assert_eq!(
+            req("name @ https://example.com/name-1.0.tar.gz"),
+            Some(("name".into(), "".into()))
+        );
+        assert_eq!(
+            req("name[extra]@ https://example.com/n.tgz"),
+            Some(("name".into(), "".into()))
+        );
+        // A parenthesised spec is tolerated; anything without a name is not a dep.
+        assert_eq!(req("legacy (>=2)"), Some(("legacy".into(), ">=2".into())));
+        assert_eq!(req(""), None);
+        assert_eq!(req(">=2"), None);
+        assert_eq!(req("; python_version >= '3'"), None);
+        assert_eq!(req("[extra]>=2"), None);
+        assert_eq!(req("foo[bar>=2"), None);
+    }
+
+    /// Contract M6d S6: names canonicalise per PEP 503.
+    #[test]
+    fn pep503_folds_case_and_separators() {
+        assert_eq!(pep503("Requests"), "requests");
+        assert_eq!(pep503("foo_bar.baz-qux"), "foo-bar-baz-qux");
+        assert_eq!(pep503("a__b..c--d"), "a-b-c-d");
+    }
+
+    /// Contract M6d S6: `pyproject.toml` and both lockfiles are manifest inputs.
+    #[test]
+    fn python_manifests_are_inputs() {
+        for f in [
+            "pyproject.toml",
+            "poetry.lock",
+            "uv.lock",
+            "svc/pyproject.toml",
+        ] {
+            assert!(is_input(f), "{f}");
+        }
+        assert!(!is_input("svc/requirements.txt"));
+        assert!(!is_input("svc/Pipfile.lock"));
+    }
+
+    const POETRY_PYPROJECT: &str = r#"[tool.poetry]
+name = "svc"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4"
+requests = "^2.32.0"
+shaped = { version = "^1.0", extras = ["fast"] }
+gitted = { git = "https://example.com/gitted.git", rev = "abc" }
+pathed = { path = "../pathed" }
+multi = [{ version = "^2.0", python = ">=3.10" }, { version = "^1.0", python = "<3.10" }]
+"#;
+
+    const POETRY_LOCK: &str = r#"[[package]]
+name = "requests"
+version = "2.32.3"
+
+[[package]]
+name = "shaped"
+version = "1.2.0"
+
+[[package]]
+name = "gitted"
+version = "0.4.0"
+
+[package.source]
+type = "git"
+url = "https://example.com/gitted.git"
+
+[[package]]
+name = "transitive"
+version = "9.9.9"
+"#;
+
+    /// Contract M6d S6: a `poetry.lock` pins exact registry versions; a git
+    /// source never pins; transitive entries and `[tool.poetry]` extras stay
+    /// out; `python` is the runtime, not a dependency.
+    #[test]
+    fn poetry_lock_pins_exact_registry_versions() {
+        let projects = [project("svc", &["svc/pyproject.toml"])];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("svc/pyproject.toml", POETRY_PYPROJECT),
+                ("svc/poetry.lock", POETRY_LOCK),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> py/gitted@? [exact] {"scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> py/multi@? [exact] {"declared":"^2.0","scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> py/pathed@? [exact] {"scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> py/requests@2.32.3 [exact] {"declared":"^2.32.0","scope":"runtime","version_from":"poetry_lock"}"#,
+                r#"svc -> py/shaped@1.2.0 [exact] {"declared":"^1.0","scope":"runtime","version_from":"poetry_lock"}"#,
+            ]
+        );
+        assert_eq!(
+            diagnostics,
+            [
+                "lockfile_missing_entry svc/pyproject.toml",
+                "lockfile_missing_entry svc/pyproject.toml",
+                "lockfile_missing_entry svc/pyproject.toml"
+            ]
+        );
+    }
+
+    const PEP621_PYPROJECT: &str = r#"[project]
+name = "app"
+version = "0.1.0"
+dependencies = [
+    "fastapi[standard]>=0.141.1,<1.0.0",
+    "httpx<1.0.0,>=0.25.1",
+    "bare",
+    "missing>=1.0",
+]
+"#;
+
+    const UV_LOCK: &str = r#"version = 1
+
+[[package]]
+name = "fastapi"
+version = "0.143.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "editable-root"
+version = "0.1.0"
+source = { editable = "." }
+"#;
+
+    /// Contract M6d S6: PEP 621 dependencies pin from the governing `uv.lock`;
+    /// a dep the lock does not list stays `?` with a counted diagnostic.
+    #[test]
+    fn uv_lock_pins_pep621_dependencies() {
+        let projects = [project("svc", &["svc/pyproject.toml"])];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("svc/pyproject.toml", PEP621_PYPROJECT),
+                ("svc/uv.lock", UV_LOCK),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> py/fastapi@0.143.0 [exact] {"declared":">=0.141.1,<1.0.0","scope":"runtime","version_from":"uv_lock"}"#,
+                r#"svc -> py/httpx@0.28.1 [exact] {"declared":"<1.0.0,>=0.25.1","scope":"runtime","version_from":"uv_lock"}"#,
+                r#"svc -> py/bare@? [exact] {"scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> py/missing@? [exact] {"declared":">=1.0","scope":"runtime","version_from":"unresolved"}"#,
+            ]
+        );
+        assert_eq!(
+            diagnostics,
+            [
+                "lockfile_missing_entry svc/pyproject.toml",
+                "lockfile_missing_entry svc/pyproject.toml"
+            ]
+        );
+    }
+
+    const UV_ROOT_PYPROJECT: &str = r#"[tool.uv.workspace]
+members = ["backend", "packages/*"]
+"#;
+
+    /// Contract M6d S6: a `uv.lock` governs its own directory and the
+    /// workspace members the root lists (exact or one-level `*`); an
+    /// unrelated nested project keeps `?`. A `poetry.lock` above never
+    /// governs below (poetry has no workspaces). Both locks in one directory:
+    /// poetry wins.
+    #[test]
+    fn uv_lock_governs_members_and_poetry_stays_local() {
+        let projects = [
+            project(".", &["pyproject.toml"]),
+            project("backend", &["backend/pyproject.toml"]),
+            project("packages/a", &["packages/a/pyproject.toml"]),
+            project("other", &["other/pyproject.toml"]),
+            project("nested", &["nested/pyproject.toml"]),
+            project("both", &["both/pyproject.toml"]),
+        ];
+        let backend = "[project]\nname = \"app\"\ndependencies = [\"httpx>=0.25\"]\n";
+        let (edges, _) = run(
+            &projects,
+            &[
+                ("pyproject.toml", UV_ROOT_PYPROJECT),
+                ("uv.lock", UV_LOCK),
+                ("backend/pyproject.toml", backend),
+                ("packages/a/pyproject.toml", backend),
+                ("other/pyproject.toml", backend),
+                ("nested/pyproject.toml", backend),
+                ("poetry.lock", POETRY_LOCK),
+                (
+                    "nested/poetry.lock",
+                    "[[package]]\nname = \"httpx\"\nversion = \"0.1.0\"\n",
+                ),
+                ("both/pyproject.toml", backend),
+                (
+                    "both/poetry.lock",
+                    "[[package]]\nname = \"httpx\"\nversion = \"0.2.0\"\n",
+                ),
+                ("both/uv.lock", UV_LOCK),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"backend -> py/httpx@0.28.1 [exact] {"declared":">=0.25","scope":"runtime","version_from":"uv_lock"}"#,
+                r#"packages/a -> py/httpx@0.28.1 [exact] {"declared":">=0.25","scope":"runtime","version_from":"uv_lock"}"#,
+                r#"other -> py/httpx@? [exact] {"declared":">=0.25","scope":"runtime","version_from":"unresolved"}"#,
+                r#"nested -> py/httpx@0.1.0 [exact] {"declared":">=0.25","scope":"runtime","version_from":"poetry_lock"}"#,
+                r#"both -> py/httpx@0.2.0 [exact] {"declared":">=0.25","scope":"runtime","version_from":"poetry_lock"}"#,
+            ]
+        );
+    }
+
+    /// Contract M6d S6: an unreadable lockfile is a counted diagnostic, and a
+    /// `requirements.txt`/`Pipfile` is noticed but never read (residue).
+    #[test]
+    fn unreadable_and_unread_python_lockfiles() {
+        let projects = [
+            project("a", &["a/pyproject.toml"]),
+            project("b", &["b/pyproject.toml"]),
+        ];
+        let manifest = "[project]\nname = \"x\"\ndependencies = [\"httpx>=0.25\"]\n";
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("a/pyproject.toml", manifest),
+                ("a/poetry.lock", "[[package]"),
+                ("b/pyproject.toml", manifest),
+                ("b/requirements.txt", "httpx==0.28.1\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"a -> py/httpx@? [exact] {"declared":">=0.25","scope":"runtime","version_from":"unresolved"}"#,
+                r#"b -> py/httpx@? [exact] {"declared":">=0.25","scope":"runtime","version_from":"unresolved"}"#,
+            ]
+        );
+        assert_eq!(
+            diagnostics,
+            [
+                "lockfile_unreadable a/poetry.lock",
+                "lockfile_unread b/requirements.txt"
+            ]
+        );
+    }
+
+    /// Contract M6d S6: only registry (or absent) sources pin; git,
+    /// editable, directory and url sources never do.
+    #[test]
+    fn uv_lock_skips_non_registry_sources() {
+        let lock = uv_lock(
+            r#"version = 1
+[[package]]
+name = "reg"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "bare"
+version = "1.0"
+[[package]]
+name = "gitted"
+version = "1.0"
+source = { git = "https://example.com/g.git" }
+[[package]]
+name = "ed"
+version = "1.0"
+source = { editable = "." }
+[[package]]
+name = "dir"
+version = "1.0"
+source = { directory = "../dir" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lock.into_iter().collect::<Vec<_>>(),
+            [
+                ("bare".to_owned(), "1.0".to_owned()),
+                ("reg".to_owned(), "1.0".to_owned())
+            ]
+        );
+        assert!(uv_lock("version = 1\n").is_err());
+        assert!(poetry_lock("[[package]\n").is_err());
+    }
+
+    /// Contract M6d S6: evidence points at the dependency's own entry.
+    #[test]
+    fn python_dependency_spans_point_at_the_entry() {
+        let text = PEP621_PYPROJECT;
+        let deps = pyproject_deps(text);
+        assert_eq!(deps.len(), 4);
+        let at = |name: &str| {
+            let start = text.find(name).unwrap();
+            span_of(text, start, start + name.len())
+        };
+        assert_eq!(deps[0].span, at("fastapi"));
+        assert_eq!(deps[2].span, at("\"bare\"\n".trim_matches(['"', '\n'])));
+        let poetry = pyproject_deps(POETRY_PYPROJECT);
+        let key = |name: &str| {
+            let line = POETRY_PYPROJECT
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap();
+            let start = POETRY_PYPROJECT.find(line).unwrap();
+            span_of(POETRY_PYPROJECT, start, start + name.len())
+        };
+        assert_eq!(
+            poetry.iter().find(|d| d.name == "requests").unwrap().span,
+            key("requests")
+        );
     }
 }
