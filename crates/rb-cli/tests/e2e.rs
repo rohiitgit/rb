@@ -3678,6 +3678,74 @@ fn scip_java_lombok() {
     assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
 }
 
+/// Contract M6e S4: the Gradle fixture. The `java-gradle-catalog` root job resolves its
+/// environment (Kotlin DSL + version catalog) behind the proxy and indexes offline with
+/// `scip-java index --build-tool Gradle`, so `Main.run → Service.process → Helper.exclaim`
+/// is exact and the catalog/literal pins are exact `DEPENDS_ON` rows (guards); cached, fresh
+/// from an emptied per-repository cache and a second repository name dump identically.
+#[test]
+fn scip_java_gradle_catalog() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "java-gradle-catalog";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipgradle_{}", std::process::id());
+    let other = format!("t_scipgradle2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!(
+        "scip_java_gradle_catalog: first index {:.1?}",
+        started.elapsed()
+    );
+    assert!(first.contains("scip: . scip-java ok"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!(
+            "scip_java_gradle_catalog guard failures:\n{}",
+            failures.join("\n")
+        );
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-process.txt",
+        &rb(&url, &["callers", "Service.process", "--repo", &name]),
+    );
+    let package = "scip-java maven . . ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "src/", ".") >= 2,
+        "{dump}"
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("scip: . scip-java ok (cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        fresh.contains("scip: . scip-java ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 /// Contract M6a S11: the npm-workspaces fixture. The root's job is grouped (`workspace 2
 /// members`, fetched at the root from its lockfile, offline: every package is local) and indexes
 /// both members, so `packages/app`'s call into `packages/core` is exact through the workspace

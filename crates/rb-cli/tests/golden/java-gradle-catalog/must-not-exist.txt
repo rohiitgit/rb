@@ -1,0 +1,8 @@
+# Anti-guards for the java-gradle-catalog fixture (contract M6e S4).
+# No exact edge has a heuristic twin; no pinned dependency stays unresolved;
+# the Gradle job is never unsupported.
+CALLS scip-java maven . . demo/Main#run(). -> scip-java maven . . demo/Service#process(). [heuristic]
+CALLS scip-java maven . . demo/Service#process(). -> scip-java maven . . demo/Helper#exclaim(). [heuristic]
+DEPENDS_ON . -> maven/com.google.code.gson/gson@?
+DEPENDS_ON . -> maven/org.apache.commons/commons-lang3@?
+DEPENDS_ON . -> maven/junit/junit@?

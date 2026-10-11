@@ -1112,19 +1112,18 @@ fn gradle_catalog(text: &str) -> Result<BTreeMap<String, (String, Option<String>
                     if module.split(':').count() != 2 {
                         return Err(format!("library {alias:?} module is not group:artifact"));
                     }
-                    let version = match (t.get("version"), t.get("version.ref")) {
-                        (None, None) => None,
-                        (Some(toml::Value::String(v)), None) => Some(v.clone()),
-                        (None, Some(toml::Value::String(r))) => versions.get(r).cloned(),
-                        // A dotted `version.ref` parses as a nested table.
-                        (None, Some(toml::Value::Table(t))) => match t.get("ref") {
+                    // `version = "x"` wins; a dotted `version.ref` parses as a
+                    // nested table; anything else dangles to `?`.
+                    let version = match t.get("version") {
+                        Some(toml::Value::String(v)) => Some(v.clone()),
+                        Some(toml::Value::Table(t)) => match t.get("ref") {
                             Some(toml::Value::String(r)) => versions.get(r).cloned(),
                             _ => None,
                         },
-                        // Rich versions, double declarations and wrong types:
-                        // the version is unresolvable, so the entry dangles
-                        // to `?` rather than failing the whole read.
-                        _ => None,
+                        _ => match t.get("version.ref") {
+                            Some(toml::Value::String(r)) => versions.get(r).cloned(),
+                            _ => None,
+                        },
                     };
                     out.insert(alias, (module.to_owned(), version));
                 }
@@ -2125,7 +2124,7 @@ mod tests {
     #[test]
     fn gradle_catalogs_resolve_libraries_versions_and_refs() {
         let catalog = gradle_catalog(
-            "[versions]\nlang = \"3.20.0\"\n[libraries]\nlang3 = { module = \"org.apache.commons:commons-lang3\", version = \"3.20.0\" }\ngson = { module = \"com.google.code.gson:gson\", version.ref = \"gson\" }\nshort = \"org.example:short:1.2.3\"\ndangling = { module = \"org.example:dangling\", version.ref = \"missing\" }\n",
+            "[versions]\nlang = \"3.20.0\"\ngson = \"2.13.1\"\n[libraries]\nlang3 = { module = \"org.apache.commons:commons-lang3\", version = \"3.20.0\" }\ngson = { module = \"com.google.code.gson:gson\", version.ref = \"gson\" }\nshort = \"org.example:short:1.2.3\"\ndangling = { module = \"org.example:dangling\", version.ref = \"missing\" }\n",
         )
         .unwrap();
         assert_eq!(
@@ -2137,7 +2136,10 @@ mod tests {
         );
         assert_eq!(
             catalog.get("gson"),
-            Some(&("com.google.code.gson:gson".to_owned(), None))
+            Some(&(
+                "com.google.code.gson:gson".to_owned(),
+                Some("2.13.1".to_owned())
+            ))
         );
         assert_eq!(
             catalog.get("short"),

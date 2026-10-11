@@ -445,3 +445,11 @@
 ## 2026-10-11: `for x in vec` across if/else branches moves
 - **Mistake (caught by the compiler):** computing per-router prefixes in `if cyclic {} else {}` moved `routers` in the first branch.
 - **Rule:** iterate by reference (`for r in &routers`) when more than one branch consumes the collection; the compiler error is the signal, not the design.
+
+## 2026-10-11: a lookup test needs a positive row, not just None cases
+- **Mistake (caught by the e2e fixture):** the catalog unit test asserted a dangling `version.ref` resolves to `None` — true under the bug too, because dotted `version.ref` never resolved at all (TOML nests it under `version`, which the match never looked inside). The suite was green and the fixture guard caught it.
+- **Rule:** every lookup test has a positive resolution row for each reference form (plain, dotted-nested, quoted-literal); a test that only asserts absences is vacuous against a resolver that resolves nothing.
+
+## 2026-10-11: TOML dotted keys nest, even inline
+- **Mistake (same fix):** `{ module = "g:a", version.ref = "lang" }` parses as `{ module = "g:a", version = { ref = "lang" } }` — `table.get("version.ref")` is always `None`.
+- **Rule:** when reading TOML with dotted keys, match on the nested table (`version` → `ref`), never on the dotted literal; cover both spellings in the reader test.
