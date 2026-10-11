@@ -688,13 +688,7 @@ mod tests {
     fn go_modules_are_their_own_jobs() {
         // Each go.mod directory builds independently (workspaces are M6e);
         // without a go.sum alongside, the fetch is not reproducible.
-        let files = [
-            "go.mod",
-            "go.sum",
-            "main.go",
-            "tools/go.mod",
-            "lib/go.mod",
-        ];
+        let files = ["go.mod", "go.sum", "main.go", "tools/go.mod", "lib/go.mod"];
         assert_eq!(
             summary(&files),
             [

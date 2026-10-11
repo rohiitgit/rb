@@ -3074,6 +3074,8 @@ fn scip_egress_probes_from_a_fetch_container() {
     let script = r#"exec 1>&2
 code() { curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$@" 2>/dev/null; echo " exit=$?"; }
 echo "allowed $(code https://repo.maven.apache.org/maven2/)"
+echo "gomod $(code https://proxy.golang.org/github.com/go-chi/chi/v5/@latest)"
+echo "gosum $(code https://sum.golang.org/)"
 echo "host $(code https://example.com/)"
 echo "plain $(code -x "$http_proxy" http://repo.maven.apache.org/maven2/)"
 echo "ip $(code https://1.1.1.1/)"
@@ -3128,6 +3130,12 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
     eprintln!("egress probes:\n{}", outcome.stderr_tail);
     assert!(outcome.ok(), "{}", outcome.stderr_tail);
     assert_eq!(result("allowed"), "200 exit=0");
+    assert_eq!(result("gomod"), "200 exit=0");
+    assert!(
+        result("gosum").starts_with("000 exit=") && result("gosum") != "000 exit=0",
+        "gosum: {}",
+        result("gosum")
+    );
     for refused in ["host", "ip", "direct", "gateway"] {
         let r = result(refused);
         assert!(
@@ -3143,7 +3151,9 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
         [
             "1.1.1.1:443",
             "example.com:443",
-            "http://repo.maven.apache.org/maven2/"
+            "http://repo.maven.apache.org/maven2/",
+            // Contract M6d S3: the checksum database stays refused.
+            "sum.golang.org:443"
         ],
         "{log}"
     );

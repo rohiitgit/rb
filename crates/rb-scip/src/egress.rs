@@ -22,10 +22,12 @@ pub const PROXY_PORT: u16 = 8888;
 pub const PROXY_CONFIG_AT: &str = "/etc/tinyproxy";
 pub const CLIENT_CONFIG_AT: &str = "/rb-egress";
 
-/// The registries the built-in recipes fetch from: Maven Central (both of its host names) and
-/// the npm and Yarn registries. The fixtures' fetches reach only `repo.maven.apache.org` and
-/// `registry.npmjs.org` (measured through an open proxy, contract M5 amendment 12).
+/// The registries the built-in recipes fetch from: Maven Central (both of its host names),
+/// the npm and Yarn registries, and the Go module proxy (contract M6d S3). The fixtures'
+/// fetches reach only `repo.maven.apache.org` and `registry.npmjs.org` (measured through an
+/// open proxy, contract M5 amendment 12).
 pub const REGISTRIES: &[&str] = &[
+    "proxy.golang.org",
     "registry.npmjs.org",
     "registry.yarnpkg.com",
     "repo.maven.apache.org",
@@ -175,6 +177,7 @@ mod tests {
         assert_eq!(
             extra.hosts,
             [
+                "proxy.golang.org",
                 "registry.npmjs.org",
                 "registry.yarnpkg.com",
                 "repo.maven.apache.org",
@@ -215,7 +218,7 @@ mod tests {
         }
         assert_eq!(
             e.proxy_filter(),
-            "registry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\n"
+            "proxy.golang.org:443\nregistry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\n"
         );
         let tmp = tempfile::tempdir().unwrap();
         e.write_config(tmp.path()).unwrap();

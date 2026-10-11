@@ -389,3 +389,7 @@
 ## 2026-10-11: shape checks must cover root manifests, not just the code dir
 - **Mistake:** phase-0 recorded "no tsconfig paths/exports in jhipster's webapp" — true of the webapp dir, false of the repo: the ROOT `tsconfig.json` carries a full `paths` map with a `"*"` catch-all. S4's repo leg looked vacuous until measurement proved it substantive (+14 exact references).
 - **Rule:** when scoping manifest-driven features, enumerate the manifests (`find -name <manifest>`) at the repo root first, then check their CONTENT everywhere — never generalize from the code directory alone.
+
+## 2026-10-11: mutant anchors must be line-anchored, scripts written atomically
+- **Mistake (recovered):** an S9a/S3 mutant anchor matched twice (indented copy inside a test expectation); and a script edit truncated its own file (`open(w)` before an exception).
+- **Rule:** anchor mutants on declaration lines (with preceding-line context when the entry line repeats); write scripts with `write()` to a temp file + atomic rename, never `open(w)` before computing content.

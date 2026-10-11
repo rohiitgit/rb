@@ -79,7 +79,7 @@ mod tests {
             input_hash(
                 files,
                 &format!(
-                    "{}\nallow registry.npmjs.org registry.yarnpkg.com repo.maven.apache.org repo1.maven.org",
+                    "{}\nallow proxy.golang.org registry.npmjs.org registry.yarnpkg.com repo.maven.apache.org repo1.maven.org",
                     crate::RECIPE_JAVA
                 )
             )
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(crate::RECIPE_JAVA, "m5-egress-1");
         assert_eq!(
             key(files),
-            "2798679d0e57cc5894dbc558e3436d8ec515b9342e08f601bfb31cc263e9bb0c"
+            "adcde79a12cc38c5f315904c99e89a03e9a973575963574e8e39995592b74e7a"
         );
         assert_ne!(
             project_input_hash(crate::RECIPE_TS, files, &crate::Egress::default()),

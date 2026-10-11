@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::egress::{CLIENT_CONFIG_AT, Egress, PROXY_IMAGE};
-use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_PYTHON_IMAGE, SCIP_TYPESCRIPT_IMAGE};
+use crate::jobs::{
+    Fetch, Indexer, Job, NodeLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_PYTHON_IMAGE,
+    SCIP_TYPESCRIPT_IMAGE,
+};
 use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
 
 /// scip-java's fetch and index recipe, part of each of its jobs' cache keys (contract M3b
@@ -252,9 +255,7 @@ impl Images {
             java: Err(format!(
                 "scip-java: image {SCIP_JAVA_IMAGE} was not looked up"
             )),
-            go: Err(format!(
-                "scip-go: image {SCIP_GO_IMAGE} was not looked up"
-            )),
+            go: Err(format!("scip-go: image {SCIP_GO_IMAGE} was not looked up")),
             proxy: Err(format!(
                 "egress proxy: image {PROXY_IMAGE} was not looked up"
             )),
@@ -725,7 +726,10 @@ fn go_runs(
         cwd: String::new(),
         caches: vec![(gomod, "/root/go/pkg/mod".into())],
         readonly: Vec::new(),
-        env: Vec::new(),
+        // Contract M6d S3: the checksum database lives outside the
+        // allow-list, so verification is off; `go.sum` still verifies the
+        // modules it pins. `GOFLAGS=-mod=mod` rides from the image.
+        env: vec![("GOSUMDB".into(), "off".into())],
         network: Network::Fetch,
         cpus: budget.cpus,
         memory: budget.memory.clone(),
@@ -753,7 +757,7 @@ fn python_runs(
     job: &Job,
     image: &str,
     work_dir: &Path,
-    cache_dir: &Path,
+    _cache_dir: &Path,
     budget: &Budget,
 ) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
     let workdir = crate::runner::absolute(work_dir)?;
@@ -965,6 +969,8 @@ mod tests {
 
     /// Contract M6d S1: a Go job fetches with `go mod download` on the fetch
     /// network (module cache mounted) and indexes with `scip-go` offline.
+    /// Contract M6d S3: the fetch pins `GOSUMDB=off` (the checksum database
+    /// is outside the allow-list; `go.sum` still verifies when present).
     #[test]
     fn go_job_runs_download_then_scip_go() {
         let lines = argv_lines(&go_job(), "sha256:go", &Budget::default());
@@ -973,13 +979,13 @@ mod tests {
             lines[0].contains("--network rb-scip-fetch")
                 && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
                 && lines[0].contains("go mod download")
-                && lines[0].contains("/root/go/pkg/mod"),
+                && lines[0].contains("/root/go/pkg/mod")
+                && lines[0].contains("-e GOSUMDB=off"),
             "{}",
             lines[0]
         );
         assert!(
-            lines[1].contains("--network none")
-                && lines[1].ends_with("scip-go"),
+            lines[1].contains("--network none") && lines[1].ends_with("scip-go"),
             "{}",
             lines[1]
         );
@@ -1307,7 +1313,7 @@ mod tests {
             *fake.proxies.borrow(),
             [
                 format!(
-                    "start rb-egress-{instance} registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443"
+                    "start rb-egress-{instance} proxy.golang.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443"
                 ),
                 format!("stop rb-egress-{instance}"),
             ]
