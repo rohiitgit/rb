@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::egress::{CLIENT_CONFIG_AT, Egress, PROXY_IMAGE};
-use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_TYPESCRIPT_IMAGE};
+use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_PYTHON_IMAGE, SCIP_TYPESCRIPT_IMAGE};
 use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
 
 /// scip-java's fetch and index recipe, part of each of its jobs' cache keys (contract M3b
@@ -27,6 +27,10 @@ pub const RECIPE_TS: &str = "m6a-ts-1";
 /// offline. Bumped like [`RECIPE_JAVA`].
 pub const RECIPE_GO: &str = "m6d-go-1";
 
+/// scip-python's recipe (contract M6d S2/S4): environment resolution, then
+/// `scip-python index` offline. Bumped like [`RECIPE_JAVA`].
+pub const RECIPE_PY: &str = "m6d-py-1";
+
 /// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
 /// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
 /// other budget settings change no index and are not part of it.
@@ -37,6 +41,7 @@ pub fn recipe(indexer: Indexer, budget: &Budget) -> String {
         }
         Indexer::ScipJava => RECIPE_JAVA.to_owned(),
         Indexer::ScipGo => RECIPE_GO.to_owned(),
+        Indexer::ScipPython => RECIPE_PY.to_owned(),
         Indexer::ScipTypescript => RECIPE_TS.to_owned(),
     }
 }
@@ -195,6 +200,7 @@ pub fn image_for(job: &Job) -> &'static str {
         Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
         Indexer::ScipJava => SCIP_JAVA_IMAGE,
         Indexer::ScipGo => SCIP_GO_IMAGE,
+        Indexer::ScipPython => SCIP_PYTHON_IMAGE,
     }
 }
 
@@ -261,6 +267,7 @@ impl Images {
     pub fn for_job(&self, job: &Job) -> Result<String, String> {
         let image = match job.indexer {
             Indexer::ScipTypescript => Ok(SCIP_TYPESCRIPT_IMAGE.to_owned()),
+            Indexer::ScipPython => Ok(SCIP_PYTHON_IMAGE.to_owned()),
             Indexer::ScipJava => self.java.clone(),
             Indexer::ScipGo => self.go.clone(),
         }?;
@@ -275,6 +282,7 @@ impl Images {
             Indexer::ScipJava => self.java.as_deref().unwrap_or("absent"),
             Indexer::ScipGo => self.go.as_deref().unwrap_or("absent"),
             Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
+            Indexer::ScipPython => SCIP_PYTHON_IMAGE,
         }
     }
 }
@@ -332,6 +340,7 @@ pub fn run_job(
             Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
             Indexer::ScipJava => java_runs(image, work_dir, cache_dir, budget)?,
             Indexer::ScipGo => go_runs(image, work_dir, cache_dir, budget)?,
+            Indexer::ScipPython => python_runs(job, image, work_dir, cache_dir, budget)?,
         };
         for fetch in &mut fetches {
             fetch.name = Some(format!("{name}-fetch"));
@@ -583,8 +592,8 @@ fn typescript_runs(
         Fetch::Maven | Fetch::Gradle => {
             anyhow::bail!("a Java fetch on a TypeScript job")
         }
-        Fetch::Go => {
-            anyhow::bail!("a Go fetch on a TypeScript job")
+        Fetch::Go | Fetch::Python => {
+            anyhow::bail!("a Go/Python fetch on a TypeScript job")
         }
     };
     let fetch = ContainerRun {
@@ -733,6 +742,47 @@ fn go_runs(
         ..base
     };
     Ok((vec![fetch], index))
+}
+
+/// The fetch and index invocations for a scip-python job (contract M6d S2).
+/// S2 fetches nothing: the environment resolution lands with the lockfile
+/// discipline (S4/S6). The index runs `scip-python index` offline; the image
+/// exists for linux/amd64 only, so the job is pinned there like
+/// scip-typescript's.
+fn python_runs(
+    job: &Job,
+    image: &str,
+    work_dir: &Path,
+    cache_dir: &Path,
+    budget: &Budget,
+) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
+    let workdir = crate::runner::absolute(work_dir)?;
+    let base = ContainerRun {
+        name: None,
+        image: image.into(),
+        platform: Some("linux/amd64".into()),
+        workdir,
+        mount_at: "/src".into(),
+        // Like scip-typescript's job roots (contract M6a D7): the container
+        // starts in the job's root; revisited with evidence in S5.
+        cwd: job.root.clone(),
+        caches: Vec::new(),
+        readonly: Vec::new(),
+        env: Vec::new(),
+        network: Network::Fetch,
+        cpus: budget.cpus,
+        memory: budget.memory.clone(),
+        timeout: budget.fetch_timeout,
+        entrypoint: None,
+        args: Vec::new(),
+    };
+    let index = ContainerRun {
+        network: Network::None,
+        timeout: budget.index_timeout,
+        args: ["scip-python", "index"].map(String::from).to_vec(),
+        ..base
+    };
+    Ok((Vec::new(), index))
 }
 
 fn once(s: &str) -> std::iter::Once<&str> {
@@ -903,6 +953,16 @@ mod tests {
         }
     }
 
+    fn python_job() -> Job {
+        Job {
+            root: "svc".into(),
+            indexer: Indexer::ScipPython,
+            fetch: Fetch::Python,
+            projects: Vec::new(),
+            unpinned: true,
+        }
+    }
+
     /// Contract M6d S1: a Go job fetches with `go mod download` on the fetch
     /// network (module cache mounted) and indexes with `scip-go` offline.
     #[test]
@@ -922,6 +982,22 @@ mod tests {
                 && lines[1].ends_with("scip-go"),
             "{}",
             lines[1]
+        );
+    }
+
+    /// Contract M6d S2: a Python job runs no fetch yet (S4) and indexes with
+    /// `scip-python index` offline, emulated on arm64.
+    #[test]
+    fn python_job_indexes_offline_with_no_fetch() {
+        let lines = argv_lines(&python_job(), "sha256:py", &Budget::default());
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("--network none")
+                && lines[0].contains("--platform linux/amd64")
+                && lines[0].contains("-v <work>:/src -w /src")
+                && lines[0].ends_with("scip-python index"),
+            "{}",
+            lines[0]
         );
     }
 

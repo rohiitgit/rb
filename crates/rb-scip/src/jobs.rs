@@ -15,6 +15,10 @@ pub const SCIP_JAVA_IMAGE: &str = "rb-scip-java:0.13.1";
 /// cache key uses its image ID, resolved at run time; when absent the job is
 /// `unsupported` and nothing builds it implicitly.
 pub const SCIP_GO_IMAGE: &str = "rb-scip-go:0.2.7";
+/// scip-python v0.6.6 is published for linux/amd64 only; on arm64 hosts it
+/// runs emulated (like scip-typescript). Pinned by digest after measuring
+/// against the disk budget (contract M6d S2).
+pub const SCIP_PYTHON_IMAGE: &str = "sourcegraph/scip-python@sha256:1847528ce710f58d13200e8c0237f8028342eee3f8a073a9f6109107f930be23";
 /// scip-typescript 0.4.0 is published for linux/amd64 only; on arm64 hosts it runs emulated.
 pub const SCIP_TYPESCRIPT_IMAGE: &str = "sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845";
 
@@ -23,6 +27,7 @@ pub enum Indexer {
     ScipJava,
     ScipTypescript,
     ScipGo,
+    ScipPython,
 }
 
 impl Indexer {
@@ -31,6 +36,7 @@ impl Indexer {
             Indexer::ScipJava => "scip-java",
             Indexer::ScipTypescript => "scip-typescript",
             Indexer::ScipGo => "scip-go",
+            Indexer::ScipPython => "scip-python",
         }
     }
 }
@@ -48,6 +54,9 @@ pub enum Fetch {
     /// `go mod download`: reproducible only with a `go.sum` alongside (else
     /// the job is `unpinned`, as with an unlockfiled npm install).
     Go,
+    /// Python environment resolution (lockfile-driven in S4/S6): unpinned
+    /// until then.
+    Python,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -212,6 +221,23 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             fetch: Fetch::Go,
             projects: Vec::new(),
             unpinned: !has(&join(&root, "go.sum")),
+        });
+    }
+    // Python: every pyproject.toml/setup.py directory is a job (contract M6d
+    // S2); fetches stay unpinned until lockfiles drive them (S4/S6).
+    let mut python_roots: Vec<String> = dirs_with("pyproject.toml")
+        .into_iter()
+        .chain(dirs_with("setup.py"))
+        .collect();
+    python_roots.sort();
+    python_roots.dedup();
+    for root in python_roots {
+        out.push(Job {
+            root: root.clone(),
+            indexer: Indexer::ScipPython,
+            fetch: Fetch::Python,
+            projects: Vec::new(),
+            unpinned: true,
         });
     }
     out.sort_by(|a, b| (a.root.as_str(), a.indexer).cmp(&(b.root.as_str(), b.indexer)));
@@ -616,6 +642,7 @@ mod tests {
                     Fetch::Maven => "maven".to_owned(),
                     Fetch::Gradle => "gradle".to_owned(),
                     Fetch::Go => "go".to_owned(),
+                    Fetch::Python => "python".to_owned(),
                     Fetch::Npm { lockfile } => format!("npm({lockfile:?})"),
                 };
                 let mut s = format!("{} {} {fetch}", j.indexer.as_str(), j.root);
@@ -674,6 +701,26 @@ mod tests {
                 "scip-go  go",
                 "scip-go lib go unpinned",
                 "scip-go tools go unpinned"
+            ]
+        );
+    }
+
+    #[test]
+    fn python_roots_are_their_own_jobs() {
+        // Contract M6d S2: every pyproject.toml/setup.py directory is a job;
+        // fetches are unpinned until lockfiles drive them (S4/S6).
+        let files = [
+            "pyproject.toml",
+            "pkg/main.py",
+            "libs/pyproject.toml",
+            "tools/setup.py",
+        ];
+        assert_eq!(
+            summary(&files),
+            [
+                "scip-python  python unpinned",
+                "scip-python libs python unpinned",
+                "scip-python tools python unpinned",
             ]
         );
     }

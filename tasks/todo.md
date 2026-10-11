@@ -901,7 +901,7 @@ Same rules as M6b/M6c:
 
 - [x] **0. Preflight** (no code). Done 2026-10-11 (amendment 1): baseline binary `var/m6d/base/rb-027a54f`; full-SHA pins (mattermost Go fresh HEAD, Python `full-stack-fastapi-template` chosen with `uv.lock`); shape checks (go.mod collected, poetry/uv absent, no Go/Python images/jobs, egress npm/yarn/maven-only, grammars pinned, no client/route packs or fixtures); scip-python 188.8 MB compressed (3× bound fits); fixture dep versions read; Go stable go1.27.2; egress baseline 61/61; e2e baseline 8/8. DB 0 repos.
 - [x] **1. scip-go image** (S1). Done 2026-10-11 (amendment 2): `docker/scip-go/` (Ubuntu pinned, Go 1.27.2 checksummed, scip-go v0.2.7 source-built at pinned commit); `rb-scip-go:0.2.7` built locally (644 MB, versions verified); jobs/wiring/`m6d-go-1` recipe; tests first + 4 mutants killed; stdlib smoke indexes offline. Files: `docker/scip-go/`, `rb-scip/src/jobs.rs`, `orchestrate.rs`, `rb-indexer/src/projects.rs`.
-- [ ] **2. scip-python pin** (S2). Size measured vs budget, then digest-pinned.
+- [x] **2. scip-python pin** (S2). Done 2026-10-11 (amendment 3): v0.6.6 digest-pinned (188.8 MB compressed, 731.6 MB actual, fits); `Indexer::ScipPython`, per-manifest jobs (`Fetch::Python`, unpinned), `m6d-py-1`, empty fetch (S4 fills), offline index, emulated platform. Tests first + 4 mutants killed; smoke indexes exit 0 (needs project metadata — planning stays gated). Files: `rb-scip/src/jobs.rs`, `orchestrate.rs`, `rb-indexer/src/projects.rs`.
 - [ ] **3. Go fetch** (S3). `go mod download` behind the proxy; refusals named.
 - [ ] **4. Python fetch** (S4). Lockfile-driven envs behind the proxy; refusals named.
 - [ ] **5. Go package keys** (S5). Shared `go/<module>@<version>`; mismatches keep both rows.
