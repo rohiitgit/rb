@@ -405,3 +405,7 @@
 ## 2026-10-11: mutant scripts must assert the mutation landed (and quote zsh safely)
 - **Mistake (recovered):** three mutant runs were vacuous — two replaced text with itself (no-op "survivors"/"kills"), one anchor matched nothing after `cargo fmt` rewrapped the line; plus `echo ===` keeps breaking zsh commands (unquoted `==`).
 - **Rule:** every mutant case asserts `count == 1` (already done) AND re-reads the file to confirm `new in text` before running tests; never `echo ===` (use `---`); re-check anchors after any fmt pass.
+
+## 2026-10-11: from-imported names need provenance, not just membership
+- **Mistake (caught by test):** the first S7 draft stored from-imported verbs as bare locals and checked the LOCAL against the verb list — `get as hget` never matched. Aliased imports must carry (original, local) through every allow-list check.
+- **Rule:** any allow-list keyed on imported names maps local → original and decides on the original; add an aliased-import case to every such test from the start.

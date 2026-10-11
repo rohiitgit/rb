@@ -158,7 +158,7 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
             feign(facts, &mut out);
         }
         Language::Go => go_http(facts, &mut out),
-        Language::Python => {}
+        Language::Python => requests_httpx(facts, &mut out),
     }
     out
 }
@@ -710,7 +710,14 @@ pub(crate) fn inert(path: &str) -> bool {
         Some("md" | "markdown" | "txt" | "rst" | "adoc")
     ) || matches!(
         name,
-        "package-lock.json" | "npm-shrinkwrap.json" | "yarn.lock" | "pnpm-lock.yaml"
+        "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            // Python lockfiles only record what the manifests declare, as
+            // above (contract M6d S6).
+            | "poetry.lock"
+            | "uv.lock"
     )
 }
 
@@ -1067,6 +1074,17 @@ fn entry<'a>(arg: Option<&'a Arg>, key: &str) -> Option<&'a Arg> {
     }
 }
 
+/// The first `key` entry among call keyword arguments (each reads as a
+/// single-entry object, so any `Arg::Object` in the way is a keyword).
+fn kwarg<'a>(args: &'a [Arg], key: &str) -> Option<&'a Arg> {
+    args.iter()
+        .filter_map(|a| match a {
+            Arg::Object { entries, .. } => entries.iter().find(|e| e.key == key).map(|e| &e.value),
+            _ => None,
+        })
+        .next()
+}
+
 /// A method from an object literal's `method` entry: `Some(None)` when the object has a
 /// non-literal method, `None` when it has none.
 fn method_entry(config: Option<&Arg>) -> Option<Option<String>> {
@@ -1420,6 +1438,323 @@ fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
     }
 }
 
+/// `requests` and `httpx` as fetch-class sites (contract M6d S7): module
+/// verbs and `request`/`stream` dispatchers behind import gates, session
+/// receivers bound directly to `Session`/`Client`/`AsyncClient`
+/// constructions, and anonymous inline instances — all with the same verb
+/// allow-list on both libraries. `base_url` folds as the base; every
+/// carrier site caps at `heuristic` (fine-grained carrier verification is
+/// S8). `send`, `build_request`, `mount` and other non-verb members are no
+/// sites; `urllib3`/`aiohttp` stay out (residue).
+fn requests_httpx(facts: &FileScope<'_>, out: &mut FileClients) {
+    /// Verbs of both libraries (`request`, and httpx's `stream`, dispatch).
+    const VERBS: &[&str] = &["get", "options", "head", "post", "put", "patch", "delete"];
+    /// Plain per-call keyword arguments: anything else, or a spread, may
+    /// reroute and caps (evaluator-pass-1 parity). `requests` hooks are
+    /// response-only, so they stay plain; `httpx` request hooks rewrite.
+    const REQUESTS_CALL_KEYS: &[&str] = &[
+        "params",
+        "data",
+        "json",
+        "files",
+        "headers",
+        "cookies",
+        "auth",
+        "timeout",
+        "allow_redirects",
+        "proxies",
+        "hooks",
+        "stream",
+        "verify",
+        "cert",
+    ];
+    const HTTPX_CALL_KEYS: &[&str] = &[
+        "params",
+        "content",
+        "data",
+        "files",
+        "json",
+        "headers",
+        "cookies",
+        "auth",
+        "proxy",
+        "timeout",
+        "follow_redirects",
+        "verify",
+    ];
+    // Local names for the two modules: an alias, or the top package (so
+    // `import requests.api` still roots `requests`), plus the submodule
+    // paths calls are written through. From-imported verbs/dispatchers and
+    // constructors keep their own maps: a bare `get(…)` is a response, never
+    // a session.
+    let mut roots: HashMap<String, bool> = HashMap::new();
+    // From-imported verbs/dispatchers: local name to (is-httpx, name as
+    // imported). Constructors keep their own map: a bare `get(…)` is a
+    // response, never a session.
+    let mut verbs: HashMap<String, (bool, String)> = HashMap::new();
+    let mut ctors: HashMap<String, bool> = HashMap::new();
+    for i in &facts.imports {
+        let requests = i.module == "requests" || i.module.starts_with("requests.");
+        let httpx = i.module == "httpx" || i.module.starts_with("httpx.");
+        if !requests && !httpx {
+            continue;
+        }
+        if let Some(alias) = i.alias.as_deref() {
+            roots.insert(alias.to_owned(), httpx);
+        } else {
+            roots.insert(
+                i.module.split('.').next().unwrap_or(&i.module).to_owned(),
+                httpx,
+            );
+        }
+        for n in &i.names {
+            if VERBS.contains(&n.name.as_str())
+                || n.name == "request"
+                || (httpx && n.name == "stream")
+            {
+                verbs.insert(n.local.clone(), (httpx, n.name.clone()));
+            } else if (!httpx && n.name == "Session")
+                || (httpx && (n.name == "Client" || n.name == "AsyncClient"))
+            {
+                ctors.insert(n.local.clone(), httpx);
+            }
+        }
+    }
+    // `name` at `at` still names its import: no shadowing binding in effect.
+    let unshadowed = |name: &str, at: Span| facts.binding_index_at(name, at).is_none();
+    // The module a call roots at, looking through the `api`/`sessions`
+    // submodule paths calls are written through (so `rq.api.get` counts
+    // under `import requests as rq` too).
+    let mod_root = |name: &str| {
+        let bare = name
+            .strip_suffix(".api")
+            .or_else(|| name.strip_suffix(".sessions"))
+            .unwrap_or(name);
+        roots.get(bare).or_else(|| roots.get(name))
+    };
+    let is_root = |httpx: bool, name: &str, at: Span| {
+        mod_root(name).is_some_and(|h| *h == httpx) && unshadowed(name, at)
+    };
+    // The first `url`-shaped argument: an explicit `url` keyword, else the
+    // first positional (kwargs read as single-entry objects, so any
+    // `Arg::Object` in the way is a keyword). `None` when neither names one.
+    let url_arg = |args: &[Arg]| {
+        for a in args {
+            if let Arg::Object { entries, .. } = a {
+                if let Some(e) = entries.iter().find(|e| e.key == "url") {
+                    return Some(e.value.clone());
+                }
+            } else {
+                return Some(a.clone());
+            }
+        }
+        None
+    };
+    // Whether the call's keywords may reroute: any key outside the plain
+    // list (a spread reads as `...`, which is outside every list).
+    let configured = |allowed: &[&str], args: &[Arg]| {
+        args.iter()
+            .flat_map(|a| match a {
+                Arg::Object { entries, .. } => entries.iter().collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .any(|e| e.key != "url" && !allowed.contains(&e.key.as_str()))
+    };
+    let site = |span: Span,
+                enclosing: Option<usize>,
+                method: Option<String>,
+                url: UrlValue,
+                base: Option<UrlValue>,
+                capped: bool| {
+        ClientCall {
+            kind: ClientKind::Fetch,
+            method,
+            url,
+            base,
+            instance: None,
+            span,
+            source: enclosing,
+            injected: None,
+            base_verified: capped.then_some(false),
+        }
+    };
+    // A dispatcher method (`request(method, url)`, `stream(method, url)`):
+    // a literal method, else unknown (the fold may still read a name).
+    let dispatch_method = |args: &[Arg]| {
+        args.first()
+            .and_then(literal)
+            .map(|m| norm_method(&m))
+            .or_else(|| {
+                kwarg(args, "method")
+                    .and_then(literal)
+                    .map(|m| norm_method(&m))
+            })
+    };
+    // Whether `(root, link)` constructs a session, and for which library:
+    // `Session`/`Client`/`AsyncClient` on their module, or a from-imported
+    // constructor alone.
+    let ctor_of = |root: Option<&str>, link: &CallLink, at: Span| -> Option<bool> {
+        match (root, link.name.as_str()) {
+            (Some(r), "Session") if is_root(false, r, at) => Some(false),
+            (Some(r), "Client" | "AsyncClient") if is_root(true, r, at) => Some(true),
+            (None, name) if unshadowed(name, at) => ctors.get(name).copied(),
+            _ => None,
+        }
+    };
+    // A session receiver: a non-member name bound directly to a session
+    // construction, with the base its `base_url` states (requests sessions
+    // take none). Factories, member receivers and rebinding wait for S8.
+    let session = |name: &str, at: Span| -> Option<(bool, Option<UrlValue>)> {
+        let bi = facts.binding_index_at(name, at)?;
+        let b = &facts.bindings[bi];
+        if b.member {
+            return None;
+        }
+        let chain = init_chain(facts, b)?;
+        let (root, [link]) = (chain.root.as_deref(), chain.links.as_slice()) else {
+            return None;
+        };
+        let httpx = ctor_of(root, link, b.span)?;
+        let base = httpx
+            .then(|| kwarg(&link.args, "base_url").map(|a| UrlValue::of(Some(a))))
+            .flatten();
+        Some((httpx, base))
+    };
+    // A verb or dispatcher site on a known receiver: `url` from the verb's
+    // first argument (kept unknown when unnamed), the dispatcher's second.
+    // `None` when the shape names no URL (an empty call, a dispatcher
+    // without one).
+    let verb_site = |link: &CallLink,
+                     span: Span,
+                     enclosing: Option<usize>,
+                     verb: &str,
+                     httpx: bool,
+                     base: Option<UrlValue>,
+                     capped: bool|
+     -> Option<ClientCall> {
+        if VERBS.contains(&verb) {
+            if link.args.is_empty() {
+                return None;
+            }
+            let url = url_arg(&link.args)
+                .map(|a| UrlValue::of(Some(&a)))
+                .unwrap_or(UrlValue::Unknown);
+            Some(site(
+                span,
+                enclosing,
+                Some(norm_method(verb)),
+                url,
+                base,
+                capped
+                    || configured(
+                        if httpx {
+                            HTTPX_CALL_KEYS
+                        } else {
+                            REQUESTS_CALL_KEYS
+                        },
+                        &link.args,
+                    ),
+            ))
+        } else if verb == "request" || (httpx && verb == "stream") {
+            let url = link
+                .args
+                .get(1)
+                .cloned()
+                .or_else(|| kwarg(&link.args, "url").cloned())?;
+            Some(site(
+                span,
+                enclosing,
+                dispatch_method(&link.args),
+                UrlValue::of(Some(&url)),
+                base,
+                capped
+                    || configured(
+                        if httpx {
+                            HTTPX_CALL_KEYS
+                        } else {
+                            REQUESTS_CALL_KEYS
+                        },
+                        &link.args,
+                    ),
+            ))
+        } else {
+            None
+        }
+    };
+    for chain in &facts.chains {
+        let Some(first) = chain.links.first() else {
+            continue;
+        };
+        // An anonymous inline instance (`Session().post(…)`,
+        // `Client(base_url=…).get(…)`): the verb is the second link, capped.
+        if let [ctor, verb] = chain.links.as_slice()
+            && let Some(httpx) = ctor_of(chain.root.as_deref(), ctor, chain.span)
+            && let Some(call) = verb_site(
+                verb,
+                chain.span,
+                chain.enclosing,
+                &verb.name,
+                httpx,
+                httpx
+                    .then(|| kwarg(&ctor.args, "base_url").map(|a| UrlValue::of(Some(a))))
+                    .flatten(),
+                true,
+            )
+        {
+            out.calls.push(call);
+            continue;
+        }
+        if chain.root.is_none() {
+            // A from-imported verb or dispatcher, unshadowed.
+            if unshadowed(&first.name, chain.span)
+                && let Some((httpx, verb)) = verbs.get(&first.name)
+                && let Some(call) = verb_site(
+                    first,
+                    chain.span,
+                    chain.enclosing,
+                    verb,
+                    *httpx,
+                    None,
+                    false,
+                )
+            {
+                out.calls.push(call);
+            }
+            continue;
+        }
+        let root = chain.root.as_deref().unwrap_or_default();
+        // A module verb or dispatcher.
+        for httpx in [false, true] {
+            if is_root(httpx, root, chain.span)
+                && let Some(call) = verb_site(
+                    first,
+                    chain.span,
+                    chain.enclosing,
+                    &first.name,
+                    httpx,
+                    None,
+                    false,
+                )
+            {
+                out.calls.push(call);
+            }
+        }
+        // A session receiver: capped.
+        if let Some((httpx, base)) = session(root, chain.span)
+            && let Some(call) = verb_site(
+                first,
+                chain.span,
+                chain.enclosing,
+                &first.name,
+                httpx,
+                base,
+                true,
+            )
+        {
+            out.calls.push(call);
+        }
+    }
+}
 /// Angular `HttpClient` calls (contract M6b S9, D8): verbs and
 /// `request(method, url)` on a receiver typed `HttpClient` — a constructor
 /// parameter property, field or local — with the `@angular/common/http`
@@ -4314,6 +4649,16 @@ mod tests {
                 .words
                 .is_empty()
         );
+        // Python lockfiles only record what the manifests declare: prose in
+        // them (a `transport` hook word in a description) scans nothing.
+        for lock in ["svc/poetry.lock", "svc/uv.lock"] {
+            assert!(
+                raw_scan(lock, Some("transport adapter hooks dispatcher"))
+                    .words
+                    .is_empty(),
+                "{lock}"
+            );
+        }
         assert!(
             raw_scan("w/package-lock.json", Some("KafkaAuditSink"))
                 .words
@@ -4868,6 +5213,115 @@ mod tests {
         // A non-verb on a carrier is no site.
         let other = "import got from \"got\";\nconst api = got.extend({});\nexport async function f() {\n  await api.unknown(\"/a\");\n}\n";
         assert!(calls(Language::TypeScript, other).is_empty());
+    }
+
+    /// Contract M6d S7: `requests` and `httpx` enter as fetch-class sites —
+    /// module verbs and `request(method, url)` dispatchers behind import
+    /// gates, with the same verb allow-list on both. A shadowed or
+    /// unimported module name and an unlisted member give nothing.
+    #[test]
+    fn requests_httpx_module_sites() {
+        let src = "import requests\nimport httpx\n\ndef f(URL, METHOD):\n    requests.get(\"http://orders/a\")\n    requests.post(URL, headers=H)\n    requests.request(\"DELETE\", \"http://orders/b\")\n    requests.request(METHOD, URL)\n    httpx.get(\"http://orders/c\")\n    httpx.request(\"post\", \"http://orders/d\")\n    httpx.get(url=\"http://orders/e\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch GET 'http://orders/a'",
+                "fetch POST URL",
+                "fetch DELETE 'http://orders/b'",
+                "fetch ? URL",
+                "fetch GET 'http://orders/c'",
+                "fetch POST 'http://orders/d'",
+                "fetch GET 'http://orders/e'",
+            ]
+        );
+        // The controls: a shadowed module name, an unimported name, an
+        // unlisted member, a missing URL and a residue library give nothing.
+        let shadowed =
+            "import requests\n\ndef f(requests):\n    requests.get(\"http://orders/a\")\n";
+        assert!(calls(Language::Python, shadowed).is_empty());
+        let plain = "def f():\n    requests.get(\"http://orders/a\")\n";
+        assert!(calls(Language::Python, plain).is_empty());
+        let other = "import requests\n\ndef f():\n    requests.fetch(\"http://orders/a\")\n    requests.get()\n";
+        assert!(calls(Language::Python, other).is_empty());
+        let residue =
+            "import urllib3\n\ndef f():\n    urllib3.request(\"GET\", \"http://orders/a\")\n";
+        assert!(calls(Language::Python, residue).is_empty());
+        // A from-imported verb shadowed by a parameter gives nothing either.
+        let shadowed_from =
+            "from requests import get\n\ndef f(get):\n    get(\"http://orders/a\")\n";
+        assert!(calls(Language::Python, shadowed_from).is_empty());
+    }
+
+    /// Contract M6d S7: session receivers — a name directly bound to
+    /// `requests.Session()`, `httpx.Client(...)` or `httpx.AsyncClient(...)`
+    /// — take the same verbs, with `base_url` folded as the base. Every
+    /// carrier site caps at `heuristic`, like the configured carriers of the
+    /// TS fetch class.
+    #[test]
+    fn requests_httpx_session_sites_fold_base_url() {
+        let src = "import requests\nimport httpx\n\ns = requests.Session()\nc = httpx.Client(base_url=\"http://orders\")\na = httpx.AsyncClient(base_url=BASE)\n\ndef f(URL):\n    s.get(\"http://orders/a\")\n    s.request(\"post\", URL)\n    c.get(\"/b\")\n    c.post(\"/c\", json=J)\n    a.delete(\"/d\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch GET 'http://orders/a' unverified",
+                "fetch POST URL unverified",
+                "fetch GET '/b' base='http://orders' unverified",
+                "fetch POST '/c' base='http://orders' unverified",
+                "fetch DELETE '/d' base=BASE unverified",
+            ]
+        );
+    }
+
+    /// Contract M6d S7: aliased modules, from-imported verbs and
+    /// constructors, and anonymous inline instances (`Session().post(…)`).
+    #[test]
+    fn requests_httpx_aliases_from_imports_and_inline_instances() {
+        let src = "import requests as rq\nfrom httpx import Client, get as hget\nfrom requests import Session, get as rget\n\ndef f(URL):\n    rq.put(\"http://orders/a\")\n    hget(\"http://orders/b\")\n    rget(URL)\n    Session().post(\"http://orders/c\")\n    Client(base_url=\"http://orders\").delete(\"/d\")\n    rq.api.get(\"http://orders/e\")\n    rq.sessions.Session().head(\"http://orders/f\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch PUT 'http://orders/a'",
+                "fetch GET 'http://orders/b'",
+                "fetch GET URL",
+                "fetch POST 'http://orders/c' unverified",
+                "fetch DELETE '/d' base='http://orders' unverified",
+                "fetch GET 'http://orders/e'",
+                "fetch HEAD 'http://orders/f' unverified",
+            ]
+        );
+    }
+
+    /// Contract M6d S7, evaluator-pass-1 parity: configuration surfaces that
+    /// may reroute cap the site. `requests` hooks are response-only, so they
+    /// stay plain; `httpx` transports, mounts, event hooks and extensions,
+    /// unknown keys and spreads cap — as do all carrier sites.
+    #[test]
+    fn requests_httpx_reconfigured_calls_are_capped() {
+        let src = "import requests\nimport httpx\n\ns = requests.Session()\nc = httpx.Client(base_url=\"http://orders\", transport=T)\nc2 = httpx.Client(base_url=\"http://orders\", unknown_opt=1)\n\ndef f(opts, H, E):\n    requests.get(\"http://orders/a\", hooks=H)\n    requests.get(\"http://orders/b\", unknown_opt=1)\n    requests.get(\"http://orders/c\", **opts)\n    httpx.get(\"http://orders/d\", extensions=E)\n    s.get(\"http://orders/e\")\n    c.get(\"/f\")\n    c2.get(\"/g\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch GET 'http://orders/a'",
+                "fetch GET 'http://orders/b' unverified",
+                "fetch GET 'http://orders/c' unverified",
+                "fetch GET 'http://orders/d' unverified",
+                "fetch GET 'http://orders/e' unverified",
+                "fetch GET '/f' base='http://orders' unverified",
+                "fetch GET '/g' base='http://orders' unverified",
+            ]
+        );
+    }
+
+    /// Contract M6d S7 boundaries: `send`, `build_request`, header/mount
+    /// calls and non-verb members are no sites; a factory-built session, a
+    /// member receiver and an unbound `Session` reference wait for S8.
+    #[test]
+    fn requests_httpx_non_sites_stay_out() {
+        let src = "import requests\nimport httpx\n\ns = requests.Session()\nc = httpx.Client(base_url=\"http://orders\")\nplain = requests.Session\nmade = get_session()\n\ndef f(prep, url):\n    c.send(prep)\n    c.build_request(\"GET\", url)\n    s.headers.update({\"a\": \"b\"})\n    s.mount(\"http://\", adapter)\n    s.close()\n    c.unknown(url)\n    plain.get(url)\n    made.get(url)\n    self.session.get(url)\n";
+        assert!(calls(Language::Python, src).is_empty());
+        // A from-imported constructor shadowed by a rebinding builds nothing.
+        let shadowed_ctor = "from httpx import Client\nClient = make_client()\n\ndef f():\n    Client(base_url=\"http://orders\").get(\"/a\")\n";
+        assert!(calls(Language::Python, shadowed_ctor).is_empty());
     }
 
     /// Contract M6b S9 (D8): Angular `HttpClient` calls enter capped at
