@@ -77,6 +77,14 @@ pub(crate) struct MapperStmt {
     pub span: rb_model::Span,
 }
 
+/// A MyBatis mapper file read: its `namespace`, plain statements and dynamic-skipped
+/// statement ids with spans and reasons.
+pub(crate) struct MapperFile {
+    pub namespace: String,
+    pub stmts: Vec<MapperStmt>,
+    pub dynamic: Vec<(String, rb_model::Span, &'static str)>,
+}
+
 /// Statement tags a mapper file may hold; anything else (dynamic tags like `<if>`, fragments)
 /// is out of the allow-list.
 const MAPPER_STATEMENTS: &[&str] = &["select", "insert", "update", "delete"];
@@ -99,13 +107,7 @@ const MAPPER_DYNAMIC: &[&str] = &[
 /// Reads a MyBatis mapper file: its `namespace`, plain statements and dynamic-skipped
 /// statement ids with spans. `None` when the root is not `<mapper>` (poms and other XML pass
 /// through untouched). `#{p}` and `${p}` placeholders fold to `?` (table extraction only).
-pub(crate) fn mapper_file(
-    text: &str,
-) -> Option<(
-    String,
-    Vec<MapperStmt>,
-    Vec<(String, rb_model::Span, &'static str)>,
-)> {
+pub(crate) fn mapper_file(text: &str) -> Option<MapperFile> {
     let root = crate::packages::parse_xml(text)?;
     if root.name != "mapper" {
         return None;
@@ -141,7 +143,11 @@ pub(crate) fn mapper_file(
             span,
         });
     }
-    Some((namespace, stmts, dynamic))
+    Some(MapperFile {
+        namespace,
+        stmts,
+        dynamic,
+    })
 }
 
 /// `#{p}` and `${p}` placeholders become `?` (an unclosed placeholder ends the fold; the
@@ -179,7 +185,12 @@ pub(crate) fn add_mapper_queries(
     path: &str,
     text: &str,
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    let Some((namespace, stmts, dynamic)) = mapper_file(text) else {
+    let Some(MapperFile {
+        namespace,
+        stmts,
+        dynamic,
+    }) = mapper_file(text)
+    else {
         return Ok(Vec::new());
     };
     let file = NodeKey::new(NodeKind::File, path);
@@ -478,7 +489,11 @@ mod tests {
     #[test]
     fn mybatis_mapper_statements_pin_namespace_id_and_sql() {
         let xml = "<?xml version=\"1.0\"?>\n<mapper namespace=\"com.acme.UserMapper\">\n  <select id=\"findAll\" resultType=\"User\">\n    SELECT id, name FROM users\n  </select>\n  <select id=\"findById\" resultMap=\"m\">\n    SELECT id FROM users WHERE id = #{id}\n  </select>\n  <insert id=\"insert\">INSERT INTO users (name) VALUES (#{name})</insert>\n  <select id=\"dyn\">SELECT a FROM t <if test=\"x != null\">AND x = #{x}</if></select>\n  <select id=\"sub\">SELECT a FROM t WHERE x IN ${xs}</select>\n</mapper>\n";
-        let (namespace, stmts, dynamic) = mapper_file(xml).unwrap();
+        let MapperFile {
+            namespace,
+            stmts,
+            dynamic,
+        } = mapper_file(xml).unwrap();
         assert_eq!(namespace, "com.acme.UserMapper");
         assert_eq!(
             stmts.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
