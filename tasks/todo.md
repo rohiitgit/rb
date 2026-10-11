@@ -947,7 +947,6 @@ Same rules as M6d:
 - [x] M6b Request-path precision (closed 2026-10-10, amendment 11; passes 1–2 PASS).
 - [x] M6c DI, RTA and orphan precision (closed 2026-10-11, amendments 1–15; passes 1–2 PASS).
 - [x] M6d Go and Python SCIP (scip-go image built locally, scip-python pinned by digest after measuring, fetch phases behind the proxy, Go/Python fixtures, the adversarial egress review).
-- [ ] M6e Build and lockfile breadth (contract written 2026-10-11, phases above; Gradle, pnpm/Yarn lockfiles and workspaces, `go.work`, Maven classifiers, tsconfig include/exclude, source encoding).
 - [x] M6e Build and lockfile breadth (closed 2026-10-12, amendment 13; passes 1–2 PASS).
 - [ ] M6f Contract packs (contract written 2026-10-12, phases below; OpenAPI, gRPC, generated interfaces, MyBatis XML).
 - [ ] M6g Topology and configuration packs (message topics, gateways, compose/k8s hosts, Spring YAML and active profiles).
