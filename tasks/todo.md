@@ -909,6 +909,7 @@ Same rules as M6b/M6c:
 - [x] **7. requests/httpx** (S7). Done 2026-10-11 (amendment 8): fetch-class sites (module/dispatcher/session/inline, shared verbs, base_url fold, carrier caps, per-lib kwarg allow-lists); kwarg extractor support + lockfile inertness. Tests first + 10 mutants killed; mixed scratch stitches 4 sites into 2 CONSUMES edges; no golden moves. Files: `rb-frameworks/src/clients.rs`, `rb-syntax/src/calls.rs`.
 - [x] **8. Python member idioms** (S8). Done 2026-10-11 (amendment 9): self/cls member receivers (construction-first, annotation fallback, conflict-dynamic) + session-typed locals; all capped. Tests first + 9 mutants killed; mixed scratch stitches member/typed sites; no golden moves. Files: `rb-frameworks/src/clients.rs`.
 - [ ] **9. Fixtures + guards** (S9). `go-chi-sqlx`, `python-fastapi-sqlalchemy`; biting guards per class.
+  - [x] **9a. chi + FastAPI route packs.** Done 2026-10-11 (amendment 10): chi verbs/nested-Route/Group/With/Method/Handle + FastAPI decorators/prefixes/includes; tests first + 11 mutants killed. Files: `rb-frameworks/src/routes.rs` (+ 1-line `kwarg` share in `clients.rs`).
 - [ ] **10. Egress review** (S10). Probe suite green on the final allow-list.
 - [ ] **11. Measurements** (S11). mattermost Go + Python repo; classified diffs + read samples.
 - [ ] **12. Records + evaluator.** S12–S14; pass 1 (full), fixes, pass 2 (verification-only).

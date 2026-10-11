@@ -1076,7 +1076,7 @@ fn entry<'a>(arg: Option<&'a Arg>, key: &str) -> Option<&'a Arg> {
 
 /// The first `key` entry among call keyword arguments (each reads as a
 /// single-entry object, so any `Arg::Object` in the way is a keyword).
-fn kwarg<'a>(args: &'a [Arg], key: &str) -> Option<&'a Arg> {
+pub(crate) fn kwarg<'a>(args: &'a [Arg], key: &str) -> Option<&'a Arg> {
     args.iter()
         .filter_map(|a| match a {
             Arg::Object { entries, .. } => entries.iter().find(|e| e.key == key).map(|e| &e.value),
