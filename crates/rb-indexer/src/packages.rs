@@ -23,6 +23,7 @@ pub(crate) fn is_input(path: &str) -> bool {
             | "package-lock.json"
             | "npm-shrinkwrap.json"
             | "go.mod"
+            | "go.work"
             | "pom.xml"
             // `yarn.lock`/`pnpm-lock.yaml` pin `npm/` versions (contract M6e
             // S5); `npm-shrinkwrap.json` stays npm-read.
@@ -585,11 +586,13 @@ fn npm_range_is_local(range: &str, service_dir: &str, target_dir: &str) -> bool 
         .is_some_and(|d| d == target_dir)
 }
 
-/// `go.mod`'s direct requirements (no `// indirect`) and its `replace` directives.
+/// `go.mod`'s direct requirements (no `// indirect`), its `replace` directives
+/// and its `exclude` directives.
 #[derive(Debug, Default)]
 struct GoMod {
     requires: Vec<(Dep, String)>,
     replaces: Vec<Replace>,
+    excludes: Vec<(String, String)>,
 }
 
 /// `replace <module> [<version>] => <target> [<version>]`.
@@ -634,6 +637,12 @@ impl GoMod {
                     .filter(of)
                     .find(|r| r.from_version.is_none())
             })
+    }
+
+    fn excluded(&self, module: &str, version: &str) -> bool {
+        self.excludes
+            .iter()
+            .any(|(m, v)| m == module && v == version)
     }
 }
 
@@ -701,10 +710,128 @@ fn go_mod(text: &str) -> GoMod {
                     }
                 }
             }
+            "exclude" => {
+                let mut words = rest.split_whitespace().map(unquote);
+                if let (Some(module), Some(version)) = (words.next(), words.next()) {
+                    out.excludes.push((module, version));
+                }
+            }
             _ => {}
         }
     }
     out
+}
+
+/// A `go.work` workspace: `use` member directories, workspace `replace`
+/// directives (which win over a member module's own) and `exclude` directives
+/// (contract M6e S8). Only the allow-listed directives are read; `go`,
+/// `toolchain` and anything else are ignored.
+#[derive(Debug, Default)]
+struct GoWork {
+    uses: Vec<String>,
+    replaces: Vec<Replace>,
+    excludes: Vec<(String, String)>,
+}
+
+impl GoWork {
+    /// The `replace` that applies to `module` at `version`: one naming that version, else one
+    /// naming none (Go's rule; mirrors [`GoMod::replace_for`]).
+    fn replace_for(&self, module: &str, version: &str) -> Option<&Replace> {
+        let of = |r: &&Replace| r.module == module;
+        self.replaces
+            .iter()
+            .filter(of)
+            .find(|r| r.from_version.as_deref() == Some(version))
+            .or_else(|| {
+                self.replaces
+                    .iter()
+                    .filter(of)
+                    .find(|r| r.from_version.is_none())
+            })
+    }
+
+    fn excluded(&self, module: &str, version: &str) -> bool {
+        self.excludes
+            .iter()
+            .any(|(m, v)| m == module && v == version)
+    }
+}
+
+fn go_work(text: &str) -> GoWork {
+    let mut out = GoWork::default();
+    let mut block: Option<&str> = None;
+    for line in text.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let code = raw.split("//").next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        let (directive, rest) = match block {
+            Some(_) if code == ")" => {
+                block = None;
+                continue;
+            }
+            Some(d) => (d, code),
+            None => {
+                let (d, rest) = code.split_once(char::is_whitespace).unwrap_or((code, ""));
+                let rest = rest.trim();
+                if rest == "(" {
+                    block = Some(match d {
+                        "use" => "use",
+                        "replace" => "replace",
+                        "exclude" => "exclude",
+                        _ => "other",
+                    });
+                    continue;
+                }
+                (d, rest)
+            }
+        };
+        let unquote = |s: &str| s.trim_matches('"').to_owned();
+        match directive {
+            "use" => {
+                if let Some(dir) = rest.split_whitespace().next() {
+                    out.uses.push(unquote(dir));
+                }
+            }
+            "replace" => {
+                if let Some((from, to)) = rest.split_once("=>") {
+                    let mut from = from.split_whitespace().map(unquote);
+                    let mut to = to.split_whitespace().map(unquote);
+                    if let (Some(module), Some(target)) = (from.next(), to.next()) {
+                        out.replaces.push(Replace {
+                            module,
+                            from_version: from.next(),
+                            target,
+                            to_version: to.next(),
+                        });
+                    }
+                }
+            }
+            "exclude" => {
+                let mut words = rest.split_whitespace().map(unquote);
+                if let (Some(module), Some(version)) = (words.next(), words.next()) {
+                    out.excludes.push((module, version));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The `go.work` governing a service directory: the nearest `go.work` at or
+/// above it (contract M6e S8; mirrors `catalog_for`).
+fn go_work_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<String> {
+    let mut dir = Some(service_dir);
+    while let Some(d) = dir {
+        let path = format!("{}go.work", dir_prefix(d));
+        if paths.contains(path.as_str()) {
+            return Some(path);
+        }
+        dir = parent_dir(d);
+    }
+    None
 }
 
 /// A PEP 503 canonical project name: lowercased with every run of `-_.`
@@ -1857,6 +1984,42 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
         }
     }
     let rel_dir = |dir: &str| dir_prefix(dir).trim_end_matches('/').to_owned();
+    // `go.work` workspaces (contract M6e S8): every workspace by path, and
+    // per workspace the module path each `use` member directory provides, so
+    // `use` directories join services even where they are not projects of
+    // their own. A use directory that leaves the repository is ignored.
+    let mut works: BTreeMap<String, GoWork> = BTreeMap::new();
+    let mut work_members: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    for (path, text) in inputs.texts.iter() {
+        if path.rsplit('/').next().unwrap_or(path) != "go.work" {
+            continue;
+        }
+        let work = go_work(text);
+        let work_dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+        let mut members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for u in &work.uses {
+            let Some(dir) = join(work_dir, u) else {
+                continue;
+            };
+            let mod_path = if dir.is_empty() {
+                "go.mod".to_owned()
+            } else {
+                format!("{dir}/go.mod")
+            };
+            if let Some(module) = inputs
+                .texts
+                .get(mod_path.as_str())
+                .and_then(|t| boundaries::go_module_path(t))
+            {
+                let dirs = members.entry(module).or_default();
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        work_members.insert((*path).to_owned(), members);
+        works.insert((*path).to_owned(), work);
+    }
     // Catalogs already reported unreadable (one diagnostic per catalog, not
     // per build file using it).
     let mut catalog_unread: BTreeSet<String> = BTreeSet::new();
@@ -2036,15 +2199,57 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                 }
                 "go.mod" => {
                     let parsed = go_mod(text);
+                    // The governing workspace, if any: its replaces win over
+                    // the module's own, joined at the workspace root, and its
+                    // `use` members join services by module path (S8).
+                    let work_path = go_work_for(&here, inputs.paths);
+                    let work = work_path.as_deref().and_then(|p| works.get(p));
+                    let work_dir = work_path
+                        .as_deref()
+                        .map(|p| p.rsplit_once('/').map_or("", |(d, _)| d))
+                        .unwrap_or("");
                     for (dep, version) in &parsed.requires {
-                        let replace = parsed.replace_for(&dep.name, version);
+                        // An excluded required version resolves to `?` with a
+                        // diagnostic: MVS would pick an unknowable next
+                        // version, so the reader never guesses (S8).
+                        let excluded = parsed.excluded(&dep.name, version)
+                            || work.is_some_and(|w| w.excluded(&dep.name, version));
+                        if excluded {
+                            diagnostics.push(diagnostic(
+                                "go_excluded",
+                                m,
+                                Some(dep.span),
+                                json!({ "service": service, "name": dep.name }),
+                            ));
+                            edges.push(ManifestEdge {
+                                service: service.to_owned(),
+                                target: Target::Package(Package {
+                                    manager: "go",
+                                    name: dep.name.clone(),
+                                    version: String::new(),
+                                }),
+                                certainty: Certainty::Exact,
+                                attrs: attrs(&[
+                                    ("declared", &dep.declared),
+                                    ("scope", dep.scope),
+                                    ("version_from", "unresolved"),
+                                ]),
+                                evidence: evidence(dep.span),
+                            });
+                            continue;
+                        }
+                        let (replace, base) =
+                            match work.and_then(|w| w.replace_for(&dep.name, version)) {
+                                Some(r) => (Some(r), work_dir),
+                                None => (parsed.replace_for(&dep.name, version), here.as_str()),
+                            };
                         // Only a relative directory joins a service: an
                         // absolute path (`/b`) is a filesystem path, never a
                         // repo-relative directory (evaluator pass 1, E2-1).
                         // It stays a local replace for the version logic below.
                         let local = replace
                             .filter(|r| r.target.starts_with("./") || r.target.starts_with("../"))
-                            .and_then(|r| join(&here, &r.target));
+                            .and_then(|r| join(base, &r.target));
                         let by_dir: Vec<&str> = local
                             .as_deref()
                             .map(|d| {
@@ -2063,11 +2268,28 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             // module: not the module path's own package (Y10).
                             (Vec::new(), Certainty::Heuristic)
                         } else {
-                            match go_modules.get(&dep.name).map(Vec::as_slice) {
-                                Some([one]) => (vec![*one], Certainty::Heuristic),
-                                Some(many) => (many.to_vec(), Certainty::Ambiguous),
-                                None => (Vec::new(), Certainty::Heuristic),
+                            // Module-path candidates: the workspace's `use`
+                            // members first, then every known module (deduped;
+                            // members that are also projects appear once).
+                            let mut names: Vec<&str> = Vec::new();
+                            if let Some(members) = work_path
+                                .as_deref()
+                                .and_then(|p| work_members.get(p))
+                                .and_then(|m| m.get(&dep.name))
+                            {
+                                names.extend(members.iter().map(String::as_str));
                             }
+                            if let Some(known) = go_modules.get(&dep.name) {
+                                names.extend(known.iter().copied());
+                            }
+                            names.sort();
+                            names.dedup();
+                            let certainty = if names.len() <= 1 {
+                                Certainty::Heuristic
+                            } else {
+                                Certainty::Ambiguous
+                            };
+                            (names, certainty)
                         };
                         let targets: Vec<&str> =
                             targets.into_iter().filter(|t| *t != service).collect();
@@ -2559,16 +2781,91 @@ mod tests {
         );
     }
 
-    /// Contract M6e S3: Gradle build files and version catalogs reach the
-    /// manifest readers that feed `maven/` package edges.
+    /// Contract M6e S8: `go.work` workspaces — `use` members join services,
+    /// workspace replaces win over module replaces, and excluded required
+    /// versions resolve to `?` with a diagnostic.
     #[test]
-    fn gradle_build_files_and_catalogs_are_manifest_inputs() {
-        assert!(is_input("svc/build.gradle"));
-        assert!(is_input("svc/build.gradle.kts"));
-        assert!(is_input("svc/gradle/libs.versions.toml"));
-        assert!(is_input("build.gradle"));
-        assert!(!is_input("svc/build.gradle.bak"));
-        assert!(!is_input("svc/settings.gradle"));
+    fn go_work_use_replace_and_exclude() {
+        let projects = [
+            project("app", &["app/go.mod"]),
+            project("lib", &["lib/go.mod"]),
+        ];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                (
+                    "go.work",
+                    "go 1.23\n\nuse ./app\nuse (\n\t./lib\n)\n\nreplace example.com/lib => ./lib\n",
+                ),
+                (
+                    "app/go.mod",
+                    "module example.com/app\n\ngo 1.23\n\nrequire (\n\texample.com/lib v0.0.0\n\tgithub.com/gin-gonic/gin v1.10.0\n\texample.com/stale v1.0.0\n)\n\nreplace example.com/lib => example.com/fork v1.0.0\n\nexclude example.com/stale v1.0.0\n",
+                ),
+                ("lib/go.mod", "module example.com/lib\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"app -> service lib [synthetic] {"declared":"v0.0.0","scope":"runtime","via":"package"}"#,
+                r#"app -> go/github.com/gin-gonic/gin@v1.10.0 [synthetic] {"declared":"v1.10.0","scope":"runtime","version_from":"go_mod"}"#,
+                r#"app -> go/example.com/stale@? [exact] {"declared":"v1.0.0","scope":"runtime","version_from":"unresolved"}"#,
+            ]
+        );
+        let mut diagnostics = diagnostics;
+        diagnostics.sort();
+        assert_eq!(diagnostics, ["go_excluded app/go.mod"]);
+        // Two members sharing one module path stay ambiguous.
+        let projects = [
+            project("app", &["app/go.mod"]),
+            project("lib", &["lib/go.mod"]),
+            project("lib2", &["lib2/go.mod"]),
+        ];
+        let (edges, _) = run(
+            &projects,
+            &[
+                ("go.work", "go 1.23\nuse ./app\nuse ./lib\nuse ./lib2\n"),
+                (
+                    "app/go.mod",
+                    "module example.com/app\n\nrequire example.com/lib v0.0.0\n",
+                ),
+                ("lib/go.mod", "module example.com/lib\n"),
+                ("lib2/go.mod", "module example.com/lib\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"app -> service lib [ambiguous] {"declared":"v0.0.0","scope":"runtime","via":"package"}"#,
+                r#"app -> service lib2 [ambiguous] {"declared":"v0.0.0","scope":"runtime","via":"package"}"#,
+            ]
+        );
+    }
+
+    /// Contract M6e S8: `go.work` files reach the manifest readers that feed
+    /// `go/` package edges.
+    #[test]
+    fn go_work_files_are_manifest_inputs() {
+        assert!(is_input("go.work"));
+        assert!(is_input("svc/go.work"));
+        assert!(!is_input("svc/go.work.bak"));
+    }
+
+    /// Contract M6e S8: `go.work` shapes — single and block `use`, `replace`
+    /// directives, `go`/`toolchain` lines and garbage ignored.
+    #[test]
+    fn go_work_use_and_replace_shapes() {
+        let w = go_work(
+            "go 1.23\n\ntoolchain go1.24.0\nuse ./a\nuse (\n\t./b\n\t./c\n)\n\nreplace example.com/x => ./x\nreplace example.com/y v1.0.0 => example.com/z v2.0.0\ngarbage )(\n",
+        );
+        assert_eq!(
+            w.uses,
+            vec!["./a".to_owned(), "./b".to_owned(), "./c".to_owned()]
+        );
+        assert_eq!(w.replaces.len(), 2);
+        assert_eq!(w.replaces[0].target, "./x");
+        let w = go_work("go 1.23\n");
+        assert!(w.uses.is_empty() && w.replaces.is_empty());
     }
 
     /// Contract M6e S3: version catalogs resolve `module` + `version` /
