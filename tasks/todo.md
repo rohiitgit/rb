@@ -885,12 +885,38 @@ Same rules as M6b:
 - [x] **8. Lombok qualifiers** (S8). Done 2026-10-11 (amendment 9): `LombokConfigs` nearest-chain reader; listed qualifiers ride the parameter (`copied_qualifier`), counted in `lombok_narrowed`. Tests + growth (8 mutants killed; stop survivor forced `+=` shape). Fixture D10 (lombok dep, config, `MailService`) + 2 guards; goldens classified per hunk. Verify: fmt, clippy clean; 751 unit, 66 store, 12 server, 32/32 e2e (no `skipping:`), 1/1 api. `PIPELINE m6c-4`. Files: `rb-frameworks/src/di.rs`, `rb-indexer/src/di.rs`, `packages.rs`, `lib.rs` + fixture/goldens.
 - [x] **9. Generics + custom qualifiers** (S9). Done 2026-10-11 (amendments 10–11): exact type-arg agreement picks single (capped, counted); custom-qualifier meta leg deferred as residue (nil incidence, needs syntax-visible annotation declarations; non-blocking per closing bar). Tests + growth (6 mutants killed; 2 redundant checks removed). Fixture D10 (`Channel.java`) + 2 guards; goldens classified per hunk. Verify: fmt, clippy clean; 753 unit, 66 store, 12 server, 32/32 e2e (no `skipping:`), 1/1 api. `PIPELINE m6c-5`. Files: `rb-syntax/src/bindings.rs`, `rb-frameworks/src/di.rs` + `clients.rs`, `rb-indexer/src/di.rs`, `lib.rs` + fixture/goldens.
 - [x] **10. Measurements** (S11). Done 2026-10-11 (amendment 13): `--no-scip` base vs head on all six D13 repos; realworld +6 S6 INJECTS with S2/S6 bucket shifts, jhipster +119 S7/+14 S4 (root-tsconfig correction), petclinic/microservices/piggymetrics/eladmin S7-only; microservices 8 S3 role flips with no blast radius; RTA yield 0, `discovery_lifted` 0, S8 vacuous everywhere. Full record `var/m6c/bench/phase11.md`. DB 0 repos.
-- [ ] **11. Records + evaluator.** S12–S14; fixtures/goldens (S10) with the fixture phases; pass 1 DONE (amendment 14: VERDICT PASS, E1+E2 fixed test-first), pass 2 DONE (amendment 15: VERDICT PASS). **M6c closed 2026-10-11.**
+- [x] **11. Records + evaluator.** S12–S14; fixtures/goldens (S10) with the fixture phases; pass 1 DONE (amendment 14: VERDICT PASS, E1+E2 fixed test-first), pass 2 DONE (amendment 15: VERDICT PASS). **M6c closed 2026-10-11.**
+
+## M6d Go and Python SCIP (contract `tasks/contract-m6d.md`, written 2026-10-11; forks F1–F6 recommendations for the orchestrator; not started)
+
+Same rules as M6b/M6c:
+- Each phase has at most 5 hand-edited source files. Fixture sources, blessed goldens and guard data are listed separately in the changelog and reviewed on their own.
+- Each phase is test-first: the new units fail, or do not compile, before the change (the failure recorded).
+- Each phase ends with its verification step: fmt, `clippy --workspace --all-targets -D warnings`, the touched crates' unit tests counted from a log holding both streams (`> log 2>&1`), and the e2e suite with `RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb` (with containers wherever the phase touches SCIP: `docker image inspect` first, no `skipping:`).
+- Any golden that changes gets a classified line diff before `RB_BLESS=1`; any dump change is classified L, T or W (contract invariant 1).
+- Mutation runs follow M4a's harness rules: fresh mtime, restored bytes checked, a `test result:` line per mutant, stopped with SIGINT, `"$@"`, `command -v` for every tool.
+- Environment: never `npm`/`npx`/`pip`/`go` on the host (lockfiles and environments are generated inside the pinned images); Docker context `desktop-linux`; no image pull except the measured scip-python pin (none is needed otherwise); `df` before every build, clone and container step, floor 6 GiB for large-repository steps and 2 GiB otherwise; one-off builds use a `CARGO_TARGET_DIR` under the scratchpad, removed afterwards; disk figures accounted part by part in MiB.
+
+`PIPELINE` becomes `m6d-1` at the first dump change and is bumped on each later one.
+
+- [ ] **0. Preflight** (no code). Baseline binary, pins (Go + Python measurement repos), shape checks (go.mod collection, poetry/uv shapes, image digests, scip-python size, egress behaviour), fixture dependency closures.
+- [ ] **1. scip-go image** (S1). Local build on pinned toolchain + base; digest recorded and re-verified.
+- [ ] **2. scip-python pin** (S2). Size measured vs budget, then digest-pinned.
+- [ ] **3. Go fetch** (S3). `go mod download` behind the proxy; refusals named.
+- [ ] **4. Python fetch** (S4). Lockfile-driven envs behind the proxy; refusals named.
+- [ ] **5. Go package keys** (S5). Shared `go/<module>@<version>`; mismatches keep both rows.
+- [ ] **6. Lockfile versions** (S6). `poetry.lock`/`uv.lock` exact; everything else `?`.
+- [ ] **7. requests/httpx** (S7). Fetch-class parity sites.
+- [ ] **8. Python member idioms** (S8). Session/receiver folds, allow-listed.
+- [ ] **9. Fixtures + guards** (S9). `go-chi-sqlx`, `python-fastapi-sqlalchemy`; biting guards per class.
+- [ ] **10. Egress review** (S10). Probe suite green on the final allow-list.
+- [ ] **11. Measurements** (S11). mattermost Go + Python repo; classified diffs + read samples.
+- [ ] **12. Records + evaluator.** S12–S14; pass 1 (full), fixes, pass 2 (verification-only).
 
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 
 - [x] M6b Request-path precision (closed 2026-10-10, amendment 11; passes 1–2 PASS).
-- [ ] M6c DI, RTA and orphan precision (registrants, gate M on main sources, RTA yield, module roles and objects, rule (e), autowired non-beans, inherited Spring Data methods, Lombok qualifiers, generics and custom qualifiers).
+- [x] M6c DI, RTA and orphan precision (closed 2026-10-11, amendments 1–15; passes 1–2 PASS).
 - [ ] M6d Go and Python SCIP (scip-go image built locally, scip-python pinned by digest after measuring, fetch phases behind the proxy, Go/Python fixtures, the adversarial egress review).
 - [ ] M6e Build and lockfile breadth (Gradle, pnpm/Yarn lockfiles and workspaces, `go.work`, Maven classifiers, tsconfig include/exclude, source encoding).
 - [ ] M6f Contract packs (OpenAPI, gRPC, generated interfaces, MyBatis XML).
