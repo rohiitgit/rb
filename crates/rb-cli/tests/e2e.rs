@@ -3818,6 +3818,52 @@ fn scip_ts_workspaces() {
     assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
 }
 
+/// Contract M6e S7: the pnpm/yarn lockfile fixture. The `pnpm` root groups two members
+/// (`workspace 2 members`, fetched at the root with pnpm) and the `yarn` service keeps its
+/// own classic job; ranges pin to exact `DEPENDS_ON` rows per format (guards); cached, fresh
+/// and a second repository name dump identically.
+#[test]
+fn scip_ts_pnpm_yarn() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = rb_scip::docker_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "ts-pnpm-yarn";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scippnpy_{}", std::process::id());
+    let other = format!("t_scippnpy2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(first.contains("scip-typescript ok"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!("scip_ts_pnpm_yarn guard failures:\n{}", failures.join("\n"));
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    let cached = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(cached.contains("(cached"), "{cached}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(!fresh.contains("(cached"), "{fresh}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump, "fresh");
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 /// Contract M3b S10 and invariant 4: a monorepo mixing a Maven project that indexes, one that
 /// fails to build on purpose (`services/broken`), and TypeScript packages. `rb index` succeeds,
 /// the failed project keeps its stderr tail and stays heuristic, the others are exact.
