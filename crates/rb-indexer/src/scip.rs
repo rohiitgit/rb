@@ -107,6 +107,12 @@ pub(crate) struct Coverage {
     /// for (a `tsconfig.json` that excludes `test/**`): they fall back to Tier B (contract M3b
     /// amendment 15), and none of their references is counted above.
     pub files_without_document: usize,
+    /// The subset of `files_without_document` positively outside their governing tsconfig's
+    /// scope (contract M6e S10): explained, still Tier B, no edge moves for this reader.
+    pub files_without_document_out_of_scope: usize,
+    /// Unread `tsconfig*.json` patterns, entries and links of this project's scopes (contract
+    /// M6e S10): their files stay in the unexplained bucket above, never wrongly out of scope.
+    pub tsconfig_unread: usize,
     /// Declared supertypes of the documented type definitions with no type occurrence inside
     /// their clause item (contract M3b amendment 26): the `IMPLEMENTS` walk stops there, and a
     /// lost true edge is preferred to a false exact one.
@@ -166,13 +172,15 @@ type Doc<'a> = (
 
 /// Joins `index` (paths relative to `root`) with the facts of the files the project owns, keyed
 /// by repo path, whose heuristic keys are `keys[path]`; `languages` are the ones the indexer
-/// covers ([`indexed_languages`]).
+/// covers ([`indexed_languages`]); `ts_scopes` partitions `files_without_document` by tsconfig
+/// membership without moving any edge (contract M6e S10).
 pub(crate) fn join(
     index: &ScipIndex,
     root: &str,
     files: &BTreeMap<&str, (Language, &FileFacts)>,
     keys: &BTreeMap<&str, Vec<String>>,
     languages: &[Language],
+    ts_scopes: &rb_scip::TsScopes,
 ) -> Joined {
     let repo_path = |doc: &str| {
         if root.is_empty() {
@@ -330,6 +338,20 @@ pub(crate) fn join(
         .iter()
         .filter(|(path, (language, _))| languages.contains(language) && !indexed.contains(**path))
         .count();
+    // TypeScript-family files the indexer left out that their tsconfig positively excludes:
+    // explained, still Tier B (contract M6e S10). Only tsconfig-scoped languages; no edge moves.
+    out.coverage.files_without_document_out_of_scope = files
+        .iter()
+        .filter(|(path, (language, _))| {
+            matches!(
+                language,
+                Language::TypeScript | Language::Tsx | Language::JavaScript
+            ) && languages.contains(language)
+                && !indexed.contains(**path)
+                && ts_scopes.out_of_scope(path)
+        })
+        .count();
+    out.coverage.tsconfig_unread = ts_scopes.unread_under(root);
     let mut locals: Vec<BTreeMap<&str, usize>> = Vec::with_capacity(docs.len());
     for ((path, ..), anchors) in docs.iter().zip(anchors_kept) {
         out.coverage.definitions_total += anchors.total;
@@ -1504,7 +1526,14 @@ mod tests {
         let heuristic = rb_syntax::symbol_keys(path, &facts);
         let files = BTreeMap::from([(path, (Language::Java, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([(path, heuristic)]);
-        let joined = join(&index(&facts), "svc", &files, &keys, &[Language::Java]);
+        let joined = join(
+            &index(&facts),
+            "svc",
+            &files,
+            &keys,
+            &[Language::Java],
+            &rb_scip::TsScopes::build([]),
+        );
         assert_eq!(joined.documented, BTreeSet::from([path.to_owned()]));
         let replaced: Vec<(String, String)> = joined.keys[path]
             .iter()
@@ -1552,6 +1581,8 @@ mod tests {
                 references_unanchored: 0,
                 references_unmatched: 0,
                 files_without_document: 0,
+                files_without_document_out_of_scope: 0,
+                tsconfig_unread: 0,
                 supertypes_unresolved: 0,
                 supertypes_unconfirmed: 0,
                 occurrences_unconverted: 0,
@@ -1632,7 +1663,14 @@ mod tests {
         let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::TypeScript],
+            &rb_scip::TsScopes::build([]),
+        );
         assert_eq!(
             joined.packages,
             [PackageUse {
@@ -1711,6 +1749,7 @@ mod tests {
             &files,
             &keys,
             java,
+            &rb_scip::TsScopes::build([]),
         );
         let replaced: Vec<(&str, &str)> = joined.keys[path]
             .iter()
@@ -1746,6 +1785,7 @@ mod tests {
             &files,
             &keys,
             java,
+            &rb_scip::TsScopes::build([]),
         );
         assert!(joined.keys.is_empty() && joined.documented.is_empty());
         assert_eq!(
@@ -1764,6 +1804,7 @@ mod tests {
             &files,
             &keys,
             java,
+            &rb_scip::TsScopes::build([]),
         );
         assert!(joined.keys.is_empty());
     }
@@ -1858,7 +1899,14 @@ mod tests {
             .iter()
             .map(|(p, f)| (p.as_str(), rb_syntax::symbol_keys(p, f)))
             .collect();
-        join(index, "", &by_path, &keys, &[language])
+        join(
+            index,
+            "",
+            &by_path,
+            &keys,
+            &[language],
+            &rb_scip::TsScopes::build([]),
+        )
     }
 
     /// The facts and the synthetic index of [`hierarchy_joined`], before the join.
@@ -2273,7 +2321,14 @@ mod tests {
         let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::TypeScript],
+            &rb_scip::TsScopes::build([]),
+        );
         let implements: Vec<String> = edge_lines(&joined)
             .into_iter()
             .filter(|l| l.contains(" Implements "))
@@ -2375,7 +2430,14 @@ mod tests {
             .expect("the constant body's method is a Tree-sitter definition");
         let files = BTreeMap::from([(path, (Language::Java, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([(path, heuristic.clone())]);
-        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::Java],
+            &rb_scip::TsScopes::build([]),
+        );
         assert!(
             !joined.keys[path].contains_key(&body),
             "the local definition keeps its heuristic key"
@@ -2429,7 +2491,14 @@ mod tests {
             .expect("the local class's method is a Tree-sitter definition");
         let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([(path, heuristic.clone())]);
-        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::TypeScript],
+            &rb_scip::TsScopes::build([]),
+        );
         assert!(
             edge_lines(&joined).contains(&format!("{} Calls {}", sym("run()."), heuristic[go])),
             "{:?}",
@@ -2487,7 +2556,14 @@ mod tests {
             ("a/A.java", rb_syntax::symbol_keys("a/A.java", &fa)),
             ("b/B.java", rb_syntax::symbol_keys("b/B.java", &fb)),
         ]);
-        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::Java],
+            &rb_scip::TsScopes::build([]),
+        );
         assert!(joined.edges.is_empty(), "{:?}", edge_lines(&joined));
         assert_eq!(joined.coverage.definitions_local, 1);
         assert_eq!(joined.coverage.references_local, 1);
@@ -2549,7 +2625,14 @@ mod tests {
         let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::TypeScript],
+            &rb_scip::TsScopes::build([]),
+        );
         assert_eq!(
             edge_lines(&joined)
                 .into_iter()
@@ -2614,7 +2697,14 @@ mod tests {
         let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::TypeScript],
+            &rb_scip::TsScopes::build([]),
+        );
         assert_eq!(joined.coverage.definitions_local, 4);
         assert_eq!(joined.coverage.relationships_dropped, 2);
         assert_eq!(joined.coverage.relationships_dropped_in_project, 2);
@@ -2670,7 +2760,14 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            join(&index, "", &files, &keys, &[Language::Java])
+            join(
+                &index,
+                "",
+                &files,
+                &keys,
+                &[Language::Java],
+                &rb_scip::TsScopes::build([]),
+            )
         };
         let joined = joined_with(vec![
             occ_at(raw(2, 13, 20), &sym(""), 1),
@@ -2869,14 +2966,28 @@ mod tests {
                     index.documents[0].rejected,
                     Some(rb_scip::Rejection::CommentTerminator)
                 );
-                let joined = join(&index, "", &files, &keys, &[language]);
+                let joined = join(
+                    &index,
+                    "",
+                    &files,
+                    &keys,
+                    &[language],
+                    &rb_scip::TsScopes::build([]),
+                );
                 assert!(joined.keys.is_empty() && joined.edges.is_empty(), "{path}");
                 assert_eq!(joined.coverage.documents_rejected, 1);
                 index.documents[0].rejected = None;
             } else {
                 assert_eq!(index.documents[0].rejected, None, "{path}");
             }
-            let joined = join(&index, "", &files, &keys, &[language]);
+            let joined = join(
+                &index,
+                "",
+                &files,
+                &keys,
+                &[language],
+                &rb_scip::TsScopes::build([]),
+            );
             // Every method keeps its own name in its key.
             for (i, d) in facts.definitions.iter().enumerate() {
                 let expected = match d.kind {
@@ -3023,7 +3134,14 @@ mod tests {
             let files = BTreeMap::from([("main.go", (Language::Go, &facts))]);
             let keys: BTreeMap<&str, Vec<String>> =
                 BTreeMap::from([("main.go", rb_syntax::symbol_keys("main.go", &facts))]);
-            let joined = join(&index, "", &files, &keys, &[Language::Go]);
+            let joined = join(
+                &index,
+                "",
+                &files,
+                &keys,
+                &[Language::Go],
+                &rb_scip::TsScopes::build([]),
+            );
             edge_lines(&joined)
                 .into_iter()
                 .filter(|l| l.contains(" Implements "))
@@ -3322,7 +3440,14 @@ mod tests {
         let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::TypeScript],
+            &rb_scip::TsScopes::build([]),
+        );
         assert!(joined.edges.is_empty());
         assert_eq!(
             joined.coverage,
@@ -3339,6 +3464,8 @@ mod tests {
                 references_unanchored: 0,
                 references_unmatched: 0,
                 files_without_document: 0,
+                files_without_document_out_of_scope: 0,
+                tsconfig_unread: 0,
                 supertypes_unresolved: 0,
                 supertypes_unconfirmed: 0,
                 occurrences_unconverted: 0,
@@ -3491,7 +3618,14 @@ mod tests {
         let files = BTreeMap::from([(path, (Language::Java, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys, &[Language::Java]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::Java],
+            &rb_scip::TsScopes::build([]),
+        );
         assert_eq!(joined.coverage.supertypes_unresolved, 1);
     }
 
@@ -3545,7 +3679,14 @@ mod tests {
         let files = BTreeMap::from([(path, (Language::TypeScript, &facts))]);
         let keys: BTreeMap<&str, Vec<String>> =
             BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
-        let joined = join(&index, "", &files, &keys, &[Language::TypeScript]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::TypeScript],
+            &rb_scip::TsScopes::build([]),
+        );
         assert_eq!(
             joined.keys[path],
             BTreeMap::from([(0, sym("f()."))]),
@@ -3571,7 +3712,14 @@ mod tests {
         // A document for a file we have no facts for, and an index with offset ranges.
         let mut idx = index(&facts);
         idx.documents[0].path = "src/Other.java".into();
-        let joined = join(&idx, "svc", &files, &keys, java);
+        let joined = join(
+            &idx,
+            "svc",
+            &files,
+            &keys,
+            java,
+            &rb_scip::TsScopes::build([]),
+        );
         assert!(joined.keys.is_empty() && joined.edges.is_empty());
         assert!(
             joined.documented.is_empty(),
@@ -3582,15 +3730,29 @@ mod tests {
         assert_eq!(joined.coverage.files_without_document, 1);
         assert_eq!(joined.coverage.definitions_total, 0);
         assert_eq!(
-            join(&idx, "svc", &files, &keys, &[Language::Python])
-                .coverage
-                .files_without_document,
+            join(
+                &idx,
+                "svc",
+                &files,
+                &keys,
+                &[Language::Python],
+                &rb_scip::TsScopes::build([])
+            )
+            .coverage
+            .files_without_document,
             0
         );
         assert_eq!(
-            join(&index(&facts), "svc", &files, &keys, java)
-                .coverage
-                .files_without_document,
+            join(
+                &index(&facts),
+                "svc",
+                &files,
+                &keys,
+                java,
+                &rb_scip::TsScopes::build([])
+            )
+            .coverage
+            .files_without_document,
             0
         );
         let mut shifted = index(&facts);
@@ -3600,13 +3762,57 @@ mod tests {
         // Every method's definition occurrence now lies inside the method, off its name: the
         // document disagrees with the syntax and the file is left to Tier B whole (contract M3b
         // amendment 64), counted as rejected and not as a file without a document.
-        let joined = join(&shifted, "svc", &files, &keys, java);
+        let joined = join(
+            &shifted,
+            "svc",
+            &files,
+            &keys,
+            java,
+            &rb_scip::TsScopes::build([]),
+        );
         assert!(joined.keys.is_empty() && joined.edges.is_empty());
         assert!(joined.documented.is_empty());
         assert_eq!(joined.coverage.definitions_total, 0);
         assert_eq!(joined.coverage.references_unmatched, 0);
         assert_eq!(joined.coverage.files_without_document, 0);
         assert_eq!(joined.coverage.documents_rejected, 1);
+    }
+
+    /// Contract M6e S10: `files_without_document` partitions into tsconfig-excluded files
+    /// without moving any edge; unread scopes fail open (nothing explained).
+    #[test]
+    fn files_without_documents_partition_by_tsconfig_scope() {
+        let facts_a = rb_syntax::extract(Language::TypeScript, b"export const a = 1;\n").unwrap();
+        let facts_b = rb_syntax::extract(Language::TypeScript, b"export const b = 2;\n").unwrap();
+        let files = BTreeMap::from([
+            ("src/a.ts", (Language::TypeScript, &facts_a)),
+            ("src/gen/b.ts", (Language::TypeScript, &facts_b)),
+        ]);
+        let keys: BTreeMap<&str, Vec<String>> = BTreeMap::from([
+            ("src/a.ts", rb_syntax::symbol_keys("src/a.ts", &facts_a)),
+            (
+                "src/gen/b.ts",
+                rb_syntax::symbol_keys("src/gen/b.ts", &facts_b),
+            ),
+        ]);
+        let index = rb_scip::ScipIndex::default();
+        let scopes = rb_scip::TsScopes::build([(
+            "tsconfig.json",
+            r#"{"include": ["src"], "exclude": ["src/gen"]}"#,
+        )]);
+        let joined = join(&index, "", &files, &keys, &[Language::TypeScript], &scopes);
+        assert_eq!(joined.coverage.files_without_document, 2);
+        assert_eq!(joined.coverage.files_without_document_out_of_scope, 1);
+        assert_eq!(joined.coverage.tsconfig_unread, 0);
+        assert!(joined.edges.is_empty());
+        // Unread scopes fail open: the total stands, nothing explained.
+        let wild = rb_scip::TsScopes::build([("tsconfig.json", r#"{"include": ["src/{a,b}"]}"#)]);
+        assert!(wild.unread > 0);
+        let joined = join(&index, "", &files, &keys, &[Language::TypeScript], &wild);
+        assert_eq!(joined.coverage.files_without_document, 2);
+        assert_eq!(joined.coverage.files_without_document_out_of_scope, 0);
+        assert!(joined.coverage.tsconfig_unread > 0);
+        assert!(joined.edges.is_empty());
     }
 
     /// The span Tree-sitter gives the `nth` match of `needle` in `src` (rows by `\n`, byte
@@ -3639,7 +3845,14 @@ mod tests {
             .iter()
             .map(|(path, f)| (*path, rb_syntax::symbol_keys(path, f)))
             .collect();
-        join(index, "", &files, &keys, &[language])
+        join(
+            index,
+            "",
+            &files,
+            &keys,
+            &[language],
+            &rb_scip::TsScopes::build([]),
+        )
     }
 
     const COMMENT_CR: &str = "package t;\n\npublic class CommentCr {\n\tint good() { // note\r return a(); } int evil() {\n\t\treturn b();\n\t}\n\tint a() { return 1; }\n\tint b() { return 2; }\n}\n";
@@ -6590,7 +6803,14 @@ mod tests {
             .keys()
             .map(|path| (*path, rb_syntax::symbol_keys(path, &facts)))
             .collect();
-        let joined = join(&index, "app", &files, &keys, &[Language::TypeScript]);
+        let joined = join(
+            &index,
+            "app",
+            &files,
+            &keys,
+            &[Language::TypeScript],
+            &rb_scip::TsScopes::build([]),
+        );
         assert_eq!(joined.coverage.documents_outside_root, 2);
         assert_eq!(
             joined.documented,

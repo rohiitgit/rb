@@ -1384,6 +1384,14 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
                 ", {} files without a document",
                 n("files_without_document")
             );
+            // Of those, the ones their tsconfig positively excludes (contract M6e S10).
+            if n("files_without_document_out_of_scope") > 0 {
+                let _ = write!(
+                    line,
+                    " ({} out of tsconfig scope)",
+                    n("files_without_document_out_of_scope")
+                );
+            }
         }
         // Declared supertypes the index has no type occurrence for: the `IMPLEMENTS` walk
         // stops at them.

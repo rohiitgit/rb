@@ -668,6 +668,9 @@ pub fn assemble(
     // `Service -DEPENDS_ON-> Package` (design §5.5): per service and package, the first site of
     // the service's files that names the package is the one evidence.
     let mut packages: BTreeMap<(NodeKey, String), (rb_scip::Package, Evidence)> = BTreeMap::new();
+    // `tsconfig*.json` scopes for partitioning `files_without_document` (contract M6e S10).
+    let ts_scopes =
+        rb_scip::TsScopes::build(content.manifests.iter().map(|(p, t)| (*p, t.as_str())));
     for project in &content.scip {
         let files: BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)> = content
             .facts
@@ -683,6 +686,7 @@ pub fn assemble(
                     &files,
                     &keys,
                     scip::indexed_languages(project.indexer),
+                    &ts_scopes,
                 );
                 for (path, routes) in &file_routes {
                     for r in &routes.routes {
@@ -987,11 +991,17 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
                 .collect::<serde_json::Map<String, Value>>(),
         });
         // Contract M6a D3: written only when non-zero, so a project without Lombok dumps as
-        // before M6a.
+        // before M6a. Contract M6e S10 likewise: a project with no out-of-scope file and no
+        // unread tsconfig pattern dumps as before M6e.
         for (key, n) in [
             ("lombok_removed", c.lombok_removed),
             ("documents_lombok", c.documents_lombok),
             ("documents_outside_root", c.documents_outside_root),
+            (
+                "files_without_document_out_of_scope",
+                c.files_without_document_out_of_scope,
+            ),
+            ("tsconfig_unread", c.tsconfig_unread),
         ] {
             if n > 0 {
                 detail["coverage"][key] = n.into();

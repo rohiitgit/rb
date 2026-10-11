@@ -298,7 +298,13 @@ pub(crate) fn run_projects(
             match rb_scip::decode(bytes, &source_of) {
                 Ok(mut index) => {
                     if job.fetch == rb_scip::jobs::Fetch::Maven {
-                        reject_for_source_encoding(&mut index, &under_root, read_blob, &source_of);
+                        reject_for_source_encoding(
+                            &mut index,
+                            &job.root,
+                            &under_root,
+                            read_blob,
+                            &source_of,
+                        );
                     }
                     project.index = Some(index);
                 }
@@ -488,34 +494,68 @@ fn yarn_file_targets(root: &str, manifest: &[u8]) -> Result<Vec<String>, String>
     Ok(targets.into_iter().collect())
 }
 
-/// Contract M3b amendment 64 (`source_encoding`): when a Maven build declares a source encoding
-/// other than UTF-8 in any of its poms, javac reads every non-ASCII file differently from
-/// Tree-sitter, so each such document is rejected. The decoder's reasons found earlier stay,
-/// except `encoding_ambiguous` (amendment 69): the pom's declaration is the more specific
-/// signal and is recorded instead.
+/// Contract M3b amendment 64 (`source_encoding`), generalised by M6e S11: a Maven document
+/// whose effective encoding ([`rb_scip::effective_encoding`]: its module's pom literals,
+/// `compilerArgs -encoding`, the build-wide `.mvn/maven.config` `-D`, explicit `-D` flags) is
+/// other than UTF-8 is read by javac differently from Tree-sitter, so each such non-ASCII
+/// document is rejected. The verdict is per document, so a mixed build rejects exactly its
+/// ISO-read files. The decoder's reasons found earlier stay, except `encoding_ambiguous`
+/// (amendment 69): the build's declaration is the more specific signal and is recorded
+/// instead.
 fn reject_for_source_encoding(
     index: &mut ScipIndex,
+    root: &str,
     under_root: &[(&str, &str)],
     read_blob: &dyn Fn(&str) -> anyhow::Result<Vec<u8>>,
     source_of: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) {
-    let poms: Vec<Vec<u8>> = under_root
+    let poms: Vec<(&str, Vec<u8>)> = under_root
         .iter()
         .filter(|(path, _)| path.rsplit('/').next() == Some("pom.xml"))
-        .filter_map(|(_, blob)| read_blob(blob).ok())
+        .filter_map(|(path, blob)| {
+            let bytes = read_blob(blob).ok()?;
+            strip_root(root, path).map(|rel| (rel, bytes))
+        })
         .collect();
-    let poms: Vec<&[u8]> = poms.iter().map(Vec::as_slice).collect();
-    if rb_scip::maven_source_encoding(&poms).is_none() {
-        return;
-    }
+    // The shallowest `.mvn/maven.config` under the root is the build's own (Maven reads the
+    // top-level one); anything deeper belongs to a nested build with its own job.
+    let mut configs: Vec<(&str, Vec<u8>)> = under_root
+        .iter()
+        .filter(|(path, _)| path.ends_with(".mvn/maven.config"))
+        .filter_map(|(path, blob)| {
+            let bytes = read_blob(blob).ok()?;
+            strip_root(root, path).map(|rel| (rel, bytes))
+        })
+        .collect();
+    configs.sort();
+    configs.sort_by_key(|(path, _)| path.matches('/').count());
+    let inputs = rb_scip::EncodingInputs {
+        poms: poms
+            .iter()
+            .map(|(path, bytes)| (*path, bytes.as_slice()))
+            .collect(),
+        maven_config: configs.first().map(|(_, bytes)| bytes.as_slice()),
+        // The pipeline's Maven invocations pass no encoding `-D` flag.
+        cli: &[],
+    };
     for doc in &mut index.documents {
         if matches!(
             doc.rejected,
             None | Some(rb_scip::Rejection::EncodingAmbiguous)
         ) && source_of(&doc.path).is_some_and(|text| !text.is_ascii())
+            && rb_scip::effective_encoding(&doc.path, &inputs).is_some()
         {
             doc.rejected = Some(rb_scip::Rejection::SourceEncoding);
         }
+    }
+}
+
+/// `path` below `root`, without the `root/` prefix (`""` is the repository root).
+fn strip_root<'a>(root: &str, path: &'a str) -> Option<&'a str> {
+    if root.is_empty() {
+        Some(path)
+    } else {
+        path.strip_prefix(root)?.strip_prefix('/')
     }
 }
 
@@ -962,6 +1002,96 @@ mod tests {
                     Some(rb_scip::Rejection::EncodingAmbiguous)
                 ),
                 ("src/Plain.java".to_owned(), None),
+            ]
+        );
+    }
+
+    /// Contract M6e S11: the verdict is per document — a UTF-8 root with an ISO-8859-1 module
+    /// rejects exactly the module's non-ASCII documents, and the module's UTF-8 declaration
+    /// likewise shields only its own files.
+    #[test]
+    fn a_mixed_encoding_build_rejects_exactly_its_iso_read_documents() {
+        use protobuf::Message as _;
+        let text = "class C { /* \u{e9} */ int aa() { return 0; } }\n";
+        let index = scip::types::Index {
+            metadata: Some(scip::types::Metadata {
+                tool_info: Some(scip::types::ToolInfo {
+                    name: "scip-java".into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            documents: ["src/A.java", "mod/B.java"]
+                .map(|path| scip::types::Document {
+                    relative_path: path.into(),
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+        let run = |root_pom: &str, mod_pom: &str| {
+            let tmp = tempfile::tempdir().unwrap();
+            let files = vec![
+                entry("svc/pom.xml", "1"),
+                entry("svc/mod/pom.xml", "2"),
+                entry("svc/src/A.java", "3"),
+                entry("svc/mod/B.java", "4"),
+            ];
+            let pom = |encoding: &str| {
+                format!(
+                    "<project><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>"
+                )
+            };
+            let sources: HashMap<String, Vec<u8>> = HashMap::from([
+                ("1".repeat(40), pom(root_pom).into_bytes()),
+                ("2".repeat(40), pom(mod_pom).into_bytes()),
+                ("3".repeat(40), text.into()),
+                ("4".repeat(40), text.into()),
+            ]);
+            let read = |blob: &str| Ok(sources[blob].clone());
+            let fake = Fake::new(index.clone(), false, true);
+            let opts = options(tmp.path(), &fake);
+            run_projects(
+                &files,
+                &read,
+                &Mode::Run(&fake),
+                &opts,
+                &mut MemCache::default(),
+            )
+            .unwrap()
+            .0[0]
+                .index
+                .as_ref()
+                .unwrap()
+                .documents
+                .iter()
+                .map(|d| (d.path.clone(), d.rejected))
+                .collect::<Vec<_>>()
+        };
+        // The module's ISO declaration rejects only the module's file.
+        assert_eq!(
+            run("UTF-8", "ISO-8859-1"),
+            [
+                (
+                    "mod/B.java".to_owned(),
+                    Some(rb_scip::Rejection::SourceEncoding)
+                ),
+                ("src/A.java".to_owned(), None),
+            ]
+        );
+        // And the root's ISO declaration rejects only the root's file.
+        assert_eq!(
+            run("ISO-8859-1", "UTF-8"),
+            [
+                ("mod/B.java".to_owned(), None),
+                (
+                    "src/A.java".to_owned(),
+                    Some(rb_scip::Rejection::SourceEncoding)
+                ),
             ]
         );
     }
