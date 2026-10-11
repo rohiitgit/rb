@@ -24,6 +24,10 @@ pub(crate) fn is_input(path: &str) -> bool {
             | "npm-shrinkwrap.json"
             | "go.mod"
             | "pom.xml"
+            // `yarn.lock`/`pnpm-lock.yaml` pin `npm/` versions (contract M6e
+            // S5); `npm-shrinkwrap.json` stays npm-read.
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
             // `build.gradle(.kts)` dependencies and `libs.versions.toml`
             // catalogs feed `maven/` package edges (contract M6e S3).
             | "build.gradle"
@@ -243,23 +247,298 @@ fn lock_version(
     None
 }
 
-/// The lockfile governing a service directory: the nearest directory, from the service's up to
-/// the root, holding `npm-shrinkwrap.json` or `package-lock.json` (`Ok`), or else `yarn.lock` or
-/// `pnpm-lock.yaml` (`Err`, not read).
-fn lockfile_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<Result<String, String>> {
+/// A yarn blockade: spec names to pinned versions (`npm:` alias specs key
+/// by their alias; the real name resolves through [`npm_alias`]).
+struct YarnLock {
+    versions: BTreeMap<String, Vec<String>>,
+}
+
+/// Whether yarn.lock text is Berry (`__metadata:` first) or v1.
+fn is_yarn_berry_text(text: &str) -> bool {
+    text.lines().any(|l| {
+        let l = l.trim();
+        !(l.is_empty() || l.starts_with('#')) && l == "__metadata:"
+    })
+}
+
+/// Split a yarn spec: `alias@npm:real@range` → (`alias`, its real package);
+/// anything else `name@range` → (`name`, none). `None` when malformed.
+fn yarn_spec(spec: &str) -> Option<(String, Option<String>)> {
+    if let Some((name, rest)) = spec.split_once("@npm:") {
+        if name.is_empty() || name.contains('@') {
+            return None;
+        }
+        let real = npm_alias(&format!("npm:{rest}")).map(str::to_owned)?;
+        return Some((name.to_owned(), Some(real)));
+    }
+    let (name, range) = if let Some(rest) = spec.strip_prefix('@') {
+        let at = rest.rfind('@')?;
+        (format!("@{}", &rest[..at]), Some(&rest[at + 1..]))
+    } else {
+        let (name, range) = spec.split_once('@')?;
+        (name.to_owned(), Some(range))
+    };
+    if name.is_empty() || range.is_some_and(str::is_empty) {
+        return None;
+    }
+    Some((name, None))
+}
+
+/// Record one pin, deduped.
+fn yarn_pin(versions: &mut BTreeMap<String, Vec<String>>, spec: &str, version: &str) {
+    let versions = versions.entry(spec.to_owned()).or_default();
+    if !versions.iter().any(|v| v == version) {
+        versions.push(version.to_owned());
+    }
+}
+
+/// A yarn.lock text (v1 blockade or Berry resolutions) to spec names and
+/// versions. Never fails: garbage yields no blocks, and every dep then
+/// reports a missing entry (safe `?`).
+fn yarn_lock(text: &str) -> YarnLock {
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if is_yarn_berry_text(text) {
+        // `"name@npm:^1":` entries pin through `resolution: "name@npm:1.2.3"`
+        // (or the `version:` field when no resolution is stated); anything
+        // but `@npm:` descriptors (workspace/file/link) stays out.
+        let mut key: Option<String> = None;
+        for line in text.lines() {
+            let body = line.trim();
+            if body.starts_with('"') && body.ends_with("\":") {
+                key = Some(body[1..body.len() - 2].to_owned());
+                continue;
+            }
+            let Some(k) = key.as_deref() else {
+                continue;
+            };
+            if body.is_empty() {
+                key = None;
+                continue;
+            }
+            if let Some(rest) = body.strip_prefix("resolution:") {
+                if let Some(r) = unquote(rest.trim())
+                    && let Some((real, v)) = r.split_once("@npm:")
+                    && !real.is_empty()
+                    && !v.is_empty()
+                    && let Some((spec, _)) = yarn_spec(k)
+                {
+                    yarn_pin(&mut versions, &spec, v);
+                }
+                continue;
+            }
+            if let Some(rest) = body.strip_prefix("version:") {
+                // Only `@npm:` descriptors pin (workspace/file/link keys
+                // never reach versions, even when they state one).
+                if !k.contains("@npm:") {
+                    continue;
+                }
+                if let Some(v) = unquote(rest.trim()) {
+                    let Some((spec, _)) = yarn_spec(k) else {
+                        continue;
+                    };
+                    yarn_pin(&mut versions, &spec, &v);
+                }
+            }
+        }
+        return YarnLock { versions };
+    }
+    // v1: unindented `"spec":` headers (comma-separated aliases share the
+    // block) with an indented `version "x"` line each.
+    let mut specs: Vec<String> = Vec::new();
+    let mut version: Option<String> = None;
+    let mut flush = |specs: &mut Vec<String>, version: &mut Option<String>| {
+        if let Some(v) = version.take() {
+            for spec in specs.drain(..) {
+                let Some((name, _)) = yarn_spec(&spec) else {
+                    continue;
+                };
+                yarn_pin(&mut versions, &name, &v);
+            }
+        } else {
+            specs.clear();
+        }
+    };
+    for line in text.lines() {
+        if line.starts_with([' ', '\t']) {
+            // v1 `version "x"` and Berry `version: x` (colon optional); first
+            // wins, so a nested dependency literally named `version` cannot
+            // override the block's pin.
+            if version.is_none()
+                && let Some(v) = line
+                    .trim()
+                    .strip_prefix("version")
+                    .and_then(|v| unquote(v.trim().trim_start_matches(':').trim()))
+            {
+                version = Some(v);
+            }
+            continue;
+        }
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            flush(&mut specs, &mut version);
+            continue;
+        }
+        if body.ends_with(':') {
+            // A new header closes the open block.
+            flush(&mut specs, &mut version);
+            let header = body.strip_suffix(':').unwrap_or_default().trim();
+            for part in header.split(',') {
+                specs.push(part.trim().trim_matches('"').to_owned());
+            }
+            continue;
+        }
+        flush(&mut specs, &mut version);
+    }
+    flush(&mut specs, &mut version);
+    YarnLock { versions }
+}
+
+/// A pnpm `packages:` map: package name to pinned versions. Only lockfile
+/// major 9 parses (pnpm 9/10); anything else, a missing `packages:` map or
+/// malformed YAML is unreadable, never inferred (contract M6e S5).
+fn pnpm_lock(text: &str) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut lines = text.lines().peekable();
+    // `lockfileVersion: '9.0'` (major 9, quoted or bare).
+    let mut major = None;
+    for line in lines.by_ref() {
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = body.strip_prefix("lockfileVersion:") else {
+            return Err("no lockfileVersion".to_owned());
+        };
+        let version = rest.trim().trim_matches('\'').trim_matches('"').to_owned();
+        major = Some(version.split('.').next().unwrap_or_default().to_owned());
+        break;
+    }
+    if major.as_deref() != Some("9") {
+        return Err(format!(
+            "unsupported lockfileVersion {}",
+            major.unwrap_or_default()
+        ));
+    }
+    // The `packages:` map: two-space `name@version:` keys (peer suffixes in
+    // parens stripped, scoped names kept). Indented content lines ignored.
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut in_packages = false;
+    let mut saw_packages = false;
+    for line in lines {
+        if line.starts_with([' ', '\t']) {
+            if !in_packages {
+                continue;
+            }
+            if line.starts_with("  ") && !line.starts_with("   ") {
+                let key = line.trim().strip_suffix(':').unwrap_or_default();
+                let key = key.trim_matches('\'').trim_matches('"');
+                let key = key.split('(').next().unwrap_or_default();
+                let Some((name, v)) = key.rsplit_once('@') else {
+                    continue;
+                };
+                if name.is_empty() || !v.starts_with(|c: char| c.is_ascii_digit()) {
+                    continue;
+                }
+                let versions = versions.entry(name.to_owned()).or_default();
+                if !versions.iter().any(|e| e == v) {
+                    versions.push(v.to_owned());
+                }
+            }
+            continue;
+        }
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        if body == "packages:" {
+            in_packages = true;
+            saw_packages = true;
+            continue;
+        }
+        // Any other top-level key ends the map.
+        if in_packages {
+            break;
+        }
+        // Lines before `packages:` that are not the version are ignored.
+    }
+    if !saw_packages {
+        return Err("no packages".to_owned());
+    }
+    Ok(versions)
+}
+/// A governing lockfile's kind: npm JSON, a yarn blockade, or a pnpm map.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LockKind {
+    Npm,
+    Yarn,
+    Pnpm,
+}
+
+/// A governing lockfile, parsed.
+enum Lock {
+    Npm {
+        path: String,
+        packages: serde_json::Map<String, Value>,
+        rel: String,
+    },
+    Yarn {
+        path: String,
+        lock: YarnLock,
+    },
+    Pnpm {
+        path: String,
+        versions: BTreeMap<String, Vec<String>>,
+    },
+}
+
+/// Resolve one dependency against pinned reads: the single read pins
+/// `Exact`, several distinct reads clear to `@?` (`Heuristic`, Maven
+/// duplicate rule), none reports a missing entry (`unresolved`).
+fn pin_reads(
+    reads: &[String],
+    from: &'static str,
+    m: &str,
+    dep: &Dep,
+    service: &str,
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> (String, &'static str, Certainty, Vec<String>) {
+    let mut distinct: Vec<String> = Vec::new();
+    for v in reads {
+        if !distinct.contains(v) {
+            distinct.push(v.clone());
+        }
+    }
+    match distinct.as_slice() {
+        [] => {
+            diagnostics.push(diagnostic(
+                "lockfile_missing_entry",
+                m,
+                Some(dep.span),
+                json!({ "service": service, "name": dep.name, "lockfile": path }),
+            ));
+            (String::new(), "unresolved", Certainty::Exact, Vec::new())
+        }
+        [v] => (v.clone(), from, Certainty::Exact, Vec::new()),
+        many => (String::new(), from, Certainty::Heuristic, many.to_vec()),
+    }
+}
+
+/// The lockfile governing a service directory: the nearest directory holding one, npm-first
+/// per directory (`package-lock.json` over `yarn.lock` over `pnpm-lock.yaml`, mirroring
+/// `node_lock`), then up toward the root.
+fn lockfile_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<(LockKind, String)> {
     let mut dir = Some(service_dir);
     while let Some(d) = dir {
         let prefix = dir_prefix(d);
-        for name in ["npm-shrinkwrap.json", "package-lock.json"] {
+        for (kind, name) in [
+            (LockKind::Npm, "npm-shrinkwrap.json"),
+            (LockKind::Npm, "package-lock.json"),
+            (LockKind::Yarn, "yarn.lock"),
+            (LockKind::Pnpm, "pnpm-lock.yaml"),
+        ] {
             let path = format!("{prefix}{name}");
             if paths.contains(path.as_str()) {
-                return Some(Ok(path));
-            }
-        }
-        for name in ["yarn.lock", "pnpm-lock.yaml"] {
-            let path = format!("{prefix}{name}");
-            if paths.contains(path.as_str()) {
-                return Some(Err(path));
+                return Some((kind, path));
             }
         }
         dir = parent_dir(d);
@@ -1599,7 +1878,7 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                     };
                     // The lockfile, read once per service.
                     let lock = match lockfile_for(&here, inputs.paths) {
-                        Some(Ok(path)) => {
+                        Some((LockKind::Npm, path)) => {
                             let lock_dir = path.rsplit_once('/').map_or("", |(d, _)| d);
                             let rel = here
                                 .strip_prefix(lock_dir)
@@ -1610,7 +1889,11 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                     // A lockfile above the service governs it only as a
                                     // workspace it lists.
                                     if rel.is_empty() || packages.contains_key(rel) {
-                                        Some((path.clone(), packages, rel.to_owned()))
+                                        Some(Lock::Npm {
+                                            path: path.clone(),
+                                            packages,
+                                            rel: rel.to_owned(),
+                                        })
                                     } else {
                                         None
                                     }
@@ -1627,14 +1910,29 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                 None => None,
                             }
                         }
-                        Some(Err(path)) => {
-                            diagnostics.push(diagnostic(
-                                "lockfile_unread",
-                                &path,
-                                None,
-                                json!({ "service": service }),
-                            ));
-                            None
+                        Some((LockKind::Yarn, path)) => {
+                            inputs.texts.get(path.as_str()).map(|text| Lock::Yarn {
+                                path: path.clone(),
+                                lock: yarn_lock(text),
+                            })
+                        }
+                        Some((LockKind::Pnpm, path)) => {
+                            match inputs.texts.get(path.as_str()).map(|t| pnpm_lock(t)) {
+                                Some(Ok(versions)) => Some(Lock::Pnpm {
+                                    path: path.clone(),
+                                    versions,
+                                }),
+                                Some(Err(reason)) => {
+                                    diagnostics.push(diagnostic(
+                                        "lockfile_unreadable",
+                                        &path,
+                                        None,
+                                        json!({ "service": service, "reason": reason }),
+                                    ));
+                                    None
+                                }
+                                None => None,
+                            }
                         }
                         None => None,
                     };
@@ -1669,28 +1967,60 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             continue;
                         }
                         let real = aliased.map(str::to_owned);
-                        let (version, from) = match &lock {
-                            Some((path, packages, rel)) => {
-                                match lock_version(packages, rel, &dep.name) {
-                                    Some(v) => (v, "lockfile"),
-                                    None => {
-                                        diagnostics.push(diagnostic(
+                        let (version, from, certainty, conflict) = match &lock {
+                            Some(Lock::Npm {
+                                path,
+                                packages,
+                                rel,
+                            }) => match lock_version(packages, rel, &dep.name) {
+                                Some(v) => (v, "lockfile", Certainty::Exact, Vec::new()),
+                                None => {
+                                    diagnostics.push(diagnostic(
                                             "lockfile_missing_entry",
                                             m,
                                             Some(dep.span),
                                             json!({ "service": service, "name": dep.name, "lockfile": path }),
                                         ));
-                                        (String::new(), "unresolved")
-                                    }
+                                    (String::new(), "unresolved", Certainty::Exact, Vec::new())
                                 }
+                            },
+                            Some(Lock::Yarn { path, lock }) => pin_reads(
+                                lock.versions.get(&dep.name).map_or(&[], Vec::as_slice),
+                                "yarn_lock",
+                                m,
+                                &dep,
+                                service,
+                                path,
+                                &mut diagnostics,
+                            ),
+                            Some(Lock::Pnpm { path, versions }) => {
+                                let key = real.as_deref().unwrap_or(&dep.name);
+                                pin_reads(
+                                    versions.get(key).map_or(&[], Vec::as_slice),
+                                    "pnpm_lock",
+                                    m,
+                                    &dep,
+                                    service,
+                                    path,
+                                    &mut diagnostics,
+                                )
                             }
-                            None => (String::new(), "unresolved"),
+                            None => (String::new(), "unresolved", Certainty::Exact, Vec::new()),
                         };
                         let alias = if real.is_some() {
                             dep.name.as_str()
                         } else {
                             ""
                         };
+                        let mut attrs = attrs(&[
+                            ("alias", alias),
+                            ("declared", &dep.declared),
+                            ("scope", dep.scope),
+                            ("version_from", from),
+                        ]);
+                        if !conflict.is_empty() {
+                            attrs.insert("versions".into(), json!(conflict));
+                        }
                         edges.push(ManifestEdge {
                             service: service.to_owned(),
                             target: Target::Package(Package {
@@ -1698,13 +2028,8 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                 name: real.unwrap_or_else(|| dep.name.clone()),
                                 version,
                             }),
-                            certainty: Certainty::Exact,
-                            attrs: attrs(&[
-                                ("alias", alias),
-                                ("declared", &dep.declared),
-                                ("scope", dep.scope),
-                                ("version_from", from),
-                            ]),
+                            certainty,
+                            attrs,
                             evidence: evidence(dep.span),
                         });
                     }
@@ -2106,6 +2431,134 @@ mod tests {
         assert!(!is_input("svc/lombok.config.bak"));
     }
 
+    /// Contract M6e S5: `yarn.lock` and `pnpm-lock.yaml` reach the manifest
+    /// readers that feed `npm/` package edges.
+    #[test]
+    fn yarn_and_pnpm_lockfiles_are_manifest_inputs() {
+        assert!(is_input("svc/yarn.lock"));
+        assert!(is_input("svc/pnpm-lock.yaml"));
+        assert!(is_input("yarn.lock"));
+        assert!(!is_input("svc/yarn.lock.bak"));
+    }
+
+    /// Contract M6e S5: yarn v1 blockade — multi-header blocks share one
+    /// version, quoted scoped headers parse, `npm:` alias specs resolve to
+    /// the real package, version-less blocks are skipped, comments ignored.
+    #[test]
+    fn yarn_v1_blocks_versions_and_aliases() {
+        let lock = yarn_lock(
+            "# yarn lockfile v1\n\n\"@scope/name@^1.0.0\", \"@scope/name@~1.0.0\":\n  version \"1.2.3\"\n  resolved \"https://registry.yarnpkg.com/@scope/name/-/name-1.2.3.tgz\"\n\nbare@^2:\n  version \"2.0.0\"\n\n\"alias@npm:real@^1\":\n  version \"1.0.1\"\n\nnoversion@^1:\n  resolved \"https://example.com/x.tgz\"\n",
+        );
+        assert_eq!(lock.versions.get("bare"), Some(&vec!["2.0.0".to_owned()]));
+        assert_eq!(lock.versions.get("alias"), Some(&vec!["1.0.1".to_owned()]));
+        assert!(!lock.versions.contains_key("noversion"));
+        // Two majors for one name both survive for the duplicate rule.
+        let lock = yarn_lock("a@^1:\n  version \"1.0.0\"\n\na@^2:\n  version \"2.0.0\"\n");
+        assert_eq!(
+            lock.versions.get("a"),
+            Some(&vec!["1.0.0".to_owned(), "2.0.0".to_owned()])
+        );
+    }
+
+    /// Contract M6e S5: Berry lockfiles gate on `__metadata` and pin through
+    /// `resolution:`; non-`npm:` descriptors (workspace/file/link) stay out.
+    #[test]
+    fn yarn_berry_entries_pin_through_resolutions() {
+        let lock = yarn_lock(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"name@npm:^1.0.0\":\n  version: 1.2.3\n  resolution: \"name@npm:1.2.3\"\n  checksum: abc\n\n\"alias@npm:real@^1\":\n  version: 1.0.1\n  resolution: \"real@npm:1.0.1\"\n\n\"local@workspace:.\":\n  version: 0.0.0-use.local\n  resolution: \"local@workspace:.\"\n",
+        );
+        assert_eq!(lock.versions.get("name"), Some(&vec!["1.2.3".to_owned()]));
+        assert_eq!(lock.versions.get("alias"), Some(&vec!["1.0.1".to_owned()]));
+        assert!(!lock.versions.contains_key("local"));
+    }
+
+    /// Contract M6e S5: pnpm v9 `packages:` keys pin versions (peer suffixes
+    /// stripped, scoped names kept); other majors and missing `packages:`
+    /// are unreadable, never inferred.
+    #[test]
+    fn pnpm_packages_peers_and_major_gate() {
+        let versions = pnpm_lock(
+            "lockfileVersion: '9.0'\npackages:\n  foo@1.0.0:\n    resolution: {integrity: sha512-x}\n  bar@2.0.0(bar@3.0.0):\n    resolution: {integrity: sha512-y}\n  '@scope/baz@4.1.0':\n    resolution: {integrity: sha512-z}\n",
+        )
+        .unwrap();
+        assert_eq!(versions.get("foo"), Some(&vec!["1.0.0".to_owned()]));
+        assert_eq!(versions.get("bar"), Some(&vec!["2.0.0".to_owned()]));
+        assert_eq!(versions.get("@scope/baz"), Some(&vec!["4.1.0".to_owned()]));
+        assert!(pnpm_lock("lockfileVersion: '6.0'\npackages:\n  foo@1.0.0:\n").is_err());
+        assert!(pnpm_lock("lockfileVersion: '9.0'\n").is_err());
+        assert!(pnpm_lock("not: [yaml").is_err());
+    }
+
+    /// Contract M6e S5, edge level: yarn/pnpm locks govern by nearness with
+    /// npm-first ties; pins are `Exact` with per-format `version_from`;
+    /// missing entries and multi-major duplicates resolve safe.
+    #[test]
+    fn yarn_and_pnpm_govern_pins_and_duplicates() {
+        let projects = [
+            project("y", &["y/package.json"]),
+            project("p", &["p/package.json"]),
+            project("n", &["n/package.json"]),
+        ];
+        let manifest = r#"{ "dependencies": { "a": "^1", "b": "^2", "c": "^1", "d": "^1", "e": "npm:real@^1" } }"#;
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("y/package.json", manifest),
+                (
+                    "y/yarn.lock",
+                    "a@^1:\n  version \"1.0.0\"\n\nb@^2:\n  version \"2.0.0\"\n\nb@^3:\n  version \"3.0.0\"\n\n\"e@npm:real@^1\":\n  version \"5.0.0\"\n",
+                ),
+                ("p/package.json", manifest),
+                (
+                    "p/pnpm-lock.yaml",
+                    "lockfileVersion: '9.0'\npackages:\n  a@1.0.0:\n  c@3.0.0:\n  real@5.0.0:\n",
+                ),
+                ("n/package.json", manifest),
+                (
+                    "n/package-lock.json",
+                    r#"{ "lockfileVersion": 3, "packages": {} }"#,
+                ),
+                ("n/yarn.lock", "a@^1:\n  version \"9.9.9\"\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"y -> npm/a@1.0.0 [exact] {"declared":"^1","scope":"runtime","version_from":"yarn_lock"}"#,
+                r#"y -> npm/b@? [heuristic] {"declared":"^2","scope":"runtime","version_from":"yarn_lock","versions":["2.0.0","3.0.0"]}"#,
+                r#"y -> npm/c@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"y -> npm/d@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"y -> npm/real@5.0.0 [exact] {"alias":"e","declared":"npm:real@^1","scope":"runtime","version_from":"yarn_lock"}"#,
+                r#"p -> npm/a@1.0.0 [exact] {"declared":"^1","scope":"runtime","version_from":"pnpm_lock"}"#,
+                r#"p -> npm/b@? [exact] {"declared":"^2","scope":"runtime","version_from":"unresolved"}"#,
+                r#"p -> npm/c@3.0.0 [exact] {"declared":"^1","scope":"runtime","version_from":"pnpm_lock"}"#,
+                r#"p -> npm/d@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"p -> npm/real@5.0.0 [exact] {"alias":"e","declared":"npm:real@^1","scope":"runtime","version_from":"pnpm_lock"}"#,
+                r#"n -> npm/a@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"n -> npm/b@? [exact] {"declared":"^2","scope":"runtime","version_from":"unresolved"}"#,
+                r#"n -> npm/c@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"n -> npm/d@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"n -> npm/real@? [exact] {"alias":"e","declared":"npm:real@^1","scope":"runtime","version_from":"unresolved"}"#,
+            ]
+        );
+        let mut diagnostics = diagnostics;
+        diagnostics.sort();
+        assert_eq!(
+            diagnostics,
+            [
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry p/package.json",
+                "lockfile_missing_entry p/package.json",
+                "lockfile_missing_entry y/package.json",
+                "lockfile_missing_entry y/package.json",
+            ]
+        );
+    }
+
     /// Contract M6e S3: Gradle build files and version catalogs reach the
     /// manifest readers that feed `maven/` package edges.
     #[test]
@@ -2378,16 +2831,10 @@ mod tests {
             edges,
             [
                 r#"a -> npm/express@? [exact] {"declared":"^4","scope":"runtime","version_from":"unresolved"}"#,
-                r#"b -> npm/express@? [exact] {"declared":"^4","scope":"runtime","version_from":"unresolved"}"#,
+                r#"b -> npm/express@4.19.2 [exact] {"declared":"^4","scope":"runtime","version_from":"yarn_lock"}"#,
             ]
         );
-        assert_eq!(
-            diagnostics,
-            [
-                "lockfile_unreadable a/package-lock.json",
-                "lockfile_unread b/yarn.lock"
-            ]
-        );
+        assert_eq!(diagnostics, ["lockfile_unreadable a/package-lock.json"]);
         let (_, diagnostics) = run(
             &projects[..1],
             &[
