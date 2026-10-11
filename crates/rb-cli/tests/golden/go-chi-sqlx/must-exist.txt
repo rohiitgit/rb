@@ -1,0 +1,19 @@
+# Precision guards for the go-chi-sqlx fixture (contract M6d S9), checked against the SCIP dump.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# Implicit interface satisfaction lands on the interface type (the spec
+# method has no node); call dispatch through the interface stays unmatched
+# (RTA through Go interfaces is future work, recorded as residue).
+CALLS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/payInvoice(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Checkout(). [exact]
+CALLS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/main(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Checkout(). [exact]
+CALLS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Card#Pay(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/charge(). [exact]
+CALLS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/health(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/lookupInvoice(). [exact]
+IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Card#Pay(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Payer# [exact]
+IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Card# -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Payer# [exact]
+IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Cash#Pay(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Payer# [exact]
+IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Cash# -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Payer# [exact]
+QUERIES scip-go gomod github.com/acme/shop . `github.com/acme/shop`/lookupInvoice(). -> public.invoices [exact] {"ops": ["read"]}
+QUERIES scip-go gomod github.com/acme/shop . `github.com/acme/shop`/recordPayment(). -> public.payments [exact] {"ops": ["insert"]}
+EXPOSES . -> HTTP POST /billing/pay @. [exact]
+HANDLED_BY HTTP POST /billing/pay @. -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/payInvoice(). [exact]
+DEPENDS_ON . -> go/github.com/go-chi/chi/v5@v5.3.2 [exact]
+DEPENDS_ON . -> go/github.com/go-chi/chi/v5@v5.3.2 [synthetic] {"version_from": "go_mod"}

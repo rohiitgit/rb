@@ -1,0 +1,15 @@
+# Precision guards for the python-fastapi-sqlalchemy fixture (contract M6d
+# S9), checked against the SCIP dump. Intra-repo imports resolve exact
+# (relative and absolute); lockfile pins are exact with their source.
+CALLS scip-python python shop 0.1.0 `app.main`/list_users(). -> scip-python python shop 0.1.0 `app.store`/active_users(). [exact]
+CALLS scip-python python shop 0.1.0 `app.main`/create_order(). -> scip-python python shop 0.1.0 `app.store`/order_total(). [exact]
+IMPLEMENTS scip-python python shop 0.1.0 `app.models`/User# -> scip-python python shop 0.1.0 `app.models`/Base# [exact]
+IMPLEMENTS scip-python python shop 0.1.0 `app.models`/Order# -> scip-python python shop 0.1.0 `app.models`/Base# [exact]
+QUERIES scip-python python shop 0.1.0 `app.store`/user_emails(). -> public.users [exact] {"ops": ["read"]}
+QUERIES scip-python python shop 0.1.0 `app.store`/order_ids(). -> public.orders [exact] {"ops": ["read"]}
+DEPENDS_ON services/shop -> py/fastapi@0.143.0 [exact] {"version_from": "uv_lock"}
+DEPENDS_ON client -> py/requests@? [exact] {"version_from": "unresolved"}
+EXPOSES services/shop -> HTTP GET /api/users @services/shop [exact]
+HANDLED_BY HTTP POST /api/orders @services/shop -> scip-python python shop 0.1.0 `app.main`/create_order(). [exact]
+CONSUMES scip-python python client 0.1.0 calls/sync(). -> HTTP GET /api/users @services/shop [synthetic] {"client": "fetch", "host": "shop", "match": "exact"}
+CONSUMES scip-python python client 0.1.0 calls/sync(). -> HTTP POST /api/orders @services/shop [heuristic] {"client": "fetch"}

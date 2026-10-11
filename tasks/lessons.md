@@ -409,3 +409,7 @@
 ## 2026-10-11: from-imported names need provenance, not just membership
 - **Mistake (caught by test):** the first S7 draft stored from-imported verbs as bare locals and checked the LOCAL against the verb list — `get as hget` never matched. Aliased imports must carry (original, local) through every allow-list check.
 - **Rule:** any allow-list keyed on imported names maps local → original and decides on the original; add an aliased-import case to every such test from the start.
+
+## 2026-10-11: never `git checkout -- <file>` to undo a mutant (or anything)
+- **Mistake (recovered, costly):** a manual `git checkout -- crates/…/scip.rs` to undo a mutant reverted the entire S9b implementation + tests (they were uncommitted); rewritten from context and re-verified (mutants re-killed, suites re-run).
+- **Rule:** mutant scripts restore bytes in `finally` (already the rule) — and for ANY manual undo use `git diff` to inspect first, `git stash`/`edit` to revert precisely; `checkout -- <file>` is banned while uncommitted work exists. (Extends the M3b `git checkout` lesson and the amendment-append rule: destructive commands need a pre-check.)

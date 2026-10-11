@@ -3175,6 +3175,170 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
     assert!(!log.contains("CONNECT 192.168.65.254"), "{log}");
 }
 
+/// Docker answering and the local scip-go image built (docker/scip-go/README.md); the
+/// reason to skip otherwise. The image is never built implicitly.
+fn scip_go_available() -> Result<(), String> {
+    use rb_scip::Runner as _;
+    rb_scip::docker_available()?;
+    let image = rb_scip::jobs::SCIP_GO_IMAGE;
+    rb_scip::DockerRunner::default()
+        .image_id(image)
+        .map(|_| ())
+        .ok_or_else(|| format!("{image} is not built; see docker/scip-go/README.md"))
+}
+
+/// Contract M6d S9: the chi/SQL fixture. Nested `Route` prefixes, `Group`,
+/// `With` chains and verbs become endpoints; `database/sql` sites become
+/// `QUERIES`; the two implicit `Payer` implementations get `IMPLEMENTS`
+/// edges (method and type) without any declared heritage (guards); call
+/// dispatch through the interface stays unmatched (RTA through Go interfaces
+/// is future work, recorded as residue). The `go.sum`-pinned fetch makes the
+/// job reproducible.
+#[test]
+fn scip_go_chi_sqlx() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_go_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "go-chi-sqlx";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipgo_{}", std::process::id());
+    let other = format!("t_scipgo2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!("scip_go_chi_sqlx: first index {:.1?}", started.elapsed());
+    assert!(
+        first.contains("scip: . scip-go ok") && !first.contains("unpinned"),
+        "{first}"
+    );
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!("scip_go_chi_sqlx guard failures:\n{}", failures.join("\n"));
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-checkout.txt",
+        &rb(&url, &["callers", "Checkout", "--repo", &name]),
+    );
+    let package = "scip-go gomod github.com/acme/shop . ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "", ".") >= 7,
+        "{dump}"
+    );
+    // The manifest and SCIP chi edges share one `go/` node (contract M6d S5).
+    assert_eq!(
+        dump.lines()
+            .filter(|l| l.contains("[\"N\",\"package\",\"go/github.com/go-chi/chi/v5@v5.3.2\""))
+            .count(),
+        1,
+        "{dump}"
+    );
+    assert!(!dump.contains("gomod/github.com/go-chi"), "{dump}");
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("scip: . scip-go ok (cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        fresh.contains("scip: . scip-go ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
+/// Contract M6d S9: the FastAPI/SQLAlchemy fixture. Decorators, prefixes
+/// and includes become endpoints; `__tablename__` models and f-string/literal
+/// SQL become `QUERIES`; intra-repo imports resolve exact both ways;
+/// `uv.lock` pins versions while the non-member client service stays `?`;
+/// session/plain `requests`/`httpx` sites stitch cross-service (guards).
+#[test]
+fn scip_python_fastapi_sqlalchemy() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = rb_scip::docker_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "python-fastapi-sqlalchemy";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scippy_{}", std::process::id());
+    let other = format!("t_scippy2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!(
+        "scip_python_fastapi_sqlalchemy: first index {:.1?}",
+        started.elapsed()
+    );
+    for line in [
+        "scip: client scip-python ok",
+        "scip: services/shop scip-python ok",
+    ] {
+        assert!(first.contains(line), "{line} in {first}");
+    }
+    assert!(first.contains("unpinned"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!(
+            "scip_python_fastapi_sqlalchemy guard failures:\n{}",
+            failures.join("\n")
+        );
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-active-users.txt",
+        &rb(&url, &["callers", "active_users", "--repo", &name]),
+    );
+    let package = "scip-python python shop 0.1.0 ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "services/shop/", "services/shop") >= 2,
+        "{dump}"
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(
+        second.contains("scip: services/shop scip-python ok (cached"),
+        "{second}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        fresh.contains("scip: services/shop scip-python ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
 /// Docker answering and the local scip-java image built (docker/scip-java/README.md); the
 /// reason to skip otherwise. The image is never built implicitly.
 fn scip_java_available() -> Result<(), String> {

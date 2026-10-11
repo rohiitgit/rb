@@ -1,0 +1,4 @@
+callers of active_users().  services/shop/app/store.py:4  [shop]
+precision=cha
+  list_users().  services/shop/app/main.py:11  [shop]  exact  (entry: endpoint GET /api/users)
+certainty: exact 1

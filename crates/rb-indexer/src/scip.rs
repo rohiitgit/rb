@@ -410,8 +410,16 @@ pub(crate) fn join(
     let mut types_by_symbol: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     let mut supertypes: BTreeMap<(usize, usize), Vec<String>> = BTreeMap::new();
     let mut related: BTreeMap<(usize, usize), BTreeSet<&str>> = BTreeMap::new();
+    // Every symbol's SCIP kind (`Interface` tells an implicit satisfaction
+    // from an override: contract M6d S9).
+    let mut symbol_kinds: BTreeMap<&str, &str> = BTreeMap::new();
     for (di, (path, doc, facts, by_span)) in docs.iter().enumerate() {
         out.coverage.occurrences_unconverted += doc.unconverted;
+        for s in &doc.symbols {
+            symbol_kinds
+                .entry(s.symbol.as_str())
+                .or_insert(s.kind.as_str());
+        }
         let replaced = out.keys.get(path);
         let java = files[path.as_str()].0 == Language::Java;
         for (i, d) in facts.definitions.iter().enumerate() {
@@ -607,7 +615,22 @@ pub(crate) fn join(
             let holder = (di, type_holder(facts, i));
             for rel in implementations {
                 let target_local = rel.symbol.starts_with("local ");
-                let target = if target_local {
+                // An origin-attested implementation of an interface needs no
+                // declared heritage (contract M6d S9): the holder declares no
+                // supertypes (Go's implicit idiom — nothing to walk), the
+                // target type is an interface by the indexer's own kinds, and
+                // it is anchored. The spec method itself has no node, so the
+                // edge lands on the interface. Anything else takes the walk
+                // below (a spec-to-impl twin lands on a class there and is
+                // rejected as today).
+                let type_symbol = rb_scip::type_symbol_of(&rel.symbol);
+                let bypass = type_symbol.as_deref().is_some_and(|ts| {
+                    symbol_kinds.get(ts).is_some_and(|k| *k == "Interface")
+                        && supertypes.get(&holder).is_some_and(Vec::is_empty)
+                });
+                let target = if bypass {
+                    type_symbol.filter(|ts| nodes.contains(ts.as_str()))
+                } else if target_local {
                     locals[di]
                         .get(rel.symbol.as_str())
                         .map(|&j| heuristic[j].clone())
@@ -625,33 +648,37 @@ pub(crate) fn join(
                 // global` is the forward side and `global → local` its reverse twin; between two
                 // locals the syntax cannot be consulted (no type symbol), so the link is dropped
                 // (amendment 54). Between globals the source's declared supertypes decide.
-                let supported = match (source_local, target_local) {
-                    (true, false) => true,
-                    (false, true) => false,
-                    (true, true) => {
-                        dropped(rel);
-                        continue;
+                let supported = if bypass {
+                    true
+                } else {
+                    match (source_local, target_local) {
+                        (true, false) => true,
+                        (false, true) => false,
+                        (true, true) => {
+                            dropped(rel);
+                            continue;
+                        }
+                        (false, false) => rb_scip::type_symbol_of(&rel.symbol)
+                            .and_then(|type_symbol| types_by_symbol.get(type_symbol.as_str()))
+                            .is_some_and(|targets| {
+                                // A holder that is no type (a top-level function) relates to nothing.
+                                related.get(&holder).is_some_and(|related| {
+                                    // Contract M6a D4: a scip-typescript interface relates its type
+                                    // to nothing, so its declared clauses alone decide the
+                                    // direction of a link its method's own symbol information
+                                    // carries (sub → super only, measured in P1b).
+                                    let confirmed_by =
+                                        (!typescript_interface(holder.1)).then_some(related);
+                                    reaches_supertype(
+                                        &supertypes,
+                                        &types_by_symbol,
+                                        holder,
+                                        targets,
+                                        confirmed_by,
+                                    )
+                                })
+                            }),
                     }
-                    (false, false) => rb_scip::type_symbol_of(&rel.symbol)
-                        .and_then(|type_symbol| types_by_symbol.get(type_symbol.as_str()))
-                        .is_some_and(|targets| {
-                            // A holder that is no type (a top-level function) relates to nothing.
-                            related.get(&holder).is_some_and(|related| {
-                                // Contract M6a D4: a scip-typescript interface relates its type
-                                // to nothing, so its declared clauses alone decide the
-                                // direction of a link its method's own symbol information
-                                // carries (sub → super only, measured in P1b).
-                                let confirmed_by =
-                                    (!typescript_interface(holder.1)).then_some(related);
-                                reaches_supertype(
-                                    &supertypes,
-                                    &types_by_symbol,
-                                    holder,
-                                    targets,
-                                    confirmed_by,
-                                )
-                            })
-                        }),
                 };
                 if supported {
                     implements.push(ScipEdge {
@@ -2950,6 +2977,131 @@ mod tests {
                 "b/Common# Implements a/Shape#",
             ]
         );
+    }
+
+    /// Contract M6d S9: Go's implicit satisfaction needs no declared
+    /// heritage — an origin-attested implementation of an interface lands on
+    /// the interface type (the spec method has no node), measured on scip-go
+    /// (is_implementation on the method only, kinds as it reports them). An
+    /// attested link at a struct needs the walk.
+    #[test]
+    fn go_implicit_satisfaction_needs_no_declared_heritage() {
+        let src = "package main\ntype Payer interface {\n\tPay(amount int) string\n}\ntype Card struct{}\nfunc (c Card) Pay(amount int) string {\n\treturn \"\"\n}\ntype Base struct{}\n";
+        let facts = rb_syntax::extract(Language::Go, src.as_bytes()).unwrap();
+        let at = |token: &str, n: usize| {
+            let start = src.match_indices(token).nth(n).unwrap().0;
+            let pos = |byte: usize| {
+                let before = &src[..byte];
+                let row = before.matches('\n').count() as i32;
+                let col = (byte - before.rfind('\n').map_or(0, |i| i + 1)) as i32;
+                (row, col)
+            };
+            let (a, b) = (pos(start), pos(start + token.len()));
+            [a.0, a.1, b.0, b.1]
+        };
+        let sym = |s: &str| format!("scip-go gomod example.com/shop . {s}");
+        let def = |span: Span, symbol: String| Occurrence {
+            span,
+            symbol,
+            roles: 1,
+            enclosing: None,
+        };
+        let go = |symbols: Vec<SymbolInfo>| {
+            let index = ScipIndex {
+                documents: vec![Document {
+                    path: "main.go".into(),
+                    occurrences: vec![
+                        def(at("Payer", 0), sym("`example.com/shop`/Payer#")),
+                        def(at("Base", 0), sym("`example.com/shop`/Base#")),
+                        def(at("Pay", 2), sym("`example.com/shop`/Card#Pay().")),
+                    ],
+                    symbols,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let files = BTreeMap::from([("main.go", (Language::Go, &facts))]);
+            let keys: BTreeMap<&str, Vec<String>> =
+                BTreeMap::from([("main.go", rb_syntax::symbol_keys("main.go", &facts))]);
+            let joined = join(&index, "", &files, &keys, &[Language::Go]);
+            edge_lines(&joined)
+                .into_iter()
+                .filter(|l| l.contains(" Implements "))
+                .collect::<Vec<_>>()
+        };
+        let pay = sym("`example.com/shop`/Card#Pay().");
+        let spec = sym("`example.com/shop`/Payer#Pay.");
+        let iface = sym("`example.com/shop`/Payer#");
+        assert_eq!(
+            go(vec![
+                SymbolInfo {
+                    symbol: pay.clone(),
+                    kind: "Method".into(),
+                    relationships: vec![Relationship {
+                        symbol: spec,
+                        is_implementation: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                SymbolInfo {
+                    symbol: iface.clone(),
+                    kind: "Interface".into(),
+                    ..Default::default()
+                },
+            ]),
+            [format!("{pay} Implements {iface}")],
+        );
+        // The same attestation at a struct needs the walk: no edge (the
+        // holder declares no supertypes, so the walk fails too — this pins
+        // the kind gate, not the walk).
+        assert!(
+            go(vec![
+                SymbolInfo {
+                    symbol: pay,
+                    kind: "Method".into(),
+                    relationships: vec![Relationship {
+                        symbol: sym("`example.com/shop`/Base#M."),
+                        is_implementation: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                SymbolInfo {
+                    symbol: sym("`example.com/shop`/Base#"),
+                    kind: "Struct".into(),
+                    ..Default::default()
+                },
+            ])
+            .is_empty()
+        );
+    }
+
+    /// The heritage check is hostile-input defense: a holder that declares an
+    /// unrelated supertype with an attested link at an interface takes no
+    /// bypass (no compiler attests this; accepting would be a false edge).
+    /// The twin direction never lands on an interface either.
+    #[test]
+    fn hostile_heritage_takes_no_bypass() {
+        let src = "package b;\ninterface I { void m(); }\nclass B {}\nclass C extends B { public void m() {} }\n";
+        let rels = [("b/C#m().", "b/I#m()."), ("b/I#m().", "b/C#m().")];
+        let (facts, mut index) = hierarchy_index(Language::Java, &[("b/C.java", src)], &rels, &[]);
+        for doc in &mut index.documents {
+            for s in &mut doc.symbols {
+                if s.symbol.ends_with("b/I#") {
+                    s.kind = "Interface".to_owned();
+                }
+            }
+            // The interface type carries symbol information, as every
+            // documented type does in a real index.
+            doc.symbols.push(SymbolInfo {
+                symbol: "scip-java maven . . b/I#".to_owned(),
+                kind: "Interface".to_owned(),
+                ..Default::default()
+            });
+        }
+        let joined = join_facts(Language::Java, &facts, &index);
+        assert!(implements_lines(Language::Java, &joined).is_empty());
     }
 
     /// Contract M3b amendment 28 (the evaluator's T1): a TypeScript `interface Mid extends

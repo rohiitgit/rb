@@ -1,0 +1,3 @@
+  code: no heuristic references to own code (0 external); 2 exact calls (scip)
+  scip: client scip-python ok unpinned, definitions matched 7/7 (0 by name), definitions without occurrence 0, references matched 0, external 0, undocumented 2, local 3, unanchored 0, unmatched 3, unconverted 0, documents rejected 0, relationships dropped 0 (0 in project, 0 anonymous)
+  scip: services/shop scip-python ok unpinned, definitions matched 13/13 (0 by name), definitions without occurrence 0, references matched 2, external 0, undocumented 0, local 6, unanchored 0, unmatched 7, unconverted 0, documents rejected 0, relationships dropped 0 (0 in project, 0 anonymous), 1 supertypes unresolved
