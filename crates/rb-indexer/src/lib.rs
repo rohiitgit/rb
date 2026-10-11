@@ -255,6 +255,12 @@ pub fn index_commit(
         })
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
+    let mappers = manifest
+        .files
+        .iter()
+        .filter(|f| f.path.ends_with(".xml") && !f.binary)
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<_>>()?;
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
@@ -265,6 +271,7 @@ pub fn index_commit(
         unparsed,
         manifests,
         specs,
+        mappers,
         words,
     };
 
@@ -342,6 +349,9 @@ pub struct Content<'a> {
     pub manifests: BTreeMap<&'a str, String>,
     /// OpenAPI/Swagger and `.proto` texts by path (contract M6f S3).
     pub specs: BTreeMap<&'a str, String>,
+    /// `*.xml` texts by path; MyBatis mappers read by root tag, everything else skipped
+    /// (contract M6f S5).
+    pub mappers: BTreeMap<&'a str, String>,
     /// Where the definitions' names occur in every non-binary file (contract M4b S12 (f)); the
     /// default is "not scanned", under which no symbol is orphan-eligible.
     pub words: liveness::Words,
@@ -931,6 +941,9 @@ pub fn assemble(
     }
     for (path, text) in &content.sql {
         diagnostics.extend(sql::add_migrations(&mut b, path, text)?);
+    }
+    for (path, text) in &content.mappers {
+        diagnostics.extend(sql::add_mapper_queries(&mut b, path, text)?);
     }
     // Entry kinds and orphan eligibility (contract M4b S11, S12), after every edge producer.
     diagnostics.push(liveness::apply(

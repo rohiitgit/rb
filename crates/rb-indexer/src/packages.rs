@@ -1188,17 +1188,29 @@ fn py_lockfile_for(
     None
 }
 #[derive(Debug, Default)]
-/// A minimal XML element: name, direct text, children, and where its start tag begins.
-struct Element {
-    name: String,
-    text: String,
-    children: Vec<Element>,
-    start: usize,
+/// A minimal XML element: name, attributes, direct text, children, and where its start tag
+/// begins and its end tag (or self-close) ends. Attributes beyond `name="value"` shapes are
+/// skipped, never fatal (contract M6f S5).
+pub(crate) struct Element {
+    pub(crate) name: String,
+    attrs: Vec<(String, String)>,
+    pub(crate) text: String,
+    pub(crate) children: Vec<Element>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 impl Element {
     fn child(&self, name: &str) -> Option<&Element> {
         self.children.iter().find(|c| c.name == name)
+    }
+
+    /// The value of attribute `name`, if stated as `name="value"` or `name='value'`.
+    pub(crate) fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
 
     fn text_of(&self, name: &str) -> Option<&str> {
@@ -1219,9 +1231,9 @@ impl Element {
 }
 
 /// Parses an XML document into its root element; comments, processing instructions and
-/// declarations are skipped, CDATA is text, attributes are ignored. `None` when the tags do not
-/// balance.
-fn parse_xml(text: &str) -> Option<Element> {
+/// declarations are skipped, CDATA is text, attributes are kept (`name="value"` shapes).
+/// `None` when the tags do not balance.
+pub(crate) fn parse_xml(text: &str) -> Option<Element> {
     let mut stack: Vec<Element> = vec![Element::default()];
     let mut i = 0;
     let bytes = text.as_bytes();
@@ -1244,27 +1256,62 @@ fn parse_xml(text: &str) -> Option<Element> {
         } else if let Some(body) = rest.strip_prefix("</") {
             let end = body.find('>')?;
             let name = body[..end].trim();
-            let done = stack.pop()?;
+            let mut done = stack.pop()?;
             if done.name != name || stack.is_empty() {
                 return None;
             }
+            done.end = i + 2 + end + 1;
             stack.last_mut()?.children.push(done);
             i += 2 + end + 1;
         } else {
             let end = rest.find('>')?;
             let tag = &rest[1..end];
             let closed = tag.ends_with('/');
-            let name = tag
-                .trim_end_matches('/')
+            let tag = tag.trim_end_matches('/');
+            let name_len = tag
                 .split(|c: char| c.is_whitespace())
-                .next()?
-                .to_owned();
-            let element = Element {
-                name,
+                .next()
+                .map_or(0, str::len);
+            if name_len == 0 {
+                return None;
+            }
+            let mut element = Element {
+                name: tag[..name_len].to_owned(),
                 start: i,
                 ..Element::default()
             };
+            // Attributes (`name="value"`), quote-aware so spaces and `=` inside values
+            // survive; malformed attributes end the list, never the element.
+            let mut attrs = tag[name_len..].trim_start();
+            loop {
+                let key_len = attrs
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(b))
+                    .count();
+                if key_len == 0 {
+                    break;
+                }
+                let after = attrs[key_len..].trim_start();
+                let Some(value) = after.strip_prefix('=') else {
+                    break;
+                };
+                let value = value.trim_start();
+                let Some(quote) = value.as_bytes().first() else {
+                    break;
+                };
+                if *quote != b'"' && *quote != b'\'' {
+                    break;
+                }
+                let Some(close) = value[1..].find(char::from(*quote)) else {
+                    break;
+                };
+                element
+                    .attrs
+                    .push((attrs[..key_len].to_owned(), decode(&value[1..close + 1])));
+                attrs = value[close + 2..].trim_start();
+            }
             if closed {
+                element.end = i + end + 1;
                 stack.last_mut()?.children.push(element);
             } else {
                 stack.push(element);
@@ -3310,6 +3357,30 @@ mod tests {
             ]
         );
         assert!(parse_xml("<project><a></project>").is_none());
+    }
+
+    /// Contract M6f S5: the XML reader keeps attributes and end offsets (for MyBatis mapper
+    /// statements); existing pom reads are unchanged.
+    #[test]
+    fn xml_elements_carry_attributes_and_end_offsets() {
+        let root = parse_xml("<mapper namespace=\"com.acme.M\" ><select id='findAll'>SELECT 1</select><br/></mapper>").unwrap();
+        assert_eq!(root.attr("namespace"), Some("com.acme.M"));
+        assert_eq!(root.attr("missing"), None);
+        let select = &root.children[0];
+        assert_eq!(select.name, "select");
+        assert_eq!(select.attr("id"), Some("findAll"));
+        assert_eq!(select.text.trim(), "SELECT 1");
+        // End offsets come from the tree, never hand-counted.
+        assert_eq!(
+            &"<mapper namespace=\"com.acme.M\" ><select id='findAll'>SELECT 1</select><br/></mapper>"
+                [select.start..select.end],
+            "<select id='findAll'>SELECT 1</select>"
+        );
+        assert_eq!(root.children[1].name, "br");
+        // A malformed attribute is skipped, not fatal.
+        let bad = parse_xml("<a b=noquotes>c</a>").unwrap();
+        assert_eq!(bad.attr("b"), None);
+        assert_eq!(bad.text, "c");
     }
 
     /// Evaluator pass 1, Y8 and Y11: an artifact declared twice with different versions, or
