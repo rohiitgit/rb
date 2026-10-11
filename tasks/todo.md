@@ -899,7 +899,7 @@ Same rules as M6b/M6c:
 
 `PIPELINE` becomes `m6d-1` at the first dump change and is bumped on each later one.
 
-- [ ] **0. Preflight** (no code). Baseline binary, pins (Go + Python measurement repos), shape checks (go.mod collection, poetry/uv shapes, image digests, scip-python size, egress behaviour), fixture dependency closures.
+- [x] **0. Preflight** (no code). Done 2026-10-11 (amendment 1): baseline binary `var/m6d/base/rb-027a54f`; full-SHA pins (mattermost Go fresh HEAD, Python `full-stack-fastapi-template` chosen with `uv.lock`); shape checks (go.mod collected, poetry/uv absent, no Go/Python images/jobs, egress npm/yarn/maven-only, grammars pinned, no client/route packs or fixtures); scip-python 188.8 MB compressed (3× bound fits); fixture dep versions read; Go stable go1.27.2; egress baseline 61/61; e2e baseline 8/8. DB 0 repos.
 - [ ] **1. scip-go image** (S1). Local build on pinned toolchain + base; digest recorded and re-verified.
 - [ ] **2. scip-python pin** (S2). Size measured vs budget, then digest-pinned.
 - [ ] **3. Go fetch** (S3). `go mod download` behind the proxy; refusals named.

@@ -1,6 +1,6 @@
 # M6d contract: Go and Python SCIP — images, fetch phases, keys, lockfiles, clients (draft, planner, 2026-10-11)
 
-**Status:** contract written 2026-10-11; forks F1–F6 await the orchestrator; phases not started (see `tasks/todo.md`).
+**Status:** contract written 2026-10-11; forks F1–F6 all as recommended (user, 2026-10-11, by "continue"); phase 0 done 2026-10-11 (amendment 1).
 
 Written before any code. M6d is done only when every assertion below is backed by a passing test or a recorded measurement. "Verified facts" are what the 2026-10-11 probe read in the code, goldens and records at commit `027a54f` (M6c closed; `PIPELINE` `m6c-5`).
 
@@ -150,3 +150,7 @@ No wall-clock/host-path/run-order in dumps (unchanged rules). Image identities a
 - **F4: Go key unification.** Recommendation: **one shared `go/<module>@<version>` key** for SCIP + manifest edges (S4 exactness doctrine).
 - **F5: requests/httpx depth.** Recommendation: **fetch-class parity** (M6b S9: verbs, sessions, base-URL folding, capped reads).
 - **F6: Python measurement repo.** Recommendation: **choose in preflight** (small, pinned, dependency-light; TBD).
+
+## Amendments
+
+1. **(phase 0) Baselines, pins and shape checks.** Baseline binary `var/m6d/base/rb-027a54f` (release, sha256 `bcb0e281…`; HEAD code == `027a54f` — the contract commit adds no code). Full-SHA pins verified by API/refs: mattermost Go `47eebd5530c0485391efa77915965b4b7317f16c` (fresh master HEAD; M6b's prefix no longer resolves to a ref); Python repo chosen (F6): `fastapi/full-stack-fastapi-template @ 7257e606cb94eada1dca40173e2b7f99dd549bc6` (7 MB, 252 files, `uv.lock` + `pyproject.toml`, 16 test files; the old `tiangolo/` path 301s to the `fastapi/` org). Shape checks: `go.mod` collected + parsed (direct reqs + replaces; poetry/uv/requirements absent everywhere); no scip-go/scip-python jobs, images or `docker/` dirs; egress `REGISTRIES` npm/yarn/maven only; tree-sitter go/python grammars pinned; no Python `requests`/`httpx` client packs, no chi/FastAPI/Flask route packs (Flask-SQLAlchemy model naming only); no Go/Python fixtures. scip-python amd64 manifest: 14 layers, 188.8 MB compressed (matches the design figure), 3× bound 566 MB vs 18G free — fits; digest `sha256:1847528c…` recorded for the S2 pin. Fixture dep versions read (pinned at creation): chi v5.3.2, fastapi 0.143.0, sqlalchemy 2.1.4, requests 2.34.2, httpx 0.28.1, uv 0.13.0. Go toolchain stable go1.27.2 recorded for the S1 image pin. Egress baseline: `rb-scip` 61/61 green; e2e baseline 8/8 green (4 no-scip fixture suites + 3 scip suites + structure). Images verified by inspect; DB 0 repos; disk 18G free. Forks F1–F6 confirmed (user, 2026-10-11, by "continue").
