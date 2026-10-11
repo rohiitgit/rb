@@ -1636,6 +1636,14 @@ mod tests {
             b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public abstract class AbsApp {}\n",
         )
         .unwrap();
+        // An interface carrier is not a class either (discriminates the kind
+        // gate from the parent rule: top-level and concrete, only the kind
+        // blocks it).
+        let iface_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public interface AppIfc {}\n",
+        )
+        .unwrap();
         let nested_app = rb_syntax::extract(
             rb_syntax::Language::Java,
             b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nclass Outer {\n@SpringBootApplication class Inner {}\n}\n",
@@ -1658,6 +1666,8 @@ mod tests {
                 "abs/src/main/java/com/acme/AbsApp.java",
                 "nest/pom.xml",
                 "nest/src/main/java/com/acme/Outer.java",
+                "iface/pom.xml",
+                "iface/src/main/java/com/acme/AppIfc.java",
             ]
             .into_iter()
             .map(entry)
@@ -1678,6 +1688,7 @@ mod tests {
                 library("meth", "meth/pom.xml"),
                 library("abs", "abs/pom.xml"),
                 library("nest", "nest/pom.xml"),
+                library("iface", "iface/pom.xml"),
             ],
             vec![],
         );
@@ -1711,6 +1722,10 @@ mod tests {
                     "nest/src/main/java/com/acme/Outer.java",
                     (rb_syntax::Language::Java, &nested_app),
                 ),
+                (
+                    "iface/src/main/java/com/acme/AppIfc.java",
+                    (rb_syntax::Language::Java, &iface_app),
+                ),
             ]),
             ..Content::default()
         };
@@ -1728,6 +1743,7 @@ mod tests {
         assert_eq!(role("meth"), "library");
         assert_eq!(role("abs"), "library");
         assert_eq!(role("nest"), "library");
+        assert_eq!(role("iface"), "library");
     }
 
     /// Contract M6c S3, invariant 9: one app class per module costs linear
