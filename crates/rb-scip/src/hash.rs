@@ -79,7 +79,7 @@ mod tests {
             input_hash(
                 files,
                 &format!(
-                    "{}\nallow files.pythonhosted.org plugins.gradle.org proxy.golang.org pypi.org registry.npmjs.org registry.yarnpkg.com repo.maven.apache.org repo1.maven.org storage.googleapis.com",
+                    "{}\nallow files.pythonhosted.org plugins-artifacts.gradle.org plugins.gradle.org proxy.golang.org pypi.org registry.npmjs.org registry.yarnpkg.com repo.maven.apache.org repo1.maven.org storage.googleapis.com",
                     crate::RECIPE_JAVA
                 )
             )
@@ -106,14 +106,17 @@ mod tests {
     /// selection to the caller (D7), leave every scip-java key as it was, so cached Java
     /// indexes stay valid. The value is what `cfa8ab9`'s `project_input_hash("svc", …)`
     /// computed for these files plus one outside `svc` (printed by that code before the split);
-    /// scip-typescript's recipe gives another key for the same files.
+    /// scip-typescript's recipe gives another key for the same files. Contract M6e phase 11:
+    /// allow-listing `plugins-artifacts.gradle.org` moves the key (the allow-list is part of
+    /// it by M5 S21, so the refused Gradle fetch retries); the new value was printed by the
+    /// failing test.
     #[test]
     fn the_java_key_is_pinned_across_the_recipe_split() {
         let files = [("svc/pom.xml", "1"), ("svc/src/A.java", "2")];
         assert_eq!(crate::RECIPE_JAVA, "m5-egress-1");
         assert_eq!(
             key(files),
-            "52fda8b2d590773546f2e15802148527ef6710270cba3a75bcadce88b954d340"
+            "c1fd98fd1f72a5121ed58244bcd16d4d1142c2be3090597dec9a907622977704"
         );
         assert_ne!(
             project_input_hash(crate::RECIPE_TS, files, &crate::Egress::default()),

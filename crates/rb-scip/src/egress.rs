@@ -26,13 +26,16 @@ pub const CLIENT_CONFIG_AT: &str = "/rb-egress";
 /// the npm and Yarn registries, the Go module proxy (contract M6d S3) with the Google-hosted
 /// bucket it redirects large downloads to (measured in S11: `go mod download` serves module
 /// zips from signed `storage.googleapis.com` URLs; refusing it fails closed on real modules),
-/// PyPI with its file host (contract M6d S4), and the Gradle plugin portal
-/// (contract M6e S2; the distribution host stays refused — nothing at runtime
-/// dials it since the wrapper is never used). The fixtures' fetches reach only
+/// PyPI with its file host (contract M6d S4), the Gradle plugin portal (contract M6e S2;
+/// the distribution host stays refused — nothing at runtime dials it since the wrapper is
+/// never used) with the artifact host its markers download from (measured in phase 11: the
+/// `plugins.gradle.org/m2` marker resolves to `plugins-artifacts.gradle.org`; refusing it
+/// fails closed on real Gradle plugins). The fixtures' fetches reach only
 /// `repo.maven.apache.org` and `registry.npmjs.org` (measured through an open proxy, contract
 /// M5 amendment 12).
 pub const REGISTRIES: &[&str] = &[
     "files.pythonhosted.org",
+    "plugins-artifacts.gradle.org",
     "plugins.gradle.org",
     "proxy.golang.org",
     "pypi.org",
@@ -201,6 +204,7 @@ mod tests {
             extra.hosts,
             [
                 "files.pythonhosted.org",
+                "plugins-artifacts.gradle.org",
                 "plugins.gradle.org",
                 "proxy.golang.org",
                 "pypi.org",
@@ -228,6 +232,21 @@ mod tests {
         }
     }
 
+    /// Contract M6e S2/F3 (phase 11): the Gradle plugin portal serves artifact downloads
+    /// from `plugins-artifacts.gradle.org` (measured on jcommander: resolving the
+    /// `plugins.gradle.org/m2` marker GETs that host, and the fetch fails closed without it).
+    /// Probed 200 direct before allow-listing; the distribution host stays refused
+    /// (wrapper-only).
+    #[test]
+    fn gradle_plugin_artifact_downloads_are_allow_listed() {
+        assert!(REGISTRIES.contains(&"plugins-artifacts.gradle.org"));
+        assert!(
+            Egress::default()
+                .proxy_filter()
+                .contains("plugins-artifacts.gradle.org:443\n")
+        );
+    }
+
     #[test]
     fn the_proxy_allows_only_connect_to_listed_hosts_on_443() {
         let e = Egress::default();
@@ -245,7 +264,7 @@ mod tests {
         }
         assert_eq!(
             e.proxy_filter(),
-            "files.pythonhosted.org:443\nplugins.gradle.org:443\nproxy.golang.org:443\npypi.org:443\nregistry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\nstorage.googleapis.com:443\n"
+            "files.pythonhosted.org:443\nplugins-artifacts.gradle.org:443\nplugins.gradle.org:443\nproxy.golang.org:443\npypi.org:443\nregistry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\nstorage.googleapis.com:443\n"
         );
         let tmp = tempfile::tempdir().unwrap();
         e.write_config(tmp.path()).unwrap();

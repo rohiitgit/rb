@@ -1596,7 +1596,7 @@ mod tests {
             *fake.proxies.borrow(),
             [
                 format!(
-                    "start rb-egress-{instance} files.pythonhosted.org:443,plugins.gradle.org:443,proxy.golang.org:443,pypi.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443,storage.googleapis.com:443"
+                    "start rb-egress-{instance} files.pythonhosted.org:443,plugins-artifacts.gradle.org:443,plugins.gradle.org:443,proxy.golang.org:443,pypi.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443,storage.googleapis.com:443"
                 ),
                 format!("stop rb-egress-{instance}"),
             ]
