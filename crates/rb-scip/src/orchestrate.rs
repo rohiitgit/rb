@@ -39,18 +39,26 @@ pub const RECIPE_GO: &str = "m6d-go-1";
 /// default trips on slow wheel reads through the emulated stack).
 pub const RECIPE_PY: &str = "m6d-py-4";
 
+/// scip-java's Gradle recipe (contract M6e S2): dependency resolution plus one
+/// online build in the fetch phase, then `scip-java index --build-tool Gradle`
+/// offline. Bumped like [`RECIPE_JAVA`]. Separate from it because the fetch
+/// commands differ: a Maven-fetched index must never serve a Gradle job.
+pub const RECIPE_GRADLE: &str = "m6e-gradle-1";
+
 /// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
 /// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
-/// other budget settings change no index and are not part of it.
-pub fn recipe(indexer: Indexer, budget: &Budget) -> String {
-    match indexer {
-        Indexer::ScipJava if budget.maven_threads > 1 => {
+/// other budget settings change no index and are not part of it. Gradle jobs carry
+/// [`RECIPE_GRADLE`] (threads are a Maven-reactor setting; Gradle commands take none).
+pub fn recipe(job: &Job, budget: &Budget) -> String {
+    match (&job.indexer, &job.fetch) {
+        (Indexer::ScipJava, Fetch::Gradle) => RECIPE_GRADLE.to_owned(),
+        (Indexer::ScipJava, _) if budget.maven_threads > 1 => {
             format!("{RECIPE_JAVA}+T{}", budget.maven_threads)
         }
-        Indexer::ScipJava => RECIPE_JAVA.to_owned(),
-        Indexer::ScipGo => RECIPE_GO.to_owned(),
-        Indexer::ScipPython => RECIPE_PY.to_owned(),
-        Indexer::ScipTypescript => RECIPE_TS.to_owned(),
+        (Indexer::ScipJava, _) => RECIPE_JAVA.to_owned(),
+        (Indexer::ScipGo, _) => RECIPE_GO.to_owned(),
+        (Indexer::ScipPython, _) => RECIPE_PY.to_owned(),
+        (Indexer::ScipTypescript, _) => RECIPE_TS.to_owned(),
     }
 }
 
@@ -316,15 +324,6 @@ pub fn run_job(
     runner: &dyn Runner,
 ) -> anyhow::Result<ScipRun> {
     let started = std::time::Instant::now();
-    if job.fetch == Fetch::Gradle {
-        // Only the Maven path is verified (contract M3b amendment 8); Gradle is M6.
-        return Ok(ScipRun {
-            status: RunStatus::Unsupported("scip-java Gradle builds are not verified yet".into()),
-            index: None,
-            stderr_tail: String::new(),
-            elapsed: Duration::ZERO,
-        });
-    }
     let instance = format!(
         "{}-{}-{}",
         work_dir
@@ -344,6 +343,9 @@ pub fn run_job(
     let result = (|| -> anyhow::Result<ScipRun> {
         let (mut fetches, mut index) = match job.indexer {
             Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
+            Indexer::ScipJava if job.fetch == Fetch::Gradle => {
+                gradle_runs(image, work_dir, cache_dir, budget)?
+            }
             Indexer::ScipJava => java_runs(image, work_dir, cache_dir, budget)?,
             Indexer::ScipGo => go_runs(image, work_dir, cache_dir, budget)?,
             Indexer::ScipPython => python_runs(job, image, work_dir, cache_dir, budget)?,
@@ -377,6 +379,12 @@ pub fn run_job(
             })?;
             for fetch in &mut fetches {
                 fetch.env.extend(crate::egress::proxy_env(&address));
+                if job.fetch == Fetch::Gradle {
+                    // Gradle reads proxy configuration from JVM system properties, not the
+                    // environment (contract M6e S2); `--no-daemon` keeps everything in the
+                    // launcher JVM, so `GRADLE_OPTS` reaches dependency resolution.
+                    fetch.env.push(crate::egress::gradle_proxy_opts(&address));
+                }
                 fetch
                     .readonly
                     .push((client.clone(), CLIENT_CONFIG_AT.to_owned()));
@@ -709,6 +717,86 @@ fn java_runs(
     Ok((fetches, index))
 }
 
+/// The fetch and index invocations for a scip-java Gradle job (docker/scip-java/README.md).
+/// The fetch phase resolves dependencies (`dependencies`) and then does one online build, so
+/// that the index phase can run the same build with `--offline` under `--network none`.
+/// Arguments after `--` replace scip-java's default Gradle arguments, so they are repeated
+/// plus `--offline`. `--console=plain` keeps progress spinners out of the stderr tail;
+/// `--no-daemon` fits ephemeral containers (no daemon is ever reused); `--no-build-cache`
+/// forces compilation to run, so javac with the SemanticDB plugin always emits (a cache hit
+/// would skip it, the spring-retry lesson of contract M3b amendment 47). The repository's
+/// wrapper stays unexported ([`export`]), so the image's `gradle` is always the one used.
+fn gradle_runs(
+    image: &str,
+    work_dir: &Path,
+    cache_dir: &Path,
+    budget: &Budget,
+) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
+    let workdir = crate::runner::absolute(work_dir)?;
+    let gradle_home = crate::runner::absolute(cache_dir)?.join("gradle");
+    std::fs::create_dir_all(&gradle_home)?;
+    let base = ContainerRun {
+        name: None,
+        image: image.into(),
+        platform: None,
+        workdir,
+        mount_at: "/sources".into(),
+        cwd: String::new(),
+        caches: vec![(gradle_home, "/root/.gradle".into())],
+        readonly: Vec::new(),
+        // Explicit (the default is also `/root/.gradle` for root): the fetch
+        // must never write where another repository's reads.
+        env: vec![("GRADLE_USER_HOME".into(), "/root/.gradle".into())],
+        network: Network::Fetch,
+        cpus: budget.cpus,
+        memory: budget.memory.clone(),
+        timeout: budget.fetch_timeout,
+        entrypoint: None,
+        args: Vec::new(),
+    };
+    let flags = [
+        "--console=plain",
+        "--quiet",
+        "--no-daemon",
+        "--no-build-cache",
+    ];
+    let gradle = |tasks: &[&str]| ContainerRun {
+        args: ["gradle"]
+            .iter()
+            .chain(flags.iter())
+            .chain(tasks.iter())
+            .map(|s| (*s).to_owned())
+            .collect(),
+        ..base.clone()
+    };
+    let fetches = vec![
+        gradle(&["dependencies"]),
+        gradle(&["clean", "compileJava", "compileTestJava"]),
+    ];
+    let index = ContainerRun {
+        network: Network::None,
+        timeout: budget.index_timeout,
+        args: [
+            "scip-java",
+            "index",
+            "--build-tool",
+            "Gradle",
+            "--",
+            "--offline",
+            "--console=plain",
+            "--no-daemon",
+            "--no-build-cache",
+            "clean",
+            "compileJava",
+            "compileTestJava",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect(),
+        ..base
+    };
+    Ok((fetches, index))
+}
 /// The fetch and index invocations for a scip-go job (docker/scip-go/README.md).
 /// The fetch phase downloads the module graph into the repository's Go module
 /// cache (`go mod download`); the index phase runs `scip-go` offline
@@ -1424,7 +1512,7 @@ mod tests {
             *fake.proxies.borrow(),
             [
                 format!(
-                    "start rb-egress-{instance} files.pythonhosted.org:443,proxy.golang.org:443,pypi.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443,storage.googleapis.com:443"
+                    "start rb-egress-{instance} files.pythonhosted.org:443,plugins.gradle.org:443,proxy.golang.org:443,pypi.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443,storage.googleapis.com:443"
                 ),
                 format!("stop rb-egress-{instance}"),
             ]
@@ -1615,27 +1703,43 @@ mod tests {
     }
 
     #[test]
-    fn gradle_jobs_and_a_missing_java_image_are_unsupported_and_exports_refuse_unsafe_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fake = Fake::new(false, false);
-        let run = run_job(
-            &java_job(Fetch::Gradle),
-            JAVA_ID,
-            &files(),
-            &tmp.path().join("w"),
-            &tmp.path().join("c"),
-            &Budget::default(),
-            &Egress::default(),
-            &fake,
-        )
-        .unwrap();
-        assert_eq!(
-            run.status,
-            RunStatus::Unsupported("scip-java Gradle builds are not verified yet".into())
+    fn gradle_job_resolves_builds_then_indexes_offline() {
+        let lines = argv_lines(&java_job(Fetch::Gradle), "sha256:java", &Budget::default());
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].contains("--network rb-scip-fetch")
+                && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
+                && lines[0].contains(
+                    "gradle --console=plain --quiet --no-daemon --no-build-cache dependencies"
+                )
+                && lines[0].contains("/root/.gradle")
+                && lines[0].contains("-e GRADLE_USER_HOME=/root/.gradle")
+                && lines[0].contains("-e GRADLE_OPTS=-Dhttps.proxyHost="),
+            "{}",
+            lines[0]
         );
-        assert!(fake.runs.borrow().is_empty());
-        assert!(!tmp.path().join("w").exists(), "nothing is exported");
+        assert!(
+            lines[1].contains("--network rb-scip-fetch")
+                && lines[1].contains(
+                    "gradle --console=plain --quiet --no-daemon --no-build-cache clean compileJava compileTestJava"
+                )
+                && lines[1].contains("/root/.gradle"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("--network none")
+                && lines[2].contains("scip-java index --build-tool Gradle")
+                && lines[2].contains("-- --offline --console=plain --no-daemon --no-build-cache")
+                && lines[2].contains("clean compileJava compileTestJava"),
+            "{}",
+            lines[2]
+        );
+    }
 
+    #[test]
+    fn a_missing_java_image_is_unsupported_and_exports_refuse_unsafe_paths() {
+        let tmp = tempfile::tempdir().unwrap();
         let no_image = Fake {
             java_image: false,
             ..Fake::new(false, false)
@@ -1768,9 +1872,17 @@ mod tests {
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m6a-ts-1"));
         assert_eq!(RECIPE_PY, "m6d-py-4");
-        assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
+        assert_eq!(RECIPE_GRADLE, "m6e-gradle-1");
         assert_eq!(
-            recipe(Indexer::ScipTypescript, &Budget::default()),
+            recipe(&java_job(Fetch::Maven), &Budget::default()),
+            RECIPE_JAVA
+        );
+        assert_eq!(
+            recipe(&java_job(Fetch::Gradle), &Budget::default()),
+            RECIPE_GRADLE
+        );
+        assert_eq!(
+            recipe(&ts_job(NodeLock::PackageLock), &Budget::default()),
             RECIPE_TS
         );
         let tmp = tempfile::tempdir().unwrap();
@@ -1927,18 +2039,22 @@ mod tests {
             assert!(line.ends_with(" -T 4"), "{line}");
             assert!(line.contains(" --cpus 8 --memory 6g "), "{line}");
         }
-        assert_eq!(recipe(Indexer::ScipJava, &threaded), "m5-egress-1+T4");
-        assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
-        assert_eq!(recipe(Indexer::ScipTypescript, &threaded), RECIPE_TS);
+        assert_eq!(recipe(&java_job(Fetch::Maven), &threaded), "m5-egress-1+T4");
+        assert_eq!(
+            recipe(&java_job(Fetch::Maven), &Budget::default()),
+            RECIPE_JAVA
+        );
+        assert_eq!(recipe(&java_job(Fetch::Gradle), &threaded), RECIPE_GRADLE);
+        assert_eq!(recipe(&ts_job(NodeLock::PackageLock), &threaded), RECIPE_TS);
         let files = [("pom.xml", "1")];
         assert_ne!(
             crate::project_input_hash(
-                &recipe(Indexer::ScipJava, &threaded),
+                &recipe(&java_job(Fetch::Maven), &threaded),
                 files,
                 &Egress::default()
             ),
             crate::project_input_hash(
-                &recipe(Indexer::ScipJava, &Budget::default()),
+                &recipe(&java_job(Fetch::Maven), &Budget::default()),
                 files,
                 &Egress::default()
             ),

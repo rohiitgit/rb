@@ -79,7 +79,7 @@ mod tests {
             input_hash(
                 files,
                 &format!(
-                    "{}\nallow files.pythonhosted.org proxy.golang.org pypi.org registry.npmjs.org registry.yarnpkg.com repo.maven.apache.org repo1.maven.org storage.googleapis.com",
+                    "{}\nallow files.pythonhosted.org plugins.gradle.org proxy.golang.org pypi.org registry.npmjs.org registry.yarnpkg.com repo.maven.apache.org repo1.maven.org storage.googleapis.com",
                     crate::RECIPE_JAVA
                 )
             )
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(crate::RECIPE_JAVA, "m5-egress-1");
         assert_eq!(
             key(files),
-            "1801927194a308dbb82ac020d2e6e0471cce0a5ffc4f79476a6ba1eb7547f729"
+            "52fda8b2d590773546f2e15802148527ef6710270cba3a75bcadce88b954d340"
         );
         assert_ne!(
             project_input_hash(crate::RECIPE_TS, files, &crate::Egress::default()),

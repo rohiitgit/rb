@@ -26,11 +26,14 @@ pub const CLIENT_CONFIG_AT: &str = "/rb-egress";
 /// the npm and Yarn registries, the Go module proxy (contract M6d S3) with the Google-hosted
 /// bucket it redirects large downloads to (measured in S11: `go mod download` serves module
 /// zips from signed `storage.googleapis.com` URLs; refusing it fails closed on real modules),
-/// and PyPI with its file host (contract M6d S4). The fixtures' fetches reach only
+/// PyPI with its file host (contract M6d S4), and the Gradle plugin portal
+/// (contract M6e S2; the distribution host stays refused — nothing at runtime
+/// dials it since the wrapper is never used). The fixtures' fetches reach only
 /// `repo.maven.apache.org` and `registry.npmjs.org` (measured through an open proxy, contract
 /// M5 amendment 12).
 pub const REGISTRIES: &[&str] = &[
     "files.pythonhosted.org",
+    "plugins.gradle.org",
     "proxy.golang.org",
     "pypi.org",
     "registry.npmjs.org",
@@ -157,6 +160,20 @@ pub fn proxy_env(address: &str) -> Vec<(String, String)> {
     .collect()
 }
 
+/// JVM system properties sending Gradle through the proxy at `address`, as one
+/// `GRADLE_OPTS` entry (Gradle reads proxy configuration from system properties, not the
+/// environment; contract M6e S2). Extended onto Gradle fetches at run time beside
+/// [`proxy_env`], when the per-run address is known.
+pub fn gradle_proxy_opts(address: &str) -> (String, String) {
+    (
+        "GRADLE_OPTS".into(),
+        format!(
+            "-Dhttps.proxyHost={address} -Dhttps.proxyPort={PROXY_PORT} \
+             -Dhttp.proxyHost={address} -Dhttp.proxyPort={PROXY_PORT}"
+        ),
+    )
+}
+
 /// The hosts the proxy refused, from its log (`Proxying refused on filtered url "…"`), sorted
 /// and without repeats: the log's timestamps and order are not functions of the commit.
 pub fn refusals(log: &str) -> Vec<String> {
@@ -184,6 +201,7 @@ mod tests {
             extra.hosts,
             [
                 "files.pythonhosted.org",
+                "plugins.gradle.org",
                 "proxy.golang.org",
                 "pypi.org",
                 "registry.npmjs.org",
@@ -227,7 +245,7 @@ mod tests {
         }
         assert_eq!(
             e.proxy_filter(),
-            "files.pythonhosted.org:443\nproxy.golang.org:443\npypi.org:443\nregistry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\nstorage.googleapis.com:443\n"
+            "files.pythonhosted.org:443\nplugins.gradle.org:443\nproxy.golang.org:443\npypi.org:443\nregistry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\nstorage.googleapis.com:443\n"
         );
         let tmp = tempfile::tempdir().unwrap();
         e.write_config(tmp.path()).unwrap();
@@ -258,6 +276,13 @@ mod tests {
             "npm_config_https_proxy".into(),
             "http://172.30.0.2:8888".into()
         )));
+        assert_eq!(
+            gradle_proxy_opts("172.30.0.2"),
+            (
+                "GRADLE_OPTS".into(),
+                "-Dhttps.proxyHost=172.30.0.2 -Dhttps.proxyPort=8888 -Dhttp.proxyHost=172.30.0.2 -Dhttp.proxyPort=8888".into()
+            )
+        );
     }
 
     #[test]

@@ -225,7 +225,7 @@ pub(crate) fn run_projects(
             }
         };
         let input_hash = rb_scip::project_input_hash(
-            &rb_scip::recipe(job.indexer, &options.budget),
+            &rb_scip::recipe(&job, &options.budget),
             exported.iter().copied(),
             &options.egress,
         );

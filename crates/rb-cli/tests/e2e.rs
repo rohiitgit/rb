@@ -3093,6 +3093,8 @@ echo "pypi $(code https://pypi.org/pypi/requests/json)"
 echo "files $(code https://files.pythonhosted.org/)"
 echo "testpypi $(code https://test.pypi.org/simple/)"
 echo "gcs $(code https://storage.googleapis.com/)"
+echo "plugins $(code https://plugins.gradle.org/)"
+echo "distrib $(code https://services.gradle.org/)"
 echo "host $(code https://example.com/)"
 echo "plain $(code -x "$http_proxy" http://repo.maven.apache.org/maven2/)"
 echo "ip $(code https://1.1.1.1/)"
@@ -3159,6 +3161,16 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
     // answers (its root is a 400).
     assert_eq!(result("files"), "404 exit=0");
     assert_eq!(result("gcs"), "400 exit=0");
+    // Contract M6e S2: the Gradle plugin portal answers through the proxy.
+    // services.gradle.org (the distribution host) stays refused: nothing at
+    // runtime dials it (the wrapper is never used), and a build that did
+    // would fail closed with a named refusal.
+    assert_eq!(result("plugins"), "200 exit=0");
+    assert!(
+        result("distrib").starts_with("000 exit=") && result("distrib") != "000 exit=0",
+        "distrib: {}",
+        result("distrib")
+    );
     assert!(
         result("testpypi").starts_with("000 exit=") && result("testpypi") != "000 exit=0",
         "testpypi: {}",
@@ -3180,6 +3192,8 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
             "1.1.1.1:443",
             "example.com:443",
             "http://repo.maven.apache.org/maven2/",
+            // Contract M6e S2: the distribution host stays refused.
+            "services.gradle.org:443",
             // Contract M6d S3: the checksum database stays refused.
             "sum.golang.org:443",
             // Contract M6d S4: the same-org test index stays refused.
