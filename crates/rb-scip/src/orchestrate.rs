@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::egress::{CLIENT_CONFIG_AT, Egress, PROXY_IMAGE};
 use crate::jobs::{
-    Fetch, Indexer, Job, NodeLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_PYTHON_IMAGE,
+    Fetch, Indexer, Job, NodeLock, PythonLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_PYTHON_IMAGE,
     SCIP_TYPESCRIPT_IMAGE,
 };
 use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
@@ -31,8 +31,10 @@ pub const RECIPE_TS: &str = "m6a-ts-1";
 pub const RECIPE_GO: &str = "m6d-go-1";
 
 /// scip-python's recipe (contract M6d S2/S4): environment resolution, then
-/// `scip-python index` offline. Bumped like [`RECIPE_JAVA`].
-pub const RECIPE_PY: &str = "m6d-py-1";
+/// `scip-python index` offline. Bumped like [`RECIPE_JAVA`]. `m6d-py-2`:
+/// the fetch installs lockfile-driven environments (S4; `m6d-py-1`
+/// fetched nothing).
+pub const RECIPE_PY: &str = "m6d-py-2";
 
 /// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
 /// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
@@ -593,7 +595,7 @@ fn typescript_runs(
         Fetch::Maven | Fetch::Gradle => {
             anyhow::bail!("a Java fetch on a TypeScript job")
         }
-        Fetch::Go | Fetch::Python => {
+        Fetch::Go | Fetch::Python { .. } => {
             anyhow::bail!("a Go/Python fetch on a TypeScript job")
         }
     };
@@ -748,19 +750,35 @@ fn go_runs(
     Ok((vec![fetch], index))
 }
 
-/// The fetch and index invocations for a scip-python job (contract M6d S2).
-/// S2 fetches nothing: the environment resolution lands with the lockfile
-/// discipline (S4/S6). The index runs `scip-python index` offline; the image
-/// exists for linux/amd64 only, so the job is pinned there like
-/// scip-typescript's.
+/// The fetch and index invocations for a scip-python job (contract M6d S4).
+/// The fetch phase resolves the environment behind the egress proxy, driven
+/// only by what the job's root pins: a `poetry.lock` installs the locked
+/// tree without the root project, a `requirements.txt` installs its pins
+/// without transitive dependencies, anything else installs the project
+/// itself without dependencies (so an unlisted host is never reached for an
+/// unpinned tree, and third-party names stay unresolved — the safe
+/// direction). The index runs `scip-python index` offline; the image exists
+/// for linux/amd64 only, so the job is pinned there like scip-typescript's.
 fn python_runs(
     job: &Job,
     image: &str,
     work_dir: &Path,
-    _cache_dir: &Path,
+    cache_dir: &Path,
     budget: &Budget,
 ) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
+    let lockfile = match job.fetch {
+        Fetch::Python { lockfile } => lockfile,
+        _ => anyhow::bail!("a non-Python fetch on a Python job"),
+    };
     let workdir = crate::runner::absolute(work_dir)?;
+    let pip_cache = crate::runner::absolute(cache_dir)?.join("pip");
+    std::fs::create_dir_all(&pip_cache)?;
+    let mut caches = vec![(pip_cache, "/root/.cache/pip".into())];
+    if lockfile == PythonLock::Poetry {
+        let poetry_cache = crate::runner::absolute(cache_dir)?.join("pypoetry");
+        std::fs::create_dir_all(&poetry_cache)?;
+        caches.push((poetry_cache, "/root/.cache/pypoetry".into()));
+    }
     let base = ContainerRun {
         name: None,
         image: image.into(),
@@ -770,9 +788,10 @@ fn python_runs(
         // Like scip-typescript's job roots (contract M6a D7): the container
         // starts in the job's root; revisited with evidence in S5.
         cwd: job.root.clone(),
-        caches: Vec::new(),
+        caches,
         readonly: Vec::new(),
-        env: Vec::new(),
+        // pip's update notice depends on the cache's state (contract M5 S22).
+        env: vec![("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into())],
         network: Network::Fetch,
         cpus: budget.cpus,
         memory: budget.memory.clone(),
@@ -780,13 +799,27 @@ fn python_runs(
         entrypoint: None,
         args: Vec::new(),
     };
+    let args: Vec<String> = match lockfile {
+        PythonLock::Poetry => ["poetry", "install", "--no-root", "--no-interaction"].to_vec(),
+        PythonLock::Requirements => {
+            ["pip", "install", "--no-deps", "-r", "requirements.txt"].to_vec()
+        }
+        PythonLock::None => ["pip", "install", "--no-deps", "-e", "."].to_vec(),
+    }
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let fetch = ContainerRun {
+        args,
+        ..base.clone()
+    };
     let index = ContainerRun {
         network: Network::None,
         timeout: budget.index_timeout,
         args: ["scip-python", "index"].map(String::from).to_vec(),
         ..base
     };
-    Ok((Vec::new(), index))
+    Ok((vec![fetch], index))
 }
 
 fn once(s: &str) -> std::iter::Once<&str> {
@@ -957,13 +990,13 @@ mod tests {
         }
     }
 
-    fn python_job() -> Job {
+    fn python_job(lockfile: PythonLock) -> Job {
         Job {
             root: "svc".into(),
             indexer: Indexer::ScipPython,
-            fetch: Fetch::Python,
+            fetch: Fetch::Python { lockfile },
             projects: Vec::new(),
-            unpinned: true,
+            unpinned: lockfile != PythonLock::Poetry,
         }
     }
 
@@ -991,20 +1024,53 @@ mod tests {
         );
     }
 
-    /// Contract M6d S2: a Python job runs no fetch yet (S4) and indexes with
-    /// `scip-python index` offline, emulated on arm64.
+    /// Contract M6d S4: a Python job's fetch resolves its environment behind
+    /// the proxy — the locked tree for a poetry.lock, pins without transitive
+    /// dependencies for a requirements.txt, the project only otherwise (a
+    /// uv.lock has no installer in the image) — and the index stays an
+    /// offline `scip-python index` on the emulated platform. pip's version
+    /// check is off in every phase (contract M5 S22: its notice depends on
+    /// the cache's state).
     #[test]
-    fn python_job_indexes_offline_with_no_fetch() {
-        let lines = argv_lines(&python_job(), "sha256:py", &Budget::default());
-        assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0].contains("--network none")
-                && lines[0].contains("--platform linux/amd64")
-                && lines[0].contains("-v <work>:/src -w /src")
-                && lines[0].ends_with("scip-python index"),
-            "{}",
-            lines[0]
-        );
+    fn python_jobs_fetch_lockfile_driven_environments_then_index_offline() {
+        for (lockfile, fetch, cache) in [
+            (
+                PythonLock::Poetry,
+                "poetry install --no-root --no-interaction",
+                "/root/.cache/pypoetry",
+            ),
+            (
+                PythonLock::Requirements,
+                "pip install --no-deps -r requirements.txt",
+                "/root/.cache/pip",
+            ),
+            (
+                PythonLock::None,
+                "pip install --no-deps -e .",
+                "/root/.cache/pip",
+            ),
+        ] {
+            let lines = argv_lines(&python_job(lockfile), "sha256:py", &Budget::default());
+            assert_eq!(lines.len(), 2, "{lockfile:?}");
+            assert!(
+                lines[0].contains("--network rb-scip-fetch")
+                    && lines[0].contains("--platform linux/amd64")
+                    && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
+                    && lines[0].contains(fetch)
+                    && lines[0].contains(cache)
+                    && lines[0].contains("-e PIP_DISABLE_PIP_VERSION_CHECK=1"),
+                "{lockfile:?}: {}",
+                lines[0]
+            );
+            assert!(
+                lines[1].contains("--network none")
+                    && lines[1].contains("--platform linux/amd64")
+                    && lines[1].contains("-v <work>:/src -w /src")
+                    && lines[1].ends_with("scip-python index"),
+                "{lockfile:?}: {}",
+                lines[1]
+            );
+        }
     }
 
     fn files() -> Vec<(String, Vec<u8>)> {
@@ -1313,7 +1379,7 @@ mod tests {
             *fake.proxies.borrow(),
             [
                 format!(
-                    "start rb-egress-{instance} proxy.golang.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443"
+                    "start rb-egress-{instance} files.pythonhosted.org:443,proxy.golang.org:443,pypi.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443"
                 ),
                 format!("stop rb-egress-{instance}"),
             ]
@@ -1656,6 +1722,7 @@ mod tests {
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m6a-ts-1"));
+        assert_eq!(RECIPE_PY, "m6d-py-2");
         assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
         assert_eq!(
             recipe(Indexer::ScipTypescript, &Budget::default()),

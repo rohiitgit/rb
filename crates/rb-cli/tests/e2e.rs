@@ -3076,6 +3076,9 @@ code() { curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$@" 2>/dev/null;
 echo "allowed $(code https://repo.maven.apache.org/maven2/)"
 echo "gomod $(code https://proxy.golang.org/github.com/go-chi/chi/v5/@latest)"
 echo "gosum $(code https://sum.golang.org/)"
+echo "pypi $(code https://pypi.org/pypi/requests/json)"
+echo "files $(code https://files.pythonhosted.org/)"
+echo "testpypi $(code https://test.pypi.org/simple/)"
 echo "host $(code https://example.com/)"
 echo "plain $(code -x "$http_proxy" http://repo.maven.apache.org/maven2/)"
 echo "ip $(code https://1.1.1.1/)"
@@ -3136,6 +3139,15 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
         "gosum: {}",
         result("gosum")
     );
+    assert_eq!(result("pypi"), "200 exit=0");
+    // Contract M6d S4: the file host answers (its root is a 404), while the
+    // same-org test index stays refused.
+    assert_eq!(result("files"), "404 exit=0");
+    assert!(
+        result("testpypi").starts_with("000 exit=") && result("testpypi") != "000 exit=0",
+        "testpypi: {}",
+        result("testpypi")
+    );
     for refused in ["host", "ip", "direct", "gateway"] {
         let r = result(refused);
         assert!(
@@ -3153,7 +3165,9 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
             "example.com:443",
             "http://repo.maven.apache.org/maven2/",
             // Contract M6d S3: the checksum database stays refused.
-            "sum.golang.org:443"
+            "sum.golang.org:443",
+            // Contract M6d S4: the same-org test index stays refused.
+            "test.pypi.org:443"
         ],
         "{log}"
     );

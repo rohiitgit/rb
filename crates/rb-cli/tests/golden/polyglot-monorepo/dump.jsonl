@@ -363,6 +363,7 @@
 ["D","scip_status","apps/web",null,{"indexer":"scip-typescript","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":true}]
 ["D","scip_status","packages/shared",null,{"indexer":"scip-typescript","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":true}]
 ["D","scip_status","services/auth",null,{"indexer":"scip-java","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":false}]
+["D","scip_status","services/billing",null,{"indexer":"scip-go","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":true}]
 ["D","scip_status","services/broken",null,{"indexer":"scip-java","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":false}]
 ["D","scip_status","services/notification",null,{"indexer":"scip-typescript","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":true}]
 ["D","unparsed_sql","services/billing/internal/invoice.go",[21,19,21,41],{"callee":"Exec","error":"Invalid statement: syntax error at or near \"$1\"","failed_statements":1}]

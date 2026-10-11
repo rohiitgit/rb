@@ -393,3 +393,7 @@
 ## 2026-10-11: mutant anchors must be line-anchored, scripts written atomically
 - **Mistake (recovered):** an S9a/S3 mutant anchor matched twice (indented copy inside a test expectation); and a script edit truncated its own file (`open(w)` before an exception).
 - **Rule:** anchor mutants on declaration lines (with preceding-line context when the entry line repeats); write scripts with `write()` to a temp file + atomic rename, never `open(w)` before computing content.
+
+## 2026-10-11: struct-field additions must update every literal constructor — `--all-targets` is the check
+- **Mistake (found, predates this phase):** M6d phase 1 added `Images.go` but left `tool_versions_record_image_identities_when_scip_is_on` constructing `Images{java, proxy}` — so `cargo clippy --workspace --all-targets` and the `rb` bin tests have been broken since phase 1, while phase 1–3 verifications reported clean (they evidently ran clippy without `--all-targets`, or only lib tests).
+- **Rule:** adding a field to a struct ends with `cargo clippy --workspace --all-targets` (not just `--workspace`) green; grep for literal constructors of the struct in test code, which the compiler only reaches under `--all-targets`/`--tests`.

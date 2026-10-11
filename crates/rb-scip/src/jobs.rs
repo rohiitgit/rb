@@ -54,9 +54,13 @@ pub enum Fetch {
     /// `go mod download`: reproducible only with a `go.sum` alongside (else
     /// the job is `unpinned`, as with an unlockfiled npm install).
     Go,
-    /// Python environment resolution (lockfile-driven in S4/S6): unpinned
-    /// until then.
-    Python,
+    /// Python environment resolution (contract M6d S4): lockfile-driven
+    /// installs only — the locked tree for a `poetry.lock`, pins without
+    /// transitive dependencies for a `requirements.txt`, the project itself
+    /// without dependencies otherwise (a `uv.lock` has no installer in the
+    /// image, so it takes the project-only path; S6 reads its versions).
+    /// Reproducible only with a `poetry.lock` alongside.
+    Python { lockfile: PythonLock },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -65,6 +69,18 @@ pub enum NodeLock {
     Yarn,
     Pnpm,
     /// No lockfile: the fetch is `npm install`, which is not reproducible; recorded on the job.
+    None,
+}
+
+/// Which lockfile a Python job's fetch installs from (contract M6d S4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PythonLock {
+    /// A `poetry.lock`: `poetry install` of the locked tree, reproducible.
+    Poetry,
+    /// A `requirements.txt`: `pip install --no-deps`, pins only.
+    Requirements,
+    /// Anything else (including a `uv.lock`, whose installer is not in the
+    /// image): `pip install --no-deps -e .`, the project only.
     None,
 }
 
@@ -224,7 +240,7 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
         });
     }
     // Python: every pyproject.toml/setup.py directory is a job (contract M6d
-    // S2); fetches stay unpinned until lockfiles drive them (S4/S6).
+    // S2); the fetch installs from its lockfile (S4).
     let mut python_roots: Vec<String> = dirs_with("pyproject.toml")
         .into_iter()
         .chain(dirs_with("setup.py"))
@@ -232,12 +248,21 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
     python_roots.sort();
     python_roots.dedup();
     for root in python_roots {
+        // The strongest pin wins: a poetry.lock pins the whole tree, a
+        // requirements.txt its pins only, anything else the project alone.
+        let lockfile = if has(&join(&root, "poetry.lock")) {
+            PythonLock::Poetry
+        } else if has(&join(&root, "requirements.txt")) {
+            PythonLock::Requirements
+        } else {
+            PythonLock::None
+        };
         out.push(Job {
             root: root.clone(),
             indexer: Indexer::ScipPython,
-            fetch: Fetch::Python,
+            fetch: Fetch::Python { lockfile },
             projects: Vec::new(),
-            unpinned: true,
+            unpinned: lockfile != PythonLock::Poetry,
         });
     }
     out.sort_by(|a, b| (a.root.as_str(), a.indexer).cmp(&(b.root.as_str(), b.indexer)));
@@ -642,7 +667,7 @@ mod tests {
                     Fetch::Maven => "maven".to_owned(),
                     Fetch::Gradle => "gradle".to_owned(),
                     Fetch::Go => "go".to_owned(),
-                    Fetch::Python => "python".to_owned(),
+                    Fetch::Python { lockfile } => format!("python({lockfile:?})"),
                     Fetch::Npm { lockfile } => format!("npm({lockfile:?})"),
                 };
                 let mut s = format!("{} {} {fetch}", j.indexer.as_str(), j.root);
@@ -701,8 +726,9 @@ mod tests {
 
     #[test]
     fn python_roots_are_their_own_jobs() {
-        // Contract M6d S2: every pyproject.toml/setup.py directory is a job;
-        // fetches are unpinned until lockfiles drive them (S4/S6).
+        // Contract M6d S2: every pyproject.toml/setup.py directory is a job.
+        // Contract M6d S4: without a lockfile the fetch installs the project
+        // only (unpinned).
         let files = [
             "pyproject.toml",
             "pkg/main.py",
@@ -712,9 +738,37 @@ mod tests {
         assert_eq!(
             summary(&files),
             [
-                "scip-python  python unpinned",
-                "scip-python libs python unpinned",
-                "scip-python tools python unpinned",
+                "scip-python  python(None) unpinned",
+                "scip-python libs python(None) unpinned",
+                "scip-python tools python(None) unpinned",
+            ]
+        );
+    }
+
+    #[test]
+    fn python_fetches_are_lockfile_driven() {
+        // Contract M6d S4: a poetry.lock installs the locked tree
+        // (reproducible); a requirements.txt installs its pins without
+        // transitive dependencies; anything else installs the project only.
+        // A uv.lock has no installer in the image, so it takes the
+        // project-only path (S6 reads its versions).
+        let files = [
+            "pyproject.toml",
+            "poetry.lock",
+            "libs/pyproject.toml",
+            "libs/requirements.txt",
+            "tools/setup.py",
+            "tools/uv.lock",
+            "tools/pyproject.toml",
+            "bare/pyproject.toml",
+        ];
+        assert_eq!(
+            summary(&files),
+            [
+                "scip-python  python(Poetry)",
+                "scip-python bare python(None) unpinned",
+                "scip-python libs python(Requirements) unpinned",
+                "scip-python tools python(None) unpinned",
             ]
         );
     }

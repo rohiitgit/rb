@@ -17,7 +17,7 @@
     },
     "nodes": 129,
     "edges": 218,
-    "diagnostics": 34,
+    "diagnostics": 35,
     "snapshots": 1,
     "coverage": {
       "sql": {
@@ -109,6 +109,15 @@
             "unpinned": false
           },
           "path": "services/auth"
+        },
+        {
+          "detail": {
+            "indexer": "scip-go",
+            "reason": "SCIP disabled (--no-scip)",
+            "status": "skipped",
+            "unpinned": true
+          },
+          "path": "services/billing"
         },
         {
           "detail": {

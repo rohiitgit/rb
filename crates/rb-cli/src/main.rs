@@ -2814,6 +2814,7 @@ mod tests {
     fn tool_versions_record_image_identities_when_scip_is_on() {
         let images = rb_scip::Images {
             java: Err("absent".into()),
+            go: Err("absent".into()),
             proxy: Ok("sha256:proxy".into()),
         };
         let on = tool_versions(&rb_indexer::ScipMode::On, &images);
@@ -2822,6 +2823,7 @@ mod tests {
         assert_eq!(on["scip_typescript"], rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE);
         let present = rb_scip::Images {
             java: Ok("sha256:abc".into()),
+            go: Ok("sha256:abc".into()),
             proxy: Ok("sha256:proxy".into()),
         };
         assert_eq!(
