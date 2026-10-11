@@ -248,8 +248,12 @@ pub(crate) fn run_projects(
                 let exported = exported
                     .iter()
                     .map(|(path, blob)| {
+                        // Contract M6d S1: scip-go exports like scip-java
+                        // (root-relative); revisited with evidence in S5.
                         let path = match job.indexer {
-                            rb_scip::Indexer::ScipJava => relative(path, &job.root),
+                            rb_scip::Indexer::ScipJava | rb_scip::Indexer::ScipGo => {
+                                relative(path, &job.root)
+                            }
                             rb_scip::Indexer::ScipTypescript => (*path).to_owned(),
                         };
                         Ok((path, read_blob(blob)?))

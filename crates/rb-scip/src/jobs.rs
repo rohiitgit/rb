@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 /// the cache key uses its image ID, resolved at run time by [`crate::Runner::image_id`]; when the
 /// image is absent the job is `unsupported` and nothing builds it implicitly.
 pub const SCIP_JAVA_IMAGE: &str = "rb-scip-java:0.13.1";
+/// The scip-go image: built locally from `docker/scip-go` (no published image
+/// is suitable). Like scip-java, a local image has no registry digest, so the
+/// cache key uses its image ID, resolved at run time; when absent the job is
+/// `unsupported` and nothing builds it implicitly.
+pub const SCIP_GO_IMAGE: &str = "rb-scip-go:0.2.7";
 /// scip-typescript 0.4.0 is published for linux/amd64 only; on arm64 hosts it runs emulated.
 pub const SCIP_TYPESCRIPT_IMAGE: &str = "sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845";
 
@@ -17,6 +22,7 @@ pub const SCIP_TYPESCRIPT_IMAGE: &str = "sourcegraph/scip-typescript@sha256:028c
 pub enum Indexer {
     ScipJava,
     ScipTypescript,
+    ScipGo,
 }
 
 impl Indexer {
@@ -24,6 +30,7 @@ impl Indexer {
         match self {
             Indexer::ScipJava => "scip-java",
             Indexer::ScipTypescript => "scip-typescript",
+            Indexer::ScipGo => "scip-go",
         }
     }
 }
@@ -38,6 +45,9 @@ pub enum Fetch {
     Gradle,
     /// `npm ci`, `yarn install --frozen-lockfile` or `pnpm install --frozen-lockfile`.
     Npm { lockfile: NodeLock },
+    /// `go mod download`: reproducible only with a `go.sum` alongside (else
+    /// the job is `unpinned`, as with an unlockfiled npm install).
+    Go,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -189,6 +199,19 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             fetch: Fetch::Npm { lockfile },
             projects,
             unpinned: lockfile == NodeLock::None,
+        });
+    }
+    // Go: every go.mod directory builds independently (workspaces are M6e).
+    let mut go_roots = dirs_with("go.mod");
+    go_roots.sort();
+    go_roots.dedup();
+    for root in go_roots {
+        out.push(Job {
+            root: root.clone(),
+            indexer: Indexer::ScipGo,
+            fetch: Fetch::Go,
+            projects: Vec::new(),
+            unpinned: !has(&join(&root, "go.sum")),
         });
     }
     out.sort_by(|a, b| (a.root.as_str(), a.indexer).cmp(&(b.root.as_str(), b.indexer)));
@@ -592,6 +615,7 @@ mod tests {
                 let fetch = match j.fetch {
                     Fetch::Maven => "maven".to_owned(),
                     Fetch::Gradle => "gradle".to_owned(),
+                    Fetch::Go => "go".to_owned(),
                     Fetch::Npm { lockfile } => format!("npm({lockfile:?})"),
                 };
                 let mut s = format!("{} {} {fetch}", j.indexer.as_str(), j.root);
@@ -629,6 +653,27 @@ mod tests {
                 "scip-java  maven",
                 "scip-java legacy gradle",
                 "scip-java tools gradle",
+            ]
+        );
+    }
+
+    #[test]
+    fn go_modules_are_their_own_jobs() {
+        // Each go.mod directory builds independently (workspaces are M6e);
+        // without a go.sum alongside, the fetch is not reproducible.
+        let files = [
+            "go.mod",
+            "go.sum",
+            "main.go",
+            "tools/go.mod",
+            "lib/go.mod",
+        ];
+        assert_eq!(
+            summary(&files),
+            [
+                "scip-go  go",
+                "scip-go lib go unpinned",
+                "scip-go tools go unpinned"
             ]
         );
     }
@@ -684,6 +729,8 @@ mod tests {
             [
                 "scip-typescript apps/web npm(None) [.] unpinned",
                 "scip-java services/auth maven",
+                // Contract M6d S1: go.mod directories are ScipGo jobs.
+                "scip-go services/billing go unpinned",
             ]
         );
         assert!(jobs(&["README.md"], &|_| None).jobs.is_empty());

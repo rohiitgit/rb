@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::egress::{CLIENT_CONFIG_AT, Egress, PROXY_IMAGE};
-use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_JAVA_IMAGE, SCIP_TYPESCRIPT_IMAGE};
+use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_TYPESCRIPT_IMAGE};
 use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
 
 /// scip-java's fetch and index recipe, part of each of its jobs' cache keys (contract M3b
@@ -23,6 +23,10 @@ pub const RECIPE_JAVA: &str = "m5-egress-1";
 /// (D7).
 pub const RECIPE_TS: &str = "m6a-ts-1";
 
+/// scip-go's recipe (contract M6d S1/S3): `go mod download`, then `scip-go`
+/// offline. Bumped like [`RECIPE_JAVA`].
+pub const RECIPE_GO: &str = "m6d-go-1";
+
 /// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
 /// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
 /// other budget settings change no index and are not part of it.
@@ -32,6 +36,7 @@ pub fn recipe(indexer: Indexer, budget: &Budget) -> String {
             format!("{RECIPE_JAVA}+T{}", budget.maven_threads)
         }
         Indexer::ScipJava => RECIPE_JAVA.to_owned(),
+        Indexer::ScipGo => RECIPE_GO.to_owned(),
         Indexer::ScipTypescript => RECIPE_TS.to_owned(),
     }
 }
@@ -189,6 +194,7 @@ pub fn image_for(job: &Job) -> &'static str {
     match job.indexer {
         Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
         Indexer::ScipJava => SCIP_JAVA_IMAGE,
+        Indexer::ScipGo => SCIP_GO_IMAGE,
     }
 }
 
@@ -203,6 +209,8 @@ pub struct Images {
     /// scip-typescript needs no field: its jobs run by, cache under and are identified by the
     /// pinned digest reference (Docker pulls it when absent; contract M3b amendment 48).
     pub java: Result<String, String>,
+    /// scip-go: like scip-java, a locally built image identified by ID.
+    pub go: Result<String, String>,
     /// The egress proxy image (contract M5 S21): its ID, or the reason every job is
     /// `unsupported` (no fetch runs without the proxy; nothing builds it implicitly).
     pub proxy: Result<String, String>,
@@ -215,6 +223,12 @@ impl Images {
                 format!(
                     "scip-java: image {SCIP_JAVA_IMAGE} is not available locally; build it as \
                      docker/scip-java/README.md describes"
+                )
+            }),
+            go: runner.image_id(SCIP_GO_IMAGE).ok_or_else(|| {
+                format!(
+                    "scip-go: image {SCIP_GO_IMAGE} is not available locally; build it as \
+                     docker/scip-go/README.md describes"
                 )
             }),
             proxy: runner.image_id(PROXY_IMAGE).ok_or_else(|| {
@@ -232,6 +246,9 @@ impl Images {
             java: Err(format!(
                 "scip-java: image {SCIP_JAVA_IMAGE} was not looked up"
             )),
+            go: Err(format!(
+                "scip-go: image {SCIP_GO_IMAGE} was not looked up"
+            )),
             proxy: Err(format!(
                 "egress proxy: image {PROXY_IMAGE} was not looked up"
             )),
@@ -245,6 +262,7 @@ impl Images {
         let image = match job.indexer {
             Indexer::ScipTypescript => Ok(SCIP_TYPESCRIPT_IMAGE.to_owned()),
             Indexer::ScipJava => self.java.clone(),
+            Indexer::ScipGo => self.go.clone(),
         }?;
         self.proxy.as_ref().map_err(Clone::clone)?;
         Ok(image)
@@ -255,6 +273,7 @@ impl Images {
     pub fn identity(&self, indexer: Indexer) -> &str {
         match indexer {
             Indexer::ScipJava => self.java.as_deref().unwrap_or("absent"),
+            Indexer::ScipGo => self.go.as_deref().unwrap_or("absent"),
             Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
         }
     }
@@ -312,6 +331,7 @@ pub fn run_job(
         let (mut fetches, mut index) = match job.indexer {
             Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
             Indexer::ScipJava => java_runs(image, work_dir, cache_dir, budget)?,
+            Indexer::ScipGo => go_runs(image, work_dir, cache_dir, budget)?,
         };
         for fetch in &mut fetches {
             fetch.name = Some(format!("{name}-fetch"));
@@ -563,6 +583,9 @@ fn typescript_runs(
         Fetch::Maven | Fetch::Gradle => {
             anyhow::bail!("a Java fetch on a TypeScript job")
         }
+        Fetch::Go => {
+            anyhow::bail!("a Go fetch on a TypeScript job")
+        }
     };
     let fetch = ContainerRun {
         entrypoint: Some(entrypoint.into()),
@@ -669,6 +692,47 @@ fn java_runs(
         ..base
     };
     Ok((fetches, index))
+}
+
+/// The fetch and index invocations for a scip-go job (docker/scip-go/README.md).
+/// The fetch phase downloads the module graph into the repository's Go module
+/// cache (`go mod download`); the index phase runs `scip-go` offline
+/// (contract M6d S1; proxy settings and lockfile discipline harden in S3/S4).
+fn go_runs(
+    image: &str,
+    work_dir: &Path,
+    cache_dir: &Path,
+    budget: &Budget,
+) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
+    let workdir = crate::runner::absolute(work_dir)?;
+    let gomod = crate::runner::absolute(cache_dir)?.join("gomod");
+    std::fs::create_dir_all(&gomod)?;
+    let base = ContainerRun {
+        name: None,
+        image: image.into(),
+        platform: None,
+        workdir,
+        mount_at: "/sources".into(),
+        cwd: String::new(),
+        caches: vec![(gomod, "/root/go/pkg/mod".into())],
+        readonly: Vec::new(),
+        env: Vec::new(),
+        network: Network::Fetch,
+        cpus: budget.cpus,
+        memory: budget.memory.clone(),
+        timeout: budget.fetch_timeout,
+        entrypoint: None,
+        args: Vec::new(),
+    };
+    let mut fetch = base.clone();
+    fetch.args = ["go", "mod", "download"].map(String::from).to_vec();
+    let index = ContainerRun {
+        network: Network::None,
+        timeout: budget.index_timeout,
+        args: ["scip-go"].map(String::from).to_vec(),
+        ..base
+    };
+    Ok((vec![fetch], index))
 }
 
 fn once(s: &str) -> std::iter::Once<&str> {
@@ -827,6 +891,38 @@ mod tests {
             projects: Vec::new(),
             unpinned: false,
         }
+    }
+
+    fn go_job() -> Job {
+        Job {
+            root: "svc".into(),
+            indexer: Indexer::ScipGo,
+            fetch: Fetch::Go,
+            projects: Vec::new(),
+            unpinned: false,
+        }
+    }
+
+    /// Contract M6d S1: a Go job fetches with `go mod download` on the fetch
+    /// network (module cache mounted) and indexes with `scip-go` offline.
+    #[test]
+    fn go_job_runs_download_then_scip_go() {
+        let lines = argv_lines(&go_job(), "sha256:go", &Budget::default());
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("--network rb-scip-fetch")
+                && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
+                && lines[0].contains("go mod download")
+                && lines[0].contains("/root/go/pkg/mod"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("--network none")
+                && lines[1].ends_with("scip-go"),
+            "{}",
+            lines[1]
+        );
     }
 
     fn files() -> Vec<(String, Vec<u8>)> {
