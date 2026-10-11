@@ -24,6 +24,11 @@ pub(crate) fn is_input(path: &str) -> bool {
             | "npm-shrinkwrap.json"
             | "go.mod"
             | "pom.xml"
+            // `build.gradle(.kts)` dependencies and `libs.versions.toml`
+            // catalogs feed `maven/` package edges (contract M6e S3).
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "libs.versions.toml"
             // `pyproject.toml` direct dependencies feed `py/` package edges;
             // `poetry.lock`/`uv.lock` pin their versions (contract M6d S6).
             // `requirements.txt`/`Pipfile` files are noticed, never read.
@@ -263,6 +268,21 @@ fn lockfile_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<Result<Stri
 }
 
 /// The package an npm alias installs: `npm:bar@^1` → `bar`, `npm:@s/p@2` → `@s/p`.
+/// The version catalog governing a Gradle build file: the nearest
+/// `gradle/libs.versions.toml` at or above the build file's directory
+/// (contract M6e S3; mirrors `lockfile_for`).
+fn catalog_for(build_path: &str, paths: &BTreeSet<&str>) -> Option<String> {
+    let mut dir = Some(build_path.rsplit_once('/').map_or("", |(d, _)| d));
+    while let Some(d) = dir {
+        let path = format!("{}gradle/libs.versions.toml", dir_prefix(d));
+        if paths.contains(path.as_str()) {
+            return Some(path);
+        }
+        dir = parent_dir(d);
+    }
+    None
+}
+
 fn npm_alias(declared: &str) -> Option<&str> {
     let spec = declared.trim().strip_prefix("npm:")?;
     let name = match spec.rfind('@') {
@@ -1034,6 +1054,483 @@ fn attrs(pairs: &[(&str, &str)]) -> Attrs {
         .collect()
 }
 
+/// A Gradle version catalog (`gradle/libs.versions.toml`): alias → (module
+/// `group:artifact`, version if the catalog states one). Versions resolve
+/// through `[versions]`; a dangling `version.ref` names the module with no
+/// version (safe `?` at use, never an error). Anything outside the
+/// allow-listed shapes makes the whole catalog unreadable (contract M6e S3:
+/// deny-default on structure, lenient on forward-compatible additions —
+/// unknown root sections like `[plugins]`/`[bundles]` are ignored, while a
+/// malformed `[libraries]` entry fails the read).
+fn gradle_catalog(text: &str) -> Result<BTreeMap<String, (String, Option<String>)>, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let mut versions: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(v) = table.get("versions") {
+        let v = v
+            .as_table()
+            .ok_or_else(|| "versions is not a table".to_owned())?;
+        // Rich versions (`lang = { strictly = … }`) are deliberately not
+        // resolved: the entry is skipped, so references to it dangle to `?`
+        // instead of taking the whole catalog down with them.
+        for (k, val) in v {
+            if let Some(s) = val.as_str() {
+                versions.insert(k.clone(), s.to_owned());
+            }
+        }
+    }
+    fn libraries(
+        table: &toml::Table,
+        prefix: &str,
+        versions: &BTreeMap<String, String>,
+        out: &mut BTreeMap<String, (String, Option<String>)>,
+    ) -> Result<(), String> {
+        for (k, val) in table {
+            let alias = if prefix.is_empty() {
+                k.clone()
+            } else {
+                format!("{prefix}.{k}")
+            };
+            match val {
+                toml::Value::String(s) => {
+                    let mut parts = s.split(':');
+                    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                        (Some(g), Some(a), v, None) => {
+                            out.insert(alias, (format!("{g}:{a}"), v.map(str::to_owned)));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "library {alias:?} is not group:artifact[:version]"
+                            ));
+                        }
+                    }
+                }
+                toml::Value::Table(t) if t.contains_key("module") => {
+                    let module = t
+                        .get("module")
+                        .and_then(toml::Value::as_str)
+                        .ok_or_else(|| format!("library {alias:?} has no string module"))?;
+                    if module.split(':').count() != 2 {
+                        return Err(format!("library {alias:?} module is not group:artifact"));
+                    }
+                    let version = match (t.get("version"), t.get("version.ref")) {
+                        (None, None) => None,
+                        (Some(toml::Value::String(v)), None) => Some(v.clone()),
+                        (None, Some(toml::Value::String(r))) => versions.get(r).cloned(),
+                        // A dotted `version.ref` parses as a nested table.
+                        (None, Some(toml::Value::Table(t))) => match t.get("ref") {
+                            Some(toml::Value::String(r)) => versions.get(r).cloned(),
+                            _ => None,
+                        },
+                        // Rich versions, double declarations and wrong types:
+                        // the version is unresolvable, so the entry dangles
+                        // to `?` rather than failing the whole read.
+                        _ => None,
+                    };
+                    out.insert(alias, (module.to_owned(), version));
+                }
+                toml::Value::Table(t) => libraries(t, &alias, versions, out)?,
+                _ => {
+                    return Err(format!("library {alias:?} is not a string or table"));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = BTreeMap::new();
+    if let Some(l) = table.get("libraries") {
+        libraries(
+            l.as_table()
+                .ok_or_else(|| "libraries is not a table".to_owned())?,
+            "",
+            &versions,
+            &mut out,
+        )?;
+    }
+    Ok(out)
+}
+
+/// One Gradle dependency with its resolved version, mirroring `Pom.deps`.
+struct GradleDep {
+    dep: Dep,
+    version: String,
+    from: &'static str,
+    conflict: Vec<String>,
+}
+
+/// Dependency configurations read, with the scope each reports (contract
+/// M6e S3: allow-listed; custom configurations stay out).
+const GRADLE_CONFIGS: &[(&str, &str)] = &[
+    ("testImplementation", "test"),
+    ("testRuntimeOnly", "test"),
+    ("implementation", "runtime"),
+    ("compileOnly", "compile"),
+    ("runtimeOnly", "runtime"),
+    ("api", "runtime"),
+];
+
+/// `line` without a `//` comment (a `//` inside quotes is kept). Byte-safe:
+/// only ASCII bytes decide, and a multibyte character never contains one.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if quote.is_none() && b == b'\\' {
+            escaped = true;
+        } else if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+        } else if Some(b) == quote {
+            quote = None;
+        } else if quote.is_none() && b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return line.get(..i).unwrap_or(line);
+        }
+        i += 1;
+    }
+    line
+}
+
+/// The content of the first balanced parenthesis group of `s` (which starts
+/// just after the opening paren), skipping quoted spans; `None` when
+/// unbalanced. Byte-safe: never splits a character, returns `None` instead.
+fn paren_group(s: &str) -> Option<&str> {
+    let mut depth = 1u32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, b) {
+            (None, b'\\') => escaped = true,
+            (None, b'(') => depth += 1,
+            (None, b')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return s.get(..i);
+                }
+            }
+            (None, b'"') | (None, b'\'') => quote = Some(b),
+            (Some(q), b) if b == q => quote = None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A quoted string's content (`"…"`, `'…`), or the bare token itself.
+fn unquote(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.len() >= 2
+        && ((token.starts_with('"') && token.ends_with('"'))
+            || (token.starts_with('\'') && token.ends_with('\'')))
+    {
+        Some(token[1..token.len() - 1].to_owned())
+    } else if token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'$'))
+    {
+        Some(token.to_owned())
+    } else {
+        None
+    }
+}
+
+/// A `group:artifact[:version]` coordinate, or `None` outside the shape.
+/// An interpolated (`$`) version resolves to nothing (safe `?`).
+fn gav(text: &str) -> Option<(String, String, Option<String>)> {
+    let mut parts = text.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(g), Some(a), v, None)
+            if !g.is_empty() && !a.is_empty() && !g.contains('$') && !a.contains('$') =>
+        {
+            let version = match v {
+                Some(v) if !v.is_empty() && !v.contains('$') => Some(v.to_owned()),
+                _ => None,
+            };
+            Some((
+                format!("{g}/{a}"),
+                v.unwrap_or_default().to_owned(),
+                version,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Split on top-level commas (commas inside quotes do not split); `None`
+/// when quotes are unbalanced.
+fn split_top_level(text: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, b) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quote.is_none() && b == b'\\' {
+            escaped = true;
+        } else if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+        } else if Some(b) == quote {
+            quote = None;
+        } else if quote.is_none() && b == b',' {
+            parts.push(text.get(start..i)?);
+            start = i + 1;
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    parts.push(text.get(start..)?);
+    Some(parts)
+}
+
+/// Whether `text` holds a top-level `:` or `=` (outside quotes): a map or
+/// named-argument form rather than a single coordinate.
+fn has_top_level_pair(text: &str) -> bool {
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for b in text.bytes() {
+        if escaped {
+            escaped = false;
+        } else if quote.is_none() && b == b'\\' {
+            escaped = true;
+        } else if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+        } else if Some(b) == quote {
+            quote = None;
+        } else if quote.is_none() && (b == b':' || b == b'=') {
+            return true;
+        }
+    }
+    false
+}
+
+/// One dependency spec: (name `group/artifact`, declared version expression,
+/// resolved version, source). `None` outside the allow-listed shapes
+/// (contract M6e S3).
+fn gradle_spec(
+    spec: &str,
+    catalog: &BTreeMap<String, (String, Option<String>)>,
+) -> Option<(String, String, Option<String>, &'static str)> {
+    let spec = spec.trim();
+    // One `platform()`/`enforcedPlatform()` layer unwraps to the platform
+    // artifact itself; deeper nesting and `project()` references stay out.
+    let mut inner = spec;
+    for prefix in ["platform", "enforcedPlatform"] {
+        if let Some(rest) = inner.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            inner = paren_group(rest.strip_prefix('(')?)?;
+            let nested = inner.trim_start();
+            if nested.starts_with("platform(") || nested.starts_with("enforcedPlatform(") {
+                return None;
+            }
+            break;
+        }
+    }
+    if inner.trim_start().starts_with("project(") {
+        return None;
+    }
+    // A `libs.` catalog reference (bare or parenthesised; the paren group
+    // already isolated it).
+    let token = inner.trim();
+    if let Some(alias) = token.strip_prefix("libs.") {
+        if !alias
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+            || alias.is_empty()
+        {
+            return None;
+        }
+        return match catalog.get(alias) {
+            Some((module, version)) => {
+                let mut parts = module.split(':');
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(g), Some(a), None) => Some((
+                        format!("{g}/{a}"),
+                        token.to_owned(),
+                        version.clone(),
+                        if version.is_some() {
+                            "catalog"
+                        } else {
+                            "unresolved"
+                        },
+                    )),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+    }
+    // Map / named-argument form (`group: 'g', name: 'a', version: 'v'`).
+    if has_top_level_pair(token) {
+        let parts = split_top_level(token)?;
+        let mut group = None;
+        let mut name = None;
+        let mut module = None;
+        let mut version = None;
+        for part in parts {
+            let mut kv = part.splitn(2, [':', '=']);
+            let (k, v) = (kv.next()?.trim(), kv.next()?.trim());
+            let k = unquote(k)?;
+            let v = unquote(v)?;
+            match k.as_str() {
+                "group" => group = Some(v),
+                "name" => name = Some(v),
+                "module" => module = Some(v),
+                "version" => version = Some(v),
+                _ => return None,
+            }
+        }
+        let (g, a) = match (group, name, module) {
+            (Some(g), Some(a), _) if !g.contains('$') && !a.contains('$') => (g, a),
+            (None, None, Some(m)) => match m.split_once(':') {
+                Some((g, a)) if !g.contains('$') && !a.contains('$') => {
+                    (g.to_owned(), a.to_owned())
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        return match version {
+            Some(v) if !v.is_empty() && !v.contains('$') => {
+                Some((format!("{g}/{a}"), v.clone(), Some(v), "literal"))
+            }
+            _ => Some((
+                format!("{g}/{a}"),
+                version.unwrap_or_default(),
+                None,
+                "unresolved",
+            )),
+        };
+    }
+    // Triple form (`"g", "a", "v"`) or a single coordinate.
+    if token.contains(',') {
+        let parts = split_top_level(token)?;
+        if parts.len() != 2 && parts.len() != 3 {
+            return None;
+        }
+        let gav: Vec<String> = parts
+            .iter()
+            .map(|p| unquote(p.trim()).unwrap_or_default())
+            .collect();
+        let (g, a) = (gav[0].clone(), gav[1].clone());
+        if g.is_empty() || a.is_empty() || g.contains('$') || a.contains('$') {
+            return None;
+        }
+        return match gav.get(2).map(String::as_str) {
+            None | Some("") => Some((format!("{g}/{a}"), String::new(), None, "unresolved")),
+            Some(v) if v.contains('$') => {
+                Some((format!("{g}/{a}"), v.to_owned(), None, "unresolved"))
+            }
+            Some(v) => Some((
+                format!("{g}/{a}"),
+                v.to_owned(),
+                Some(v.to_owned()),
+                "literal",
+            )),
+        };
+    }
+    // A single `group:artifact[:version]` string.
+    let token = unquote(token)?;
+    let (name, declared, version) = gav(&token)?;
+    let from = if version.is_some() {
+        "literal"
+    } else {
+        "unresolved"
+    };
+    Some((name, declared, version, from))
+}
+
+/// The dependencies a Gradle build file declares (both DSLs): literals,
+/// `libs.` catalog references and `platform()`-wrapped literals.
+/// `project()` references, multi-line blocks and anything outside the
+/// allow-listed shapes stay out (contract M6e S3). Duplicates mirror Maven:
+/// the first declaration stays, cleared to `@?` when versions differ.
+fn gradle_deps(text: &str, catalog: &BTreeMap<String, (String, Option<String>)>) -> Vec<GradleDep> {
+    let mut deps: Vec<GradleDep> = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let stripped = strip_line_comment(line);
+        let body = stripped.trim_start();
+        if body.is_empty() {
+            continue;
+        }
+        // Longest-first: `testImplementation` wins over `implementation`.
+        // No trailing-boundary check: followers are strict (a parenthesis
+        // or an exact spec), so a longer identifier can never parse — proven
+        // when its mutant survived (contract M6e amendment 4), and the
+        // `implementationX` row below pins the behavior.
+        let Some((config, scope)) = GRADLE_CONFIGS.iter().find(|&(c, _)| body.starts_with(c))
+        else {
+            continue;
+        };
+        let kw_start = start + (stripped.len() - body.len());
+        let rest = body[config.len()..].trim_start();
+        let rest_start = kw_start + config.len() + (body[config.len()..].len() - rest.len());
+        // Parenthesised form: the first balanced group; bare form: the rest
+        // of the line must be exactly one spec.
+        let (spec, spec_end) = if let Some(after) = rest.strip_prefix('(') {
+            let Some(group) = paren_group(after) else {
+                continue;
+            };
+            let end = rest_start + 1 + group.len() + 1;
+            (group, end)
+        } else {
+            (rest, rest_start + rest.len())
+        };
+        let Some((name, declared, version, from)) = gradle_spec(spec, catalog) else {
+            continue;
+        };
+        deps.push(GradleDep {
+            dep: Dep {
+                name,
+                declared,
+                scope,
+                span: span_of(text, kw_start, spec_end),
+            },
+            version: version.unwrap_or_default(),
+            from,
+            conflict: Vec::new(),
+        });
+    }
+    // An artifact declared twice: Maven keeps one declaration (and warns), so with
+    // different versions none is the stated one. First stays, listing every version read.
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for d in &deps {
+        let read = if d.version.is_empty() {
+            if d.dep.declared.is_empty() {
+                "?".to_owned()
+            } else {
+                d.dep.declared.clone()
+            }
+        } else {
+            d.version.clone()
+        };
+        let seen = versions.entry(d.dep.name.clone()).or_default();
+        if !seen.contains(&read) {
+            seen.push(read);
+        }
+    }
+    let mut kept = BTreeSet::new();
+    deps.retain(|d| kept.insert(d.dep.name.clone()));
+    for d in &mut deps {
+        if versions[&d.dep.name].len() > 1 {
+            d.version.clear();
+            d.from = "unresolved";
+            d.conflict.clone_from(&versions[&d.dep.name]);
+        }
+    }
+    deps
+}
+
 fn diagnostic(kind: &str, path: &str, span: Option<Span>, detail: Value) -> Diagnostic {
     Diagnostic {
         kind: kind.to_owned(),
@@ -1082,6 +1579,9 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
         }
     }
     let rel_dir = |dir: &str| dir_prefix(dir).trim_end_matches('/').to_owned();
+    // Catalogs already reported unreadable (one diagnostic per catalog, not
+    // per build file using it).
+    let mut catalog_unread: BTreeSet<String> = BTreeSet::new();
     for p in inputs.projects {
         let service = p.dir.as_str();
         let here = rel_dir(service);
@@ -1428,6 +1928,55 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                         });
                     }
                 }
+                "build.gradle" | "build.gradle.kts" => {
+                    // The governing catalog (nearest `gradle/libs.versions.toml`
+                    // above the build file); an unreadable one is one
+                    // diagnostic, and its `libs.` references stay unresolved.
+                    let mut catalog = BTreeMap::new();
+                    if let Some(path) = catalog_for(m, inputs.paths)
+                        && let Some(text) = inputs.texts.get(path.as_str())
+                    {
+                        match gradle_catalog(text) {
+                            Ok(read) => catalog = read,
+                            Err(reason) => {
+                                if catalog_unread.insert(path.clone()) {
+                                    diagnostics.push(diagnostic(
+                                        "catalog_unreadable",
+                                        &path,
+                                        None,
+                                        json!({ "service": service, "reason": reason }),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    for d in gradle_deps(text, &catalog) {
+                        let certainty = if !d.conflict.is_empty() {
+                            Certainty::Heuristic
+                        } else {
+                            Certainty::Exact
+                        };
+                        let mut attrs = attrs(&[
+                            ("declared", &d.dep.declared),
+                            ("scope", d.dep.scope),
+                            ("version_from", d.from),
+                        ]);
+                        if !d.conflict.is_empty() {
+                            attrs.insert("versions".into(), json!(d.conflict));
+                        }
+                        edges.push(ManifestEdge {
+                            service: service.to_owned(),
+                            target: Target::Package(Package {
+                                manager: "maven",
+                                name: d.dep.name.clone(),
+                                version: d.version.clone(),
+                            }),
+                            certainty,
+                            attrs,
+                            evidence: evidence(d.dep.span),
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -1556,6 +2105,200 @@ mod tests {
         assert!(is_input("svc/lombok.config"));
         assert!(is_input("lombok.config"));
         assert!(!is_input("svc/lombok.config.bak"));
+    }
+
+    /// Contract M6e S3: Gradle build files and version catalogs reach the
+    /// manifest readers that feed `maven/` package edges.
+    #[test]
+    fn gradle_build_files_and_catalogs_are_manifest_inputs() {
+        assert!(is_input("svc/build.gradle"));
+        assert!(is_input("svc/build.gradle.kts"));
+        assert!(is_input("svc/gradle/libs.versions.toml"));
+        assert!(is_input("build.gradle"));
+        assert!(!is_input("svc/build.gradle.bak"));
+        assert!(!is_input("svc/settings.gradle"));
+    }
+
+    /// Contract M6e S3: version catalogs resolve `module` + `version` /
+    /// `version.ref` / short `group:artifact:version` entries; a dangling
+    /// ref resolves to nothing; bad TOML is unreadable, never inferred.
+    #[test]
+    fn gradle_catalogs_resolve_libraries_versions_and_refs() {
+        let catalog = gradle_catalog(
+            "[versions]\nlang = \"3.20.0\"\n[libraries]\nlang3 = { module = \"org.apache.commons:commons-lang3\", version = \"3.20.0\" }\ngson = { module = \"com.google.code.gson:gson\", version.ref = \"gson\" }\nshort = \"org.example:short:1.2.3\"\ndangling = { module = \"org.example:dangling\", version.ref = \"missing\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.get("lang3"),
+            Some(&(
+                "org.apache.commons:commons-lang3".to_owned(),
+                Some("3.20.0".to_owned())
+            ))
+        );
+        assert_eq!(
+            catalog.get("gson"),
+            Some(&("com.google.code.gson:gson".to_owned(), None))
+        );
+        assert_eq!(
+            catalog.get("short"),
+            Some(&("org.example:short".to_owned(), Some("1.2.3".to_owned())))
+        );
+        assert_eq!(
+            catalog.get("dangling"),
+            Some(&("org.example:dangling".to_owned(), None))
+        );
+        assert!(gradle_catalog("[[[nope").is_err());
+        assert!(gradle_catalog("[libraries]\nlang3 = 42\n").is_err());
+    }
+
+    /// Contract M6e S3: Kotlin-DSL literals across the allow-listed
+    /// configurations — parenthesised, triple-argument, named-argument and
+    /// `libs.` forms; `platform()` unwraps; `$`-interpolated versions stay
+    /// unresolved; commented lines give nothing.
+    #[test]
+    fn gradle_kotlin_literals_and_catalog_refs() {
+        let catalog = gradle_catalog(
+            "[libraries]\nlang3 = { module = \"org.apache.commons:commons-lang3\", version = \"3.20.0\" }\nodd = { module = \"org.example:odd\", version = \"3.0.1\" }\n",
+        )
+        .unwrap();
+        let deps = gradle_deps(
+            "plugins { id(\"java\") }\ndependencies {\n    implementation(\"org.apache.commons:commons-lang3:3.20.0\")\n    api(\"com.google.code.gson\", \"gson\", \"2.13.1\")\n    testImplementation(libs.odd)\n    compileOnly(group = \"org.example\", name = \"bare\", version = \"1.0\")\n    runtimeOnly(\"org.example:interp:${v}\")\n    implementation(platform(\"org.example:bom:2.0\"))\n    // implementation(\"org.example:commented:9.9\")\n}\n",
+            &catalog,
+        );
+        let row =
+            |d: &GradleDep| format!("{}|{}|{}|{}", d.dep.name, d.version, d.from, d.dep.scope);
+        let rows: Vec<String> = deps.iter().map(row).collect();
+        assert_eq!(
+            rows,
+            [
+                "org.apache.commons/commons-lang3|3.20.0|literal|runtime",
+                "com.google.code.gson/gson|2.13.1|literal|runtime",
+                "org.example/odd|3.0.1|catalog|test",
+                "org.example/bare|1.0|literal|compile",
+                "org.example/interp||unresolved|runtime",
+                "org.example/bom|2.0|literal|runtime",
+            ]
+        );
+    }
+
+    /// Contract M6e S3: Groovy-DSL literals — single quotes, bare (no
+    /// parens), map notation and `libs.` forms; `project()` references and
+    /// multi-line blocks stay out.
+    #[test]
+    fn gradle_groovy_literals_maps_and_bare_forms() {
+        let catalog = gradle_catalog(
+            "[libraries]\nodd = { module = \"org.example:is-odd\", version = \"3.0.1\" }\n",
+        )
+        .unwrap();
+        let deps = gradle_deps(
+            "dependencies {\n    implementation 'org.apache.commons:commons-lang3:3.20.0'\n    implementation \"org.example:bare:1.1\"\n    implementation group: 'org.example', name: 'mapped', version: '2.0'\n    testImplementation libs.odd\n    implementation project(':lib')\n    implementation(\"org.example:multi\",\n        \"1.2\")\n    implementation 'org.example:trail:1.0' // trailing comment\n    implementationX(\"org.example:nope:1.0\")\n}\n",
+            &catalog,
+        );
+        let rows: Vec<String> = deps
+            .iter()
+            .map(|d| format!("{}|{}|{}|{}", d.dep.name, d.version, d.from, d.dep.scope))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "org.apache.commons/commons-lang3|3.20.0|literal|runtime",
+                "org.example/bare|1.1|literal|runtime",
+                "org.example/mapped|2.0|literal|runtime",
+                "org.example/is-odd|3.0.1|catalog|test",
+                "org.example/trail|1.0|literal|runtime",
+            ]
+        );
+    }
+
+    /// Contract M6e S3: a repeated artifact at two versions keeps the first
+    /// and clears it to `@?` with `versions` (the Maven duplicate rule).
+    #[test]
+    fn gradle_duplicate_artifacts_keep_the_first_as_unknown() {
+        let projects = [project("a", &["a/build.gradle"])];
+        let (edges, _) = run(
+            &projects,
+            &[(
+                "a/build.gradle",
+                "dependencies {\n    implementation(\"org.example:dup:1.0\")\n    implementation(\"org.example:dup:2.0\")\n}\n",
+            )],
+        );
+        assert_eq!(
+            edges,
+            [
+                "a -> maven/org.example/dup@? [heuristic] {\"declared\":\"1.0\",\"scope\":\"runtime\",\"version_from\":\"unresolved\",\"versions\":[\"1.0\",\"2.0\"]}"
+            ]
+        );
+    }
+
+    /// Contract M6e S3: the governing catalog is the nearest
+    /// `gradle/libs.versions.toml` at or above the build file.
+    #[test]
+    fn gradle_catalogs_govern_from_the_nearest_ancestor() {
+        let projects = [project("a", &["a/sub/build.gradle"])];
+        let (edges, _) = run(
+            &projects,
+            &[
+                (
+                    "a/sub/build.gradle",
+                    "dependencies {\n    implementation(libs.odd)\n}\n",
+                ),
+                (
+                    "a/gradle/libs.versions.toml",
+                    "[libraries]\nodd = { module = \"org.example:odd\", version = \"3.0.1\" }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                "a -> maven/org.example/odd@3.0.1 [exact] {\"declared\":\"libs.odd\",\"scope\":\"runtime\",\"version_from\":\"catalog\"}"
+            ]
+        );
+    }
+
+    /// Contract M6e S3, edge level: literals are `Exact`, catalog pins are
+    /// `Exact` with `version_from: catalog`, unresolvable versions are
+    /// `Exact` with `version_from: unresolved`, and an unreadable catalog is
+    /// a diagnostic (its `libs.` refs stay unresolved).
+    #[test]
+    fn gradle_edges_versions_and_catalog_diagnostics() {
+        let projects = [
+            project("k", &["k/build.gradle.kts", "k/gradle/libs.versions.toml"]),
+            project("g", &["g/build.gradle", "g/gradle/libs.versions.toml"]),
+        ];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                (
+                    "k/build.gradle.kts",
+                    "dependencies {\n    implementation(\"org.apache.commons:commons-lang3:3.20.0\")\n    testImplementation(libs.odd)\n    implementation(\"org.example:interp:${v}\")\n    implementation(libs.ghost)\n}\n",
+                ),
+                (
+                    "k/gradle/libs.versions.toml",
+                    "[libraries]\nlang3 = { module = \"org.apache.commons:commons-lang3\", version = \"3.20.0\" }\nodd = { module = \"org.example:odd\", version = \"3.0.1\" }\nghost = { module = \"org.example:ghost\" }\n",
+                ),
+                (
+                    "g/build.gradle",
+                    "dependencies {\n    implementation 'org.example:mapped:4.0'\n    implementation(\"org.example:bare\")\n}\n",
+                ),
+                ("g/gradle/libs.versions.toml", "[[[nope"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                "k -> maven/org.apache.commons/commons-lang3@3.20.0 [exact] {\"declared\":\"3.20.0\",\"scope\":\"runtime\",\"version_from\":\"literal\"}",
+                "k -> maven/org.example/odd@3.0.1 [exact] {\"declared\":\"libs.odd\",\"scope\":\"test\",\"version_from\":\"catalog\"}",
+                "k -> maven/org.example/interp@? [exact] {\"declared\":\"${v}\",\"scope\":\"runtime\",\"version_from\":\"unresolved\"}",
+                "k -> maven/org.example/ghost@? [exact] {\"declared\":\"libs.ghost\",\"scope\":\"runtime\",\"version_from\":\"unresolved\"}",
+                "g -> maven/org.example/mapped@4.0 [exact] {\"declared\":\"4.0\",\"scope\":\"runtime\",\"version_from\":\"literal\"}",
+                "g -> maven/org.example/bare@? [exact] {\"scope\":\"runtime\",\"version_from\":\"unresolved\"}",
+            ]
+        );
+        assert_eq!(
+            diagnostics,
+            ["catalog_unreadable g/gradle/libs.versions.toml"]
+        );
     }
 
     const LOCK: &str = r#"{
