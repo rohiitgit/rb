@@ -127,6 +127,9 @@ pub fn is_lombok_generated_marker(symbol: &str) -> bool {
 
 /// The package of a global symbol; `None` for local symbols, strings the grammar rejects and
 /// symbols with no package (scip-java's namespace-only `scip-java maven . . org/springframework/`).
+/// scip-go reports module-resolved symbols under the manager `gomod`, which normalises to the
+/// manifest's `go` (contract M6d S5: one shared `go/<module>@<version>` key); every other
+/// manager passes through untouched.
 pub fn package(symbol: &str) -> Option<Package> {
     if scip::symbol::is_local_symbol(symbol) {
         return None;
@@ -136,12 +139,17 @@ pub fn package(symbol: &str) -> Option<Package> {
     if p.manager.is_empty() || p.name.is_empty() {
         return None;
     }
+    let manager = if p.manager == "gomod" {
+        "go"
+    } else {
+        &p.manager
+    };
     let name = p
         .name
-        .strip_prefix(&format!("{}/", p.manager))
+        .strip_prefix(&format!("{manager}/"))
         .unwrap_or(&p.name);
     Some(Package {
-        manager: p.manager.clone(),
+        manager: manager.to_owned(),
         name: name.to_owned(),
         version: p.version.clone(),
     })
@@ -313,6 +321,60 @@ mod tests {
         assert_eq!(package(""), None);
     }
 
+    /// Contract M6d S5: scip-go reports module-resolved symbols under the
+    /// manager `gomod`, which keys as the manifest's `go` (one shared
+    /// `go/<module>@<version>` key); names and versions pass through
+    /// byte-identical, and a version the index did not report keys apart
+    /// (`?`), so a mismatch keeps both rows (D3).
+    #[test]
+    fn go_packages_key_as_the_manifest_does() {
+        let pkg = |manager: &str, name: &str, version: &str| Package {
+            manager: manager.into(),
+            name: name.into(),
+            version: version.into(),
+        };
+        // Measured with rb-scip-go:0.2.7 on a gin-bearing module: a dependency
+        // carries its module path and resolved version.
+        let gin = package("scip-go gomod github.com/gin-gonic/gin v1.10.0 gin/Context#").unwrap();
+        assert_eq!(gin, pkg("go", "github.com/gin-gonic/gin", "v1.10.0"));
+        assert_eq!(gin.key(), "go/github.com/gin-gonic/gin@v1.10.0");
+        // The standard library is a pseudo-module at the toolchain version.
+        let std = package("scip-go gomod github.com/golang/go/src go1.23 net/http#Get().").unwrap();
+        assert_eq!(std.key(), "go/github.com/golang/go/src@go1.23");
+        // The main module reports no version (`.` parses as absent, as on
+        // scip-java's `maven/org.ext/lib .` above).
+        let own = package("scip-go gomod github.com/acme/billing . billing/Handler#").unwrap();
+        assert_eq!(own.key(), "go/github.com/acme/billing@?");
+        // npm and maven managers pass through untouched.
+        assert_eq!(
+            package("scip-typescript npm gin 1.0.0 src/`a.ts`/")
+                .unwrap()
+                .key(),
+            "npm/gin@1.0.0"
+        );
+    }
+
+    /// Contract M6d S5/D3: the same module at different versions keys apart,
+    /// so each row survives (never merged across keys).
+    #[test]
+    fn go_packages_at_different_versions_key_apart() {
+        let at = |version: &str| {
+            package(&format!(
+                "scip-go gomod github.com/gin-gonic/gin {version} gin/Context#"
+            ))
+            .unwrap()
+            .key()
+        };
+        assert_eq!(at("v1.10.0"), "go/github.com/gin-gonic/gin@v1.10.0");
+        assert_eq!(at("v1.9.1"), "go/github.com/gin-gonic/gin@v1.9.1");
+        assert_ne!(at("v1.10.0"), at("v1.9.1"));
+        // An unreported version (`.` parses as absent) keys apart from every
+        // pinned one.
+        assert_eq!(at("."), "go/github.com/gin-gonic/gin@?");
+        assert_ne!(at("."), at("v1.10.0"));
+    }
+    /// told apart by the parsed package (`maven/org.projectlombok/lombok`, any version) and the
+    /// whole descriptor path (`lombok/` then `Generated#`), never by text.
     /// Contract M6a D1, S1 (k): the marker is Lombok's own `lombok.Generated` annotation type,
     /// told apart by the parsed package (`maven/org.projectlombok/lombok`, any version) and the
     /// whole descriptor path (`lombok/` then `Generated#`), never by text.

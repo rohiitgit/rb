@@ -397,3 +397,7 @@
 ## 2026-10-11: struct-field additions must update every literal constructor — `--all-targets` is the check
 - **Mistake (found, predates this phase):** M6d phase 1 added `Images.go` but left `tool_versions_record_image_identities_when_scip_is_on` constructing `Images{java, proxy}` — so `cargo clippy --workspace --all-targets` and the `rb` bin tests have been broken since phase 1, while phase 1–3 verifications reported clean (they evidently ran clippy without `--all-targets`, or only lib tests).
 - **Rule:** adding a field to a struct ends with `cargo clippy --workspace --all-targets` (not just `--workspace`) green; grep for literal constructors of the struct in test code, which the compiler only reaches under `--all-targets`/`--tests`.
+
+## 2026-10-11: append contract amendments anchored on the previous amendment's tail, never the shared header
+- **Mistake (twice):** the edit anchored on `## Amendments\n\n<N>. **...**` and replaced the next amendment's opener with the new text — once deleting amendment 4's opener (caught by grep before commit), once inverting amendments 5/6 (repaired by swapping the single-line blocks).
+- **Rule:** anchor amendment appends on the previous amendment's unique TAIL text (its last sentence), and verify with `grep -n "phase N)"` that numbering and order are chronological before committing.

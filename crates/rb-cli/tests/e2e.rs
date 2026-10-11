@@ -3625,6 +3625,30 @@ fn scip_polyglot_monorepo() {
         assert_exact_code_edges(&dump, auth_package, "services/auth/", "services/auth") >= 1,
         "{dump}"
     );
+    // Contract M6d S5: the manifest and SCIP gin edges share one
+    // `go/<module>@<version>` node (no `gomod/` row survives); the stdlib
+    // pseudo-module keys under the same manager.
+    let gin = "go/github.com/gin-gonic/gin@v1.10.0";
+    assert_eq!(
+        dump.lines()
+            .filter(|l| l.contains(&format!("[\"N\",\"package\",\"{gin}\"")))
+            .count(),
+        1,
+        "{dump}"
+    );
+    assert!(!dump.contains("gomod/github.com/gin-gonic/gin"), "{dump}");
+    for provenance in ["\"manifest\"", "\"scip\""] {
+        assert!(
+            dump.lines().any(|l| l.contains(&format!(
+                "\"DEPENDS_ON\",\"package\",\"{gin}\",{provenance}"
+            ))),
+            "{provenance} gin edge in {dump}"
+        );
+    }
+    assert!(
+        dump.contains("[\"N\",\"package\",\"go/github.com/golang/go/src@go1.23\""),
+        "{dump}"
+    );
     // S8: the ok Maven service lists its packages; the failed one has no `scip` package, only
     // its pom's literal dependency (contract M4b S15, provenance `manifest`).
     golden(
