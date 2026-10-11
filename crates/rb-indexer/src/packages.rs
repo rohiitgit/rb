@@ -1293,11 +1293,12 @@ struct Pom {
     group: String,
     artifact: String,
     version: String,
-    /// Each dependency (named `<groupId>/<artifactId>`) with its version, empty when
-    /// unresolved, the version's source (`literal`, `property` or `unresolved`), and the
+    /// Each dependency (named `<groupId>/<artifactId>[/<classifier>]`) with its version, empty
+    /// when unresolved, the version's source (`literal`, `property` or `unresolved`), the
     /// conflicting versions when the artifact is declared twice, or its property defined twice,
-    /// with different values (evaluator pass 1, Y8, Y11).
-    deps: Vec<(Dep, String, &'static str, Vec<String>)>,
+    /// with different values (evaluator pass 1, Y8, Y11), and its `<type>` as written (recorded,
+    /// never keyed; contract M6e S9).
+    deps: Vec<(Dep, String, &'static str, Vec<String>, String)>,
 }
 
 /// A `${…}` reference in a pom, read.
@@ -1373,6 +1374,17 @@ fn pom(text: &str) -> Option<Pom> {
         if group.is_empty() || artifact.is_empty() {
             continue;
         }
+        // The classifier rides the key (`group/artifact[/classifier]`); a
+        // property-shaped classifier names no classifier (fail-safe: it
+        // merges with the plain GA, as today). `<type>` is recorded, never
+        // keyed (contract M6e S9).
+        let classifier = d.text_of("classifier").unwrap_or_default();
+        let classifier = if !classifier.is_empty() && !classifier.contains("${") {
+            classifier
+        } else {
+            ""
+        };
+        let typ = d.text_of("type").unwrap_or_default().to_owned();
         let declared = d.text_of("version").unwrap_or_default();
         let mut conflict = Vec::new();
         let (version, from) = if declared.is_empty() {
@@ -1399,9 +1411,14 @@ fn pom(text: &str) -> Option<Pom> {
         };
         let at = d.child("artifactId").map_or(d.start, |a| a.start);
         let end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+        let name = if classifier.is_empty() {
+            format!("{group}/{artifact}")
+        } else {
+            format!("{group}/{artifact}/{classifier}")
+        };
         deps.push((
             Dep {
-                name: format!("{group}/{artifact}"),
+                name,
                 declared: declared.to_owned(),
                 scope,
                 span: span_of(text, at, end),
@@ -1409,13 +1426,14 @@ fn pom(text: &str) -> Option<Pom> {
             version,
             from,
             conflict,
+            typ,
         ));
     }
     // An artifact declared twice: Maven keeps one declaration (and warns), so with different
     // versions none is the stated one (Y8). The first declaration stays, unresolved, listing
     // every version read.
     let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (dep, version, _, conflict) in &deps {
+    for (dep, version, _, conflict, _) in &deps {
         let read = if conflict.is_empty() {
             vec![if !version.is_empty() {
                 version.clone()
@@ -1435,8 +1453,8 @@ fn pom(text: &str) -> Option<Pom> {
         }
     }
     let mut kept = BTreeSet::new();
-    deps.retain(|(dep, _, _, _)| kept.insert(dep.name.clone()));
-    for (dep, version, from, conflict) in &mut deps {
+    deps.retain(|(dep, _, _, _, _)| kept.insert(dep.name.clone()));
+    for (dep, version, from, conflict, _) in &mut deps {
         let read = &versions[&dep.name];
         if read.len() > 1 {
             version.clear();
@@ -2416,9 +2434,14 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                     let Some(pom) = poms.get(m.as_str()) else {
                         continue;
                     };
-                    for (dep, version, from, conflict) in &pom.deps {
-                        let (group, artifact) =
-                            dep.name.split_once('/').unwrap_or((dep.name.as_str(), ""));
+                    for (dep, version, from, conflict, typ) in &pom.deps {
+                        // Service identities are GA only: a classified
+                        // dependency still joins the service providing it.
+                        let mut segs = dep.name.splitn(3, '/');
+                        let (group, artifact) = (
+                            segs.next().unwrap_or_default(),
+                            segs.next().unwrap_or_default(),
+                        );
                         if let Some(modules) = maven.get(&(group.to_owned(), artifact.to_owned())) {
                             let modules: Vec<&(&str, String)> =
                                 modules.iter().filter(|(d, _)| *d != service).collect();
@@ -2456,6 +2479,7 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                         let mut attrs = attrs(&[
                             ("declared", &dep.declared),
                             ("scope", dep.scope),
+                            ("type", typ),
                             ("version_from", from),
                         ]);
                         if !conflict.is_empty() {
@@ -3337,6 +3361,92 @@ mod tests {
             edges,
             [
                 r#"svc -> maven/org.example/dup@? [heuristic] {"declared":"${lib.version}","scope":"runtime","version_from":"unresolved","versions":["1.0","2.0"]}"#
+            ]
+        );
+    }
+
+    /// Contract M6e S9: the package key carries the Maven classifier — the
+    /// same GA with different classifiers never merges, while a true
+    /// duplicate (same full key, different versions) still clears to `@?`.
+    /// `<type>` is recorded on the edge, never keyed.
+    #[test]
+    fn pom_classifiers_ride_the_package_key() {
+        let projects = [project("svc", &["svc/pom.xml"])];
+        let pom = |body: &str| -> String {
+            format!(
+                "<project><groupId>g</groupId><artifactId>svc</artifactId><version>1</version><dependencies>{body}</dependencies></project>"
+            )
+        };
+        let dep = |artifact: &str, classifier: &str, extra: &str, version: &str| {
+            format!(
+                "<dependency><groupId>org.example</groupId><artifactId>{artifact}</artifactId><classifier>{classifier}</classifier>{extra}<version>{version}</version></dependency>"
+            )
+        };
+        // The same GA plain and classified keeps three exact edges.
+        let mixed = pom(&format!(
+            "{}{}{}",
+            dep("lib", "", "", "3.0"),
+            dep("lib", "tests", "", "1.0"),
+            dep("lib", "sources", "<type>java-source</type>", "2.0"),
+        ));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &mixed)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/lib@3.0 [exact] {"declared":"3.0","scope":"runtime","version_from":"literal"}"#,
+                r#"svc -> maven/org.example/lib/tests@1.0 [exact] {"declared":"1.0","scope":"runtime","version_from":"literal"}"#,
+                r#"svc -> maven/org.example/lib/sources@2.0 [exact] {"declared":"2.0","scope":"runtime","type":"java-source","version_from":"literal"}"#,
+            ]
+        );
+        // The same full key twice with different versions clears to `@?`.
+        let twice = pom(&format!(
+            "{}{}",
+            dep("lib", "tests", "", "1.0"),
+            dep("lib", "tests", "", "2.0")
+        ));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &twice)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/lib/tests@? [heuristic] {"declared":"1.0","scope":"runtime","version_from":"unresolved","versions":["1.0","2.0"]}"#
+            ]
+        );
+        // A property-shaped classifier names no classifier.
+        let prop = pom(&dep("lib", "${c}", "", "1.0"));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &prop)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/lib@1.0 [exact] {"declared":"1.0","scope":"runtime","version_from":"literal"}"#,
+            ]
+        );
+    }
+
+    /// Contract M6e S9: a classified dependency still joins the service that
+    /// provides its GA.
+    #[test]
+    fn pom_classified_dependencies_join_their_service() {
+        let projects = [
+            project("svc", &["svc/pom.xml"]),
+            project("lib", &["lib/pom.xml"]),
+        ];
+        let (edges, _) = run(
+            &projects,
+            &[
+                (
+                    "svc/pom.xml",
+                    "<project><groupId>g</groupId><artifactId>svc</artifactId><dependencies><dependency><groupId>org.example</groupId><artifactId>lib</artifactId><classifier>tests</classifier><version>1.0</version></dependency></dependencies></project>",
+                ),
+                (
+                    "lib/pom.xml",
+                    "<project><groupId>org.example</groupId><artifactId>lib</artifactId><version>1.0</version></project>",
+                ),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> service lib [synthetic] {"declared":"1.0","scope":"runtime","via":"package"}"#
             ]
         );
     }
