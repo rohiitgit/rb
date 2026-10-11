@@ -1603,7 +1603,8 @@ fn requests_httpx(facts: &FileScope<'_>, out: &mut FileClients) {
     };
     // A session receiver: a non-member name bound directly to a session
     // construction, with the base its `base_url` states (requests sessions
-    // take none). Factories, member receivers and rebinding wait for S8.
+    // take none). Factories wait for no phase (dynamic); member receivers
+    // resolve below.
     let session = |name: &str, at: Span| -> Option<(bool, Option<UrlValue>)> {
         let bi = facts.binding_index_at(name, at)?;
         let b = &facts.bindings[bi];
@@ -1620,6 +1621,103 @@ fn requests_httpx(facts: &FileScope<'_>, out: &mut FileClients) {
             .flatten();
         Some((httpx, base))
     };
+    // Session-typed names: dotted constructor paths under an imported
+    // module, or bare from-imported constructor locals.
+    let session_type = |t: &str| -> Option<bool> {
+        match t {
+            "requests.Session" if roots.values().any(|h| !h) => Some(false),
+            "httpx.Client" | "httpx.AsyncClient" if roots.values().any(|h| *h) => Some(true),
+            name => ctors.get(name).copied(),
+        }
+    };
+    // A local name carrying a session type but no construction (an
+    // injected client). A construction decides first, so this never doubles
+    // the session above.
+    let typed_local = |name: &str, at: Span| -> Option<bool> {
+        let bi = facts.binding_index_at(name, at)?;
+        let b = &facts.bindings[bi];
+        if b.member || b.init.is_some() {
+            return None;
+        }
+        std::iter::once(&b.type_name)
+            .chain(b.type_args.iter())
+            .find_map(|t| session_type(t))
+    };
+    // Member sessions by (class scope, member name): construction wins over
+    // a bare annotation, anything else conflicting goes dynamic (an
+    // annotation never runs, so it cannot overwrite; two constructions may
+    // run in either order).
+    #[derive(Clone, PartialEq)]
+    enum MemberRes {
+        Dynamic,
+        Annot(bool),
+        Made(bool, Option<UrlValue>),
+    }
+    let resolve_member = |b: &Binding| -> MemberRes {
+        use MemberRes::{Annot, Dynamic, Made};
+        match &b.init {
+            Some(Init::Call { .. }) => {
+                let chain = init_chain(facts, b);
+                match chain.map(|c| (c.root.as_deref(), c.links.as_slice())) {
+                    Some((root, [link])) => match ctor_of(root, link, b.span) {
+                        Some(httpx) => {
+                            let base = httpx
+                                .then(|| {
+                                    kwarg(&link.args, "base_url").map(|a| UrlValue::of(Some(a)))
+                                })
+                                .flatten();
+                            Made(httpx, base)
+                        }
+                        None => Dynamic,
+                    },
+                    _ => Dynamic,
+                }
+            }
+            _ => {
+                if b.init.is_some() {
+                    return Dynamic;
+                }
+                match std::iter::once(&b.type_name)
+                    .chain(b.type_args.iter())
+                    .find_map(|t| session_type(t))
+                {
+                    Some(httpx) => Annot(httpx),
+                    None => Dynamic,
+                }
+            }
+        }
+    };
+    fn merge_member(a: MemberRes, b: MemberRes) -> MemberRes {
+        use MemberRes::{Annot, Dynamic, Made};
+        match (a, b) {
+            (Dynamic, _) | (_, Dynamic) => Dynamic,
+            (Annot(x), Annot(y)) if x == y => Annot(x),
+            (Annot(_), m @ Made(..)) | (m @ Made(..), Annot(_)) => m,
+            (x, y) if x == y => x,
+            _ => Dynamic,
+        }
+    }
+    let mut member_sessions: HashMap<(usize, String), MemberRes> = HashMap::new();
+    for b in facts.bindings.iter() {
+        // Class-body bindings (member writes and bare annotations) by their
+        // class; method locals live under function scopes and never join.
+        let Some(scope) = b.scope else {
+            continue;
+        };
+        if !matches!(
+            facts.facts.definitions.get(scope).map(|d| d.kind),
+            Some(DefKind::Class)
+        ) {
+            continue;
+        }
+        let resolved = resolve_member(b);
+        member_sessions
+            .entry((scope, b.name.clone()))
+            .and_modify(|slot| {
+                *slot = merge_member(slot.clone(), resolved.clone());
+            })
+            .or_insert(resolved);
+    }
     // A verb or dispatcher site on a known receiver: `url` from the verb's
     // first argument (kept unknown when unnamed), the dispatcher's second.
     // `None` when the shape names no URL (an empty call, a dispatcher
@@ -1748,6 +1846,58 @@ fn requests_httpx(facts: &FileScope<'_>, out: &mut FileClients) {
                 &first.name,
                 httpx,
                 base,
+                true,
+            )
+        {
+            out.calls.push(call);
+        }
+        // A `self.`/`cls.` member receiver, through the enclosing class:
+        // capped. Deeper paths stay dynamic.
+        if let Some((obj, member)) = root.split_once('.')
+            && (obj == "self" || obj == "cls")
+            && !member.contains('.')
+            && let Some(class) = {
+                let mut scope = chain.enclosing;
+                loop {
+                    match scope {
+                        Some(d) if facts.facts.definitions[d].kind == DefKind::Class => {
+                            break Some(d);
+                        }
+                        Some(d) => scope = facts.facts.definitions[d].parent,
+                        None => break None,
+                    }
+                }
+            }
+            && let Some(res) = member_sessions.get(&(class, member.to_owned()))
+            && let (httpx, base) = match res {
+                MemberRes::Made(httpx, base) => (*httpx, base.clone()),
+                MemberRes::Annot(httpx) => (*httpx, None),
+                MemberRes::Dynamic => continue,
+            }
+            && let Some(call) = verb_site(
+                first,
+                chain.span,
+                chain.enclosing,
+                &first.name,
+                httpx,
+                base,
+                true,
+            )
+        {
+            out.calls.push(call);
+        }
+        // A local name carrying a session type but no construction (an
+        // injected client): capped. A construction decides first, so this
+        // never doubles the session above.
+        if !root.contains('.')
+            && let Some(httpx) = typed_local(root, chain.span)
+            && let Some(call) = verb_site(
+                first,
+                chain.span,
+                chain.enclosing,
+                &first.name,
+                httpx,
+                None,
                 true,
             )
         {
@@ -5322,6 +5472,67 @@ mod tests {
         // A from-imported constructor shadowed by a rebinding builds nothing.
         let shadowed_ctor = "from httpx import Client\nClient = make_client()\n\ndef f():\n    Client(base_url=\"http://orders\").get(\"/a\")\n";
         assert!(calls(Language::Python, shadowed_ctor).is_empty());
+    }
+
+    /// Contract M6d S8: `self.` member receivers — a member bound once to a
+    /// session construction — resolve like plain sessions (capped), with the
+    /// constructor's `base_url` as the base. Anything else on `self.` stays
+    /// out.
+    #[test]
+    fn self_session_members_resolve() {
+        let src = "import requests\nimport httpx\n\nclass C:\n    def __init__(self):\n        self.session = requests.Session()\n        self.client = httpx.Client(base_url=\"http://orders\")\n        self.repo = Repo()\n    def run(self, url):\n        self.session.get(url)\n        self.client.post(\"/a\", json=J)\n        self.repo.get(url)\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch GET url unverified",
+                "fetch POST '/a' base='http://orders' unverified",
+            ]
+        );
+        // A bare annotation plus an assignment resolves to the construction.
+        let annotated = "import httpx\n\nclass D:\n    cli: httpx.Client\n    def __init__(self):\n        self.cli = httpx.Client(base_url=\"http://orders\")\n    def run(self):\n        self.cli.get(\"/a\")\n";
+        assert_eq!(
+            calls(Language::Python, annotated),
+            ["fetch GET '/a' base='http://orders' unverified"]
+        );
+    }
+
+    /// Contract M6d S8: a session-typed parameter or member (FastAPI
+    /// `Depends` shape) counts as a capped receiver when its type names a
+    /// session constructor under an imported module; without the import, or
+    /// untyped, it stays dynamic. Subscripted annotations (`Optional[.]`,
+    /// unions) are out of scope — the extractor keeps no Python type
+    /// arguments.
+    #[test]
+    fn session_typed_parameters_count_when_imported() {
+        let src = "import httpx\n\nclass C:\n    def run(self, s: httpx.Client, u):\n        s.get(\"http://a\")\n        u.get(\"http://c\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            ["fetch GET 'http://a' unverified"]
+        );
+        let unimported =
+            "class C:\n    def run(self, s: httpx.Client):\n        s.get(\"http://a\")\n";
+        assert!(calls(Language::Python, unimported).is_empty());
+        // A bare class-level annotation (injected elsewhere) resolves too.
+        let member_ann = "import httpx\n\nclass C:\n    s: httpx.Client\n    def run(self):\n        self.s.get(\"http://a\")\n";
+        assert_eq!(
+            calls(Language::Python, member_ann),
+            ["fetch GET 'http://a' unverified"]
+        );
+    }
+
+    /// Contract M6d S8 boundaries: a factory-built or twice-bound member, a
+    /// `None` member, a deeper path, an unknown member and a bare name with
+    /// only a member present stay dynamic.
+    #[test]
+    fn ambiguous_members_stay_dynamic() {
+        let src = "import requests\nimport httpx\n\ndef make_session():\n    return requests.Session()\n\nclass C:\n    def __init__(self, flag):\n        if flag:\n            self.s = requests.Session()\n        else:\n            self.s = make_session()\n        self.n = None\n    def run(self, url):\n        self.s.get(url)\n        self.n.get(url)\n        self.a.b.get(url)\n        self.missing.get(url)\n        session.get(url)\n";
+        assert!(calls(Language::Python, src).is_empty());
+        // A member of another class, a foreign receiver and a construction
+        // shadowed by an annotation stay out.
+        let other = "import requests\nimport httpx\n\nclass A:\n    def __init__(self):\n        self.s = requests.Session()\nclass B:\n    def run(self, url, helper, t):\n        self.s.get(url)\n        helper.session.get(url)\n";
+        assert!(calls(Language::Python, other).is_empty());
+        let annotated = "import httpx\n\ndef make_client():\n    return httpx.Client()\n\ndef f(url):\n    t: httpx.Client = make_client()\n    t.get(url)\n";
+        assert!(calls(Language::Python, annotated).is_empty());
     }
 
     /// Contract M6b S9 (D8): Angular `HttpClient` calls enter capped at
