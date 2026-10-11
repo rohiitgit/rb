@@ -245,6 +245,16 @@ pub fn index_commit(
         .filter(|f| packages::is_input(&f.path) && !f.binary)
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
+    let specs = manifest
+        .files
+        .iter()
+        .filter(|f| {
+            (rb_frameworks::spec::is_spec_input(&f.path)
+                || rb_frameworks::spec::is_proto_input(&f.path))
+                && !f.binary
+        })
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<_>>()?;
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
@@ -254,6 +264,7 @@ pub fn index_commit(
         config,
         unparsed,
         manifests,
+        specs,
         words,
     };
 
@@ -329,6 +340,8 @@ pub struct Content<'a> {
     pub unparsed: rb_frameworks::clients::RawScan,
     /// `package.json`, npm lockfiles, `go.mod` and `pom.xml` texts (contract M4b S15).
     pub manifests: BTreeMap<&'a str, String>,
+    /// OpenAPI/Swagger and `.proto` texts by path (contract M6f S3).
+    pub specs: BTreeMap<&'a str, String>,
     /// Where the definitions' names occur in every non-binary file (contract M4b S12 (f)); the
     /// default is "not scanned", under which no symbol is orphan-eligible.
     pub words: liveness::Words,
@@ -823,6 +836,7 @@ pub fn assemble(
             (!ctx.is_empty()).then(|| (service.clone(), ctx.to_owned()))
         })
         .collect();
+    let has_project = |path: &str| boundaries.project_for(path).is_some();
     // Spring DI (contract M4b S4–S8): `INJECTS` from injection points to beans.
     // (`deployable` computed above: manifest-detected plus `@SpringBootApplication` modules.)
     let depends = di::package_dependencies(&manifest_edges);
@@ -877,6 +891,8 @@ pub fn assemble(
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &spring.unread,
+            specs: &content.specs,
+            has_project: &has_project,
         },
     )?;
     diagnostics.extend(route_diagnostics);

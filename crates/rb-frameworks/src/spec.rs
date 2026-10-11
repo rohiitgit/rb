@@ -7,14 +7,17 @@
 //! `openapi_unread` and creates no endpoints, today's safe direction).
 
 use crate::work::tick;
+use rb_syntax::Span;
 
-/// One spec operation: its raw in-spec path, upper-cased method and operation ID (empty when
-/// the operation states none).
+/// One spec operation: its raw in-spec path, upper-cased method, operation ID (empty when
+/// the operation states none) and evidence span — the path line for YAML, file start for
+/// JSON (serde reports no positions).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SpecOp {
     pub path: String,
     pub method: String,
     pub operation: String,
+    pub span: Span,
 }
 
 /// A file this stage reads, by file name.
@@ -73,6 +76,7 @@ pub fn openapi_json(text: &str) -> Option<Vec<SpecOp>> {
                 path: path.clone(),
                 method: method.to_uppercase(),
                 operation,
+                span: [0, 0, 0, 0],
             });
         }
     }
@@ -85,9 +89,9 @@ pub fn openapi_yaml(text: &str) -> Option<Vec<SpecOp>> {
     let mut ops: Vec<SpecOp> = Vec::new();
     let mut in_paths = false;
     let mut had_entries = false;
-    let mut path: Option<String> = None;
+    let mut path: Option<(String, Span)> = None;
     let mut op: Option<usize> = None;
-    for line in text.split_inclusive('\n') {
+    for (row, line) in text.split_inclusive('\n').enumerate() {
         tick(1);
         if line.contains('\t') {
             return None;
@@ -96,6 +100,8 @@ pub fn openapi_yaml(text: &str) -> Option<Vec<SpecOp>> {
         let mut content = line.trim();
         content = content.strip_suffix('\n').unwrap_or(content);
         let content = content.strip_suffix('\r').unwrap_or(content);
+        let row = row as i32;
+        let width = content.len() as i32;
         if content.is_empty() || content.starts_with('#') {
             continue;
         }
@@ -113,26 +119,30 @@ pub fn openapi_yaml(text: &str) -> Option<Vec<SpecOp>> {
         }
         if indent == 2 {
             had_entries = true;
-            path = path_token(content);
+            path = path_token(content).map(|path| {
+                let span = [row, 0, row, indent as i32 + width];
+                (path, span)
+            });
             op = None;
         } else if indent == 4 {
             op = match path {
                 Some(_) => method_token(content).map(|method| {
+                    let (ref path, span) = path.clone().unwrap_or_default();
                     ops.push(SpecOp {
-                        path: path.clone().unwrap_or_default(),
+                        path: path.clone(),
                         method,
                         operation: String::new(),
+                        span,
                     });
                     ops.len() - 1
                 }),
                 None => None,
             };
-        } else if indent >= 6 {
-            if let (Some(i), Some(rest)) = (op, content.strip_prefix("operationId:")) {
-                if ops[i].operation.is_empty() {
-                    ops[i].operation = scalar(rest);
-                }
-            }
+        } else if indent >= 6
+            && let (Some(i), Some(rest)) = (op, content.strip_prefix("operationId:"))
+            && ops[i].operation.is_empty()
+        {
+            ops[i].operation = scalar(rest);
         }
     }
     if had_entries && ops.is_empty() {
@@ -334,17 +344,20 @@ mod tests {
                 SpecOp {
                     path: "/users".into(),
                     method: "GET".into(),
-                    operation: "listUsers".into()
+                    operation: "listUsers".into(),
+                    span: [0, 0, 0, 0],
                 },
                 SpecOp {
                     path: "/users".into(),
                     method: "POST".into(),
-                    operation: "".into()
+                    operation: "".into(),
+                    span: [0, 0, 0, 0],
                 },
                 SpecOp {
                     path: "/users/{id}".into(),
                     method: "GET".into(),
-                    operation: "getUser".into()
+                    operation: "getUser".into(),
+                    span: [0, 0, 0, 0],
                 },
             ]
         );
@@ -362,23 +375,33 @@ mod tests {
     #[test]
     fn openapi_yaml_reads_the_indented_shapes() {
         let doc = "# users API\nopenapi: 3.0.0\npaths:\n  /users:\n    get: # list\n      operationId: listUsers\n    post:\n      operationId: 'addUser'\n  \"/users/{id}\":\n    get:\n      operationId: \"getUser\"\n  /ignored:\n    parameters: []\nservers:\n  - url: https://x.example\n";
+        // Positions are never hand-counted: path-line spans from the text.
+        let span_of = |needle: &str| {
+            let pos = doc.find(needle).unwrap();
+            let row = doc[..pos].matches('\n').count() as i32;
+            let end = doc[pos..].find('\n').map_or(doc.len(), |n| pos + n);
+            [row, 0, row, (end - pos) as i32]
+        };
         assert_eq!(
             openapi_yaml(doc).unwrap(),
             [
                 SpecOp {
                     path: "/users".into(),
                     method: "GET".into(),
-                    operation: "listUsers".into()
+                    operation: "listUsers".into(),
+                    span: span_of("  /users:"),
                 },
                 SpecOp {
                     path: "/users".into(),
                     method: "POST".into(),
-                    operation: "addUser".into()
+                    operation: "addUser".into(),
+                    span: span_of("  /users:"),
                 },
                 SpecOp {
                     path: "/users/{id}".into(),
                     method: "GET".into(),
-                    operation: "getUser".into()
+                    operation: "getUser".into(),
+                    span: span_of("  \"/users/{id}\":"),
                 },
             ]
         );

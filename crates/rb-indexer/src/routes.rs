@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rb_frameworks::endpoint::{endpoint_key, endpoint_name, norm_path, prefix_unknown_key};
+use rb_frameworks::endpoint::{
+    endpoint_key, endpoint_name, grpc_key, norm_path, prefix_unknown_key,
+};
 use rb_frameworks::routes::{
     FileRoutes, FileScope, Framework, Handler, RouteBase, RouterKind, binding_identity,
     gin_group_prefix,
@@ -40,6 +42,10 @@ pub(crate) struct Inputs<'a, 'r> {
     /// Services with Spring configuration M4a does not read (`config_unread`, evaluator pass 1,
     /// P7): their endpoints' deployed prefix may be missing.
     pub config_unread: &'a BTreeSet<String>,
+    /// OpenAPI/Swagger and `.proto` texts by path (contract M6f S3).
+    pub specs: &'a BTreeMap<&'a str, String>,
+    /// Whether a path lies in any project (a spec outside all projects stays endpoint-less).
+    pub has_project: &'a dyn Fn(&str) -> bool,
 }
 
 /// The token a handler name ends with (`login` in `ctrl.login`) and its span, when the name is
@@ -229,6 +235,9 @@ struct Registration {
     /// Call sites a parameter group's prefix was composed from (contract M6b S2):
     /// the registration's file and span stay in `at`.
     composed_from: Vec<Evidence>,
+    /// From an OpenAPI/proto spec (contract M6f S3): never carries a handler itself; it joins
+    /// one through the shared key when a code route registers the same endpoint.
+    from_spec: bool,
 }
 
 /// An endpoint the stage added, as stitching reads it (contract M4a S13).
@@ -565,10 +574,12 @@ pub(crate) fn add_endpoints(
                         span: r.span,
                     },
                     composed_from,
+                    from_spec: false,
                 });
             }
         }
     }
+    add_spec_endpoints(&mut endpoints, &mut diagnostics, inputs);
     let added = endpoints
         .into_iter()
         .map(|(key, e)| {
@@ -577,6 +588,123 @@ pub(crate) fn add_endpoints(
         })
         .collect::<anyhow::Result<_>>()?;
     Ok((diagnostics, added))
+}
+
+/// Spec operations and proto RPCs as endpoint registrations under the shared key space, so a
+/// code route for the same method+path joins its handler for free (contract M6f S3/S4).
+/// Unreadable specs are counted (`openapi_unread`); specs outside any project stay
+/// endpoint-less and counted; operations with no code route are kept, exact, unhandled and
+/// counted per registration.
+fn add_spec_endpoints(
+    endpoints: &mut BTreeMap<String, Endpoint>,
+    diagnostics: &mut Vec<Diagnostic>,
+    inputs: &Inputs<'_, '_>,
+) {
+    let diag = |kind: &str, path: &str, span: Span, detail: serde_json::Value| Diagnostic {
+        kind: kind.to_owned(),
+        path: Some(path.to_owned()),
+        span: Some(span),
+        detail,
+    };
+    let mut specs: Vec<(&str, &String)> = inputs.specs.iter().map(|(p, t)| (*p, t)).collect();
+    specs.sort();
+    for (spec_path, text) in specs {
+        rb_frameworks::work::tick(1);
+        if !(inputs.has_project)(spec_path) {
+            diagnostics.push(diag(
+                "spec_outside_project",
+                spec_path,
+                [0, 0, 0, 0],
+                json!({}),
+            ));
+            continue;
+        }
+        let service = (inputs.service_of)(spec_path);
+        if spec_path.ends_with(".proto") {
+            for svc in rb_frameworks::spec::proto_services(text) {
+                for rpc in svc.rpcs {
+                    let target = if svc.package.is_empty() {
+                        format!("{}/{}", svc.name, rpc.name)
+                    } else {
+                        format!("{}.{}/{}", svc.package, svc.name, rpc.name)
+                    };
+                    let key = grpc_key(&svc.package, &svc.name, &rpc.name, &service);
+                    let e = endpoints.entry(key).or_insert_with(|| Endpoint {
+                        method: "GRPC".into(),
+                        path: target,
+                        service: service.clone(),
+                        router: None,
+                        ..Endpoint::default()
+                    });
+                    e.frameworks.insert("grpc");
+                    e.any_host = true;
+                    e.registrations.push(Registration {
+                        path_certainty: Certainty::Exact,
+                        handler: Vec::new(),
+                        candidates: 0,
+                        at: Evidence {
+                            path: spec_path.to_owned(),
+                            span: rpc.span,
+                        },
+                        composed_from: Vec::new(),
+                        from_spec: true,
+                    });
+                }
+            }
+            continue;
+        }
+        let trimmed = text.trim_start();
+        let ops = if trimmed.starts_with('{') {
+            rb_frameworks::spec::openapi_json(text)
+        } else {
+            rb_frameworks::spec::openapi_yaml(text)
+        };
+        let Some(ops) = ops else {
+            diagnostics.push(diag("openapi_unread", spec_path, [0, 0, 0, 0], json!({})));
+            continue;
+        };
+        for op in ops {
+            let norm = norm_path(&op.path);
+            let key = endpoint_key(&op.method, &norm, &service);
+            let e = endpoints.entry(key).or_insert_with(|| Endpoint {
+                method: op.method.clone(),
+                path: norm.clone(),
+                service: service.clone(),
+                router: None,
+                ..Endpoint::default()
+            });
+            e.frameworks.insert("openapi");
+            e.any_host = true;
+            e.registrations.push(Registration {
+                path_certainty: Certainty::Exact,
+                handler: Vec::new(),
+                candidates: 0,
+                at: Evidence {
+                    path: spec_path.to_owned(),
+                    span: op.span,
+                },
+                composed_from: Vec::new(),
+                from_spec: true,
+            });
+        }
+    }
+    for e in endpoints.values() {
+        if e.registrations.iter().all(|r| r.handler.is_empty()) {
+            for r in e.registrations.iter().filter(|r| r.from_spec) {
+                let detail = if e.method == "GRPC" {
+                    json!({ "target": e.path })
+                } else {
+                    json!({ "method": e.method, "path": e.path })
+                };
+                diagnostics.push(diag(
+                    "spec_operation_unhandled",
+                    &r.at.path,
+                    r.at.span,
+                    detail,
+                ));
+            }
+        }
+    }
 }
 
 /// A route's handler targets, each with its certainty and, for an inline function, its span;
@@ -765,6 +893,14 @@ mod tests {
     /// Indexes `files` (path, language, source) with every file in the service named by its
     /// first path segment, and `context_paths` per service.
     fn build(files: &[(&str, Language, &str)], context_paths: &[(&str, &str)]) -> Built {
+        build_with_specs(files, &[], context_paths)
+    }
+
+    fn build_with_specs(
+        files: &[(&str, Language, &str)],
+        specs: &[(&str, &str)],
+        context_paths: &[(&str, &str)],
+    ) -> Built {
         let facts: Vec<(String, Language, FileFacts)> = files
             .iter()
             .map(|(p, l, src)| {
@@ -775,11 +911,16 @@ mod tests {
                 )
             })
             .collect();
-        build_from(&facts, context_paths, &BTreeMap::new(), &[])
+        let specs: Vec<(String, String)> = specs
+            .iter()
+            .map(|(p, t)| ((*p).to_owned(), (*t).to_owned()))
+            .collect();
+        build_from(&facts, &specs, context_paths, &BTreeMap::new(), &[])
     }
 
     fn build_from(
         facts: &[(String, Language, FileFacts)],
+        specs: &[(String, String)],
         context_paths: &[(&str, &str)],
         exact: &BTreeMap<(&str, Span), String>,
         config_unread: &[&str],
@@ -809,12 +950,43 @@ mod tests {
             }
             crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
         }
+        for (path, _) in specs {
+            // Spec files are manifest files (File nodes with `IN_SERVICE` in the real
+            // pipeline): the harness mirrors that so spec evidence validates.
+            b.add_node(
+                NodeKey::new(NodeKind::File, path.as_str()),
+                path.as_str(),
+                Attrs::new(),
+            )
+            .unwrap();
+            let s = NodeKey::new(NodeKind::Service, service_of(path));
+            if !b.has_node(&s) {
+                b.add_node(s.clone(), service_of(path), Attrs::new())
+                    .unwrap();
+            }
+            b.add_edge(NewEdge::new(
+                NodeKey::new(NodeKind::File, path.as_str()),
+                EdgeKind::InService,
+                s,
+                Provenance::Manifest,
+                Certainty::Exact,
+            ))
+            .unwrap();
+        }
         let context_paths: BTreeMap<String, String> = context_paths
             .iter()
             .map(|(s, c)| ((*s).to_owned(), (*c).to_owned()))
             .collect();
         let config_unread: BTreeSet<String> =
             config_unread.iter().map(|s| (*s).to_owned()).collect();
+        let spec_texts: BTreeMap<&str, String> =
+            specs.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
+        let has_project = |p: &str| {
+            let service = p.split('/').next().unwrap_or(p);
+            by_path
+                .keys()
+                .any(|f| f.split('/').next().unwrap_or(*f) == service)
+        };
         let inputs = Inputs {
             files: &by_path,
             routes: &routes,
@@ -824,6 +996,8 @@ mod tests {
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &config_unread,
+            specs: &spec_texts,
+            has_project: &has_project,
         };
         let (diagnostics, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
         Built {
@@ -1136,6 +1310,8 @@ mod tests {
                 service_of: &service_of,
                 context_paths: &context,
                 config_unread: &unread,
+                specs: &BTreeMap::new(),
+                has_project: &|_: &str| true,
             };
             let (_, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
             assert_eq!(endpoints.len(), 2);
@@ -1299,6 +1475,8 @@ mod tests {
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &config_unread,
+            specs: &BTreeMap::new(),
+            has_project: &|_: &str| true,
         };
         let (diagnostics, _) = add_endpoints(&mut b, &inputs).unwrap();
         let built = Built {
@@ -1313,6 +1491,73 @@ mod tests {
                 "HANDLED_BY HTTP GET /api/users/login @users -> rb-heuristic . . . `users/routers.go`/Login(). [heuristic]",
             ]
         );
+    }
+
+    /// Contract M6f S3/S4: spec operations become endpoints under the shared key, so a code
+    /// route for the same method+path joins its handler for free; an operation with no code
+    /// route is kept, exact, unhandled and counted.
+    #[test]
+    fn spec_operations_become_endpoints_and_join_code_routes() {
+        let app = "import express from \"express\";\nexport const app = express();\napp.get(\"/users\", (req, res) => res.end());\napp.post(\"/users\", (req, res) => res.end());\n";
+        let spec = "openapi: 3.0.0\npaths:\n  /users:\n    get:\n      operationId: listUsers\n    post:\n      operationId: addUser\n  /missing:\n    get:\n      operationId: getMissing\n";
+        let built = build_with_specs(
+            &[("api/src/app.ts", Language::TypeScript, app)],
+            &[("api/openapi.yaml", spec)],
+            &[],
+        );
+        assert_eq!(
+            edges(&built),
+            [
+                "EXPOSES api -> HTTP GET /missing @api [exact]",
+                "EXPOSES api -> HTTP GET /users @api [exact]",
+                "EXPOSES api -> HTTP POST /users @api [exact]",
+                "HANDLED_BY HTTP GET /users @api -> api/src/app.ts [exact]",
+                "HANDLED_BY HTTP POST /users @api -> api/src/app.ts [exact]",
+            ]
+        );
+        let diag = diagnostics(&built);
+        assert!(
+            diag.iter()
+                .any(|d| d.starts_with("spec_operation_unhandled")),
+            "{diag:?}"
+        );
+        assert!(
+            !diag.iter().any(|d| d.starts_with("openapi_unread")),
+            "{diag:?}"
+        );
+    }
+
+    /// Contract M6f S3: proto services become `GRPC` endpoints of their service; a spec
+    /// outside any project stays endpoint-less and counted; an unreadable spec is counted.
+    #[test]
+    fn proto_services_and_unread_specs_are_counted() {
+        let proto =
+            "syntax = \"proto3\";\npackage acme;\nservice Users {\n  rpc Get (A) returns (B);\n}\n";
+        let built = build_with_specs(
+            &[(
+                "api/src/a.ts",
+                Language::TypeScript,
+                "export const a = 1;\n",
+            )],
+            &[
+                ("api/svc.proto", proto),
+                ("docs/openapi.yaml", "openapi: 3.0.0\npaths:\n"),
+                ("api/broken.yaml", "openapi: 3.0.0\npaths:\n  /x:\n"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built),
+            ["EXPOSES api -> GRPC acme.Users/Get @api [exact]",]
+        );
+        let diag = diagnostics(&built);
+        for kind in [
+            "spec_operation_unhandled",
+            "spec_outside_project",
+            "openapi_unread",
+        ] {
+            assert!(diag.iter().any(|d| d.starts_with(kind)), "{kind}: {diag:?}");
+        }
     }
 
     /// S2 fallback: a dynamic group argument folds to nothing, so the unknown node
@@ -1400,6 +1645,8 @@ mod tests {
                 service_of: &service_of,
                 context_paths: &context_paths,
                 config_unread: &config_unread,
+                specs: &BTreeMap::new(),
+                has_project: &|_: &str| true,
             };
             rb_frameworks::work::take();
             let (_, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
@@ -1481,7 +1728,7 @@ mod tests {
             )
         })
         .collect();
-        let built = build_from(&facts, &[], &BTreeMap::new(), &["stats"]);
+        let built = build_from(&facts, &[], &[], &BTreeMap::new(), &["stats"]);
         let attrs = |key: &str| {
             built
                 .graph
@@ -1556,7 +1803,7 @@ mod tests {
         let col = (start - app[..start].rfind('\n').unwrap() - 1) as i32;
         let handler = rb_syntax::symbol_keys("svc/handlers.ts", &facts[1].2)[0].clone();
         let certainty = |exact: &BTreeMap<(&str, Span), String>| {
-            let built = build_from(&facts, &[], exact, &[]);
+            let built = build_from(&facts, &[], &[], exact, &[]);
             let g = &built.graph;
             let e = g
                 .edges()

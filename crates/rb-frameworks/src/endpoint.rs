@@ -678,9 +678,30 @@ pub fn endpoint_name(method: &str, path: &str) -> String {
     format!("{method} {path}")
 }
 
+/// The natural key of a gRPC endpoint (contract M6f S3): `GRPC pkg.Service/Method @service`,
+/// or `GRPC Service/Method @service` when the proto states no package.
+pub fn grpc_key(package: &str, service: &str, method: &str, at: &str) -> String {
+    let target = if package.is_empty() {
+        format!("{service}/{method}")
+    } else {
+        format!("{package}.{service}/{method}")
+    };
+    format!("GRPC {target} @{at}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract M6f S3: gRPC keys carry `package.Service/Method` and the service.
+    #[test]
+    fn grpc_keys_carry_package_service_method_and_service() {
+        assert_eq!(
+            grpc_key("acme", "Users", "Get", "api"),
+            "GRPC acme.Users/Get @api"
+        );
+        assert_eq!(grpc_key("", "Users", "Get", "api"), "GRPC Users/Get @api");
+    }
 
     #[test]
     fn parameter_and_catch_all_forms() {
