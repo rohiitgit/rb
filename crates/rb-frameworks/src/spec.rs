@@ -1,0 +1,307 @@
+//! Contract packs (design §4.5, contract M6f S1): OpenAPI specs as authoritative endpoint
+//! sources. JSON reads through `serde_json`; YAML through an indented line reader over
+//! allow-listed shapes (no new dependency, M6e-F4 precedent): `paths:` at column 0, paths at
+//! indent 2, methods at indent 4, `operationId` at indent 6. Anything else contributes no
+//! operation; a tab-indented line or a `paths:` section with entries but zero readable
+//! operations makes the whole document unreadable (`None`: the indexer counts
+//! `openapi_unread` and creates no endpoints, today's safe direction).
+
+use crate::work::tick;
+
+/// One spec operation: its raw in-spec path, upper-cased method and operation ID (empty when
+/// the operation states none).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SpecOp {
+    pub path: String,
+    pub method: String,
+    pub operation: String,
+}
+
+/// A file this stage reads, by file name.
+pub fn is_spec_input(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        name,
+        "openapi.json"
+            | "openapi.yaml"
+            | "openapi.yml"
+            | "swagger.json"
+            | "swagger.yaml"
+            | "swagger.yml"
+    )
+}
+
+/// The seven OpenAPI operations, lower-case as written.
+fn verb(token: &str) -> bool {
+    matches!(
+        token,
+        "get" | "put" | "post" | "delete" | "options" | "head" | "patch" | "trace"
+    )
+}
+
+fn sorted(mut ops: Vec<SpecOp>) -> Vec<SpecOp> {
+    ops.sort();
+    ops
+}
+
+/// Reads an OpenAPI/Swagger JSON document: `None` when it has no `paths` object (not a spec,
+/// or unreadable).
+pub fn openapi_json(text: &str) -> Option<Vec<SpecOp>> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let paths = json.get("paths")?.as_object()?;
+    let mut ops = Vec::new();
+    for (path, item) in paths {
+        tick(1);
+        if !path.starts_with('/') {
+            continue;
+        }
+        let Some(methods) = item.as_object() else {
+            continue;
+        };
+        for (method, op) in methods {
+            tick(1);
+            if !verb(method) {
+                continue;
+            };
+            let operation = op
+                .as_object()
+                .and_then(|o| o.get("operationId"))
+                .and_then(|o| o.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            ops.push(SpecOp {
+                path: path.clone(),
+                method: method.to_uppercase(),
+                operation,
+            });
+        }
+    }
+    Some(sorted(ops))
+}
+
+/// Reads an OpenAPI/Swagger YAML document with the 0/2/4/6-space shapes: `None` when a line
+/// is tab-indented, or the `paths:` section holds entries but yields zero operations.
+pub fn openapi_yaml(text: &str) -> Option<Vec<SpecOp>> {
+    let mut ops: Vec<SpecOp> = Vec::new();
+    let mut in_paths = false;
+    let mut had_entries = false;
+    let mut path: Option<String> = None;
+    let mut op: Option<usize> = None;
+    for line in text.split_inclusive('\n') {
+        tick(1);
+        if line.contains('\t') {
+            return None;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let mut content = line.trim();
+        content = content.strip_suffix('\n').unwrap_or(content);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        if indent == 0 {
+            in_paths = content == "paths:" || content.starts_with("paths: ");
+            if content == "paths: {}" {
+                return Some(Vec::new());
+            }
+            path = None;
+            op = None;
+            continue;
+        }
+        if !in_paths {
+            continue;
+        }
+        if indent == 2 {
+            had_entries = true;
+            path = path_token(content);
+            op = None;
+        } else if indent == 4 {
+            op = match path {
+                Some(_) => method_token(content).map(|method| {
+                    ops.push(SpecOp {
+                        path: path.clone().unwrap_or_default(),
+                        method,
+                        operation: String::new(),
+                    });
+                    ops.len() - 1
+                }),
+                None => None,
+            };
+        } else if indent >= 6 {
+            if let (Some(i), Some(rest)) = (op, content.strip_prefix("operationId:")) {
+                if ops[i].operation.is_empty() {
+                    ops[i].operation = scalar(rest);
+                }
+            }
+        }
+    }
+    if had_entries && ops.is_empty() {
+        return None;
+    }
+    Some(sorted(ops))
+}
+
+/// A path line (`/users:`, `"/users/{id}":`, trailing comments allowed): the raw path, or
+/// `None` for anything else.
+fn path_token(content: &str) -> Option<String> {
+    let content = content.split(" #").next().unwrap_or(content).trim_end();
+    let content = content.strip_suffix(':')?.trim_end();
+    let path = content
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            content
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })
+        .unwrap_or(content);
+    path.starts_with('/').then(|| path.to_owned())
+}
+
+/// A method line (`get:`, `post: # comment`): the upper-cased method, or `None`.
+fn method_token(content: &str) -> Option<String> {
+    let content = content.split(" #").next().unwrap_or(content).trim_end();
+    let token = content.strip_suffix(':').unwrap_or(content);
+    verb(token).then(|| token.to_uppercase())
+}
+
+/// A scalar value (operation IDs): comments and surrounding quotes stripped.
+fn scalar(rest: &str) -> String {
+    let value = rest.split(" #").next().unwrap_or(rest).trim();
+    value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(value)
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::work;
+
+    /// Contract M6f S1: JSON specs pin paths, methods and operation IDs; `servers`,
+    /// `webhooks`, `components`, `$ref`s and unknown method keys contribute nothing.
+    #[test]
+    fn openapi_json_reads_paths_methods_and_operation_ids() {
+        let doc = r##"{
+            "openapi": "3.1.0",
+            "servers": [{"url": "https://x.example"}],
+            "paths": {
+                "/users": {
+                    "get": {"operationId": "listUsers"},
+                    "post": {},
+                    "parameters": [{"name": "q"}]
+                },
+                "/users/{id}": {"get": {"operationId": "getUser"}, "x-trace": {}},
+                "/linked": {"$ref": "#/components/x"},
+                "relative": {"get": {}}
+            },
+            "webhooks": {"/hook": {"post": {}}},
+            "components": {}
+        }"##;
+        assert_eq!(
+            openapi_json(doc).unwrap(),
+            [
+                SpecOp {
+                    path: "/users".into(),
+                    method: "GET".into(),
+                    operation: "listUsers".into()
+                },
+                SpecOp {
+                    path: "/users".into(),
+                    method: "POST".into(),
+                    operation: "".into()
+                },
+                SpecOp {
+                    path: "/users/{id}".into(),
+                    method: "GET".into(),
+                    operation: "getUser".into()
+                },
+            ]
+        );
+        assert_eq!(
+            openapi_json(r#"{"openapi": "3.0.0", "paths": {}}"#).unwrap(),
+            []
+        );
+        assert_eq!(openapi_json(r#"{"nope": true}"#), None);
+        assert_eq!(openapi_json("{broken"), None);
+        assert_eq!(openapi_json(r#"{"paths": []}"#), None);
+    }
+
+    /// Contract M6f S1: YAML specs read through the 0/2/4/6 shapes; tabs, or entries with
+    /// zero readable operations, make the document unreadable.
+    #[test]
+    fn openapi_yaml_reads_the_indented_shapes() {
+        let doc = "# users API\nopenapi: 3.0.0\npaths:\n  /users:\n    get: # list\n      operationId: listUsers\n    post:\n      operationId: 'addUser'\n  \"/users/{id}\":\n    get:\n      operationId: \"getUser\"\n  /ignored:\n    parameters: []\nservers:\n  - url: https://x.example\n";
+        assert_eq!(
+            openapi_yaml(doc).unwrap(),
+            [
+                SpecOp {
+                    path: "/users".into(),
+                    method: "GET".into(),
+                    operation: "listUsers".into()
+                },
+                SpecOp {
+                    path: "/users".into(),
+                    method: "POST".into(),
+                    operation: "addUser".into()
+                },
+                SpecOp {
+                    path: "/users/{id}".into(),
+                    method: "GET".into(),
+                    operation: "getUser".into()
+                },
+            ]
+        );
+        assert_eq!(openapi_yaml("openapi: 3.0.0\npaths: {}\n").unwrap(), []);
+        assert_eq!(openapi_yaml("paths:\n\t/users:\n"), None);
+        assert_eq!(openapi_yaml("paths:\n  /users:\n    get: [1]\n"), None);
+        assert_eq!(openapi_yaml("nothing here\n"), Some(Vec::new()));
+    }
+
+    /// Contract M6f S1: spec file names, and only those, reach the reader.
+    #[test]
+    fn spec_inputs_are_the_allow_listed_basenames() {
+        for f in [
+            "openapi.json",
+            "openapi.yaml",
+            "openapi.yml",
+            "swagger.json",
+            "swagger.yaml",
+            "swagger.yml",
+            "svc/openapi.yaml",
+        ] {
+            assert!(is_spec_input(f), "{f}");
+        }
+        for f in [
+            "openapi.txt",
+            "myopenapi.yaml",
+            "openapi.json.bak",
+            "paths.yaml",
+            "api.json",
+        ] {
+            assert!(!is_spec_input(f), "{f}");
+        }
+    }
+
+    /// Contract M6f S1, invariant 5: reading 4× the lines costs at most 5× the operations.
+    #[test]
+    fn openapi_reading_grows_linearly() {
+        let work = |n: usize| {
+            let mut doc = String::from("openapi: 3.0.0\npaths:\n");
+            for i in 0..n {
+                doc.push_str(&format!(
+                    "  /r{i}:\n    get:\n      operationId: op{i}\n    post:\n      operationId: mk{i}\n"
+                ));
+            }
+            work::take();
+            let ops = openapi_yaml(&doc).unwrap();
+            assert_eq!(ops.len(), 2 * n);
+            work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+}
