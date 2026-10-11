@@ -1604,8 +1604,9 @@ mod tests {
             ),
             None
         );
-        // Unreadable anywhere keeps the lower slot's reading: a dangling `-encoding`, garbage
-        // config lines, and a `-D` without `=` name nothing.
+        // Unreadable anywhere keeps the higher slot's reading: a dangling `-encoding`, garbage
+        // config lines, and a `-D` without `=` name nothing. An unresolvable `${…}` value is a
+        // declaration, like the pom reader's `${missing}`: fail-safe away from UTF-8.
         assert_eq!(
             case(
                 "A.java",
@@ -1615,6 +1616,10 @@ mod tests {
             )
             .as_deref(),
             Some("ISO-8859-1")
+        );
+        assert_eq!(
+            case("A.java", &[("pom.xml", &arg("${enc}"))], None, &[]).as_deref(),
+            Some("${enc}")
         );
     }
 
@@ -2142,5 +2147,16 @@ mod tests {
         };
         let (small, large) = (work(100), work(400));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Evaluator pass 1, M6e-12 (S10): a pattern escaping the tsconfig directory stays
+    /// unread and fails open.
+    #[test]
+    fn tsconfig_patterns_escaping_their_directory_stay_unread() {
+        let scopes =
+            TsScopes::build([("tsconfig.json", r#"{"include": ["../o", "/abs", "src"]}"#)]);
+        assert!(!scopes.out_of_scope("src/a.ts"));
+        assert!(scopes.out_of_scope("o/a.ts"));
+        assert_eq!(scopes.unread, 2);
     }
 }

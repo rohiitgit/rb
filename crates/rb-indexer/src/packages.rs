@@ -3451,6 +3451,74 @@ mod tests {
         );
     }
 
+    /// Evaluator pass 1, M6e-12 (S9): the same classified declaration twice with the same
+    /// version stays one exact edge (no conflict); a `go.work` `use` escaping the repository
+    /// is ignored without breaking the workspace.
+    #[test]
+    fn duplicate_classifiers_and_escaping_workspace_uses() {
+        let projects = [project("svc", &["svc/pom.xml"])];
+        let twice = "<project><groupId>g</groupId><artifactId>svc</artifactId><dependencies><dependency><groupId>org.example</groupId><artifactId>lib</artifactId><classifier>tests</classifier><version>1.0</version></dependency><dependency><groupId>org.example</groupId><artifactId>lib</artifactId><classifier>tests</classifier><version>1.0</version></dependency></dependencies></project>";
+        let (edges, _) = run(&projects, &[("svc/pom.xml", twice)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/lib/tests@1.0 [exact] {"declared":"1.0","scope":"runtime","version_from":"literal"}"#
+            ]
+        );
+        let projects = [project("app", &["app/go.mod"])];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("go.work", "go 1.23\nuse ../outside\nuse ./app\n"),
+                (
+                    "app/go.mod",
+                    "module example.com/app\n\ngo 1.23\n\nrequire github.com/gin-gonic/gin v1.10.0\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"app -> go/github.com/gin-gonic/gin@v1.10.0 [synthetic] {"declared":"v1.10.0","scope":"runtime","version_from":"go_mod"}"#,
+            ]
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    /// Evaluator pass 1, M6e-12 (S8): the nearest `go.work` governs each service — `app`'s
+    /// own workspace replace wins over the root's dangling one.
+    #[test]
+    fn nearest_go_work_governs_each_service() {
+        let projects = [
+            project("app", &["app/go.mod"]),
+            project("lib", &["lib/go.mod"]),
+        ];
+        let (edges, _) = run(
+            &projects,
+            &[
+                (
+                    "go.work",
+                    "go 1.23\n\nuse ./app\nuse ./lib\n\nreplace example.com/lib => ./missing\n",
+                ),
+                (
+                    "app/go.work",
+                    "go 1.23\n\nuse ../lib\n\nreplace example.com/lib => ../lib\n",
+                ),
+                (
+                    "app/go.mod",
+                    "module example.com/app\n\ngo 1.23\n\nrequire example.com/lib v0.0.0\n",
+                ),
+                ("lib/go.mod", "module example.com/lib\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"app -> service lib [synthetic] {"declared":"v0.0.0","scope":"runtime","via":"package"}"#,
+            ]
+        );
+    }
+
     /// Evaluator pass 1, Y9: an npm alias (`"foo": "npm:bar@^1"`) installs `bar`: the key is
     /// the real package with the lockfile's version, and the alias is an attribute.
     #[test]

@@ -1414,6 +1414,12 @@ mod tests {
                 String::from_utf8_lossy(clean)
             );
         }
+        // Safe-direction pin: a line-start marker inside a template literal still rejects
+        // (coverage cost only, never a false edge).
+        assert_eq!(
+            decoded_document("scip-typescript", "", Some(b"const s = `\n--> x`;\n")).rejected,
+            Some(Rejection::Restructured)
+        );
     }
 
     /// Contract M3b amendment 77 (`structural_escape`): a scip-java document holding a Unicode

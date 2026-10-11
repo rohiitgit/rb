@@ -453,3 +453,15 @@
 ## 2026-10-11: TOML dotted keys nest, even inline
 - **Mistake (same fix):** `{ module = "g:a", version.ref = "lang" }` parses as `{ module = "g:a", version = { ref = "lang" } }` — `table.get("version.ref")` is always `None`.
 - **Rule:** when reading TOML with dotted keys, match on the nested table (`version` → `ref`), never on the dotted literal; cover both spellings in the reader test.
+
+## 2026-10-12: a resolver mutant needs paths that separate depth from sort order
+- **Mistake (caught at once):** the "first-sorted-wins" mutant on the module-override rule survived: every test path (`mod/pom.xml`) also sorted first, so depth-wins and first-wins agreed everywhere.
+- **Rule:** when two orderings could both explain the cases, add a row where they disagree (`zmod/` sorts after the root pom; same-depth ties go sorted-first) before counting the mutant killed.
+
+## 2026-10-12: measure a hypothesized precedence before coding it
+- **Mistake (caught by the scratch build):** D9 placed `compilerArgs -encoding` above the pom literal by documentation reasoning; the real image shows the pom literal winning both directions (the plugin's own `-encoding` reaches javac first).
+- **Rule:** a precedence taken from docs is a hypothesis until a scratch build observes it; the observable here is cheap (a 0xE9 source: the unmappable-character error names the effective encoding). Code the measured order and record the deviation in the contract.
+
+## 2026-10-12: a job-level verdict can have an unsafe corner a per-entity verdict has not
+- **Mistake (caught by design review before any use):** per-job deepest-wins for encodings would trust an ISO root's files under a UTF-8 module verdict — silently accepting misread files.
+- **Rule:** when one verdict covers entities with different configurations, resolve per entity (per-document nearest-pom here); mixed-configuration tests (root-ISO/module-UTF-8 both ways) pin each side. No prior binary shipped the weaker rule.

@@ -940,7 +940,7 @@ Same rules as M6d:
 - [x] **9. Maven classifiers** (S9). Done 2026-10-12 (amendment 10): `<classifier>` rides the key, duplicate rule per full key, `<type>` recorded; tests first + mutants; full verify green unblessed, no dump change.
 - [x] **10. tsconfig scoping + encodings + N3** (S10–S12). Done 2026-10-12 (amendment 11): `TsScopes` reader (allow-list globs, bounded extends, unread counted, fail-open) partitioning `files_without_document` with no edge moves; per-document five-source effective encodings (D9 corrected by measurement: pom beats compilerArgs both directions); N3 `restructured` rejection after 0-calibration. Tests first + mutants + growth + scratch measurement; full verify green unblessed, no dump change.
 - [x] **11. Measurements** (S13). Done 2026-10-12 (amendment 12): jcommander --no-scip identical + deterministic, Gradle SCIP ok 45.3s (1,218/1,218 defs, 1,355 exact CALLS, 20/20 samples, cached identical) after allow-listing plugins-artifacts (probed 200, key moved by design); ofetch 12 pnpm pins classified + sampled + deterministic; class-validator S10 live-fire 42 = 38 + 4; cleanup done.
-- [ ] **12. Records + evaluator.** S14–S16; pass 1 (full), fixes, pass 2 (verification-only).
+- [x] **12. Records + evaluator.** Done 2026-10-12 (amendment 13): pass 1 full review (12 probes, 5 new tests, VERDICT PASS, no blockers); pass 2 verification-only (VERDICT PASS, close verify green). **M6e closed.**
 
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 
