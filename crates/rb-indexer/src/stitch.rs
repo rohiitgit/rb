@@ -1125,6 +1125,7 @@ mod tests {
             certainty: Certainty::Exact,
             hosts: Vec::new(),
             prefix_maybe_incomplete: false,
+            operations: Vec::new(),
         }
     }
 

@@ -257,6 +257,8 @@ pub(crate) struct EndpointRef {
     /// The service has Spring configuration M4a does not read (`config_unread`), so its deployed
     /// prefix may be missing (evaluator pass 1, P7).
     pub prefix_maybe_incomplete: bool,
+    /// Operation IDs its spec registrations state (contract M6f S6).
+    pub operations: Vec<String>,
 }
 
 #[derive(Default)]
@@ -265,6 +267,9 @@ struct Endpoint {
     path: String,
     service: String,
     frameworks: BTreeSet<&'static str>,
+    /// Operation IDs its spec registrations state (contract M6f S6, for stitching generated
+    /// calls by operation name).
+    operations: BTreeSet<String>,
     /// The router of an endpoint whose prefix is unknown (part of its key, amendment 10).
     router: Option<String>,
     /// `ServeMux` host patterns of its registrations (P8).
@@ -674,6 +679,9 @@ fn add_spec_endpoints(
                 ..Endpoint::default()
             });
             e.frameworks.insert("openapi");
+            if !op.operation.is_empty() {
+                e.operations.insert(op.operation.clone());
+            }
             e.any_host = true;
             e.registrations.push(Registration {
                 path_certainty: Certainty::Exact,
@@ -774,6 +782,12 @@ fn add_endpoint(
         "frameworks".into(),
         e.frameworks.iter().copied().collect::<Vec<_>>().into(),
     );
+    if !e.operations.is_empty() {
+        attrs.insert(
+            "operations".into(),
+            e.operations.iter().cloned().collect::<Vec<_>>().into(),
+        );
+    }
     if let Some(router) = &e.router {
         attrs.insert("prefix_unknown".into(), true.into());
         attrs.insert("router".into(), router.clone().into());
@@ -875,6 +889,7 @@ fn add_endpoint(
         certainty: exposes,
         hosts,
         prefix_maybe_incomplete: unread,
+        operations: e.operations.into_iter().collect(),
     })
 }
 
@@ -1525,6 +1540,20 @@ mod tests {
             !diag.iter().any(|d| d.starts_with("openapi_unread")),
             "{diag:?}"
         );
+        // Operation IDs ride the endpoint refs for generated-call stitching (S6).
+        let ops: Vec<(&str, Vec<&str>)> = built
+            .endpoints
+            .iter()
+            .map(|e| {
+                (
+                    e.key.as_str(),
+                    e.operations.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert!(ops.contains(&("HTTP GET /users @api", vec!["listUsers"])));
+        assert!(ops.contains(&("HTTP POST /users @api", vec!["addUser"])));
+        assert!(ops.contains(&("HTTP GET /missing @api", vec!["getMissing"])));
     }
 
     /// Contract M6f S3: proto services become `GRPC` endpoints of their service; a spec

@@ -138,6 +138,35 @@ pub struct FileClients {
     /// reaches an in-process sink (contract M6b S4), in source order. The
     /// indexer turns these sites `unmatched`, never edges.
     pub in_process: BTreeSet<Span>,
+    /// Generated-client call sites (contract M6f S6): operationId/RPC candidates the indexer
+    /// matches against spec operations, in source order.
+    pub generated: Vec<GeneratedCall>,
+}
+
+/// A generated client (OpenAPI generator, gRPC stub): what names the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedKind {
+    OpenApi,
+    Grpc,
+}
+
+impl GeneratedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeneratedKind::OpenApi => "openapi",
+            GeneratedKind::Grpc => "grpc",
+        }
+    }
+}
+
+/// One generated-client call site: the operation (operationId or RPC name), its carrier (the
+/// `*Api` receiver or stub class/service, for scoping) and the call's span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedCall {
+    pub kind: GeneratedKind,
+    pub operation: String,
+    pub carrier: String,
+    pub span: Span,
 }
 
 /// Every client call site of one file, in source order per pack.
@@ -150,15 +179,23 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
             axios(facts, &mut out, &Gate::new(facts.facts));
             fetch_class(facts, &mut out);
             http_client(facts, &mut out);
+            generated_calls(Language::TypeScript, facts, &mut out);
         }
         Language::Java => {
             let bases = SpringBases::new(facts, Gate::new(facts.facts));
             rest_template(facts, &mut out, &bases);
             web_client(facts, &mut out, &bases);
             feign(facts, &mut out);
+            generated_calls(Language::Java, facts, &mut out);
         }
-        Language::Go => go_http(facts, &mut out),
-        Language::Python => requests_httpx(facts, &mut out),
+        Language::Go => {
+            go_http(facts, &mut out);
+            generated_calls(Language::Go, facts, &mut out);
+        }
+        Language::Python => {
+            requests_httpx(facts, &mut out);
+            generated_calls(Language::Python, facts, &mut out);
+        }
     }
     out
 }
@@ -3941,6 +3978,207 @@ fn format_template(
     Some(StrTemplate { parts, span })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Generated clients (contract M6f S6): OpenAPI-generator operation calls and gRPC stub calls.
+// Per-file candidates; the indexer keeps only the ones naming a spec operation or RPC, so the
+// pack stays generous within its allow-list and the join stays strict.
+
+/// The last `.`-segment of a dotted path.
+fn last_segment(path: &str) -> &str {
+    path.rsplit('.').next().unwrap_or(path)
+}
+
+/// An inline construction's type (`new UsersApi()` → `UsersApi`), or `None`.
+fn constructed(root: &str) -> Option<&str> {
+    let root = root.strip_prefix("new ")?;
+    let type_name = root.split('(').next()?.trim();
+    (!type_name.is_empty()).then_some(type_name)
+}
+
+/// A `New*Client` constructor call's service (`NewGreeterClient` → `Greeter`); empty when the
+/// name carries none.
+fn client_service(name: &str) -> Option<&str> {
+    let inner = name.strip_prefix("New")?.strip_suffix("Client")?;
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// A `*Client` type's service (`GreeterClient` → `Greeter`); empty when it carries none.
+fn client_type(name: &str) -> Option<&str> {
+    let inner = name.strip_suffix("Client")?;
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// The binding `root` names and its type, when it resolves to one binding.
+fn binding_type<'f>(
+    facts: &'f FileScope<'_>,
+    language: Language,
+    root: &str,
+    at: Span,
+) -> Option<&'f str> {
+    let bi = local_binding(facts, language, root, at)?;
+    Some(facts.bindings[bi].type_name.as_str())
+}
+
+/// OperationId/RPC candidates of one file: single-link calls on `*Api` receivers or
+/// `*Api`-typed bindings (OpenAPI), `*Grpc` roots with 2+ links, inline `new *Stub`
+/// constructions, `*Stub`-typed bindings (gRPC Java), and calls on bindings built by
+/// `New*Client` constructors or `new *Client` (gRPC Go/TypeScript). Multi-link chains name
+/// navigation, not operations — only the last link of a stub chain reads as the RPC.
+fn generated_calls(language: Language, facts: &FileScope<'_>, out: &mut FileClients) {
+    for chain in &facts.chains {
+        crate::work::tick(1);
+        let (Some(root), links) = (chain.root.as_deref(), chain.links.as_slice()) else {
+            continue;
+        };
+        let [only] = links else {
+            // A stub chain's last link is its RPC; anything else multi-link is navigation.
+            if matches!(
+                language,
+                Language::Java
+                    | Language::Go
+                    | Language::TypeScript
+                    | Language::Tsx
+                    | Language::JavaScript
+            ) && links.len() >= 2
+                && let Some(last) = links.last()
+                && !last.name.is_empty()
+            {
+                grpc_chain(out, root, last);
+            }
+            continue;
+        };
+        if only.name.is_empty() {
+            continue;
+        }
+        let simplified = constructed(root).unwrap_or(root);
+        let simple = last_segment(simplified.split('(').next().unwrap_or(simplified));
+        // OpenAPI: `*Api` receivers, inline constructions and `*Api`-typed bindings.
+        if simple.ends_with("Api") {
+            out.generated.push(GeneratedCall {
+                kind: GeneratedKind::OpenApi,
+                operation: only.name.clone(),
+                carrier: simplified.to_owned(),
+                span: only.span,
+            });
+            continue;
+        }
+        if matches!(
+            language,
+            Language::Java | Language::TypeScript | Language::Tsx | Language::JavaScript
+        ) && let Some(type_name) = binding_type(facts, language, root, chain.span)
+            && last_segment(type_name).ends_with("Api")
+        {
+            out.generated.push(GeneratedCall {
+                kind: GeneratedKind::OpenApi,
+                operation: only.name.clone(),
+                carrier: root.to_owned(),
+                span: only.span,
+            });
+            continue;
+        }
+        // gRPC Java: `*Stub`-typed bindings and inline `new *Stub`.
+        if language == Language::Java {
+            if let Some(type_name) = binding_type(facts, language, root, chain.span)
+                && last_segment(type_name).ends_with("Stub")
+            {
+                out.generated.push(GeneratedCall {
+                    kind: GeneratedKind::Grpc,
+                    operation: only.name.clone(),
+                    carrier: root.to_owned(),
+                    span: only.span,
+                });
+                continue;
+            }
+            if let Some(type_name) = constructed(root)
+                && last_segment(type_name).ends_with("Stub")
+                && !only.name.ends_with("Stub")
+            {
+                out.generated.push(GeneratedCall {
+                    kind: GeneratedKind::Grpc,
+                    operation: only.name.clone(),
+                    carrier: type_name.to_owned(),
+                    span: only.span,
+                });
+                continue;
+            }
+        }
+        // gRPC Go/TypeScript: bindings whose type is a `*Client` (TypeScript `new`), whose
+        // initialiser calls a `New*Client` constructor, or whose own statement holds exactly
+        // one such constructor (Go `client, _ := pb.NewGreeterClient(conn)`, whose binding
+        // carries no initialiser: the M6b-S4 statement-span association).
+        if matches!(
+            language,
+            Language::Go | Language::TypeScript | Language::Tsx | Language::JavaScript
+        ) && let Some(bi) = local_binding(facts, language, root, chain.span)
+        {
+            let binding = &facts.bindings[bi];
+            let mut service = client_type(last_segment(&binding.type_name)).map(str::to_owned);
+            if service.is_none() {
+                match &binding.init {
+                    Some(Init::Call { chain: ci }) => {
+                        if let Some(init_chain) = facts.chains.get(*ci) {
+                            crate::work::tick(init_chain.links.len());
+                            for link in init_chain.links.iter().rev() {
+                                if let Some(svc) = client_service(&link.name) {
+                                    service = Some(svc.to_owned());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Init::New { type_name, .. }) => {
+                        service = client_type(last_segment(type_name)).map(str::to_owned);
+                    }
+                    None => {
+                        let mut found = Vec::new();
+                        for candidate in facts.chains.iter() {
+                            crate::work::tick(1);
+                            if !within(candidate.span, binding.span) {
+                                continue;
+                            }
+                            for link in candidate.links.iter().rev() {
+                                if let Some(svc) = client_service(&link.name) {
+                                    found.push(svc.to_owned());
+                                    break;
+                                }
+                            }
+                        }
+                        found.sort();
+                        found.dedup();
+                        if let [one] = found.as_slice() {
+                            service = Some(one.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(service) = service {
+                out.generated.push(GeneratedCall {
+                    kind: GeneratedKind::Grpc,
+                    operation: only.name.clone(),
+                    carrier: service,
+                    span: only.span,
+                });
+            }
+        }
+    }
+}
+
+/// A multi-link chain's last link as a gRPC RPC when its root names the stub (`*Grpc` roots,
+/// inline `new *Stub` constructions).
+fn grpc_chain(out: &mut FileClients, root: &str, last: &CallLink) {
+    let simplified = constructed(root).unwrap_or(root);
+    let simple = last_segment(simplified.split('(').next().unwrap_or(simplified));
+    if simple.ends_with("Grpc") || simple.ends_with("Stub") {
+        out.generated.push(GeneratedCall {
+            kind: GeneratedKind::Grpc,
+            operation: last.name.clone(),
+            carrier: simplified.to_owned(),
+            span: last.span,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6113,6 +6351,70 @@ mod tests {
         let ops = crate::work::take();
         assert!(found.is_empty(), "{found:?}");
         assert!(ops < 1000, "{ops} counted operations");
+    }
+
+    /// `kind operation @carrier` per generated call.
+    fn generated(language: Language, src: &str) -> Vec<String> {
+        let facts = extract(language, src.as_bytes()).unwrap();
+        clients(language, &facts)
+            .generated
+            .iter()
+            .map(|c| format!("{} {} @{}", c.kind.as_str(), c.operation, c.carrier))
+            .collect()
+    }
+
+    /// Contract M6f S6: calls on `*Api` receivers (or `*Api`-typed bindings) are
+    /// operationId candidates; anything else is not.
+    #[test]
+    fn openapi_api_receivers_are_operation_candidates() {
+        let src = "import { DefaultApi } from './gen';\nconst usersApi = new DefaultApi();\nexport async function f(id) {\n  await usersApi.listUsers();\n  await new DefaultApi().addUser(id);\n  await api.list();\n  await service.list();\n}\n";
+        assert_eq!(
+            generated(Language::TypeScript, src),
+            ["openapi listUsers @usersApi", "openapi addUser @DefaultApi"]
+        );
+        let java = "class C {\n  UsersApi api;\n  void f() {\n    api.getUser(1);\n    new UsersApi().addUser(2);\n    service.list();\n  }\n}\n";
+        assert_eq!(
+            generated(Language::Java, java),
+            ["openapi getUser @api", "openapi addUser @UsersApi"]
+        );
+    }
+
+    /// Contract M6f S6: gRPC stub chains (a `*Grpc` root with 2+ links, or an inline
+    /// `new *Stub`) and `New*Client`-typed bindings pin their RPC.
+    #[test]
+    fn grpc_stub_chains_and_typed_bindings_pin_their_rpc() {
+        let java = "class C {\n  void f(Object ch, Object req) {\n    GreeterGrpc.newBlockingStub(ch).sayHello(req);\n    GreeterGrpc.newFutureStub(ch).watch(req);\n    foo.bar(req);\n  }\n}\n";
+        assert_eq!(
+            generated(Language::Java, java),
+            ["grpc sayHello @GreeterGrpc", "grpc watch @GreeterGrpc"]
+        );
+        let go = "package main\nimport pb \"example.com/helloworld\"\nfunc f(conn Conn, ctx Ctx, req Req) {\n  client, _ := pb.NewGreeterClient(conn)\n  client.SayHello(ctx, req)\n  db.Query(req)\n}\n";
+        assert_eq!(generated(Language::Go, go), ["grpc SayHello @Greeter"]);
+        let ts = "import { GreeterClient } from './gen';\nexport function f(addr, x) {\n  const client = new GreeterClient(addr);\n  client.sayHello(x);\n  other.ping(x);\n}\n";
+        assert_eq!(
+            generated(Language::TypeScript, ts),
+            ["grpc sayHello @Greeter"]
+        );
+    }
+
+    /// Contract M6f S6, invariant 5: scanning 4× the chains costs at most 5× the operations.
+    #[test]
+    fn generated_call_scanning_grows_linearly() {
+        let work = |n: usize| {
+            let mut src = String::from("class C {\n  void f(Object ch) {\n");
+            for i in 0..n {
+                src.push_str(&format!("    Api{i}Grpc.newStub(ch).m{i}(x);\n"));
+                src.push_str(&format!("    plain{i}(x);\n"));
+            }
+            src.push_str("  }\n}\n");
+            let facts = extract(Language::Java, src.as_bytes()).unwrap();
+            crate::work::take();
+            let out = clients(Language::Java, &facts);
+            assert_eq!(out.generated.len(), n);
+            crate::work::take()
+        };
+        let (small, large) = (work(50), work(200));
+        assert!(large <= small * 5, "{small} -> {large}");
     }
 
     /// A dot import of `net/http` (and of `net/httptest`) is outside the
