@@ -1214,8 +1214,12 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                     let parsed = go_mod(text);
                     for (dep, version) in &parsed.requires {
                         let replace = parsed.replace_for(&dep.name, version);
+                        // Only a relative directory joins a service: an
+                        // absolute path (`/b`) is a filesystem path, never a
+                        // repo-relative directory (evaluator pass 1, E2-1).
+                        // It stays a local replace for the version logic below.
                         let local = replace
-                            .filter(|r| r.local())
+                            .filter(|r| r.target.starts_with("./") || r.target.starts_with("../"))
                             .and_then(|r| join(&here, &r.target));
                         let by_dir: Vec<&str> = local
                             .as_deref()
@@ -1872,6 +1876,31 @@ mod tests {
                 r#"web -> npm/bar@1.2.3 [exact] {"alias":"foo","declared":"npm:bar@^1.0.0","scope":"runtime","version_from":"lockfile"}"#,
                 r#"web -> npm/real@? [exact] {"alias":"nolock","declared":"npm:real@1","scope":"runtime","version_from":"unresolved"}"#,
                 r#"web -> npm/@s/pkg@2.0.0 [exact] {"alias":"sc","declared":"npm:@s/pkg@^2","scope":"runtime","version_from":"lockfile"}"#,
+            ]
+        );
+    }
+
+    /// Evaluator pass 1, E2-1: an absolute-path `replace` target joins no
+    /// service: `/b` is a filesystem path, never the repo-relative `a/b`
+    /// below the service. The version stays unresolved (Y10), as for any
+    /// directory replace.
+    #[test]
+    fn absolute_replace_paths_never_join_a_service() {
+        let projects = [project("a", &["a/go.mod"]), project("a/b", &["a/b/go.mod"])];
+        let (edges, _) = run(
+            &projects,
+            &[
+                (
+                    "a/go.mod",
+                    "module example.com/a\n\nrequire example.com/dep v1.0.0\nreplace example.com/dep => /b\n",
+                ),
+                ("a/b/go.mod", "module example.com/dep\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"a -> go/example.com/dep@? [exact] {"declared":"v1.0.0","replaced":"/b","scope":"runtime","version_from":"unresolved"}"#,
             ]
         );
     }

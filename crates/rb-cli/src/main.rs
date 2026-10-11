@@ -1591,6 +1591,8 @@ fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value
         tools["scip_typescript"] = images
             .identity(rb_scip::jobs::Indexer::ScipTypescript)
             .into();
+        tools["scip_go"] = images.identity(rb_scip::jobs::Indexer::ScipGo).into();
+        tools["scip_python"] = images.identity(rb_scip::jobs::Indexer::ScipPython).into();
     }
     tools
 }
@@ -2810,6 +2812,9 @@ mod tests {
     /// Contract M3b amendments 29, 31 and 48: the image identities are recorded only when SCIP
     /// is on (the pinned scip-typescript image by its digest reference, the local scip-java
     /// one by its ID or `absent`); a timeout prints its phase and budget.
+    /// Contract M6d S1 (evaluator pass 1, E1-1): the locally built scip-go
+    /// image and the pinned scip-python image are recorded too, so a rebuilt
+    /// image is never served as "up to date".
     #[test]
     fn tool_versions_record_image_identities_when_scip_is_on() {
         let images = rb_scip::Images {
@@ -2821,6 +2826,8 @@ mod tests {
         assert_eq!(on["scip"], "on");
         assert_eq!(on["scip_java"], "absent");
         assert_eq!(on["scip_typescript"], rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE);
+        assert_eq!(on["scip_go"], "absent");
+        assert_eq!(on["scip_python"], rb_scip::jobs::SCIP_PYTHON_IMAGE);
         let present = rb_scip::Images {
             java: Ok("sha256:abc".into()),
             go: Ok("sha256:abc".into()),
@@ -2828,6 +2835,10 @@ mod tests {
         };
         assert_eq!(
             tool_versions(&rb_indexer::ScipMode::On, &present)["scip_java"],
+            "sha256:abc"
+        );
+        assert_eq!(
+            tool_versions(&rb_indexer::ScipMode::On, &present)["scip_go"],
             "sha256:abc"
         );
         assert_eq!(on["pipeline"], rb_indexer::PIPELINE);

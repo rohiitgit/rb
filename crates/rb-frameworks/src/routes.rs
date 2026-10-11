@@ -1041,7 +1041,7 @@ fn chi(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 };
                 (m, &last.args[1..])
             }
-            "Handle" if last.args.len() >= 2 => (ANY.to_owned(), &last.args[1..]),
+            "Handle" if last.args.len() >= 2 => (ANY.to_owned(), &last.args[..]),
             _ => continue,
         };
         // Links before the last carry middleware (`With`); the receiver
@@ -1328,22 +1328,34 @@ fn fastapi(facts: &FileScope<'_>, out: &mut FileRoutes) {
         seen.remove(&router);
         out
     }
-    let mut rewritten: Vec<(usize, String)> = Vec::new();
+    // Compose include_router edges into router paths: one row per prefix
+    // (a router included twice serves both).
+    let mut rewritten: Vec<(usize, Vec<String>)> = Vec::new();
     for (i, route) in out.routes.iter().enumerate() {
         let (Some(router), Some(local)) = (routers_of.get(i).copied().flatten(), locals.get(i))
         else {
             continue;
         };
-        // Zero (unknown) or one identical prefix: keep the collected row.
-        for prefix in full_prefix(&apps, &includes, router, &mut HashSet::new(), 0) {
-            let composed = join(&prefix, local);
-            if composed != route.path {
-                rewritten.push((i, composed));
-            }
+        // Zero (unknown) or identical prefixes: keep the collected row.
+        let fresh: Vec<String> = full_prefix(&apps, &includes, router, &mut HashSet::new(), 0)
+            .into_iter()
+            .map(|prefix| join(&prefix, local))
+            .filter(|composed| composed != &route.path)
+            .collect();
+        if !fresh.is_empty() {
+            rewritten.push((i, fresh));
         }
     }
-    for (i, path) in rewritten {
-        out.routes[i].path = path;
+    for (i, paths) in rewritten {
+        let mut paths = paths.into_iter();
+        if let Some(first) = paths.next() {
+            out.routes[i].path = first;
+        }
+        for path in paths {
+            let mut clone = out.routes[i].clone();
+            clone.path = path;
+            out.routes.push(clone);
+        }
     }
 }
 
@@ -1774,7 +1786,7 @@ public class AuthController {
     /// chains, and `Method` dispatchers. Handler names resolve like gin's.
     #[test]
     fn chi_verbs_nested_routes_and_middleware() {
-        let src = "package main\nimport \"github.com/go-chi/chi/v5\"\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Get(\"/health\", health)\n\tr.Route(\"/api\", func(r chi.Router) {\n\t\tr.Post(\"/login\", login)\n\t\tr.Route(\"/v1\", func(r chi.Router) {\n\t\t\tr.Get(\"/users\", users)\n\t\t})\n\t})\n\tr.Group(func(r chi.Router) {\n\t\tr.Delete(\"/cache\", clear)\n\t})\n\tr.With(auth).Put(\"/profile\", update)\n\tsub := r.With(auth)\n\tsub.Get(\"/priv\", priv)\n\tr.Method(\"PATCH\", \"/patch\", patcher)\n}\n";
+        let src = "package main\nimport \"github.com/go-chi/chi/v5\"\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Get(\"/health\", health)\n\tr.Route(\"/api\", func(r chi.Router) {\n\t\tr.Post(\"/login\", login)\n\t\tr.Route(\"/v1\", func(r chi.Router) {\n\t\t\tr.Get(\"/users\", users)\n\t\t})\n\t})\n\tr.Group(func(r chi.Router) {\n\t\tr.Delete(\"/cache\", clear)\n\t})\n\tr.With(auth).Put(\"/profile\", update)\n\tsub := r.With(auth)\n\tsub.Get(\"/priv\", priv)\n\tr.Method(\"PATCH\", \"/patch\", patcher)\n\tr.Handle(\"/raw\", raw)\n}\n";
         assert_eq!(
             summary(Language::Go, src),
             [
@@ -1785,6 +1797,7 @@ public class AuthController {
                 "PUT /profile root name update",
                 "GET /priv root name priv",
                 "PATCH /patch root name patcher",
+                "ANY /raw root name raw",
             ]
         );
         // Without the chi import nothing is a chi route; an aliased import
@@ -1824,7 +1837,7 @@ public class AuthController {
     /// its own prefix). Handlers are the decorated functions.
     #[test]
     fn fastapi_decorators_prefixes_and_includes() {
-        let src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\nrouter = APIRouter(prefix=\"/api\")\nv1 = APIRouter()\n\n@app.get(\"/health\")\ndef health():\n    pass\n\n@router.post(\"/login\")\ndef login():\n    pass\n\n@v1.get(\"/users\")\ndef users():\n    pass\n\n@v1.delete(\"/users/{id}\")\ndef drop_user():\n    pass\n\napp.include_router(router)\napp.include_router(v1, prefix=\"/v1\")\n";
+        let src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\nrouter = APIRouter(prefix=\"/api\")\nv1 = APIRouter()\n\n@app.get(\"/health\")\ndef health():\n    pass\n\n@router.post(\"/login\")\ndef login():\n    pass\n\n@v1.get(\"/users\")\ndef users():\n    pass\n\n@v1.delete(\"/users/{id}\")\ndef drop_user():\n    pass\n\napp.include_router(router)\napp.include_router(v1, prefix=\"/v1\")\napp.include_router(router, prefix=\"/v2\")\n";
         assert_eq!(
             summary(Language::Python, src),
             [
@@ -1832,6 +1845,7 @@ public class AuthController {
                 "POST /api/login root def login",
                 "GET /v1/users root def users",
                 "DELETE /v1/users/{} root def drop_user",
+                "POST /v2/api/login root def login",
             ]
         );
         // Without the fastapi import nothing is a route.

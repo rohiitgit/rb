@@ -413,3 +413,7 @@
 ## 2026-10-11: never `git checkout -- <file>` to undo a mutant (or anything)
 - **Mistake (recovered, costly):** a manual `git checkout -- crates/…/scip.rs` to undo a mutant reverted the entire S9b implementation + tests (they were uncommitted); rewritten from context and re-verified (mutants re-killed, suites re-run).
 - **Rule:** mutant scripts restore bytes in `finally` (already the rule) — and for ANY manual undo use `git diff` to inspect first, `git stash`/`edit` to revert precisely; `checkout -- <file>` is banned while uncommitted work exists. (Extends the M3b `git checkout` lesson and the amendment-append rule: destructive commands need a pre-check.)
+
+## 2026-10-11: e2e `rb()` shells `target/debug/rb`, which `cargo test` does not refresh
+- **Mistake (recovered, ~1 h):** two fixture bless runs failed on rows the fixed code produces; manual runs with the same binary passed. Root cause chain: `cargo test` builds the test harness (which printed NEW guard text, looking current) but `rb()` shells `target/debug/rb`, refreshed only by explicit `cargo build -p rb-cli` — last run before the fixes. Suspected cache poisoning, fixture staleness, and guard-key typos (one real: endpoint keys carry the `HTTP` prefix) before finding it.
+- **Rule:** always `cargo build -p rb-cli` after touching anything the binary embeds, before any e2e run. When an e2e result contradicts a manual run of the "same" binary, check binary mtimes first (`ls -la target/debug/rb`), mechanism second.

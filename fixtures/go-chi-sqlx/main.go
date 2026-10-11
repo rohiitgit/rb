@@ -42,6 +42,7 @@ func main() {
 	r.Group(func(r chi.Router) {
 		r.Delete("/cache", purgeCache)
 	})
+	r.Handle("/raw", rawHandler)
 	_ = Checkout(Card{Number: "4111"}, 100)
 	_ = Checkout(Cash{}, 5)
 	_ = http.ListenAndServe(":8080", r)
@@ -69,3 +70,5 @@ func receipt(next http.Handler) http.Handler {
 func purgeCache(w http.ResponseWriter, req *http.Request) {
 	clearCache()
 }
+
+func rawHandler(w http.ResponseWriter, req *http.Request) {}

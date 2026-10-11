@@ -2920,6 +2920,13 @@ fn scip_image_identity_is_part_of_the_tool_configuration() {
         rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE,
         "{tools}"
     );
+    // Contract M6d S1 (evaluator pass 1, E1-1): the go and python identities
+    // ride the same record (the java fixture has neither job).
+    assert_eq!(
+        tools["scip_python"],
+        rb_scip::jobs::SCIP_PYTHON_IMAGE,
+        "{tools}"
+    );
     // Amendment 44: an `unsupported` job did not finish, so with the image still absent the
     // snapshot is rebuilt (cheaply: facts and index caches are warm), not "up to date".
     let again = rb_with_path(&url, &["index", path, "--repo", &name], Some(&shimmed));
@@ -2936,6 +2943,12 @@ fn scip_image_identity_is_part_of_the_tool_configuration() {
     let tools = store.live_snapshot(&name).unwrap().unwrap().tool_versions;
     assert!(
         tools["scip_java"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("sha256:")),
+        "{tools}"
+    );
+    assert!(
+        tools["scip_go"]
             .as_str()
             .is_some_and(|id| id.starts_with("sha256:")),
         "{tools}"

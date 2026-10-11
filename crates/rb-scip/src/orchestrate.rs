@@ -733,10 +733,14 @@ fn go_runs(
         // allow-list, so verification is off; `go.sum` still verifies the
         // modules it pins. `GOFLAGS=-mod=mod` rides from the image. The
         // proxy is pinned (no `,direct` git fallback outside the
-        // allow-list; S11: it would only fail closed, slowly).
+        // allow-list; S11: it would only fail closed, slowly). The toolchain
+        // is pinned too (evaluator pass 1, E1-5): a newer-toolchain repo
+        // fails closed instead of downloading one from outside the list.
         env: vec![
             ("GOSUMDB".into(), "off".into()),
             ("GOPROXY".into(), "https://proxy.golang.org".into()),
+            ("GOTOOLCHAIN".into(), "local".into()),
+            ("GOFLAGS".into(), "-mod=mod".into()),
         ],
         network: Network::Fetch,
         cpus: budget.cpus,
@@ -1041,7 +1045,9 @@ mod tests {
                 && lines[0].contains("go mod download")
                 && lines[0].contains("/root/go/pkg/mod")
                 && lines[0].contains("-e GOSUMDB=off")
-                && lines[0].contains("-e GOPROXY=https://proxy.golang.org"),
+                && lines[0].contains("-e GOPROXY=https://proxy.golang.org")
+                && lines[0].contains("-e GOTOOLCHAIN=local")
+                && lines[0].contains("-e GOFLAGS=-mod=mod"),
             "{}",
             lines[0]
         );

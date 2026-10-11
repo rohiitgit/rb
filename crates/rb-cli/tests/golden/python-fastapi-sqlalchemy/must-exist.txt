@@ -11,5 +11,12 @@ DEPENDS_ON services/shop -> py/fastapi@0.143.0 [exact] {"version_from": "uv_lock
 DEPENDS_ON client -> py/requests@? [exact] {"version_from": "unresolved"}
 EXPOSES services/shop -> HTTP GET /api/users @services/shop [exact]
 HANDLED_BY HTTP POST /api/orders @services/shop -> scip-python python shop 0.1.0 `app.main`/create_order(). [exact]
+# A router included twice serves both prefixes (evaluator pass 1, E3-2):
+# `v1` has no own prefix, so it serves only under `/v2`.
+EXPOSES services/shop -> HTTP GET /v2/users @services/shop [exact]
+HANDLED_BY HTTP GET /v2/users @services/shop -> scip-python python shop 0.1.0 `app.main`/list_users_v1(). [exact]
+# The merged GET edge carries both the absolute-URL plain call and the
+# session-relative call (sites:2); the session path alone is pinned by the
+# POST guard below (carrier-capped, heuristic).
 CONSUMES scip-python python client 0.1.0 calls/sync(). -> HTTP GET /api/users @services/shop [synthetic] {"client": "fetch", "host": "shop", "match": "exact"}
 CONSUMES scip-python python client 0.1.0 calls/sync(). -> HTTP POST /api/orders @services/shop [heuristic] {"client": "fetch"}

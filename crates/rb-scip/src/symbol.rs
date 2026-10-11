@@ -144,6 +144,10 @@ pub fn package(symbol: &str) -> Option<Package> {
     } else {
         &p.manager
     };
+    // Strip with the normalized manager: a `gomod/`-prefixed wire name is
+    // not a measured form, so it keys apart rather than merging across keys
+    // (evaluator pass 1, E2-2 — declined the wire-manager strip: D3
+    // fail-closed on unmeasured forms).
     let name = p
         .name
         .strip_prefix(&format!("{manager}/"))
@@ -345,6 +349,14 @@ mod tests {
         // scip-java's `maven/org.ext/lib .` above).
         let own = package("scip-go gomod github.com/acme/billing . billing/Handler#").unwrap();
         assert_eq!(own.key(), "go/github.com/acme/billing@?");
+        // A `gomod/`-prefixed wire name is not ours to shorten: it keys
+        // apart (evaluator pass 1, E2-2), never merging across keys.
+        assert_eq!(
+            package("scip-go gomod gomod/github.com/gin-gonic/gin v1.10.0 gin/Context#")
+                .unwrap()
+                .key(),
+            "go/gomod/github.com/gin-gonic/gin@v1.10.0"
+        );
         // npm and maven managers pass through untouched.
         assert_eq!(
             package("scip-typescript npm gin 1.0.0 src/`a.ts`/")

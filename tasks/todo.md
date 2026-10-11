@@ -913,6 +913,7 @@ Same rules as M6b/M6c:
 - [x] **10. Egress review** (S10). Done 2026-10-11 (amendment 12): probe suite re-run green on the final 7-host allow-list; per-tool posture recorded; verdict no finding, no code change.
 - [x] **11. Measurements** (S11). Done 2026-10-11 (amendment 13, record `var/m6d/bench/phase11.md`): --no-scip both binaries both repos (identical graphs, classified +W-only diffs, read samples); scip-go 6/9 ok + scip-python ok with two measurement-driven fetch fixes (GCS redirect host, requires-python flag + recipe bump); classified SCIP diffs + samples; deterministic. Files: `rb-scip/src/egress.rs`, `hash.rs`, `orchestrate.rs`, `rb-cli/tests/e2e.rs`.
 - [ ] **12. Records + evaluator.** S12–S14; pass 1 (full), fixes, pass 2 (verification-only).
+  - [x] **Pass 1 + fixes.** Done 2026-10-11 (amendment 14): 3 parallel evaluators, 2 blocking + 9 non-blocking findings; blockers fixed test-first (tool_versions identities, absolute replace) + claim-breaking hardening (chi Handle, double-include expansion, dispatcher kwargs, gomod split pin, GOTOOLCHAIN env); rest recorded with reasons.
 
 ## Later M6 sub-milestones (not started; scope and exit criteria in design §13)
 

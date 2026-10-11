@@ -5,10 +5,16 @@ from app.models import Order, User
 from .store import active_users, order_total
 
 router = APIRouter(prefix="/api")
+v1 = APIRouter()
 
 
 @router.get("/users")
 def list_users():
+    return active_users()
+
+
+@v1.get("/users")
+def list_users_v1():
     return active_users()
 
 
@@ -31,3 +37,4 @@ def owner(name: str):
 
 
 app.include_router(router)
+app.include_router(v1, prefix="/v2")

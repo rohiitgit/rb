@@ -1551,14 +1551,16 @@ fn requests_httpx(facts: &FileScope<'_>, out: &mut FileClients) {
         None
     };
     // Whether the call's keywords may reroute: any key outside the plain
-    // list (a spread reads as `...`, which is outside every list).
+    // list (a spread reads as `...`, which is outside every list). `url`
+    // and `method` never count: the dispatcher's native slots, inert on a
+    // verb call.
     let configured = |allowed: &[&str], args: &[Arg]| {
         args.iter()
             .flat_map(|a| match a {
                 Arg::Object { entries, .. } => entries.iter().collect::<Vec<_>>(),
                 _ => Vec::new(),
             })
-            .any(|e| e.key != "url" && !allowed.contains(&e.key.as_str()))
+            .any(|e| e.key != "url" && e.key != "method" && !allowed.contains(&e.key.as_str()))
     };
     let site = |span: Span,
                 enclosing: Option<usize>,
@@ -1754,11 +1756,16 @@ fn requests_httpx(facts: &FileScope<'_>, out: &mut FileClients) {
                     ),
             ))
         } else if verb == "request" || (httpx && verb == "stream") {
-            let url = link
-                .args
-                .get(1)
-                .cloned()
-                .or_else(|| kwarg(&link.args, "url").cloned())?;
+            // A positional URL, else a `url` keyword (a keyword `Object` in
+            // the slot never reads as the URL); anything else unnamed keeps
+            // an Unknown site, as for `fetch`.
+            let url = match link.args.get(1) {
+                Some(Arg::Template { .. } | Arg::Name { .. }) => link.args.get(1).cloned(),
+                Some(_) => kwarg(&link.args, "url")
+                    .cloned()
+                    .or_else(|| link.args.get(1).cloned()),
+                None => kwarg(&link.args, "url").cloned(),
+            }?;
             Some(site(
                 span,
                 enclosing,
@@ -5444,10 +5451,11 @@ mod tests {
     /// Contract M6d S7, evaluator-pass-1 parity: configuration surfaces that
     /// may reroute cap the site. `requests` hooks are response-only, so they
     /// stay plain; `httpx` transports, mounts, event hooks and extensions,
-    /// unknown keys and spreads cap — as do all carrier sites.
+    /// unknown keys and spreads cap — as do all carrier sites. A `url`
+    /// keyword reads like a positional one, including on dispatchers.
     #[test]
     fn requests_httpx_reconfigured_calls_are_capped() {
-        let src = "import requests\nimport httpx\n\ns = requests.Session()\nc = httpx.Client(base_url=\"http://orders\", transport=T)\nc2 = httpx.Client(base_url=\"http://orders\", unknown_opt=1)\n\ndef f(opts, H, E):\n    requests.get(\"http://orders/a\", hooks=H)\n    requests.get(\"http://orders/b\", unknown_opt=1)\n    requests.get(\"http://orders/c\", **opts)\n    httpx.get(\"http://orders/d\", extensions=E)\n    s.get(\"http://orders/e\")\n    c.get(\"/f\")\n    c2.get(\"/g\")\n";
+        let src = "import requests\nimport httpx\n\ns = requests.Session()\nc = httpx.Client(base_url=\"http://orders\", transport=T)\nc2 = httpx.Client(base_url=\"http://orders\", unknown_opt=1)\n\ndef f(opts, H, E):\n    requests.get(\"http://orders/a\", hooks=H)\n    requests.get(\"http://orders/b\", unknown_opt=1)\n    requests.get(\"http://orders/c\", **opts)\n    httpx.get(\"http://orders/d\", extensions=E)\n    s.get(\"http://orders/e\")\n    c.get(\"/f\")\n    c2.get(\"/g\")\n    requests.request(\"GET\", url=\"http://orders/h\")\n    httpx.request(method=\"POST\", url=\"http://orders/i\")\n";
         assert_eq!(
             calls(Language::Python, src),
             [
@@ -5458,6 +5466,8 @@ mod tests {
                 "fetch GET 'http://orders/e' unverified",
                 "fetch GET '/f' base='http://orders' unverified",
                 "fetch GET '/g' base='http://orders' unverified",
+                "fetch GET 'http://orders/h'",
+                "fetch POST 'http://orders/i'",
             ]
         );
     }
