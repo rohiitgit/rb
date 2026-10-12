@@ -1,0 +1,18 @@
+# Precision guards (contract M6g S6), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# Routes: the Spring controller's POST on its path, to its method.
+EXPOSES services/auth -> HTTP POST /v1/login @services/auth [exact]
+HANDLED_BY HTTP POST /v1/login @services/auth -> rb-heuristic . . . `services/auth/src/main/java/acme/AuthController.java`/AuthController#login(). [exact]
+# Topics (S1/S2/S5): the producer's placeholder resolves through the active profile's YAML
+# document, so the consumer's literal meets it at prod-events.
+PUBLISHES services/jobs -> topic/prod-events [heuristic]
+SUBSCRIBES services/worker -> topic/prod-events [heuristic]
+# Gateway rewrites (S3): the nginx locations and the Spring Gateway route strip their prefix
+# and scope to auth, each marked.
+CONSUMES rb-heuristic . . . `apps/web/src/client.ts`/loginViaNginx(). -> HTTP POST /v1/login @services/auth [heuristic] {"via_gateway":"/api/"}
+CONSUMES rb-heuristic . . . `apps/web/src/client.ts`/loginViaPay(). -> HTTP POST /v1/login @services/auth [heuristic] {"via_gateway":"/pay/"}
+CONSUMES rb-heuristic . . . `apps/web/src/client.ts`/loginViaBill(). -> HTTP POST /v1/login @services/auth [heuristic] {"via_gateway":"/bill/"}
+# Host names (S4): the rb.toml mapping and the k8s Service name pin their hosts to auth.
+CONSUMES rb-heuristic . . . `apps/web/src/client.ts`/loginViaAlias(). -> HTTP POST /v1/login @services/auth [heuristic] {"host":"login"}
+CONSUMES rb-heuristic . . . `apps/web/src/client.ts`/loginViaK8s(). -> HTTP POST /v1/login @services/auth [heuristic] {"host":"auth-http"}

@@ -582,3 +582,23 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Phase 8, measurements (S8, amendment 10): grpc-go classified (18 endpoints, 52 synthetic CONSUMES sampled, 869 correctly-unmatched residue) + deterministic; OAI identical + reader breadth on real specs; cleanup.
   - [x] Phase 9, evaluator + close (amendment 11): pass 1 full review (12 probes, 1 fix + churn fix, VERDICT PASS), pass 2 verification-only (VERDICT PASS, close verify green).
 - **Verification** (`var/m6f/logs/p9-close3-*`): fmt, clippy `-D warnings`, 842 units + 25 cli-bin, store 66, server 12, e2e 37/37, api 1/1 (150 sets), no `skipping:`, no listener, stub scan clean. `PIPELINE` `m6c-5` → `m6f-1`. DB holds only the 3 pre-existing `fx_*` repos.
+
+## M6g Topology and configuration packs: complete (closed 2026-10-12, contract amendment 11)
+
+- **Contract:** `tasks/contract-m6g.md` (2026-10-12), S1–S10 and invariants 1–7, D1–D7, forks F1–F5.
+- **Soundness claims and closing bar, stated up front:** silent-failure outputs (wrong topic, misroute, merged hosts, wrong profile, YAML misread) all take the safe direction (unreadable contributes nothing counted; dynamics never edge; ambiguous rewrites never applied; unknown profiles keep today's reading; duplicates never merge). Pass 1 full, pass 2 verification-only.
+- **Decided in the contract (D1–D7):** topic edges originate at services; literals only; gateway rules rewrite (no new node kind); hosts extend D6; YAML hand-rolled with documented precedence; fixture plan is code; measurement pins.
+- **Progress:**
+  - [x] Phase 0, preflight (amendment 1): baseline binary `var/m6g/base/rb-f80714d`, kafka + gateway pins, shape checks.
+  - [x] Phase 1, topic packs (S1, amendment 2): Kafka/Rabbit listeners + template sends; dynamics counted; mutants.
+  - [x] Phase 2, topic graph (S2, amendment 3): `Topic` + `PUBLISHES`/`SUBSCRIBES`, placeholder resolution; mutants.
+  - [x] Phase 3, gateway packs (S3, amendment 4): nginx + Spring Gateway readers + stitch rewrites (`via_gateway`); mutants.
+  - [x] Phase 4, host names (S4, amendment 5): compose/k8s/`rb.toml` readers + stitch aliases + `RbToml.hosts`; mutants.
+  - [x] Phase 5, Spring YAML (S5, amendment 6): multi-doc profiles evaluated in documented precedence; diagnostics stay conservative; mutants.
+  - [x] Phase 6, fixture + guards (S6, amendment 7): topo-packs fixture, e2e + dump golden + 11/4 guards each biting (8 mutant runs); `PIPELINE` `m6g-1`.
+  - [x] S9, growth (amendment 8): counted ops for the config walk (4x→5x); readers ride existing growth tests.
+  - [x] Close verify + invariant 1 (amendment 8): 10 old fixtures `--no-scip` identical + polyglot/ts-express SCIP identical.
+  - [x] Phase 7, measurements (amendment 9): kafka 625k identical (vacuous, proven); gateway +8 correct unreads; spring-kafka +808 (0 false in samples).
+  - [x] Evaluator pass 1 (amendment 10, `tasks/eval-m6g-pass1.md`): VERDICT PASS — 6 fixes (P9/P18/P30/P31/P32/P2), 10/10 mutants killed.
+  - [x] Evaluator pass 2 (`tasks/eval-m6g-pass2.md`): verification-only — VERDICT PASS (repros re-run, mutants cited, suite green, invariant 1 re-derived).
+- **Verification** (`var/m6g/logs/p6-close2-*`): fmt, clippy `-D warnings` (clean on the final tree; the loop's clippy step ran pre-fix), 866 units, `rb-store` 66/66, `rb-server` 12/12, e2e 38/38, api 1/1, no `skipping:`, no listener, stub scan clean.

@@ -1,0 +1,9 @@
+# The gateway is pure nginx config: no build manifest, but it is a deployable service.
+[[service]]
+path = "gateway"
+name = "edge-gateway"
+
+# `login` names the auth service on the wire.
+[[hosts]]
+service = "services/auth"
+names = ["login"]

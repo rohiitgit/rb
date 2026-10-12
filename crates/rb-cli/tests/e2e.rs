@@ -654,6 +654,195 @@ fn polyglot_monorepo() {
     check_fixture("polyglot-monorepo", "poly");
 }
 
+/// Contract M6g S6: the topo-packs fixture. Kafka producer/consumer join `topic/prod-events`
+/// (the placeholder resolves through the active profile's YAML document, so the base and
+/// bootstrap values never edge); the dynamic send is counted, never an edge. The web client's
+/// gateway calls stitch through the nginx and Spring Gateway rewrites (`via_gateway`), and the
+/// alias calls through `rb.toml` and k8s host names. Determinism, the store round trip, the
+/// precision guards with the HTTP/M4b invariants, the file set and AGE parity all hold; the
+/// `--no-scip` dump is golden.
+#[test]
+fn topo_packs() {
+    let Some(url) = db_url() else { return };
+    let fixture = "topo-packs";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let pid = std::process::id();
+    let (a, b) = (format!("t_topo_{pid}_a"), format!("t_topo_{pid}_b"));
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![a.clone(), b.clone()],
+    };
+
+    // Determinism: the same commit indexed into two repos, and rebuilt, dumps byte-identically.
+    rb(&url, &["index", path, "--repo", &a, "--no-scip"]);
+    rb(&url, &["index", path, "--repo", &b, "--no-scip"]);
+    let dump_a = rb(&url, &["dump", "--repo", &a]);
+    let dump_b = rb(&url, &["dump", "--repo", &b]);
+    assert_eq!(dump_a, dump_b, "same commit, different repos");
+
+    assert!(rb(&url, &["index", path, "--repo", &a, "--no-scip"]).contains("up to date"));
+    rb(&url, &["index", path, "--repo", &a, "--no-scip", "--force"]);
+    assert_eq!(rb(&url, &["dump", "--repo", &a]), dump_a, "forced rebuild");
+
+    // The stored snapshot is faithful to the in-memory pipeline output.
+    let indexed = rb_indexer::index_commit(
+        repo.path(),
+        "HEAD",
+        &mut rb_indexer::NoCache,
+        &rb_indexer::ScipOptions::disabled(),
+        &mut rb_indexer::NoScipCache,
+    )
+    .unwrap();
+    assert_eq!(
+        canonical_dump(&indexed.commit_sha, &indexed.graph, &indexed.diagnostics),
+        dump_a,
+        "store round trip"
+    );
+    let graph = &indexed.graph;
+    let node = |id: i64| graph.nodes().iter().find(|n| n.id == id).unwrap();
+
+    // The fixture's precision guards, and the HTTP/M4b invariants every dump keeps.
+    let mut failures = guard_failures(fixture, &dump_a);
+    failures.extend(http_invariant_failures(graph));
+    failures.extend(m4b_invariant_failures(graph));
+    assert!(
+        failures.is_empty(),
+        "precision guards and invariants of {fixture}:\n{}",
+        failures.join("\n")
+    );
+
+    // The fixture commit holds the tracked files and nothing else (amendment 40).
+    let mut files: Vec<String> = graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::File)
+        .map(|n| n.key.clone())
+        .collect();
+    files.sort();
+    let mut tracked = tracked_files(fixture);
+    tracked.sort();
+    assert_eq!(files, tracked, "the fixture repository's files");
+
+    // Invariant: every File has exactly one IN_SERVICE edge.
+    for f in graph.nodes().iter().filter(|n| n.kind == NodeKind::File) {
+        let memberships = graph
+            .edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::InService && e.src == f.id)
+            .count();
+        assert_eq!(
+            memberships, 1,
+            "{} has {memberships} IN_SERVICE edges",
+            f.key
+        );
+    }
+
+    // Contract M5 S6: the projection holds exactly the snapshot's vertices and edges.
+    let failures = age_parity_failures(&url, &a, graph);
+    assert!(failures.is_empty(), "AGE parity:\n{}", failures.join("\n"));
+
+    golden(fixture, "dump.jsonl", &dump_a);
+
+    // The endpoint's 1-hop neighbours in each direction equal the relational ones.
+    let mut endpoints: Vec<String> = graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::Endpoint)
+        .map(|n| n.key.clone())
+        .collect();
+    endpoints.sort();
+    assert!(!endpoints.is_empty());
+    let cypher = |query: &str, cols: &str| {
+        sorted_rows(&rb(
+            &url,
+            &[
+                "cypher",
+                query,
+                "--repo",
+                &a,
+                "--cols",
+                cols,
+                "--timeout-ms",
+                "30000",
+            ],
+        ))
+    };
+    for (outbound, query) in [
+        (
+            true,
+            "MATCH (e:Endpoint)-[r]->(n) RETURN e.key, label(r), n.key",
+        ),
+        (
+            false,
+            "MATCH (n)-[r]->(e:Endpoint) RETURN e.key, label(r), n.key",
+        ),
+    ] {
+        let mut expected: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter_map(|e| {
+                let (end, other) = if outbound {
+                    (node(e.src), node(e.dst))
+                } else {
+                    (node(e.dst), node(e.src))
+                };
+                (end.kind == NodeKind::Endpoint)
+                    .then(|| format!("{}\t{}\t{}", end.key, e.kind, other.key))
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(
+            cypher(query, "endpoint,kind,neighbour"),
+            expected,
+            "{query}"
+        );
+    }
+
+    // Topic vertices project too: services publish and subscribe through their labels.
+    for (kind, query) in [
+        (
+            EdgeKind::Publishes,
+            "MATCH (s:Service)-[r:PUBLISHES]->(t:Topic) RETURN s.key, t.key",
+        ),
+        (
+            EdgeKind::Subscribes,
+            "MATCH (s:Service)-[r:SUBSCRIBES]->(t:Topic) RETURN s.key, t.key",
+        ),
+    ] {
+        let mut expected: Vec<String> = graph
+            .edges()
+            .iter()
+            .filter(|e| {
+                e.kind == kind
+                    && node(e.src).kind == NodeKind::Service
+                    && node(e.dst).kind == NodeKind::Topic
+            })
+            .map(|e| format!("{}\t{}", node(e.src).key, node(e.dst).key))
+            .collect();
+        expected.sort();
+        assert!(!expected.is_empty(), "{query} matches nothing relationally");
+        assert_eq!(cypher(query, "service,topic"), expected, "{query}");
+    }
+
+    // Cypher runs read-only: writes are rejected.
+    let out = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .args([
+            "cypher",
+            "CREATE (n:File {key: 'x'}) RETURN n",
+            "--repo",
+            &a,
+        ])
+        .env("RB_DATABASE_URL", &url)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a CREATE through rb cypher must fail"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("read-only"));
+}
+
 fn golden_path(fixture: &str, name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")

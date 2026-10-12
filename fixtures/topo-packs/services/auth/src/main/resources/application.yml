@@ -1,0 +1,9 @@
+auth:
+  note: base deployment
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+auth:
+  note: production deployment

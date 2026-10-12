@@ -1,0 +1,9 @@
+app:
+  topic: base-events
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+app:
+  topic: prod-events

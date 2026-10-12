@@ -1,0 +1,5 @@
+services:
+  auth:
+    image: auth:1
+  jobs:
+    image: jobs:1

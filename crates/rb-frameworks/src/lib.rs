@@ -9,8 +9,11 @@ pub mod clients;
 pub mod di;
 pub mod endpoint;
 pub mod fold;
+pub mod gateway;
+pub mod hosts;
 pub mod routes;
 pub mod spec;
+pub mod topics;
 
 /// Operation counts for the growth tests (contract M4a invariant 11; amendment 12, Q4): the
 /// measured loops call [`work::tick`] with the elements they examine, and a test compares the

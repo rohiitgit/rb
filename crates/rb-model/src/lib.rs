@@ -62,6 +62,7 @@ string_enum! {
         Owner => "owner",
         Endpoint => "endpoint",
         Package => "package",
+        Topic => "topic",
     }
 }
 
@@ -76,6 +77,7 @@ impl NodeKind {
             NodeKind::Owner => "Owner",
             NodeKind::Endpoint => "Endpoint",
             NodeKind::Package => "Package",
+            NodeKind::Topic => "Topic",
         }
     }
 }
@@ -98,6 +100,8 @@ string_enum! {
         Consumes => "CONSUMES",
         OwnedBy => "OWNED_BY",
         DependsOn => "DEPENDS_ON",
+        Publishes => "PUBLISHES",
+        Subscribes => "SUBSCRIBES",
     }
 }
 
