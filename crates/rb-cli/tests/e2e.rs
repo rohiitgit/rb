@@ -656,7 +656,12 @@ fn java_spring_jpa() {
 #[test]
 fn check_gates() {
     let Some(url) = db_url() else { return };
-    for (fixture, tag) in [("topo-packs", "topo"), ("polyglot-monorepo", "poly")] {
+    for (fixture, tag, pin_golden) in [
+        ("topo-packs", "topo", true),
+        ("polyglot-monorepo", "poly", true),
+        ("java-spring-jpa", "jpa", false),
+        ("ts-express-prisma", "tse", false),
+    ] {
         let repo = fixture_repo(fixture);
         let path = repo.path().to_str().unwrap();
         let pid = std::process::id();
@@ -702,9 +707,11 @@ fn check_gates() {
             if expected.is_empty() { 0 } else { 1 },
             "exit code on {fixture}"
         );
-        // The text output is golden; a clean rule filter exits 0.
+        // The text output is golden on the rule fixtures; a clean rule filter exits 0.
         let (code, stdout, _) = rb_exit(&url, &["check", "--repo", &name]);
-        golden(fixture, "check.txt", &stdout);
+        if pin_golden {
+            golden(fixture, "check.txt", &stdout);
+        }
         assert_eq!(
             code,
             if expected.is_empty() { 0 } else { 1 },
