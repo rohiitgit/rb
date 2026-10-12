@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M6l CLOSED (evaluator passes 1–2)
+- Phase 1: XML `di_unresolved` diagnostics site the document (`owner_path` → `xml_path`) + unit (mutant kills) + spring-xml fixture (`missing` ref, no new nodes/edges, guards hold) + reviewed re-bless (coverage +1/+1, newly-sited diagnostic only).
+- Pass 1: short review — the fix surface, one mutant kill, no other rows shift.
+- Pass 2 (`tasks/eval-m6l-pass2.md`): VERDICT PASS — close verify stands (fmt, clippy, 927 units, store 72, server 12, e2e 47/47, api 1/1; first attempt died environmentally mid-e2e, rerun green), invariant 17/18 + 2 SCIP identical.
+- `PIPELINE` `m6l-1` (metadata-only: no golden pins it; close verify re-proves the exact bumped tree).
+- Files: `crates/rb-indexer/src/di.rs`, `crates/rb-cli/tests/golden/spring-xml/`, `fixtures/spring-xml/`; records `tasks/{contract-m6l,eval-m6l-pass2,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-12] (wall clock) M6k CLOSED (evaluator passes 1–2)
 - Phase 1 (amendment 2): anchor-at-type — `FileDi::unanchored` + shared `resolve_lane_point` + unique-or-skip anchoring (XML-bean precedent); val-form + top-level `AddX` engine proofs.
 - Phase 2 (amendments 3–4): `@Assisted` exclusion, `toProvider`, C# properties (`[Inject]`/`[FromServices]`/`[FromKeyedServices]`, statics excluded), keyed services (literal keys ride qualifiers), C# `argument` unwrap, global-namespace key; pack + engine units.

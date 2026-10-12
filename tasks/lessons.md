@@ -529,3 +529,7 @@
 ## 2026-10-12: diagnostic spans must live in the diagnostic's file
 - **Mistake (caught by springfu's new diagnostics landing mid-identifier):** anchored points reported the owner's path with record-file spans — incoherent coordinates no consumer can use. The XML lane shares the shape (precedent, left alone to avoid churning M6j goldens).
 - **Rule:** synthesized facts carry two files (evidence vs owner); every site (diagnostic, unique-key, evidence) must say which file its span belongs to. When in doubt, site where the point is written.
+
+## 2026-10-13: check the whole check output, not its head
+- **Mistake (caught by the close loop failing):** `cargo fmt --check | head -2` showed nothing while a violation sat below the cut — the loop's fmt step failed on a tree declared clean.
+- **Rule:** never truncate check output; assert on exit codes (`check ... && echo CLEAN`), not on the visible head. Same for clippy and test summaries: grep the counts, show the whole line.

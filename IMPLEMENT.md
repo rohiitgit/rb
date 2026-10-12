@@ -669,3 +669,15 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Pass-1 probing (amendments 7–8, `tasks/eval-m6k-pass1.md`): VERDICT PASS — H1–H6 in-tree (dotted namespaces, cross-namespace merge, enclosing scope, diagnostic siting, static properties, vacuous tests), 20+ source-read samples.
   - [x] Evaluator pass 2 (`tasks/eval-m6k-pass2.md`): VERDICT PASS — repros re-run, suite stands.
 - **Verification** (`var/m6k/logs/p6-close-*`): fmt, clippy `-D warnings`, 926 units, `rb-store` 72/72, `rb-server` 12/12, e2e 47/47, api 1/1, no `skipping:`, no listener, stub scan clean.
+
+## M6l XML diagnostic siting: complete (closed 2026-10-13, contract amendment 3)
+
+- **Contract:** `tasks/contract-m6l.md` (2026-10-12), S1–S4, D1–D2, fork F1.
+- **Progress:**
+  - [x] Phase 0, baselines (amendment 1): baseline binary `41e7d632` (M6k final-tree build, no code delta at copy).
+  - [x] Phase 1, siting fix (amendment 2): `owner_path` → `xml_path` in the one call + unit (mutant kills) + spring-xml `missing` ref (no new nodes/edges, guards hold) + reviewed re-bless (coverage +1/+1, newly-sited diagnostic only) + clippy fix in the new test.
+  - [x] Invariant 1: 17/18 identical + 2 SCIP identical; the single spring-xml row moves the diagnostic to the document.
+  - [x] Evaluator pass 1 (short review): the fix surface, one mutant kill, no other rows shift.
+  - [x] Evaluator pass 2 (`tasks/eval-m6l-pass2.md`): VERDICT PASS — repros re-run, suite stands.
+  - [x] `PIPELINE m6l-1`: metadata-only, no golden pins it.
+- **Verification** (`var/m6l/logs/p6-pipe-*`): fmt, clippy `-D warnings`, 927 units, `rb-store` 72/72, `rb-server` 12/12, e2e 47/47, api 1/1, no `skipping:`, no listener, stub scan clean.

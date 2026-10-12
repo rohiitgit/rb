@@ -107,3 +107,9 @@ spring-xml fixture (`missing` ref on the audit bean — no new nodes/edges, no
 guard churn) + reviewed re-bless (coverage +1 point/+1 unresolved, new
 diagnostic sited in the document, blob/hash only). Commit `ca0c641` (incl. a
 clippy `needless_borrow` fix in the new test).
+
+3. **(close) Evaluator pass 2 + records.** Pass 2 (`tasks/eval-m6l-pass2.md`):
+VERDICT PASS — close loop `p6-pipe` stands (fmt, clippy, 927 units, store 72,
+server 12, e2e 47/47, api 1/1), invariant stands, release `0adc2829` from the
+bumped tree. Records: CHANGELOG (`M6l CLOSED`), IMPLEMENT.md §M6l, design M6l
+row, lessons (1 new), todo (M6l closed). `PIPELINE` is `m6l-1`.
