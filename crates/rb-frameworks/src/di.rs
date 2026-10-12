@@ -41,6 +41,20 @@ const GUICE_NAME: &str = "com.google.inject.name";
 const DAGGER: &str = "dagger";
 // Contract M6j S3: NestJS decorators live in `@nestjs/common`.
 const NEST: &str = "@nestjs/common";
+// Contract M6j S6: Microsoft DI registrations live in
+// `Microsoft.Extensions.DependencyInjection`.
+const DOTNET_DI: &str = "Microsoft.Extensions.DependencyInjection";
+
+/// `IServiceCollection` registration calls (contract M6j S6): keyed variants stay
+/// unread (their keys are not modeled).
+const SERVICE_REGISTRATIONS: &[&str] = &[
+    "AddSingleton",
+    "AddTransient",
+    "AddScoped",
+    "TryAddSingleton",
+    "TryAddTransient",
+    "TryAddScoped",
+];
 
 /// The class-level annotations that make a class a bean when it is component-scanned (S2),
 /// by package. `@SpringBootApplication` and `@SpringBootConfiguration` are meta-annotated with
@@ -882,6 +896,72 @@ pub fn kotlin_di(facts: &FileFacts) -> FileDi {
                 annotations: Vec::new(),
                 span,
             });
+        }
+    }
+    out
+}
+
+/// Microsoft DI facts per file (contract M6j S6): `services.AddX<T>()` /
+/// `AddX<T, Impl>()` registrations as `Binds` beans anchored at their enclosing
+/// definition (top-level minimal-hosting statements have none and stay unread), and
+/// constructor parameters (non-member typed bindings scoped to a class) as points.
+/// Registrations need the namespace import (the language requires it); points do not
+/// (consumers often import nothing) — the lane resolves only points whose owner class
+/// is itself registered, so unregistered consumers stay silent. Lifetimes are not
+/// modeled (all lifetimes resolve identically here); factories, instances, `typeof`
+/// and keyed services stay unread.
+pub fn dotnet_di(facts: &FileFacts) -> FileDi {
+    let mut out = FileDi::default();
+    if facts.imports.iter().any(|i| {
+        !i.is_static
+            && (i.module == DOTNET_DI
+                || i.module
+                    .starts_with("Microsoft.Extensions.DependencyInjection."))
+    }) {
+        for chain in &facts.chains {
+            let Some(last) = chain.links.last() else {
+                continue;
+            };
+            let base = last.name.split('<').next().unwrap_or(&last.name);
+            if !SERVICE_REGISTRATIONS.contains(&base) {
+                continue;
+            }
+            let (service, created) = match last.type_args.as_slice() {
+                [s] => (s.clone(), Vec::new()),
+                [s, i] => (s.clone(), vec![i.clone()]),
+                _ => continue,
+            };
+            let Some(enc) = chain.enclosing else { continue };
+            out.beans.push(Bean {
+                definition: enc,
+                origin: Origin::Binds,
+                type_name: service,
+                generic: false,
+                names: Vec::new(),
+                qualifiers: Vec::new(),
+                primary: false,
+                conditional: false,
+                annotations: Vec::new(),
+                created,
+                extends: Vec::new(),
+            });
+        }
+    }
+    let scopes = Scopes::new(facts);
+    for (i, def) in facts.definitions.iter().enumerate() {
+        if def.kind != DefKind::Class {
+            continue;
+        }
+        let mut params: Vec<&Binding> = scopes
+            .of(i)
+            .iter()
+            .copied()
+            .filter(|b| !b.member && !b.type_name.is_empty())
+            .collect();
+        params.sort_by_key(|b| b.span);
+        for b in params {
+            out.points
+                .extend(point(facts, b, i, false, Form::Constructor));
         }
     }
     out
@@ -2279,6 +2359,42 @@ mod tests {
         assert_eq!(points(src), ["Store.field db: Db", "Store.setter db: Db"]);
     }
 
+    /// `origin name: type [names]` per .NET bean.
+    fn dotnet_beans(src: &str) -> Vec<String> {
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let out = dotnet_di(&facts);
+        out.beans
+            .iter()
+            .map(|b| {
+                format!(
+                    "{} {}: {} [{}]",
+                    b.origin.as_str(),
+                    facts.definitions[b.definition].name,
+                    b.type_name,
+                    b.names.join(",")
+                )
+            })
+            .collect()
+    }
+
+    /// `owner.form name: element` per .NET point.
+    fn dotnet_points(src: &str) -> Vec<String> {
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let out = dotnet_di(&facts);
+        out.points
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}.{} {}: {}",
+                    facts.definitions[p.owner].name,
+                    p.form.as_str(),
+                    p.name,
+                    p.element
+                )
+            })
+            .collect()
+    }
+
     /// `origin name: type [names] q=…` per NestJS bean.
     fn nest_beans(src: &str) -> Vec<String> {
         let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
@@ -2325,6 +2441,43 @@ mod tests {
             })
             .collect()
     }
+    /// Contract M6j S6: Microsoft DI registrations and constructor points; files
+    /// without the namespace read nothing.
+    #[test]
+    fn dotnet_registrations_and_ctor_points() {
+        let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Startup {\npublic void ConfigureServices(IServiceCollection services) {\nservices.AddSingleton<IService, ServiceImpl>();\nservices.AddTransient<Db>();\n}\n}\npublic class Consumer {\npublic Consumer(Service svc, Db db) {\n}\n}\n";
+        assert_eq!(
+            dotnet_beans(src),
+            [
+                "binds ConfigureServices: IService []",
+                "binds ConfigureServices: Db []",
+            ]
+        );
+        assert_eq!(
+            dotnet_points(src),
+            [
+                "Consumer.constructor svc: Service",
+                "Consumer.constructor db: Db",
+            ]
+        );
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let created: Vec<(String, Vec<String>)> = dotnet_di(&facts)
+            .beans
+            .iter()
+            .map(|b| (b.type_name.clone(), b.created.clone()))
+            .collect();
+        assert_eq!(
+            created,
+            [
+                ("IService".to_owned(), vec!["ServiceImpl".to_owned()]),
+                ("Db".to_owned(), Vec::new()),
+            ]
+        );
+        let bare = "public class Startup {\npublic void ConfigureServices(object services) {\nservices.AddSingleton<IService, ServiceImpl>();\n}\n}\n";
+        assert!(dotnet_beans(bare).is_empty());
+        assert!(dotnet_points(bare).is_empty());
+    }
+
     /// Contract M6j S3: NestJS injectables, controllers, constructor points and token
     /// qualifiers; module metadata is understood.
     #[test]

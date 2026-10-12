@@ -8,3 +8,6 @@ CALLS rb-heuristic . . . `src/Program.cs`/Program#Main(). -> rb-heuristic . . . 
 REFERENCES rb-heuristic . . . `src/Program.cs`/Program#Main(). -> rb-heuristic . . . `src/Util.cs`/Shop/Greeter# [heuristic]
 IMPLEMENTS rb-heuristic . . . `src/Util.cs`/Shop/Greeter# -> rb-heuristic . . . `src/Util.cs`/Shop/IGreeter# [heuristic]
 IMPLEMENTS rb-heuristic . . . `src/Util.cs`/Shop/Greeter#Greet(). -> rb-heuristic . . . `src/Util.cs`/Shop/IGreeter#Greet(). [heuristic]
+# M6j S6: the two constructor points resolve through their registrations into one
+# merged edge (two sites); the unregistered consumer stays silent.
+INJECTS rb-heuristic . . . `src/MailerUser.cs`/MailerUser# -> rb-heuristic . . . `src/Startup.cs`/Startup#ConfigureServices(). [heuristic] {"sites":2}

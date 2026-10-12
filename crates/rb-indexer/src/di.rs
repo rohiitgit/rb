@@ -18,7 +18,7 @@ use rb_model::{
     Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
     Provenance, Span,
 };
-use rb_syntax::{FileFacts, Language, MentionRole, RefKind};
+use rb_syntax::{DefKind, FileFacts, Language, MentionRole, RefKind};
 use serde_json::{Value, json};
 
 use crate::resolve::{Container, Index};
@@ -380,25 +380,7 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
         let service = (inputs.service_of)(path);
         let package = facts.package.as_deref().unwrap_or_default();
         for bean in &d.beans {
-            let def = &facts.definitions[bean.definition];
-            let (start, inferred) = match bean.origin {
-                // Contract M6j S2: `Binds` beans resolve their bound type like `@Bean`
-                // methods do (falling back to the created/implementation types).
-                Origin::BeanMethod | Origin::Binds => {
-                    let found = index.type_candidates(path, def.parent, &bean.type_name);
-                    if found.is_empty() {
-                        let created: Vec<Sym<'_>> = bean
-                            .created
-                            .iter()
-                            .flat_map(|c| index.type_candidates(path, Some(bean.definition), c))
-                            .collect();
-                        (created, true)
-                    } else {
-                        (found, false)
-                    }
-                }
-                _ => (vec![(path, bean.definition)], false),
-            };
+            let (start, inferred) = bean_start(index, path, facts, bean);
             beans.push(BeanAt {
                 path,
                 bean,
@@ -603,7 +585,38 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
     out
 }
 
-/// NestJS and Kotlin-beans resolution (contract M6j S3/S5): a compact lane beside the
+/// The symbols a bean is assignable from (contract M6j S2/S6): `@Bean`-like beans
+/// resolve their declared type (falling back to the created/implementation types);
+/// every other bean starts at its own definition. Shared by the Java engine and the
+/// managed lane so `Binds` beans match identically in both.
+fn bean_start<'a>(
+    index: &Index<'a>,
+    path: &'a str,
+    facts: &'a FileFacts,
+    bean: &Bean,
+) -> (Vec<Sym<'a>>, bool) {
+    let def = &facts.definitions[bean.definition];
+    match bean.origin {
+        // Contract M6j S2: `Binds` beans resolve their bound type like `@Bean`
+        // methods do (falling back to the created/implementation types).
+        Origin::BeanMethod | Origin::Binds => {
+            let found = index.type_candidates(path, def.parent, &bean.type_name);
+            if found.is_empty() {
+                let created: Vec<Sym<'_>> = bean
+                    .created
+                    .iter()
+                    .flat_map(|c| index.type_candidates(path, Some(bean.definition), c))
+                    .collect();
+                (created, true)
+            } else {
+                (found, false)
+            }
+        }
+        _ => (vec![(path, bean.definition)], false),
+    }
+}
+
+/// NestJS, Kotlin-beans and .NET resolution (contract M6j S3/S5/S6): a compact lane
 /// Java engine. Neither TypeScript nor Kotlin has scan roots, conditionals, Lombok,
 /// registrants or wrappers that matter here;
 /// points match beans by resolved type (tokens by qualifier only, never auto-names),
@@ -715,6 +728,9 @@ fn resolve_xml_points<'a>(
                 .cmp(&inputs.keys[beans[*b].path][beans[*b].bean.definition])
         });
         candidates.dedup();
+        if !types.is_empty() && candidates.iter().any(|&i| beans[i].inferred) {
+            gates.insert("bean_type_inferred");
+        }
         let several = candidates.len() > 1;
         let certainty = if several {
             Certainty::Ambiguous
@@ -782,7 +798,7 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
         .filter(|(_, (language, _))| {
             matches!(
                 language,
-                Language::TypeScript | Language::Tsx | Language::Kotlin
+                Language::TypeScript | Language::Tsx | Language::Kotlin | Language::CSharp
             )
         })
         .map(|(path, (language, facts))| (*path, *language, *facts))
@@ -795,30 +811,37 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
         .map(|(path, language, facts)| {
             let di = match language {
                 Language::Kotlin => spring::kotlin_di(facts),
+                Language::CSharp => spring::dotnet_di(facts),
                 _ => spring::nest_di(facts),
             };
             (*path, *facts, di)
         })
         .collect();
-    struct NestBean<'x, 'y> {
-        path: &'x str,
-        bean: &'y Bean,
+    struct NestBean<'a, 'b> {
+        path: &'a str,
+        bean: &'b Bean,
         service: String,
+        types: Vec<Sym<'a>>,
+        inferred: bool,
     }
     let mut beans: Vec<NestBean<'_, '_>> = Vec::new();
-    for (path, _, d) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+    for (path, facts, d) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
         let service = (inputs.service_of)(path);
         for bean in &d.beans {
+            let (start, inferred) = bean_start(inputs.index, path, facts, bean);
+            let types: Vec<Sym<'_>> = assignable(inputs.index, &start).into_iter().collect();
             beans.push(NestBean {
                 path,
                 bean,
                 service: service.clone(),
+                types,
+                inferred,
             });
         }
     }
     let mut by_type: BTreeMap<Sym<'a>, Vec<usize>> = BTreeMap::new();
     for (i, b) in beans.iter().enumerate() {
-        for t in assignable(inputs.index, &[(b.path, b.bean.definition)]) {
+        for &t in &b.types {
             work::tick(1);
             by_type.entry(t).or_default().push(i);
         }
@@ -840,6 +863,19 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
                 *out.buckets.get_mut("test").unwrap() += 1;
                 continue;
             }
+            // Contract M6j S6: class owners resolve only when registered themselves;
+            // function owners (Kotlin DSL) always pass.
+            if inputs.files[path]
+                .1
+                .definitions
+                .get(p.owner)
+                .is_some_and(|d| {
+                    d.kind == DefKind::Class
+                        && !beans.iter().any(|b| simple(&b.bean.type_name) == d.name)
+                })
+            {
+                continue;
+            }
             out.points
                 .by_owner
                 .entry(((*path).to_owned(), p.owner))
@@ -856,6 +892,13 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
             gates.insert("scan_roots_unknown");
             let mut candidates: Vec<usize> = Vec::new();
             let mut resolution = "unique";
+            let types: Vec<Sym> = if p.qualifier.is_none() {
+                inputs
+                    .index
+                    .type_candidates(path, Some(p.owner), &p.element)
+            } else {
+                Vec::new()
+            };
             if let Some(q) = &p.qualifier {
                 // A token: beans explicitly carrying it as qualifier. Auto-names do
                 // not count (a class named `DB` does not serve token `'DB'` without
@@ -871,9 +914,6 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
                 }
                 resolution = "qualifier";
             } else {
-                let types = inputs
-                    .index
-                    .type_candidates(path, Some(p.owner), &p.element);
                 let mut set = BTreeSet::new();
                 for t in &types {
                     for &i in by_type.get(t).into_iter().flatten() {
@@ -902,6 +942,9 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
                     .cmp(&inputs.keys[beans[*b].path][beans[*b].bean.definition])
             });
             candidates.dedup();
+            if !types.is_empty() && candidates.iter().any(|&i| beans[i].inferred) {
+                gates.insert("bean_type_inferred");
+            }
             let several = candidates.len() > 1;
             let certainty = if several {
                 Certainty::Ambiguous

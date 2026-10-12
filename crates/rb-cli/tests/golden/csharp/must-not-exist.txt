@@ -1,5 +1,8 @@
 # Precision guards (contract M6i S4): forbidden edges. A non-`*` source must name a node
 # of the dump, so a misspelt key cannot pass vacuously.
 # Tier B is never exact, and Main calls the implementation, never the interface directly.
+# M6j S6: DI is never exact; the unregistered consumer emits nothing.
 CALLS * -> * [exact]
 CALLS rb-heuristic . . . `src/Program.cs`/Program#Main(). -> rb-heuristic . . . `src/Util.cs`/Shop/IGreeter#Greet(). [heuristic]
+INJECTS * -> * [exact]
+INJECTS rb-heuristic . . . `src/Unregistered.cs`/Unregistered# -> * [heuristic]

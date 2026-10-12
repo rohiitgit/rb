@@ -284,3 +284,19 @@ killed (W1/W3 patterns fixed, W8 retargeted to the pack test that actually reads
 values); K1 fixture + K2 lane-cap bites. D4 amended: beans get a plain fixture.
 Residue: val-form top-level beans, nested-bean suppliers, `created` inference, ctor
 signature inference for `ref()`, conditional DSL.
+
+7. **(phase 6) .NET DI.** C# generic call args decode (`generic_name` spine walk, never
+into arguments or nested invocations); file-scoped namespaces spell `module` (block
+namespaces unchanged; sibling classes do not nest — residue); `Add/TryAdd
+Singleton/Transient/Scoped` in imported files become `Binds` beans anchored at their
+enclosing method (keyed/lambda/instance/`typeof`/top-level forms stay unread);
+constructor parameters (non-member typed bindings scoped to a class) become points;
+the lane resolves only points whose owner class is itself registered (unregistered
+consumers stay silent). Two real gaps found by the fixture: C# namespaces never
+entered the package map (same-namespace resolution was import-only), and the lane
+built `by_type` from raw definitions instead of resolved bean types (extracted shared
+`bean_start`, inferred gate mirrored). Fixture extends `csharp/` (mailer story renamed
+off a real collision that killed old edges mid-phase); dump gains only additions.
+Tests-first (pack + query + outline units); 5/5 mutants killed; D6/D7/V1/V2 e2e bites.
+Residue: keyed services, factories, instances, `typeof`, top-level minimal hosting,
+property injection, lifetimes, scopes.

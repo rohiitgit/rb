@@ -1350,6 +1350,19 @@ namespace Acme {
         );
     }
 
+    /// Contract M6j S6: file-scoped namespaces (`namespace Shop;`) are module
+    /// definitions too (modern C# has no `namespace_declaration` for them).
+    #[test]
+    fn csharp_file_scoped_namespaces_are_modules() {
+        let src = "namespace Shop;\npublic class A {}\n";
+        // The module registers (same-namespace resolution reads it); the class does not
+        // nest under it (siblings in the tree) — residue, harmless to resolution.
+        assert_eq!(
+            outline(Language::CSharp, src),
+            ["module Shop@0:10", "class A@1:13",]
+        );
+    }
+
     /// A record's compact canonical constructor is a constructor definition (named like the
     /// record) and the source of the calls in its body (contract M3b amendment 75).
     #[test]
