@@ -6,6 +6,7 @@
 
 mod age;
 pub mod card;
+pub mod check;
 pub mod code;
 #[cfg(test)]
 mod db_tests;
