@@ -1,0 +1,8 @@
+# Precision guards (contract M6j S4), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# Dagger: the binds method resolves uniquely; the component interface is understood, not a bean.
+INJECTS rb-heuristic . . . `src/Shop.java`/Shop# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#bindService(). [heuristic]
+CALLS rb-heuristic . . . `src/Shop.java`/Shop#run(). -> rb-heuristic . . . `src/Service.java`/Service#serve(). [heuristic]
+IMPLEMENTS rb-heuristic . . . `src/ServiceImpl.java`/ServiceImpl# -> rb-heuristic . . . `src/Service.java`/Service# [heuristic]
+REFERENCES rb-heuristic . . . `src/ShopModule.java`/ShopModule#provideDb(). -> rb-heuristic . . . `src/Db.java`/Db# [heuristic]

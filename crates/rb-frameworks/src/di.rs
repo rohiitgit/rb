@@ -9,7 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rb_syntax::{
-    Binding, Decoration, DecorationArg, DefKind, Definition, FileFacts, Language, Span,
+    Arg, Binding, Decoration, DecorationArg, DefKind, Definition, FileFacts, Language, Span,
+    TemplatePart,
 };
 
 use crate::routes::is_annotation;
@@ -32,6 +33,12 @@ const FEIGN: &[&str] = &[
 const INJECT: &[&str] = &["jakarta.inject", "javax.inject"];
 const RESOURCE: &[&str] = &["jakarta.annotation", "javax.annotation"];
 const LOMBOK: &str = "lombok";
+// Contract M6j S2: Guice and Dagger packages. Guice's `Inject` is its own annotation
+// (`com.google.inject.Inject`, not JSR-330); Dagger binds through `dagger` annotations
+// with `jakarta.inject` points.
+const GUICE: &str = "com.google.inject";
+const GUICE_NAME: &str = "com.google.inject.name";
+const DAGGER: &str = "dagger";
 
 /// The class-level annotations that make a class a bean when it is component-scanned (S2),
 /// by package. `@SpringBootApplication` and `@SpringBootConfiguration` are meta-annotated with
@@ -60,6 +67,14 @@ pub enum Origin {
     BeanMethod,
     SpringData,
     Feign,
+    /// A `@Singleton` class (Guice's own; contract M6j S2).
+    Singleton,
+    /// A concrete class with an `@Inject` constructor in a Guice/Dagger file (contract M6j
+    /// S2): injectable without further declaration.
+    Injectable,
+    /// A Dagger `@Binds` method or a Guice `bind(X).to(Y)` pair (contract M6j S2): the
+    /// binding declaration, typed by the bound type.
+    Binds,
 }
 
 impl Origin {
@@ -69,6 +84,9 @@ impl Origin {
             Origin::BeanMethod => "bean_method",
             Origin::SpringData => "spring_data",
             Origin::Feign => "feign",
+            Origin::Singleton => "singleton",
+            Origin::Injectable => "injectable",
+            Origin::Binds => "binds",
         }
     }
 }
@@ -336,6 +354,14 @@ fn understood(facts: &FileFacts, d: &Decoration) -> bool {
             .any(|n| is_annotation(facts, d, BEANS_ANNOTATION, n))
         || is_annotation(facts, d, CORE_ANNOTATION, "Order")
         || is_any(facts, d, INJECT, "Inject")
+        || is_annotation(facts, d, GUICE, "Inject")
+        || is_annotation(facts, d, GUICE, "Singleton")
+        || is_annotation(facts, d, GUICE, "Provides")
+        || is_annotation(facts, d, GUICE_NAME, "Named")
+        || is_annotation(facts, d, DAGGER, "Module")
+        || is_annotation(facts, d, DAGGER, "Provides")
+        || is_annotation(facts, d, DAGGER, "Binds")
+        || is_annotation(facts, d, DAGGER, "Component")
         || is_any(facts, d, RESOURCE, "Resource")
         || LOMBOK_NAMES
             .iter()
@@ -407,7 +433,9 @@ fn qualifier_of(facts: &FileFacts, decorations: &[Decoration]) -> Option<String>
 }
 
 fn is_qualifier(facts: &FileFacts, d: &Decoration) -> bool {
-    is_annotation(facts, d, BEANS_ANNOTATION, "Qualifier") || is_any(facts, d, INJECT, "Named")
+    is_annotation(facts, d, BEANS_ANNOTATION, "Qualifier")
+        || is_any(facts, d, INJECT, "Named")
+        || is_annotation(facts, d, GUICE_NAME, "Named")
 }
 
 fn has(facts: &FileFacts, decorations: &[Decoration], package: &str, name: &str) -> bool {
@@ -509,7 +537,7 @@ pub fn di(
             DefKind::Class => {
                 let is_bean = beans.contains(&i);
                 if is_bean {
-                    out.beans.push(stereotype_bean(facts, i));
+                    out.beans.push(class_bean(facts, i));
                     constructor_points(facts, i, &scopes, path, lombok, &mut out);
                 } else if !foreign(facts, &def.decorations).is_empty()
                     || def.decorations.iter().any(|d| stereotype(facts, d))
@@ -561,10 +589,34 @@ pub fn di(
                             .extend(point(facts, b, i, true, Form::BeanParameter));
                     }
                 }
+                // Contract M6j S2: `@Provides` methods in module hosts are beans even
+                // though the module class is not one (the Spring `@Bean`-in-bean case
+                // above stays exclusive); Dagger `@Binds` methods bind their return type.
+                if def.parent == Some(class)
+                    && def.return_type.is_some()
+                    && !(is_bean && has(facts, &def.decorations, CONTEXT, "Bean"))
+                {
+                    if def.decorations.iter().any(|d| bean_factory(facts, d))
+                        && provides_host(facts, class)
+                    {
+                        out.beans.push(bean_method(facts, i, class));
+                        for b in params(i) {
+                            out.points
+                                .extend(point(facts, b, i, true, Form::BeanParameter));
+                        }
+                    } else if def
+                        .decorations
+                        .iter()
+                        .any(|d| is_annotation(facts, d, DAGGER, "Binds"))
+                    {
+                        out.beans.push(binds_bean(facts, i));
+                    }
+                }
             }
             _ => {}
         }
     }
+    bind_chains(facts, &mut out);
     surface_of_facts(facts, &mut out.surface);
     out
 }
@@ -573,10 +625,11 @@ fn has_any(facts: &FileFacts, decorations: &[Decoration], packages: &[&str], nam
     decorations.iter().any(|d| is_any(facts, d, packages, name))
 }
 
-/// `@Autowired`, `@Inject` or `@Resource`.
+/// `@Autowired`, `@Inject` (JSR-330 or Guice's own) or `@Resource`.
 fn has_any_inject(facts: &FileFacts, decorations: &[Decoration]) -> bool {
     has(facts, decorations, BEANS_ANNOTATION, "Autowired")
         || has_any(facts, decorations, INJECT, "Inject")
+        || has(facts, decorations, GUICE, "Inject")
         || has_any(facts, decorations, RESOURCE, "Resource")
 }
 
@@ -595,14 +648,208 @@ fn property(method: &str) -> String {
     decapitalize(method.strip_prefix("set").unwrap_or(method))
 }
 
+/// A file carrying Guice or Dagger markers: any import of their packages (contract M6j
+/// S2). Class-bean rules beyond `@Singleton` apply only here, so Spring files (which never
+/// import these packages) read exactly as before.
+fn framework_file(facts: &FileFacts) -> bool {
+    facts.imports.iter().any(|i| {
+        !i.is_static
+            && (i.module == GUICE
+                || i.module.starts_with("com.google.inject.")
+                || i.module == DAGGER
+                || i.module.starts_with("dagger."))
+    })
+}
+
+/// A `@Singleton` class of Guice's own package (contract M6j S2).
+fn singleton_class(facts: &FileFacts, i: usize) -> bool {
+    facts.definitions[i]
+        .decorations
+        .iter()
+        .any(|d| is_annotation(facts, d, GUICE, "Singleton"))
+}
+
+/// A class with an `@Inject` constructor (contract M6j S2): Guice's own `@Inject` always
+/// counts; JSR-330 `@Inject` counts in a framework file. The constructor may be declared
+/// (a method definition) — generated ones do not exist here (no Lombok for Guice).
+fn injectable_class(facts: &FileFacts, i: usize) -> bool {
+    let defs = &facts.definitions;
+    (0..defs.len()).any(|c| {
+        defs[c].kind == DefKind::Method
+            && defs[c].parent == Some(i)
+            && is_constructor(defs, c, i)
+            && (defs[c]
+                .decorations
+                .iter()
+                .any(|d| is_annotation(facts, d, GUICE, "Inject"))
+                || (framework_file(facts)
+                    && defs[c]
+                        .decorations
+                        .iter()
+                        .any(|d| has_any_inject(facts, std::slice::from_ref(d)))))
+    })
+}
+
+/// A bean-producing method annotation: Spring's `@Bean` or Guice/Dagger `@Provides`
+/// (contract M6j S2).
+fn bean_factory(facts: &FileFacts, d: &Decoration) -> bool {
+    is_annotation(facts, d, CONTEXT, "Bean")
+        || is_annotation(facts, d, GUICE, "Provides")
+        || is_annotation(facts, d, DAGGER, "Provides")
+}
+
+/// A class hosting `@Provides` methods (contract M6j S2): a Dagger `@Module`, or a Guice
+/// module by convention (a supertype whose simple name ends in `Module`). The method's
+/// `@Provides` stays import-gated, so a loose host only reads a real provides method.
+fn provides_host(facts: &FileFacts, class: usize) -> bool {
+    let defs = &facts.definitions;
+    defs[class]
+        .decorations
+        .iter()
+        .any(|d| is_annotation(facts, d, DAGGER, "Module"))
+        || defs[class].supertypes.iter().any(|s| {
+            s.name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&s.name)
+                .ends_with("Module")
+        })
+}
+
+/// The single class literal of `bind`/`to` arguments, else `None`.
+fn single_type(args: &[Arg]) -> Option<String> {
+    match args {
+        [Arg::Type { text, .. }] => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// The qualifier literal of an `annotatedWith` argument: the single `named()` chain at the
+/// argument span decoding to one literal template, else `None`.
+fn qualifier_argument(facts: &FileFacts, arg: &Arg) -> Option<String> {
+    let chain = facts.chains.iter().find(|c| c.span == arg.span())?;
+    let [link] = chain.links.as_slice() else {
+        return None;
+    };
+    if link.name != "named" || link.args.len() != 1 {
+        return None;
+    }
+    match &link.args[0] {
+        Arg::Template { template } => {
+            let mut text = String::new();
+            for part in &template.parts {
+                match part {
+                    TemplatePart::Lit { text: t } => text.push_str(t),
+                    TemplatePart::Hole { .. } => return None,
+                }
+            }
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+/// Guice `bind(X).to(Y)` pairs as `Binds` beans (contract M6j S2): rootless chains whose
+/// first link is `bind` with one class literal and whose last link is `to` with one; the
+/// implementation rides `created` like a `@Bean` body's (engine-tested). Middle
+/// `annotatedWith` links contribute the qualifier when every one resolves to a literal;
+/// anything else in the middle, or an unresolvable qualifier, skips the pair (an
+/// unqualified point must not match a qualified binding).
+fn bind_chains(facts: &FileFacts, out: &mut FileDi) {
+    for chain in &facts.chains {
+        if chain.root.is_some() {
+            continue;
+        }
+        let (first, middle, last) = match chain.links.as_slice() {
+            [first, middle @ .., last] if first.name == "bind" && last.name == "to" => {
+                (first, middle, last)
+            }
+            _ => continue,
+        };
+        let (Some(x), Some(y)) = (single_type(&first.args), single_type(&last.args)) else {
+            continue;
+        };
+        let Some(enc) = chain.enclosing else { continue };
+        let mut qualifier = None;
+        let mut ok = true;
+        for m in middle {
+            if m.name != "annotatedWith" || m.args.len() != 1 {
+                ok = false;
+                break;
+            }
+            match qualifier_argument(facts, &m.args[0]) {
+                Some(q) if qualifier.is_none() => qualifier = Some(q),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        out.beans.push(Bean {
+            definition: enc,
+            origin: Origin::Binds,
+            type_name: x,
+            generic: false,
+            names: Vec::new(),
+            qualifiers: qualifier.into_iter().collect(),
+            primary: false,
+            conditional: false,
+            annotations: Vec::new(),
+            created: vec![y],
+            extends: Vec::new(),
+        });
+    }
+}
+
+/// A Dagger `@Binds` method as a bean (contract M6j S2): typed by its return type, named
+/// by nothing (callers never address the method), qualified by its `@Named`.
+fn binds_bean(facts: &FileFacts, i: usize) -> Bean {
+    let def = &facts.definitions[i];
+    let (type_name, generic) = def
+        .return_type
+        .clone()
+        .unwrap_or_default()
+        .split_once('<')
+        .map(|(head, _)| (head.trim().to_owned(), true))
+        .unwrap_or_else(|| {
+            (
+                def.return_type
+                    .clone()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+                false,
+            )
+        });
+    Bean {
+        definition: i,
+        origin: Origin::Binds,
+        type_name,
+        generic,
+        names: Vec::new(),
+        qualifiers: qualifier_of(facts, &def.decorations).into_iter().collect(),
+        primary: false,
+        conditional: def.decorations.iter().any(|d| is_conditional(facts, d)),
+        annotations: foreign(facts, &def.decorations),
+        created: Vec::new(),
+        extends: Vec::new(),
+    }
+}
+
 /// A concrete, independent class with a stereotype (S2): not abstract, top-level or a static
-/// nested class (or nested in an interface, implicitly static).
+/// nested class (or nested in an interface, implicitly static); or a Guice/Dagger bean
+/// class (contract M6j S2).
 fn is_bean_class(facts: &FileFacts, i: usize) -> bool {
     let defs = &facts.definitions;
     let d = &defs[i];
     d.kind == DefKind::Class
         && !d.modifiers.iter().any(|m| m == "abstract")
-        && d.decorations.iter().any(|a| stereotype(facts, a))
+        && (d.decorations.iter().any(|a| stereotype(facts, a))
+            || singleton_class(facts, i)
+            || injectable_class(facts, i))
         && d.parent.is_none_or(|p| {
             defs[p].kind == DefKind::Interface || d.modifiers.iter().any(|m| m == "static")
         })
@@ -622,7 +869,39 @@ fn short_name(defs: &[Definition], i: usize) -> String {
     parts.join(".")
 }
 
-fn stereotype_bean(facts: &FileFacts, i: usize) -> Bean {
+/// The bean record for a bean class (contract M6j S2): a stereotype keeps
+/// `Origin::Stereotype`; otherwise `@Singleton` beats injectable-by-constructor.
+fn class_bean(facts: &FileFacts, i: usize) -> Bean {
+    let defs = &facts.definitions;
+    if defs[i].decorations.iter().any(|a| stereotype(facts, a)) {
+        stereotype_bean(facts, i, Origin::Stereotype)
+    } else if singleton_class(facts, i) {
+        stereotype_bean(facts, i, Origin::Singleton)
+    } else {
+        injectable_bean(facts, i)
+    }
+}
+
+/// A concrete class with an `@Inject` constructor as a bean (contract M6j S2): named by
+/// the decapitalised class name, qualified by its `@Named`.
+fn injectable_bean(facts: &FileFacts, i: usize) -> Bean {
+    let def = &facts.definitions[i];
+    Bean {
+        definition: i,
+        origin: Origin::Injectable,
+        type_name: def.name.clone(),
+        generic: false,
+        names: vec![decapitalize(&short_name(&facts.definitions, i))],
+        qualifiers: qualifier_of(facts, &def.decorations).into_iter().collect(),
+        primary: false,
+        conditional: def.decorations.iter().any(|d| is_conditional(facts, d)),
+        annotations: foreign(facts, &def.decorations),
+        created: Vec::new(),
+        extends: Vec::new(),
+    }
+}
+
+fn stereotype_bean(facts: &FileFacts, i: usize, origin: Origin) -> Bean {
     let def = &facts.definitions[i];
     let named = def
         .decorations
@@ -633,7 +912,7 @@ fn stereotype_bean(facts: &FileFacts, i: usize) -> Bean {
         .find(|v| !v.is_empty());
     Bean {
         definition: i,
-        origin: Origin::Stereotype,
+        origin,
         type_name: def.name.clone(),
         generic: false,
         names: vec![named.unwrap_or_else(|| decapitalize(&short_name(&facts.definitions, i)))],
@@ -657,7 +936,7 @@ fn bean_method(facts: &FileFacts, i: usize, class: usize) -> Bean {
     let names = def
         .decorations
         .iter()
-        .find(|d| is_annotation(facts, d, CONTEXT, "Bean"))
+        .find(|d| bean_factory(facts, d))
         .and_then(|d| literals(d, &["value", "name"]).ok())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| vec![def.name.clone()]);
@@ -998,6 +1277,7 @@ fn constructor_points<'f>(
             .filter(|&&c| {
                 has(facts, &defs[c].decorations, BEANS_ANNOTATION, "Autowired")
                     || has_any(facts, &defs[c].decorations, INJECT, "Inject")
+                    || has(facts, &defs[c].decorations, GUICE, "Inject")
             })
             .map(|&c| params(c).into_iter().map(|b| (b, false)).collect())
             .collect();
@@ -1692,6 +1972,68 @@ mod tests {
 
     fn with_imports(body: &str) -> String {
         format!("{IMPORTS}{body}")
+    }
+
+    /// Contract M6j S2: Guice singletons, provides methods, inject points and
+    /// `bind().to()` links; the qualifier comes from `com.google.inject.name`.
+    #[test]
+    fn guice_singletons_provides_points_and_binds() {
+        let src = "package com.acme;\nimport com.google.inject.AbstractModule;\nimport com.google.inject.Inject;\nimport com.google.inject.Provides;\nimport com.google.inject.Singleton;\nimport com.google.inject.name.Named;\n@Singleton class Store {\n  private final Db db;\n  @Inject public Store(@Named(\"main\") Db db) { this.db = db; }\n}\nclass ShopModule extends AbstractModule {\n  @Override protected void configure() {\n    bind(Service.class).to(ServiceImpl.class);\n    bind(Names.class).annotatedWith(Names.named(\"a\")).to(A.class);\n  }\n  @Provides @Singleton Db provideDb() { return new Db(); }\n}\n";
+        assert_eq!(
+            beans(src),
+            [
+                "singleton Store: Store [store]",
+                "bean_method provideDb: Db [provideDb] new=Db",
+                "binds configure: Service [] new=ServiceImpl",
+                "binds configure: Names [] q=a new=A",
+            ]
+        );
+        assert_eq!(points(src), ["Store.constructor db: Db q=main"]);
+    }
+
+    /// Contract M6j S2: Dagger modules, binds, provides, components and inject points;
+    /// `@Component` interfaces are understood but not beans.
+    #[test]
+    fn dagger_modules_binds_components_and_points() {
+        let src = "package com.acme;\nimport dagger.Binds;\nimport dagger.Component;\nimport dagger.Module;\nimport dagger.Provides;\nimport jakarta.inject.Inject;\nimport jakarta.inject.Singleton;\n@Module abstract class ShopModule {\n  @Binds abstract Service bindService(ServiceImpl impl);\n  @Provides static Db provideDb() { return new Db(); }\n}\n@Singleton @Component(modules = ShopModule.class) interface ShopComponent {\n  Shop shop();\n}\nclass Shop {\n  @Inject public Shop(Service svc) {}\n}\n";
+        assert_eq!(
+            beans(src),
+            [
+                "binds bindService: Service []",
+                "bean_method provideDb: Db [provideDb] new=Db",
+                "injectable Shop: Shop [shop]",
+            ]
+        );
+        assert_eq!(points(src), ["Shop.constructor svc: Service"]);
+        let (_, out) = file_di(src);
+        assert!(out.unread_classes.is_empty());
+    }
+
+    /// Contract M6j S2: an `annotatedWith` the pack cannot read to a literal skips the
+    /// pair (an unqualified point must not match a qualified binding).
+    #[test]
+    fn guice_unresolvable_qualifiers_skip_the_binding() {
+        let src = "package com.acme;\nimport com.google.inject.AbstractModule;\nimport com.google.inject.name.Named;\nclass ShopModule extends AbstractModule {\n  @Override protected void configure() {\n    bind(Names.class).annotatedWith(Names.named(prefix + \"x\")).to(A.class);\n  }\n}\n";
+        assert_eq!(beans(src), Vec::<String>::new());
+    }
+
+    /// Contract M6j S2: Guice field and setter points through Guice's own `@Inject`.
+    #[test]
+    fn guice_field_and_setter_points() {
+        let src = "package com.acme;\nimport com.google.inject.Inject;\nimport com.google.inject.Singleton;\n@Singleton class Store {\n  @Inject Db db;\n  @Inject public void setDb(Db db) {}\n}\n";
+        assert_eq!(points(src), ["Store.field db: Db", "Store.setter db: Db"]);
+    }
+
+    /// Contract M6j S2 decoys: same-named annotations from other packages bind nothing;
+    /// a bare jakarta `@Inject` constructor with no framework marker is no bean.
+    #[test]
+    fn di_decoys_give_no_beans() {
+        let src = "package com.acme;\nimport com.acme.Singleton;\nimport com.acme.Provides;\n@Singleton class Plain {}\nclass Shop {\n  @Provides Db make() { return null; }\n}\n";
+        assert_eq!(beans(src), Vec::<String>::new());
+        let bare = "package com.acme;\nimport jakarta.inject.Inject;\nclass Shop {\n  @Inject public Shop(Service svc) {}\n}\n";
+        assert_eq!(beans(bare), Vec::<String>::new());
+        // Constructor points exist only for bean classes, as in Spring: no bean, no points.
+        assert_eq!(points(bare), Vec::<String>::new());
     }
 
     #[test]

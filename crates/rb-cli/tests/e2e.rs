@@ -850,6 +850,20 @@ fn csharp_tier_b() {
     check_language_fixture("csharp", "cs");
 }
 
+/// Contract M6j S4: the java-guice fixture (Guice singletons, provides methods, inject
+/// points and `bind().to()` links, no SCIP).
+#[test]
+fn java_guice_tier_b() {
+    check_language_fixture("java-guice", "guice");
+}
+
+/// Contract M6j S4: the java-dagger fixture (Dagger modules, binds, provides, components
+/// and inject points, no SCIP).
+#[test]
+fn java_dagger_tier_b() {
+    check_language_fixture("java-dagger", "dagger");
+}
+
 /// Contract M6i S3: the kotlin-gradle fixture through scip-java. The Gradle Kotlin 2.2
 /// build indexes ok; every Tier B call has its exact twin with the same target; the dump is
 /// golden. Cached, fresh and second-name runs dump identically.

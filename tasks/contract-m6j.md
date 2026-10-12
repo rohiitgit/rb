@@ -95,9 +95,10 @@ unchanged in shape.
   from a measured gap (M6i D1 precedent).
 - **D3: XML reuses `parse_xml` (F3).** The `Element` model + MyBatis reader are the
   precedent; Spring `<beans>` is a second reader over the same model, not a new parser.
-- **D4: fixture plan is code (F4).** Three new fixtures (`java-guice`, `ts-nest`,
-  `spring-xml`) + two extensions (`kotlin-beans` into `kotlin-gradle`, `dotnet` into
-  `csharp`); exact file lists amended in phase 0; polyglot untouched.
+- **D4: fixture plan is code (F4).** Four new fixtures (`java-guice`, `java-dagger`,
+  `ts-nest`, `spring-xml`) + two extensions (`kotlin-beans` into `kotlin-gradle`, `dotnet`
+  into `csharp`); exact file lists amended per phase; polyglot untouched. (Amended in
+  phase 2: Dagger gets its own fixture — honest names over one mixed fixture.)
 
 ## Assertions
 
@@ -218,3 +219,24 @@ units); 12/12 mutants killed — including a harness repair (uncompilable `Langu
 mutants give no verdict per the M6i lesson; non-unique REV patterns leave mutants in the
 tree — both bitten during the run and fixed with string-only mutants, unique both
 directions, plus an XXX sweep).
+
+3. **(phase 2) Guice/Dagger packs.** Import-gated packs over the M4b machinery (certainty
+caps at heuristic by construction): Guice `@Inject` points (field/ctor/setter),
+`@Singleton` classes → `singleton` beans, `@Provides` → `bean_method` reuse in module
+hosts (`@Module` or `*Module` supertype), `@Named` (guice package) qualifiers,
+`bind(X).to(Y)` → `binds` beans (typed X, impl in `created`, qualifier joined from the
+nested `named()` chain by span; unresolvable qualifiers and foreign middles skip the
+pair); Dagger `@Module`/`@Component` understood but not beans, `@Binds` → `binds` beans,
+`@Provides` → `bean_method`, jakarta `@Inject`/`@Singleton` points; injectable classes
+(`@Inject` ctor) become `injectable` beans only with a Guice/Dagger file marker, so
+Spring files read byte-identically. Engine: `Binds` resolves its bound type like
+`BeanMethod` (created-fallback included); new origins eligible like stereotypes. The
+`bind()`-side class literals join as M5-S19(g) registrants — `ambiguous` beside the binds
+bean, every candidate genuinely related. `Arg::Type` decodes Java class literals (no
+downstream consumer matches `Other` explicitly — proven by the unchanged frameworks
+suite). Residue: impl-preference among multiples (ambiguous, honest); pure-jakarta
+Dagger consumers without a dagger import; `Lazy`/`Provider` wrappers; Dagger generated
+code. Fixtures `java-guice` + `java-dagger` with reviewed dump goldens and 8/5 guards;
+every guard proven biting (G1–G4 code mutants, F1–F4 fixture perturbations). 12/12 pack
+mutants + T1/T2 arg mutants killed. D4 amended: Dagger gets its own fixture (honest
+names over one mixed fixture).

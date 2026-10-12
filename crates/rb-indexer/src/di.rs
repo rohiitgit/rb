@@ -324,7 +324,9 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
         for bean in &d.beans {
             let def = &facts.definitions[bean.definition];
             let (start, inferred) = match bean.origin {
-                Origin::BeanMethod => {
+                // Contract M6j S2: `Binds` beans resolve their bound type like `@Bean`
+                // methods do (falling back to the created/implementation types).
+                Origin::BeanMethod | Origin::Binds => {
                     let found = index.type_candidates(path, def.parent, &bean.type_name);
                     if found.is_empty() {
                         let created: Vec<Sym<'_>> = bean
@@ -806,9 +808,13 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             return false;
         }
         match b.bean.origin {
-            Origin::Stereotype | Origin::BeanMethod => {
-                components.is_none_or(|r| under(b.package, r))
-            }
+            // Contract M6j S2: the new origins are eligible like stereotypes (scan
+            // roots, when known; open world otherwise).
+            Origin::Stereotype
+            | Origin::BeanMethod
+            | Origin::Singleton
+            | Origin::Injectable
+            | Origin::Binds => components.is_none_or(|r| under(b.package, r)),
             Origin::SpringData => roots
                 .and_then(|r| r.repositories.as_ref())
                 .is_none_or(|r| under(b.package, r)),

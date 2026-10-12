@@ -337,6 +337,9 @@ pub enum Arg {
         span: Span,
         args: Vec<Arg>,
     },
+    /// A class literal (`Service.class`): the type as written, for `bind(X).to(Y)` shapes
+    /// (contract M6j S2). Kotlin `X::class` and C# `typeof(X)` stay `Other`.
+    Type { text: String, span: Span },
     /// Anything else (a call, a number, an array, …).
     Other { span: Span },
 }
@@ -349,6 +352,7 @@ impl Arg {
             | Arg::Function { span }
             | Arg::Object { span, .. }
             | Arg::New { span, .. }
+            | Arg::Type { span, .. }
             | Arg::Other { span } => *span,
         }
     }

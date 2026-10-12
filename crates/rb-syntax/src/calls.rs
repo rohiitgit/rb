@@ -360,6 +360,19 @@ fn summary(language: Language, syn: &Syntax, node: Node<'_>, source: &[u8], dept
             }],
         };
     }
+    // A class literal (`Service.class`): the type as written (contract M6j S2).
+    if language == Language::Java && node.kind() == "class_literal" {
+        let mut c = node.walk();
+        let text = node
+            .named_children(&mut c)
+            .next()
+            .map(|t| capped(text(t, source)))
+            .unwrap_or_default();
+        return Arg::Type {
+            text,
+            span: span(node),
+        };
+    }
     if language == Language::Java && node.kind() == "object_creation_expression" && depth == 0 {
         let type_name = node
             .child_by_field_name("type")
@@ -599,8 +612,19 @@ mod tests {
                 let a: Vec<String> = args.iter().map(short).collect();
                 format!("new {type_name}({})", a.join(", "))
             }
+            Arg::Type { text, .. } => format!("{text}.class"),
             Arg::Other { .. } => "?".into(),
         }
+    }
+
+    /// Contract M6j S2: Java class literals decode as types (Guice `bind().to()` shapes).
+    #[test]
+    fn java_class_literals_decode_as_types() {
+        let src = "class M {\nvoid c() {\nbind(Service.class).to(ServiceImpl.class);\n}\n}\n";
+        assert_eq!(
+            outline(Language::Java, src),
+            ["bind(Service.class).to(ServiceImpl.class)"]
+        );
     }
 
     #[test]
@@ -682,11 +706,11 @@ mod tests {
         assert_eq!(
             outline(Language::Java, src),
             [
-                "webClient.post().uri('/users/{id}', id).retrieve().bodyToMono(?)",
-                "this.restTemplate.exchange('{BASE}/x/{id}', HttpMethod.POST, ?, ?)",
+                "webClient.post().uri('/users/{id}', id).retrieve().bodyToMono(String.class)",
+                "this.restTemplate.exchange('{BASE}/x/{id}', HttpMethod.POST, ?, String.class)",
                 "list.forEach(fn)",
                 "send(x)",
-                "rest.getForObject('/a\tb\n', ?)",
+                "rest.getForObject('/a\tb\n', String.class)",
             ]
         );
         let all = chains(Language::Java, src);
