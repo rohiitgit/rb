@@ -150,3 +150,21 @@ No wall-clock/host-path/run-order in dumps (unchanged rules). Fresh == cached, t
 7. **(phase 6) Fixture + guards.** `fixtures/topo-packs/`: Kafka producer (`send("${app.topic}")` resolved through the active profile's YAML document to `prod-events`, plus a computed decoy) + consumer (`@KafkaListener(topics = "prod-events")`), Spring `POST /v1/login`, TS client with one function per call (nginx `/api/`+`/pay/`, gateway `/bill/`, `rb.toml` alias `login`, k8s alias `auth-http`), `nginx.conf`, gateway YAML (2 routes + 1 unread `/w/*`), root `compose.yaml` + `k8s.yaml`, `rb.toml` (`[[service]]` gateway + `[[hosts]]`), profile `application.yml` files + `bootstrap.properties`. e2e `topo_packs`: determinism (two repos + force), store round trip, guards + HTTP/M4b invariants, file set, AGE parity (whole-graph plus `PUBLISHES`/`SUBSCRIBES` label checks, proving the generic projection), `dump.jsonl` golden (reviewed by hand, 102 lines), endpoint neighbours, read-only cypher. 11 must-exist + 4 must-not-exist guards, each biting across 8 mutant runs (precedence both directions, consumer literal, rewrite-to-silent, unruled prefix, exact-certainty code mutant, method change, bootstrap value). `PIPELINE` `m6g-1` (no golden pins the string). Verify: fmt, clippy clean; topo e2e green unblessed.
 
 8. **(phase 6 close) Determinism + invariant 1.** Close verify `var/m6g/logs/p6-full-*` green: fmt, clippy `-D warnings`, 861 workspace units (0 failed), store 66/66, server 12/12, e2e 38/38 with containers, api 1/1 (150 parameter sets identical), no `skipping:`, no listener, stub scan clean (only the known `rb-sql` match). `git diff 781d32a f80714d` empty (the merge added nothing), and the direct base-vs-head spot check (`var/m6g/scripts/p6-invariant.sh`, release binaries, dumps asserted non-empty) is IDENTICAL everywhere: all 10 old fixtures `--no-scip` (0 added/removed rows each) plus SCIP mode for `polyglot-monorepo` (396 rows) and `ts-express-prisma` (71 rows). SCIP scope decision: `--no-scip` compared on all fixtures; SCIP compared where no dump golden pins the mode (the other SCIP fixtures' dump goldens passed e2e unchanged, which proves their equality). No fixture carries M6g inputs except `topo-packs` (new) and polyglot's `gateway/nginx.conf` (rewrite falls back: stripped `/v1/login` matches no endpoint, direct edge stays).
+
+9. **(phase 7) Public-repository measurements.** `--no-scip` base-vs-head dumps (release
+binaries, dumps asserted non-empty, one repo at a time + `VACUUM`, trees removed after):
+apache/kafka @ `f32956…` (625,213 rows, IDENTICAL — vacuous leg, proven correct: no
+spring-kafka/spring-rabbit/spring-amqp/spring-cloud-stream dependency in any build file, so no
+Spring topic form can occur); spring-cloud-gateway @ `c5021b…` (+8 rows, all `gateway_unread` on
+test-resource YAMLs, 0 removed, 0 new edges — all 8 verified by hand: placeholder
+`uri: ${test.uri}`, unknown schemes `no://op`/`forward:`, host-only/uri-less blocks; positive
+reader samples: `Path=/**` → `/`, `https://example*.com` + `Path=/anything/*` routes);
+spring-projects/spring-kafka @ `6c8549…` (+808 rows, 0 removed: 116 `Topic` nodes, 60 `PUBLISHES`,
+107 `SUBSCRIBES`, ~525 `topic_dynamic`). Post-fix re-measurement (P9/P18/P30/P32): gateway
+unchanged (+8 same rows), spring-kafka 111→107 SUBSCRIBES and 119→116 nodes (the 3 SpEL false
+edges gone, now dynamics), 0 suspicious topic names remaining. Samples read in source (all
+true): `template.send("annotated13", null, "")` → PUB; `@KafkaListener(topics =
+"DltStartupTests.2")` → SUB; sample-01 `send("topic1")`/`topics="topic1"`/`topics="topic1-dlt"`
+(PUB/SUB/SUB); `template.sendDefault(0, 0, "foo")` with variable default topic → dynamic (the
+P18 case in the wild). 0 false topics/rewrites/hosts in all samples. New pins verified by
+`git ls-remote` (full SHAs above).

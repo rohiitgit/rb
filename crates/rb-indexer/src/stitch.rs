@@ -790,7 +790,9 @@ impl<'e> Stitcher<'e> {
     }
 
     /// Resolve raw `(prefix, target host)` rules to rewrites: the target names exactly one
-    /// service, else the rule is dropped. Pure function of the service list (tested).
+    /// service, else the rule is dropped. A prefix claimed for two different services never
+    /// applies (evaluator pass 1, P31): file order must not pick the target silently. Pure
+    /// function of the service list (tested).
     pub(crate) fn resolve_rewrites(
         rules: &[(String, String)],
         services: &[ServiceRef],
@@ -807,7 +809,7 @@ impl<'e> Stitcher<'e> {
                 .or_default()
                 .insert(&s.key);
         }
-        rules
+        let mut resolved: Vec<GatewayRewrite> = rules
             .iter()
             .filter_map(
                 |(prefix, target)| match hosts.get(&target.to_ascii_lowercase()) {
@@ -818,7 +820,23 @@ impl<'e> Stitcher<'e> {
                     _ => None,
                 },
             )
-            .collect()
+            .collect();
+        // Contested prefixes (one prefix, several services) apply to nothing.
+        let mut contested: BTreeSet<String> = BTreeSet::new();
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for r in &resolved {
+            match seen.insert(r.prefix.clone(), r.service.clone()) {
+                Some(prior) if prior != r.service => {
+                    contested.insert(r.prefix.clone());
+                }
+                _ => {}
+            }
+        }
+        resolved.retain(|r| !contested.contains(&r.prefix));
+        // Identical duplicates (one prefix restated for its service) keep their first stating.
+        let mut stated: BTreeSet<(String, String)> = BTreeSet::new();
+        resolved.retain(|r| stated.insert((r.prefix.clone(), r.service.clone())));
+        resolved
     }
 
     /// The rewrite stripping this path, if any: longest prefix with a `/` boundary.
@@ -1683,6 +1701,28 @@ mod tests {
                 .map(|r| r.prefix.as_str())
                 .collect::<Vec<_>>(),
             ["/api/admin/", "/api/"]
+        );
+    }
+
+    /// Contract M6g S1 (evaluator pass 1, P31): conflicting duplicate prefixes never apply.
+    /// Two files stating the same prefix for different services would otherwise let file order
+    /// pick the target silently.
+    #[test]
+    fn conflicting_duplicate_prefixes_resolve_to_nothing() {
+        let services = services();
+        let rules = vec![
+            ("/api/".to_owned(), "auth".to_owned()),
+            ("/api/".to_owned(), "notification".to_owned()),
+            ("/pay/".to_owned(), "auth".to_owned()),
+            ("/pay/".to_owned(), "auth".to_owned()),
+        ];
+        let resolved = Stitcher::resolve_rewrites(&rules, &services);
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|r| (r.prefix.as_str(), r.service.as_str()))
+                .collect::<Vec<_>>(),
+            [("/pay/", AUTH)]
         );
     }
 

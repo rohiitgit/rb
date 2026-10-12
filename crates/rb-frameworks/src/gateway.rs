@@ -378,6 +378,10 @@ mod tests {
         // A single-`*` tail is not a plain prefix (it would over-match deeper paths), and the
         // uri-less block names nothing: both unread, nothing silently folded.
         assert_eq!(file.unread, 2);
+        // Path-bearing targets replace the prefix instead of stripping it (evaluator pass 1,
+        // P9): unread, in both schemes.
+        assert!(spring_gateway("routes:\n  - id: x\n    uri: lb://svc/prefix\n    predicates:\n      - Path=/x/**\n").rules.is_empty());
+        assert!(spring_gateway("routes:\n  - id: x\n    uri: http://svc:8080/prefix\n    predicates:\n      - Path=/x/**\n").rules.is_empty());
         assert!(spring_gateway("routes:\n\t- id: x\n").rules.is_empty());
         assert!(is_gateway_input("gw/nginx.conf"));
         assert!(is_gateway_input("svc/application-prod.yaml"));

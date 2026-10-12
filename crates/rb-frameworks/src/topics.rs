@@ -88,25 +88,35 @@ fn annotation_topics(decoration: &Decoration) -> Option<(Vec<TopicName>, bool)> 
         return Some((Vec::new(), true));
     };
     // A `${…}` value is a property reference (the extractor marks it literal): always a
-    // placeholder, never a literal topic.
+    // placeholder, never a literal topic. Anything SpEL (`#{…}`) or partially templated is
+    // computed: dynamic, never an edge (evaluator pass 1, P32).
     let classify = |value: &str| {
         if is_placeholder(value) {
-            TopicName::Placeholder(value.to_owned())
+            Some(TopicName::Placeholder(value.to_owned()))
+        } else if value.contains("#{") || value.contains("${") {
+            None
         } else {
-            TopicName::Literal(value.to_owned())
+            Some(TopicName::Literal(value.to_owned()))
         }
     };
     let mut topics = Vec::new();
+    let mut dynamic = dynamic;
     if arg.items.is_empty() {
         if arg.literal || is_placeholder(&arg.value) {
-            topics.push(classify(&arg.value));
+            match classify(&arg.value) {
+                Some(topic) => topics.push(topic),
+                None => dynamic = true,
+            }
         } else {
             dynamic = true;
         }
     } else {
         for item in &arg.items {
             if item.literal || is_placeholder(&item.value) {
-                topics.push(classify(&item.value));
+                match classify(&item.value) {
+                    Some(topic) => topics.push(topic),
+                    None => dynamic = true,
+                }
             } else {
                 dynamic = true;
             }
@@ -183,6 +193,17 @@ fn send(language: Language, facts: &FileFacts, chain: &rb_syntax::CallChain, out
         return;
     }
     let arg = first.args.first();
+    // Rabbit's exchange-first arities route on a later argument (evaluator pass 1, P30): only
+    // arities whose first argument is the routing target read it.
+    let kafka = receiver.ends_with("KafkaTemplate");
+    if !kafka {
+        let arity = first.args.len();
+        let routing_first =
+            first.name == "convertAndSend" && arity == 2 || first.name == "send" && arity <= 2;
+        if !routing_first {
+            return dynamic_send(chain, out);
+        }
+    }
     let text = match arg {
         Some(rb_syntax::Arg::Template { template: t }) => {
             let mut lit = String::new();
@@ -204,6 +225,10 @@ fn send(language: Language, facts: &FileFacts, chain: &rb_syntax::CallChain, out
         _ => return dynamic_send(chain, out),
     };
     if text.is_empty() {
+        return dynamic_send(chain, out);
+    }
+    // SpEL and partial templates are computed (evaluator pass 1, P32): dynamic, never an edge.
+    if text.contains("#{") || text.contains("${") && !is_placeholder(&text) {
         return dynamic_send(chain, out);
     }
     let topic = if is_placeholder(&text) {
@@ -323,6 +348,28 @@ mod tests {
         ));
         assert!(sites.is_empty());
         assert_eq!(dynamic, ["pub"]);
+        // SpEL and partial templates are computed, never literal edges.
+        let src = "package p;\nimport org.springframework.kafka.annotation.KafkaListener;\nimport org.springframework.kafka.core.KafkaTemplate;\nclass C {\n  KafkaTemplate<String, String> t;\n  @KafkaListener(topics = \"#{__x.topic}\")\n  void a(String m) {}\n  @KafkaListener(topics = \"pre-${x}\")\n  void b(String m) {}\n  void c(String v) {\n    t.send(\"#{x}\", \"v\");\n    t.send(\"pre-${x}\", \"v\");\n  }\n}\n";
+        let (sites, dynamic) = show(&topics(
+            Language::Java,
+            &extract(Language::Java, src.as_bytes()).unwrap(),
+        ));
+        assert!(sites.is_empty());
+        assert_eq!(dynamic, ["sub", "sub", "pub", "pub"]);
+    }
+
+    /// Contract M6g S1 (evaluator pass 1, P30): Rabbit's 3-argument sends take the exchange
+    /// first, not the topic: only arities whose first argument routes are read, the rest are
+    /// counted dynamic. Kafka's topic is always first, at any arity.
+    #[test]
+    fn rabbit_sends_read_only_routing_first_arities() {
+        let src = "package p;\nimport org.springframework.amqp.rabbit.core.RabbitTemplate;\nclass C {\n  RabbitTemplate t;\n  void a(Object v) {\n    t.convertAndSend(\"jobs\", \"v\");\n    t.convertAndSend(\"ex\", \"jobs\", \"v\");\n    t.send(\"jobs\", \"v\");\n    t.send(\"ex\", \"jobs\", \"v\");\n  }\n}\n";
+        let (sites, dynamic) = show(&topics(
+            Language::Java,
+            &extract(Language::Java, src.as_bytes()).unwrap(),
+        ));
+        assert_eq!(sites, ["pub:jobs", "pub:jobs"]);
+        assert_eq!(dynamic, ["pub", "pub"]);
     }
 
     /// Contract M6g S1, invariants 5–6: scanning 4× the sites costs at most 5× the operations.
