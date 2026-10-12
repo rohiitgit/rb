@@ -2686,8 +2686,14 @@ mod tests {
     /// unmarked and static properties stay silent.
     #[test]
     fn dotnet_property_points_need_markers() {
-        let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Consumer {\n[Inject] public Svc Marked { get; set; }\npublic Svc Plain { get; set; }\n[Inject] public static Svc Static { get; set; }\n}\n";
-        assert_eq!(dotnet_points(src), ["Consumer.field Marked: Svc"]);
+        let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Consumer {\n[Inject] public Svc Marked { get; set; }\n[FromServices] public Svc Served { get; set; }\npublic Svc Plain { get; set; }\n[Inject] public static Svc Static { get; set; }\n}\n";
+        assert_eq!(
+            dotnet_points(src),
+            [
+                "Consumer.field Marked: Svc",
+                "Consumer.field Served: Svc",
+            ]
+        );
     }
 
     /// Contract M6k S6: keyed registrations qualify by key literal; non-literal

@@ -727,11 +727,13 @@ fn csharp<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
             // static properties (never injected), like Java fields.
             if pushed {
                 let mut c = node.walk();
-                out.last_mut().expect("pushed").modifiers = node
-                    .children(&mut c)
-                    .filter(|n| n.kind() == "modifier")
-                    .map(|n| text(n, source))
-                    .collect();
+                if let Some(b) = out.last_mut() {
+                    b.modifiers = node
+                        .children(&mut c)
+                        .filter(|n| n.kind() == "modifier")
+                        .map(|n| text(n, source))
+                        .collect();
+                }
             }
             initialised(out, pushed, None, false);
         }
