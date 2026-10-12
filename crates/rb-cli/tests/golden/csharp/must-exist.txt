@@ -19,3 +19,5 @@ INJECTS rb-heuristic . . . `src/Keyed.cs`/KeyedConsumer# -> rb-heuristic . . . `
 # Contract M6k S3: the top-level minimal-hosting registration anchors at its bound
 # type; its constructor wires like any registered consumer.
 INJECTS rb-heuristic . . . `src/Mini.cs`/Mini# -> rb-heuristic . . . `src/Startup.cs`/Startup#ConfigureServices(). [heuristic]
+# Contract M6k pass 1: enclosing namespaces resolve with no `using`.
+IMPLEMENTS rb-heuristic . . . `src/SubHelper.cs`/SubHelper# -> rb-heuristic . . . `src/Helper.cs`/Helper# [heuristic]
