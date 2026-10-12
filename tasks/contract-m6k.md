@@ -263,3 +263,9 @@ Measurement (`p8-measure3.log`):
   new exact Tier-B edges. 20+ source-read samples, 0 false.
 The two intermediate legs (polluted automapper, mis-sited springfu
 diagnostics) are VOID and superseded by these numbers.
+
+10. **(close) Evaluator pass 2 + records.** Pass 2 (`tasks/eval-m6k-pass2.md`):
+VERDICT PASS — H1–H6 hold in the close loop (926 units), fixtures green,
+invariant + measurement stand, tree == loop tree. Records: CHANGELOG
+(`M6k CLOSED`), IMPLEMENT.md §M6k, design §13 M6k row, lessons (3 new),
+todo (M6k closed). `PIPELINE` stays `m6k-1`.

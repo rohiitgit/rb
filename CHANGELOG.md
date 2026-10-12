@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-10-12] (wall clock) M6k CLOSED (evaluator passes 1–2)
+- Phase 1 (amendment 2): anchor-at-type — `FileDi::unanchored` + shared `resolve_lane_point` + unique-or-skip anchoring (XML-bean precedent); val-form + top-level `AddX` engine proofs.
+- Phase 2 (amendments 3–4): `@Assisted` exclusion, `toProvider`, C# properties (`[Inject]`/`[FromServices]`/`[FromKeyedServices]`, statics excluded), keyed services (literal keys ride qualifiers), C# `argument` unwrap, global-namespace key; pack + engine units.
+- Phase 3 (amendment 4): fixture extensions (`ValBeans.kt`, `Keyed.cs` + `Mini.cs`, Guice `Cache*`/`AssistedShop` + `SubHelper.cs`/`OtherDecoy.cs`) with reviewed purely-additive goldens; every new guard bites by perturbation with byte-identical restores.
+- Phase 4 (amendment 5): anchor-skip unit, 7/7 manual mutant kills (two vacuous-test repairs), `PIPELINE m6k-1`, lint clean.
+- Phase 5 (amendments 6, 8–9): invariant-1 15/16 identical + 2 SCIP identical (3 extended fixtures classified); measurement guice +20/−19, springfu +16/−1 D, automapper +5740/−353 — every row legitimate (programmatic namespace/using/global checks + 20 source-read samples), 0 false, 0 lost, 0 new exact Tier-B.
+- Pass 1 (`tasks/eval-m6k-pass1.md`, amendments 7–8): VERDICT PASS with H1–H6 in-tree (dotted namespaces, cross-namespace merge, enclosing scope, diagnostic siting, static properties, vacuous tests).
+- Pass 2 (`tasks/eval-m6k-pass2.md`, amendment 10): VERDICT PASS — close verify stands (fmt, clippy, 926 units, store 72, server 12, e2e 47/47, api 1/1), invariant + measurement stand.
+- `PIPELINE` `m6k-1` (metadata-only: no golden pins it; close verify re-proves the exact bumped tree).
+- Files: `crates/rb-syntax/src/{queries,lib,bindings,calls}.rs`, `crates/rb-frameworks/src/di.rs`, `crates/rb-indexer/src/{di,lib,resolve}.rs`, `crates/rb-cli/tests/golden/{csharp,java-guice,kotlin-beans}`, `fixtures/{csharp,java-guice,kotlin-beans}/`; records `tasks/{contract-m6k,eval-m6k-pass1,eval-m6k-pass2,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-12] (wall clock) M6j CLOSED (evaluator passes 1–2)
 - Phases 0–1 (amendments 1–2): preflight (baseline binary, six pins, grammar shapes); Kotlin/C# decorations with literals, string literal decoding, `class_parameter` bindings — each test-first with killed mutants.
 - Phase 2 (amendment 3): Guice/Dagger import-gated packs (singletons, injectables, provides, binds, `bind().to()` qualifier joins) + `Arg::Type`; engine `Binds` arm; `java-guice` + `java-dagger` fixtures with 8/5 biting guards.

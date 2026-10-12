@@ -517,3 +517,15 @@
 ## 2026-10-12: a passing bless can hide a stale-tree failure
 - **Mistake (caught by reading the dump, not the test result):** the csharp re-bless passed while producing zero INJECTS — the `RB_BLESS=1` run rewrites goldens from whatever the tree yields, so green means nothing until the blessed diff is reviewed row by row.
 - **Rule:** after every bless, `git diff` the golden before anything else; a bless that only adds coverage rows while the feature rows are missing is a red flag, not a pass.
+
+## 2026-10-12: a fallback that fires on missing data must not fire on data missing through a bug
+- **Mistake (caught by source-reading a measurement pair):** the M6k global-namespace fallback merged every dotted-namespace file (whose Module defs never existed through a query bug) under one key, producing cross-namespace matches in the automapper leg. Same-namespace recall looked great; it was pollution.
+- **Rule:** when a fallback's hit rate surprises upward, miniature-prove one hit in each direction before celebrating. Bisect to the hunk, not the milestone.
+
+## 2026-10-12: a surviving mutant is a test bug until proven otherwise
+- **Mistake (caught twice in one battery):** the assisted unit used a scalar parameter (excluded by an earlier gate anyway) and the ambiguous-anchor unit's qualifier matched nothing either way — both mutants survived a correct implementation.
+- **Rule:** design each mutant test so the mutant flips its specific verdict (non-scalar assisted params; refs that resolve when bound). A green battery with vacuous tests is worse than no battery.
+
+## 2026-10-12: diagnostic spans must live in the diagnostic's file
+- **Mistake (caught by springfu's new diagnostics landing mid-identifier):** anchored points reported the owner's path with record-file spans — incoherent coordinates no consumer can use. The XML lane shares the shape (precedent, left alone to avoid churning M6j goldens).
+- **Rule:** synthesized facts carry two files (evidence vs owner); every site (diagnostic, unique-key, evidence) must say which file its span belongs to. When in doubt, site where the point is written.

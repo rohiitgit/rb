@@ -654,3 +654,18 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Evaluator pass 1 (amendment 10, `tasks/eval-m6j-pass1.md`): VERDICT PASS — H1–H4 in-tree, 9 probes, 52/52 mutants.
   - [x] Evaluator pass 2 (`tasks/eval-m6j-pass2.md`): VERDICT PASS — repros re-run, suite stands.
 - **Verification** (`var/m6j/logs/p6-close-*`): fmt, clippy `-D warnings`, 913 units, `rb-store` 72/72, `rb-server` 12/12, e2e 47/47, api 1/1 (150 sets identical), no `skipping:`, no listener, stub scan clean.
+
+## M6k DI recall: complete (closed 2026-10-12, contract amendment 10)
+
+- **Contract:** `tasks/contract-m6k.md` (2026-10-12), S1–S11 and invariants 1–7, D1–D5, forks F1–F5.
+- **Soundness claims and closing bar, stated up front:** misanchored beans, assisted leakage, unmarked-property points, key confusion; safe direction everywhere (unresolvable anchors skip, assisted excluded import-gated, properties opt-in, literal-only keys, heuristic max).
+- **Progress:**
+  - [x] Phase 0, preflight (amendment 1): baseline binary `eb2242be`, M6j pins reused, green baseline.
+  - [x] Phase 1, anchor at type (amendment 2): `FileDi::unanchored` + shared `resolve_lane_point` + unique-or-skip (XML-bean precedent); val-form + minimal-hosting engine proofs.
+  - [x] Phase 2, packs (amendments 3–4): `@Assisted` exclusion, `toProvider`, C# properties, keyed services, C# `argument` unwrap, global-namespace key; pack + engine units.
+  - [x] Phase 3, fixtures (amendment 4): extensions with reviewed purely-additive goldens; every new guard bites with byte-identical restores.
+  - [x] Phase 4, units/mutants/PIPELINE (amendment 5): anchor-skip unit, 7/7 manual kills (two vacuous-test repairs), `PIPELINE m6k-1`, lint clean.
+  - [x] Phase 5, invariant + measurement (amendments 6, 8–9): 15/16 identical + 2 SCIP identical; guice/springfu/automapper classified, 0 false, 0 lost, 0 new exact Tier-B.
+  - [x] Pass-1 probing (amendments 7–8, `tasks/eval-m6k-pass1.md`): VERDICT PASS — H1–H6 in-tree (dotted namespaces, cross-namespace merge, enclosing scope, diagnostic siting, static properties, vacuous tests), 20+ source-read samples.
+  - [x] Evaluator pass 2 (`tasks/eval-m6k-pass2.md`): VERDICT PASS — repros re-run, suite stands.
+- **Verification** (`var/m6k/logs/p6-close-*`): fmt, clippy `-D warnings`, 926 units, `rb-store` 72/72, `rb-server` 12/12, e2e 47/47, api 1/1, no `skipping:`, no listener, stub scan clean.
