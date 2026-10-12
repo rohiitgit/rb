@@ -3777,10 +3777,7 @@ mod tests {
     fn xml_unresolved_diagnostic_sites_the_document() {
         let java = "package com.acme;\nclass C0 {}\n";
         let xml = "<beans xmlns=\"http://www.springframework.org/schema/beans\">\n  <bean id=\"b0\" class=\"com.acme.C0\">\n    <constructor-arg ref=\"missing\"/>\n  </bean>\n</beans>\n";
-        let (r, _) = resolve_lang(
-            &[("src/C.java", Language::Java, java)],
-            &[("app.xml", xml)],
-        );
+        let (r, _) = resolve_lang(&[("src/C.java", Language::Java, java)], &[("app.xml", xml)]);
         assert!(r.injections.is_empty());
         let d: Vec<&Diagnostic> = r
             .diagnostics
