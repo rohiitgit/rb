@@ -51,6 +51,8 @@ pub(crate) fn decorations(language: Language, def: Node<'_>, source: &[u8]) -> V
             found
         }
         Language::Go => Vec::new(),
+        // Contract M6i S2: annotations land with Tier B.
+        Language::Kotlin | Language::CSharp => Vec::new(),
     };
     nodes
         .into_iter()
@@ -229,6 +231,8 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
             }
         }
         Language::Go => {}
+        // Contract M6i S2: supertypes land with Tier B.
+        Language::Kotlin | Language::CSharp => {}
     }
     out
 }
@@ -531,6 +535,8 @@ pub(crate) fn modifiers(language: Language, def: Node<'_>, source: &[u8]) -> Vec
             }
         }
         Language::Python | Language::Go => {}
+        // Contract M6i S2: modifiers land with Tier B.
+        Language::Kotlin | Language::CSharp => {}
     }
     out.sort();
     out.dedup();

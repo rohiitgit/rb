@@ -166,6 +166,8 @@ pub fn routes(language: Language, facts: &FileFacts) -> FileRoutes {
             net_http(facts, &mut out);
         }
         Language::Python => fastapi(facts, &mut out),
+        // Contract M6i S2: route packs land with Tier B.
+        Language::Kotlin | Language::CSharp => {}
     }
     out
 }

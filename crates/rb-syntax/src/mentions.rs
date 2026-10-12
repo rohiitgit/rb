@@ -25,7 +25,8 @@ pub(crate) fn mentions(
     let java = match language {
         Language::Java => true,
         Language::TypeScript | Language::Tsx | Language::JavaScript => false,
-        Language::Python | Language::Go => return out,
+        // Contract M6i S2: mention roles land with Tier B.
+        Language::Python | Language::Go | Language::Kotlin | Language::CSharp => return out,
     };
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {

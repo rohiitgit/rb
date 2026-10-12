@@ -25,7 +25,7 @@ pub use tokens::surface_names;
 
 /// Grammar versions (checked against Cargo.lock by a test). Query text and the extractor's own
 /// source code are fingerprinted automatically by [`extractor_id`], so no manual bump is needed.
-pub const EXTRACTOR_VERSION: &str = "rb-syntax;tree-sitter-0.27.0;typescript-0.23.2;javascript-0.25.0;java-0.23.5;python-0.25.0;go-0.25.0";
+pub const EXTRACTOR_VERSION: &str = "rb-syntax;tree-sitter-0.27.0;typescript-0.23.2;javascript-0.25.0;java-0.23.5;python-0.25.0;go-0.25.0;kotlin-ng-1.1.0;csharp-0.23.5";
 
 /// The cache identity of this extractor: [`EXTRACTOR_VERSION`] plus a fingerprint of every
 /// bundled query and of the extraction source code. Any edit to either invalidates cached facts,
@@ -81,6 +81,8 @@ pub enum Language {
     Java,
     Python,
     Go,
+    Kotlin,
+    CSharp,
 }
 
 impl Language {
@@ -92,6 +94,8 @@ impl Language {
             Language::Java => "java",
             Language::Python => "python",
             Language::Go => "go",
+            Language::Kotlin => "kotlin",
+            Language::CSharp => "csharp",
         }
     }
 
@@ -104,6 +108,8 @@ impl Language {
             "java" => Language::Java,
             "python" => Language::Python,
             "go" => Language::Go,
+            "kotlin" => Language::Kotlin,
+            "csharp" => Language::CSharp,
             _ => return None,
         })
     }
@@ -1242,6 +1248,78 @@ interface Mfa { String send(String e); }
         );
     }
 
+    const KOTLIN: &str = "package acme
+
+interface Greeter {
+    fun greet(name: String): String
+}
+
+class DefaultGreeter : Greeter {
+    override fun greet(name: String): String {
+        return Helper.shout(name)
+    }
+}
+
+fun main() {
+    val g = DefaultGreeter()
+    g.greet(\"hi\")
+}
+";
+
+    /// Contract M6i S1: Kotlin definitions pin classes, interfaces, methods and top-level
+    /// functions with hand-written name spans; calls pin bare and member callees.
+    #[test]
+    fn kotlin_definitions_and_calls() {
+        assert_eq!(
+            outline(Language::Kotlin, KOTLIN),
+            [
+                "interface Greeter@2:10",
+                "method Greeter.greet@3:8",
+                "class DefaultGreeter@6:6",
+                "method DefaultGreeter.greet@7:17",
+                "function main@12:4",
+            ]
+        );
+        assert_eq!(
+            refs(Language::Kotlin, KOTLIN, RefKind::Call),
+            ["shout in greet", "DefaultGreeter in main", "greet in main"]
+        );
+    }
+
+    const CSHARP: &str = "using System;
+namespace Acme {
+    public interface IGreeter { string Greet(string name); }
+    public class Greeter : IGreeter {
+        public string Greet(string name) { return Helper.Shout(name); }
+    }
+    public static class Program {
+        public static void Main() { new Greeter().Greet(\"x\"); }
+    }
+}
+";
+
+    /// Contract M6i S1: C# definitions pin namespaces, interfaces, classes and methods with
+    /// hand-written name spans; invocations pin member callees.
+    #[test]
+    fn csharp_definitions_and_calls() {
+        assert_eq!(
+            outline(Language::CSharp, CSHARP),
+            [
+                "module Acme@1:10",
+                "interface Acme.IGreeter@2:21",
+                "method Acme.IGreeter.Greet@2:39",
+                "class Acme.Greeter@3:17",
+                "method Acme.Greeter.Greet@4:22",
+                "class Acme.Program@6:24",
+                "method Acme.Program.Main@7:27",
+            ]
+        );
+        assert_eq!(
+            refs(Language::CSharp, CSHARP, RefKind::Call),
+            ["Shout in Greet", "Greet in Main"]
+        );
+    }
+
     /// A record's compact canonical constructor is a constructor definition (named like the
     /// record) and the source of the calls in its body (contract M3b amendment 75).
     #[test]
@@ -1657,6 +1735,8 @@ export function hash(s: string): string {
             ("tree-sitter-java", "java"),
             ("tree-sitter-python", "python"),
             ("tree-sitter-go", "go"),
+            ("tree-sitter-kotlin-ng", "kotlin-ng"),
+            ("tree-sitter-c-sharp", "csharp"),
         ] {
             let pinned = format!(";{tag}-{};", version_of(crate_name));
             assert!(

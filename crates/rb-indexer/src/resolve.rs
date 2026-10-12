@@ -1202,7 +1202,8 @@ impl<'a> Index<'a> {
             Language::Java => self.def(class).name.as_str(),
             Language::Python => "__init__",
             Language::TypeScript | Language::Tsx | Language::JavaScript => "constructor",
-            Language::Go => return None,
+            // Contract M6i S2: constructor dispatch lands with Tier B (Go precedent: none).
+            Language::Go | Language::Kotlin | Language::CSharp => return None,
         };
         self.named(class.0, Some(class.1), name, |k| {
             matches!(k, DefKind::Method | DefKind::Function)

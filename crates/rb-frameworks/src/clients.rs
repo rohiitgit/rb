@@ -206,6 +206,8 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
             let claimed = claimed(&out);
             generated_calls(Language::Python, facts, &mut out, &claimed);
         }
+        // Contract M6i S2: client packs land with Tier B.
+        Language::Kotlin | Language::CSharp => {}
     }
     out
 }
@@ -542,6 +544,8 @@ pub fn global_hooks(language: Language, facts: &FileFacts) -> Vec<ClientKind> {
             }
         }
         Language::Python => {}
+        // Contract M6i S2: client packs land with Tier B.
+        Language::Kotlin | Language::CSharp => {}
     }
     out
 }

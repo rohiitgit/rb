@@ -87,6 +87,18 @@ fn syntax(language: Language) -> Syntax {
             raw_literals: &["raw_string_literal"],
             text_blocks: false,
         },
+        // Contract M6i S2: string shapes land with Tier B (nothing matches until then).
+        Language::Kotlin | Language::CSharp => Syntax {
+            literals: &[],
+            holes: &[],
+            concat: &[],
+            implicit_concat: &[],
+            arguments: &[],
+            calls: &[],
+            skip: &[],
+            raw_literals: &[],
+            text_blocks: false,
+        },
     }
 }
 

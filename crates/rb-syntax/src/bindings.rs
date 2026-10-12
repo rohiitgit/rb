@@ -57,6 +57,8 @@ pub(crate) fn bindings<'t>(
             }
             Language::Python => python(node, source, &mut out),
             Language::Go => go(node, source, &mut out),
+            // Contract M6i S2: per-language binding walks land with Tier B.
+            Language::Kotlin | Language::CSharp => {}
         }
         let mut c = node.walk();
         let children: Vec<Node<'t>> = node.children(&mut c).collect();
@@ -404,6 +406,9 @@ fn scope_kinds(language: Language) -> &'static [&'static str] {
             "if_statement",
             "switch_block",
         ],
+        // Contract M6i S2: scope refined with Tier B (roots verified by the S1 parse tests).
+        Language::Kotlin => &["source_file"],
+        Language::CSharp => &["compilation_unit"],
     }
 }
 

@@ -86,6 +86,8 @@ impl<'a> Modules<'a> {
             Language::Java => self.java(import),
             Language::Python => self.python(from, import),
             Language::Go => self.go(&import.module),
+            // Contract M6i S2: import resolution lands with Tier B.
+            Language::Kotlin | Language::CSharp => Vec::new(),
         };
         out.sort_unstable();
         out.dedup();

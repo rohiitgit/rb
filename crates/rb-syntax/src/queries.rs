@@ -44,6 +44,31 @@ const JAVA_SUPPLEMENT: &str = "
 (compact_constructor_declaration name: (identifier) @name) @definition.method
 ";
 
+/// The Kotlin grammar crate (`-ng`) ships no `tags.scm`, so the tags are hand-written here
+/// from the grammar's node shapes (contract M6i D1). Order matters: `capture` de-duplicates
+/// same-span definitions with first-pattern-wins, so interfaces beat classes and member
+/// functions beat top-level ones.
+const KOTLIN_TAGS: &str = "
+(class_declaration \"interface\" name: (identifier) @name) @definition.interface
+(class_declaration (modifiers) \"interface\" name: (identifier) @name) @definition.interface
+(class_declaration name: (identifier) @name) @definition.class
+(object_declaration name: (identifier) @name) @definition.class
+(class_body (function_declaration name: (identifier) @name) @definition.method)
+(function_declaration name: (identifier) @name) @definition.function
+(call_expression (identifier) @name) @reference.call
+(call_expression (navigation_expression (identifier) @name .)) @reference.call
+";
+
+/// C#'s stock tags use `@reference.send` for invocations, which the extractor does not map, so
+/// the supplement restates invocations as `@reference.call` (contract M6i D1).
+const CSHARP_SUPPLEMENT: &str = "
+(invocation_expression function: (identifier) @name) @reference.call
+(invocation_expression function: (member_access_expression name: (identifier) @name)) @reference.call
+";
+
+const KOTLIN_ANONYMOUS: &[&str] = &["anonymous_function", "lambda_literal"];
+const CSHARP_ANONYMOUS: &[&str] = &["anonymous_function", "lambda_expression"];
+
 pub(crate) fn for_language(language: Language) -> &'static Grammar {
     static TYPESCRIPT: OnceLock<Grammar> = OnceLock::new();
     static TSX: OnceLock<Grammar> = OnceLock::new();
@@ -51,6 +76,8 @@ pub(crate) fn for_language(language: Language) -> &'static Grammar {
     static JAVA: OnceLock<Grammar> = OnceLock::new();
     static PYTHON: OnceLock<Grammar> = OnceLock::new();
     static GO: OnceLock<Grammar> = OnceLock::new();
+    static KOTLIN: OnceLock<Grammar> = OnceLock::new();
+    static CSHARP: OnceLock<Grammar> = OnceLock::new();
     let js_and_ts = [
         tree_sitter_javascript::TAGS_QUERY,
         tree_sitter_typescript::TAGS_QUERY,
@@ -99,6 +126,20 @@ pub(crate) fn for_language(language: Language) -> &'static Grammar {
                 GO_ANONYMOUS,
             )
         }),
+        Language::Kotlin => KOTLIN.get_or_init(|| {
+            build(
+                tree_sitter_kotlin_ng::LANGUAGE.into(),
+                &[KOTLIN_TAGS],
+                KOTLIN_ANONYMOUS,
+            )
+        }),
+        Language::CSharp => CSHARP.get_or_init(|| {
+            build(
+                tree_sitter_c_sharp::LANGUAGE.into(),
+                &[tree_sitter_c_sharp::TAGS_QUERY, CSHARP_SUPPLEMENT],
+                CSHARP_ANONYMOUS,
+            )
+        }),
     }
 }
 
@@ -112,6 +153,9 @@ pub(crate) fn all_sources() -> String {
         JAVA_SUPPLEMENT,
         tree_sitter_python::TAGS_QUERY,
         tree_sitter_go::TAGS_QUERY,
+        KOTLIN_TAGS,
+        tree_sitter_c_sharp::TAGS_QUERY,
+        CSHARP_SUPPLEMENT,
     ]
     .join("\n")
 }

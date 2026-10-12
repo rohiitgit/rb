@@ -253,7 +253,8 @@ pub fn mappings(path: &str, language: Language, facts: &FileFacts) -> Vec<Mappin
                 Language::TypeScript | Language::Tsx | Language::JavaScript => {
                     typeorm_mapping(class, &defs[class])
                 }
-                Language::Python | Language::Go => None,
+                // Contract M6i S2: ORM mappings land with Tier B.
+                Language::Python | Language::Go | Language::Kotlin | Language::CSharp => None,
             },
         })
         .collect()
@@ -828,7 +829,8 @@ pub fn accesses(
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             prisma_accesses(facts, &mut out)
         }
-        Language::Python | Language::Go => {}
+        // Contract M6i S2: ORM accesses land with Tier B.
+        Language::Python | Language::Go | Language::Kotlin | Language::CSharp => {}
     }
     out
 }

@@ -76,6 +76,16 @@ fn syntax(language: Language) -> Syntax {
             object: None,
             skip: &["decorator"],
         },
+        // Contract M6i S2: call chains land with Tier B (a kind that matches nothing reads no
+        // chains until then).
+        Language::Kotlin | Language::CSharp => Syntax {
+            call: "",
+            member: ("", "", ""),
+            names: &[],
+            functions: &[],
+            object: None,
+            skip: &[],
+        },
     }
 }
 
