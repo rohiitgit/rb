@@ -1,0 +1,2 @@
+orphan_endpoints services/auth -> HTTP GET /v1/logout @services/auth
+check: 1 violation

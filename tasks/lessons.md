@@ -489,3 +489,11 @@
 ## 2026-10-12: prove a vacuous measurement leg vacuous, or replace it
 - **Mistake (avoided by design):** apache/kafka @ pin carries no Spring-Kafka dependency, so its 625k-row identical dump proves nothing positive about topics.
 - **Rule:** check the leg can exercise the code first (here: a build-file grep for the frameworks); a vacuous leg gets a stated vacuity proof, and the positive proof moves to a repo that carries the forms (spring-kafka: +808 rows, samples read in source).
+
+## 2026-10-12: never edit the same file in parallel tool calls
+- **Mistake (caught by the e2e):** two edits to one fixture file in a single parallel block raced; last-write-wins silently dropped the method addition while keeping the import, and the endpoint vanished from the dump.
+- **Rule:** one file, one edit per message. Sequential edits to the same file go in separate blocks; verify the file after any same-file sequence.
+
+## 2026-10-12: `git checkout -- <file>` discards uncommitted work (re-learned)
+- **Mistake (caught by the e2e):** reverting a guard-bite mutant with `git checkout --` wiped the file's uncommitted import + method; both had to be re-applied (and the re-apply then raced — see above).
+- **Rule:** revert mutants with the edit tool (exact inverse), never with checkout. This is the M3b lesson restated: it bites again the moment the working tree holds uncommitted fixture work.

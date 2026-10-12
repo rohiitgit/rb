@@ -649,6 +649,80 @@ fn java_spring_jpa() {
     check_fixture("java-spring-jpa", "java");
 }
 
+/// Contract M6h S5: architecture rules as a CI gate. For each fixture: `rb check` prints the
+/// golden violation list with the golden exit code (0 clean, 1 violations, 2 errors); every
+/// rule's Cypher rows equal the relational twin's rows on the same snapshot; `--rule` filters;
+/// an unknown rule and a missing repository exit 2.
+#[test]
+fn check_gates() {
+    let Some(url) = db_url() else { return };
+    for (fixture, tag) in [("topo-packs", "topo"), ("polyglot-monorepo", "poly")] {
+        let repo = fixture_repo(fixture);
+        let path = repo.path().to_str().unwrap();
+        let pid = std::process::id();
+        let name = format!("t_check_{tag}_{pid}");
+        let _cleanup = Cleanup {
+            url: &url,
+            repos: vec![name.clone()],
+        };
+        rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+        // The relational twin on the in-memory pipeline output.
+        let indexed = rb_indexer::index_commit(
+            repo.path(),
+            "HEAD",
+            &mut rb_indexer::NoCache,
+            &rb_indexer::ScipOptions::disabled(),
+            &mut rb_indexer::NoScipCache,
+        )
+        .unwrap();
+        let mut expected: Vec<(String, String, String)> = rb_store::check::check(&indexed.graph)
+            .into_iter()
+            .map(|v| (v.rule.to_owned(), v.src, v.dst))
+            .collect();
+        expected.sort();
+        // The product path: each rule's Cypher rows over AGE, as JSON.
+        let (code, stdout, _) = rb_exit(&url, &["check", "--json", "--repo", &name]);
+        let body: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let mut actual: Vec<(String, String, String)> = body["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                (
+                    v["rule"].as_str().unwrap().to_owned(),
+                    v["src"].as_str().unwrap().to_owned(),
+                    v["dst"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected, "Cypher twin == relational twin on {fixture}");
+        assert_eq!(
+            code,
+            if expected.is_empty() { 0 } else { 1 },
+            "exit code on {fixture}"
+        );
+        // The text output is golden; a clean rule filter exits 0.
+        let (code, stdout, _) = rb_exit(&url, &["check", "--repo", &name]);
+        golden(fixture, "check.txt", &stdout);
+        assert_eq!(
+            code,
+            if expected.is_empty() { 0 } else { 1 },
+            "text exit code on {fixture}"
+        );
+        let (code, stdout, _) = rb_exit(&url, &["check", "--repo", &name, "--rule", "service_cycles"]);
+        assert_eq!(code, 0, "a clean rule filter exits 0");
+        assert_eq!(stdout, "check: 0 violations\n");
+        // An unknown rule exits 2, against a repository that exists.
+        let (code, _, stderr) = rb_exit(&url, &["check", "--repo", &name, "--rule", "bogus"]);
+        assert_eq!(code, 2);
+        assert!(stderr.contains("unknown rule"), "{stderr}");
+    }
+    // A repository that was never indexed exits 2.
+    let (code, _, stderr) = rb_exit(&url, &["check", "--repo", "t_check_missing"]);
+    assert_eq!(code, 2, "{stderr}");
+}
+
 #[test]
 fn polyglot_monorepo() {
     check_fixture("polyglot-monorepo", "poly");
