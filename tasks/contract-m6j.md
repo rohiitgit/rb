@@ -202,4 +202,6 @@ verified (phase 1 discovers them by parsing, M6i-D1-style). Measurement pins ver
 `8f8775ec…` (HEAD; Kotlin-beans leg), AutoMapper/AutoMapper `6e8697bc…` (M6i pin reused
 for the .NET leg — it carries DI tests). Sizes accepted per M5 precedent (parse-only
 `--no-scip` handled 1.7M lines; one repo at a time, remove + `VACUUM`). Baseline verify
-`var/m6j/logs/p0-baseline-*` running. DB holds only the 3 pre-existing `fx_*` repos.
+`var/m6j/logs/p0-baseline-*` green (fmt, clippy `-D warnings`, 888 units, store 72, server
+12, e2e 42/42, api 1/1, no skips, no listener, stub scan clean). DB holds only the 3
+pre-existing `fx_*` repos.
