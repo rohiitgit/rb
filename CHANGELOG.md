@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-10-12] (wall clock) M6f CLOSED (evaluator passes 1–2)
+- Phases 0–2 (amendments 1–3): preflight (grpc-go + OAI pins, proto binds); OpenAPI JSON/YAML reader; proto service reader — each test-first with killed mutants.
+- Phases 3–4 (amendments 4–5): spec endpoints under the shared key (GRPC keys, diagnostics) + handler join for free; MyBatis mapper XML to tables via rb-sql (Element attrs/ends).
+- Phases 5–6 + S4b (amendments 6–8): generated-client packs, operation/RPC stitching (synthetic cap, own-service rule), interface handler roll-down via IMPLEMENTS.
+- Phase 7 (amendment 9): contract-packs fixture (Maven + nested webapp), e2e + 5 goldens + 12/3 guards, every line read, 4 guard-bite mutants.
+- Phase 8 (amendment 10): grpc-go classified (52 synthetic CONSUMES, 869 correctly-unmatched residue) + deterministic; OAI identical + reader breadth.
+- Pass 1 (`tasks/eval-m6f-pass1.md`): VERDICT PASS with one fix (YAML/JSON dispatch layer) + polyglot churn fix (URL-claimed chains, framework denylist).
+- Pass 2 (`tasks/eval-m6f-pass2.md`): VERDICT PASS — probes re-run, mutants re-killed, invariant 1, determinism; close verify green (fmt, clippy, 842 units + 25 cli-bin, store 66, server 12, e2e 37/37, api 1/1).
+- `PIPELINE` `m6c-5` → `m6f-1` (first dump change: the new fixture; pre-existing dumps byte-identical).
+- Files: `crates/rb-frameworks/src/{spec,endpoint,routes,clients}.rs`, `crates/rb-indexer/src/{routes,sql,packages,lib,stitch}`, `crates/rb-model/src/graph.rs`, `crates/rb-cli/src/main.rs`; records `tasks/{contract-m6f,eval-m6f-pass1,eval-m6f-pass2,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-12] (wall clock) M6e CLOSED (evaluator passes 1–2)
 - Phases 0–7 (amendments 1–8): Gradle image/fetch/versions/fixture, pnpm-yarn readers/workspaces/fixture — each test-first with killed mutants; no dump change throughout.
 - Phases 8–9 (amendments 9–10): go.work workspaces + excludes; Maven classifiers riding the key with `<type>` recorded. Full verifies green unblessed.

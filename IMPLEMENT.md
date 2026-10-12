@@ -562,3 +562,23 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Phase 11, measurements (S13, amendment 12): jcommander `--no-scip` identical + deterministic, Gradle SCIP ok 45.3 s (1,218/1,218 defs, 1,355 exact CALLS, 20/20 samples, cached identical) after allow-listing `plugins-artifacts.gradle.org` (probed 200, key moved by design); ofetch 12 pnpm pins classified + sampled + deterministic; class-validator S10 live-fire 42 = 38 + 4; cleanup done.
   - [x] Phase 12, evaluator + close (amendment 13): pass 1 full review (12 probes, 5 new tests, VERDICT PASS, no blockers), pass 2 verification-only (VERDICT PASS, close verify green).
 - **Verification** (`var/m6e/logs/p12-close-*`): fmt, clippy `-D warnings`, 822 units + 25 cli-bin, store 66, server 12, e2e 36/36, api 1/1 (150 sets), no `skipping:`, no listener, stub scan clean. `PIPELINE` unbumped (`m6c-5`). DB holds only the 3 pre-existing `fx_*` repos.
+
+## M6f Contract packs: complete (closed 2026-10-12, contract amendment 11)
+
+- **Contract:** `tasks/contract-m6f.md` (2026-10-12), S1–S11 and invariants 1–6. Phases 0–9 in `tasks/todo.md`.
+- **Soundness claims and closing bar, stated up front** (lesson 2026-10-06): no misread paths/methods/versions; Gradle-style exfiltration discipline reused (no new fetches); no wrongly rejected/kept TS... (M6f: specs/protos) documents; no encoding-style misreads. Everything unproven takes the safe direction (unreadable pins nothing, unresolvable stays external/unhandled, duplicates never merge silently, `info.version` never a package version, `CONSUMES` never `exact` — deviating from design §10.2 with reasons in D5).
+- **Decided in the contract (D1–D7):** hand-rolled YAML (no new dependency); proto prefers the grammar; specs authoritative for existence only; MyBatis rides rb-sql; generated clients cap at synthetic; fixture plan is code; measurement reuses pins.
+- **Forks:** F1 hand-rolled YAML, F2 grammar-first proto, F3 existence-only authority, F4 MyBatis-on-rb-sql, F5 synthetic cap.
+- **Progress:**
+  - [x] Phase 0, preflight (amendment 1): baseline binary, grpc-go + OAI pins, tree-sitter-proto binds (stream needs text check), shape checks, baseline green.
+  - [x] Phase 1, OpenAPI reading (S1, amendment 2): JSON + YAML shapes, basenames, growth; mutants.
+  - [x] Phase 2, proto reading (S2, amendment 3): services/RPCs/streams/spans; mutants; growth.
+  - [x] Phase 3, spec endpoints in graph (S3, amendment 4): shared-key registrations, GRPC keys, diagnostics; mutants.
+  - [x] Phase 4, MyBatis mapper XML (S5, amendment 5): Element attrs/ends, statements→tables, dynamics counted; mutants.
+  - [x] Phase 5, generated-client packs (S6 packs, amendment 6): operationId/RPC candidates + Endpoint.operations; mutants; growth.
+  - [x] Phase 6, generated-call stitching (S6 stitch, amendment 7): operation/RPC matching, own-service rule, synthetic cap; mutants.
+  - [x] S4b, interface handler roll-down (S4, amendment 8): interface_routes recorded, spec-matched roll-down via IMPLEMENTS; mutants.
+  - [x] Phase 7, fixture + guards (S7, amendment 9): contract-packs fixture (Maven + nested webapp), e2e + 5 goldens + 12/3 guards, every line read, 4 guard-bite mutants.
+  - [x] Phase 8, measurements (S8, amendment 10): grpc-go classified (18 endpoints, 52 synthetic CONSUMES sampled, 869 correctly-unmatched residue) + deterministic; OAI identical + reader breadth on real specs; cleanup.
+  - [x] Phase 9, evaluator + close (amendment 11): pass 1 full review (12 probes, 1 fix + churn fix, VERDICT PASS), pass 2 verification-only (VERDICT PASS, close verify green).
+- **Verification** (`var/m6f/logs/p9-close3-*`): fmt, clippy `-D warnings`, 842 units + 25 cli-bin, store 66, server 12, e2e 37/37, api 1/1 (150 sets), no `skipping:`, no listener, stub scan clean. `PIPELINE` `m6c-5` → `m6f-1`. DB holds only the 3 pre-existing `fx_*` repos.

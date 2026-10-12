@@ -465,3 +465,11 @@
 ## 2026-10-12: a job-level verdict can have an unsafe corner a per-entity verdict has not
 - **Mistake (caught by design review before any use):** per-job deepest-wins for encodings would trust an ISO root's files under a UTF-8 module verdict — silently accepting misread files.
 - **Rule:** when one verdict covers entities with different configurations, resolve per entity (per-document nearest-pom here); mixed-configuration tests (root-ISO/module-UTF-8 both ways) pin each side. No prior binary shipped the weaker rule.
+
+## 2026-10-12: URL-claimed chains are never generated candidates
+- **Mistake (caught by golden churn):** generated packs fired on real HTTP clients named `*Api` (`mailApi.post`) and Angular `HttpClient` params — 3 false `http_unmatched` diagnostics plus coverage inflation on polyglot.
+- **Rule:** a chain the URL packs already read (exact span equality, verified empirically) is skipped by generated packs; framework HTTP client types (`HttpClient`, `WebClient`, `RestClient`) are denied stub candidacy even unclaimed. Both rules test-first with killed mutants.
+
+## 2026-10-12: content sniffing belongs in the reader, not the stage
+- **Mistake (caught by a probe test):** flow-JSON in a `.yaml` file silently read as empty YAML because the JSON sniff lived in the stage's dispatch while the reader never saw it.
+- **Rule:** format detection lives with the format readers (one place decides); stages dispatch by extension only.
