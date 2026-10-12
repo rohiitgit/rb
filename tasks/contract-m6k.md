@@ -241,3 +241,25 @@ plus global last (all genuine C# visibility, no new guess). Miniature-proven
 both directions and pinned in the fixture (`SubHelper.cs` resolves,
 `OtherDecoy.cs` silent, both guards bite). Release `d07cf7e1` superseded;
 invariant + measurement rerun on the final tree (amendment 9).
+
+9. **(phase 5b) Rerun results (S8–S9, final tree `41e7d632`).**
+Invariant-1 (`p9-invariant3.log`): 15/16 fixtures byte-identical + 2 SCIP
+identical; only the 3 extended fixtures differ, exactly as their e2e goldens
+pin (guice +INJECTS/−CacheUser-unresolved/−2 assisted edges; kbeans +val-form
+edge; csharp +3 INJECTS/+SubHelper edges/−newly-resolved diagnostics +
+supertype-keep lift on `SubHelper`, mechanism working as designed).
+Measurement (`p8-measure3.log`):
+- guice +20/−19: ambiguous-candidate growth from genuine `toProvider` beans
+  (+`bean_type_inferred` where honest); the one removed unique edge reappears
+  as ambiguous (source-read: plain `@Inject`). 0 false.
+- springfu +16/−1, all `D`: 15 newly-visible val-form `ref()` misses
+  (`no_bean`, bare/untyped residue), now sited in the record files. 0 false.
+- automapper +5740/−353: 333 Module nodes + 334 DEFINED_IN (dotted-ns
+  detection); IMPLEMENTS/REFERENCES 3501, every one namespace- or
+  using-legitimate (3377 same/parent-ns, 107 using-covered, 17 global
+  visibility; programmatic, 0 unexplained); CALLS 1227 (receiver types via
+  parent-ns; ambiguous ones are genuine overload/dispatch sets); removed rows
+  are coverage churn + 1 evidence-corrected DEFINED_IN; zero lost edges, zero
+  new exact Tier-B edges. 20+ source-read samples, 0 false.
+The two intermediate legs (polluted automapper, mis-sited springfu
+diagnostics) are VOID and superseded by these numbers.
