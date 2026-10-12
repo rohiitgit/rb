@@ -959,7 +959,8 @@ Same rules as M6d:
 - [x] **7. Fixture + guards** (S7). Done (amendment 9): contract-packs fixture (Maven + nested webapp), e2e + 5 goldens + 12/3 guards, every line read, 4 guard-bite mutants, unblessed green.
 - [x] **8. Measurements** (S8). Done (amendment 10): grpc-go classified (18 endpoints, 52 synthetic CONSUMES sampled, 869 correctly-unmatched residue) + deterministic; OAI identical + reader breadth on real specs; cleanup done.
 - [x] **9. Records + evaluator.** Done 2026-10-12 (amendment 11): pass 1 (12 probes, dispatch fix + churn fix, VERDICT PASS); pass 2 (VERDICT PASS, close verify green). **M6f closed.**
-- [ ] M6g Topology and configuration packs (contract written 2026-10-12, phases below; topics, gateways, host names, Spring YAML/profiles).
+- [x] **0. Preflight** (M6g). Done 2026-10-12 (amendment 1): baseline binary `var/m6g/base/rb-f80714d` (HEAD code == `f80714d`); pins apache/kafka + spring-cloud-gateway (ls-remote); shape checks; baseline verify green (fmt, clippy, 842 units, store 66, server 12, e2e 37/37, api 1/1).
+- [ ] M6g phases 1+ (topic packs, topic graph, gateway packs, host names, Spring YAML, fixture, measurements, evaluator).
 - [ ] M6h Architecture rules as a CI gate (`rb check` in Cypher).
 - [ ] M6i Kotlin and C# syntax.
 - [ ] M6j DI breadth (Guice, Dagger, NestJS, Spring XML and Kotlin beans, .NET over Tier B).
