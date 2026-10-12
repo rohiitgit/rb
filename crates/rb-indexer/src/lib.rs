@@ -114,7 +114,7 @@ use serde_json::{Value, json};
 /// rides the generated parameter and narrows, counted (M6c S8).
 /// `m6c-5` exact type-arg agreement: the single bean in simple-name agreement
 /// picks at `heuristic`, capped by the generic gate, counted (M6c S9a).
-pub const PIPELINE: &str = "m6f-1";
+pub const PIPELINE: &str = "m6g-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -1152,7 +1152,25 @@ pub fn assemble(
             continue;
         }
         match boundaries.project_for(path) {
-            Some(p) => host_aliases.extend(names.into_iter().map(|n| (n, p.dir.clone()))),
+            Some(p) => {
+                // Root-matches win over ownership (a manifest for another service is never
+                // stolen); otherwise-novel names alias the owning service.
+                for name in &names {
+                    let mut matched = false;
+                    for service in &services {
+                        let base = service.key.rsplit('/').next().unwrap_or(&service.key);
+                        if base.eq_ignore_ascii_case(name)
+                            || service.name.eq_ignore_ascii_case(name)
+                        {
+                            host_aliases.push((name.clone(), service.key.clone()));
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        host_aliases.push((name.clone(), p.dir.clone()));
+                    }
+                }
+            }
             None => {
                 let mut matched = false;
                 for service in &services {

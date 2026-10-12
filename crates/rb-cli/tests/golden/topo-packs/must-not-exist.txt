@@ -1,0 +1,8 @@
+# Precision guards (contract M6g S6): forbidden edges. A non-`*` source must name a node
+# of the dump, so a misspelt key cannot pass vacuously.
+# Profile precedence (S5): the base document's and bootstrap's values never edge.
+PUBLISHES * -> topic/base-events [heuristic]
+PUBLISHES * -> topic/boot-events [heuristic]
+SUBSCRIBES * -> topic/base-events [heuristic]
+# Stitching certainty (M4a S13, reaffirmed M6g): CONSUMES is never exact.
+CONSUMES * -> * [exact]

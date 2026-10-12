@@ -1,0 +1,12 @@
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: billing
+          uri: lb://auth
+          predicates:
+            - Path=/bill/**
+        - id: wild
+          uri: lb://auth
+          predicates:
+            - Path=/w/*
