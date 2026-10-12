@@ -75,8 +75,9 @@ struct RbToml {
     exclude: Vec<String>,
     #[serde(default)]
     service: Vec<ServiceOverride>,
-    /// Host mappings (contract M6g S4): read by the indexer, ignored here beyond parsing.
+    /// Host mappings (contract M6g S4): parsed so detection accepts them; read by the indexer.
     #[serde(default)]
+    #[allow(dead_code)]
     hosts: Vec<toml::Value>,
 }
 

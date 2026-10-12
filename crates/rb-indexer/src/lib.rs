@@ -495,6 +495,110 @@ fn is_config_client_key(key: &str) -> bool {
 /// (amendments 12 and 13).
 const CONFIG_CLIENT_ENABLED: &str = "spring.cloud.config.enabled";
 
+/// The key selecting active profiles (contract M6g S5). The environment and the command line
+/// are never read (host-dependent), so only file-declared profiles activate.
+const ACTIVE_PROFILES_KEY: &str = "spring.profiles.active";
+
+/// A profile list value as names: comma/whitespace separated, quotes and brackets dropped.
+fn split_profiles(value: &str) -> Vec<String> {
+    value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split([',', ' ', '\t', '\n'])
+        .filter_map(|p| {
+            let p = p.trim().trim_matches('"').trim_matches('\'').trim();
+            (!p.is_empty()).then(|| p.to_owned())
+        })
+        .collect()
+}
+
+/// The profiles a configuration document selects: `spring.config.activate.on-profile` and the
+/// legacy `spring.profiles` scalar (contract M6g S5). Cloud-platform conditions select none.
+fn document_profiles(doc: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["spring.config.activate.on-profile", "spring.profiles"] {
+        if let Some(value) = doc.get(key) {
+            out.extend(split_profiles(value));
+        }
+    }
+    out
+}
+
+/// The active profiles per service (contract M6g S5): the highest-precedence file that sets
+/// `spring.profiles.active` wins (bootstrap < YAML < properties, per Spring's file order;
+/// profile files cannot select themselves). Profile-specific and build files never select.
+fn active_profiles(read: &[ConfigRead<'_>]) -> BTreeMap<String, BTreeSet<String>> {
+    let rank = |kind: ConfigFile| match kind {
+        ConfigFile::Bootstrap => 0,
+        ConfigFile::Yaml => 1,
+        ConfigFile::Read => 2,
+        ConfigFile::Profile | ConfigFile::ConfigDir | ConfigFile::Build => 3,
+    };
+    let mut per_service: BTreeMap<String, Vec<(usize, BTreeSet<String>)>> = BTreeMap::new();
+    for (path, text, kind, service, _) in read {
+        // Only unconditional documents select profiles: a profile-gated document cannot
+        // select itself.
+        let base: BTreeMap<String, String> = match kind {
+            ConfigFile::Read => rb_frameworks::fold::properties_documents(text)
+                .into_iter()
+                .filter(|d| !rb_frameworks::fold::conditional_document(d))
+                .flatten()
+                .collect(),
+            ConfigFile::Yaml => select_yaml_documents(text, &BTreeSet::new()).0,
+            ConfigFile::Bootstrap if !path.ends_with(".properties") => {
+                select_yaml_documents(text, &BTreeSet::new()).0
+            }
+            ConfigFile::Bootstrap => rb_frameworks::fold::parse_properties(text),
+            ConfigFile::Profile | ConfigFile::ConfigDir | ConfigFile::Build => continue,
+        };
+        if let Some(value) = base.get(ACTIVE_PROFILES_KEY) {
+            per_service
+                .entry(service.clone())
+                .or_default()
+                .push((rank(*kind), split_profiles(value).into_iter().collect()));
+        }
+    }
+    per_service
+        .into_iter()
+        .map(|(service, mut ranked)| {
+            ranked.sort_by_key(|(r, _)| *r);
+            (
+                service,
+                ranked.last().map(|(_, p)| p.clone()).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// A YAML file's entries split into base and selected-profile documents (contract M6g S5):
+/// unconditional documents always apply; conditional ones apply when they select an active
+/// profile. A tabbed file is unreadable: it contributes nothing (today's reading is kept).
+fn select_yaml_documents(
+    text: &str,
+    active: &BTreeSet<String>,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let (mut base, mut profile) = (BTreeMap::new(), BTreeMap::new());
+    if text.contains('\t') {
+        return (base, profile);
+    }
+    for doc in rb_frameworks::fold::yaml_documents(text) {
+        if !rb_frameworks::fold::conditional_document(&doc) {
+            base.extend(doc);
+        } else if document_profiles(&doc).iter().any(|p| active.contains(p)) {
+            profile.extend(doc);
+        }
+    }
+    (base, profile)
+}
+
+/// The profile of an `application-<profile>.*` file name, or `None` for anything else.
+fn profile_of(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let stem = name.rsplit_once('.')?.0;
+    stem.strip_prefix("application-").map(str::to_owned)
+}
+
 /// One configuration file as read: path, text, kind, service, and its keys with their values.
 type ConfigRead<'a> = (
     &'a str,
@@ -504,12 +608,16 @@ type ConfigRead<'a> = (
     BTreeMap<String, String>,
 );
 
-/// Reads the services' Spring configuration (evaluator pass 1, P7): `application.properties`
-/// is read; profile files, YAML, `bootstrap*` files and a Spring Cloud Config client (by build
-/// dependency, or by a `spring.config.import`/`spring.cloud.config` key) are not, so each such
-/// service gets one `config_unread` diagnostic (lesson 2026-10-01: a suppressed source is
-/// counted) and its overrides: the keys those files set, or every key for a config client. A
-/// YAML file mentioning `context-path` keeps its `spring_config_unread` (S4).
+/// Reads the services' Spring configuration (evaluator pass 1, P7; contract M6g S5):
+/// `application.properties` is read; `application.yml`/`.yaml` (unconditional documents plus
+/// the active profiles' documents) and active `application-<profile>.*` files are read above
+/// it; `bootstrap*` files are read lowest. Precedence, lowest first: bootstrap, YAML base,
+/// properties, YAML profile documents, profile YAML, profile properties (profile files beat
+/// base files, and `.properties` beats `.yml` in the same tier, per Spring's file order).
+/// Profile files, YAML, `bootstrap*` files and a Spring Cloud Config client keep their
+/// `config_unread` diagnostic and overrides (profiles can also come from the environment or
+/// the command line, which are never read, so the caps stay conservative); a YAML file that
+/// still contributes nothing and mentions `context-path` keeps `spring_config_unread`.
 fn spring_config(
     config: &BTreeMap<&str, String>,
     service_of: &dyn Fn(&str) -> String,
@@ -529,6 +637,7 @@ fn spring_config(
         };
         read.push((path, text, kind, service_of(path), entries));
     }
+    let active = active_profiles(&read);
     // `false` turns the client off only in a base (unconditional) document of
     // `application.properties`/`application.yml`, and only when no file or document sets it
     // back to `true`: a profile's or a cloud platform's switch applies there alone (amendments
@@ -566,17 +675,51 @@ fn spring_config(
     let disabled: BTreeSet<&str> = off.difference(&on).copied().collect();
     // Service → (reasons, files).
     let mut unread: BTreeMap<String, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+    // Selected values per service in precedence order (rank, path, entries): merged lowest
+    // first after the loop, so profile files beat base files.
+    let mut selected: Vec<(String, usize, &str, BTreeMap<String, String>)> = Vec::new();
     for (path, text, kind, service, entries) in &read {
         let (path, text, kind, service) = (*path, *text, *kind, service.clone());
         let keys: BTreeSet<String> = entries.keys().cloned().collect();
-        if kind == ConfigFile::Read {
-            out.properties
-                .entry(service.clone())
-                .or_default()
-                .extend(entries.clone());
+        let active_here: BTreeSet<String> = active.get(&service).cloned().unwrap_or_default();
+        // The values this file contributes (contract M6g S5); `None` reads as nothing.
+        let mut values: Vec<(usize, BTreeMap<String, String>)> = Vec::new();
+        match kind {
+            ConfigFile::Read => values.push((2, entries.clone())),
+            ConfigFile::Bootstrap if path.ends_with(".properties") => {
+                values.push((0, entries.clone()));
+            }
+            ConfigFile::Bootstrap => {
+                let (base, profile) = select_yaml_documents(text, &active_here);
+                values.push((0, base));
+                values.push((0, profile));
+            }
+            ConfigFile::Yaml => {
+                let (base, profile) = select_yaml_documents(text, &active_here);
+                values.push((1, base));
+                values.push((3, profile));
+            }
+            ConfigFile::Profile => {
+                let gated = profile_of(path).is_some_and(|p| active_here.contains(&p));
+                if gated {
+                    if path.ends_with(".properties") {
+                        values.push((5, entries.clone()));
+                    } else {
+                        let (base, profile) = select_yaml_documents(text, &active_here);
+                        values.push((4, base));
+                        values.push((4, profile));
+                    }
+                }
+            }
+            ConfigFile::ConfigDir | ConfigFile::Build => {}
+        }
+        let contributed = values.iter().any(|(_, m)| !m.is_empty());
+        for (rank, map) in values {
+            selected.push((service.clone(), rank, path, map));
         }
         if matches!(kind, ConfigFile::Yaml | ConfigFile::Profile)
             && !path.ends_with(".properties")
+            && !contributed
             && text.contains("context-path")
         {
             diagnostics.push(Diagnostic {
@@ -621,6 +764,11 @@ fn spring_config(
             detail: json!({ "service": service, "reasons": reasons, "files": files }),
         });
         out.unread.insert(service);
+    }
+    // Effective values, lowest precedence first (a later file's keys win).
+    selected.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(b.2)));
+    for (service, _, _, map) in selected {
+        out.properties.entry(service).or_default().extend(map);
     }
     (out, diagnostics)
 }
@@ -2317,6 +2465,130 @@ mod tests {
         let unread_services: Vec<&str> = spring.unread.iter().map(String::as_str).collect();
         assert_eq!(unread_services, ["a", "b", "c", "d", "e", "g", "h"]);
         assert!(!spring.overrides["h"].all, "a config server is no client");
+    }
+
+    /// Contract M6g S5: `application.yml` multi-document profiles are evaluated. Base
+    /// documents always apply; `on-profile` (and legacy `spring.profiles`) documents apply
+    /// when their profile is active. `bootstrap*` is lowest, `.properties` beats `.yml` in
+    /// the same tier, profile files beat inline documents, and an unreadable (tabbed) YAML
+    /// file keeps today's `.properties` reading.
+    #[test]
+    fn spring_yaml_profiles_evaluate_in_documented_precedence() {
+        let res = "src/main/resources";
+        let files: Vec<(String, &str)> = vec![
+            // Active profile `prod`, set by the properties file (beats the YAML's `dev`).
+            (
+                format!("a/{res}/application.properties"),
+                "spring.profiles.active=prod\nusers.url=http://base\nshared=props\n",
+            ),
+            (
+                format!("a/{res}/application.yml"),
+                "spring:\n  profiles:\n    active: dev\nusers:\n  url: http://yaml-base\nshared: yaml\n---\nspring:\n  config:\n    activate:\n      on-profile: prod\nusers:\n  url: http://yaml-prod\n---\nspring:\n  config:\n    activate:\n      on-profile: staging\nusers:\n  url: http://yaml-staging\n",
+            ),
+            // A legacy `spring.profiles` document for the active profile.
+            (
+                format!("b/{res}/application.properties"),
+                "spring.profiles.active=prod\n",
+            ),
+            (
+                format!("b/{res}/application.yml"),
+                "users:\n  url: http://b-base\n---\nspring:\n  profiles: prod\nusers:\n  url: http://b-prod\n",
+            ),
+            (
+                format!("b/{res}/application-prod.properties"),
+                "users.url=http://b-file\n",
+            ),
+            // Bootstrap is lowest: loses to `application.properties`.
+            (
+                format!("c/{res}/bootstrap.properties"),
+                "users.url=http://boot-props\n",
+            ),
+            (
+                format!("c/{res}/application.properties"),
+                "users.url=http://c-app\n",
+            ),
+            // A tabbed YAML file is unreadable: today's `.properties` reading is kept.
+            (
+                format!("d/{res}/application.properties"),
+                "spring.profiles.active=prod\nusers.url=http://d-base\n",
+            ),
+            (
+                format!("d/{res}/application.yml"),
+                "users:\n\turl: http://d-yaml\n---\nspring:\n  config:\n    activate:\n      on-profile: prod\nusers:\n  url: http://d-prod\n",
+            ),
+            // An inactive profile file contributes nothing.
+            (
+                format!("e/{res}/application.properties"),
+                "users.url=http://e-base\n",
+            ),
+            (
+                format!("e/{res}/application-staging.properties"),
+                "users.url=http://e-staging\n",
+            ),
+            // A context path from the active YAML document flows into the properties.
+            (
+                format!("f/{res}/application.properties"),
+                "spring.profiles.active=prod\n",
+            ),
+            (
+                format!("f/{res}/application.yml"),
+                "server:\n  servlet:\n    context-path: /base\n---\nspring:\n  config:\n    activate:\n      on-profile: prod\nserver:\n  servlet:\n    context-path: /prod\n",
+            ),
+        ];
+        let config: BTreeMap<&str, String> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), (*t).to_owned()))
+            .collect();
+        let service_of = |p: &str| p.split('/').next().unwrap().to_owned();
+        let (spring, _) = spring_config(&config, &service_of);
+        // `prod` (properties) beats `dev` (YAML); the staging document never applies.
+        assert_eq!(spring.properties["a"]["users.url"], "http://yaml-prod");
+        assert_eq!(spring.properties["a"]["shared"], "props");
+        // The profile file beats the inline profile document.
+        assert_eq!(spring.properties["b"]["users.url"], "http://b-file");
+        // Bootstrap loses.
+        assert_eq!(spring.properties["c"]["users.url"], "http://c-app");
+        // Tabbed YAML contributes nothing.
+        assert_eq!(spring.properties["d"]["users.url"], "http://d-base");
+        // Inactive profile files contribute nothing.
+        assert_eq!(spring.properties["e"]["users.url"], "http://e-base");
+        // The active profile's context path flows through.
+        assert_eq!(
+            spring.properties["f"]["server.servlet.context-path"],
+            "/prod"
+        );
+    }
+
+    /// Contract M6g S5: with no active profile only base documents apply, and a read YAML
+    /// file setting a context path loses its `spring_config_unread` diagnostic.
+    #[test]
+    fn spring_yaml_without_an_active_profile_reads_base_documents_only() {
+        let res = "src/main/resources";
+        let files: Vec<(String, &str)> = vec![
+            (
+                format!("a/{res}/application.yml"),
+                "server:\n  servlet:\n    context-path: /base\nusers:\n  url: http://base\n---\nspring:\n  config:\n    activate:\n      on-profile: prod\nusers:\n  url: http://prod\nserver:\n  servlet:\n    context-path: /prod\n",
+            ),
+            (
+                format!("a/{res}/application-prod.properties"),
+                "users.url=http://file\n",
+            ),
+        ];
+        let config: BTreeMap<&str, String> = files
+            .iter()
+            .map(|(p, t)| (p.as_str(), (*t).to_owned()))
+            .collect();
+        let service_of = |p: &str| p.split('/').next().unwrap().to_owned();
+        let (spring, diagnostics) = spring_config(&config, &service_of);
+        assert_eq!(spring.properties["a"]["users.url"], "http://base");
+        assert_eq!(
+            spring.properties["a"]["server.servlet.context-path"],
+            "/base"
+        );
+        assert!(
+            diagnostics.iter().all(|d| d.kind != "spring_config_unread"),
+            "a read file's context path is applied, not counted unread"
+        );
     }
 
     /// Contract M4a amendment 12 (evaluator pass 2, Q3): Spring Boot's `classpath:/config/`
