@@ -723,6 +723,16 @@ fn csharp<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 source,
             );
             with_type_args(out, pushed, node.child_by_field_name("type"), source);
+            // Contract M6k pass 1: modifiers ride the binding so the pack can skip
+            // static properties (never injected), like Java fields.
+            if pushed {
+                let mut c = node.walk();
+                out.last_mut().expect("pushed").modifiers = node
+                    .children(&mut c)
+                    .filter(|n| n.kind() == "modifier")
+                    .map(|n| text(n, source))
+                    .collect();
+            }
             initialised(out, pushed, None, false);
         }
         "parameter" => {

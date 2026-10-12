@@ -1064,13 +1064,17 @@ pub fn dotnet_di(facts: &FileFacts) -> FileDi {
             }
         }
         // Contract M6k S5: `[Inject]`/`[FromServices]`/`[FromKeyedServices]`
-        // properties are member bindings and points; unmarked properties stay silent.
+        // properties are member bindings and points; unmarked and static
+        // properties stay silent (statics are never injected).
         let mut props: Vec<&Binding> = scopes
             .of(i)
             .iter()
             .copied()
             .filter(|b| {
-                b.member && !b.type_name.is_empty() && dotnet_property_point(&b.decorations)
+                b.member
+                    && !b.type_name.is_empty()
+                    && !b.modifiers.iter().any(|m| m == "static")
+                    && dotnet_property_point(&b.decorations)
             })
             .collect();
         props.sort_by_key(|b| b.span);
@@ -2523,6 +2527,20 @@ mod tests {
         assert_eq!(points(src), ["Shop.constructor svc: Service"]);
     }
 
+    /// Contract M6k pass 1: a same-named annotation from another package does not
+    /// exclude (the gate is import-gated, not name-gated).
+    #[test]
+    fn assisted_needs_its_import() {
+        let src = "package com.acme;\nimport com.google.inject.Inject;\nimport com.acme.Assisted;\nimport jakarta.inject.Singleton;\n@Singleton class Shop {\n  @Inject public Shop(Service svc, @Assisted Helper helped) {}\n}\n";
+        assert_eq!(
+            points(src),
+            [
+                "Shop.constructor svc: Service",
+                "Shop.constructor helped: Helper @Assisted"
+            ]
+        );
+    }
+
     /// Contract M6k S7: `bind(X).toProvider(P.class)` records the impl like `to`.
     #[test]
     fn guice_to_provider_records_impl() {
@@ -2665,10 +2683,10 @@ mod tests {
     }
 
     /// Contract M6k S5: `[Inject]`/`[FromServices]` properties are points;
-    /// unmarked properties stay silent.
+    /// unmarked and static properties stay silent.
     #[test]
     fn dotnet_property_points_need_markers() {
-        let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Consumer {\n[Inject] public Svc Marked { get; set; }\npublic Svc Plain { get; set; }\n}\n";
+        let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Consumer {\n[Inject] public Svc Marked { get; set; }\npublic Svc Plain { get; set; }\n[Inject] public static Svc Static { get; set; }\n}\n";
         assert_eq!(dotnet_points(src), ["Consumer.field Marked: Svc"]);
     }
 
