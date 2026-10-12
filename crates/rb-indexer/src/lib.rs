@@ -19,6 +19,7 @@ mod scip;
 mod sql;
 mod stitch;
 mod syntax;
+mod topics;
 
 pub use projects::{
     NoScipCache, ScipCache, ScipCacheEntry, ScipMode, ScipOptions, ScipProject, WriteOnlyScipCache,
@@ -945,6 +946,15 @@ pub fn assemble(
     for (path, text) in &content.mappers {
         diagnostics.extend(sql::add_mapper_queries(&mut b, path, text)?);
     }
+    // Message topics (contract M6g S2): publish/subscribe edges from topic literals.
+    diagnostics.extend(topics::add_topics(
+        &mut b,
+        &topics::Inputs {
+            files: &content.facts,
+            service_of: &service_of,
+            properties: &spring.properties,
+        },
+    )?);
     // Entry kinds and orphan eligibility (contract M4b S11, S12), after every edge producer.
     diagnostics.push(liveness::apply(
         &mut b,

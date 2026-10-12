@@ -74,22 +74,27 @@ fn annotation_topics(decoration: &Decoration) -> Option<(Vec<TopicName>, bool)> 
         .args
         .iter()
         .find(|a| a.key.as_deref() == Some(key))?;
+    // A `${…}` value is a property reference (the extractor marks it literal): always a
+    // placeholder, never a literal topic.
+    let classify = |value: &str| {
+        if is_placeholder(value) {
+            TopicName::Placeholder(value.to_owned())
+        } else {
+            TopicName::Literal(value.to_owned())
+        }
+    };
     let mut topics = Vec::new();
     let mut dynamic = false;
     if arg.items.is_empty() {
-        if arg.literal {
-            topics.push(TopicName::Literal(arg.value.clone()));
-        } else if is_placeholder(&arg.value) {
-            topics.push(TopicName::Placeholder(arg.value.clone()));
+        if arg.literal || is_placeholder(&arg.value) {
+            topics.push(classify(&arg.value));
         } else {
             dynamic = true;
         }
     } else {
         for item in &arg.items {
-            if item.literal {
-                topics.push(TopicName::Literal(item.value.clone()));
-            } else if is_placeholder(&item.value) {
-                topics.push(TopicName::Placeholder(item.value.clone()));
+            if item.literal || is_placeholder(&item.value) {
+                topics.push(classify(&item.value));
             } else {
                 dynamic = true;
             }

@@ -1,0 +1,22 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+# Local (this-machine) Conductor settings for the Repository Brain workspace.
+# Rust + Postgres/AGE project: toolchain pinned in rust-toolchain.toml, database via
+# compose.yaml (127.0.0.1:55432, RB_DB_PORT moves it), CLI at target/debug/rb.
+
+[scripts]
+setup = """
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+rustup toolchain install 1.98.1 --component clippy --component rustfmt --no-self-update
+docker compose up -d --wait
+cargo build
+target/debug/rb migrate
+"""
+archive = "target/debug/rb gc"
+run_mode = "concurrent"
+
+[scripts.run.serve]
+command = 'target/debug/rb serve --bind "127.0.0.1:$CONDUCTOR_PORT"'
+default = true
+icon = "server"
+available_in = ["local"]
