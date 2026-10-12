@@ -3746,6 +3746,79 @@ fn scip_java_gradle_catalog() {
     assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
 }
 
+/// Contract M6f S7: the contract-packs fixture. `openapi.yaml` (3 operations) and `svc.proto`
+/// (3 services... see fixture: Greeter + Users) become exact endpoints of the root service; the
+/// spec operations matching the committed `UsersApi` interface are handled by its declaration
+/// (`exact`) and `UserController` (`heuristic`); `POST /users` and the GRPC methods stay
+/// unhandled and counted. `OrderClient`'s operationId call and stub call stitch `synthetic`
+/// `CONSUMES` edges, as do the TypeScript client's; `UserMapper.xml` statements reach
+/// `public.users` exactly (the `<if>` statement is a counted diagnostic). Cached, fresh from an
+/// emptied per-repository cache and a second repository name dump identically.
+#[test]
+fn scip_contract_packs() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = rb_scip::docker_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "contract-packs";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scippacks_{}", std::process::id());
+    let other = format!("t_scippacks2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!("scip_contract_packs: first index {:.1?}", started.elapsed());
+    assert!(first.contains("scip-java ok") || first.contains("scip: . scip-java ok"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!("scip_contract_packs guard failures:\n{}", failures.join("\n"));
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-listusers.txt",
+        &rb(&url, &["callers", "UserController.listUsers", "--repo", &name]),
+    );
+    golden(
+        fixture,
+        "scip-path-getusers.txt",
+        &rb(&url, &["path", "GET /users", "--repo", &name]),
+    );
+    golden(
+        fixture,
+        "table-deps-users.txt",
+        &rb(&url, &["table-deps", "public.users", "--repo", &name]),
+    );
+    let package = "scip-java maven maven/acme/contract-packs 1.0.0 ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "src/", ".") >= 2,
+        "{dump}"
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("(cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(&url, &["index", path, "--repo", &name, "--force", "--no-cache"]);
+    assert!(!fresh.contains("(cached"), "{fresh}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 /// Contract M6a S11: the npm-workspaces fixture. The root's job is grouped (`workspace 2
 /// members`, fetched at the root from its lockfile, offline: every package is local) and indexes
 /// both members, so `packages/app`'s call into `packages/core` is exact through the workspace

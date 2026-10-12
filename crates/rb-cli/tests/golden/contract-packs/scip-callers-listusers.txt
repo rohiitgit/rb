@@ -1,0 +1,4 @@
+callers of acme/UserController#listUsers().  src/main/java/acme/UserController.java:9  [contract-packs]
+precision=cha
+  acme/OrderClient#names().  src/main/java/acme/OrderClient.java:10  [contract-packs]  dispatch, via dispatch
+certainty: dispatch 1

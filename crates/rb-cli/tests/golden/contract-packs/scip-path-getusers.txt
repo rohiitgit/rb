@@ -1,0 +1,10 @@
+Request path: GET /users  [contract-packs]
+precision=cha
+Statically possible paths from the call graph and HTTP stitching, not a trace of one request.
+UPSTREAM
+  client webapp/client.ts (top-level code)  [packs-web]  [synthetic]
+ENDPOINT  GET /users  [contract-packs]
+DOWNSTREAM
+  acme/UsersApi#listUsers().  src/main/java/acme/UsersApi.java:11  [contract-packs]  [exact]
+  acme/UserController#listUsers().  src/main/java/acme/UserController.java:9  [contract-packs]  [heuristic]
+certainty: exact 1, synthetic 1, heuristic 1

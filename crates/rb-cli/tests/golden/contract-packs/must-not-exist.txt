@@ -1,0 +1,7 @@
+# Anti-guards for the contract-packs fixture (contract M6f S7).
+# Closing bar (f): CONSUMES never reaches exact, through any pack.
+CONSUMES * -> * [exact]
+# S4b: implementors never reach exact (the declaration keeps it).
+HANDLED_BY HTTP GET /users @. -> scip-java maven maven/acme/contract-packs 1.0.0 acme/UserController#listUsers(). [exact]
+# S3: every endpoint here is stated (spec/proto), so no EXPOSES is heuristic.
+EXPOSES * -> * [heuristic]
