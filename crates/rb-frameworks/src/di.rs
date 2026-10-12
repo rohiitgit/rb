@@ -812,22 +812,25 @@ pub fn kotlin_di(facts: &FileFacts) -> FileDi {
             enclosing: chain.enclosing,
         });
     }
-    // Constructed types: the single non-`ref` bare call inside each bean container,
+    // Constructed types: the single non-DSL bare call inside each bean container,
     // attributed innermost-first (a nested bean's calls belong to it, not the outer).
     // `ref()` calls likewise; each bean numbers its own in span order.
     for (n, link) in links.iter().enumerate() {
+        // Chains inside a strictly smaller bean container belong to it, not here.
         let inner = |span: Span| {
-            !links
-                .iter()
-                .enumerate()
-                .any(|(m, o)| m != n && span_contains(o.container, span))
+            !links.iter().enumerate().any(|(m, o)| {
+                m != n
+                    && o.container != link.container
+                    && span_contains(link.container, o.container)
+                    && span_contains(o.container, span)
+            })
         };
         let mut found = facts
             .chains
             .iter()
             .filter(|c| {
                 c.root.is_none()
-                    && matches!(c.links.as_slice(), [l] if l.name != "ref")
+                    && matches!(c.links.as_slice(), [l] if !matches!(l.name.as_str(), "ref" | "bean" | "beans"))
                     && span_contains(link.container, c.span)
                     && inner(c.span)
             })
@@ -1091,11 +1094,20 @@ fn qualifier_argument(facts: &FileFacts, arg: &Arg) -> Option<String> {
 /// anything else in the middle, or an unresolvable qualifier, skips the pair (an
 /// unqualified point must not match a qualified binding).
 fn bind_chains(facts: &FileFacts, out: &mut FileDi) {
+    // Only Guice/Dagger files bind (a bare `bind().to()` elsewhere is another API).
+    if !framework_file(facts) {
+        return;
+    }
     for chain in &facts.chains {
         if chain.root.is_some() {
             continue;
         }
-        let (first, middle, last) = match chain.links.as_slice() {
+        // A trailing `.in(Scope.class)` scopes the binding; scopes stay unread.
+        let mut links = chain.links.as_slice();
+        while links.last().is_some_and(|l| l.name == "in") {
+            links = &links[..links.len() - 1];
+        }
+        let (first, middle, last) = match links {
             [first, middle @ .., last] if first.name == "bind" && last.name == "to" => {
                 (first, middle, last)
             }
@@ -2313,7 +2325,7 @@ mod tests {
     /// `bind().to()` links; the qualifier comes from `com.google.inject.name`.
     #[test]
     fn guice_singletons_provides_points_and_binds() {
-        let src = "package com.acme;\nimport com.google.inject.AbstractModule;\nimport com.google.inject.Inject;\nimport com.google.inject.Provides;\nimport com.google.inject.Singleton;\nimport com.google.inject.name.Named;\n@Singleton class Store {\n  private final Db db;\n  @Inject public Store(@Named(\"main\") Db db) { this.db = db; }\n}\nclass ShopModule extends AbstractModule {\n  @Override protected void configure() {\n    bind(Service.class).to(ServiceImpl.class);\n    bind(Names.class).annotatedWith(Names.named(\"a\")).to(A.class);\n  }\n  @Provides @Singleton Db provideDb() { return new Db(); }\n}\n";
+        let src = "package com.acme;\nimport com.google.inject.AbstractModule;\nimport com.google.inject.Inject;\nimport com.google.inject.Provides;\nimport com.google.inject.Singleton;\nimport com.google.inject.name.Named;\n@Singleton class Store {\n  private final Db db;\n  @Inject public Store(@Named(\"main\") Db db) { this.db = db; }\n}\nclass ShopModule extends AbstractModule {\n  @Override protected void configure() {\n    bind(Service.class).to(ServiceImpl.class);\n    bind(Names.class).annotatedWith(Names.named(\"a\")).to(A.class);\n    bind(Other.class).to(OtherImpl.class).in(Singleton.class);\n  }\n  @Provides @Singleton Db provideDb() { return new Db(); }\n}\n";
         assert_eq!(
             beans(src),
             [
@@ -2321,6 +2333,7 @@ mod tests {
                 "bean_method provideDb: Db [provideDb] new=Db",
                 "binds configure: Service [] new=ServiceImpl",
                 "binds configure: Names [] q=a new=A",
+                "binds configure: Other [] new=OtherImpl",
             ]
         );
         assert_eq!(points(src), ["Store.constructor db: Db q=main"]);
@@ -2566,6 +2579,49 @@ mod tests {
                 "appBeans.constructor #0:  q=Some(\"db\")",
             ]
         );
+    }
+
+    /// Contract M6j S5: nested `beans { }` attribute refs innermost-first.
+    #[test]
+    fn kotlin_nested_beans_attribute_innermost() {
+        let src = "package acme\nfun outer() = beans {\nbean(\"a\") { A(beans { bean(\"b\") { B(ref(\"x\")) } }) }\n}\n";
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let out = kotlin_di(&facts);
+        let beans: Vec<String> = out
+            .beans
+            .iter()
+            .map(|b| {
+                format!(
+                    "{} {}: {} [{}]",
+                    b.origin.as_str(),
+                    facts.definitions[b.definition].name,
+                    b.type_name,
+                    b.names.join(",")
+                )
+            })
+            .collect();
+        assert_eq!(beans, ["binds outer: A [a]", "binds outer: B [b]",]);
+        assert_eq!(out.points.len(), 1);
+        assert_eq!(out.points[0].qualifier.as_deref(), Some("x"));
+    }
+
+    /// Contract M6j S5: `bean()`/`ref()` calls outside any `beans { }` block stay unread.
+    #[test]
+    fn kotlin_stray_bean_calls_stay_unread() {
+        let src = "package acme\nfun f() {\nbean<X>()\nref()\n}\n";
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let out = kotlin_di(&facts);
+        assert!(out.beans.is_empty());
+        assert!(out.points.is_empty());
+    }
+
+    /// Contract M6j S2: `bind().to()` outside Guice/Dagger files binds nothing.
+    #[test]
+    fn bind_chains_need_framework_markers() {
+        let src = "package com.acme;\nclass M {\nvoid c() {\nbind(Service.class).to(ServiceImpl.class);\n}\n}\n";
+        let (facts, out) = file_di(src);
+        assert!(out.beans.is_empty());
+        let _ = facts;
     }
 
     /// Contract M6j S2 decoys: same-named annotations from other packages bind nothing;
