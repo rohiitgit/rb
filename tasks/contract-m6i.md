@@ -162,3 +162,15 @@ pins verified by `git ls-remote` (full SHAs): Kotlin/kotlinx.coroutines `113ee1f
 Sizes accepted per M5 precedent (parse-only `--no-scip` handled 1.7M lines; one repo at a time,
 remove + `VACUUM`). Baseline verify `var/m6i/logs/p0-baseline-*` running. DB holds only the 3
 pre-existing `fx_*` repos.
+
+2. **(phase 1) Grammars with definitions and references.** `tree-sitter-kotlin-ng =1.1.0`
+(ABI 14, `LANGUAGE` fn-pointer constant — no unsafe needed; the 0.3.x line binds tree-sitter
+0.20, whose `Language` is a different Rust type under the workspace's `unsafe-code = forbid`)
+and `tree-sitter-c-sharp =0.23.5` (ABI 15, loads under runtime 0.27 — proven by the green C1
+tests). Kotlin tags hand-written (interface/class/method/function anchoring with
+first-pattern-wins order; bare + member calls); C# stock tags plus an invocation supplement
+(stock `@reference.send` is unmapped). `Language::{Kotlin, CSharp}` wired end to end
+(`language_for_path` already mapped `kt`/`cs`); Tier-B-adjacent matches default to marked
+no-ops; `EXTRACTOR_VERSION` + pin test extended. Tests-first (2 C1 tests green after
+hand-count corrections); old languages byte-identical (102 syntax units). Mutants: pending
+phase-1 close battery.
