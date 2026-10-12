@@ -151,6 +151,15 @@ pub(crate) struct ServiceRef {
     pub name: String,
 }
 
+/// One gateway rewrite (contract M6g S3): calls under `prefix` reach `service`.
+/// Resolved at build: the target names exactly one service that exposes endpoints,
+/// else the rule is dropped (safe direction: the direct form stays).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayRewrite {
+    pub prefix: String,
+    pub service: String,
+}
+
 /// One edge a site gives.
 #[derive(Debug, Clone, PartialEq)]
 struct Link {
@@ -712,13 +721,15 @@ enum Scope<'s> {
 }
 
 /// The stitching context of a snapshot: endpoints, their index, and the services hosts name.
-struct Stitcher<'e> {
+pub(crate) struct Stitcher<'e> {
     /// Counted when scanned, so a scan per site is measured (amendment 13; R6).
     endpoints: Counted<'e, EndpointRef>,
     index: EndpointIndex,
     /// Host form (a service's name, lower-cased, or the last segment of its key) → service keys.
     hosts: HashMap<String, BTreeSet<&'e str>>,
     exposing: HashSet<&'e str>,
+    /// Gateway rewrites, longest prefix first (contract M6g S3).
+    rewrites: Vec<GatewayRewrite>,
 }
 
 impl<'e> Stitcher<'e> {
@@ -740,6 +751,77 @@ impl<'e> Stitcher<'e> {
             index: EndpointIndex::new(endpoints),
             hosts,
             exposing: endpoints.iter().map(|e| e.service.as_str()).collect(),
+            rewrites: Vec::new(),
+        }
+    }
+
+    fn with_rewrites(
+        endpoints: &'e [EndpointRef],
+        services: &'e [ServiceRef],
+        rewrites: Vec<GatewayRewrite>,
+    ) -> Self {
+        let mut this = Self::new(endpoints, services);
+        let mut rewrites: Vec<GatewayRewrite> = rewrites
+            .into_iter()
+            .filter(|r| this.exposing.contains(r.service.as_str()))
+            .collect();
+        // Longest prefix wins; ties keep repository order (stable sort).
+        rewrites.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
+        this.rewrites = rewrites;
+        this
+    }
+
+    /// Resolve raw `(prefix, target host)` rules to rewrites: the target names exactly one
+    /// service, else the rule is dropped. Pure function of the service list (tested).
+    pub(crate) fn resolve_rewrites(
+        rules: &[(String, String)],
+        services: &[ServiceRef],
+    ) -> Vec<GatewayRewrite> {
+        let mut hosts: HashMap<String, BTreeSet<&str>> = HashMap::new();
+        for s in services {
+            hosts
+                .entry(s.name.to_ascii_lowercase())
+                .or_default()
+                .insert(&s.key);
+            let last = s.key.rsplit('/').next().unwrap_or(&s.key);
+            hosts
+                .entry(last.to_ascii_lowercase())
+                .or_default()
+                .insert(&s.key);
+        }
+        rules
+            .iter()
+            .filter_map(
+                |(prefix, target)| match hosts.get(&target.to_ascii_lowercase()) {
+                    Some(keys) if keys.len() == 1 => Some(GatewayRewrite {
+                        prefix: prefix.clone(),
+                        service: keys.iter().next().unwrap().to_string(),
+                    }),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    /// The rewrite stripping this path, if any: longest prefix with a `/` boundary.
+    /// `None` when no rule matches (the direct form stays).
+    fn rewrite_for(&self, path: &str) -> Option<&GatewayRewrite> {
+        self.rewrites.iter().find(|r| {
+            let p = r.prefix.as_str();
+            path == p
+                || path.starts_with(p)
+                || (!p.ends_with('/') && path.starts_with(&format!("{p}/")))
+        })
+    }
+
+    /// The path after stripping the rewrite prefix (`/` when nothing remains).
+    fn stripped_path(path: &str, prefix: &str) -> String {
+        let rest = path.strip_prefix(prefix).unwrap_or(path);
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{rest}")
         }
     }
 
@@ -817,10 +899,41 @@ impl<'e> Stitcher<'e> {
                 };
             }
         }
-        let client = segments(&url.path);
+        let mut client = segments(&url.path);
         let has_hole = folded.pieces.contains(&Piece::Hole);
         if has_hole && !client.iter().any(|s| matches!(s, Segment::Lit(_))) {
             return Outcome::bucket(Bucket::Dynamic);
+        }
+        // Gateway rewrites (contract M6g S3): when the host does not already pin to an
+        // exposing service, a matching prefix strips and scopes to the target. A rewrite
+        // yielding no candidate is never applied (the direct form stays).
+        let mut via_gateway: Option<String> = None;
+        if !matches!(scope, Scope::Only(_))
+            && let Some(rw) = self.rewrite_for(&url.path)
+        {
+            let stripped = Self::stripped_path(&url.path, &rw.prefix);
+            let stripped_client = segments(&stripped);
+            let probe: Vec<(usize, PathMatch)> = self
+                .index
+                .candidates(&stripped_client, url.base_unknown)
+                .into_iter()
+                .filter(|(i, _)| {
+                    let e = &self.endpoints[*i];
+                    e.service == rw.service.as_str()
+                        && methods_match(site.method.as_deref().unwrap_or(ANY), &e.method)
+                        && (e.hosts.is_empty()
+                            || url.host.as_ref().is_some_and(|h| e.hosts.contains(h)))
+                })
+                .collect();
+            let probe: Vec<(usize, PathMatch)> = probe
+                .into_iter()
+                .filter(|(i, _)| self.index.segments[*i] != [Segment::Wild])
+                .collect();
+            if !probe.is_empty() {
+                client = stripped_client;
+                scope = Scope::Only(rw.service.as_str());
+                via_gateway = Some(rw.prefix.clone());
+            }
         }
         let method = site.method.as_deref().unwrap_or(ANY);
         // Candidates of every service the host allows, the caller's own included: they are
@@ -905,6 +1018,9 @@ impl<'e> Stitcher<'e> {
                 "host"
             };
             attrs.insert(key.into(), host.as_str().into());
+        }
+        if let Some(prefix) = via_gateway {
+            attrs.insert("via_gateway".into(), prefix.into());
         }
         // A host naming a service may be bound to other instances by discovery (W4).
         let rebound = site.discovery && !matches!(scope, Scope::Any);
@@ -1117,7 +1233,18 @@ pub(crate) fn add_consumes(
     endpoints: &[EndpointRef],
     services: &[ServiceRef],
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    let stitcher = Stitcher::new(endpoints, services);
+    add_consumes_with(b, sites, endpoints, services, &[])
+}
+
+/// Stitches every site with gateway rewrites (contract M6g S3).
+pub(crate) fn add_consumes_with(
+    b: &mut GraphBuilder,
+    sites: &[Site],
+    endpoints: &[EndpointRef],
+    services: &[ServiceRef],
+    rewrites: &[GatewayRewrite],
+) -> anyhow::Result<Vec<Diagnostic>> {
+    let stitcher = Stitcher::with_rewrites(endpoints, services, rewrites.to_vec());
     struct Merged {
         certainty: Certainty,
         attrs: Attrs,
@@ -1372,6 +1499,126 @@ mod tests {
             })
             .collect();
         (o.bucket, links)
+    }
+
+    /// `one` with gateway rewrites (contract M6g S3).
+    fn one_rewritten(
+        endpoints: &[EndpointRef],
+        rewrites: Vec<GatewayRewrite>,
+        s: &Site,
+    ) -> (Bucket, Vec<String>) {
+        let services = services();
+        let stitcher = Stitcher::with_rewrites(endpoints, &services, rewrites);
+        let o = stitcher.site(s);
+        let links = o
+            .links
+            .iter()
+            .map(|l| {
+                format!(
+                    "{} [{}] {}",
+                    endpoints[l.endpoint].key,
+                    l.certainty.as_str(),
+                    Value::Object(l.attrs.clone())
+                )
+            })
+            .collect();
+        (o.bucket, links)
+    }
+
+    /// Contract M6g S3: a gateway rewrite strips its prefix and scopes to the target,
+    /// disambiguating two services that expose the same path.
+    #[test]
+    fn gateway_rewrites_strip_prefix_and_scope_to_the_target() {
+        let eps = vec![
+            ep("POST", "/v1/login", AUTH),
+            ep("POST", "/v1/login", NOTIFICATION),
+        ];
+        let call = site(
+            WEB,
+            Some("POST"),
+            Some(("http://gateway/api/v1/login", Literal)),
+            1,
+        );
+        // Without the rewrite the full path matches nothing: no false edge.
+        assert_eq!(one(&eps, &call).0, Bucket::Unmatched);
+        // With `/api/` → auth the edge pins to auth and says so.
+        let rw = vec![GatewayRewrite {
+            prefix: "/api/".into(),
+            service: AUTH.into(),
+        }];
+        let (bucket, links) = one_rewritten(&eps, rw, &call);
+        assert_eq!(bucket, Bucket::Synthetic);
+        assert_eq!(links.len(), 1);
+        assert!(links[0].contains("@services/auth"), "{links:?}");
+        assert!(links[0].contains("via_gateway"), "{links:?}");
+    }
+
+    /// Contract M6g S3: resolving raw rules drops unknown and ambiguous targets, never edges.
+    #[test]
+    fn gateway_rewrite_resolution_drops_unknown_and_ambiguous_targets() {
+        let services = services();
+        let rules = vec![
+            ("/api/".to_owned(), "auth".to_owned()),
+            ("/nope/".to_owned(), "no-such-service".to_owned()),
+            ("/amb/".to_owned(), "billing".to_owned()),
+        ];
+        let resolved = Stitcher::resolve_rewrites(&rules, &services);
+        // `auth` names services/auth alone; the unknown names nothing. `billing` names
+        // services/billing/cmd/billing alone (name and last segment agree), so it resolves.
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().any(|r| r.prefix == "/api/"));
+        // A host naming several services never resolves: a second service whose key ends
+        // in `auth` makes `auth` ambiguous (0 rules), as does a shared name.
+        let mut dup = services.clone();
+        dup.push(ServiceRef {
+            key: "other/auth".into(),
+            name: "auth-clone".into(),
+        });
+        let dupe_rules = vec![("/a/".to_owned(), "auth".to_owned())];
+        assert!(Stitcher::resolve_rewrites(&dupe_rules, &dup).is_empty());
+        let both = vec![
+            ServiceRef {
+                key: "x".into(),
+                name: "same".into(),
+            },
+            ServiceRef {
+                key: "y".into(),
+                name: "same".into(),
+            },
+        ];
+        assert!(Stitcher::resolve_rewrites(&dupe_rules, &both).is_empty());
+    }
+
+    /// Contract M6g S3: a rewrite yielding no candidate is never applied (direct form stays),
+    /// and a rewrite to a service exposing nothing is dropped at build.
+    #[test]
+    fn gateway_rewrites_without_a_candidate_keep_the_direct_form() {
+        let eps = vec![ep("POST", "/direct/path", NOTIFICATION)];
+        let direct = site(WEB, Some("POST"), Some(("/direct/path", Literal)), 1);
+        let rw = vec![GatewayRewrite {
+            prefix: "/api/".into(),
+            service: AUTH.into(),
+        }];
+        // No prefix match: the direct edge lands with no rewrite mark.
+        let (bucket, links) = one_rewritten(&eps, rw.clone(), &direct);
+        assert_eq!(bucket, Bucket::Heuristic);
+        assert!(!links[0].contains("via_gateway"), "{links:?}");
+        // Prefix matches but nothing under it is exposed: direct form stays (unmatched here,
+        // never a false edge to auth).
+        let miss = site(WEB, Some("POST"), Some(("/api/nothing/here", Literal)), 1);
+        let (bucket, links) = one_rewritten(&eps, rw, &miss);
+        assert_eq!((bucket, links), (Bucket::Unmatched, vec![]));
+        // A rewrite to a silent service is dropped at build: longest-prefix order still holds.
+        let all = services();
+        let silent = Stitcher::with_rewrites(
+            &eps,
+            &all,
+            vec![GatewayRewrite {
+                prefix: "/s/".into(),
+                service: "services/orders".into(),
+            }],
+        );
+        assert!(silent.rewrites.is_empty());
     }
 
     /// The pathological input's bound: an order of magnitude above a measured local run.

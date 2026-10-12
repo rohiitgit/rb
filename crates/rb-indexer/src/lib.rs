@@ -262,6 +262,12 @@ pub fn index_commit(
         .filter(|f| f.path.ends_with(".xml") && !f.binary)
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
+    let gateways = manifest
+        .files
+        .iter()
+        .filter(|f| rb_frameworks::gateway::is_gateway_input(&f.path) && !f.binary)
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<_>>()?;
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
@@ -273,6 +279,7 @@ pub fn index_commit(
         manifests,
         specs,
         mappers,
+        gateways,
         words,
     };
 
@@ -353,6 +360,9 @@ pub struct Content<'a> {
     /// `*.xml` texts by path; MyBatis mappers read by root tag, everything else skipped
     /// (contract M6f S5).
     pub mappers: BTreeMap<&'a str, String>,
+    /// Gateway texts by path (`nginx.conf`, Spring Gateway `application*`/`bootstrap*` YAML;
+    /// contract M6g S3).
+    pub gateways: BTreeMap<&'a str, String>,
     /// Where the definitions' names occur in every non-binary file (contract M4b S12 (f)); the
     /// default is "not scanned", under which no symbol is orphan-eligible.
     pub words: liveness::Words,
@@ -927,7 +937,33 @@ pub fn assemble(
             name: p.name.clone(),
         })
         .collect();
-    diagnostics.extend(stitch::add_consumes(&mut b, &sites, &endpoints, &services)?);
+    // Gateway rewrites (contract M6g S3): nginx + Spring Gateway rules become prefix strips
+    // scoped to the target service. Unread blocks are counted per file, never edges.
+    let mut gateway_rules: Vec<(String, String)> = Vec::new();
+    for (path, text) in &content.gateways {
+        let file = if path.ends_with("nginx.conf") {
+            rb_frameworks::gateway::nginx_gateway(text)
+        } else {
+            rb_frameworks::gateway::spring_gateway(text)
+        };
+        gateway_rules.extend(file.rules.into_iter().map(|r| (r.prefix, r.target)));
+        if file.unread > 0 {
+            diagnostics.push(Diagnostic {
+                kind: "gateway_unread".into(),
+                path: Some((*path).to_owned()),
+                span: None,
+                detail: json!({ "unread": file.unread }),
+            });
+        }
+    }
+    let rewrites = stitch::Stitcher::resolve_rewrites(&gateway_rules, &services);
+    if rewrites.is_empty() {
+        diagnostics.extend(stitch::add_consumes(&mut b, &sites, &endpoints, &services)?);
+    } else {
+        diagnostics.extend(stitch::add_consumes_with(
+            &mut b, &sites, &endpoints, &services, &rewrites,
+        )?);
+    }
     let (orm_index, orm_diagnostics) = orm::add_mappings(&mut b, &files, &prisma, &keys)?;
     diagnostics.extend(orm_diagnostics);
     for (path, (language, facts)) in &content.facts {
