@@ -1,0 +1,4 @@
+# The C# sources are plain files: no build manifest, but they are a service.
+[[service]]
+path = "src"
+name = "shop"

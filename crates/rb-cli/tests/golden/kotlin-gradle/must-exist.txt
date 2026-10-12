@@ -1,0 +1,11 @@
+# Precision guards (contract M6i S4), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# Tier B: the member call, the typed-receiver call and the same-package call, all heuristic;
+# the constructor call references its class; the class and the method implement the interface.
+CALLS rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/Greeter#greet(). -> rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/shout(). [heuristic]
+CALLS rb-heuristic . . . `src/main/kotlin/acme/Main.kt`/main(). -> rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/Greeter#greet(). [heuristic]
+CALLS rb-heuristic . . . `src/main/kotlin/acme/Main.kt`/main(). -> rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/shout(). [heuristic]
+REFERENCES rb-heuristic . . . `src/main/kotlin/acme/Main.kt`/main(). -> rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/Greeter# [heuristic]
+IMPLEMENTS rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/Greeter# -> rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/GreeterApi# [heuristic]
+IMPLEMENTS rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/Greeter#greet(). -> rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/GreeterApi#greet(). [heuristic]

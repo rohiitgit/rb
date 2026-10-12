@@ -736,6 +736,115 @@ fn check_gates() {
     assert_eq!(code, 2, "{stderr}");
 }
 
+/// Contract M6i S4: language fixtures without injections. Determinism, the store round
+/// trip, the precision guards with the HTTP/M4b invariants, the file set, AGE parity and the
+/// `--no-scip` dump golden. Endpoints and topics get their own assertions in the tests that
+/// have them.
+fn check_language_fixture(fixture: &str, tag: &str) {
+    let Some(url) = db_url() else { return };
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let pid = std::process::id();
+    let (a, b) = (format!("t_{tag}_{pid}_a"), format!("t_{tag}_{pid}_b"));
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![a.clone(), b.clone()],
+    };
+
+    // Determinism: the same commit indexed into two repos, and rebuilt, dumps byte-identically.
+    rb(&url, &["index", path, "--repo", &a, "--no-scip"]);
+    rb(&url, &["index", path, "--repo", &b, "--no-scip"]);
+    let dump_a = rb(&url, &["dump", "--repo", &a]);
+    let dump_b = rb(&url, &["dump", "--repo", &b]);
+    assert_eq!(dump_a, dump_b, "same commit, different repos");
+
+    assert!(rb(&url, &["index", path, "--repo", &a, "--no-scip"]).contains("up to date"));
+    rb(&url, &["index", path, "--repo", &a, "--no-scip", "--force"]);
+    assert_eq!(rb(&url, &["dump", "--repo", &a]), dump_a, "forced rebuild");
+
+    // The stored snapshot is faithful to the in-memory pipeline output.
+    let indexed = rb_indexer::index_commit(
+        repo.path(),
+        "HEAD",
+        &mut rb_indexer::NoCache,
+        &rb_indexer::ScipOptions::disabled(),
+        &mut rb_indexer::NoScipCache,
+    )
+    .unwrap();
+    assert_eq!(
+        canonical_dump(&indexed.commit_sha, &indexed.graph, &indexed.diagnostics),
+        dump_a,
+        "store round trip"
+    );
+    let graph = &indexed.graph;
+
+    // The fixture's precision guards, and the HTTP/M4b invariants every dump keeps.
+    let mut failures = guard_failures(fixture, &dump_a);
+    failures.extend(http_invariant_failures(graph));
+    failures.extend(m4b_invariant_failures(graph));
+    assert!(
+        failures.is_empty(),
+        "precision guards and invariants of {fixture}:\n{}",
+        failures.join("\n")
+    );
+
+    // The fixture commit holds the tracked files and nothing else (amendment 40).
+    let mut files: Vec<String> = graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::File)
+        .map(|n| n.key.clone())
+        .collect();
+    files.sort();
+    let mut tracked = tracked_files(fixture);
+    tracked.sort();
+    assert_eq!(files, tracked, "the fixture repository's files");
+
+    // Invariant: every File has exactly one IN_SERVICE edge.
+    for f in graph.nodes().iter().filter(|n| n.kind == NodeKind::File) {
+        let memberships = graph
+            .edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::InService && e.src == f.id)
+            .count();
+        assert_eq!(
+            memberships, 1,
+            "{} has {memberships} IN_SERVICE edges",
+            f.key
+        );
+    }
+
+    // Contract M5 S6: the projection holds exactly the snapshot's vertices and edges.
+    let failures = age_parity_failures(&url, &a, graph);
+    assert!(failures.is_empty(), "AGE parity:\n{}", failures.join("\n"));
+
+    golden(fixture, "dump.jsonl", &dump_a);
+
+    // Cypher runs read-only: writes are rejected.
+    let out = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .args(["cypher", "CREATE (n:File {key: 'x'}) RETURN n", "--repo", &a])
+        .env("RB_DATABASE_URL", &url)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a CREATE through rb cypher must fail"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("read-only"));
+}
+
+/// Contract M6i S4: the kotlin-gradle fixture (Tier B calls across files, no SCIP yet).
+#[test]
+fn kotlin_gradle_tier_b() {
+    check_language_fixture("kotlin-gradle", "kt");
+}
+
+/// Contract M6i S4: the csharp fixture (Tier B calls across files, no SCIP by design).
+#[test]
+fn csharp_tier_b() {
+    check_language_fixture("csharp", "cs");
+}
+
 #[test]
 fn polyglot_monorepo() {
     check_fixture("polyglot-monorepo", "poly");
