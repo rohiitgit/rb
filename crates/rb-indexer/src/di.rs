@@ -603,9 +603,10 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
     out
 }
 
-/// NestJS resolution (contract M6j S3): a compact lane beside the Java engine. TypeScript
-/// has no scan roots, conditionals, Lombok, registrants or wrappers that matter here;
-/// points match beans by resolved type (tokens by qualifier-or-name), unique resolves
+/// NestJS and Kotlin-beans resolution (contract M6j S3/S5): a compact lane beside the
+/// Java engine. Neither TypeScript nor Kotlin has scan roots, conditionals, Lombok,
+/// registrants or wrappers that matter here;
+/// points match beans by resolved type (tokens by qualifier only, never auto-names),
 /// heuristic, several resolves ambiguous, nothing rises above heuristic. Buckets merge
 /// with the Java lane's under the same names.
 /// XML-declared points (contract M6j S4): mirrors the NestJS lane, except qualifiers
@@ -775,18 +776,29 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
     for b in BUCKETS {
         out.buckets.insert(b, 0);
     }
-    let ts: Vec<(&'a str, &'a FileFacts)> = inputs
+    let ts: Vec<(&'a str, Language, &'a FileFacts)> = inputs
         .files
         .iter()
-        .filter(|(_, (language, _))| matches!(language, Language::TypeScript | Language::Tsx))
-        .map(|(path, (_, facts))| (*path, *facts))
+        .filter(|(_, (language, _))| {
+            matches!(
+                language,
+                Language::TypeScript | Language::Tsx | Language::Kotlin
+            )
+        })
+        .map(|(path, (language, facts))| (*path, *language, *facts))
         .collect();
     if ts.is_empty() {
         return out;
     }
     let per_file: Vec<(&'a str, &'a FileFacts, FileDi)> = ts
         .iter()
-        .map(|(path, facts)| (*path, *facts, spring::nest_di(facts)))
+        .map(|(path, language, facts)| {
+            let di = match language {
+                Language::Kotlin => spring::kotlin_di(facts),
+                _ => spring::nest_di(facts),
+            };
+            (*path, *facts, di)
+        })
         .collect();
     struct NestBean<'x, 'y> {
         path: &'x str,

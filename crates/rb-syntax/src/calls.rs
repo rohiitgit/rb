@@ -197,6 +197,30 @@ fn is_inner_link(language: Language, syn: &Syntax, call: Node<'_>) -> bool {
     outer.is_some_and(|outer| split(language, syn, outer).0 == Some(call))
 }
 
+/// Call-site type arguments as written (contract M6j S5): Kotlin `type_arguments`
+/// decoded to their user-type texts; every other language reads none.
+fn call_type_args(language: Language, call: Node<'_>, source: &[u8]) -> Vec<String> {
+    if language != Language::Kotlin {
+        return Vec::new();
+    }
+    let mut c = call.walk();
+    call.named_children(&mut c)
+        .filter(|n| n.kind() == "type_arguments")
+        .flat_map(|a| {
+            let mut c = a.walk();
+            a.named_children(&mut c)
+                .filter(|n| n.kind() == "type_projection")
+                .filter_map(|p| {
+                    let mut c = p.walk();
+                    p.named_children(&mut c)
+                        .find(|n| n.kind() == "user_type")
+                        .map(|t| capped(text(t, source)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn chain<'t>(language: Language, syn: &Syntax, outer: Node<'t>, source: &[u8]) -> RawChain<'t> {
     let mut links = Vec::new();
     let mut root = None;
@@ -208,6 +232,7 @@ fn chain<'t>(language: Language, syn: &Syntax, outer: Node<'t>, source: &[u8]) -
             name: name.map(|n| text(n, source)).unwrap_or_default(),
             span: span(callee.unwrap_or(call)),
             args: arguments.map_or_else(Vec::new, |a| args(language, syn, a, source)),
+            type_args: call_type_args(language, call, source),
         });
         match receiver {
             Some(r) if r.kind() == syn.call => call = r,
@@ -372,6 +397,20 @@ fn summary(language: Language, syn: &Syntax, node: Node<'_>, source: &[u8], dept
             text,
             span: span(node),
         };
+    }
+    // Kotlin `value_argument` (possibly `name = value`): the value decodes, the key
+    // is dropped (contract M6j S5). Without this every Kotlin argument stays `Other`.
+    if node.kind() == "value_argument" {
+        let mut c = node.walk();
+        let mut kids = node.named_children(&mut c);
+        let (first, second) = (kids.next(), kids.next());
+        match (first, second) {
+            (Some(v), None) => return summary(language, syn, v, source, depth),
+            (Some(k), Some(v)) if k.kind() == "identifier" => {
+                return summary(language, syn, v, source, depth);
+            }
+            _ => return Arg::Other { span: span(node) },
+        }
     }
     if language == Language::Java && node.kind() == "object_creation_expression" && depth == 0 {
         let type_name = node
@@ -545,7 +584,7 @@ mod tests {
         let src = "fun f() {\nfoo(1)\na.bar(x)\na.baz(1).qux(2)\n}\n";
         assert_eq!(
             outline(Language::Kotlin, src),
-            ["foo(?)", "a.bar(?)", "a.baz(?).qux(?)"]
+            ["foo(?)", "a.bar(x)", "a.baz(?).qux(?)"]
         );
     }
 
@@ -615,6 +654,30 @@ mod tests {
             Arg::Type { text, .. } => format!("{text}.class"),
             Arg::Other { .. } => "?".into(),
         }
+    }
+
+    /// Contract M6j S5: Kotlin `bean` calls shape the beans DSL (of several
+    /// `bean` overloads this is the only one the pack reads).
+    #[test]
+    fn kotlin_bean_calls_carry_type_arguments() {
+        let src =
+            "fun beans() = beans {\nbean<ServiceImpl>()\nbean(\"store\") { Store(ref()) }\n}\n";
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let calls: Vec<(String, Vec<String>)> = facts
+            .chains
+            .iter()
+            .flat_map(|c| {
+                c.links
+                    .iter()
+                    .map(|l| (l.name.clone(), l.type_args.clone()))
+            })
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .any(|(n, t)| n == "bean" && *t == ["ServiceImpl".to_owned()])
+        );
+        assert!(calls.iter().any(|(n, t)| n == "beans" && t.is_empty()));
     }
 
     /// Contract M6j S2: Java class literals decode as types (Guice `bind().to()` shapes).

@@ -728,6 +728,165 @@ fn nest_constructor_points(facts: &FileFacts, class: usize, scopes: &Scopes<'_>,
     }
 }
 
+/// A span strictly inside another (row-major; equal spans never contain).
+fn span_contains(outer: Span, inner: Span) -> bool {
+    (outer[0], outer[1]) <= (inner[0], inner[1])
+        && (inner[2], inner[3]) <= (outer[2], outer[3])
+        && outer != inner
+}
+
+/// A template argument decoding to one literal, else `None`.
+fn template_literal(arg: &Arg) -> Option<String> {
+    match arg {
+        Arg::Template { template } => {
+            let mut text = String::new();
+            for part in &template.parts {
+                match part {
+                    TemplatePart::Lit { text: t } => text.push_str(t),
+                    TemplatePart::Hole { .. } => return None,
+                }
+            }
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+/// Kotlin `beans { }` registrations (contract M6j S5): `bean` calls inside a `beans`
+/// call span become `Binds` beans anchored at their enclosing definition (top-level
+/// `val` forms have none and stay unread); `ref()` calls inside a bean lambda become
+/// points (untyped; qualified only by a literal). Custom scopes and conditionals stay
+/// unread.
+pub fn kotlin_di(facts: &FileFacts) -> FileDi {
+    let mut out = FileDi::default();
+    let beans_roots: Vec<Span> = facts
+        .chains
+        .iter()
+        .filter(|c| c.root.is_none() && matches!(c.links.as_slice(), [l] if l.name == "beans"))
+        .map(|c| c.span)
+        .collect();
+    if beans_roots.is_empty() {
+        return out;
+    }
+    // Bean links with their spans: `bean` calls directly inside a `beans` block. A
+    // trailing lambda rides a second, nameless link; the chain span (the whole call)
+    // is the container its refs and constructed calls live in.
+    struct BeanLink {
+        container: Span,
+        type_args: Vec<String>,
+        args: Vec<Arg>,
+        enclosing: Option<usize>,
+    }
+    let mut links: Vec<BeanLink> = Vec::new();
+    for chain in &facts.chains {
+        if chain.root.is_some() {
+            continue;
+        }
+        let Some(first) = chain.links.first() else {
+            continue;
+        };
+        if first.name != "bean" {
+            continue;
+        }
+        if !beans_roots.iter().any(|r| span_contains(*r, chain.span)) {
+            continue;
+        }
+        links.push(BeanLink {
+            container: chain.span,
+            type_args: first.type_args.clone(),
+            args: first.args.clone(),
+            enclosing: chain.enclosing,
+        });
+    }
+    // Constructed types: the single non-`ref` bare call inside each bean container,
+    // attributed innermost-first (a nested bean's calls belong to it, not the outer).
+    // `ref()` calls likewise; each bean numbers its own in span order.
+    for (n, link) in links.iter().enumerate() {
+        let inner = |span: Span| {
+            !links
+                .iter()
+                .enumerate()
+                .any(|(m, o)| m != n && span_contains(o.container, span))
+        };
+        let mut found = facts
+            .chains
+            .iter()
+            .filter(|c| {
+                c.root.is_none()
+                    && matches!(c.links.as_slice(), [l] if l.name != "ref")
+                    && span_contains(link.container, c.span)
+                    && inner(c.span)
+            })
+            .map(|c| c.links[0].name.clone());
+        let constructed = match (found.next(), found.next()) {
+            (Some(t), None) => Some(t),
+            _ => None,
+        };
+        let type_name = link
+            .type_args
+            .first()
+            .cloned()
+            .or(constructed)
+            .unwrap_or_default();
+        if type_name.is_empty() {
+            continue;
+        }
+        let Some(enc) = link.enclosing else { continue };
+        let name = link
+            .args
+            .first()
+            .and_then(template_literal)
+            .unwrap_or_else(|| decapitalize(&type_name));
+        out.beans.push(Bean {
+            definition: enc,
+            origin: Origin::Binds,
+            type_name,
+            generic: false,
+            names: vec![name.clone()],
+            qualifiers: vec![name],
+            primary: false,
+            conditional: false,
+            annotations: Vec::new(),
+            created: Vec::new(),
+            extends: Vec::new(),
+        });
+        let mut refs: Vec<(Span, Option<String>)> = facts
+            .chains
+            .iter()
+            .filter(|c| {
+                c.root.is_none()
+                    && matches!(c.links.as_slice(), [l] if l.name == "ref")
+                    && span_contains(link.container, c.span)
+                    && inner(c.span)
+            })
+            .map(|c| {
+                let qualifier = c.links[0].args.first().and_then(template_literal);
+                (c.span, qualifier)
+            })
+            .collect();
+        refs.sort();
+        for (k, (span, qualifier)) in refs.into_iter().enumerate() {
+            out.points.push(InjectionPoint {
+                owner: enc,
+                owner_is_bean: false,
+                form: Form::Constructor,
+                name: format!("#{k}"),
+                type_name: String::new(),
+                element: String::new(),
+                wrapper: None,
+                generic: false,
+                type_args: Vec::new(),
+                qualifier,
+                copied_qualifier: false,
+                by_name: None,
+                annotations: Vec::new(),
+                span,
+            });
+        }
+    }
+    out
+}
+
 fn has_any(facts: &FileFacts, decorations: &[Decoration], packages: &[&str], name: &str) -> bool {
     decorations.iter().any(|d| is_any(facts, d, packages, name))
 }
@@ -842,19 +1001,7 @@ fn qualifier_argument(facts: &FileFacts, arg: &Arg) -> Option<String> {
     if link.name != "named" || link.args.len() != 1 {
         return None;
     }
-    match &link.args[0] {
-        Arg::Template { template } => {
-            let mut text = String::new();
-            for part in &template.parts {
-                match part {
-                    TemplatePart::Lit { text: t } => text.push_str(t),
-                    TemplatePart::Hole { .. } => return None,
-                }
-            }
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
-    }
+    template_literal(&link.args[0])
 }
 
 /// Guice `bind(X).to(Y)` pairs as `Binds` beans (contract M6j S2): rootless chains whose
@@ -2215,6 +2362,57 @@ mod tests {
         // The foreign `@Component` taints its class (gate D keeps working on TS).
         let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
         assert_eq!(nest_di(&facts).unread_classes.len(), 1);
+    }
+
+    /// Contract M6j S5: Kotlin `beans { }` registrations read as beans; `ref()`
+    /// calls read as points (untyped, qualifier only when a literal names one).
+    #[test]
+    fn kotlin_beans_dsl_registrations_and_refs() {
+        let src = "package acme\nimport org.springframework.fu.kofu.beans\nfun appBeans() = beans {\nbean<ServiceImpl>()\nbean(\"store\") { Store(ref()) }\nbean(\"cfg\", scope = SINGLETON) { Config(ref(\"db\")) }\n}\n";
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let out = kotlin_di(&facts);
+        let beans: Vec<String> = out
+            .beans
+            .iter()
+            .map(|b| {
+                format!(
+                    "{} {}: {} [{}]",
+                    b.origin.as_str(),
+                    facts.definitions[b.definition].name,
+                    b.type_name,
+                    b.names.join(",")
+                )
+            })
+            .collect();
+        assert_eq!(
+            beans,
+            [
+                "binds appBeans: ServiceImpl [serviceImpl]",
+                "binds appBeans: Store [store]",
+                "binds appBeans: Config [cfg]",
+            ]
+        );
+        let points: Vec<String> = out
+            .points
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}.{} {}: {} q={:?}",
+                    facts.definitions[p.owner].name,
+                    p.form.as_str(),
+                    p.name,
+                    p.element,
+                    p.qualifier
+                )
+            })
+            .collect();
+        assert_eq!(
+            points,
+            [
+                "appBeans.constructor #0:  q=None",
+                "appBeans.constructor #0:  q=Some(\"db\")",
+            ]
+        );
     }
 
     /// Contract M6j S2 decoys: same-named annotations from other packages bind nothing;

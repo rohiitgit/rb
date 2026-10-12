@@ -878,6 +878,13 @@ fn spring_xml_tier_b() {
     check_language_fixture("spring-xml", "springxml");
 }
 
+/// Contract M6j S4: the kotlin-beans fixture (`beans { }` registrations and `ref()`
+/// points, no SCIP and no Gradle build by design).
+#[test]
+fn kotlin_beans_tier_b() {
+    check_language_fixture("kotlin-beans", "kbeans");
+}
+
 /// Contract M6i S3: the kotlin-gradle fixture through scip-java. The Gradle Kotlin 2.2
 /// build indexes ok; every Tier B call has its exact twin with the same target; the dump is
 /// golden. Cached, fresh and second-name runs dump identically.

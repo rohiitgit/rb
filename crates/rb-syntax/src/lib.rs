@@ -312,6 +312,10 @@ pub struct CallLink {
     /// Span of the name (of the callee when there is no name).
     pub span: Span,
     pub args: Vec<Arg>,
+    /// Call-site type arguments as written (`bean<ServiceImpl>`; contract M6j S5).
+    /// Only Kotlin fills these; every other language leaves them empty.
+    #[serde(default)]
+    pub type_args: Vec<String>,
 }
 
 /// A summary of one call argument (contract M4a S1).

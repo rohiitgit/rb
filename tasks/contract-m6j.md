@@ -269,3 +269,18 @@ bites (incl. an eligible-arm false-no-bite that exposed the lane bypassing per-o
 checks — fixed by mirroring the full match). Residue: parent-bean merge, nested
 `<bean>`, `scope` modeling, `spring.factories`, unresolvable-id points (unresolved,
 counted).
+
+6. **(phase 5) Kotlin beans DSL.** `CallLink.type_args` carries Kotlin call-site type
+arguments (dump-safe: chains never dump); `value_argument` decodes (names and named
+args; existing Kotlin outlines get strictly more precise). Pack reads `bean` calls
+inside `beans` spans (structural gate, no import FQNs needed): type-arg, constructed
+callee (innermost-wins), or string name; top-level `val` forms without enclosing defs
+stay unread; `ref()` points untyped (qualifier only from literals). Beans anchor at
+their enclosing function as `Binds` (the configure-method precedent); the shared lane
+covers Kotlin with zero engine changes (empty elements land unresolved, verified).
+Fixture `kotlin-beans` (plain, no Gradle — spring-fu predates the 2.2.0 toolchain) with
+reviewed dump golden and 4/3 guards incl. qualifier attrs. Tests-first; 8/8 mutants
+killed (W1/W3 patterns fixed, W8 retargeted to the pack test that actually reads
+values); K1 fixture + K2 lane-cap bites. D4 amended: beans get a plain fixture.
+Residue: val-form top-level beans, nested-bean suppliers, `created` inference, ctor
+signature inference for `ref()`, conditional DSL.
