@@ -251,3 +251,21 @@ import-qualified Tier B hit, not the stdlib builder); `Profiles.cs:84/77` `FooSe
 `reverseMap.ForMember(...)` CALLS (3 candidates over the overloads); `ISourceToDestinationNameMapper`
 interface + methods defined. 0 false edges in samples; no exact edges involved (`--no-scip`
 legs — exactness is S3, proven by the fixture e2e). S5 holds.
+
+6. **(phase-5 follow-up) Kotlin wildcard imports resolve.** Pass-1 probing caught a precision
+miss the phase-2 units left open: `import com.acme.model.*` found its target files (modules
+level, tested) but names used through it never resolved — the wildcard arm of `imported()`
+was Java-only, so a star-imported `User` stayed unresolved (reproduced end-to-end on a
+scratch repo: 2 unresolved calls, 0 edges). Fix (test-first): the arm now reads
+`Language::Java | Language::Kotlin`, so Kotlin star imports resolve at the import level and
+imports (named and wildcard alike) precede the package — the non-Java order, which matches
+Kotlin's import-shadows-package rule. One-line code change + `kotlin_wildcard_imports_resolve`
+unit (star-imported class through an explicitly-typed binding; constructor `User()` stays a
+`References` per the Go precedent); the mutant (arm back to Java-only) fails the unit.
+Residue: constructor-call values stay untyped (`val u = User()` without `: User` leaves `u`
+untyped, pinned by the phase-2 bindings unit — Java-`var` precedent); nested-type access
+through a star import (`import a.Outer.*`) resolves top-level names only (no `java_type_path`
+fallback for Kotlin); extension-function receivers are not captured (`fun String.shout`
+lands as plain `shout` — probed, safe direction). Also fixed in passing: a `cargo fmt`
+violation phase 3 left in `e2e.rs:822` (formatting-only; no loop had run `fmt --check`
+since).

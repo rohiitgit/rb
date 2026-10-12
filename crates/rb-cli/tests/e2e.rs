@@ -822,7 +822,12 @@ fn check_language_fixture(fixture: &str, tag: &str) {
 
     // Cypher runs read-only: writes are rejected.
     let out = Command::new(env!("CARGO_BIN_EXE_rb"))
-        .args(["cypher", "CREATE (n:File {key: 'x'}) RETURN n", "--repo", &a])
+        .args([
+            "cypher",
+            "CREATE (n:File {key: 'x'}) RETURN n",
+            "--repo",
+            &a,
+        ])
         .env("RB_DATABASE_URL", &url)
         .output()
         .unwrap();

@@ -836,7 +836,9 @@ impl<'a> Index<'a> {
     }
 
     /// Definitions `name` refers to through the file's imports: single-name imports, or with
-    /// `on_demand` only Java wildcard (package or static) imports.
+    /// `on_demand` only Java wildcard (package or static) imports. Kotlin star imports ride the
+    /// wildcard arm at the import level, so for Kotlin imports (named and wildcard alike)
+    /// precede the package, the non-Java order.
     fn imported(
         &self,
         path: &'a str,
@@ -881,7 +883,7 @@ impl<'a> Index<'a> {
                         }
                     }
                 }
-                Language::Java if import.wildcard => out.extend(top(name)),
+                Language::Java | Language::Kotlin if import.wildcard => out.extend(top(name)),
                 Language::Go if import.alias.as_deref() == Some(".") => out.extend(top(name)),
                 // C# plain usings (`using A;`) import every name of the namespace, like Java
                 // on-demand imports — including namespace members, which are file-visible.
@@ -1514,6 +1516,32 @@ mod tests {
                 "Util:Acme/Greeter#Greet(). -> Util:Acme/IGreeter#Greet(). [heuristic]",
             ]
         );
+    }
+
+    /// Contract M6i S2 follow-up: Kotlin wildcard imports resolve names like Java's do
+    /// (a star-imported class used through an explicitly-typed binding).
+    #[test]
+    fn kotlin_wildcard_imports_resolve() {
+        let built = build(
+            &[
+                (
+                    "model/User.kt",
+                    KT,
+                    "package com.acme.model\nclass User {\nfun name(): String {\nreturn \"u\"\n}\n}\n",
+                ),
+                (
+                    "web/Ctl.kt",
+                    KT,
+                    "package com.acme.web\nimport com.acme.model.*\nclass Ctl {\nfun run(): String {\nval u: User = User()\nreturn u.name()\n}\n}\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            ["Ctl:Ctl#run(). -> User:User#name(). [heuristic]"]
+        );
+        assert_eq!(unresolved(&built), []);
     }
 
     #[test]
