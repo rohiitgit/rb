@@ -1,0 +1,2 @@
+  code: 0.0% of references to own code resolved (0 resolved, 0 ambiguous, 8 unresolved; 0 external); 3 exact calls (scip)
+  scip: . scip-java ok, definitions matched 6/6 (0 by name), definitions without occurrence 0, references matched 3, external 0, undocumented 0, local 0, unanchored 1, unmatched 0, unconverted 0, documents rejected 0, relationships dropped 0 (0 in project, 0 anonymous)

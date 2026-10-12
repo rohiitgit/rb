@@ -845,6 +845,82 @@ fn csharp_tier_b() {
     check_language_fixture("csharp", "cs");
 }
 
+/// Contract M6i S3: the kotlin-gradle fixture through scip-java. The Gradle Kotlin 2.2
+/// build indexes ok; every Tier B call has its exact twin with the same target; the dump is
+/// golden. Cached, fresh and second-name runs dump identically.
+#[test]
+fn scip_kotlin_gradle() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "kotlin-gradle";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipkt_{}", std::process::id());
+    let other = format!("t_scipkt2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name]);
+    eprintln!("scip_kotlin_gradle: first index {:.1?}", started.elapsed());
+    assert!(first.contains("scip: . scip-java ok"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    golden(fixture, "scip-dump.jsonl", &dump);
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    // Every Tier B call's exact twin names the same target (modulo the key scheme).
+    let pairs = |dump: &str| {
+        let mut out: Vec<(String, String)> = dump
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let row: serde_json::Value = serde_json::from_str(l).unwrap();
+                (row[0] == "E" && row[3] == "CALLS").then(|| {
+                    let short = |v: &serde_json::Value| {
+                        v.as_str()
+                            .unwrap_or_default()
+                            .rsplit("acme/")
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    (short(&row[2]), short(&row[5]))
+                })
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        pairs(&dump),
+        [
+            ("Greeter#greet().".to_owned(), "shout().".to_owned()),
+            ("main().".to_owned(), "Greeter#greet().".to_owned()),
+            ("main().".to_owned(), "shout().".to_owned()),
+        ]
+    );
+    golden(
+        fixture,
+        "scip-callers-greet.txt",
+        &rb(&url, &["callers", "Greeter.greet", "--repo", &name]),
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("(cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(!fresh.contains("(cached"), "{fresh}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 #[test]
 fn polyglot_monorepo() {
     check_fixture("polyglot-monorepo", "poly");
