@@ -949,7 +949,16 @@ Same rules as M6d:
 - [x] M6d Go and Python SCIP (scip-go image built locally, scip-python pinned by digest after measuring, fetch phases behind the proxy, Go/Python fixtures, the adversarial egress review).
 - [x] M6e Build and lockfile breadth (closed 2026-10-12, amendment 13; passes 1–2 PASS).
 - [x] **0. Preflight** (M6f). Done 2026-10-12 (amendment 1): baseline binary `var/m6f/base/rb-376dbcb` (HEAD code == `376dbcb`); pins grpc-go + OAI spec repo (ls-remote + API listings); tree-sitter-proto binds (node kinds confirmed, stream needs text check); shape checks; baseline verify green (fmt, clippy, 822 units, store 66, server 12, e2e 36/36, api 1/1).
-- [ ] M6f phases 1+ (OpenAPI reader, proto reader, spec endpoints, handler joining, MyBatis, generated clients, fixture, measurements, evaluator).
+- [x] **1. OpenAPI reader** (S1). Done (amendment 2): JSON + YAML shapes, basenames, growth; mutants.
+- [x] **2. Proto reader** (S2). Done (amendment 3): tree-sitter-proto services/RPCs/streams/spans; mutants; growth.
+- [x] **3. Spec endpoints in graph** (S3). Done (amendment 4): shared-key registrations, GRPC keys, diagnostics; mutants.
+- [x] **4. MyBatis mapper XML** (S5). Done (amendment 5): Element attrs/ends, statements→tables, dynamics counted; mutants.
+- [x] **5. Generated-client packs** (S6 packs). Done (amendment 6): operationId/RPC candidates + Endpoint.operations; mutants; growth.
+- [x] **6. Generated-call stitching** (S6 stitch). Done (amendment 7): operation/RPC matching, own-service rule, synthetic cap; mutants.
+- [x] **S4b. Interface handler roll-down** (S4). Done (amendment 8): interface_routes recorded, spec-matched roll-down via IMPLEMENTS; mutants.
+- [ ] **7. Fixture + guards** (S7). contract-packs fixture, e2e fns + goldens, per-class biting guards.
+- [ ] **8. Measurements** (S8). grpc-go + OAI spec repo; classified diffs + samples; deterministic.
+- [ ] **9. Records + evaluator.** S9–S11; pass 1 (full), fixes, pass 2 (verification-only).
 - [ ] M6g Topology and configuration packs (message topics, gateways, compose/k8s hosts, Spring YAML and active profiles).
 - [ ] M6h Architecture rules as a CI gate (`rb check` in Cypher).
 - [ ] M6i Kotlin and C# syntax.
