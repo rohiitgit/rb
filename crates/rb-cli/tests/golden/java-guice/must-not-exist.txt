@@ -5,3 +5,6 @@ INJECTS * -> * [exact]
 INJECTS rb-heuristic . . . `src/Consumer.java`/Consumer# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#provideCache(). [heuristic]
 INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/ServiceImpl.java`/ServiceImpl# [ambiguous]
 INJECTS rb-heuristic . . . `src/CacheConsumer.java`/CacheConsumer# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#configure(). [ambiguous]
+# Contract M6k S4: the `@Assisted` parameter never becomes a point.
+INJECTS rb-heuristic . . . `src/AssistedShop.java`/AssistedShop# -> rb-heuristic . . . `src/ServiceImpl.java`/ServiceImpl# [ambiguous]
+INJECTS rb-heuristic . . . `src/AssistedShop.java`/AssistedShop# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#configure(). [ambiguous]

@@ -11,3 +11,8 @@ INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/Ma
 INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#configure(). [ambiguous]
 CALLS rb-heuristic . . . `src/Consumer.java`/Consumer#run(). -> rb-heuristic . . . `src/Service.java`/Service#serve(). [heuristic]
 CALLS rb-heuristic . . . `src/Store.java`/Store#stock(). -> rb-heuristic . . . `src/MainDb.java`/MainDb#load(). [heuristic]
+# Contract M6k S7: `toProvider` records the implementation like `to`; the call reads.
+INJECTS rb-heuristic . . . `src/CacheUser.java`/CacheUser# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#configure(). [heuristic] {"origin":"binds"}
+CALLS rb-heuristic . . . `src/CacheUser.java`/CacheUser#fetch(). -> rb-heuristic . . . `src/Cache.java`/Cache#get(). [heuristic]
+# Contract M6k S4: only the non-assisted parameter wires (to the `@Provides` method).
+INJECTS rb-heuristic . . . `src/AssistedShop.java`/AssistedShop# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#provideCache(). [heuristic]
