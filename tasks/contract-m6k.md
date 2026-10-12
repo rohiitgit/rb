@@ -164,3 +164,10 @@ Unchanged rules. Fresh == cached, two names, forced rebuilds (e2e).
 ## Amendments
 
 (none yet)
+
+## Amendments
+
+1. **(phase 0) Baselines.** Baseline binary `var/m6k/base/rb-m6jclose` (release, sha256
+`eb2242be…`, no-op rebuild proves HEAD code == the M6j close tree: the contract commit
+adds no code). Re-measurement reuses M6j pins. Baseline verify
+`var/m6k/logs/p0-baseline-*` running. DB holds only the 3 pre-existing `fx_*` repos.
