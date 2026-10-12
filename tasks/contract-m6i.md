@@ -269,3 +269,8 @@ fallback for Kotlin); extension-function receivers are not captured (`fun String
 lands as plain `shout` — probed, safe direction). Also fixed in passing: a `cargo fmt`
 violation phase 3 left in `e2e.rs:822` (formatting-only; no loop had run `fmt --check`
 since).
+
+7. **(close) `PIPELINE m6i-1`.** First dump change was phase 2 (new Kotlin/C# facts); the bump
+lagged until close. Metadata-only (`tool_versions` in snapshot data, never the canonical
+dump): no golden pins the string (grep proves it), the `pipeline` e2e assert is
+self-consistent, and the close verify below re-proves the exact bumped tree.
