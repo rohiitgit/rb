@@ -1028,42 +1028,58 @@ struct SynthPoint<'a> {
     span: Span,
 }
 
+/// Class definitions by simple name, for Spring XML resolution (contract M6j S4/S10):
+/// Java and Kotlin classes once (C# would only collide). Built once per resolution so
+/// each bean resolves by lookup, not by scan.
+fn class_index<'a>(
+    files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
+) -> BTreeMap<&'a str, Vec<(&'a str, usize)>> {
+    let mut out: BTreeMap<&str, Vec<(&str, usize)>> = BTreeMap::new();
+    for (path, (language, facts)) in files {
+        // Spring XML wires JVM classes; C# never matches (its names would only collide).
+        if !matches!(language, Language::Java | Language::Kotlin) {
+            continue;
+        }
+        for (i, d) in facts.definitions.iter().enumerate() {
+            work::tick(1);
+            if d.kind == rb_syntax::DefKind::Class {
+                out.entry(d.name.as_str()).or_default().push((*path, i));
+            }
+        }
+    }
+    out
+}
+
 /// Class definitions matching `class`: fully qualified names match package + simple name
 /// (one package level is also stripped for nested classes); simple names match
 /// repo-wide. Zero or several matches give nothing (never guess).
 fn resolve_class<'a>(
     files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
+    index: &BTreeMap<&'a str, Vec<(&'a str, usize)>>,
     class: &str,
 ) -> Vec<(&'a str, usize)> {
     let (package, simple) = match class.rsplit_once('.') {
         Some((p, s)) => (Some(p), s),
         None => (None, class),
     };
-    let mut out = Vec::new();
-    for (path, (language, facts)) in files {
-        // Spring XML wires JVM classes; C# never matches (its names would only collide).
-        if !matches!(language, Language::Java | Language::Kotlin) {
-            continue;
-        }
-        let file_package = facts.package.as_deref().unwrap_or_default();
-        let package_ok = match package {
-            None => true,
-            Some(p) => {
-                file_package == p
-                    || p.rsplit_once('.')
-                        .is_some_and(|(outer, _)| outer == file_package)
+    index
+        .get(simple)
+        .into_iter()
+        .flatten()
+        .filter(|(path, _)| {
+            work::tick(1);
+            match package {
+                None => true,
+                Some(p) => {
+                    let file_package = files[path].1.package.as_deref().unwrap_or_default();
+                    file_package == p
+                        || p.rsplit_once('.')
+                            .is_some_and(|(outer, _)| outer == file_package)
+                }
             }
-        };
-        if !package_ok {
-            continue;
-        }
-        for (i, d) in facts.definitions.iter().enumerate() {
-            if d.kind == rb_syntax::DefKind::Class && d.name == simple {
-                out.push((*path, i));
-            }
-        }
-    }
-    out
+        })
+        .copied()
+        .collect()
 }
 
 /// Synthesizes beans and points from Spring beans documents (contract M6j S4): each
@@ -1082,13 +1098,14 @@ fn synthesize_xml_beans<'a>(
     let mut points: Vec<SynthPoint<'a>> = Vec::new();
     // Bean ids and aliases per service, for ref resolution.
     let mut by_id: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let classes = class_index(inputs.files);
     for (xml_path, doc) in docs {
         if is_test_path(xml_path) {
             continue;
         }
         let service = (inputs.service_of)(xml_path);
         for bean in &doc.beans {
-            let targets = resolve_class(inputs.files, &bean.class);
+            let targets = resolve_class(inputs.files, &classes, &bean.class);
             if targets.len() != 1 {
                 continue;
             }
@@ -3450,6 +3467,101 @@ mod tests {
     /// (counted operations, at most 5× for 4× the input).
     #[test]
     fn di_resolution_grows_linearly() {
+        let (small, large) = (work_for(100), work_for(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M6j S10: XML bean synthesis grows linearly in beans (counted
+    /// operations, at most 5× for 4× the input): classes resolve by index lookup.
+    #[test]
+    fn xml_beans_grow_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut java = String::from("package com.acme;\n");
+            let mut xml =
+                String::from("<beans xmlns=\"http://www.springframework.org/schema/beans\">\n");
+            for i in 0..n {
+                java += &format!("class C{i} {{}}\n");
+                if i == 0 {
+                    xml += &format!("  <bean id=\"b{i}\" class=\"com.acme.C{i}\"/>\n");
+                } else {
+                    xml += &format!(
+                        "  <bean id=\"b{i}\" class=\"com.acme.C{i}\">\n    <constructor-arg ref=\"b{j}\"/>\n  </bean>\n",
+                        j = i - 1,
+                    );
+                }
+            }
+            xml += "</beans>\n";
+            let (r, ops) = resolve_lang(
+                &[("src/C.java", Language::Java, &java)],
+                &[("app.xml", &xml)],
+            );
+            assert_eq!(r.injections.len(), n - 1);
+            ops
+        }
+        let (small, large) = (work_for(100), work_for(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Resolves mixed-language files with XML texts (contract M6j S10): returns the
+    /// resolution and the counted operations its `resolve` took.
+    fn resolve_lang(files: &[(&str, Language, &str)], xml: &[(&str, &str)]) -> (Resolution, u64) {
+        let facts: Vec<(String, Language, FileFacts)> = files
+            .iter()
+            .map(|(p, l, s)| {
+                (
+                    (*p).to_owned(),
+                    *l,
+                    rb_syntax::extract(*l, s.as_bytes()).unwrap(),
+                )
+            })
+            .collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
+            .iter()
+            .map(|(p, l, f)| (p.as_str(), (*l, f)))
+            .collect();
+        let keys: BTreeMap<&str, Vec<String>> = by_path
+            .iter()
+            .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+            .collect();
+        let go = BTreeMap::new();
+        let index = Index::new(&by_path, &go, &keys);
+        let service_of = |_: &str| ".".to_owned();
+        let empty = BTreeSet::new();
+        let depends = BTreeMap::new();
+        let raw = RawScan::default();
+        let xml_map: BTreeMap<&str, String> =
+            xml.iter().map(|(p, t)| (*p, (*t).to_owned())).collect();
+        work::take();
+        let r = resolve(&Inputs {
+            files: &by_path,
+            keys: &keys,
+            index: &index,
+            service_of: &service_of,
+            deployable: &empty,
+            depends: &depends,
+            unparsed: &raw,
+            manifests: &BTreeMap::new(),
+            xml: &xml_map,
+        });
+        (r, work::take())
+    }
+
+    /// Contract M6j S10: the managed lane (NestJS here) grows linearly in beans and
+    /// points (counted operations, at most 5× for 4× the input).
+    #[test]
+    fn managed_lane_grows_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut body = String::from("import { Injectable } from '@nestjs/common';\n");
+            for i in 0..n {
+                body += &format!(
+                    "@Injectable()\nexport class S{i} {{}}\n@Injectable()\nexport class C{i} {{\nconstructor(private s: S{i}) {{}}\n}}\n"
+                );
+            }
+            let (r, ops) = resolve_lang(&[("src/a.ts", Language::TypeScript, &body)], &[]);
+            assert_eq!(r.injections.len(), n);
+            ops
+        }
+        // Counted operations, not wall clock: take the delta around resolve.
         let (small, large) = (work_for(100), work_for(400));
         assert!(large <= small * 5, "{small} -> {large}");
     }

@@ -331,3 +331,10 @@ non-empty; one repo at a time + `VACUUM`):
   self-injection, jpetstore `@Autowired` fields, AutoMap `ReverseMap()` call.
   0 false edges in samples. Unresolved buckets sample clean (assisted factories,
   custom binding annotations, framework types — all recorded residue).
+
+9. **(S10 growth).** New walks counted: `bean_start` extracted shared (Java engine and
+managed lane resolve `Binds` identically); class resolution indexed once per resolve
+(replacing per-bean file scans after review); ticks on file scans, candidate loops and
+lanes; `managed_lane_grows_linearly` + `xml_beans_grow_linearly` ratio tests green
+(≤5× at 4×). No new unbounded walk anywhere (single-pass visitors, map lookups,
+visited-set machinery reused).
