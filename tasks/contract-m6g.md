@@ -151,6 +151,7 @@ No wall-clock/host-path/run-order in dumps (unchanged rules). Fresh == cached, t
 
 8. **(phase 6 close) Determinism + invariant 1.** Close verify `var/m6g/logs/p6-full-*` green: fmt, clippy `-D warnings`, 861 workspace units (0 failed), store 66/66, server 12/12, e2e 38/38 with containers, api 1/1 (150 parameter sets identical), no `skipping:`, no listener, stub scan clean (only the known `rb-sql` match). `git diff 781d32a f80714d` empty (the merge added nothing), and the direct base-vs-head spot check (`var/m6g/scripts/p6-invariant.sh`, release binaries, dumps asserted non-empty) is IDENTICAL everywhere: all 10 old fixtures `--no-scip` (0 added/removed rows each) plus SCIP mode for `polyglot-monorepo` (396 rows) and `ts-express-prisma` (71 rows). SCIP scope decision: `--no-scip` compared on all fixtures; SCIP compared where no dump golden pins the mode (the other SCIP fixtures' dump goldens passed e2e unchanged, which proves their equality). No fixture carries M6g inputs except `topo-packs` (new) and polyglot's `gateway/nginx.conf` (rewrite falls back: stripped `/v1/login` matches no endpoint, direct edge stays).
 
+
 9. **(phase 7) Public-repository measurements.** `--no-scip` base-vs-head dumps (release
 binaries, dumps asserted non-empty, one repo at a time + `VACUUM`, trees removed after):
 apache/kafka @ `f32956…` (625,213 rows, IDENTICAL — vacuous leg, proven correct: no
@@ -168,3 +169,26 @@ true): `template.send("annotated13", null, "")` → PUB; `@KafkaListener(topics 
 (PUB/SUB/SUB); `template.sendDefault(0, 0, "foo")` with variable default topic → dynamic (the
 P18 case in the wild). 0 false topics/rewrites/hosts in all samples. New pins verified by
 `git ls-remote` (full SHAs above).
+
+10. **(evaluator pass 1) VERDICT PASS with 6 fixes.** Adversarial battery P1–P33
+(`tasks/eval-m6g-pass1.md`): P9 path-bearing proxy/uri targets never read (a URI path replaces
+the prefix); P18 pattern/partitions/bindings listeners and `sendDefault` counted dynamic, never
+silent; P30 Rabbit exchange-first arities gated (2-arg `convertAndSend`, ≤2-arg `send`); P31
+contested prefixes (one prefix, several services) dropped, identical restatements deduped; P32
+SpEL/partial-template literals dynamic (3 false `SUBSCRIBES` caught on spring-kafka by sampling);
+P2 longest-prefix order asserted. All test-first; 10/10 mutants killed and reverted (two battery
+scripts needed a rerun: uncompilable mutants give no verdict). Measurements re-run post-fix:
+gateway unchanged, spring-kafka 111→107 SUBSCRIBES with 0 suspicious topics. Residue recorded:
+`@SendTo`, list-form `on-profile`, YAML anchors, comma `Path=` values.
+
+11. **(evaluator pass 2 + M6g close) VERDICT PASS.** Verification-only: every pass-1 repro
+re-run green on the final tree (P9/P18/P30/P31/P32/P2 units; spring-kafka 0 suspicious topics);
+10/10 pass-1 mutants cited killed (the only later change is a no-op clippy refactor plus tests,
+touching none of the mutated lines); close verify `var/m6g/logs/p6-close2-*` green — fmt, 866
+workspace units, store 66, server 12, e2e 38/38 with containers, api 1/1 (150 sets identical),
+no `skipping:`, no listener, stub scan clean (the loop's clippy step ran pre-fix and failed on
+`redundant_locals`; the fix is a committed no-op, re-proven `clippy -D warnings` clean on the
+final tree); invariant-1 spot check re-run on the final tree IDENTICAL; topo e2e unblessed green.
+**M6g closed.** `PIPELINE` `m6g-1`. Open items carried forward: `@SendTo` reply topics,
+list-form `on-profile`, YAML anchors, comma `Path=` values (all recorded residue); M6h–M6j as
+planned (M6h contract drafted at `tasks/contract-m6h.md`).

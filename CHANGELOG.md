@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-10-12] (wall clock) M6g CLOSED (evaluator passes 1–2)
+- Phases 0–2 (amendments 1–3): preflight (kafka + gateway pins, shape checks); topic packs (Kafka/Rabbit listeners + template sends, literals/placeholders/counted dynamics); topic graph (`Topic` + `PUBLISHES`/`SUBSCRIBES`, service-originated, placeholder resolution via Spring properties) — each test-first with killed mutants.
+- Phases 3–4 (amendments 4–5): gateway packs (nginx + Spring Gateway rewrites, longest-prefix, safe fallback, `via_gateway`) + host names (compose/k8s/`rb.toml` aliases, duplicates ambiguous) — each test-first with killed mutants.
+- Phase 5 (amendment 6): Spring YAML multi-doc profiles evaluated (bootstrap < yaml-base < properties < yaml-profile < profile files; `.properties` beats `.yml`); diagnostics/overrides stay conservative; context-paths + folding flow from merged values.
+- Phase 6 (amendment 7): topo-packs fixture + e2e (determinism, guards, AGE parity incl. topic labels, dump golden) + 11/4 guards each biting (8 mutant runs); `PIPELINE` `m6g-1`.
+- S9: counted ops for the config walk (4x→5x growth test); close verify + invariant 1 (amendment 8): 10 old fixtures `--no-scip` identical + polyglot/ts-express SCIP identical, 0 unclassified rows.
+- Phase 7 (amendment 9): kafka 625k identical (vacuous, proven); gateway +8 correct `gateway_unread`; spring-kafka +808 (116 topics, 60 PUB, 107 SUB, 0 false in samples).
+- Pass 1 (`tasks/eval-m6g-pass1.md`, amendment 10): VERDICT PASS with 6 fixes (P9 path-bearing targets, P18 unresolvable topics, P30 Rabbit arities, P31 contested prefixes, P32 SpEL literals, P2 order) + clippy follow-up; 10/10 mutants killed.
+- Pass 2 (`tasks/eval-m6g-pass2.md`, amendment 11): VERDICT PASS — repros re-run, mutants cited killed, close verify green (fmt, clippy `-D warnings` clean on the final tree, 866 units, store 66, server 12, e2e 38/38, api 1/1), invariant 1 re-derived identical.
+- Files: `crates/rb-frameworks/src/{topics,gateway,hosts}.rs`, `crates/rb-indexer/src/{topics,stitch,lib}.rs`, `crates/rb-git/src/boundaries.rs`, `crates/rb-model/src/lib.rs`, `crates/rb-cli/tests/e2e.rs`, `fixtures/topo-packs/`; records `tasks/{contract-m6g,eval-m6g-pass1,eval-m6g-pass2,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-12] (wall clock) M6f CLOSED (evaluator passes 1–2)
 - Phases 0–2 (amendments 1–3): preflight (grpc-go + OAI pins, proto binds); OpenAPI JSON/YAML reader; proto service reader — each test-first with killed mutants.
 - Phases 3–4 (amendments 4–5): spec endpoints under the shared key (GRPC keys, diagnostics) + handler join for free; MyBatis mapper XML to tables via rb-sql (Element attrs/ends).

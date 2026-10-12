@@ -20,10 +20,14 @@ M1–M10 as listed in `tasks/eval-m6g-pass1.md`: each fails its unit. (Result re
 
 ## Suite + invariant 1 + determinism
 
-Close verify `var/m6g/logs/p6-close2-*`: fmt, clippy, workspace units, store 66, server 12,
-e2e with containers, api. Invariant-1 spot check re-run on the final tree. topo e2e unblessed.
-(Result recorded at close.)
+Close verify `var/m6g/logs/p6-close2-*`: fmt ok; workspace units 866/866; store 66/66; server
+12/12; e2e 38/38 with containers; api 1/1 (150 sets identical); no `skipping:`; no listener;
+stub scan clean (only the known `rb-sql` match). The loop's clippy step failed on the pre-fix
+tree (`redundant_locals`, committed no-op fix, re-proven clean with the loop's exact flags on
+the final tree). Invariant-1 spot check re-run on the final tree: IDENTICAL everywhere.
+topo_packs e2e unblessed green on the final tree.
 
 ## Verdict
 
-PENDING (recorded at close).
+PASS. No blockers: every pass-1 repro holds, mutants cited killed, suite green, invariant 1 and
+determinism re-derived. **M6g closed.**
