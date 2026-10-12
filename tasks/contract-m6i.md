@@ -204,3 +204,13 @@ Int/Char/Unit + decimal/dynamic/nint/nuint/sbyte/uint/ulong/ushort). Framework p
 (routes/clients/ORM) stay out of M6i. Tests-first throughout; 12/12 mutants killed.
 Fixtures `kotlin-gradle` + `csharp` with reviewed dump goldens and 11/4 biting guards (7
 mutant runs, incl. implementation-preferred dispatch both languages).
+
+4. **(phase 3) Kotlin exact edges.** The fixture must build with the Kotlin version scip-java
+itself compiles against (2.2.0, read from its build file): 1.9.24 dies in compiler
+environment setup, 2.0.21/2.1.21 die in version-mixed FIR checking, all inside the project's
+own `compileKotlin` (Gradle detection + fetch worked throughout). With 2.2.0 the join needs
+zero new calibrations — 6/6 definitions matched, 0 documents rejected, 3 exact `CALLS` + 2
+exact `IMPLEMENTS` with the same targets Tier B found (asserted pair-wise in e2e).
+`scip_kotlin_gradle` e2e: status/callers/dump goldens (all reviewed), cached + fresh +
+second-name identical. The version-bite is proven thrice over (each wrong version fails the
+test); no join mutants apply (no join code changed).
