@@ -722,12 +722,7 @@ fn csharp<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 node,
                 source,
             );
-            with_type_args(
-                out,
-                pushed,
-                node.child_by_field_name("type"),
-                source,
-            );
+            with_type_args(out, pushed, node.child_by_field_name("type"), source);
             initialised(out, pushed, None, false);
         }
         "parameter" => {

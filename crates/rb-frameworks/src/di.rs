@@ -1037,9 +1037,8 @@ pub fn dotnet_di(facts: &FileFacts) -> FileDi {
             .collect();
         params.sort_by_key(|b| b.span);
         for b in params {
-            let mut p = point(facts, b, i, false, Form::Constructor);
             // Contract M6k S6: `[FromKeyedServices("k")]` qualifies the point.
-            if let Some(mut p) = p {
+            if let Some(mut p) = point(facts, b, i, false, Form::Constructor) {
                 if p.qualifier.is_none() {
                     p.qualifier = dotnet_key_qualifier(&b.decorations);
                 }
@@ -1076,13 +1075,12 @@ pub fn dotnet_di(facts: &FileFacts) -> FileDi {
             .collect();
         props.sort_by_key(|b| b.span);
         for b in props {
-            let mut p = point(facts, b, i, false, Form::Field);
-            if let Some(ref mut p) = p {
+            if let Some(mut p) = point(facts, b, i, false, Form::Field) {
                 if p.qualifier.is_none() {
                     p.qualifier = dotnet_key_qualifier(&b.decorations);
                 }
+                out.points.push(p);
             }
-            out.points.extend(p);
         }
     }
     out
@@ -1091,9 +1089,12 @@ pub fn dotnet_di(facts: &FileFacts) -> FileDi {
 /// A C# property injection marker (contract M6k S5): `[Inject]`, `[FromServices]`
 /// or `[FromKeyedServices]` by simple name (consumers often import nothing).
 fn dotnet_property_point(decorations: &[Decoration]) -> bool {
-    decorations
-        .iter()
-        .any(|d| matches!(simple(&d.name), "Inject" | "FromServices" | "FromKeyedServices"))
+    decorations.iter().any(|d| {
+        matches!(
+            simple(&d.name),
+            "Inject" | "FromServices" | "FromKeyedServices"
+        )
+    })
 }
 
 /// A `[FromKeyedServices("k")]` key literal (contract M6k S6): the first literal
@@ -1245,8 +1246,7 @@ fn bind_chains(facts: &FileFacts, out: &mut FileDi) {
         }
         let (first, middle, last) = match links {
             [first, middle @ .., last]
-                if first.name == "bind"
-                    && (last.name == "to" || last.name == "toProvider") =>
+                if first.name == "bind" && (last.name == "to" || last.name == "toProvider") =>
             {
                 (first, middle, last)
             }
@@ -2516,9 +2516,10 @@ mod tests {
     }
 
     /// Contract M6k S4: `@Assisted` params never become points (import-gated).
+    /// The assisted parameter is a non-scalar, so only the gate excludes it.
     #[test]
     fn assisted_params_never_become_points() {
-        let src = "package com.acme;\nimport com.google.inject.Inject;\nimport com.google.inject.assistedinject.Assisted;\nimport jakarta.inject.Singleton;\n@Singleton class Shop {\n  @Inject public Shop(Service svc, @Assisted String name) {}\n}\n";
+        let src = "package com.acme;\nimport com.google.inject.Inject;\nimport com.google.inject.assistedinject.Assisted;\nimport jakarta.inject.Singleton;\n@Singleton class Shop {\n  @Inject public Shop(Service svc, @Assisted Helper helped) {}\n}\n";
         assert_eq!(points(src), ["Shop.constructor svc: Service"]);
     }
 
@@ -2678,8 +2679,7 @@ mod tests {
         let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Startup {\npublic void ConfigureServices(object services) {\nservices.AddKeyedSingleton<IService, ServiceImpl>(\"main\");\nservices.AddKeyedSingleton<IService, OtherImpl>(\"other\");\n}\n}\npublic class Consumer {\npublic Consumer([FromKeyedServices(\"main\")] IService svc) {\n}\n}\n";
         let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
         let out = dotnet_di(&facts);
-        let keys: Vec<Vec<String>> =
-            out.beans.iter().map(|b| b.qualifiers.clone()).collect();
+        let keys: Vec<Vec<String>> = out.beans.iter().map(|b| b.qualifiers.clone()).collect();
         assert_eq!(keys, [vec!["main".to_owned()], vec!["other".to_owned()]]);
         assert_eq!(out.points.len(), 1);
         assert_eq!(out.points[0].qualifier.as_deref(), Some("main"));
@@ -2821,11 +2821,7 @@ mod tests {
         let src = "package acme\nval x = beans {\nbean<Y>()\nbean(\"s\") { Store(ref(\"db\")) }\n}\nfun f() = beans {\nbean<Z>()\n}\n";
         let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
         let out = kotlin_di(&facts);
-        let anchored: Vec<String> = out
-            .beans
-            .iter()
-            .map(|b| b.type_name.clone())
-            .collect();
+        let anchored: Vec<String> = out.beans.iter().map(|b| b.type_name.clone()).collect();
         assert_eq!(anchored, ["Z"]);
         assert_eq!(out.unanchored.len(), 2);
         assert_eq!(out.unanchored[0].type_name, "Y");

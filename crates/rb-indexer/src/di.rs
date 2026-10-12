@@ -656,8 +656,7 @@ fn resolve_lane_point<'a>(
         .definitions
         .get(p.owner)
         .is_some_and(|d| {
-            d.kind == DefKind::Class
-                && !beans.iter().any(|b| simple(&b.bean.type_name) == d.name)
+            d.kind == DefKind::Class && !beans.iter().any(|b| simple(&b.bean.type_name) == d.name)
         })
     {
         return;
@@ -679,7 +678,9 @@ fn resolve_lane_point<'a>(
     let mut candidates: Vec<usize> = Vec::new();
     let mut resolution = "unique";
     let types: Vec<Sym> = if p.qualifier.is_none() {
-        inputs.index.type_candidates(owner_path, Some(p.owner), &p.element)
+        inputs
+            .index
+            .type_candidates(owner_path, Some(p.owner), &p.element)
     } else {
         Vec::new()
     };
@@ -3641,6 +3642,32 @@ mod tests {
         );
     }
 
+    /// Contract M6k S1: ambiguous anchors skip (two same-named bound types bind
+    /// nothing, and their refs wire nowhere); missing anchors skip too. The `Db`
+    /// bean anchors (unique) but has no refs, so a correct skip yields no edges;
+    /// binding the ambiguous anchor would wire `Svc(ref("d"))` to it.
+    #[test]
+    fn ambiguous_and_missing_anchors_skip() {
+        let kt = "package acme\nval x = beans {\nbean(\"d\") { Db() }\nbean(\"s\") { Svc(ref(\"d\")) }\nbean(\"n\") { Nope() }\n}\n";
+        let (r, _) = resolve_lang(
+            &[
+                ("src/A.kt", Language::Kotlin, kt),
+                (
+                    "src/B.kt",
+                    Language::Kotlin,
+                    "package acme\nclass Db {\n}\nclass Svc {\n}\n",
+                ),
+                (
+                    "src/C.kt",
+                    Language::Kotlin,
+                    "package acme\nclass Svc {\n}\n",
+                ),
+            ],
+            &[],
+        );
+        assert!(r.injections.is_empty());
+    }
+
     /// Contract M6k S3: top-level `AddX` anchors at the bound type; a registered
     /// consumer's constructor wires to it.
     #[test]
@@ -3670,9 +3697,7 @@ mod tests {
         let keyed: Vec<&str> = r
             .injections
             .iter()
-            .filter(|e| {
-                e.attrs.get("qualifier").and_then(|v| v.as_str()) == Some("main")
-            })
+            .filter(|e| e.attrs.get("qualifier").and_then(|v| v.as_str()) == Some("main"))
             .map(|e| e.dst.as_str())
             .collect();
         // Both keyed registrations anchor at their enclosing method (the M6j .NET
@@ -3681,10 +3706,7 @@ mod tests {
         assert!(keyed[0].contains("ConfigureServices"), "{}", keyed[0]);
         // The unqualified property sees both keyed beans: one ambiguous pair.
         assert_eq!(r.injections.len(), 3);
-        assert_eq!(
-            r.buckets.get("ambiguous").copied().unwrap_or(0),
-            1
-        );
+        assert_eq!(r.buckets.get("ambiguous").copied().unwrap_or(0), 1);
     }
 
     /// Contract M6j S10: XML bean synthesis grows linearly in beans (counted
