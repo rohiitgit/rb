@@ -214,3 +214,40 @@ exact `IMPLEMENTS` with the same targets Tier B found (asserted pair-wise in e2e
 `scip_kotlin_gradle` e2e: status/callers/dump goldens (all reviewed), cached + fresh +
 second-name identical. The version-bite is proven thrice over (each wrong version fails the
 test); no join mutants apply (no join code changed).
+
+5. **(phase 5) Public measurement: coroutines + automapper classified and sampled.** Head binary
+`target/release/rb` (sha256 `9bfa7510…`, built 16:41, postdates the phase-3 commit `0b1dd40`;
+current HEAD is contract-only over it, so the binary is the current tree). The planned MEASURE2
+rerun (`var/m6i/scripts/p5-measure.sh`, `*2_` names) was superseded and never ran: both legs
+already ran on the post-rebuild binary (coroutines finished 16:41, automapper 16:47), and the
+head dumps prove phase-2 code (21k/20k resolved Tier B edges with candidate counts — a phase-1
+binary resolves none). Dumps: `var/m6i/measure/{coroutines,automapper}_{base,head}.jsonl`,
+`--no-scip`, both binaries, asserted non-empty.
+Coroutines @ `113ee1f3`: base 3,018 rows → head 33,509. Added 30,496: 8,162 N (every one a
+`.kt`/`.kts` symbol), 21,299 E (every row touches a Kotlin endpoint), 1,035 D (972 + 42
+`unresolved_references` for `.kt`/`.kts` files, 16 `syntax_error`, 3 updated java diagnostics,
+2 coverage updates). Removed 5 D only (the 3 superseded java diagnostics + 2 coverage rows) —
+zero removed N/E. Automapper @ `6e8697bc`: base 1,208 → head 31,445. Added 30,239: 9,245 N
+(all `.cs`), 20,490 E (all touch C#), 504 D (500 unresolved + 2 `syntax_error` + 2 coverage).
+Removed 2 coverage rows. Zero old-file changes on automapper.
+Java→Kotlin interop (classified, intended — Kotlin reuses Java packages, amendment 2):
+`RxJava2PlaysScrabble(.Opt).java` gain 7 edges to Kotlin (IMPLEMENTS + REFERENCES to
+`ShakespearePlaysScrabble`, CALLS to `IterableSpliterator#of`, `play()` IMPLEMENTS), all read
+in source at the pin (`abstract class` in Kotlin, `extends` in Java — IMPLEMENTS is the
+established extends/implements convention per scip.rs). Consequence: external 51→47, types
+2→1 on those files. `RunBlockingJavaTest.java` keeps 3 total unresolved with one
+re-categorized external→calls (3→2, 0→1): its `kotlinx.coroutines` import now resolves to an
+in-repo Kotlin file so `is_external` no longer fires, while the member itself stays unresolved
+— safe direction, no new edge, recorded precision residue (statically-imported top-level
+Kotlin fun shape).
+`syntax_error` rows (16 coroutines + 2 automapper) are partial definitions plus the diagnostic,
+never a panic (M1b C8); whole-file ranges (e.g. `Semaphore.kt` [0,0,395,0]) are grammar gaps
+recorded for their owner, not blockers (closing bar 4).
+Samples read in source at the pins, all correct: the Scrabble interop edges above;
+`NumbersBenchmark.kt:24` `flow` → `FlowPlaysScrabbleOpt.kt/flow()` (the file imports
+`benchmarks.flow.scrabble.flow`, a shadowing top-level `fun <T> flow` at line 184 — an
+import-qualified Tier B hit, not the stdlib builder); `Profiles.cs:84/77` `FooService` /
+`MutableService : ISomeService` + `Modify()` IMPLEMENTS; `MappingExpression.cs:13`
+`reverseMap.ForMember(...)` CALLS (3 candidates over the overloads); `ISourceToDestinationNameMapper`
+interface + methods defined. 0 false edges in samples; no exact edges involved (`--no-scip`
+legs — exactness is S3, proven by the fixture e2e). S5 holds.
