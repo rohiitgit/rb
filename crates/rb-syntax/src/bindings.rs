@@ -704,10 +704,32 @@ fn kotlin<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
     }
 }
 
-/// C# parameters, fields and locals. `var x = new Foo()` takes the construction type (the
+/// C# parameters, fields, properties and locals. `var x = new Foo()` takes the construction type (the
 /// Java `var` precedent); anything else without a written type stays untyped.
+/// Properties bind as members (contract M6k S5): their decorations ride the node.
 fn csharp<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
     match node.kind() {
+        "property_declaration" => {
+            let ty = node
+                .child_by_field_name("type")
+                .and_then(|t| type_name(t, source));
+            let pushed = push(
+                out,
+                node.child_by_field_name("name"),
+                ty,
+                true,
+                node,
+                node,
+                source,
+            );
+            with_type_args(
+                out,
+                pushed,
+                node.child_by_field_name("type"),
+                source,
+            );
+            initialised(out, pushed, None, false);
+        }
         "parameter" => {
             let pushed = push(
                 out,

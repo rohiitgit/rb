@@ -38,6 +38,8 @@ const LOMBOK: &str = "lombok";
 // with `jakarta.inject` points.
 const GUICE: &str = "com.google.inject";
 const GUICE_NAME: &str = "com.google.inject.name";
+// Contract M6k S4: assisted-inject params are factory inputs, never points.
+const ASSISTEDINJECT: &str = "com.google.inject.assistedinject";
 const DAGGER: &str = "dagger";
 // Contract M6j S3: NestJS decorators live in `@nestjs/common`.
 const NEST: &str = "@nestjs/common";
@@ -45,8 +47,9 @@ const NEST: &str = "@nestjs/common";
 // `Microsoft.Extensions.DependencyInjection`.
 const DOTNET_DI: &str = "Microsoft.Extensions.DependencyInjection";
 
-/// `IServiceCollection` registration calls (contract M6j S6): keyed variants stay
-/// unread (their keys are not modeled).
+/// `IServiceCollection` registration calls (contract M6j S6, keys in M6k S6):
+/// plain and `TryAdd*` forms plus their `Keyed` variants (the key literal rides
+/// qualifiers; non-literal keys skip).
 const SERVICE_REGISTRATIONS: &[&str] = &[
     "AddSingleton",
     "AddTransient",
@@ -54,6 +57,12 @@ const SERVICE_REGISTRATIONS: &[&str] = &[
     "TryAddSingleton",
     "TryAddTransient",
     "TryAddScoped",
+    "AddKeyedSingleton",
+    "AddKeyedTransient",
+    "AddKeyedScoped",
+    "TryAddKeyedSingleton",
+    "TryAddKeyedTransient",
+    "TryAddKeyedScoped",
 ];
 
 /// The class-level annotations that make a class a bean when it is component-scanned (S2),
@@ -947,15 +956,16 @@ pub fn kotlin_di(facts: &FileFacts) -> FileDi {
     out
 }
 
-/// Microsoft DI facts per file (contract M6j S6): `services.AddX<T>()` /
+/// Microsoft DI facts per file (contract M6j S6, M6k S1/S5/S6): `services.AddX<T>()` /
 /// `AddX<T, Impl>()` registrations as `Binds` beans anchored at their enclosing
-/// definition (top-level minimal-hosting statements have none and stay unread), and
-/// constructor parameters (non-member typed bindings scoped to a class) as points.
-/// Registrations need the namespace import (the language requires it); points do not
-/// (consumers often import nothing) — the lane resolves only points whose owner class
-/// is itself registered, so unregistered consumers stay silent. Lifetimes are not
-/// modeled (all lifetimes resolve identically here); factories, instances, `typeof`
-/// and keyed services stay unread.
+/// definition (top-level minimal-hosting statements have none and anchor at type),
+/// keyed variants qualified by their key literal, and constructor parameters (non-member
+/// typed bindings scoped to a class) plus `[Inject]`/`[FromServices]`/`[FromKeyedServices]`
+/// properties as points. Registrations need the namespace import (the language requires
+/// it); points do not (consumers often import nothing) — the lane resolves only points
+/// whose owner class is itself registered, so unregistered consumers stay silent.
+/// Lifetimes are not modeled (all lifetimes resolve identically here); factories,
+/// instances and `typeof` stay unread.
 pub fn dotnet_di(facts: &FileFacts) -> FileDi {
     let mut out = FileDi::default();
     if facts.imports.iter().any(|i| {
@@ -977,12 +987,23 @@ pub fn dotnet_di(facts: &FileFacts) -> FileDi {
                 [s, i] => (s.clone(), vec![i.clone()]),
                 _ => continue,
             };
+            // Contract M6k S6: keyed registrations qualify by their key literal
+            // (first string-literal value argument); non-literal keys skip.
+            let keyed = base.contains("Keyed");
+            let key: Vec<String> = if keyed {
+                match last.args.first().and_then(template_literal) {
+                    Some(k) => vec![k],
+                    None => continue,
+                }
+            } else {
+                Vec::new()
+            };
             let Some(enc) = chain.enclosing else {
                 // Contract M6k S1: top-level minimal-hosting statements have no
                 // enclosing definition — an unanchored record for engine-side anchoring.
                 out.unanchored.push(UnanchoredBean {
                     type_name: service,
-                    names: Vec::new(),
+                    names: key.clone(),
                     created,
                     refs: Vec::new(),
                 });
@@ -993,8 +1014,8 @@ pub fn dotnet_di(facts: &FileFacts) -> FileDi {
                 origin: Origin::Binds,
                 type_name: service,
                 generic: false,
-                names: Vec::new(),
-                qualifiers: Vec::new(),
+                names: key.clone(),
+                qualifiers: key,
                 primary: false,
                 conditional: false,
                 annotations: Vec::new(),
@@ -1016,11 +1037,73 @@ pub fn dotnet_di(facts: &FileFacts) -> FileDi {
             .collect();
         params.sort_by_key(|b| b.span);
         for b in params {
-            out.points
-                .extend(point(facts, b, i, false, Form::Constructor));
+            let mut p = point(facts, b, i, false, Form::Constructor);
+            // Contract M6k S6: `[FromKeyedServices("k")]` qualifies the point.
+            if let Some(mut p) = p {
+                if p.qualifier.is_none() {
+                    p.qualifier = dotnet_key_qualifier(&b.decorations);
+                }
+                out.points.push(p);
+            } else if dotnet_key_qualifier(&b.decorations).is_some() {
+                // A keyed scalar (e.g. `string` key param) still points by key.
+                out.points.push(InjectionPoint {
+                    owner: i,
+                    owner_is_bean: false,
+                    form: Form::Constructor,
+                    name: b.name.clone(),
+                    type_name: b.type_name.clone(),
+                    element: b.type_name.clone(),
+                    wrapper: None,
+                    generic: false,
+                    type_args: Vec::new(),
+                    qualifier: dotnet_key_qualifier(&b.decorations),
+                    copied_qualifier: false,
+                    by_name: None,
+                    annotations: Vec::new(),
+                    span: b.span,
+                });
+            }
+        }
+        // Contract M6k S5: `[Inject]`/`[FromServices]`/`[FromKeyedServices]`
+        // properties are member bindings and points; unmarked properties stay silent.
+        let mut props: Vec<&Binding> = scopes
+            .of(i)
+            .iter()
+            .copied()
+            .filter(|b| {
+                b.member && !b.type_name.is_empty() && dotnet_property_point(&b.decorations)
+            })
+            .collect();
+        props.sort_by_key(|b| b.span);
+        for b in props {
+            let mut p = point(facts, b, i, false, Form::Field);
+            if let Some(ref mut p) = p {
+                if p.qualifier.is_none() {
+                    p.qualifier = dotnet_key_qualifier(&b.decorations);
+                }
+            }
+            out.points.extend(p);
         }
     }
     out
+}
+
+/// A C# property injection marker (contract M6k S5): `[Inject]`, `[FromServices]`
+/// or `[FromKeyedServices]` by simple name (consumers often import nothing).
+fn dotnet_property_point(decorations: &[Decoration]) -> bool {
+    decorations
+        .iter()
+        .any(|d| matches!(simple(&d.name), "Inject" | "FromServices" | "FromKeyedServices"))
+}
+
+/// A `[FromKeyedServices("k")]` key literal (contract M6k S6): the first literal
+/// argument, else `None`.
+fn dotnet_key_qualifier(decorations: &[Decoration]) -> Option<String> {
+    decorations
+        .iter()
+        .find(|d| simple(&d.name) == "FromKeyedServices")
+        .and_then(|d| d.args.iter().find(|a| a.literal && !a.value.is_empty()))
+        .map(|a| a.value.clone())
 }
 
 fn has_any(facts: &FileFacts, decorations: &[Decoration], packages: &[&str], name: &str) -> bool {
@@ -1161,7 +1244,10 @@ fn bind_chains(facts: &FileFacts, out: &mut FileDi) {
             links = &links[..links.len() - 1];
         }
         let (first, middle, last) = match links {
-            [first, middle @ .., last] if first.name == "bind" && last.name == "to" => {
+            [first, middle @ .., last]
+                if first.name == "bind"
+                    && (last.name == "to" || last.name == "toProvider") =>
+            {
                 (first, middle, last)
             }
             _ => continue,
@@ -1479,6 +1565,10 @@ fn point(
     form: Form,
 ) -> Option<InjectionPoint> {
     if has(facts, &b.decorations, BEANS_ANNOTATION, "Value") {
+        return None;
+    }
+    // Contract M6k S4: `@Assisted` params are factory inputs, never injection points.
+    if has(facts, &b.decorations, ASSISTEDINJECT, "Assisted") {
         return None;
     }
     let (wrapper, element, generic) = unwrap(facts, b)?;
@@ -2425,6 +2515,23 @@ mod tests {
         assert_eq!(points(src), ["Store.field db: Db", "Store.setter db: Db"]);
     }
 
+    /// Contract M6k S4: `@Assisted` params never become points (import-gated).
+    #[test]
+    fn assisted_params_never_become_points() {
+        let src = "package com.acme;\nimport com.google.inject.Inject;\nimport com.google.inject.assistedinject.Assisted;\nimport jakarta.inject.Singleton;\n@Singleton class Shop {\n  @Inject public Shop(Service svc, @Assisted String name) {}\n}\n";
+        assert_eq!(points(src), ["Shop.constructor svc: Service"]);
+    }
+
+    /// Contract M6k S7: `bind(X).toProvider(P.class)` records the impl like `to`.
+    #[test]
+    fn guice_to_provider_records_impl() {
+        let src = "package com.acme;\nimport com.google.inject.AbstractModule;\nclass ShopModule extends AbstractModule {\n  @Override protected void configure() {\n    bind(Service.class).toProvider(ServiceProvider.class);\n  }\n}\n";
+        assert_eq!(
+            beans(src),
+            ["binds configure: Service [] new=ServiceProvider"]
+        );
+    }
+
     /// `origin name: type [names]` per .NET bean.
     fn dotnet_beans(src: &str) -> Vec<String> {
         let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
@@ -2554,6 +2661,33 @@ mod tests {
         assert_eq!(out.unanchored.len(), 1);
         assert_eq!(out.unanchored[0].type_name, "IService");
         assert_eq!(out.unanchored[0].created, ["ServiceImpl"]);
+    }
+
+    /// Contract M6k S5: `[Inject]`/`[FromServices]` properties are points;
+    /// unmarked properties stay silent.
+    #[test]
+    fn dotnet_property_points_need_markers() {
+        let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Consumer {\n[Inject] public Svc Marked { get; set; }\npublic Svc Plain { get; set; }\n}\n";
+        assert_eq!(dotnet_points(src), ["Consumer.field Marked: Svc"]);
+    }
+
+    /// Contract M6k S6: keyed registrations qualify by key literal; non-literal
+    /// keys skip; `[FromKeyedServices]` qualifies the point.
+    #[test]
+    fn dotnet_keyed_registrations_match_by_key() {
+        let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Startup {\npublic void ConfigureServices(object services) {\nservices.AddKeyedSingleton<IService, ServiceImpl>(\"main\");\nservices.AddKeyedSingleton<IService, OtherImpl>(\"other\");\n}\n}\npublic class Consumer {\npublic Consumer([FromKeyedServices(\"main\")] IService svc) {\n}\n}\n";
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let out = dotnet_di(&facts);
+        let keys: Vec<Vec<String>> =
+            out.beans.iter().map(|b| b.qualifiers.clone()).collect();
+        assert_eq!(keys, [vec!["main".to_owned()], vec!["other".to_owned()]]);
+        assert_eq!(out.points.len(), 1);
+        assert_eq!(out.points[0].qualifier.as_deref(), Some("main"));
+        let dynamic = "using Microsoft.Extensions.DependencyInjection;\npublic class Startup {\npublic void ConfigureServices(object services) {\nservices.AddKeyedSingleton<IService, ServiceImpl>(key);\n}\n}\n";
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let _ = facts;
+        let dyn_facts = extract(Language::CSharp, dynamic.as_bytes()).unwrap();
+        assert!(dotnet_di(&dyn_facts).beans.is_empty());
     }
 
     /// Contract M6j S3: NestJS injectables, controllers, constructor points and token

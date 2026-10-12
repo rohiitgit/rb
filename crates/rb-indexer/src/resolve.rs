@@ -337,11 +337,17 @@ fn package_key<'a>(
         Language::Kotlin => Some(("", package)),
         Language::Go => Some((dir(path), package)),
         // C# namespaces: the file's top-level module definition, when it has one.
-        Language::CSharp => facts
-            .definitions
-            .iter()
-            .find(|d| d.kind == DefKind::Module && d.parent.is_none())
-            .map(|d| ("", d.name.as_str())),
+        // Contract M6k S3: files without one share the global namespace key —
+        // global-namespace types are visible across files with no import (minimal
+        // hosting's Program.cs leg). Namespaced files keep their own key.
+        Language::CSharp => Some(
+            facts
+                .definitions
+                .iter()
+                .find(|d| d.kind == DefKind::Module && d.parent.is_none())
+                .map(|d| ("", d.name.as_str()))
+                .unwrap_or(("", "")),
+        ),
         _ => None,
     }
 }

@@ -3641,6 +3641,52 @@ mod tests {
         );
     }
 
+    /// Contract M6k S3: top-level `AddX` anchors at the bound type; a registered
+    /// consumer's constructor wires to it.
+    #[test]
+    fn unanchored_dotnet_registrations_resolve() {
+        let prog = "using Microsoft.Extensions.DependencyInjection;\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddSingleton<IService, ServiceImpl>();\n";
+        let lib = "using Microsoft.Extensions.DependencyInjection;\npublic interface IService {}\npublic class ServiceImpl : IService {}\npublic class Startup {\npublic void ConfigureServices(object s) {\ns.AddSingleton<Consumer>();\n}\npublic class Consumer {\npublic Consumer(IService svc) {}\n}\n}\n";
+        let (r, _) = resolve_lang(
+            &[
+                ("src/Program.cs", Language::CSharp, prog),
+                ("src/Lib.cs", Language::CSharp, lib),
+            ],
+            &[],
+        );
+        assert_eq!(r.injections.len(), 1);
+        let e = &r.injections[0];
+        assert!(e.src.contains("Consumer#"), "{}", e.src);
+        // The anchor binds the bound type's definition (contract M6k S1).
+        assert!(e.dst.contains("IService#"), "{}", e.dst);
+    }
+
+    /// Contract M6k S5+S6: a marked property points, and a keyed point matches the
+    /// keyed registration.
+    #[test]
+    fn dotnet_property_and_keyed_points_resolve() {
+        let src = "using Microsoft.Extensions.DependencyInjection;\npublic interface IService {}\npublic class ServiceImpl : IService {}\npublic class OtherImpl : IService {}\npublic class Startup {\npublic void ConfigureServices(object s) {\ns.AddKeyedSingleton<IService, ServiceImpl>(\"main\");\ns.AddKeyedSingleton<IService, OtherImpl>(\"other\");\ns.AddSingleton<Consumer>();\n}\npublic class Consumer {\n[Inject] public IService Prop { get; set; }\npublic Consumer([FromKeyedServices(\"main\")] IService svc) {}\n}\n}\n";
+        let (r, _) = resolve_lang(&[("src/Lib.cs", Language::CSharp, src)], &[]);
+        let keyed: Vec<&str> = r
+            .injections
+            .iter()
+            .filter(|e| {
+                e.attrs.get("qualifier").and_then(|v| v.as_str()) == Some("main")
+            })
+            .map(|e| e.dst.as_str())
+            .collect();
+        // Both keyed registrations anchor at their enclosing method (the M6j .NET
+        // semantic); the key disambiguates to the `main` registration site.
+        assert_eq!(keyed.len(), 1);
+        assert!(keyed[0].contains("ConfigureServices"), "{}", keyed[0]);
+        // The unqualified property sees both keyed beans: one ambiguous pair.
+        assert_eq!(r.injections.len(), 3);
+        assert_eq!(
+            r.buckets.get("ambiguous").copied().unwrap_or(0),
+            1
+        );
+    }
+
     /// Contract M6j S10: XML bean synthesis grows linearly in beans (counted
     /// operations, at most 5× for 4× the input): classes resolve by index lookup.
     #[test]
