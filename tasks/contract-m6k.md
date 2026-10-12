@@ -173,3 +173,46 @@ adds no code). Re-measurement reuses M6j pins. Baseline verify
 `var/m6k/logs/p0-baseline-*` green (fmt, clippy `-D warnings`, 914 units, store 72,
 server 12, e2e 47/47, api 1/1, no skips, no listener, stub scan clean). DB holds only
 the 3 pre-existing `fx_*` repos.
+
+2. **(phase 1) Anchor at type (S1).** `FileDi::unanchored` (Default, non-breaking) +
+shared `resolve_lane_point` + two-phase anchor/link in `resolve_nest` (unique-or-skip,
+XML-bean precedent). Commit `d5b3db8`. Note: the phase arrived with a broken
+`xml_beans_grow_linearly` header (insertion ate the doc + `fn` lines); repaired and
+proven by the suite. Lesson re-learned: never parallelize two edits to the same file
+(the C# `Aux` rename was lost the same way later and re-applied sequentially).
+
+3. **(phase 2) Packs (S4–S6).** Import-gated `@Assisted` exclusion in `point()`;
+`toProvider` beside `to` in `bind_chains`; C# `property_declaration` bindings +
+`[Inject]`/`[FromServices]`/`[FromKeyedServices]` property points; keyed
+registrations (key literal rides qualifiers, non-literal skips) +
+`[FromKeyedServices]` point qualifiers; C# `argument`-wrapper unwrap in `summary()`
+(identifier args now read as names, `this.Bar(x)`-shaped — the `csharp_calls_chain`
+expectation updated, strictly more precise); global-namespace package key
+(`("","")`) so namespace-less files resolve each other (minimal hosting's
+Program.cs leg; namespaced files keep their keys). Indexer proofs for val-form,
+top-level .NET, property+keyed wiring. Commit `7f00c81`.
+
+4. **(phase 3) Fixtures + guards (S7).** `ValBeans.kt` (self-contained val form;
+deliberately fresh type/method names — reusing `load`/`stock` tripped the
+pre-existing orphan mention rule on existing nodes, so the fixture keeps the dump
+diff purely additive); `Keyed.cs` (keyed pair + registered consumer with marked
+and unmarked properties) + `Mini.cs` (top-level minimal hosting, global
+namespace); Guice `Cache`/`CacheProvider`/`CacheUser`/`AssistedShop` + `toProvider`
+line. Goldens re-blessed and reviewed row-by-row (all added rows classified;
+removed rows are coverage updates, ShopModule line-shifts, blobs). Every new
+guard bites by perturbation and the tree is restored byte-identical and green
+after each. Commit `3ac29c3`.
+
+5. **(phase 4) Units, mutants, PIPELINE.** Ambiguous/missing-anchor-skip unit.
+Manual mutant battery, 7/7 kills (two test repairs: assisted param must be
+non-scalar to discriminate the gate; the ambiguous-anchor ref must resolve when
+bound, else the mutant is vacuous). `PIPELINE m6k-1` (`lib.rs`). fmt + clippy
+`-D warnings` clean. Commit `ba6163c`.
+
+6. **(phase 5) Invariant + measurement (S8–S9).** Scripts
+`var/m6k/scripts/p9-invariant.sh` (all old fixtures + the three extended ones —
+both legs use the working-tree fixtures, so the diff isolates code-driven
+change; SCIP legs per precedent) and `p8-measure.sh` (guice/springfu/automapper
+@ M6j pins; nest/jpetstore excluded — M6k touches neither TS nor XML).
+Release head binary sha `99d7156c…`. Logs `var/m6k/logs/p9-invariant.log`,
+`p8-measure.log`. (Results recorded here on completion.)
