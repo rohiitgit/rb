@@ -513,9 +513,12 @@ mod tests {
         );
         assert_eq!(dynamic.len(), 1);
         assert_eq!(dynamic[0].0, "dyn");
-        // Anything else is not a mapper.
+        // Anything else is not a mapper; a namespace-less mapper still reads.
         assert!(mapper_file("<project><a/></project>").is_none());
         assert!(mapper_file("))) garbage (((").is_none());
+        let no_ns = mapper_file("<mapper><select id=\"s\">SELECT 1</select></mapper>").unwrap();
+        assert_eq!(no_ns.namespace, "");
+        assert_eq!(no_ns.stmts.len(), 1);
     }
 
     /// Contract M6f S5: mapper statements become exact `QUERIES` from their file; dynamic

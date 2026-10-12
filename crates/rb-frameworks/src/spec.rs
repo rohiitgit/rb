@@ -84,8 +84,12 @@ pub fn openapi_json(text: &str) -> Option<Vec<SpecOp>> {
 }
 
 /// Reads an OpenAPI/Swagger YAML document with the 0/2/4/6-space shapes: `None` when a line
-/// is tab-indented, or the `paths:` section holds entries but yields zero operations.
+/// is tab-indented, or the `paths:` section holds entries but yields zero operations. A
+/// flow-JSON document reads as JSON.
 pub fn openapi_yaml(text: &str) -> Option<Vec<SpecOp>> {
+    if text.trim_start().starts_with('{') {
+        return openapi_json(text);
+    }
     let mut ops: Vec<SpecOp> = Vec::new();
     let mut in_paths = false;
     let mut had_entries = false;
@@ -512,5 +516,29 @@ mod tests {
         };
         let (small, large) = (work(50), work(200));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Evaluator pass 1, M6f-9 (S1/S2): a nested `paths:` never reads as the document's
+    /// (indentation gates at column 0); JSON content in a `.yaml` file reads as JSON; a
+    /// doubled proto service merges by key downstream (both readings kept here).
+    #[test]
+    fn spec_surfaces_resist_smuggling() {
+        assert_eq!(
+            openapi_yaml("info:\n  paths:\n    /x:\n      get:\n").unwrap(),
+            []
+        );
+        assert_eq!(
+            openapi_yaml("{\"openapi\": \"3.0.0\", \"paths\": {\"/x\": {\"get\": {}}}}").unwrap(),
+            [SpecOp {
+                path: "/x".into(),
+                method: "GET".into(),
+                operation: "".into(),
+                span: [0, 0, 0, 0],
+            }]
+        );
+        let doubled = "syntax = \"proto3\";\nservice A {\n  rpc M (X) returns (Y);\n}\nservice A {\n  rpc N (X) returns (Y);\n}\n";
+        let services = proto_services(doubled);
+        assert_eq!(services.len(), 2);
+        assert!(services.iter().all(|s| s.name == "A"));
     }
 }

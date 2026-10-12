@@ -676,8 +676,7 @@ fn add_spec_endpoints(
             }
             continue;
         }
-        let trimmed = text.trim_start();
-        let ops = if trimmed.starts_with('{') {
+        let ops = if spec_path.ends_with(".json") {
             rb_frameworks::spec::openapi_json(text)
         } else {
             rb_frameworks::spec::openapi_yaml(text)

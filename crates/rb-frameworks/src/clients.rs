@@ -185,22 +185,26 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
             axios(facts, &mut out, &Gate::new(facts.facts));
             fetch_class(facts, &mut out);
             http_client(facts, &mut out);
-            generated_calls(Language::TypeScript, facts, &mut out);
+            let claimed = claimed(&out);
+            generated_calls(Language::TypeScript, facts, &mut out, &claimed);
         }
         Language::Java => {
             let bases = SpringBases::new(facts, Gate::new(facts.facts));
             rest_template(facts, &mut out, &bases);
             web_client(facts, &mut out, &bases);
             feign(facts, &mut out);
-            generated_calls(Language::Java, facts, &mut out);
+            let claimed = claimed(&out);
+            generated_calls(Language::Java, facts, &mut out, &claimed);
         }
         Language::Go => {
             go_http(facts, &mut out);
-            generated_calls(Language::Go, facts, &mut out);
+            let claimed = claimed(&out);
+            generated_calls(Language::Go, facts, &mut out, &claimed);
         }
         Language::Python => {
             requests_httpx(facts, &mut out);
-            generated_calls(Language::Python, facts, &mut out);
+            let claimed = claimed(&out);
+            generated_calls(Language::Python, facts, &mut out, &claimed);
         }
     }
     out
@@ -4014,6 +4018,14 @@ fn client_type(name: &str) -> Option<&str> {
     (!inner.is_empty()).then_some(inner)
 }
 
+/// Framework HTTP client types: `*Client`-shaped but never generated stubs (Angular
+/// `HttpClient`, Spring `WebClient`/`RestClient`). Bindings and constructions of these types
+/// are URL calls (or nothing), never gRPC candidates.
+fn is_framework_client(type_name: &str) -> bool {
+    let simple = type_name.rsplit('.').next().unwrap_or(type_name);
+    matches!(simple, "HttpClient" | "WebClient" | "RestClient")
+}
+
 /// The binding `root` names and its type, when it resolves to one binding.
 fn binding_type<'f>(
     facts: &'f FileScope<'_>,
@@ -4030,9 +4042,25 @@ fn binding_type<'f>(
 /// constructions, `*Stub`-typed bindings (gRPC Java), and calls on bindings built by
 /// `New*Client` constructors or `new *Client` (gRPC Go/TypeScript). Multi-link chains name
 /// navigation, not operations — only the last link of a stub chain reads as the RPC.
-fn generated_calls(language: Language, facts: &FileScope<'_>, out: &mut FileClients) {
+/// The spans URL packs already claimed as call sites.
+fn claimed(out: &FileClients) -> HashSet<Span> {
+    out.calls.iter().map(|c| c.span).collect()
+}
+
+fn generated_calls(
+    language: Language,
+    facts: &FileScope<'_>,
+    out: &mut FileClients,
+    claimed: &HashSet<Span>,
+) {
     for chain in &facts.chains {
         crate::work::tick(1);
+        // A chain the URL packs already read as a call site is an HTTP client, whatever its
+        // receiver is named (`mailApi.post`, Angular `this.http.post`): never a second,
+        // generated reading of the same call.
+        if claimed.contains(&chain.span) {
+            continue;
+        }
         let (Some(root), links) = (chain.root.as_deref(), chain.links.as_slice()) else {
             continue;
         };
@@ -4118,7 +4146,10 @@ fn generated_calls(language: Language, facts: &FileScope<'_>, out: &mut FileClie
         ) && let Some(bi) = local_binding(facts, language, root, chain.span)
         {
             let binding = &facts.bindings[bi];
-            let mut service = client_type(last_segment(&binding.type_name)).map(str::to_owned);
+            let mut service = (!is_framework_client(&binding.type_name))
+                .then(|| client_type(last_segment(&binding.type_name)))
+                .flatten()
+                .map(str::to_owned);
             if service.is_none() {
                 match &binding.init {
                     Some(Init::Call { chain: ci }) => {
@@ -4132,7 +4163,7 @@ fn generated_calls(language: Language, facts: &FileScope<'_>, out: &mut FileClie
                             }
                         }
                     }
-                    Some(Init::New { type_name, .. }) => {
+                    Some(Init::New { type_name, .. }) if !is_framework_client(type_name) => {
                         service = client_type(last_segment(type_name)).map(str::to_owned);
                     }
                     None => {
@@ -6423,6 +6454,19 @@ mod tests {
         assert!(large <= small * 5, "{small} -> {large}");
     }
 
+    /// Evaluator pass 1, M6f-9 (polyglot churn): a chain the URL packs already read is an
+    /// HTTP client, whatever its receiver is named — never a second, generated reading.
+    #[test]
+    fn url_claimed_chains_are_never_generated_candidates() {
+        let src = "import got from 'got';\nconst mailApi = got.extend({ prefixUrl: 'http://n' });\nexport async function f(email: string) {\n  return mailApi.post('http://notification/internal/mfa/email', { json: { email } });\n}\n";
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let out = clients(Language::TypeScript, &facts);
+        assert!(!out.calls.is_empty());
+        assert!(out.generated.is_empty());
+        let ng = "export class MailClient {\n  constructor(private http: HttpClient) {}\n  send(email: string) {\n    return this.http.post('http://notification/internal/mfa/email', { email });\n  }\n}\n";
+        let facts = extract(Language::TypeScript, ng.as_bytes()).unwrap();
+        assert!(clients(Language::TypeScript, &facts).generated.is_empty());
+    }
     /// A dot import of `net/http` (and of `net/httptest`) is outside the
     /// import gate, as for the client sites themselves (S11): no sink is
     /// recognised there.

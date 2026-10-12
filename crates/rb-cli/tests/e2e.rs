@@ -3780,18 +3780,27 @@ fn scip_contract_packs() {
     let started = std::time::Instant::now();
     let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
     eprintln!("scip_contract_packs: first index {:.1?}", started.elapsed());
-    assert!(first.contains("scip-java ok") || first.contains("scip: . scip-java ok"), "{first}");
+    assert!(
+        first.contains("scip-java ok") || first.contains("scip: . scip-java ok"),
+        "{first}"
+    );
     let dump = rb(&url, &["dump", "--repo", &name]);
     let failures = guard_failures(fixture, &dump);
     if !failures.is_empty() {
-        eprintln!("scip_contract_packs guard failures:\n{}", failures.join("\n"));
+        eprintln!(
+            "scip_contract_packs guard failures:\n{}",
+            failures.join("\n")
+        );
     }
     golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     golden(
         fixture,
         "scip-callers-listusers.txt",
-        &rb(&url, &["callers", "UserController.listUsers", "--repo", &name]),
+        &rb(
+            &url,
+            &["callers", "UserController.listUsers", "--repo", &name],
+        ),
     );
     golden(
         fixture,
@@ -3812,7 +3821,10 @@ fn scip_contract_packs() {
     let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
     assert!(second.contains("(cached"), "{second}");
     assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
-    let fresh = rb(&url, &["index", path, "--repo", &name, "--force", "--no-cache"]);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
     assert!(!fresh.contains("(cached"), "{fresh}");
     assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
     rb(&url, &["index", path, "--repo", &other]);
