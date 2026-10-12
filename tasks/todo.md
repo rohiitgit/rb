@@ -957,7 +957,7 @@ Same rules as M6d:
 - [x] **6. Generated-call stitching** (S6 stitch). Done (amendment 7): operation/RPC matching, own-service rule, synthetic cap; mutants.
 - [x] **S4b. Interface handler roll-down** (S4). Done (amendment 8): interface_routes recorded, spec-matched roll-down via IMPLEMENTS; mutants.
 - [x] **7. Fixture + guards** (S7). Done (amendment 9): contract-packs fixture (Maven + nested webapp), e2e + 5 goldens + 12/3 guards, every line read, 4 guard-bite mutants, unblessed green.
-- [ ] **8. Measurements** (S8). grpc-go + OAI spec repo; classified diffs + samples; deterministic.
+- [x] **8. Measurements** (S8). Done (amendment 10): grpc-go classified (18 endpoints, 52 synthetic CONSUMES sampled, 869 correctly-unmatched residue) + deterministic; OAI identical + reader breadth on real specs; cleanup done.
 - [ ] **9. Records + evaluator.** S9–S11; pass 1 (full), fixes, pass 2 (verification-only).
 - [ ] M6g Topology and configuration packs (message topics, gateways, compose/k8s hosts, Spring YAML and active profiles).
 - [ ] M6h Architecture rules as a CI gate (`rb check` in Cypher).
