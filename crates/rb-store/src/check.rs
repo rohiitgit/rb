@@ -35,7 +35,7 @@ pub const RULES: &[Rule] = &[
     Rule {
         name: RULE_UNOWNED_TABLE_WRITES,
         description: "an insert/update/delete/merge query on a table migrated by another service",
-        cypher: "MATCH (t:Table)<-[q:QUERIES]-(x) WHERE ANY(op IN q.ops WHERE op IN ['insert', 'update', 'delete', 'merge']) OPTIONAL MATCH (x)-[:DEFINED_IN]->(df:File)-[:IN_SERVICE]->(s1:Service) OPTIONAL MATCH (x)-[:IN_SERVICE]->(s2:Service) OPTIONAL MATCH (mf:File)-[:MIGRATES]->(t) OPTIONAL MATCH (mf)-[:IN_SERVICE]->(o:Service) WITH t, COALESCE(s1, s2) AS s, COLLECT(DISTINCT o.key) AS owners WHERE NOT s.key IN owners AND SIZE(owners) > 0 RETURN s.key, t.key ORDER BY s.key, t.key",
+        cypher: "MATCH (t:Table)<-[q:QUERIES]-(x) WHERE ANY(op IN q.ops WHERE op IN ['insert', 'update', 'delete', 'merge']) OPTIONAL MATCH (x)-[:DEFINED_IN]->(df:File)-[:IN_SERVICE]->(s1:Service) OPTIONAL MATCH (x)-[:IN_SERVICE]->(s2:Service) OPTIONAL MATCH (mf:File)-[:MIGRATES]->(t) OPTIONAL MATCH (mf)-[:IN_SERVICE]->(o:Service) WITH t, COALESCE(s1, s2) AS s, COLLECT(DISTINCT o.key) AS owners WHERE NOT s.key IN owners AND SIZE(owners) > 0 RETURN DISTINCT s.key, t.key ORDER BY s.key, t.key",
     },
     Rule {
         name: RULE_SERVICE_CYCLES,
@@ -471,6 +471,68 @@ mod tests {
                 "{ops}"
             );
         }
+        // Two writers in one service report one violation (the Cypher twin's DISTINCT agrees).
+        let mut b2 = GraphBuilder::new();
+        for (key, name, attrs) in [
+            svc("a"),
+            svc("b"),
+            (NodeKey::new(NodeKind::File, "a/f"), "f", Attrs::new()),
+            (NodeKey::new(NodeKind::File, "b/g"), "g", Attrs::new()),
+            (NodeKey::new(NodeKind::Symbol, "s"), "s", Attrs::new()),
+            (NodeKey::new(NodeKind::Symbol, "t"), "t", Attrs::new()),
+            (NodeKey::new(NodeKind::Table, "public.u"), "u", Attrs::new()),
+        ] {
+            b2.add_node(key, name, attrs).unwrap();
+        }
+        let plain = |src: NodeKey, kind: EdgeKind, dst: NodeKey| {
+            NewEdge::new(src, kind, dst, Provenance::Treesitter, Certainty::Exact)
+        };
+        for (src, kind, dst) in [
+            (
+                NodeKey::new(NodeKind::File, "a/f"),
+                EdgeKind::InService,
+                NodeKey::new(NodeKind::Service, "a"),
+            ),
+            (
+                NodeKey::new(NodeKind::File, "b/g"),
+                EdgeKind::InService,
+                NodeKey::new(NodeKind::Service, "b"),
+            ),
+            (
+                NodeKey::new(NodeKind::File, "a/f"),
+                EdgeKind::Migrates,
+                NodeKey::new(NodeKind::Table, "public.u"),
+            ),
+        ] {
+            b2.add_edge(plain(src, kind, dst)).unwrap();
+        }
+        for sym in ["s", "t"] {
+            b2.add_edge(plain(
+                NodeKey::new(NodeKind::Symbol, sym),
+                EdgeKind::DefinedIn,
+                NodeKey::new(NodeKind::File, "b/g"),
+            ))
+            .unwrap();
+            let mut q = NewEdge::new(
+                NodeKey::new(NodeKind::Symbol, sym),
+                EdgeKind::Queries,
+                NodeKey::new(NodeKind::Table, "public.u"),
+                Provenance::SqlLiteral,
+                Certainty::Heuristic,
+            );
+            q.attrs = [("ops".to_owned(), json!(["insert"]))]
+                .into_iter()
+                .collect();
+            b2.add_edge(q).unwrap();
+        }
+        assert_eq!(
+            unowned_table_writes(&b2.finish().unwrap()),
+            [Violation {
+                rule: RULE_UNOWNED_TABLE_WRITES,
+                src: "b".into(),
+                dst: "public.u".into(),
+            }]
+        );
     }
 
     /// Contract M6h S1: cycle links report; DAG links and self-standing services stay silent.
@@ -555,6 +617,15 @@ mod tests {
             }
             assert!(upper.contains("ORDER BY"), "{}, no ORDER BY", rule.name);
         }
+        // Multi-match rules dedupe their returned rows: the twin compares exact row sets
+        // (evaluator pass 1). The COLLECT(DISTINCT …) alone does not dedupe rows.
+        assert!(
+            RULES
+                .iter()
+                .find(|r| r.name == RULE_UNOWNED_TABLE_WRITES)
+                .is_some_and(|r| r.cypher.contains("RETURN DISTINCT")),
+            "unowned_table_writes dedupes its rows"
+        );
     }
 
     /// Contract M6h S1, invariants 5–6: checking 4× the services costs at most 5× the operations.
