@@ -1058,9 +1058,20 @@ fn type_qualifier(name: Node<'_>, source: &[u8]) -> Option<String> {
 
 fn call_qualifier(name: Node<'_>, source: &[u8]) -> Option<String> {
     let member = name.parent()?;
+    // Kotlin navigation receivers are positional (no `object:` field): the receiver precedes
+    // the member name (contract M6i S2).
+    if member.kind() == "navigation_expression" {
+        let mut c = member.walk();
+        let receiver = member.named_children(&mut c).next()?;
+        if receiver.id() == name.id() {
+            return None;
+        }
+        return Some(text(receiver, source));
+    }
     let object = member
         .child_by_field_name("object")
         .or_else(|| member.child_by_field_name("operand"))
+        .or_else(|| member.child_by_field_name("expression"))
         .filter(|o| o.id() != name.id())?;
     Some(text(object, source))
 }
@@ -1594,6 +1605,17 @@ export function hash(s: string): string {
         assert_eq!(
             qualifiers(Language::Go, "package p\nfunc f() { db.Query(q) }\n"),
             [q("Query", Some("db"))]
+        );
+        assert_eq!(
+            qualifiers(Language::Kotlin, "fun f() {\nHelper.shout(x)\n}\n"),
+            [q("shout", Some("Helper"))]
+        );
+        assert_eq!(
+            qualifiers(
+                Language::CSharp,
+                "class K {\nvoid M() {\nUtil.Shout(x);\n}\n}\n"
+            ),
+            [q("Shout", Some("Util"))]
         );
     }
 

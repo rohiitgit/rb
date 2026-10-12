@@ -19,6 +19,8 @@ pub(crate) fn imports(language: Language, root: Node<'_>, source: &[u8]) -> Vec<
                 out.extend(python_from_import(node, source));
             }
             (Language::Go, "import_spec") => out.extend(go_import(node, source)),
+            (Language::Kotlin, "import") => out.extend(kotlin_import(node, source)),
+            (Language::CSharp, "using_directive") => out.extend(csharp_import(node, source)),
             _ => {
                 let mut c = node.walk();
                 let children: Vec<Node<'_>> = node.children(&mut c).collect();
@@ -29,10 +31,11 @@ pub(crate) fn imports(language: Language, root: Node<'_>, source: &[u8]) -> Vec<
     out
 }
 
-/// The Java `package` or Go `package` clause.
+/// The Kotlin `package` header.
 pub(crate) fn package(language: Language, root: Node<'_>, source: &[u8]) -> Option<String> {
     let kind = match language {
         Language::Java => "package_declaration",
+        Language::Kotlin => "package_header",
         Language::Go => "package_clause",
         _ => return None,
     };
@@ -299,10 +302,66 @@ fn python_from_import(node: Node<'_>, source: &[u8]) -> Option<Import> {
     Some(out)
 }
 
+/// `import a.b.C`, `import a.b.*`, `import a.b.C as D` (Kotlin has no static imports).
+fn kotlin_import(node: Node<'_>, source: &[u8]) -> Option<Import> {
+    let mut c = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut c).collect();
+    let path = children
+        .iter()
+        .find(|n| n.kind() == "qualified_identifier")
+        .map(|n| text(*n, source))?;
+    if children
+        .iter()
+        .any(|n| !n.is_named() && text(*n, source) == "*")
+    {
+        // `import a.b.*`: the module is the path without the star.
+        let mut out = import(node, path.strip_suffix(".*").unwrap_or(&path).to_owned());
+        out.wildcard = true;
+        return Some(out);
+    }
+    // Like Java, the module is the package part and the last segment is the name.
+    let (module, name) = path.rsplit_once('.')?;
+    let mut out = import(node, module.to_owned());
+    let local = children
+        .iter()
+        .rev()
+        .find(|n| n.is_named() && n.kind() == "identifier")
+        .map(|n| text(*n, source))
+        .unwrap_or_else(|| name.to_owned());
+    out.names.push(named(name.to_owned(), local));
+    Some(out)
+}
+
 /// `import "x/y"`, `import f "x/y"` (a spec, alone or inside an import block).
 fn go_import(node: Node<'_>, source: &[u8]) -> Option<Import> {
     let mut out = import(node, unquote(node.child_by_field_name("path")?, source));
     out.alias = node.child_by_field_name("name").map(|n| text(n, source));
+    Some(out)
+}
+
+/// `using System;`, `using Foo = Bar.Baz;`, `using static System.Math;`.
+fn csharp_import(node: Node<'_>, source: &[u8]) -> Option<Import> {
+    let mut c = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut c).collect();
+    let is_static = children
+        .iter()
+        .any(|n| !n.is_named() && text(*n, source) == "static");
+    // The aliased name (`Foo` in `using Foo = …`), if any.
+    let alias = node.child_by_field_name("name").map(|n| text(n, source));
+    // The referenced namespace or type: the qualified name, else the bare identifier.
+    let target = children
+        .iter()
+        .rev()
+        .find(|n| {
+            n.is_named() && matches!(n.kind(), "qualified_name" | "identifier" | "generic_name")
+        })
+        .map(|n| text(*n, source))?;
+    let mut out = import(node, target);
+    if is_static {
+        out.is_static = true;
+    } else if let Some(name) = alias {
+        out.alias = Some(name);
+    }
     Some(out)
 }
 
@@ -373,6 +432,24 @@ mod tests {
         );
         let facts = extract(Language::Java, src.as_bytes()).unwrap();
         assert_eq!(facts.package.as_deref(), Some("com.acme.web"));
+    }
+
+    #[test]
+    fn kotlin_and_csharp_imports_and_package() {
+        let kt = "package acme.web\nimport java.util.List\nimport com.acme.*\nimport com.acme.Foo as Bar\nclass K {}\n";
+        assert_eq!(
+            summary(Language::Kotlin, kt),
+            ["java.util [List]", "com.acme [] *", "com.acme [Foo->Bar]"]
+        );
+        let facts = extract(Language::Kotlin, kt.as_bytes()).unwrap();
+        assert_eq!(facts.package.as_deref(), Some("acme.web"));
+        let cs = "using System;\nusing Foo = Bar.Baz;\nusing static System.Math;\nnamespace Acme {\nclass K {}\n}\n";
+        assert_eq!(
+            summary(Language::CSharp, cs),
+            ["System []", "Bar.Baz [] as Foo", "System.Math [] static"]
+        );
+        let facts = extract(Language::CSharp, cs.as_bytes()).unwrap();
+        assert_eq!(facts.package, None);
     }
 
     #[test]

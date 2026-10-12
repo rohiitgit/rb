@@ -333,7 +333,15 @@ fn package_key<'a>(
     let package = facts.package.as_deref().unwrap_or_default();
     match language {
         Language::Java => Some(("", package)),
+        // Kotlin packages resolve like Java ones (contract M6i S2).
+        Language::Kotlin => Some(("", package)),
         Language::Go => Some((dir(path), package)),
+        // C# namespaces: the file's top-level module definition, when it has one.
+        Language::CSharp => facts
+            .definitions
+            .iter()
+            .find(|d| d.kind == DefKind::Module && d.parent.is_none())
+            .map(|d| ("", d.name.as_str())),
         _ => None,
     }
 }
@@ -875,6 +883,19 @@ impl<'a> Index<'a> {
                 }
                 Language::Java if import.wildcard => out.extend(top(name)),
                 Language::Go if import.alias.as_deref() == Some(".") => out.extend(top(name)),
+                // C# plain usings (`using A;`) import every name of the namespace, like Java
+                // on-demand imports — including namespace members, which are file-visible.
+                Language::CSharp if !import.is_static && import.alias.is_none() => {
+                    out.extend(top(name));
+                    out.extend(targets.iter().flat_map(|&f| {
+                        self.facts(f)
+                            .definitions
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, d)| d.parent.is_none() && d.kind == DefKind::Module)
+                            .flat_map(|(m, _)| self.named(f, Some(m), name, want))
+                    }));
+                }
                 _ => {
                     for n in import
                         .names
@@ -1421,6 +1442,79 @@ mod tests {
     const TS: Language = Language::TypeScript;
     const PY: Language = Language::Python;
     const GO: Language = Language::Go;
+    const KT: Language = Language::Kotlin;
+    const CS: Language = Language::CSharp;
+
+    /// Contract M6i S2: Kotlin calls resolve across files (bare top-level, typed-receiver
+    /// methods); constructor calls reference their class; interface implementations link.
+    #[test]
+    fn kotlin_calls_types_and_implements_resolve() {
+        let built = build(
+            &[
+                (
+                    "svc/util.kt",
+                    KT,
+                    "package acme\nfun shout(s: String): String {\nreturn s\n}\nclass Greeter : GreeterApi {\nfun greet(name: String): String {\nreturn shout(name)\n}\n}\ninterface GreeterApi {\nfun greet(name: String): String\n}\n",
+                ),
+                (
+                    "svc/main.kt",
+                    KT,
+                    "package acme\nfun main() {\nval g: Greeter = Greeter()\ng.greet(\"hi\")\nshout(\"yo\")\n}\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "main:main(). -> util:Greeter#greet(). [heuristic]",
+                "main:main(). -> util:shout(). [heuristic]",
+                "util:Greeter#greet(). -> util:shout(). [heuristic]",
+            ]
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Implements),
+            [
+                "util:Greeter# -> util:GreeterApi# [heuristic]",
+                "util:Greeter#greet(). -> util:GreeterApi#greet(). [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M6i S2: C# calls resolve across files (static type calls, typed-receiver
+    /// methods); constructor calls reference their class; interface implementations link.
+    #[test]
+    fn csharp_calls_types_and_implements_resolve() {
+        let built = build(
+            &[
+                (
+                    "svc/Util.cs",
+                    CS,
+                    "namespace Acme {\npublic static class Util {\npublic static string Shout(string s) {\nreturn s;\n}\n}\npublic interface IGreeter {\nstring Greet(string n);\n}\npublic class Greeter : IGreeter {\npublic string Greet(string n) {\nreturn Util.Shout(n);\n}\n}\n}\n",
+                ),
+                (
+                    "svc/Main.cs",
+                    CS,
+                    "using Acme;\nclass Program {\nstatic void Main() {\nvar g = new Greeter();\ng.Greet(\"hi\");\n}\n}\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "Main:Program#Main(). -> Util:Acme/Greeter#Greet(). [heuristic]",
+                "Util:Acme/Greeter#Greet(). -> Util:Acme/Util#Shout(). [heuristic]",
+            ]
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Implements),
+            [
+                "Util:Acme/Greeter# -> Util:Acme/IGreeter# [heuristic]",
+                "Util:Acme/Greeter#Greet(). -> Util:Acme/IGreeter#Greet(). [heuristic]",
+            ]
+        );
+    }
 
     #[test]
     fn java_levels_typed_receivers_statics_and_inheritance() {

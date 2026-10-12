@@ -57,8 +57,8 @@ pub(crate) fn bindings<'t>(
             }
             Language::Python => python(node, source, &mut out),
             Language::Go => go(node, source, &mut out),
-            // Contract M6i S2: per-language binding walks land with Tier B.
-            Language::Kotlin | Language::CSharp => {}
+            Language::Kotlin => kotlin(node, source, &mut out),
+            Language::CSharp => csharp(node, source, &mut out),
         }
         let mut c = node.walk();
         let children: Vec<Node<'t>> = node.children(&mut c).collect();
@@ -638,6 +638,135 @@ const PYTHON_PARAMETERS: &[&str] = &[
 
 /// Go: the position of a `parameter_declaration`'s first name in its function's parameters
 /// (not a receiver's or named result's list); unnamed parameters take one position each.
+/// Whether a Kotlin declaration sits in a type body (a member) rather than a function.
+fn kotlin_member(node: Node<'_>) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "function_declaration" | "function_body" | "block" | "source_file" => return false,
+            "class_body" | "enum_class_body" => return true,
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+/// Kotlin parameters, properties and locals with their declared types (`val` is constant;
+/// constructor-call values stay untyped, like Java `var` without `new`).
+fn kotlin<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
+    match node.kind() {
+        "parameter" => {
+            let mut c = node.walk();
+            let mut kids = node.named_children(&mut c);
+            let name = kids.find(|n| n.kind() == "identifier");
+            let mut c = node.walk();
+            let ty = node
+                .named_children(&mut c)
+                .find(|n| n.kind() == "user_type")
+                .and_then(|t| type_name(t, source));
+            let pushed = push(out, name, ty, false, node, node, source);
+            initialised(out, pushed, None, false);
+        }
+        "property_declaration" => {
+            let mut c = node.walk();
+            let decl = node
+                .named_children(&mut c)
+                .find(|n| n.kind() == "variable_declaration");
+            let mut c = node.walk();
+            let value = node.named_children(&mut c).find(|n| {
+                matches!(
+                    n.kind(),
+                    "call_expression"
+                        | "navigation_expression"
+                        | "object_literal"
+                        | "anonymous_function"
+                )
+            });
+            if let Some(d) = decl {
+                let mut c = d.walk();
+                let mut kids = d.named_children(&mut c);
+                let name = kids.find(|n| n.kind() == "identifier");
+                let mut c = d.walk();
+                let ty = d
+                    .named_children(&mut c)
+                    .find(|n| n.kind() == "user_type")
+                    .and_then(|t| type_name(t, source));
+                let member = kotlin_member(node);
+                let is_val = text(node, source).trim_start().starts_with("val ");
+                let pushed = push(out, name, ty, member, node, d, source);
+                initialised(out, pushed, value, is_val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// C# parameters, fields and locals. `var x = new Foo()` takes the construction type (the
+/// Java `var` precedent); anything else without a written type stays untyped.
+fn csharp<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
+    match node.kind() {
+        "parameter" => {
+            let pushed = push(
+                out,
+                node.child_by_field_name("name"),
+                node.child_by_field_name("type")
+                    .and_then(|t| type_name(t, source)),
+                false,
+                node,
+                node,
+                source,
+            );
+            initialised(out, pushed, None, false);
+        }
+        "variable_declarator" => {
+            let declaration = node.parent();
+            // The extent runs to the end of the declaration: later siblings see the name.
+            let extent = declaration
+                .and_then(|d| d.parent())
+                .filter(|p| {
+                    matches!(
+                        p.kind(),
+                        "local_declaration_statement" | "field_declaration"
+                    )
+                })
+                .or(declaration);
+            let member = extent.is_some_and(|p| p.kind() == "field_declaration");
+            let ty = declaration
+                .and_then(|d| d.child_by_field_name("type"))
+                .and_then(|t| {
+                    if text(t, source) == "var" {
+                        // `var x = <value>`: the value is the declarator's second named child
+                        // (it carries no field name).
+                        let mut vc = node.walk();
+                        let mut values = node.named_children(&mut vc);
+                        values.next();
+                        values
+                            .find(|v| v.kind() == "object_creation_expression")
+                            .and_then(|v| type_name(v, source))
+                    } else {
+                        type_name(t, source)
+                    }
+                });
+            let mut vc = node.walk();
+            let mut values = node.named_children(&mut vc);
+            values.next();
+            let value = values.next();
+            let pushed = push(
+                out,
+                node.child_by_field_name("name"),
+                ty,
+                member,
+                extent.or(declaration).unwrap_or(node),
+                node,
+                source,
+            );
+            initialised(out, pushed, value, false);
+        }
+        _ => {}
+    }
+}
+
 fn go_position(node: Node<'_>) -> Option<usize> {
     let list = node.parent().filter(|l| l.kind() == "parameter_list")?;
     let owner = list.parent()?;
@@ -736,6 +865,21 @@ const BUILTIN_TYPES: &[&str] = &[
     "object",
     "None",
     "Any",
+    // Kotlin scalars (contract M6i S2). Only spellings no Java reference type uses:
+    // java.lang has Long, Short, Byte, Double, Float, Boolean and String.
+    "Int",
+    "Char",
+    "Unit",
+    // C# scalars (contract M6i S2). Same rule: long, double, short, char, void and boolean
+    // are Java spellings too.
+    "decimal",
+    "dynamic",
+    "nint",
+    "nuint",
+    "sbyte",
+    "uint",
+    "ulong",
+    "ushort",
 ];
 
 /// A type node as a name: type arguments, pointers and annotations stripped. Built-in scalars,
@@ -762,6 +906,22 @@ fn type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
         | "scoped_identifier"
         | "attribute"
         | "member_expression" => Some(text(node, source)),
+        // Kotlin `String?`, `acme.Foo`, `Map<String, Foo>`: the head name.
+        "user_type" => {
+            let mut text = text(node, source);
+            if let Some(i) = text.find('<') {
+                text.truncate(i);
+            }
+            Some(text.trim_end_matches('?').trim().to_owned())
+        }
+        // C# `Bar.Baz`, `List<Foo>`: the head name.
+        "qualified_name" | "generic_name" => {
+            let mut text = text(node, source);
+            if let Some(i) = text.find('<') {
+                text.truncate(i);
+            }
+            Some(text.trim().to_owned())
+        }
         _ => None,
     }
 }
@@ -1382,6 +1542,36 @@ mod tests {
                 "t: Thing in f",
                 "v: ? in f",
                 "c: a.b.C in f"
+            ]
+        );
+    }
+
+    #[test]
+    fn kotlin_properties_parameters_and_locals() {
+        let src = "class K {\nval repo: Repo\nfun f(u: User, i: Int) {\nval s: Store = Store()\nvar v = Thing()\n}\n}\n";
+        assert_eq!(
+            bound(Language::Kotlin, src),
+            [
+                "*repo: Repo in K",
+                "u: User in f",
+                "i: ? in f",
+                "s: Store in f",
+                "v: ? in f",
+            ]
+        );
+    }
+
+    #[test]
+    fn csharp_fields_parameters_and_locals() {
+        let src = "class K {\nFoo f;\npublic Bar M(Baz b, int i) {\nvar x = new Qux();\nFoo y = null;\n}\n}\n";
+        assert_eq!(
+            bound(Language::CSharp, src),
+            [
+                "*f: Foo in K",
+                "b: Baz in M",
+                "i: ? in M",
+                "x: Qux in M",
+                "y: Foo in M",
             ]
         );
     }

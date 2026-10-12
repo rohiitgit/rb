@@ -76,15 +76,24 @@ fn syntax(language: Language) -> Syntax {
             object: None,
             skip: &["decorator"],
         },
-        // Contract M6i S2: call chains land with Tier B (a kind that matches nothing reads no
-        // chains until then).
-        Language::Kotlin | Language::CSharp => Syntax {
-            call: "",
-            member: ("", "", ""),
-            names: &[],
-            functions: &[],
+        // Contract M6i S2: Kotlin calls are positional (no `function:` field).
+        Language::Kotlin => Syntax {
+            call: "call_expression",
+            member: ("navigation_expression", "", ""),
+            names: &["identifier"],
+            functions: &["anonymous_function", "lambda_literal"],
             object: None,
-            skip: &[],
+            skip: &["annotation"],
+        },
+        // Contract M6i S2: call chains (C# invocations carry `function:`/`arguments:` fields
+        // like TypeScript calls; `this.` has no expression child, so this-calls are receiverless).
+        Language::CSharp => Syntax {
+            call: "invocation_expression",
+            member: ("member_access_expression", "expression", "name"),
+            names: &["identifier"],
+            functions: &["anonymous_method_expression", "lambda_expression"],
+            object: None,
+            skip: &["attribute", "attribute_list"],
         },
     }
 }
@@ -123,6 +132,35 @@ fn split<'t>(
             call.child_by_field_name("name"),
             arguments,
         );
+    }
+    if language == Language::Kotlin {
+        // Positional: `(call_expression <callee> <value_arguments?>)`; a navigation callee
+        // carries the receiver first and the member name last.
+        let mut c = call.walk();
+        let mut kids = call.named_children(&mut c);
+        let callee = kids.next();
+        let arguments = {
+            let mut c = call.walk();
+            call.named_children(&mut c)
+                .find(|n| n.kind() == "value_arguments")
+        };
+        return match callee.map(|n| n.kind()) {
+            Some("navigation_expression") => {
+                let callee = callee.expect("matched");
+                let mut c = callee.walk();
+                let mut parts = callee.named_children(&mut c);
+                let receiver = parts.next();
+                let mut c = callee.walk();
+                let name = callee
+                    .named_children(&mut c)
+                    .filter(|n| n.kind() == "identifier")
+                    .last();
+                (receiver, name, arguments)
+            }
+            Some("identifier") => (None, callee, arguments),
+            Some("call_expression") => (callee, None, arguments),
+            _ => (None, None, arguments),
+        };
     }
     let Some(function) = call.child_by_field_name("function") else {
         return (None, None, arguments);
@@ -486,6 +524,26 @@ mod tests {
 
     fn chains(language: Language, src: &str) -> Vec<CallChain> {
         extract(language, src.as_bytes()).unwrap().chains
+    }
+
+    /// Contract M6i S2: Kotlin bare and member calls chain with their receivers and arguments.
+    #[test]
+    fn kotlin_calls_chain() {
+        let src = "fun f() {\nfoo(1)\na.bar(x)\na.baz(1).qux(2)\n}\n";
+        assert_eq!(
+            outline(Language::Kotlin, src),
+            ["foo(?)", "a.bar(?)", "a.baz(?).qux(?)"]
+        );
+    }
+
+    /// Contract M6i S2: C# invocations chain, including `this` and chained members.
+    #[test]
+    fn csharp_calls_chain() {
+        let src = "class K {\nvoid M() {\nFoo(1);\nthis.Bar(x);\na.Baz(1).Qux(2);\n}\n}\n";
+        assert_eq!(
+            outline(Language::CSharp, src),
+            ["Foo(?)", "this.Bar(?)", "a.Baz(?).Qux(?)"]
+        );
     }
 
     /// `root.link(args).link(args)` with argument kinds abbreviated, per chain.

@@ -231,8 +231,94 @@ pub(crate) fn supertypes(language: Language, def: Node<'_>, source: &[u8]) -> Ve
             }
         }
         Language::Go => {}
-        // Contract M6i S2: supertypes land with Tier B.
-        Language::Kotlin | Language::CSharp => {}
+        // Contract M6i S2: Kotlin delegation specifiers (constructor calls are superclasses,
+        // bare and `by` types are implemented interfaces).
+        Language::Kotlin => {
+            let mut c = def.walk();
+            let specs = def
+                .named_children(&mut c)
+                .find(|n| n.kind() == "delegation_specifiers");
+            // An `interface` parses as a class declaration with the keyword: its types extend.
+            let mut kc = def.walk();
+            let is_interface = def
+                .children(&mut kc)
+                .any(|t| !t.is_named() && crate::text(t, source) == "interface");
+            if let Some(specs) = specs {
+                let mut sc = specs.walk();
+                for spec in specs.named_children(&mut sc) {
+                    if spec.kind() != "delegation_specifier" {
+                        continue;
+                    }
+                    let mut c = spec.walk();
+                    let mut kids = spec.named_children(&mut c);
+                    let first = kids.next();
+                    let (target, explicit) = match first.map(|n| n.kind()) {
+                        Some("constructor_invocation") => (
+                            first.and_then(|n| {
+                                let mut cc = n.walk();
+                                n.named_children(&mut cc).find(|t| t.kind() == "user_type")
+                            }),
+                            false,
+                        ),
+                        Some("explicit_delegation") => (
+                            first.and_then(|n| {
+                                let mut cc = n.walk();
+                                n.named_children(&mut cc).find(|t| t.kind() == "user_type")
+                            }),
+                            !is_interface,
+                        ),
+                        _ => (first.filter(|n| n.kind() == "user_type"), !is_interface),
+                    };
+                    if let Some(t) = target {
+                        let (name, span) = name_and_span(t, source);
+                        let mut tc = t.walk();
+                        let type_args = t
+                            .named_children(&mut tc)
+                            .find(|n| n.kind() == "type_arguments")
+                            .map(|a| named_texts(a, source))
+                            .unwrap_or_default();
+                        out.push(Supertype {
+                            name,
+                            type_args,
+                            implements: explicit,
+                            span,
+                        });
+                    }
+                }
+            }
+        }
+        // Contract M6i S2: C# base lists (first item extends, the rest implement; interfaces
+        // only extend — an `interface` parses as a class declaration with the keyword).
+        Language::CSharp => {
+            let mut kc = def.walk();
+            let extends_only = def.kind() == "interface_declaration"
+                || def
+                    .children(&mut kc)
+                    .any(|t| !t.is_named() && crate::text(t, source) == "interface");
+            let mut c = def.walk();
+            let base = def.named_children(&mut c).find(|n| n.kind() == "base_list");
+            if let Some(base) = base {
+                let mut bc = base.walk();
+                for (i, item) in base.named_children(&mut bc).enumerate() {
+                    if is_comment(item) {
+                        continue;
+                    }
+                    let (name, span) = name_and_span(item, source);
+                    let mut tc = item.walk();
+                    let type_args = item
+                        .named_children(&mut tc)
+                        .find(|n| n.kind() == "type_argument_list")
+                        .map(|a| named_texts(a, source))
+                        .unwrap_or_default();
+                    out.push(Supertype {
+                        name,
+                        type_args,
+                        implements: !extends_only && i > 0,
+                        span,
+                    });
+                }
+            }
+        }
     }
     out
 }
@@ -331,8 +417,16 @@ fn name_and_span(node: Node<'_>, source: &[u8]) -> (String, crate::Span) {
         "nested_identifier",
         "member_expression",
         "attribute",
+        "user_type",
+        "qualified_name",
+        "qualified_identifier",
     ];
-    const IDENTIFIER: &[&str] = &["identifier", "type_identifier", "property_identifier"];
+    const IDENTIFIER: &[&str] = &[
+        "identifier",
+        "type_identifier",
+        "property_identifier",
+        "simple_identifier",
+    ];
     fn identifiers<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) -> bool {
         let mut c = node.walk();
         node.named_children(&mut c).all(|n| {
@@ -601,6 +695,36 @@ mod tests {
                 format!("{}: {}", d.name, s.join(" "))
             })
             .collect()
+    }
+
+    /// Contract M6i S2: Kotlin delegation specifiers pin supertypes (constructor calls are
+    /// superclasses, bare and `by` types are implemented interfaces).
+    #[test]
+    fn kotlin_supertypes() {
+        let src = "open class A : Base(), Greeter by support {\n}\ninterface B : A {\n}\n";
+        assert_eq!(supers(Language::Kotlin, src), ["A: Base Greeter", "B: A"]);
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let flags: Vec<bool> = facts
+            .definitions
+            .iter()
+            .flat_map(|d| d.supertypes.iter().map(|t| t.implements))
+            .collect();
+        assert_eq!(flags, [false, true, false]);
+    }
+
+    /// Contract M6i S2: C# base lists pin supertypes (first item extends, the rest implement;
+    /// interfaces only extend).
+    #[test]
+    fn csharp_supertypes() {
+        let src = "class A : Base, IGreeter {\n}\ninterface B : A {\n}\n";
+        assert_eq!(supers(Language::CSharp, src), ["A: Base IGreeter", "B: A"]);
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let flags: Vec<bool> = facts
+            .definitions
+            .iter()
+            .flat_map(|d| d.supertypes.iter().map(|t| t.implements))
+            .collect();
+        assert_eq!(flags, [false, true, false]);
     }
 
     const JAVA: &str = r#"@Entity @Table(name = "users", schema = "auth")

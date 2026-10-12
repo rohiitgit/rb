@@ -62,6 +62,7 @@ const KOTLIN_TAGS: &str = "
 /// C#'s stock tags use `@reference.send` for invocations, which the extractor does not map, so
 /// the supplement restates invocations as `@reference.call` (contract M6i D1).
 const CSHARP_SUPPLEMENT: &str = "
+(namespace_declaration name: (qualified_name) @name) @definition.module
 (invocation_expression function: (identifier) @name) @reference.call
 (invocation_expression function: (member_access_expression name: (identifier) @name)) @reference.call
 ";
