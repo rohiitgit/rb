@@ -300,3 +300,34 @@ off a real collision that killed old edges mid-phase); dump gains only additions
 Tests-first (pack + query + outline units); 5/5 mutants killed; D6/D7/V1/V2 e2e bites.
 Residue: keyed services, factories, instances, `typeof`, top-level minimal hosting,
 property injection, lifetimes, scopes.
+
+8. **(phase 8) Public measurement.** Base-vs-head `--no-scip` on all five pins (head
+`e6f7ddf5`, post-phase-6; `var/m6j/measure/*_{base,head}.jsonl`, dumps asserted
+non-empty; one repo at a time + `VACUUM`):
+- guice @ `b8cab7e4`: +40/−1. 24 added INJECTS (Guice-internal wirings) + 16 D; the one
+  removal is the superseded coverage row. di_coverage: 292 test points untouched, 7
+  ambiguous + 3 capped + 8 not_a_bean + 7 unresolved main points.
+- nest @ `45146232`: +168/−1. 106 added INJECTS (controllers/pipes/services) + 62 D;
+  one coverage swap. 184 points: 106 capped (scan_roots_unknown), 61 unresolved, 17
+  test. Unresolved sampled: framework types only (`Reflector`, `DiscoveryService`,
+  `HttpAdapterHost`, …) — honest misses.
+- jpetstore @ `344ef63d`: +6/−6. The same 5 INJECTS edges with `scan_roots_unknown`
+  REMOVED from `capped_by` (XML component-scan made roots known; buckets identical) +
+  coverage swap. The designed scan effect, proven end-to-end.
+- springfu @ `8f8775ec`: +39/−3. 33 added `QUERIES` + 3 tables (Kotlin string literals
+  from S1 enable SQL candidates as a side effect) + coverage; 2 recounted diagnostics
+  (constant totals); zero removed facts. No beans-DSL INJECTS anywhere: every real
+  `beans { }` site is a top-level `val` form (confirmed in source at the pin), which
+  stays unread per the S5 residue; `bean(::routes)` callable refs recorded as a new
+  residue shape.
+- automapper @ `6e8697bc` (M6i pin reused): +693/−134. 132 file-scoped-namespace
+  `Module` defs (+132 DEFINED_IN) enabling 208 REFERENCES + 133 IMPLEMENTS + 59 CALLS
+  in previously unresolving files; 131 recounted + 2 coverage diagnostics; exactly ONE
+  removed edge, reborn as a twin with honest ambiguity (newly visible hierarchy adds a
+  second candidate at certainty 1 — `MapperConfigurationExpression : Profile,
+  IGlobalConfigurationExpression`, read in source).
+- Samples read in source, all correct: JpaPersistService inner-class injection,
+  ManagedFilterPipeline delegation, PersistFilter pair, HelloController, Nest
+  self-injection, jpetstore `@Autowired` fields, AutoMap `ReverseMap()` call.
+  0 false edges in samples. Unresolved buckets sample clean (assisted factories,
+  custom binding annotations, framework types — all recorded residue).
