@@ -712,9 +712,11 @@ fn resolve_lane_point<'a>(
     }
     if candidates.is_empty() {
         *out.buckets.get_mut("unresolved").unwrap() += 1;
+        // Contract M6k S1: the diagnostic sites where the point is written (the
+        // record for anchored points), never the owner's path with foreign spans.
         out.diagnostics.push(site_diagnostic(
             "di_unresolved",
-            owner_path,
+            ev_path,
             p.span,
             &p.element,
             "no_bean",
@@ -3640,6 +3642,33 @@ mod tests {
             e.attrs.get("qualifier").and_then(|v| v.as_str()),
             Some("db")
         );
+    }
+
+    /// Contract M6k pass 1: an unresolved anchored point's diagnostic sites the
+    /// record file (where the ref is written), never the anchor's file with
+    /// foreign spans.
+    #[test]
+    fn anchored_unresolved_diagnostic_sites_the_record() {
+        let kt = "package acme\nval x = beans {\nbean(\"s\") { Svc(ref(\"missing\")) }\n}\n";
+        let (r, _) = resolve_lang(
+            &[
+                ("src/A.kt", Language::Kotlin, kt),
+                (
+                    "src/B.kt",
+                    Language::Kotlin,
+                    "package acme\nclass Svc {\n}\n",
+                ),
+            ],
+            &[],
+        );
+        assert!(r.injections.is_empty());
+        let d: Vec<&Diagnostic> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "di_unresolved")
+            .collect();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path.as_deref(), Some("src/A.kt"));
     }
 
     /// Contract M6k S1: ambiguous anchors skip (two same-named bound types bind
