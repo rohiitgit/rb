@@ -75,6 +75,9 @@ struct RbToml {
     exclude: Vec<String>,
     #[serde(default)]
     service: Vec<ServiceOverride>,
+    /// Host mappings (contract M6g S4): read by the indexer, ignored here beyond parsing.
+    #[serde(default)]
+    hosts: Vec<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -550,6 +553,21 @@ mod tests {
         assert!(detect_in(&[("rb.toml", "bogus = 1\n")]).is_err());
         assert!(detect_in(&[("rb.toml", "exclude = [\"!x\"]\n")]).is_err());
         assert!(detect_in(&[("rb.toml", "[[service]]\npath = \"nope\"\n")]).is_err());
+    }
+
+    /// Contract M6g S4: `[[hosts]]` entries parse (the indexer reads them; detection
+    /// ignores them beyond parsing).
+    #[test]
+    fn rb_toml_hosts_entries_parse() {
+        let b = detect_in(&[
+            (
+                "rb.toml",
+                "[[hosts]]\nservice = \"services/auth\"\nnames = [\"auth\", \"login\"]\n",
+            ),
+            ("services/auth/package.json", "{}"),
+        ])
+        .unwrap();
+        assert_eq!(b.projects.len(), 1);
     }
 
     #[test]

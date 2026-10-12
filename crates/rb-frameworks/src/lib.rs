@@ -10,6 +10,7 @@ pub mod di;
 pub mod endpoint;
 pub mod fold;
 pub mod gateway;
+pub mod hosts;
 pub mod routes;
 pub mod spec;
 pub mod topics;

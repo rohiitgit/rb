@@ -771,6 +771,24 @@ impl<'e> Stitcher<'e> {
         this
     }
 
+    /// Extra host spellings for known services (contract M6g S4): each `(name, service
+    /// key)` joins the host→services map. A name joining several services stays ambiguous
+    /// (never merged); an unknown service key reads as nothing.
+    pub(crate) fn add_host_aliases(
+        &mut self,
+        services: &'e [ServiceRef],
+        aliases: &[(String, String)],
+    ) {
+        for (name, key) in aliases {
+            if let Some(s) = services.iter().find(|s| &s.key == key) {
+                self.hosts
+                    .entry(name.to_ascii_lowercase())
+                    .or_default()
+                    .insert(s.key.as_str());
+            }
+        }
+    }
+
     /// Resolve raw `(prefix, target host)` rules to rewrites: the target names exactly one
     /// service, else the rule is dropped. Pure function of the service list (tested).
     pub(crate) fn resolve_rewrites(
@@ -1233,18 +1251,21 @@ pub(crate) fn add_consumes(
     endpoints: &[EndpointRef],
     services: &[ServiceRef],
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    add_consumes_with(b, sites, endpoints, services, &[])
+    add_consumes_with(b, sites, endpoints, services, &[], &[])
 }
 
-/// Stitches every site with gateway rewrites (contract M6g S3).
-pub(crate) fn add_consumes_with(
+/// Stitches every site with gateway rewrites (contract M6g S3) and host aliases
+/// (contract M6g S4).
+pub(crate) fn add_consumes_with<'e>(
     b: &mut GraphBuilder,
     sites: &[Site],
-    endpoints: &[EndpointRef],
-    services: &[ServiceRef],
+    endpoints: &'e [EndpointRef],
+    services: &'e [ServiceRef],
     rewrites: &[GatewayRewrite],
+    aliases: &[(String, String)],
 ) -> anyhow::Result<Vec<Diagnostic>> {
-    let stitcher = Stitcher::with_rewrites(endpoints, services, rewrites.to_vec());
+    let mut stitcher = Stitcher::with_rewrites(endpoints, services, rewrites.to_vec());
+    stitcher.add_host_aliases(services, aliases);
     struct Merged {
         certainty: Certainty,
         attrs: Attrs,
@@ -1553,7 +1574,65 @@ mod tests {
         assert!(links[0].contains("via_gateway"), "{links:?}");
     }
 
-    /// Contract M6g S3: resolving raw rules drops unknown and ambiguous targets, never edges.
+    /// `one` with host aliases (contract M6g S4).
+    fn one_aliased(
+        endpoints: &[EndpointRef],
+        aliases: &[(String, String)],
+        s: &Site,
+    ) -> (Bucket, Vec<String>) {
+        let services = services();
+        let mut stitcher = Stitcher::new(endpoints, &services);
+        stitcher.add_host_aliases(&services, aliases);
+        let o = stitcher.site(s);
+        let links = o
+            .links
+            .iter()
+            .map(|l| {
+                format!(
+                    "{} [{}] {}",
+                    endpoints[l.endpoint].key,
+                    l.certainty.as_str(),
+                    Value::Object(l.attrs.clone())
+                )
+            })
+            .collect();
+        (o.bucket, links)
+    }
+
+    /// Contract M6g S4: an alias makes a new host spelling pin to its service; a name
+    /// aliasing two services stays ambiguous; an unknown service key reads as nothing.
+    #[test]
+    fn host_aliases_extend_the_host_rule() {
+        let eps = vec![
+            ep("POST", "/v1/login", AUTH),
+            ep("POST", "/v1/login", NOTIFICATION),
+        ];
+        // No alias: the invented host names no service.
+        let call = site(
+            WEB,
+            Some("POST"),
+            Some(("http://login/v1/login", Literal)),
+            1,
+        );
+        assert_eq!(one(&eps, &call).0, Bucket::External);
+        // One alias: the host pins to auth alone (exact path, known method, stated host).
+        let auth = vec![("login".to_owned(), AUTH.to_owned())];
+        let (bucket, links) = one_aliased(&eps, &auth, &call);
+        assert_eq!(bucket, Bucket::Synthetic);
+        assert_eq!(links.len(), 1);
+        assert!(links[0].contains("@services/auth"), "{links:?}");
+        // The same name for two services: the host restricts nothing.
+        let both = vec![
+            ("login".to_owned(), AUTH.to_owned()),
+            ("login".to_owned(), NOTIFICATION.to_owned()),
+        ];
+        let (bucket, links) = one_aliased(&eps, &both, &call);
+        assert_eq!(bucket, Bucket::Ambiguous);
+        assert_eq!(links.len(), 2);
+        // An unknown service key reads as nothing: still external.
+        let unknown = vec![("login".to_owned(), "services/none".to_owned())];
+        assert_eq!(one_aliased(&eps, &unknown, &call).0, Bucket::External);
+    }
     #[test]
     fn gateway_rewrite_resolution_drops_unknown_and_ambiguous_targets() {
         let services = services();

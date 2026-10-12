@@ -268,6 +268,22 @@ pub fn index_commit(
         .filter(|f| rb_frameworks::gateway::is_gateway_input(&f.path) && !f.binary)
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
+    let host_files = manifest
+        .files
+        .iter()
+        .filter(|f| rb_frameworks::hosts::is_hosts_input(&f.path) && !f.binary)
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<BTreeMap<&str, String>>>()?;
+    let rb_hosts = manifest
+        .files
+        .iter()
+        .find(|f| f.path == "rb.toml" && !f.binary)
+        .map(|f| {
+            repo.blob_text(&f.blob_sha)
+                .map(|t| rb_frameworks::hosts::rb_toml_hosts(&t))
+        })
+        .transpose()?
+        .unwrap_or_default();
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
@@ -280,6 +296,8 @@ pub fn index_commit(
         specs,
         mappers,
         gateways,
+        host_files,
+        rb_hosts,
         words,
     };
 
@@ -363,6 +381,10 @@ pub struct Content<'a> {
     /// Gateway texts by path (`nginx.conf`, Spring Gateway `application*`/`bootstrap*` YAML;
     /// contract M6g S3).
     pub gateways: BTreeMap<&'a str, String>,
+    /// Host-name texts by path (Compose files, Kubernetes YAML; contract M6g S4).
+    pub host_files: BTreeMap<&'a str, String>,
+    /// The root `rb.toml`'s `[[hosts]]` entries: `(service directory, names; contract M6g S4).
+    pub rb_hosts: Vec<(String, Vec<String>)>,
     /// Where the definitions' names occur in every non-binary file (contract M4b S12 (f)); the
     /// default is "not scanned", under which no symbol is orphan-eligible.
     pub words: liveness::Words,
@@ -957,11 +979,66 @@ pub fn assemble(
         }
     }
     let rewrites = stitch::Stitcher::resolve_rewrites(&gateway_rules, &services);
-    if rewrites.is_empty() {
+    // Host names (contract M6g S4): Compose/k8s names owned by path alias their service;
+    // root-level names match services by key basename or name; `rb.toml` maps explicitly.
+    // Names matching nothing are counted, never edges; duplicates stay ambiguous.
+    let mut host_aliases: Vec<(String, String)> = Vec::new();
+    for (dir, names) in &content.rb_hosts {
+        match boundaries.projects().iter().find(|p| &p.dir == dir) {
+            Some(p) => host_aliases.extend(names.iter().map(|n| (n.clone(), p.dir.clone()))),
+            None => diagnostics.push(Diagnostic {
+                kind: "hosts_unmatched".into(),
+                path: Some("rb.toml".to_owned()),
+                span: None,
+                detail: json!({ "service": dir, "names": names }),
+            }),
+        }
+    }
+    for (path, text) in &content.host_files {
+        let mut names = Vec::new();
+        if rb_frameworks::hosts::is_compose_input(path) {
+            names.extend(rb_frameworks::hosts::compose_names(text));
+        }
+        names.extend(rb_frameworks::hosts::k8s_service_names(text));
+        if names.is_empty() {
+            continue;
+        }
+        match boundaries.project_for(path) {
+            Some(p) => host_aliases.extend(names.into_iter().map(|n| (n, p.dir.clone()))),
+            None => {
+                let mut matched = false;
+                for service in &services {
+                    let base = service.key.rsplit('/').next().unwrap_or(&service.key);
+                    for name in &names {
+                        if base.eq_ignore_ascii_case(name)
+                            || service.name.eq_ignore_ascii_case(name)
+                        {
+                            host_aliases.push((name.clone(), service.key.clone()));
+                            matched = true;
+                        }
+                    }
+                }
+                if !matched {
+                    diagnostics.push(Diagnostic {
+                        kind: "hosts_unmatched".into(),
+                        path: Some((*path).to_owned()),
+                        span: None,
+                        detail: json!({ "names": names }),
+                    });
+                }
+            }
+        }
+    }
+    if rewrites.is_empty() && host_aliases.is_empty() {
         diagnostics.extend(stitch::add_consumes(&mut b, &sites, &endpoints, &services)?);
     } else {
         diagnostics.extend(stitch::add_consumes_with(
-            &mut b, &sites, &endpoints, &services, &rewrites,
+            &mut b,
+            &sites,
+            &endpoints,
+            &services,
+            &rewrites,
+            &host_aliases,
         )?);
     }
     let (orm_index, orm_diagnostics) = orm::add_mappings(&mut b, &files, &prisma, &keys)?;
