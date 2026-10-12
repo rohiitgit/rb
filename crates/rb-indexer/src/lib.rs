@@ -20,6 +20,7 @@ mod sql;
 mod stitch;
 mod syntax;
 mod topics;
+mod xml_beans;
 
 pub use projects::{
     NoScipCache, ScipCache, ScipCacheEntry, ScipMode, ScipOptions, ScipProject, WriteOnlyScipCache,
@@ -1043,6 +1044,7 @@ pub fn assemble(
         depends: &depends,
         unparsed: &content.unparsed,
         manifests: &content.manifests,
+        xml: &content.mappers,
     });
     let fragments = resolution.fragments.clone();
     let points = std::mem::take(&mut resolution.points);

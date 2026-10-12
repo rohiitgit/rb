@@ -657,6 +657,7 @@ mod tests {
         // The fragment interfaces as the pipeline computes them (DI's Spring Data beans).
         let (depends, unparsed) = (BTreeMap::new(), rb_frameworks::clients::RawScan::default());
         let empty_manifests: BTreeMap<&str, String> = BTreeMap::new();
+        let empty_xml: BTreeMap<&str, String> = BTreeMap::new();
         let fragments = crate::di::resolve(&crate::di::Inputs {
             files: &by_path,
             keys: &keys,
@@ -666,6 +667,7 @@ mod tests {
             depends: &depends,
             unparsed: &unparsed,
             manifests: &empty_manifests,
+            xml: &empty_xml,
         })
         .fragments;
         let coverage = apply(

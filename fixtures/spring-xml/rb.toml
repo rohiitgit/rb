@@ -1,0 +1,4 @@
+# The Spring sources are plain files: no build manifest, but they are one service.
+[[service]]
+path = "."
+name = "shop"

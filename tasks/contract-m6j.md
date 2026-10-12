@@ -252,3 +252,20 @@ shared buckets). A `DB`-named decoy bean pins that tokens never match auto-names
 Fixture `ts-nest` with reviewed dump golden and 3/3 guards. Tests-first; 6/6 pack
 mutants killed (providers[] masked the decorator gates until the unit dropped its
 `@Module`), lane bites proven end-to-end (exact-forcer, names-widening).
+
+5. **(phase 4) Spring XML.** F5 decided: no new Symbol nodes — `<bean>` targets its
+resolved class (FQ or simple-name match, nested-aware; 0/2+ matches skip), ids and
+aliases ride names and qualifiers; refs become points owned by the consumer class with
+XML evidence (element resolved through same-service ids, qualifier always the id).
+Reader (`xml_beans.rs`) over the generic `Element` tree: beans/aliases/scans, abstract
+and class-less beans skipped, value-only properties ignored, spans computed. Engine:
+`Inputs.xml` (all `.xml` texts; 7 construction sites), XML beans merged into the shared
+bean set (Java points match them too), XML scans union into roots (unknown stays
+unknown; repositories follow defaults), read files retire their `beans namespace`
+finding, `Origin::XmlBean` eligible ignoring scans. Fixture `spring-xml` (plain: 2
+points, zero gates) with reviewed dump golden and 4/3 guards incl. qualifier attrs and
+an alias-traversed edge. Tests-first (reader units); 7/7 reader mutants + X1–X5 e2e
+bites (incl. an eligible-arm false-no-bite that exposed the lane bypassing per-origin
+checks — fixed by mirroring the full match). Residue: parent-bean merge, nested
+`<bean>`, `scope` modeling, `spring.factories`, unresolvable-id points (unresolved,
+counted).

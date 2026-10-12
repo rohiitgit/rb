@@ -1,0 +1,7 @@
+# Precision guards (contract M6j S4): forbidden edges. A non-`*` source must name a node
+# of the dump, so a misspelt key cannot pass vacuously.
+# DI is never exact; wiring never runs backwards or across beans.
+INJECTS * -> * [exact]
+INJECTS rb-heuristic . . . `src/Db.java`/Db# -> rb-heuristic . . . `src/Store.java`/Store# [heuristic]
+INJECTS rb-heuristic . . . `src/Helper.java`/Helper# -> rb-heuristic . . . `src/Db.java`/Db# [heuristic]
+INJECTS rb-heuristic . . . `src/Audit.java`/Audit# -> rb-heuristic . . . `src/Db.java`/Db# [heuristic]

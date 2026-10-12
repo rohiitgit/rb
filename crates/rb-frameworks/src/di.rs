@@ -77,6 +77,9 @@ pub enum Origin {
     /// A Dagger `@Binds` method or a Guice `bind(X).to(Y)` pair (contract M6j S2): the
     /// binding declaration, typed by the bound type.
     Binds,
+    /// A Spring `<bean>` (contract M6j S4): targets its resolved class definition; the
+    /// `id` and aliases ride names and qualifiers.
+    XmlBean,
 }
 
 impl Origin {
@@ -89,6 +92,7 @@ impl Origin {
             Origin::Singleton => "singleton",
             Origin::Injectable => "injectable",
             Origin::Binds => "binds",
+            Origin::XmlBean => "xml_bean",
         }
     }
 }
