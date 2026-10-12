@@ -964,6 +964,6 @@ Same rules as M6d:
 - [x] **2. Topic graph** (S2). Done (amendment 3): Topic/PUBLISHES/SUBSCRIBES kinds, stage wired, placeholder resolution; mutants.
 - [ ] M6g phases 3+ (gateway packs, host names, Spring YAML, fixture, measurements, evaluator).
 - [ ] M6h Architecture rules as a CI gate (`rb check` in Cypher).
-- [ ] M6i Kotlin and C# syntax.
+- [x] M6i Kotlin and C# syntax (closed 2026-10-12, amendments 1–8; passes 1–2 PASS).
 - [ ] M6j DI breadth (Guice, Dagger, NestJS, Spring XML and Kotlin beans, .NET over Tier B).
 - Deferred beyond M6: scip-clang, `rust-analyzer scip`, scip-dotnet, the SCIP incremental below a single-root reactor, authentication/remote binding/`POST …/index` and move detection (only if asked for). Dropped: Groovy registrants.

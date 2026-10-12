@@ -505,3 +505,7 @@
 ## 2026-10-12: `--lib` on a binary-only package proves nothing
 - **Mistake (caught by reading the output):** a mutant battery reported SURVIVED because `cargo test -p rb-cli --lib` errors (no library targets) — the grep found no FAILED in a compile error.
 - **Rule:** the battery must distinguish test failure from harness failure: use the package's real test target (`--bin rb` here) and treat anything but an explicit `test result: FAILED` (or the expected failure line) as invalid, never as survived.
+
+## 2026-10-12: the same-file parallel-edit race bites the edit tool too
+- **Mistake (caught by re-reading the function):** two edits to `resolve.rs` in one parallel block raced; last-write-wins silently dropped the match-arm fix while keeping the gate fix, and the test kept failing for a reason that looked semantic. Restatement of the existing parallel-edit rule, now with the mechanism: parallel calls snapshot the same file state.
+- **Rule:** one file, one edit per block — no exceptions, even for "independent" hunks. After any same-file sequence, re-read the region before testing.

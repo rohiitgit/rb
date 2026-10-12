@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-10-12] (wall clock) M6i CLOSED (evaluator passes 1–2)
+- Phases 0–2 (amendments 1–3): preflight (baseline binary, grammar pins, coroutines + automapper pins); Kotlin + C# grammars (hand-written Kotlin tags, C# invocation supplement); Tier B imports→implements with `kotlin-gradle` + `csharp` fixtures and 11/4 biting guards — each test-first with killed mutants.
+- Phase 3 (amendment 4): Kotlin exact edges through scip-java (fixture builds at Kotlin 2.2.0, 0 new calibrations, pair-wise Tier-B agreement, `scip_kotlin_gradle` e2e).
+- Phase 5 (amendment 5): coroutines +30,496 / automapper +30,239 rows, every row classified (all new-language; 7 Java→Kotlin interop edges source-verified); 6 source-read samples correct, 0 false edges.
+- Follow-up (amendment 6): pass-1 probing caught a Kotlin wildcard-import miss → 1-line arm fix + unit, mutant bites; `PIPELINE` `m6i-1` (amendment 7, metadata-only).
+- Close (amendment 8): `java-gradle-catalog` golden re-bless (+1 classified row + status recompute; census proves it the only stale golden).
+- Pass 1 (`tasks/eval-m6i-pass1.md`): VERDICT PASS with H1 in-tree (wildcard fix) + 8 probes, mutant killed.
+- Pass 2 (`tasks/eval-m6i-pass2.md`): VERDICT PASS — repros re-run, close verify stands (fmt, clippy, 888 units, store 72, server 12, e2e 42/42, api 1/1).
+- Invariant 1: 12/13 fixture comparisons identical + 1 classified (build.gradle.kts parses as Kotlin); both SCIP legs identical.
+- Files: `crates/rb-syntax/src/{queries,lib,imports,bindings,calls,decorations}.rs`, `crates/rb-indexer/src/{modules,resolve,lib}.rs`, `crates/rb-cli/tests/{e2e.rs,golden/{kotlin-gradle,csharp,java-gradle-catalog}}`, `fixtures/{kotlin-gradle,csharp}/`; records `tasks/{contract-m6i,eval-m6i-pass1,eval-m6i-pass2,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-12] (wall clock) M6h CLOSED (evaluator passes 1–2)
 - Phases 0–1 (amendments 1–2): preflight (baseline binary, `rb check` name free, read-only + timeout path, AGE labels, fixture inventory); rule module with relational twins (orphans, unowned writes, service cycles + Cypher each) — test-first, 3/3 mutants killed.
 - Phases 2–3 (amendments 3–4): `rb check` CLI gate (read-only path, sorted lines, JSON, exit 0/1/2; live-fired on topo + polyglot; AGE rebinding fix); check goldens + twin parity e2e on 4 fixtures (orphans live everywhere) + topo orphan endpoint with biting guards.

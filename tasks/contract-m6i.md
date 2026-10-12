@@ -284,3 +284,13 @@ in-repo to resolve to). No e2e had run on M6i code since phase 2, so no earlier 
 have caught it. A `.kt`/`.kts`/`.cs` census over all old fixtures proves this is the only
 stale golden (2 files, both here). Re-blessed with `RB_BLESS=1`, diff reviewed row by row,
 then re-run green without bless.
+
+9. **(close) Passes, records, push.** Pass 1 (`tasks/eval-m6i-pass1.md`): VERDICT PASS with
+H1 in-tree + 8 probes, mutant killed. Pass 2 (`tasks/eval-m6i-pass2.md`):
+verification-only VERDICT PASS. Records: CHANGELOG (M6i entry), IMPLEMENT (M6i section),
+lessons (parallel-edit race restated with mechanism), design §13 row, todo. **M6i closed
+2026-10-12.** Head binary `target/release/rb` sha256 `23723d89…` (release; the commits
+after the verified code tree touch records + goldens only). Residue carried forward:
+syntax-error grammar gaps (18 files); RunBlocking-style static-import precision; untyped
+constructor-call values; extension receivers; nested-type star-import fallback; Kotlin
+Maven builds; C# executable builds (no dotnet); scip-dotnet beyond M6. Next owner: M6j.
