@@ -137,6 +137,20 @@ pub struct FileRoutes {
     pub routers: Vec<RouterDecl>,
     pub mounts: Vec<Mount>,
     pub diagnostics: Vec<RouteDiagnostic>,
+    /// Mappings on interface methods (contract M6f S4b): counted, not resolved (D12 — no
+    /// endpoints from interfaces alone). A spec operation matching one is handled by the
+    /// method's implementors.
+    pub interface_routes: Vec<InterfaceRoute>,
+}
+
+/// One mapping on an interface method: the composed raw path, methods, the method's
+/// definition and the mapping's span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceRoute {
+    pub path: String,
+    pub methods: Vec<String>,
+    pub def: usize,
+    pub span: Span,
 }
 
 /// Every route fact of one file.
@@ -471,13 +485,36 @@ fn spring(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 {
                     continue;
                 }
+                let class_paths: Vec<String> = def
+                    .decorations
+                    .iter()
+                    .find(|d| is_annotation(facts, d, SPRING_WEB, "RequestMapping"))
+                    .map(|d| mapping_paths(d).unwrap_or_default())
+                    .unwrap_or_else(|| vec![String::new()]);
                 for &m in &methods {
-                    for (d, _) in mappings(facts, &defs[m].decorations) {
+                    for (d, fixed) in mappings(facts, &defs[m].decorations) {
                         out.diagnostics.push(RouteDiagnostic {
                             kind: "route_on_interface",
                             span: d.span,
                             detail: format!("{}#{}", def.name, defs[m].name),
                         });
+                        // Recorded for spec-operation joining (contract M6f S4b); dynamic
+                        // paths stay out silently (counted above).
+                        let Ok(paths) = mapping_paths(d) else {
+                            continue;
+                        };
+                        let verbs =
+                            fixed.map_or_else(|| mapping_methods(d), |f| vec![f.to_owned()]);
+                        for prefix in &class_paths {
+                            for path in &paths {
+                                out.interface_routes.push(InterfaceRoute {
+                                    path: join(prefix, path),
+                                    methods: verbs.clone(),
+                                    def: m,
+                                    span: d.span,
+                                });
+                            }
+                        }
                     }
                 }
             }

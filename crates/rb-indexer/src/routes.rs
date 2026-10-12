@@ -9,8 +9,8 @@ use rb_frameworks::endpoint::{
     endpoint_key, endpoint_name, grpc_key, norm_path, prefix_unknown_key,
 };
 use rb_frameworks::routes::{
-    FileRoutes, FileScope, Framework, Handler, RouteBase, RouterKind, binding_identity,
-    gin_group_prefix,
+    FileRoutes, FileScope, Framework, Handler, InterfaceRoute, RouteBase, RouterKind,
+    binding_identity, gin_group_prefix,
 };
 use rb_model::{
     Attrs, Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
@@ -584,7 +584,7 @@ pub(crate) fn add_endpoints(
             }
         }
     }
-    add_spec_endpoints(&mut endpoints, &mut diagnostics, inputs);
+    add_spec_endpoints(b, &mut endpoints, &mut diagnostics, inputs);
     let added = endpoints
         .into_iter()
         .map(|(key, e)| {
@@ -601,6 +601,7 @@ pub(crate) fn add_endpoints(
 /// endpoint-less and counted; operations with no code route are kept, exact, unhandled and
 /// counted per registration.
 fn add_spec_endpoints(
+    b: &GraphBuilder,
     endpoints: &mut BTreeMap<String, Endpoint>,
     diagnostics: &mut Vec<Diagnostic>,
     inputs: &Inputs<'_, '_>,
@@ -613,6 +614,23 @@ fn add_spec_endpoints(
     };
     let mut specs: Vec<(&str, &String)> = inputs.specs.iter().map(|(p, t)| (*p, t)).collect();
     specs.sort();
+    // Interface mappings by service (contract M6f S4b): a spec operation matching one is
+    // handled by the declaration and its implementors.
+    let mut interfaces: BTreeMap<String, Vec<(&str, &InterfaceRoute)>> = BTreeMap::new();
+    for (path, file) in inputs.routes {
+        rb_frameworks::work::tick(1);
+        if file.interface_routes.is_empty() {
+            continue;
+        }
+        let service = (inputs.service_of)(path);
+        for route in &file.interface_routes {
+            rb_frameworks::work::tick(1);
+            interfaces
+                .entry(service.clone())
+                .or_default()
+                .push((path, route));
+        }
+    }
     for (spec_path, text) in specs {
         rb_frameworks::work::tick(1);
         if !(inputs.has_project)(spec_path) {
@@ -669,6 +687,7 @@ fn add_spec_endpoints(
             continue;
         };
         for op in ops {
+            rb_frameworks::work::tick(1);
             let norm = norm_path(&op.path);
             let key = endpoint_key(&op.method, &norm, &service);
             let e = endpoints.entry(key).or_insert_with(|| Endpoint {
@@ -694,6 +713,38 @@ fn add_spec_endpoints(
                 composed_from: Vec::new(),
                 from_spec: true,
             });
+            // Interface mappings the operation matches (contract M6f S4b): handled by the
+            // declaration (`exact`) and each implementor (`heuristic`).
+            if let Some(routes) = interfaces.get(&service) {
+                for (ipath, route) in routes {
+                    rb_frameworks::work::tick(1);
+                    if !route.methods.iter().any(|m| m == &op.method)
+                        || norm_path(&route.path) != norm
+                    {
+                        continue;
+                    }
+                    let iface =
+                        NodeKey::new(NodeKind::Symbol, inputs.keys[*ipath][route.def].clone());
+                    let mut handler = vec![(iface.clone(), Certainty::Exact, None)];
+                    for implementor in b.implementors(&iface) {
+                        if implementor == iface {
+                            continue;
+                        }
+                        handler.push((implementor, Certainty::Heuristic, None));
+                    }
+                    e.registrations.push(Registration {
+                        path_certainty: Certainty::Exact,
+                        handler,
+                        candidates: 0,
+                        at: Evidence {
+                            path: (*ipath).to_owned(),
+                            span: route.span,
+                        },
+                        composed_from: Vec::new(),
+                        from_spec: true,
+                    });
+                }
+            }
         }
     }
     for e in endpoints.values() {
@@ -994,6 +1045,9 @@ mod tests {
             .collect();
         let config_unread: BTreeSet<String> =
             config_unread.iter().map(|s| (*s).to_owned()).collect();
+        // Tier B resolution, as production runs it before this stage: calls, types and
+        // `IMPLEMENTS` edges exist for handler roll-down (contract M6f S4b).
+        let mut tier_b = crate::resolve::add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
         let spec_texts: BTreeMap<&str, String> =
             specs.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
         let has_project = |p: &str| {
@@ -1014,7 +1068,8 @@ mod tests {
             specs: &spec_texts,
             has_project: &has_project,
         };
-        let (diagnostics, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
+        let (mut diagnostics, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
+        diagnostics.splice(0..0, tier_b.drain(..));
         Built {
             graph: b.finish().unwrap(),
             diagnostics,
@@ -1079,7 +1134,15 @@ mod tests {
         let row = AUTH[..arrow].matches('\n').count() as i64;
         assert_eq!(login.attrs["handler_spans"][0][0], row);
         assert_eq!(login.evidence[0].path, "api/src/routes/auth.ts");
-        assert!(built.diagnostics.is_empty(), "{:?}", diagnostics(&built));
+        // Tier B resolution runs in this harness as in production, so its
+        // `unresolved_references` counts ride along; no route diagnostic.
+        assert!(
+            diagnostics(&built)
+                .iter()
+                .all(|d| d.starts_with("unresolved_references")),
+            "{:?}",
+            diagnostics(&built)
+        );
         let node = g
             .nodes()
             .iter()
@@ -1554,6 +1617,39 @@ mod tests {
         assert!(ops.contains(&("HTTP GET /users @api", vec!["listUsers"])));
         assert!(ops.contains(&("HTTP POST /users @api", vec!["addUser"])));
         assert!(ops.contains(&("HTTP GET /missing @api", vec!["getMissing"])));
+    }
+
+    /// Contract M6f S4b: a spec operation matching an interface mapping is handled by the
+    /// interface declaration (`exact`) and its implementors (`heuristic`); without a spec,
+    /// interface mappings stay invisible (D12).
+    #[test]
+    fn spec_operations_on_interfaces_roll_down_to_implementors() {
+        let api = "package p;\nimport org.springframework.web.bind.annotation.*;\npublic interface UsersApi {\n  @GetMapping(\"/users\")\n  String list();\n}\n";
+        let ctrl = "package p;\nclass UserController implements UsersApi {\n  public String list() { return \"\"; }\n}\n";
+        let spec = "openapi: 3.0.0\npaths:\n  /users:\n    get:\n      operationId: listUsers\n";
+        let files = [
+            ("api/UsersApi.java", Language::Java, api),
+            ("api/UserController.java", Language::Java, ctrl),
+        ];
+        let built = build_with_specs(&files, &[("api/openapi.yaml", spec)], &[]);
+        assert_eq!(
+            edges(&built),
+            [
+                "EXPOSES api -> HTTP GET /users @api [exact]",
+                "HANDLED_BY HTTP GET /users @api -> rb-heuristic . . . `api/UserController.java`/UserController#list(). [heuristic]",
+                "HANDLED_BY HTTP GET /users @api -> rb-heuristic . . . `api/UsersApi.java`/UsersApi#list(). [exact]",
+            ]
+        );
+        // Without the spec the interface mapping stays invisible.
+        let built = build(&files, &[]);
+        assert!(edges(&built).is_empty());
+        assert!(
+            diagnostics(&built)
+                .iter()
+                .any(|d| d.starts_with("route_on_interface")),
+            "{:?}",
+            diagnostics(&built)
+        );
     }
 
     /// Contract M6f S3: proto services become `GRPC` endpoints of their service; a spec

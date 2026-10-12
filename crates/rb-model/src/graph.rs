@@ -220,6 +220,21 @@ impl GraphBuilder {
             .collect()
     }
 
+    /// The sources of `IMPLEMENTS` edges into `dst` added so far: the definitions
+    /// implementing it (contract M6f S4b: a route handled by an interface method is also
+    /// handled by its implementors). One pass over the edges.
+    pub fn implementors(&self, dst: &NodeKey) -> Vec<NodeKey> {
+        let mut out: Vec<NodeKey> = self
+            .edges
+            .keys()
+            .filter(|(_, k, d, _)| *k == EdgeKind::Implements && d == dst)
+            .map(|(src, _, _, _)| src.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Sets attribute `name` to `value` on every edge of `kind` added so far whose source is in
     /// `sources`; returns how many edges it set (contract M4b D4: RTA's
     /// `impl_instantiated: false` on `IMPLEMENTS`, set once every producer has run). An edge
