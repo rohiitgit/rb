@@ -216,3 +216,28 @@ change; SCIP legs per precedent) and `p8-measure.sh` (guice/springfu/automapper
 @ M6j pins; nest/jpetstore excluded — M6k touches neither TS nor XML).
 Release head binary sha `99d7156c…`. Logs `var/m6k/logs/p9-invariant.log`,
 `p8-measure.log`. (Results recorded here on completion.)
+
+7. **(pass 1) Dotted namespaces + diagnostic siting.** File-scoped namespaces with
+dotted names never matched the module query (it took only bare `identifier`s), so
+their files silently lost same-namespace resolution; the M6k global-namespace
+fallback then merged them all under `("","")`, producing cross-namespace matches
+in the automapper leg (e.g. `IgnoreAttribute` → `IMemberConfigurationProvider`,
+different namespaces, no using — a false positive, caught by source-reading the
+new pair). Fix: both namespace forms accept bare or dotted names (`queries.rs`) +
+unit; the `("","")` fallback stays, now correctly scoped to genuinely
+namespace-less files (miniature-proven: same dotted-namespace resolves,
+cross-namespace `Decoy` stays silent). Static `[Inject]` properties excluded;
+`@Assisted` import-gating proven; anchored `di_unresolved` diagnostics site the
+record file (the XML lane's owner-path-with-foreign-span shape stays as
+precedent, out of scope). The first automapper leg is VOID (measured the
+intermediate); invariant + measurement rerun on the final tree (amendment 8).
+
+8. **(pass 1) Enclosing-namespace scope.** Rerun analysis showed 62 lost true
+edges: parent-namespace visibility base covered by accident through the
+outer-namespace `using` fallback (e.g. `IGlobalConfiguration` in
+`AutoMapper.Internal` → `IConfigurationProvider` in `AutoMapper`, no using).
+Fix: C# `same_package` walks enclosing namespaces nearest-first with hiding,
+plus global last (all genuine C# visibility, no new guess). Miniature-proven
+both directions and pinned in the fixture (`SubHelper.cs` resolves,
+`OtherDecoy.cs` silent, both guards bite). Release `d07cf7e1` superseded;
+invariant + measurement rerun on the final tree (amendment 9).
