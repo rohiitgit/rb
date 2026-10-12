@@ -372,6 +372,26 @@ enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Check the live snapshot against the built-in architecture rules: prints violations
+    /// (sorted by rule, source, target) and exits 0 when clean, 1 on violations, 2 on errors.
+    Check {
+        #[arg(long)]
+        repo: Option<String>,
+        /// Run only this rule (orphan_endpoints, unowned_table_writes, service_cycles).
+        #[arg(long)]
+        rule: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// The Cypher statement timeout in milliseconds for each rule (1-30000).
+        #[arg(
+            long,
+            env = "RB_CYPHER_TIMEOUT_MS",
+            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
+            value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
+        )]
+        timeout_ms: u64,
+    },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
         /// openCypher query, e.g. "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)".
@@ -549,6 +569,14 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                     store.prune_scip(&[&java, rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE], dry_run)?;
                 println!("scip: {verb} {} rows, {} bytes", r.rows, r.bytes);
             }
+        }
+        Command::Check {
+            repo,
+            rule,
+            json,
+            timeout_ms,
+        } => {
+            return check_rules(&mut store, repo, rule, json, timeout_ms);
         }
         question => {
             let asked = asked(question).expect("every other command is a question");
@@ -744,6 +772,7 @@ fn asked(command: Command) -> Option<Asked> {
         }
         Command::Migrate
         | Command::Index(_)
+        | Command::Check { .. }
         | Command::Serve { .. }
         | Command::Dump { .. }
         | Command::Gc { .. }
@@ -2228,6 +2257,89 @@ fn percent(part: usize, total: usize) -> usize {
     }
 }
 
+/// One `rb check` violation line: `rule src -> dst`, sorted by (rule, src, dst) by construction.
+fn check_line(rule: &str, src: &str, dst: &str) -> String {
+    format!("{rule} {src} -> {dst}")
+}
+
+/// Runs the built-in architecture rules' Cypher queries against the live snapshot (contract M6h
+/// S3–S4): the shared read-only `cypher()` path carries the timeout and row cap, so rules can
+/// neither write nor hang the database. Exit 0 when clean, 1 on violations, 2 on errors.
+fn check_rules(
+    store: &mut Store,
+    repo: Option<String>,
+    rule: Option<String>,
+    json: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<ExitCode> {
+    let outcome = (|| -> anyhow::Result<Vec<(String, String, String)>> {
+        let snap = live_snapshot(store, repo)?;
+        let selected: Vec<&rb_store::check::Rule> = match &rule {
+            Some(name) => vec![
+                rb_store::check::RULES
+                    .iter()
+                    .find(|r| r.name == name)
+                    .with_context(|| format!("unknown rule {name:?}"))?,
+            ],
+            None => rb_store::check::RULES.iter().collect(),
+        };
+        let limits = rb_store::CypherLimits {
+            timeout_ms,
+            rows: rb_store::CYPHER_ROWS_MAX,
+        };
+        let mut violations = Vec::new();
+        for r in selected {
+            let rows = store.cypher(
+                snap.id,
+                r.cypher,
+                &["src".to_owned(), "dst".to_owned()],
+                limits,
+            )?;
+            for row in rows.rows {
+                violations.push((r.name.to_owned(), row[0].clone(), row[1].clone()));
+            }
+        }
+        violations.sort();
+        Ok(violations)
+    })();
+    let violations = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "rules": violations
+                    .iter()
+                    .map(|(rule, src, dst)| serde_json::json!({
+                        "rule": rule,
+                        "src": src,
+                        "dst": dst,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        for (rule, src, dst) in &violations {
+            println!("{}", check_line(rule, src, dst));
+        }
+        println!(
+            "check: {} violation{}",
+            violations.len(),
+            if violations.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(if violations.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
     let repo = match repo {
         Some(r) => r,
@@ -2350,6 +2462,19 @@ mod tests {
             "  profile: age File (File.csv): 3 rows, 120 bytes, 4.0 ms\n\
              \x20 profile: age QUERIES (QUERIES.ops.csv): 2 rows, 90 bytes, 6.0 ms\n\
              \x20 profile: age total: 2 files, 5 rows, 210 bytes, 10.0 ms\n"
+        );
+    }
+
+    /// Contract M6h S3: `rb check` violation lines name the rule, source and target.
+    #[test]
+    fn check_lines_name_rule_source_and_target() {
+        assert_eq!(
+            check_line(
+                "orphan_endpoints",
+                "services/auth",
+                "HTTP GET /x @services/auth"
+            ),
+            "orphan_endpoints services/auth -> HTTP GET /x @services/auth"
         );
     }
 

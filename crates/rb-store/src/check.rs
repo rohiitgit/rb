@@ -35,7 +35,7 @@ pub const RULES: &[Rule] = &[
     Rule {
         name: RULE_UNOWNED_TABLE_WRITES,
         description: "an insert/update/delete/merge query on a table migrated by another service",
-        cypher: "MATCH (t:Table)<-[q:QUERIES]-(x) WHERE ANY(op IN q.ops WHERE op IN ['insert', 'update', 'delete', 'merge']) OPTIONAL MATCH (x)-[:DEFINED_IN]->(df:File) WITH t, COALESCE(df, x) AS f MATCH (f)-[:IN_SERVICE]->(s:Service) OPTIONAL MATCH (mf:File)-[:MIGRATES]->(t) OPTIONAL MATCH (mf)-[:IN_SERVICE]->(o:Service) WITH s, t, COLLECT(DISTINCT o.key) AS owners WHERE NOT s.key IN owners AND SIZE(owners) > 0 RETURN s.key, t.key ORDER BY s.key, t.key",
+        cypher: "MATCH (t:Table)<-[q:QUERIES]-(x) WHERE ANY(op IN q.ops WHERE op IN ['insert', 'update', 'delete', 'merge']) OPTIONAL MATCH (x)-[:DEFINED_IN]->(df:File)-[:IN_SERVICE]->(s1:Service) OPTIONAL MATCH (x)-[:IN_SERVICE]->(s2:Service) OPTIONAL MATCH (mf:File)-[:MIGRATES]->(t) OPTIONAL MATCH (mf)-[:IN_SERVICE]->(o:Service) WITH t, COALESCE(s1, s2) AS s, COLLECT(DISTINCT o.key) AS owners WHERE NOT s.key IN owners AND SIZE(owners) > 0 RETURN s.key, t.key ORDER BY s.key, t.key",
     },
     Rule {
         name: RULE_SERVICE_CYCLES,
