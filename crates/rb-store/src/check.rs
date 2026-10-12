@@ -535,6 +535,43 @@ mod tests {
         );
     }
 
+    /// Contract M6h S1 (evaluator pass 1, A1): a `QUERIES` edge without an `ops` attribute
+    /// never fires (both twins skip it: no provable write).
+    #[test]
+    fn queries_without_ops_never_fire() {
+        let mut b = GraphBuilder::new();
+        for (key, name, attrs) in [
+            svc("a"),
+            (NodeKey::new(NodeKind::File, "a/f"), "f", Attrs::new()),
+            (NodeKey::new(NodeKind::Symbol, "s"), "s", Attrs::new()),
+            (NodeKey::new(NodeKind::Table, "public.t"), "t", Attrs::new()),
+        ] {
+            b.add_node(key, name, attrs).unwrap();
+        }
+        let plain = |src: NodeKey, kind: EdgeKind, dst: NodeKey| {
+            NewEdge::new(src, kind, dst, Provenance::Treesitter, Certainty::Exact)
+        };
+        b.add_edge(plain(
+            NodeKey::new(NodeKind::File, "a/f"),
+            EdgeKind::InService,
+            NodeKey::new(NodeKind::Service, "a"),
+        ))
+        .unwrap();
+        b.add_edge(plain(
+            NodeKey::new(NodeKind::Symbol, "s"),
+            EdgeKind::DefinedIn,
+            NodeKey::new(NodeKind::File, "a/f"),
+        ))
+        .unwrap();
+        b.add_edge(plain(
+            NodeKey::new(NodeKind::Symbol, "s"),
+            EdgeKind::Queries,
+            NodeKey::new(NodeKind::Table, "public.t"),
+        ))
+        .unwrap();
+        assert!(unowned_table_writes(&b.finish().unwrap()).is_empty());
+    }
+
     /// Contract M6h S1: cycle links report; DAG links and self-standing services stay silent.
     #[test]
     fn service_cycles_report_links_on_cycles() {
