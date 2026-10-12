@@ -1,0 +1,10 @@
+# Precision guards (contract M6i S4), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# Tier B: the static type call and the typed-receiver call, all heuristic; the constructor call
+# references its class; the class and the method implement the interface.
+CALLS rb-heuristic . . . `src/Util.cs`/Shop/Greeter#Greet(). -> rb-heuristic . . . `src/Util.cs`/Shop/Util#Shout(). [heuristic]
+CALLS rb-heuristic . . . `src/Program.cs`/Program#Main(). -> rb-heuristic . . . `src/Util.cs`/Shop/Greeter#Greet(). [heuristic]
+REFERENCES rb-heuristic . . . `src/Program.cs`/Program#Main(). -> rb-heuristic . . . `src/Util.cs`/Shop/Greeter# [heuristic]
+IMPLEMENTS rb-heuristic . . . `src/Util.cs`/Shop/Greeter# -> rb-heuristic . . . `src/Util.cs`/Shop/IGreeter# [heuristic]
+IMPLEMENTS rb-heuristic . . . `src/Util.cs`/Shop/Greeter#Greet(). -> rb-heuristic . . . `src/Util.cs`/Shop/IGreeter#Greet(). [heuristic]

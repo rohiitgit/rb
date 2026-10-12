@@ -372,6 +372,26 @@ enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Check the live snapshot against the built-in architecture rules: prints violations
+    /// (sorted by rule, source, target) and exits 0 when clean, 1 on violations, 2 on errors.
+    Check {
+        #[arg(long)]
+        repo: Option<String>,
+        /// Run only this rule (orphan_endpoints, unowned_table_writes, service_cycles).
+        #[arg(long)]
+        rule: Option<String>,
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        /// The Cypher statement timeout in milliseconds for each rule (1-30000).
+        #[arg(
+            long,
+            env = "RB_CYPHER_TIMEOUT_MS",
+            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
+            value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
+        )]
+        timeout_ms: u64,
+    },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
         /// openCypher query, e.g. "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)".
@@ -549,6 +569,14 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                     store.prune_scip(&[&java, rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE], dry_run)?;
                 println!("scip: {verb} {} rows, {} bytes", r.rows, r.bytes);
             }
+        }
+        Command::Check {
+            repo,
+            rule,
+            json,
+            timeout_ms,
+        } => {
+            return check_rules(&mut store, repo, rule, json, timeout_ms);
         }
         question => {
             let asked = asked(question).expect("every other command is a question");
@@ -744,6 +772,7 @@ fn asked(command: Command) -> Option<Asked> {
         }
         Command::Migrate
         | Command::Index(_)
+        | Command::Check { .. }
         | Command::Serve { .. }
         | Command::Dump { .. }
         | Command::Gc { .. }
@@ -2228,6 +2257,124 @@ fn percent(part: usize, total: usize) -> usize {
     }
 }
 
+/// One `rb check` violation line: `rule src -> dst`, sorted by (rule, src, dst) by construction.
+fn check_line(rule: &str, src: &str, dst: &str) -> String {
+    format!("{rule} {src} -> {dst}")
+}
+
+/// Renders `rb check` output: the sorted violation lines plus the summary, or the JSON
+/// envelope. Pure function of the rows (tested without a database).
+fn format_check(violations: &[(String, String, String)], truncated: bool, json: bool) -> String {
+    if json {
+        serde_json::json!({
+            "rules": violations
+                .iter()
+                .map(|(rule, src, dst)| serde_json::json!({
+                    "rule": rule,
+                    "src": src,
+                    "dst": dst,
+                }))
+                .collect::<Vec<_>>(),
+            "truncated": truncated,
+        })
+        .to_string()
+    } else {
+        let mut out = String::new();
+        for (rule, src, dst) in violations {
+            out.push_str(&check_line(rule, src, dst));
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "check: {} violation{}",
+            violations.len(),
+            if violations.len() == 1 { "" } else { "s" }
+        ));
+        if truncated {
+            out.push_str(" (truncated: rows)");
+        }
+        out.push('\n');
+        out
+    }
+}
+
+/// The rows of one `rb check` run: sorted unique `(rule, src, dst)` triples plus whether any
+/// rule's row list was cut by the cap.
+struct CheckOutcome {
+    violations: Vec<(String, String, String)>,
+    truncated: bool,
+}
+
+/// Runs the built-in architecture rules' Cypher queries against the live snapshot (contract M6h
+/// S3–S4): the shared read-only `cypher()` path carries the timeout and row cap, so rules can
+/// neither write nor hang the database. Exit 0 when clean, 1 on violations, 2 on errors.
+fn check_rules(
+    store: &mut Store,
+    repo: Option<String>,
+    rule: Option<String>,
+    json: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<ExitCode> {
+    let outcome = (|| -> anyhow::Result<CheckOutcome> {
+        let snap = live_snapshot(store, repo)?;
+        let selected: Vec<&rb_store::check::Rule> = match &rule {
+            Some(name) => vec![
+                rb_store::check::RULES
+                    .iter()
+                    .find(|r| r.name == name)
+                    .with_context(|| format!("unknown rule {name:?}"))?,
+            ],
+            None => rb_store::check::RULES.iter().collect(),
+        };
+        let limits = rb_store::CypherLimits {
+            timeout_ms,
+            rows: rb_store::CYPHER_ROWS_MAX,
+        };
+        let mut violations = Vec::new();
+        let mut truncated = false;
+        for r in selected {
+            let rows = store.cypher(
+                snap.id,
+                r.cypher,
+                &["src".to_owned(), "dst".to_owned()],
+                limits,
+            )?;
+            truncated |= !rows.truncated.is_empty();
+            for row in rows.rows {
+                violations.push((r.name.to_owned(), row[0].clone(), row[1].clone()));
+            }
+        }
+        violations.sort();
+        violations.dedup();
+        Ok(CheckOutcome {
+            violations,
+            truncated,
+        })
+    })();
+    let CheckOutcome {
+        violations,
+        truncated,
+    } = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    // A cut row list would silently pass a violating snapshot: say so loudly (contract M6h S4).
+    if truncated {
+        eprintln!(
+            "warning: rule rows truncated at {}",
+            rb_store::CYPHER_ROWS_MAX
+        );
+    }
+    print!("{}", format_check(&violations, truncated, json));
+    Ok(if violations.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
     let repo = match repo {
         Some(r) => r,
@@ -2351,6 +2498,35 @@ mod tests {
              \x20 profile: age QUERIES (QUERIES.ops.csv): 2 rows, 90 bytes, 6.0 ms\n\
              \x20 profile: age total: 2 files, 5 rows, 210 bytes, 10.0 ms\n"
         );
+    }
+
+    /// Contract M6h S3: `rb check` violation lines name the rule, source and target.
+    #[test]
+    fn check_lines_name_rule_source_and_target() {
+        assert_eq!(
+            check_line(
+                "orphan_endpoints",
+                "services/auth",
+                "HTTP GET /x @services/auth"
+            ),
+            "orphan_endpoints services/auth -> HTTP GET /x @services/auth"
+        );
+    }
+
+    /// Contract M6h S4: truncated row lists say so loudly, in both formats; empty stays clean.
+    #[test]
+    fn check_output_marks_truncation() {
+        let violations = vec![("r".to_owned(), "a".to_owned(), "b".to_owned())];
+        assert_eq!(
+            format_check(&violations, false, false),
+            "r a -> b\ncheck: 1 violation\n"
+        );
+        assert!(format_check(&violations, true, false).contains("(truncated: rows)"));
+        assert_eq!(format_check(&[], false, false), "check: 0 violations\n");
+        let json = format_check(&violations, true, true);
+        let body: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(body["truncated"], true);
+        assert_eq!(body["rules"].as_array().unwrap().len(), 1);
     }
 
     /// Contract M5 S4: `rb gc`'s lines name each graph's owner or its absence.

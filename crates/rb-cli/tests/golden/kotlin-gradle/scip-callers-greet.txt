@@ -1,0 +1,4 @@
+callers of acme/Greeter#greet().  src/main/kotlin/acme/Greeter.kt:8  [(repo root)]
+precision=cha
+  acme/main().  src/main/kotlin/acme/Main.kt:3  [(repo root)]  exact
+certainty: exact 1

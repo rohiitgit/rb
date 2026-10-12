@@ -602,3 +602,36 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Evaluator pass 1 (amendment 10, `tasks/eval-m6g-pass1.md`): VERDICT PASS — 6 fixes (P9/P18/P30/P31/P32/P2), 10/10 mutants killed.
   - [x] Evaluator pass 2 (`tasks/eval-m6g-pass2.md`): verification-only — VERDICT PASS (repros re-run, mutants cited, suite green, invariant 1 re-derived).
 - **Verification** (`var/m6g/logs/p6-close2-*`): fmt, clippy `-D warnings` (clean on the final tree; the loop's clippy step ran pre-fix), 866 units, `rb-store` 66/66, `rb-server` 12/12, e2e 38/38, api 1/1, no `skipping:`, no listener, stub scan clean.
+
+## M6h Architecture rules as a CI gate: complete (closed 2026-10-12, contract amendment 7)
+
+- **Contract:** `tasks/contract-m6h.md` (2026-10-12), S1–S8 and invariants 1–7, D1–D4, forks F1–F4.
+- **Soundness claims and closing bar, stated up front:** unreadable rules impossible (registry is code); twins prove patterns; read-only by construction; timeouts + caps on every query.
+- **Decided in the contract (D1–D4):** AGE projection is the engine; twins prove patterns; built-ins only; violations sorted.
+- **Progress:**
+  - [x] Phase 0, preflight (amendment 1): baseline binary, `rb check` free, guard rails, AGE labels, fixture inventory.
+  - [x] Phase 1, rule module (amendment 2): orphans, unowned writes, service cycles + Cypher twins; 3/3 mutants.
+  - [x] Phase 2, CLI gate (amendment 3): read-only path, sorted/JSON, exit 0/1/2; live-fired; AGE rebinding fix.
+  - [x] Phase 3, goldens + parity (amendment 4): twin parity on 4 fixtures; check.txt goldens; topo orphan endpoint.
+  - [x] Phase 4, public legs (amendment 5): piggy/spring-kafka/gateway sampled, 0 false; residue-miss root cause.
+  - [x] Evaluator pass 1 (amendment 6, `tasks/eval-m6h-pass1.md`): VERDICT PASS — 4 fixes, 5/5 mutants.
+  - [x] Evaluator pass 2 (amendment 7, `tasks/eval-m6h-pass2.md`): VERDICT PASS — repros re-run, 3/3 re-killed, suite green.
+- **Verification** (`var/m6h/logs/p6-final-*`): fmt, clippy `-D warnings`, 874 units, `rb-store` 72/72, `rb-server` 12/12, e2e 39/39, api 1/1, no `skipping:`, no listener, stub scan clean.
+
+## M6i Kotlin and C# syntax: complete (closed 2026-10-12, contract amendment 8)
+
+- **Contract:** `tasks/contract-m6i.md` (2026-10-12), S1–S8 and invariants 1–7, D1–D4, forks F1–F4.
+- **Soundness claims and closing bar, stated up front:** wrong-parent definitions, wrong-scope references, wrong exact edges, grammar panics; safe direction everywhere (partial + `syntax_error`, references stay references, old facts frozen, SCIP owns Kotlin only under the unchanged checks).
+- **Decided in the contract (D1–D4):** stock queries first; Tier B reuse; unchanged agreement checks; fixture plan is code.
+- **Progress:**
+  - [x] Phase 0, preflight (amendment 1): baseline binary, grammar-crate pins (`kotlin-ng 1.1.0`, `c-sharp 0.23.5`), scip-java Kotlin support, coroutines + automapper pins.
+  - [x] Phase 1, grammars (amendment 2): Kotlin hand-written tags (first-pattern-wins) + C# stock tags with invocation supplement; `EXTRACTOR_VERSION` + pin test; old languages byte-identical.
+  - [x] Phase 2, Tier B (amendment 3): imports/bindings/calls/modules/qualifiers/supertypes per language; fixtures + 11/4 biting guards; 12/12 mutants.
+  - [x] Phase 3, Kotlin exact (amendment 4): fixture builds at Kotlin 2.2.0 (scip-java's own version); 0 new calibrations; `scip_kotlin_gradle` e2e.
+  - [x] Phase 5, public measurement (amendment 5): coroutines +30,496 / automapper +30,239 rows, every row classified; 7 Java→Kotlin interop edges source-verified; 0 false in samples.
+  - [x] Phase-5 follow-up (amendment 6): Kotlin wildcard miss → 1-line arm fix + unit; mutant bites.
+  - [x] `PIPELINE m6i-1` (amendment 7): metadata-only, no golden pins it.
+  - [x] Golden re-bless (amendment 8): `java-gradle-catalog` +1 classified row + status recompute; `.kts`/`.cs` census proves it the only stale golden.
+  - [x] Evaluator pass 1 (`tasks/eval-m6i-pass1.md`): VERDICT PASS — H1 in-tree, 8 probes, mutant killed.
+  - [x] Evaluator pass 2 (`tasks/eval-m6i-pass2.md`): VERDICT PASS — repros re-run, suite stands.
+- **Verification** (`var/m6i/logs/p6-close2-*`): fmt, clippy `-D warnings`, 888 units, `rb-store` 72/72, `rb-server` 12/12, e2e 42/42 (after the reviewed re-bless), api 1/1 (150 sets identical), no `skipping:`, no listener, stub scan clean.

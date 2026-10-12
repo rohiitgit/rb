@@ -489,3 +489,23 @@
 ## 2026-10-12: prove a vacuous measurement leg vacuous, or replace it
 - **Mistake (avoided by design):** apache/kafka @ pin carries no Spring-Kafka dependency, so its 625k-row identical dump proves nothing positive about topics.
 - **Rule:** check the leg can exercise the code first (here: a build-file grep for the frameworks); a vacuous leg gets a stated vacuity proof, and the positive proof moves to a repo that carries the forms (spring-kafka: +808 rows, samples read in source).
+
+## 2026-10-12: never edit the same file in parallel tool calls
+- **Mistake (caught by the e2e):** two edits to one fixture file in a single parallel block raced; last-write-wins silently dropped the method addition while keeping the import, and the endpoint vanished from the dump.
+- **Rule:** one file, one edit per message. Sequential edits to the same file go in separate blocks; verify the file after any same-file sequence.
+
+## 2026-10-12: `git checkout -- <file>` discards uncommitted work (re-learned)
+- **Mistake (caught by the e2e):** reverting a guard-bite mutant with `git checkout --` wiped the file's uncommitted import + method; both had to be re-applied (and the re-apply then raced — see above).
+- **Rule:** revert mutants with the edit tool (exact inverse), never with checkout. This is the M3b lesson restated: it bites again the moment the working tree holds uncommitted fixture work.
+
+## 2026-10-12: a pinning assertion must match the exact defended text
+- **Mistake (caught by the mutant surviving):** the DISTINCT pin asserted `cypher.contains("DISTINCT")`, which also matches `COLLECT(DISTINCT o.key)` — dropping `RETURN DISTINCT` survived.
+- **Rule:** pin the exact defended fragment (`RETURN DISTINCT`), and always run the mutant once against the new assertion before counting it.
+
+## 2026-10-12: `--lib` on a binary-only package proves nothing
+- **Mistake (caught by reading the output):** a mutant battery reported SURVIVED because `cargo test -p rb-cli --lib` errors (no library targets) — the grep found no FAILED in a compile error.
+- **Rule:** the battery must distinguish test failure from harness failure: use the package's real test target (`--bin rb` here) and treat anything but an explicit `test result: FAILED` (or the expected failure line) as invalid, never as survived.
+
+## 2026-10-12: the same-file parallel-edit race bites the edit tool too
+- **Mistake (caught by re-reading the function):** two edits to `resolve.rs` in one parallel block raced; last-write-wins silently dropped the match-arm fix while keeping the gate fix, and the test kept failing for a reason that looked semantic. Restatement of the existing parallel-edit rule, now with the mechanism: parallel calls snapshot the same file state.
+- **Rule:** one file, one edit per block — no exceptions, even for "independent" hunks. After any same-file sequence, re-read the region before testing.

@@ -1,0 +1,5 @@
+# Precision guards (contract M6i S4): forbidden edges. A non-`*` source must name a node
+# of the dump, so a misspelt key cannot pass vacuously.
+# Tier B is never exact, and main calls the implementation, never the interface directly.
+CALLS * -> * [exact]
+CALLS rb-heuristic . . . `src/main/kotlin/acme/Main.kt`/main(). -> rb-heuristic . . . `src/main/kotlin/acme/Greeter.kt`/GreeterApi#greet(). [heuristic]

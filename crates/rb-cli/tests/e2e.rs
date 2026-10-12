@@ -649,6 +649,283 @@ fn java_spring_jpa() {
     check_fixture("java-spring-jpa", "java");
 }
 
+/// Contract M6h S5: architecture rules as a CI gate. For each fixture: `rb check` prints the
+/// golden violation list with the golden exit code (0 clean, 1 violations, 2 errors); every
+/// rule's Cypher rows equal the relational twin's rows on the same snapshot; `--rule` filters;
+/// an unknown rule and a missing repository exit 2.
+#[test]
+fn check_gates() {
+    let Some(url) = db_url() else { return };
+    for (fixture, tag, pin_golden) in [
+        ("topo-packs", "topo", true),
+        ("polyglot-monorepo", "poly", true),
+        ("java-spring-jpa", "jpa", false),
+        ("ts-express-prisma", "tse", false),
+    ] {
+        let repo = fixture_repo(fixture);
+        let path = repo.path().to_str().unwrap();
+        let pid = std::process::id();
+        let name = format!("t_check_{tag}_{pid}");
+        let _cleanup = Cleanup {
+            url: &url,
+            repos: vec![name.clone()],
+        };
+        rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+        // The relational twin on the in-memory pipeline output.
+        let indexed = rb_indexer::index_commit(
+            repo.path(),
+            "HEAD",
+            &mut rb_indexer::NoCache,
+            &rb_indexer::ScipOptions::disabled(),
+            &mut rb_indexer::NoScipCache,
+        )
+        .unwrap();
+        let mut expected: Vec<(String, String, String)> = rb_store::check::check(&indexed.graph)
+            .into_iter()
+            .map(|v| (v.rule.to_owned(), v.src, v.dst))
+            .collect();
+        expected.sort();
+        // The product path: each rule's Cypher rows over AGE, as JSON.
+        let (code, stdout, _) = rb_exit(&url, &["check", "--json", "--repo", &name]);
+        let body: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let mut actual: Vec<(String, String, String)> = body["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                (
+                    v["rule"].as_str().unwrap().to_owned(),
+                    v["src"].as_str().unwrap().to_owned(),
+                    v["dst"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "Cypher twin == relational twin on {fixture}"
+        );
+        assert_eq!(
+            code,
+            if expected.is_empty() { 0 } else { 1 },
+            "exit code on {fixture}"
+        );
+        // The text output is golden on the rule fixtures; a clean rule filter exits 0.
+        let (code, stdout, _) = rb_exit(&url, &["check", "--repo", &name]);
+        if pin_golden {
+            golden(fixture, "check.txt", &stdout);
+        }
+        assert_eq!(
+            code,
+            if expected.is_empty() { 0 } else { 1 },
+            "text exit code on {fixture}"
+        );
+        let (code, stdout, _) = rb_exit(
+            &url,
+            &["check", "--repo", &name, "--rule", "service_cycles"],
+        );
+        assert_eq!(code, 0, "a clean rule filter exits 0");
+        assert_eq!(stdout, "check: 0 violations\n");
+        // An unknown rule exits 2, against a repository that exists.
+        let (code, _, stderr) = rb_exit(&url, &["check", "--repo", &name, "--rule", "bogus"]);
+        assert_eq!(code, 2);
+        assert!(stderr.contains("unknown rule"), "{stderr}");
+    }
+    // A repository that was never indexed exits 2.
+    let (code, _, stderr) = rb_exit(&url, &["check", "--repo", "t_check_missing"]);
+    assert_eq!(code, 2, "{stderr}");
+}
+
+/// Contract M6i S4: language fixtures without injections. Determinism, the store round
+/// trip, the precision guards with the HTTP/M4b invariants, the file set, AGE parity and the
+/// `--no-scip` dump golden. Endpoints and topics get their own assertions in the tests that
+/// have them.
+fn check_language_fixture(fixture: &str, tag: &str) {
+    let Some(url) = db_url() else { return };
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let pid = std::process::id();
+    let (a, b) = (format!("t_{tag}_{pid}_a"), format!("t_{tag}_{pid}_b"));
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![a.clone(), b.clone()],
+    };
+
+    // Determinism: the same commit indexed into two repos, and rebuilt, dumps byte-identically.
+    rb(&url, &["index", path, "--repo", &a, "--no-scip"]);
+    rb(&url, &["index", path, "--repo", &b, "--no-scip"]);
+    let dump_a = rb(&url, &["dump", "--repo", &a]);
+    let dump_b = rb(&url, &["dump", "--repo", &b]);
+    assert_eq!(dump_a, dump_b, "same commit, different repos");
+
+    assert!(rb(&url, &["index", path, "--repo", &a, "--no-scip"]).contains("up to date"));
+    rb(&url, &["index", path, "--repo", &a, "--no-scip", "--force"]);
+    assert_eq!(rb(&url, &["dump", "--repo", &a]), dump_a, "forced rebuild");
+
+    // The stored snapshot is faithful to the in-memory pipeline output.
+    let indexed = rb_indexer::index_commit(
+        repo.path(),
+        "HEAD",
+        &mut rb_indexer::NoCache,
+        &rb_indexer::ScipOptions::disabled(),
+        &mut rb_indexer::NoScipCache,
+    )
+    .unwrap();
+    assert_eq!(
+        canonical_dump(&indexed.commit_sha, &indexed.graph, &indexed.diagnostics),
+        dump_a,
+        "store round trip"
+    );
+    let graph = &indexed.graph;
+
+    // The fixture's precision guards, and the HTTP/M4b invariants every dump keeps.
+    let mut failures = guard_failures(fixture, &dump_a);
+    failures.extend(http_invariant_failures(graph));
+    failures.extend(m4b_invariant_failures(graph));
+    assert!(
+        failures.is_empty(),
+        "precision guards and invariants of {fixture}:\n{}",
+        failures.join("\n")
+    );
+
+    // The fixture commit holds the tracked files and nothing else (amendment 40).
+    let mut files: Vec<String> = graph
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::File)
+        .map(|n| n.key.clone())
+        .collect();
+    files.sort();
+    let mut tracked = tracked_files(fixture);
+    tracked.sort();
+    assert_eq!(files, tracked, "the fixture repository's files");
+
+    // Invariant: every File has exactly one IN_SERVICE edge.
+    for f in graph.nodes().iter().filter(|n| n.kind == NodeKind::File) {
+        let memberships = graph
+            .edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::InService && e.src == f.id)
+            .count();
+        assert_eq!(
+            memberships, 1,
+            "{} has {memberships} IN_SERVICE edges",
+            f.key
+        );
+    }
+
+    // Contract M5 S6: the projection holds exactly the snapshot's vertices and edges.
+    let failures = age_parity_failures(&url, &a, graph);
+    assert!(failures.is_empty(), "AGE parity:\n{}", failures.join("\n"));
+
+    golden(fixture, "dump.jsonl", &dump_a);
+
+    // Cypher runs read-only: writes are rejected.
+    let out = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .args([
+            "cypher",
+            "CREATE (n:File {key: 'x'}) RETURN n",
+            "--repo",
+            &a,
+        ])
+        .env("RB_DATABASE_URL", &url)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a CREATE through rb cypher must fail"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("read-only"));
+}
+
+/// Contract M6i S4: the kotlin-gradle fixture (Tier B calls across files, no SCIP yet).
+#[test]
+fn kotlin_gradle_tier_b() {
+    check_language_fixture("kotlin-gradle", "kt");
+}
+
+/// Contract M6i S4: the csharp fixture (Tier B calls across files, no SCIP by design).
+#[test]
+fn csharp_tier_b() {
+    check_language_fixture("csharp", "cs");
+}
+
+/// Contract M6i S3: the kotlin-gradle fixture through scip-java. The Gradle Kotlin 2.2
+/// build indexes ok; every Tier B call has its exact twin with the same target; the dump is
+/// golden. Cached, fresh and second-name runs dump identically.
+#[test]
+fn scip_kotlin_gradle() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "kotlin-gradle";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipkt_{}", std::process::id());
+    let other = format!("t_scipkt2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name]);
+    eprintln!("scip_kotlin_gradle: first index {:.1?}", started.elapsed());
+    assert!(first.contains("scip: . scip-java ok"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    golden(fixture, "scip-dump.jsonl", &dump);
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    // Every Tier B call's exact twin names the same target (modulo the key scheme).
+    let pairs = |dump: &str| {
+        let mut out: Vec<(String, String)> = dump
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let row: serde_json::Value = serde_json::from_str(l).unwrap();
+                (row[0] == "E" && row[3] == "CALLS").then(|| {
+                    let short = |v: &serde_json::Value| {
+                        v.as_str()
+                            .unwrap_or_default()
+                            .rsplit("acme/")
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    (short(&row[2]), short(&row[5]))
+                })
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        pairs(&dump),
+        [
+            ("Greeter#greet().".to_owned(), "shout().".to_owned()),
+            ("main().".to_owned(), "Greeter#greet().".to_owned()),
+            ("main().".to_owned(), "shout().".to_owned()),
+        ]
+    );
+    golden(
+        fixture,
+        "scip-callers-greet.txt",
+        &rb(&url, &["callers", "Greeter.greet", "--repo", &name]),
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("(cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(!fresh.contains("(cached"), "{fresh}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 #[test]
 fn polyglot_monorepo() {
     check_fixture("polyglot-monorepo", "poly");

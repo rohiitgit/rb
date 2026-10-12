@@ -33,7 +33,8 @@ impl<'a> Modules<'a> {
         let mut go_dirs: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (&path, (language, facts)) in files {
             match language {
-                Language::Java => {
+                // Kotlin packages resolve exactly like Java ones (contract M6i S2).
+                Language::Java | Language::Kotlin => {
                     let package = facts.package.as_deref().unwrap_or_default();
                     java_packages.entry(package).or_default().push(path);
                 }
@@ -83,9 +84,11 @@ impl<'a> Modules<'a> {
             Language::TypeScript | Language::Tsx | Language::JavaScript => {
                 self.ecmascript(from, &import.module).into_iter().collect()
             }
-            Language::Java => self.java(import),
+            Language::Java | Language::Kotlin => self.java(import),
             Language::Python => self.python(from, import),
             Language::Go => self.go(&import.module),
+            // Contract M6i S2: C# namespaces resolve to the files declaring them.
+            Language::CSharp => self.csharp(import),
         };
         out.sort_unstable();
         out.dedup();
@@ -150,6 +153,34 @@ impl<'a> Modules<'a> {
 
     pub(crate) fn package_files(&self, package: &str) -> Vec<&'a str> {
         self.java_packages.get(package).cloned().unwrap_or_default()
+    }
+
+    /// Files declaring the C# namespace `dotted` (or the outer namespace of a nested one):
+    /// `using A.B;` may name namespace A.B or a type B in A. Aliases and static imports resolve
+    /// by their module alone.
+    pub(crate) fn csharp(&self, import: &Import) -> Vec<&'a str> {
+        let mut path = import.module.as_str();
+        loop {
+            let found: Vec<&str> = self
+                .files
+                .iter()
+                .filter(|(_, (language, _))| *language == Language::CSharp)
+                .filter_map(|(f, (_, facts))| {
+                    facts
+                        .definitions
+                        .iter()
+                        .any(|d| d.kind == rb_syntax::DefKind::Module && d.name == path)
+                        .then_some(*f)
+                })
+                .collect();
+            if !found.is_empty() {
+                return found;
+            }
+            match path.rsplit_once('.') {
+                Some((parent, _)) => path = parent,
+                None => return Vec::new(),
+            }
+        }
     }
 
     /// Files declaring the top-level class `a.b.C`, or the outer class of a nested one
@@ -510,6 +541,66 @@ mod tests {
                 vec![],
             ]
         );
+    }
+
+    #[test]
+    fn kotlin_packages_resolve_like_java() {
+        let k = Language::Kotlin;
+        let got = resolved(
+            &[
+                (
+                    "web/src/Ctl.kt",
+                    k,
+                    "package com.acme.web\nimport com.acme.model.User\nimport com.acme.model.*\nclass Ctl {}\n",
+                ),
+                (
+                    "model/src/User.kt",
+                    k,
+                    "package com.acme.model\nclass User {}\n",
+                ),
+                (
+                    "model/src/Role.kt",
+                    k,
+                    "package com.acme.model\nclass Role {}\n",
+                ),
+            ],
+            &[],
+            "web/src/Ctl.kt",
+        );
+        assert_eq!(
+            got,
+            [
+                vec!["model/src/User.kt"],
+                vec!["model/src/Role.kt", "model/src/User.kt"],
+            ]
+        );
+    }
+
+    #[test]
+    fn csharp_namespaces_resolve_to_their_files() {
+        let c = Language::CSharp;
+        let got = resolved(
+            &[
+                (
+                    "Web/Ctl.cs",
+                    c,
+                    "using Acme.Model;\nnamespace Acme.Web {\nclass Ctl {}\n}\n",
+                ),
+                (
+                    "Model/User.cs",
+                    c,
+                    "namespace Acme.Model {\nclass User {}\n}\n",
+                ),
+                (
+                    "Model/Role.cs",
+                    c,
+                    "namespace Acme.Model.Sub {\nclass Role {}\n}\n",
+                ),
+            ],
+            &[],
+            "Web/Ctl.cs",
+        );
+        assert_eq!(got, [vec!["Model/User.cs"]]);
     }
 
     #[test]

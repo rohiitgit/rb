@@ -23,7 +23,8 @@ pub fn surface_names(language: Language) -> &'static [&'static str] {
         Language::TypeScript | Language::Tsx | Language::JavaScript => SURFACE_NAMES[0],
         Language::Go => SURFACE_NAMES[1],
         Language::Java => SURFACE_NAMES[2],
-        Language::Python => &[],
+        // Contract M6i S2: framework surface names land with Tier B.
+        Language::Python | Language::Kotlin | Language::CSharp => &[],
     }
 }
 
