@@ -2615,6 +2615,18 @@ mod tests {
         assert!(out.points.is_empty());
     }
 
+    /// Contract M6j S5: top-level `val` beans blocks have no enclosing definition, so
+    /// their registrations stay unread (residue); function forms in the same file read.
+    /// A named bean with no determinable type stays unread too.
+    #[test]
+    fn kotlin_val_form_beans_stay_unread() {
+        let src = "package acme\nval x = beans {\nbean<Y>()\n}\nfun f() = beans {\nbean<Z>()\nbean(\"s\") {}\n}\n";
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let out = kotlin_di(&facts);
+        let beans: Vec<String> = out.beans.iter().map(|b| b.type_name.clone()).collect();
+        assert_eq!(beans, ["Z"]);
+    }
+
     /// Contract M6j S2: `bind().to()` outside Guice/Dagger files binds nothing.
     #[test]
     fn bind_chains_need_framework_markers() {
