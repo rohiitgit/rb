@@ -886,9 +886,11 @@ fn resolve_xml_points<'a>(
         });
         if candidates.is_empty() {
             *out.buckets.get_mut("unresolved").unwrap() += 1;
+            // Contract M6l S1: the diagnostic sites the XML document (where the
+            // ref is written), never the owner's path with foreign spans.
             out.diagnostics.push(site_diagnostic(
                 "di_unresolved",
-                p.owner_path,
+                p.xml_path,
                 p.span,
                 &p.element,
                 "no_bean",
@@ -3767,6 +3769,26 @@ mod tests {
         }
         let (small, large) = (work_for(100), work_for(400));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M6l S1: an unresolved XML ref's diagnostic sites the XML document
+    /// (where the ref is written), never the consumer class file.
+    #[test]
+    fn xml_unresolved_diagnostic_sites_the_document() {
+        let java = "package com.acme;\nclass C0 {}\n";
+        let xml = "<beans xmlns=\"http://www.springframework.org/schema/beans\">\n  <bean id=\"b0\" class=\"com.acme.C0\">\n    <constructor-arg ref=\"missing\"/>\n  </bean>\n</beans>\n";
+        let (r, _) = resolve_lang(
+            &[("src/C.java", Language::Java, java)],
+            &[("app.xml", xml)],
+        );
+        assert!(r.injections.is_empty());
+        let d: Vec<&Diagnostic> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "di_unresolved")
+            .collect();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path.as_deref(), Some("app.xml"));
     }
 
     /// Resolves mixed-language files with XML texts (contract M6j S10): returns the
