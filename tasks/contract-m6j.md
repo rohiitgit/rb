@@ -338,3 +338,9 @@ managed lane resolve `Binds` identically); class resolution indexed once per res
 lanes; `managed_lane_grows_linearly` + `xml_beans_grow_linearly` ratio tests green
 (≤5× at 4×). No new unbounded walk anywhere (single-pass visitors, map lookups,
 visited-set machinery reused).
+
+10. **(pass 1) Full review, VERDICT PASS.** `tasks/eval-m6j-pass1.md`: H1 (`.in()`
+tolerance), H2 (bind markers), H3 (nested innermost), H4 (file-scoped modules) —
+all found during probing and in-tree; P5–P9 verified no-change (qualifiers, assisted
+risk with no instance, dump-neutral decorations, no panics, determinism). 52/52 unit
+mutants + all guard bites re-verified on the final tree.
