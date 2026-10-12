@@ -95,4 +95,15 @@ ever); anything else.
 
 ## Amendments
 
-(none yet)
+1. **(phase 0) Baselines.** Baseline binary `var/m6l/base/rb-m6kclose` (release,
+sha256 `41e7d632…`, copied from the M6k final-tree build: no code changed
+between its source and HEAD at copy time — only the contract draft commit).
+Baseline is the M6k close by construction; no separate baseline verify (the
+M6k `p6-close` loop is the standing green baseline; M6l re-runs it at close).
+
+2. **(phase 1) Siting fix.** One-word change (`owner_path` → `xml_path`) +
+unit (`xml_unresolved_diagnostic_sites_the_document`, mutant kills) +
+spring-xml fixture (`missing` ref on the audit bean — no new nodes/edges, no
+guard churn) + reviewed re-bless (coverage +1 point/+1 unresolved, new
+diagnostic sited in the document, blob/hash only). Commit `ca0c641` (incl. a
+clippy `needless_borrow` fix in the new test).
