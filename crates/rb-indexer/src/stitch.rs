@@ -98,6 +98,9 @@ pub(crate) struct Site {
     pub method: Option<String>,
     /// `None` when the URL is not a string or a name.
     pub url: Option<Folded>,
+    /// A generated-client call (contract M6f S6): stitched by operation/RPC name, never by
+    /// URL. `None` for URL sites.
+    pub generated: Option<GeneratedSite>,
     /// The request value reaches an in-process sink (contract M6b S4): never
     /// stitched, whatever the URL folds to.
     pub in_process: bool,
@@ -129,6 +132,16 @@ pub(crate) struct Site {
     /// one naming an external host makes the site external. Empty when the base is decided or
     /// unknown with no stated value, or does not apply (an absolute URL).
     pub base_candidates: Vec<Folded>,
+}
+
+/// A generated-client call site (contract M6f S6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedSite {
+    pub kind: rb_frameworks::clients::GeneratedKind,
+    /// The operationId or RPC name.
+    pub operation: String,
+    /// The `*Api` receiver, stub class or service, for scoping.
+    pub carrier: String,
 }
 
 /// A service as the host rule (D6) sees it.
@@ -451,6 +464,37 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 discovery,
                 discovery_broad: broad,
                 base_candidates,
+                generated: None,
+            });
+        }
+        for gencall in &file_clients.generated {
+            // Generated calls stitch by operation/RPC name (below); they fold nothing.
+            let kind = match gencall.kind {
+                rb_frameworks::clients::GeneratedKind::OpenApi => ClientKind::OpenApi,
+                rb_frameworks::clients::GeneratedKind::Grpc => ClientKind::Grpc,
+            };
+            out.push(Site {
+                src: NodeKey::new(NodeKind::File, path),
+                at: Evidence {
+                    path: path.to_owned(),
+                    span: gencall.span,
+                },
+                service: service.clone(),
+                client: kind,
+                method: None,
+                url: None,
+                generated: Some(GeneratedSite {
+                    kind: gencall.kind,
+                    operation: gencall.operation.clone(),
+                    carrier: gencall.carrier.clone(),
+                }),
+                in_process: file_clients.in_process.contains(&gencall.span),
+                config_overridden: false,
+                base_from_bean: false,
+                base_verified: None,
+                discovery: false,
+                discovery_broad: false,
+                base_candidates: Vec::new(),
             });
         }
     }
@@ -631,6 +675,31 @@ impl EndpointIndex {
     }
 }
 
+/// Whether a GRPC endpoint's target names `service` with RPC `rpc` (contract M6f S6): the
+/// carrier's `Grpc` suffix is the stub class, not the service (`GreeterGrpc` serves `Greeter`),
+/// and stub generators re-case the RPC's first letter (Java `sayHello` for `SayHello`), so the
+/// method matches with its first letter folded.
+fn grpc_target_match(e: &EndpointRef, carrier: &str, rpc: &str) -> bool {
+    if e.method != "GRPC" {
+        return false;
+    }
+    let Some((service_part, method)) = e.path.rsplit_once('/') else {
+        return false;
+    };
+    if method.is_empty() || rpc.is_empty() {
+        return false;
+    }
+    if method.len() != rpc.len()
+        || method[1..] != rpc[1..]
+        || !method[..1].eq_ignore_ascii_case(&rpc[..1])
+    {
+        return false;
+    }
+    let service = service_part.rsplit('.').next().unwrap_or(service_part);
+    let carrier = carrier.strip_suffix("Grpc").unwrap_or(carrier);
+    service == carrier
+}
+
 /// How the host restricts candidates (D6).
 enum Scope<'s> {
     /// No host, a host with a hole, or one naming several services: every other service.
@@ -693,6 +762,11 @@ impl<'e> Stitcher<'e> {
                 detail: Some("in_process"),
                 ..Outcome::bucket(Bucket::Unmatched)
             };
+        }
+        // A generated-client call stitches by operation/RPC name (contract M6f S6), never by
+        // URL: it folds nothing.
+        if let Some(generated) = &site.generated {
+            return self.generated(site, generated);
         }
         let Some(folded) = &site.url else {
             return Outcome::bucket(Bucket::Dynamic);
@@ -895,6 +969,96 @@ impl<'e> Stitcher<'e> {
         }
     }
 
+    /// A generated-client call's matches (contract M6f S6): endpoints stating its operationId,
+    /// or GRPC endpoints whose target names its service and RPC. Sorted by key, so the outcome
+    /// never depends on endpoint order.
+    fn generated_matches(&self, generated: &GeneratedSite) -> Vec<usize> {
+        let mut found: Vec<usize> = match generated.kind {
+            rb_frameworks::clients::GeneratedKind::OpenApi => self
+                .endpoints
+                .iter()
+                .enumerate()
+                .inspect(|_| rb_frameworks::work::tick(1))
+                .filter(|(_, e)| e.operations.iter().any(|o| o == &generated.operation))
+                .map(|(i, _)| i)
+                .collect(),
+            rb_frameworks::clients::GeneratedKind::Grpc => self
+                .endpoints
+                .iter()
+                .enumerate()
+                .inspect(|_| rb_frameworks::work::tick(1))
+                .filter(|(_, e)| grpc_target_match(e, &generated.carrier, &generated.operation))
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        found.sort_by_key(|&i| &self.endpoints[i].key);
+        found
+    }
+
+    /// Stitches a generated-client call (contract M6f S6): the certainty never exceeds
+    /// `synthetic` (closing bar (f)); a name match cannot tell a self call from a foreign one,
+    /// so any own-service match makes the site self (M4a invariant 5 — self is never linked).
+    fn generated(&self, site: &Site, generated: &GeneratedSite) -> Outcome {
+        let found = self.generated_matches(generated);
+        if found.is_empty() {
+            return Outcome::bucket(Bucket::Unmatched);
+        }
+        if found
+            .iter()
+            .any(|&i| self.endpoints[i].service == site.service)
+        {
+            return Outcome::bucket(Bucket::OwnService);
+        }
+        let n = found.len();
+        if n > MAX_CANDIDATES {
+            return Outcome {
+                candidates: n,
+                ..Outcome::bucket(Bucket::TooAmbiguous)
+            };
+        }
+        let mut attrs = Attrs::new();
+        attrs.insert(
+            "match".into(),
+            match generated.kind {
+                rb_frameworks::clients::GeneratedKind::OpenApi => "operation",
+                rb_frameworks::clients::GeneratedKind::Grpc => "rpc",
+            }
+            .into(),
+        );
+        attrs.insert("client".into(), site.client.as_str().into());
+        if n > 1 {
+            attrs.insert("candidates".into(), n.into());
+            return Outcome {
+                bucket: Bucket::Ambiguous,
+                links: found
+                    .iter()
+                    .map(|&i| Link {
+                        endpoint: i,
+                        certainty: Certainty::Ambiguous,
+                        attrs: attrs.clone(),
+                    })
+                    .collect(),
+                candidates: n,
+                detail: None,
+            };
+        }
+        let certainty = Certainty::Synthetic.min(self.endpoints[found[0]].certainty);
+        Outcome {
+            bucket: if certainty == Certainty::Synthetic {
+                Bucket::Synthetic
+            } else {
+                Bucket::Heuristic
+            },
+            links: vec![Link {
+                endpoint: found[0],
+                certainty,
+                attrs,
+            }],
+            candidates: 1,
+            detail: None,
+        }
+    }
+
     /// D9: the candidates with the most literal segments, then those whose method equals a known
     /// client method over `ANY` ones. A suffix match counts the literals of the endpoint tail the
     /// client's `client_len` segments matched (amendment 9); a tail ending in `{*}` has no fixed
@@ -987,6 +1151,10 @@ pub(crate) fn add_consumes(
         };
         if let Some(kind) = kind {
             let mut detail = json!({ "client": site.client.as_str() });
+            if let Some(generated) = &site.generated {
+                detail["operation"] = generated.operation.as_str().into();
+                detail["carrier"] = generated.carrier.as_str().into();
+            }
             if let Some(url) = &site.url {
                 detail["url"] = render(url).into();
                 let u = client_url(&url.pieces);
@@ -1088,7 +1256,7 @@ pub(crate) fn add_consumes(
 
 #[cfg(test)]
 mod tests {
-    use rb_frameworks::endpoint::{endpoint_key, norm_path};
+    use rb_frameworks::endpoint::{endpoint_key, grpc_key, norm_path};
     use rb_model::Graph;
 
     use super::*;
@@ -1182,6 +1350,7 @@ mod tests {
             discovery: false,
             discovery_broad: false,
             base_candidates: Vec::new(),
+            generated: None,
         }
     }
 
@@ -2872,6 +3041,90 @@ mod tests {
                 format!("{} {} {}{to}", s.at.path, s.at.span[0], o.bucket.as_str())
             })
             .collect()
+    }
+
+    /// Contract M6f S6: operationId calls stitch by operation name (unique → synthetic, own
+    /// service → self, unknown → unmatched, several → ambiguous); RPC calls stitch by
+    /// service+method; an own-service match makes the site self; certainty never exceeds
+    /// synthetic.
+    #[test]
+    fn generated_calls_stitch_by_operation_and_rpc_name() {
+        let caller = "import { UsersApi } from './gen';\nconst usersApi = new UsersApi();\nexport async function f() {\n  await usersApi.listUsers();\n  await usersApi.missing();\n}\n";
+        let selfcaller = "import { UsersApi } from './gen';\nconst usersApi = new UsersApi();\nexport async function g() {\n  await usersApi.listUsers();\n}\n";
+        let mut list = ep("GET", "/users", "orders");
+        list.operations = vec!["listUsers".into()];
+        let eps = vec![list];
+        assert_eq!(
+            stitched(
+                &[
+                    ("web/src/a.ts", Language::TypeScript, caller),
+                    ("orders/src/b.ts", Language::TypeScript, selfcaller)
+                ],
+                &eps,
+                &["web", "orders"],
+            ),
+            [
+                "orders/src/b.ts 3 self",
+                "web/src/a.ts 3 synthetic -> HTTP GET /users @orders [synthetic]",
+                "web/src/a.ts 4 unmatched",
+            ]
+        );
+        // Two foreign services sharing the operation: ambiguous; an own-service match makes
+        // the site self instead of linking.
+        let mut billing = ep("GET", "/users", "billing");
+        billing.operations = vec!["listUsers".into()];
+        let mut mine = ep("GET", "/users", "web");
+        mine.operations = vec!["listUsers".into()];
+        assert_eq!(
+            stitched(
+                &[("web/src/a.ts", Language::TypeScript, caller)],
+                std::slice::from_ref(&mine),
+                &["web", "orders", "billing"],
+            ),
+            ["web/src/a.ts 3 self", "web/src/a.ts 4 unmatched"]
+        );
+        let mut other = ep("GET", "/users", "orders");
+        other.operations = vec!["listUsers".into()];
+        let eps = vec![billing, other];
+        assert_eq!(
+            stitched(
+                &[("web/src/a.ts", Language::TypeScript, caller)],
+                &eps,
+                &["web", "orders", "billing"],
+            ),
+            [
+                "web/src/a.ts 3 ambiguous -> HTTP GET /users @billing [ambiguous] -> HTTP GET /users @orders [ambiguous]",
+                "web/src/a.ts 4 unmatched"
+            ]
+        );
+    }
+
+    /// Contract M6f S6: gRPC stub calls stitch by service and RPC name.
+    #[test]
+    fn grpc_calls_stitch_by_service_and_rpc_name() {
+        let java = "class C {\n  void f(Object ch, Object req) {\n    GreeterGrpc.newBlockingStub(ch).sayHello(req);\n    GreeterGrpc.newBlockingStub(ch).unknown(req);\n  }\n}\n";
+        let greet = EndpointRef {
+            key: grpc_key("acme", "Greeter", "SayHello", "orders"),
+            method: "GRPC".into(),
+            path: "acme.Greeter/SayHello".into(),
+            service: "orders".into(),
+            prefix_unknown: false,
+            certainty: Certainty::Exact,
+            hosts: Vec::new(),
+            prefix_maybe_incomplete: false,
+            operations: Vec::new(),
+        };
+        assert_eq!(
+            stitched(
+                &[("web/src/C.java", Language::Java, java)],
+                std::slice::from_ref(&greet),
+                &["web", "orders"],
+            ),
+            [
+                "web/src/C.java 2 synthetic -> GRPC acme.Greeter/SayHello @orders [synthetic]",
+                "web/src/C.java 3 unmatched",
+            ]
+        );
     }
 
     /// Contract M6b S7, from source: `scheme://user…hole…@host` matches

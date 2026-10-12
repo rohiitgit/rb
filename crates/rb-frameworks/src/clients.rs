@@ -27,6 +27,10 @@ pub enum ClientKind {
     RestClient,
     Feign,
     GoHttp,
+    /// An OpenAPI-generator client call (contract M6f S6): stitched by operationId.
+    OpenApi,
+    /// A gRPC stub call (contract M6f S6): stitched by service and RPC name.
+    Grpc,
 }
 
 impl ClientKind {
@@ -39,6 +43,8 @@ impl ClientKind {
             ClientKind::RestClient => "rest_client",
             ClientKind::Feign => "feign",
             ClientKind::GoHttp => "net/http",
+            ClientKind::OpenApi => "openapi",
+            ClientKind::Grpc => "grpc",
         }
     }
 }
