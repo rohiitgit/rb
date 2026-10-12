@@ -3273,6 +3273,7 @@ mod tests {
         let deployable: BTreeSet<String> = by_path.keys().map(|p| service_of(p)).collect();
         let depends = BTreeMap::new();
         let empty_manifests: BTreeMap<&str, String> = BTreeMap::new();
+        let empty_xml: BTreeMap<&str, String> = BTreeMap::new();
         let resolution = crate::di::resolve(&crate::di::Inputs {
             files: &by_path,
             keys: &keys,
@@ -3282,6 +3283,7 @@ mod tests {
             depends: &depends,
             unparsed,
             manifests: &empty_manifests,
+            xml: &empty_xml,
         });
         let inputs = Inputs {
             files: &by_path,

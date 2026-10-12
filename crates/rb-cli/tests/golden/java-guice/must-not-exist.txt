@@ -1,0 +1,7 @@
+# Precision guards (contract M6j S4): forbidden edges. A non-`*` source must name a node
+# of the dump, so a misspelt key cannot pass vacuously.
+# Tier B and DI are never exact; injections never cross vignettes.
+INJECTS * -> * [exact]
+INJECTS rb-heuristic . . . `src/Consumer.java`/Consumer# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#provideCache(). [heuristic]
+INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/ServiceImpl.java`/ServiceImpl# [ambiguous]
+INJECTS rb-heuristic . . . `src/CacheConsumer.java`/CacheConsumer# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#configure(). [ambiguous]

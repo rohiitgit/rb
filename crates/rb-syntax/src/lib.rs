@@ -312,6 +312,10 @@ pub struct CallLink {
     /// Span of the name (of the callee when there is no name).
     pub span: Span,
     pub args: Vec<Arg>,
+    /// Call-site type arguments as written (`bean<ServiceImpl>`; contract M6j S5).
+    /// Only Kotlin fills these; every other language leaves them empty.
+    #[serde(default)]
+    pub type_args: Vec<String>,
 }
 
 /// A summary of one call argument (contract M4a S1).
@@ -337,6 +341,9 @@ pub enum Arg {
         span: Span,
         args: Vec<Arg>,
     },
+    /// A class literal (`Service.class`): the type as written, for `bind(X).to(Y)` shapes
+    /// (contract M6j S2). Kotlin `X::class` and C# `typeof(X)` stay `Other`.
+    Type { text: String, span: Span },
     /// Anything else (a call, a number, an array, …).
     Other { span: Span },
 }
@@ -349,6 +356,7 @@ impl Arg {
             | Arg::Function { span }
             | Arg::Object { span, .. }
             | Arg::New { span, .. }
+            | Arg::Type { span, .. }
             | Arg::Other { span } => *span,
         }
     }
@@ -769,7 +777,18 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                             .and_then(|v| calls::init(language, v, source, &chain_index))
                     }),
                 constant: b.constant,
-                decorations: if language == Language::Java {
+                // Contract M6j S1+S3: Kotlin, C# and TypeScript bindings carry their
+                // annotations like Java's do (definition decorations ride the same
+                // arms; TS parameter decorators attach through the `decorator`
+                // field for NestJS points).
+                decorations: if matches!(
+                    language,
+                    Language::Java
+                        | Language::Kotlin
+                        | Language::CSharp
+                        | Language::TypeScript
+                        | Language::Tsx
+                ) {
                     decorations::decorations(language, b.node, source)
                 } else {
                     Vec::new()
@@ -1328,6 +1347,19 @@ namespace Acme {
         assert_eq!(
             refs(Language::CSharp, CSHARP, RefKind::Call),
             ["Shout in Greet", "Greet in Main"]
+        );
+    }
+
+    /// Contract M6j S6: file-scoped namespaces (`namespace Shop;`) are module
+    /// definitions too (modern C# has no `namespace_declaration` for them).
+    #[test]
+    fn csharp_file_scoped_namespaces_are_modules() {
+        let src = "namespace Shop;\npublic class A {}\n";
+        // The module registers (same-namespace resolution reads it); the class does not
+        // nest under it (siblings in the tree) — residue, harmless to resolution.
+        assert_eq!(
+            outline(Language::CSharp, src),
+            ["module Shop@0:10", "class A@1:13",]
         );
     }
 

@@ -653,10 +653,12 @@ fn kotlin_member(node: Node<'_>) -> bool {
 }
 
 /// Kotlin parameters, properties and locals with their declared types (`val` is constant;
-/// constructor-call values stay untyped, like Java `var` without `new`).
+/// constructor-call values stay untyped, like Java `var` without `new`). Primary-constructor
+/// parameters (`class_parameter`) bind like parameters (contract M6j S1: constructor injection
+/// points).
 fn kotlin<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
     match node.kind() {
-        "parameter" => {
+        "parameter" | "class_parameter" => {
             let mut c = node.walk();
             let mut kids = node.named_children(&mut c);
             let name = kids.find(|n| n.kind() == "identifier");
@@ -1559,6 +1561,17 @@ mod tests {
                 "v: ? in f",
             ]
         );
+    }
+
+    /// Contract M6j S1: primary-constructor parameters bind (constructor injection points).
+    #[test]
+    fn kotlin_primary_constructor_parameters_bind() {
+        let src = "class C @Inject constructor(@Named(\"s\") val s: Svc, t: T) {\n}\n";
+        assert_eq!(bound(Language::Kotlin, src), ["s: Svc in C", "t: T in C"]);
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let s = facts.bindings.iter().find(|b| b.name == "s").unwrap();
+        assert_eq!(s.decorations.len(), 1);
+        assert_eq!(s.decorations[0].name, "Named");
     }
 
     #[test]

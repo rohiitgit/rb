@@ -1,0 +1,14 @@
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:context="http://www.springframework.org/schema/context">
+  <context:component-scan base-package="com.acme.shop"/>
+  <bean id="store" class="com.acme.shop.Store">
+    <constructor-arg ref="db"/>
+    <property name="helper" ref="helper"/>
+  </bean>
+  <bean id="db" class="com.acme.shop.Db" primary="true"/>
+  <bean id="helper" class="com.acme.shop.Helper"/>
+  <alias name="store" alias="shop"/>
+  <bean id="audit" class="com.acme.shop.Audit">
+    <constructor-arg ref="shop"/>
+  </bean>
+</beans>

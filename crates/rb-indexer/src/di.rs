@@ -18,7 +18,7 @@ use rb_model::{
     Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
     Provenance, Span,
 };
-use rb_syntax::{FileFacts, Language, MentionRole, RefKind};
+use rb_syntax::{DefKind, FileFacts, Language, MentionRole, RefKind};
 use serde_json::{Value, json};
 
 use crate::resolve::{Container, Index};
@@ -48,6 +48,8 @@ pub(crate) struct Inputs<'a> {
     pub unparsed: &'a RawScan,
     /// Manifest texts by path, for the `lombok.config` chain (contract M6c S8).
     pub manifests: &'a BTreeMap<&'a str, String>,
+    /// XML texts by path, for the Spring beans reader (contract M6j S4).
+    pub xml: &'a BTreeMap<&'a str, String>,
 }
 
 /// The coverage buckets (S7, amendment 2), in the order `rb status` prints them.
@@ -231,15 +233,26 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
         })
         .collect();
 
+    // Contract M6j S4: Spring beans documents among the XML texts. Successfully read
+    // documents retire their `beans namespace` gate-D finding below; unreadable ones
+    // keep tainting.
+    let xml_docs: Vec<(&'a str, crate::xml_beans::XmlBeansDoc)> = inputs
+        .xml
+        .iter()
+        .filter_map(|(path, text)| {
+            work::tick(1);
+            crate::xml_beans::read_spring_beans(text).map(|doc| (*path, doc))
+        })
+        .collect();
+
     // Gate D (S6; amendment 3: main sources only).
     let surface = per_file
         .iter()
         .any(|(path, _, d)| !is_test_path(path) && !d.surface.is_empty())
-        || inputs
-            .unparsed
-            .di_surface
-            .iter()
-            .any(|(path, _)| !is_test_path(path));
+        || inputs.unparsed.di_surface.iter().any(|(path, finding)| {
+            !is_test_path(path)
+                && !(finding == "beans namespace" && xml_docs.iter().any(|(p, _)| p == path))
+        });
     // Gate M (S6, narrowed by S2): names with a mention outside the allowed
     // roles in any parsed Java file — except `ClassLiteral` mentions in test
     // paths, which register nothing in the application's context (contract
@@ -275,6 +288,9 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
 
     // Roots per service, from main sources.
     let mut roots: BTreeMap<String, Roots> = BTreeMap::new();
+    // Contract M6j S4: services carrying annotation component scans (unknown stays
+    // unknown when XML scans join below).
+    let mut services_with_scans: BTreeSet<String> = BTreeSet::new();
     {
         let mut decls: BTreeMap<String, Vec<(&str, &spring::ScanDecl)>> = BTreeMap::new();
         for (path, _, d) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
@@ -298,6 +314,11 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                     .then(|| ds.iter().flat_map(|(_, s)| s.packages.clone()).collect())
             };
             let components = of(ScanKind::Components);
+            // Contract M6j S4: services with annotation component scans, for the XML
+            // union below (unknown stays unknown).
+            if !components.is_empty() {
+                services_with_scans.insert(service.clone());
+            }
             let classes: BTreeSet<(&str, usize)> =
                 components.iter().map(|(p, s)| (*p, s.class)).collect();
             let r = roots.entry(service).or_default();
@@ -313,6 +334,43 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
             r.feign = (!feign.is_empty()).then(|| known(&feign));
         }
     }
+    // Contract M6j S4: component-scan packages from Spring XML join the roots. Known
+    // stays known (union); unknown stays unknown; repositories follow components when
+    // they defaulted to them.
+    {
+        let mut xml_scans: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, doc) in &xml_docs {
+            if is_test_path(path) || doc.scans.is_empty() {
+                continue;
+            }
+            xml_scans
+                .entry((inputs.service_of)(path))
+                .or_default()
+                .extend(doc.scans.iter().cloned());
+        }
+        for (service, packages) in &xml_scans {
+            let r = roots.entry(service.clone()).or_default();
+            // Unknown annotation scans stay unknown: XML only narrows known roots, or
+            // seeds services with no annotation scans at all.
+            if services_with_scans.contains(service) && r.components.is_none() {
+                continue;
+            }
+            let repos_followed = r.repositories == r.components;
+            let mut union = match &r.components {
+                Some(known) => known.clone(),
+                None => Vec::new(),
+            };
+            for p in packages {
+                if !union.iter().any(|q| q == p) {
+                    union.push(p.clone());
+                }
+            }
+            r.components = Some(union.clone());
+            if repos_followed {
+                r.repositories = Some(union);
+            }
+        }
+    }
 
     // Beans and unread classes from main sources.
     let mut beans: Vec<BeanAt<'a, '_>> = Vec::new();
@@ -322,23 +380,7 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
         let service = (inputs.service_of)(path);
         let package = facts.package.as_deref().unwrap_or_default();
         for bean in &d.beans {
-            let def = &facts.definitions[bean.definition];
-            let (start, inferred) = match bean.origin {
-                Origin::BeanMethod => {
-                    let found = index.type_candidates(path, def.parent, &bean.type_name);
-                    if found.is_empty() {
-                        let created: Vec<Sym<'_>> = bean
-                            .created
-                            .iter()
-                            .flat_map(|c| index.type_candidates(path, Some(bean.definition), c))
-                            .collect();
-                        (created, true)
-                    } else {
-                        (found, false)
-                    }
-                }
-                _ => (vec![(path, bean.definition)], false),
-            };
+            let (start, inferred) = bean_start(index, path, facts, bean);
             beans.push(BeanAt {
                 path,
                 bean,
@@ -355,6 +397,43 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
         }
         for &c in &d.unread_classes {
             unread.push((service.clone(), assignable(index, &[(path, c)])));
+        }
+    }
+    // Contract M6j S4: `<bean>` definitions become beans targeting their resolved class,
+    // carrying their ids and aliases as names and qualifiers; their refs become points.
+    let (xml_beans, xml_points) = synthesize_xml_beans(inputs, &xml_docs);
+    let mut xml_owned: Vec<Bean> = Vec::new();
+    for b in &xml_beans {
+        xml_owned.push(Bean {
+            definition: b.definition,
+            origin: Origin::XmlBean,
+            type_name: b.type_name.clone(),
+            generic: false,
+            names: b.names.clone(),
+            qualifiers: b.names.clone(),
+            primary: b.primary,
+            conditional: false,
+            annotations: Vec::new(),
+            created: Vec::new(),
+            extends: Vec::new(),
+        });
+    }
+    {
+        for (k, b) in xml_beans.iter().enumerate() {
+            let facts = inputs.files[b.target_path].1;
+            beans.push(BeanAt {
+                path: b.target_path,
+                bean: &xml_owned[k],
+                service: (inputs.service_of)(b.target_path),
+                package: facts.package.as_deref().unwrap_or_default(),
+                types: assignable(index, &[(b.target_path, b.definition)]),
+                clauses: facts.definitions[b.definition]
+                    .supertypes
+                    .iter()
+                    .map(|s| (simple(&s.name).to_owned(), s.type_args.clone()))
+                    .collect(),
+                inferred: false,
+            });
         }
     }
     let mut by_type: BTreeMap<Sym<'a>, Vec<usize>> = BTreeMap::new();
@@ -470,7 +549,629 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
             resolve_point(&ctx, p, &mut out);
         }
     }
+    // Contract M6j S3: the NestJS lane merges here, so every caller of `resolve` sees one
+    // Resolution with shared buckets.
+    let nest = resolve_nest(inputs);
+    for (k, v) in nest.buckets {
+        *out.buckets.entry(k).or_default() += v;
+    }
+    for (k, v) in nest.gates {
+        *out.gates.entry(k).or_default() += v;
+    }
+    out.injections.extend(nest.injections);
+    out.diagnostics.extend(nest.diagnostics);
+    for (k, v) in nest.points.by_owner {
+        out.points.by_owner.entry(k).or_default().extend(v);
+    }
+    for (k, v) in nest.points.unique {
+        out.points.unique.insert(k, v);
+    }
+    // Contract M6j S4: the XML points lane merges here (same shared buckets).
+    let xml_lane = resolve_xml_points(inputs, &beans, &by_type, &xml_points, &roots, surface);
+    for (k, v) in xml_lane.buckets {
+        *out.buckets.entry(k).or_default() += v;
+    }
+    for (k, v) in xml_lane.gates {
+        *out.gates.entry(k).or_default() += v;
+    }
+    out.injections.extend(xml_lane.injections);
+    out.diagnostics.extend(xml_lane.diagnostics);
+    for (k, v) in xml_lane.points.by_owner {
+        out.points.by_owner.entry(k).or_default().extend(v);
+    }
+    for (k, v) in xml_lane.points.unique {
+        out.points.unique.insert(k, v);
+    }
     out
+}
+
+/// The symbols a bean is assignable from (contract M6j S2/S6): `@Bean`-like beans
+/// resolve their declared type (falling back to the created/implementation types);
+/// every other bean starts at its own definition. Shared by the Java engine and the
+/// managed lane so `Binds` beans match identically in both.
+fn bean_start<'a>(
+    index: &Index<'a>,
+    path: &'a str,
+    facts: &'a FileFacts,
+    bean: &Bean,
+) -> (Vec<Sym<'a>>, bool) {
+    let def = &facts.definitions[bean.definition];
+    match bean.origin {
+        // Contract M6j S2: `Binds` beans resolve their bound type like `@Bean`
+        // methods do (falling back to the created/implementation types).
+        Origin::BeanMethod | Origin::Binds => {
+            let found = index.type_candidates(path, def.parent, &bean.type_name);
+            if found.is_empty() {
+                let created: Vec<Sym<'_>> = bean
+                    .created
+                    .iter()
+                    .flat_map(|c| index.type_candidates(path, Some(bean.definition), c))
+                    .collect();
+                (created, true)
+            } else {
+                (found, false)
+            }
+        }
+        _ => (vec![(path, bean.definition)], false),
+    }
+}
+
+/// NestJS, Kotlin-beans and .NET resolution (contract M6j S3/S5/S6): a compact lane
+/// Java engine. Neither TypeScript nor Kotlin has scan roots, conditionals, Lombok,
+/// registrants or wrappers that matter here;
+/// points match beans by resolved type (tokens by qualifier only, never auto-names),
+/// heuristic, several resolves ambiguous, nothing rises above heuristic. Buckets merge
+/// with the Java lane's under the same names.
+/// XML-declared points (contract M6j S4): mirrors the NestJS lane, except qualifiers
+/// narrow (they are bean ids, always present) and evidence lives in the XML file while
+/// the owner lives in the consumer class. Eligibility follows the same per-origin rules
+/// as the Java engine.
+fn resolve_xml_points<'a>(
+    inputs: &Inputs<'a>,
+    beans: &[BeanAt<'a, '_>],
+    by_type: &BTreeMap<Sym<'a>, Vec<usize>>,
+    points: &[SynthPoint<'a>],
+    roots: &BTreeMap<String, Roots>,
+    surface: bool,
+) -> Resolution {
+    let mut out = Resolution::default();
+    for b in BUCKETS {
+        out.buckets.insert(b, 0);
+    }
+    if points.is_empty() {
+        return out;
+    }
+    let mut classpaths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for p in points {
+        if is_test_path(p.xml_path) {
+            *out.buckets.get_mut("test").unwrap() += 1;
+            continue;
+        }
+        let service = (inputs.service_of)(p.owner_path);
+        let classpath = classpaths
+            .entry(service.clone())
+            .or_insert_with(|| {
+                crate::packages::classpath(&service, inputs.depends)
+                    .into_iter()
+                    .filter(|s| *s == service || !inputs.deployable.contains(s))
+                    .collect()
+            })
+            .clone();
+        out.points
+            .by_owner
+            .entry((p.owner_path.to_owned(), p.owner))
+            .or_default()
+            .push(PointRef {
+                name: p.name.clone(),
+                element: p.element.clone(),
+                span: p.span,
+            });
+        let mut gates: BTreeSet<&'static str> = BTreeSet::new();
+        if surface {
+            gates.insert("surface");
+        }
+        let components = roots.get(&service).and_then(|r| r.components.as_ref());
+        if components.is_none() {
+            gates.insert("scan_roots_unknown");
+        }
+        let types = inputs
+            .index
+            .type_candidates(p.owner_path, Some(p.owner), &p.element);
+        let mut set = BTreeSet::new();
+        for t in &types {
+            for &i in by_type.get(t).into_iter().flatten() {
+                work::tick(1);
+                let b = &beans[i];
+                if !classpath.contains(&b.service) {
+                    continue;
+                }
+                let eligible = match b.bean.origin {
+                    Origin::Stereotype
+                    | Origin::BeanMethod
+                    | Origin::Singleton
+                    | Origin::Injectable
+                    | Origin::Binds => components.is_none_or(|r| under(b.package, r)),
+                    Origin::SpringData => roots
+                        .get(&b.service)
+                        .and_then(|r| r.repositories.as_ref())
+                        .is_none_or(|r| under(b.package, r)),
+                    Origin::Feign => match roots.get(&b.service).and_then(|r| r.feign.as_ref()) {
+                        None => false,
+                        Some(None) => true,
+                        Some(Some(r)) => under(b.package, r),
+                    },
+                    Origin::XmlBean => true,
+                };
+                if eligible {
+                    set.insert(i);
+                }
+            }
+        }
+        let mut candidates: Vec<usize> = set.into_iter().collect();
+        candidates.retain(|&i| {
+            beans[i].bean.names.iter().any(|n| n == &p.qualifier)
+                || beans[i].bean.qualifiers.iter().any(|x| x == &p.qualifier)
+        });
+        if candidates.is_empty() {
+            *out.buckets.get_mut("unresolved").unwrap() += 1;
+            out.diagnostics.push(site_diagnostic(
+                "di_unresolved",
+                p.owner_path,
+                p.span,
+                &p.element,
+                "no_bean",
+            ));
+            continue;
+        }
+        candidates.sort_by(|a, b| {
+            inputs.keys[beans[*a].path][beans[*a].bean.definition]
+                .cmp(&inputs.keys[beans[*b].path][beans[*b].bean.definition])
+        });
+        candidates.dedup();
+        if !types.is_empty() && candidates.iter().any(|&i| beans[i].inferred) {
+            gates.insert("bean_type_inferred");
+        }
+        let several = candidates.len() > 1;
+        let certainty = if several {
+            Certainty::Ambiguous
+        } else {
+            Certainty::Heuristic
+        };
+        let label = if several {
+            "ambiguous"
+        } else if gates.is_empty() {
+            "plain"
+        } else {
+            "capped"
+        };
+        *out.buckets.get_mut(label).unwrap() += 1;
+        for g in &gates {
+            *out.gates.entry(g).or_default() += 1;
+        }
+        if candidates.len() == 1 {
+            let b = &beans[candidates[0]];
+            out.points.unique.insert(
+                (p.owner_path.to_owned(), p.span),
+                (b.path.to_owned(), b.bean.definition),
+            );
+        }
+        let src = inputs.keys[p.owner_path][p.owner].clone();
+        for &i in &candidates {
+            let b = &beans[i];
+            let mut attrs = serde_json::Map::new();
+            attrs.insert("origin".into(), b.bean.origin.as_str().into());
+            attrs.insert("via".into(), p.form.as_str().into());
+            attrs.insert("resolution".into(), "qualifier".into());
+            attrs.insert("qualifier".into(), p.qualifier.as_str().into());
+            if several {
+                attrs.insert("candidates".into(), candidates.len().into());
+            }
+            if !gates.is_empty() {
+                attrs.insert(
+                    "capped_by".into(),
+                    Value::Array(gates.iter().map(|g| Value::from(*g)).collect()),
+                );
+            }
+            out.injections.push(Injection {
+                src: src.clone(),
+                dst: inputs.keys[b.path][b.bean.definition].clone(),
+                certainty,
+                attrs,
+                at: Evidence {
+                    path: p.xml_path.to_owned(),
+                    span: p.span,
+                },
+            });
+        }
+    }
+    out
+}
+
+pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
+    let mut out = Resolution::default();
+    for b in BUCKETS {
+        out.buckets.insert(b, 0);
+    }
+    let ts: Vec<(&'a str, Language, &'a FileFacts)> = inputs
+        .files
+        .iter()
+        .filter(|(_, (language, _))| {
+            matches!(
+                language,
+                Language::TypeScript | Language::Tsx | Language::Kotlin | Language::CSharp
+            )
+        })
+        .map(|(path, (language, facts))| (*path, *language, *facts))
+        .collect();
+    if ts.is_empty() {
+        return out;
+    }
+    let per_file: Vec<(&'a str, &'a FileFacts, FileDi)> = ts
+        .iter()
+        .map(|(path, language, facts)| {
+            let di = match language {
+                Language::Kotlin => spring::kotlin_di(facts),
+                Language::CSharp => spring::dotnet_di(facts),
+                _ => spring::nest_di(facts),
+            };
+            (*path, *facts, di)
+        })
+        .collect();
+    struct NestBean<'a, 'b> {
+        path: &'a str,
+        bean: &'b Bean,
+        service: String,
+        types: Vec<Sym<'a>>,
+        inferred: bool,
+    }
+    let mut beans: Vec<NestBean<'_, '_>> = Vec::new();
+    for (path, facts, d) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+        let service = (inputs.service_of)(path);
+        for bean in &d.beans {
+            let (start, inferred) = bean_start(inputs.index, path, facts, bean);
+            let types: Vec<Sym<'_>> = assignable(inputs.index, &start).into_iter().collect();
+            beans.push(NestBean {
+                path,
+                bean,
+                service: service.clone(),
+                types,
+                inferred,
+            });
+        }
+    }
+    let mut by_type: BTreeMap<Sym<'a>, Vec<usize>> = BTreeMap::new();
+    for (i, b) in beans.iter().enumerate() {
+        for &t in &b.types {
+            work::tick(1);
+            by_type.entry(t).or_default().push(i);
+        }
+    }
+    let mut classpaths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (path, _, d) in &per_file {
+        let service = (inputs.service_of)(path);
+        let classpath = classpaths
+            .entry(service.clone())
+            .or_insert_with(|| {
+                crate::packages::classpath(&service, inputs.depends)
+                    .into_iter()
+                    .filter(|s| *s == service || !inputs.deployable.contains(s))
+                    .collect()
+            })
+            .clone();
+        for p in &d.points {
+            if is_test_path(path) {
+                *out.buckets.get_mut("test").unwrap() += 1;
+                continue;
+            }
+            // Contract M6j S6: class owners resolve only when registered themselves;
+            // function owners (Kotlin DSL) always pass.
+            if inputs.files[path]
+                .1
+                .definitions
+                .get(p.owner)
+                .is_some_and(|d| {
+                    d.kind == DefKind::Class
+                        && !beans.iter().any(|b| simple(&b.bean.type_name) == d.name)
+                })
+            {
+                continue;
+            }
+            out.points
+                .by_owner
+                .entry(((*path).to_owned(), p.owner))
+                .or_default()
+                .push(PointRef {
+                    name: p.name.clone(),
+                    element: p.element.clone(),
+                    span: p.span,
+                });
+            let mut gates: BTreeSet<&'static str> = BTreeSet::new();
+            if !d.surface.is_empty() {
+                gates.insert("surface");
+            }
+            gates.insert("scan_roots_unknown");
+            let mut candidates: Vec<usize> = Vec::new();
+            let mut resolution = "unique";
+            let types: Vec<Sym> = if p.qualifier.is_none() {
+                inputs
+                    .index
+                    .type_candidates(path, Some(p.owner), &p.element)
+            } else {
+                Vec::new()
+            };
+            if let Some(q) = &p.qualifier {
+                // A token: beans explicitly carrying it as qualifier. Auto-names do
+                // not count (a class named `DB` does not serve token `'DB'` without
+                // a custom provider, which stays unread).
+                for (i, b) in beans.iter().enumerate() {
+                    work::tick(1);
+                    if !classpath.contains(&b.service) {
+                        continue;
+                    }
+                    if b.bean.qualifiers.iter().any(|x| x == q) {
+                        candidates.push(i);
+                    }
+                }
+                resolution = "qualifier";
+            } else {
+                let mut set = BTreeSet::new();
+                for t in &types {
+                    for &i in by_type.get(t).into_iter().flatten() {
+                        work::tick(1);
+                        if classpath.contains(&beans[i].service) {
+                            set.insert(i);
+                        }
+                    }
+                }
+                candidates = set.into_iter().collect();
+            }
+            if candidates.is_empty() {
+                *out.buckets.get_mut("unresolved").unwrap() += 1;
+                out.diagnostics.push(site_diagnostic(
+                    "di_unresolved",
+                    path,
+                    p.span,
+                    &p.element,
+                    "no_bean",
+                ));
+                continue;
+            }
+            // Deterministic order: by target key.
+            candidates.sort_by(|a, b| {
+                inputs.keys[beans[*a].path][beans[*a].bean.definition]
+                    .cmp(&inputs.keys[beans[*b].path][beans[*b].bean.definition])
+            });
+            candidates.dedup();
+            if !types.is_empty() && candidates.iter().any(|&i| beans[i].inferred) {
+                gates.insert("bean_type_inferred");
+            }
+            let several = candidates.len() > 1;
+            let certainty = if several {
+                Certainty::Ambiguous
+            } else {
+                Certainty::Heuristic
+            };
+            let label = if several {
+                "ambiguous"
+            } else if gates.is_empty() {
+                "plain"
+            } else {
+                "capped"
+            };
+            *out.buckets.get_mut(label).unwrap() += 1;
+            for g in &gates {
+                *out.gates.entry(g).or_default() += 1;
+            }
+            if candidates.len() == 1 {
+                let b = &beans[candidates[0]];
+                out.points.unique.insert(
+                    ((*path).to_owned(), p.span),
+                    (b.path.to_owned(), b.bean.definition),
+                );
+            }
+            let src = inputs.keys[path][p.owner].clone();
+            for &i in &candidates {
+                let b = &beans[i];
+                let mut attrs = serde_json::Map::new();
+                attrs.insert("origin".into(), b.bean.origin.as_str().into());
+                attrs.insert("via".into(), p.form.as_str().into());
+                attrs.insert("resolution".into(), resolution.into());
+                if let Some(q) = &p.qualifier {
+                    attrs.insert("qualifier".into(), q.as_str().into());
+                }
+                if several {
+                    attrs.insert("candidates".into(), candidates.len().into());
+                }
+                if !gates.is_empty() {
+                    attrs.insert(
+                        "capped_by".into(),
+                        Value::Array(gates.iter().map(|g| Value::from(*g)).collect()),
+                    );
+                }
+                out.injections.push(Injection {
+                    src: src.clone(),
+                    dst: inputs.keys[b.path][b.bean.definition].clone(),
+                    certainty,
+                    attrs,
+                    at: Evidence {
+                        path: (*path).to_owned(),
+                        span: p.span,
+                    },
+                });
+            }
+        }
+    }
+    out
+}
+
+/// A `<bean>` resolved to its class definition (contract M6j S4).
+struct SynthBean<'a> {
+    xml_path: &'a str,
+    target_path: &'a str,
+    definition: usize,
+    type_name: String,
+    names: Vec<String>,
+    primary: bool,
+    refs: Vec<crate::xml_beans::XmlRef>,
+}
+
+/// An injection point declared by `<constructor-arg>`/`<property>` (contract M6j S4):
+/// owned by the resolved consumer class, evidenced in the XML file.
+struct SynthPoint<'a> {
+    xml_path: &'a str,
+    owner_path: &'a str,
+    owner: usize,
+    form: Form,
+    name: String,
+    element: String,
+    qualifier: String,
+    span: Span,
+}
+
+/// Class definitions by simple name, for Spring XML resolution (contract M6j S4/S10):
+/// Java and Kotlin classes once (C# would only collide). Built once per resolution so
+/// each bean resolves by lookup, not by scan.
+fn class_index<'a>(
+    files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
+) -> BTreeMap<&'a str, Vec<(&'a str, usize)>> {
+    let mut out: BTreeMap<&str, Vec<(&str, usize)>> = BTreeMap::new();
+    for (path, (language, facts)) in files {
+        // Spring XML wires JVM classes; C# never matches (its names would only collide).
+        if !matches!(language, Language::Java | Language::Kotlin) {
+            continue;
+        }
+        for (i, d) in facts.definitions.iter().enumerate() {
+            work::tick(1);
+            if d.kind == rb_syntax::DefKind::Class {
+                out.entry(d.name.as_str()).or_default().push((*path, i));
+            }
+        }
+    }
+    out
+}
+
+/// Class definitions matching `class`: fully qualified names match package + simple name
+/// (one package level is also stripped for nested classes); simple names match
+/// repo-wide. Zero or several matches give nothing (never guess).
+fn resolve_class<'a>(
+    files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
+    index: &BTreeMap<&'a str, Vec<(&'a str, usize)>>,
+    class: &str,
+) -> Vec<(&'a str, usize)> {
+    let (package, simple) = match class.rsplit_once('.') {
+        Some((p, s)) => (Some(p), s),
+        None => (None, class),
+    };
+    index
+        .get(simple)
+        .into_iter()
+        .flatten()
+        .filter(|(path, _)| {
+            work::tick(1);
+            match package {
+                None => true,
+                Some(p) => {
+                    let file_package = files[path].1.package.as_deref().unwrap_or_default();
+                    file_package == p
+                        || p.rsplit_once('.')
+                            .is_some_and(|(outer, _)| outer == file_package)
+                }
+            }
+        })
+        .copied()
+        .collect()
+}
+
+/// Synthesizes beans and points from Spring beans documents (contract M6j S4): each
+/// `<bean>` with exactly one class match becomes a bean targeting its class (ids and
+/// aliases ride names and qualifiers); each `ref` becomes a point owned by the consumer
+/// class, evidenced in the XML. Test-path documents contribute nothing (like Java).
+/// Returns the beans, the points, and the services with component scans is left to the
+/// caller (roots union above).
+#[allow(clippy::type_complexity)]
+fn synthesize_xml_beans<'a>(
+    inputs: &Inputs<'a>,
+    docs: &[(&'a str, crate::xml_beans::XmlBeansDoc)],
+) -> (Vec<SynthBean<'a>>, Vec<SynthPoint<'a>>) {
+    use crate::xml_beans::XmlRefKind;
+    let mut beans: Vec<SynthBean<'a>> = Vec::new();
+    let mut points: Vec<SynthPoint<'a>> = Vec::new();
+    // Bean ids and aliases per service, for ref resolution.
+    let mut by_id: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let classes = class_index(inputs.files);
+    for (xml_path, doc) in docs {
+        if is_test_path(xml_path) {
+            continue;
+        }
+        let service = (inputs.service_of)(xml_path);
+        for bean in &doc.beans {
+            let targets = resolve_class(inputs.files, &classes, &bean.class);
+            if targets.len() != 1 {
+                continue;
+            }
+            let (target_path, definition) = targets[0];
+            let simple = bean
+                .class
+                .rsplit('.')
+                .next()
+                .unwrap_or(&bean.class)
+                .to_owned();
+            let mut names: Vec<String> = if bean.id.is_empty() {
+                vec![spring::decapitalize(&simple)]
+            } else {
+                vec![bean.id.clone()]
+            };
+            for (alias, name) in &doc.aliases {
+                if name == &bean.id && !names.iter().any(|n| n == alias) {
+                    names.push(alias.clone());
+                }
+            }
+            let idx = beans.len();
+            beans.push(SynthBean {
+                xml_path,
+                target_path,
+                definition,
+                type_name: simple,
+                names,
+                primary: bean.primary,
+                refs: bean.refs.clone(),
+            });
+            // Ids and aliases resolve repo-wide by (service, name); empty ids are not
+            // addressable, so they stay out (two nameless beans must not collide).
+            if !bean.id.is_empty() {
+                by_id.insert((service.clone(), bean.id.clone()), idx);
+            }
+            for (alias, name) in &doc.aliases {
+                if name == &bean.id {
+                    by_id.insert((service.clone(), alias.clone()), idx);
+                }
+            }
+        }
+    }
+    // Pass two: refs (forward references resolve: every bean is registered above).
+    for b in &beans {
+        let service = (inputs.service_of)(b.xml_path);
+        for r in &b.refs {
+            let (element, qualifier) = match by_id.get(&(service.clone(), r.target.clone())) {
+                Some(&t) => (beans[t].type_name.clone(), r.target.clone()),
+                None => (r.target.clone(), r.target.clone()),
+            };
+            points.push(SynthPoint {
+                xml_path: b.xml_path,
+                owner_path: b.target_path,
+                owner: b.definition,
+                form: match r.kind {
+                    XmlRefKind::ConstructorArg => Form::Constructor,
+                    XmlRefKind::Property => Form::Setter,
+                },
+                name: r.name.clone(),
+                element,
+                qualifier,
+                span: r.span,
+            });
+        }
+    }
+    (beans, points)
 }
 
 struct PointContext<'c, 'a> {
@@ -806,12 +1507,19 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             return false;
         }
         match b.bean.origin {
-            Origin::Stereotype | Origin::BeanMethod => {
-                components.is_none_or(|r| under(b.package, r))
-            }
+            // Contract M6j S2: the new origins are eligible like stereotypes (scan
+            // roots, when known; open world otherwise).
+            Origin::Stereotype
+            | Origin::BeanMethod
+            | Origin::Singleton
+            | Origin::Injectable
+            | Origin::Binds => components.is_none_or(|r| under(b.package, r)),
             Origin::SpringData => roots
                 .and_then(|r| r.repositories.as_ref())
                 .is_none_or(|r| under(b.package, r)),
+            // Contract M6j S4: explicit `<bean>` definitions ignore scans (Spring
+            // instantiates them regardless); the classpath gate above still applies.
+            Origin::XmlBean => true,
             Origin::Feign => match roots.and_then(|r| r.feign.as_ref()) {
                 None => false,
                 Some(None) => true,
@@ -1378,6 +2086,7 @@ mod tests {
             .iter()
             .map(|(p, t)| (*p, (*t).to_owned()))
             .collect();
+        let empty_xml: BTreeMap<&str, String> = BTreeMap::new();
         let r = resolve(&Inputs {
             files: &by_path,
             keys: &keys,
@@ -1387,6 +2096,7 @@ mod tests {
             depends: &depends,
             unparsed: &unparsed,
             manifests: &manifests,
+            xml: &empty_xml,
         });
         let short = |k: &str| {
             k.rsplit_once("`/")
@@ -2747,6 +3457,7 @@ mod tests {
             depends: &depends,
             unparsed: &raw,
             manifests: &BTreeMap::new(),
+            xml: &BTreeMap::new(),
         });
         assert_eq!(r.injections.len(), n);
         work::take()
@@ -2756,6 +3467,101 @@ mod tests {
     /// (counted operations, at most 5× for 4× the input).
     #[test]
     fn di_resolution_grows_linearly() {
+        let (small, large) = (work_for(100), work_for(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M6j S10: XML bean synthesis grows linearly in beans (counted
+    /// operations, at most 5× for 4× the input): classes resolve by index lookup.
+    #[test]
+    fn xml_beans_grow_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut java = String::from("package com.acme;\n");
+            let mut xml =
+                String::from("<beans xmlns=\"http://www.springframework.org/schema/beans\">\n");
+            for i in 0..n {
+                java += &format!("class C{i} {{}}\n");
+                if i == 0 {
+                    xml += &format!("  <bean id=\"b{i}\" class=\"com.acme.C{i}\"/>\n");
+                } else {
+                    xml += &format!(
+                        "  <bean id=\"b{i}\" class=\"com.acme.C{i}\">\n    <constructor-arg ref=\"b{j}\"/>\n  </bean>\n",
+                        j = i - 1,
+                    );
+                }
+            }
+            xml += "</beans>\n";
+            let (r, ops) = resolve_lang(
+                &[("src/C.java", Language::Java, &java)],
+                &[("app.xml", &xml)],
+            );
+            assert_eq!(r.injections.len(), n - 1);
+            ops
+        }
+        let (small, large) = (work_for(100), work_for(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Resolves mixed-language files with XML texts (contract M6j S10): returns the
+    /// resolution and the counted operations its `resolve` took.
+    fn resolve_lang(files: &[(&str, Language, &str)], xml: &[(&str, &str)]) -> (Resolution, u64) {
+        let facts: Vec<(String, Language, FileFacts)> = files
+            .iter()
+            .map(|(p, l, s)| {
+                (
+                    (*p).to_owned(),
+                    *l,
+                    rb_syntax::extract(*l, s.as_bytes()).unwrap(),
+                )
+            })
+            .collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
+            .iter()
+            .map(|(p, l, f)| (p.as_str(), (*l, f)))
+            .collect();
+        let keys: BTreeMap<&str, Vec<String>> = by_path
+            .iter()
+            .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+            .collect();
+        let go = BTreeMap::new();
+        let index = Index::new(&by_path, &go, &keys);
+        let service_of = |_: &str| ".".to_owned();
+        let empty = BTreeSet::new();
+        let depends = BTreeMap::new();
+        let raw = RawScan::default();
+        let xml_map: BTreeMap<&str, String> =
+            xml.iter().map(|(p, t)| (*p, (*t).to_owned())).collect();
+        work::take();
+        let r = resolve(&Inputs {
+            files: &by_path,
+            keys: &keys,
+            index: &index,
+            service_of: &service_of,
+            deployable: &empty,
+            depends: &depends,
+            unparsed: &raw,
+            manifests: &BTreeMap::new(),
+            xml: &xml_map,
+        });
+        (r, work::take())
+    }
+
+    /// Contract M6j S10: the managed lane (NestJS here) grows linearly in beans and
+    /// points (counted operations, at most 5× for 4× the input).
+    #[test]
+    fn managed_lane_grows_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut body = String::from("import { Injectable } from '@nestjs/common';\n");
+            for i in 0..n {
+                body += &format!(
+                    "@Injectable()\nexport class S{i} {{}}\n@Injectable()\nexport class C{i} {{\nconstructor(private s: S{i}) {{}}\n}}\n"
+                );
+            }
+            let (r, ops) = resolve_lang(&[("src/a.ts", Language::TypeScript, &body)], &[]);
+            assert_eq!(r.injections.len(), n);
+            ops
+        }
+        // Counted operations, not wall clock: take the delta around resolve.
         let (small, large) = (work_for(100), work_for(400));
         assert!(large <= small * 5, "{small} -> {large}");
     }

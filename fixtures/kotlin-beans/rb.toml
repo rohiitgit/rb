@@ -1,0 +1,5 @@
+# The Kotlin DSL sources are plain files: no build manifest (the Gradle fixture stays
+# untouched — spring-fu predates its Kotlin 2.2.0 toolchain), but they are one service.
+[[service]]
+path = "."
+name = "shop"

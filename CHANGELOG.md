@@ -1,5 +1,19 @@
 # Changelog
 
+## [2026-10-12] (wall clock) M6j CLOSED (evaluator passes 1–2)
+- Phases 0–1 (amendments 1–2): preflight (baseline binary, six pins, grammar shapes); Kotlin/C# decorations with literals, string literal decoding, `class_parameter` bindings — each test-first with killed mutants.
+- Phase 2 (amendment 3): Guice/Dagger import-gated packs (singletons, injectables, provides, binds, `bind().to()` qualifier joins) + `Arg::Type`; engine `Binds` arm; `java-guice` + `java-dagger` fixtures with 8/5 biting guards.
+- Phase 3 (amendment 4): NestJS decorator packs + `resolve_nest` lane (qualifier-only tokens); `ts-nest` fixture + 3/3 guards (incl. token-vs-name decoy).
+- Phase 4 (amendment 5): Spring XML reader + synthesis (beans target resolved classes, refs become points, scans union roots, findings retire); `spring-xml` fixture + 4/3 guards.
+- Phase 5 (amendment 6): Kotlin `beans { }` DSL via call type-args + structural spans, shared lane; plain `kotlin-beans` fixture + 4/3 guards.
+- Phase 6 (amendment 7): .NET `Add/TryAdd` packs with owner-registration rule; C# file-scoped modules; `csharp/` extended + guards.
+- Phase 8 (amendment 8): five public legs classified (guice/nest/jpetstore gate-lift/springfu/automapper), samples read in source, 0 false.
+- S10 (amendment 9): shared `bean_start`, indexed class resolution, two lane ratio tests green.
+- Pass 1 (`tasks/eval-m6j-pass1.md`, amendment 10): VERDICT PASS with H1–H4 in-tree (`.in()` tolerance, bind markers, nested innermost, file-scoped modules); 52/52 mutants killed.
+- Pass 2 (`tasks/eval-m6j-pass2.md`, amendment 11): VERDICT PASS — repros re-run, close verify stands (fmt, clippy, 913 units, store 72, server 12, e2e 47/47, api 1/1), invariant 1 re-derived identical.
+- `PIPELINE` `m6j-1` (metadata-only: no golden pins it; close verify re-proves the exact bumped tree).
+- Files: `crates/rb-syntax/src/{queries,lib,strings,bindings,calls}.rs`, `crates/rb-frameworks/src/di.rs`, `crates/rb-indexer/src/{di,lib,xml_beans,liveness,rta,stitch}.rs`, `crates/rb-cli/tests/{e2e.rs,golden/{java-guice,java-dagger,ts-nest,spring-xml,kotlin-beans,csharp}}`, `fixtures/{java-guice,java-dagger,ts-nest,spring-xml,kotlin-beans,csharp}/`; records `tasks/{contract-m6j,eval-m6j-pass1,eval-m6j-pass2,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-12] (wall clock) M6i CLOSED (evaluator passes 1–2)
 - Phases 0–2 (amendments 1–3): preflight (baseline binary, grammar pins, coroutines + automapper pins); Kotlin + C# grammars (hand-written Kotlin tags, C# invocation supplement); Tier B imports→implements with `kotlin-gradle` + `csharp` fixtures and 11/4 biting guards — each test-first with killed mutants.
 - Phase 3 (amendment 4): Kotlin exact edges through scip-java (fixture builds at Kotlin 2.2.0, 0 new calibrations, pair-wise Tier-B agreement, `scip_kotlin_gradle` e2e).

@@ -197,6 +197,67 @@ fn is_inner_link(language: Language, syn: &Syntax, call: Node<'_>) -> bool {
     outer.is_some_and(|outer| split(language, syn, outer).0 == Some(call))
 }
 
+/// Call-site type arguments as written (contract M6j S5/S6): Kotlin `type_arguments`
+/// and C# `generic_name` type lists decoded to their identifier texts; every other
+/// language reads none.
+fn call_type_args(language: Language, call: Node<'_>, source: &[u8]) -> Vec<String> {
+    if language == Language::Kotlin {
+        let mut c = call.walk();
+        return call
+            .named_children(&mut c)
+            .filter(|n| n.kind() == "type_arguments")
+            .flat_map(|a| {
+                let mut c = a.walk();
+                a.named_children(&mut c)
+                    .filter(|n| n.kind() == "type_projection")
+                    .filter_map(|p| {
+                        let mut c = p.walk();
+                        p.named_children(&mut c)
+                            .find(|n| n.kind() == "user_type")
+                            .map(|t| capped(text(t, source)))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
+    if language == Language::CSharp {
+        // `recv.AddSingleton<X, Y>()`: the member name is a `generic_name` carrying a
+        // `type_argument_list`; nested generics read their direct identifiers only. The
+        // descent follows `member_access_expression` spine (never arguments, never nested
+        // invocations, whose generics belong to their own links).
+        let mut out = Vec::new();
+        let mut node = call;
+        loop {
+            let mut c = node.walk();
+            let kids: Vec<_> = node.named_children(&mut c).collect();
+            if let Some(g) = kids.iter().find(|n| n.kind() == "generic_name") {
+                let mut c = g.walk();
+                for l in g
+                    .named_children(&mut c)
+                    .filter(|n| n.kind() == "type_argument_list")
+                {
+                    let mut c = l.walk();
+                    out.extend(
+                        l.named_children(&mut c)
+                            .filter(|t| t.kind() == "identifier")
+                            .map(|t| capped(text(t, source))),
+                    );
+                }
+                break;
+            }
+            match kids
+                .into_iter()
+                .find(|n| n.kind() == "member_access_expression")
+            {
+                Some(n) => node = n,
+                None => break,
+            }
+        }
+        return out;
+    }
+    Vec::new()
+}
+
 fn chain<'t>(language: Language, syn: &Syntax, outer: Node<'t>, source: &[u8]) -> RawChain<'t> {
     let mut links = Vec::new();
     let mut root = None;
@@ -208,6 +269,7 @@ fn chain<'t>(language: Language, syn: &Syntax, outer: Node<'t>, source: &[u8]) -
             name: name.map(|n| text(n, source)).unwrap_or_default(),
             span: span(callee.unwrap_or(call)),
             args: arguments.map_or_else(Vec::new, |a| args(language, syn, a, source)),
+            type_args: call_type_args(language, call, source),
         });
         match receiver {
             Some(r) if r.kind() == syn.call => call = r,
@@ -359,6 +421,33 @@ fn summary(language: Language, syn: &Syntax, node: Node<'_>, source: &[u8], dept
                     }),
             }],
         };
+    }
+    // A class literal (`Service.class`): the type as written (contract M6j S2).
+    if language == Language::Java && node.kind() == "class_literal" {
+        let mut c = node.walk();
+        let text = node
+            .named_children(&mut c)
+            .next()
+            .map(|t| capped(text(t, source)))
+            .unwrap_or_default();
+        return Arg::Type {
+            text,
+            span: span(node),
+        };
+    }
+    // Kotlin `value_argument` (possibly `name = value`): the value decodes, the key
+    // is dropped (contract M6j S5). Without this every Kotlin argument stays `Other`.
+    if node.kind() == "value_argument" {
+        let mut c = node.walk();
+        let mut kids = node.named_children(&mut c);
+        let (first, second) = (kids.next(), kids.next());
+        match (first, second) {
+            (Some(v), None) => return summary(language, syn, v, source, depth),
+            (Some(k), Some(v)) if k.kind() == "identifier" => {
+                return summary(language, syn, v, source, depth);
+            }
+            _ => return Arg::Other { span: span(node) },
+        }
     }
     if language == Language::Java && node.kind() == "object_creation_expression" && depth == 0 {
         let type_name = node
@@ -532,7 +621,7 @@ mod tests {
         let src = "fun f() {\nfoo(1)\na.bar(x)\na.baz(1).qux(2)\n}\n";
         assert_eq!(
             outline(Language::Kotlin, src),
-            ["foo(?)", "a.bar(?)", "a.baz(?).qux(?)"]
+            ["foo(?)", "a.bar(x)", "a.baz(?).qux(?)"]
         );
     }
 
@@ -599,8 +688,67 @@ mod tests {
                 let a: Vec<String> = args.iter().map(short).collect();
                 format!("new {type_name}({})", a.join(", "))
             }
+            Arg::Type { text, .. } => format!("{text}.class"),
             Arg::Other { .. } => "?".into(),
         }
+    }
+
+    /// Contract M6j S5: Kotlin `bean` calls shape the beans DSL (of several
+    /// `bean` overloads this is the only one the pack reads).
+    #[test]
+    fn kotlin_bean_calls_carry_type_arguments() {
+        let src =
+            "fun beans() = beans {\nbean<ServiceImpl>()\nbean(\"store\") { Store(ref()) }\n}\n";
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let calls: Vec<(String, Vec<String>)> = facts
+            .chains
+            .iter()
+            .flat_map(|c| {
+                c.links
+                    .iter()
+                    .map(|l| (l.name.clone(), l.type_args.clone()))
+            })
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .any(|(n, t)| n == "bean" && *t == ["ServiceImpl".to_owned()])
+        );
+        assert!(calls.iter().any(|(n, t)| n == "beans" && t.is_empty()));
+    }
+
+    /// Contract M6j S6: C# generic call arguments decode as types (DI `AddX<T>()`
+    /// shapes); the callee keeps its written name.
+    #[test]
+    fn csharp_generic_calls_carry_type_arguments() {
+        let src = "class A {\nvoid m() {\nservices.AddSingleton<IService, ServiceImpl>();\nservices.AddTransient<Db>();\n}\n}\n";
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let calls: Vec<(String, Vec<String>)> = facts
+            .chains
+            .iter()
+            .flat_map(|c| {
+                c.links
+                    .iter()
+                    .map(|l| (l.name.clone(), l.type_args.clone()))
+            })
+            .collect();
+        assert!(calls.iter().any(|(n, t)| n.starts_with("AddSingleton")
+            && *t == ["IService".to_owned(), "ServiceImpl".to_owned()]));
+        assert!(
+            calls
+                .iter()
+                .any(|(n, t)| n.starts_with("AddTransient") && *t == ["Db".to_owned()])
+        );
+    }
+
+    /// Contract M6j S2: Java class literals decode as types (Guice `bind().to()` shapes).
+    #[test]
+    fn java_class_literals_decode_as_types() {
+        let src = "class M {\nvoid c() {\nbind(Service.class).to(ServiceImpl.class);\n}\n}\n";
+        assert_eq!(
+            outline(Language::Java, src),
+            ["bind(Service.class).to(ServiceImpl.class)"]
+        );
     }
 
     #[test]
@@ -682,11 +830,11 @@ mod tests {
         assert_eq!(
             outline(Language::Java, src),
             [
-                "webClient.post().uri('/users/{id}', id).retrieve().bodyToMono(?)",
-                "this.restTemplate.exchange('{BASE}/x/{id}', HttpMethod.POST, ?, ?)",
+                "webClient.post().uri('/users/{id}', id).retrieve().bodyToMono(String.class)",
+                "this.restTemplate.exchange('{BASE}/x/{id}', HttpMethod.POST, ?, String.class)",
                 "list.forEach(fn)",
                 "send(x)",
-                "rest.getForObject('/a\tb\n', ?)",
+                "rest.getForObject('/a\tb\n', String.class)",
             ]
         );
         let all = chains(Language::Java, src);

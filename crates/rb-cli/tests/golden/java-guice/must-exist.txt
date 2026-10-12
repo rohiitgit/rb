@@ -1,0 +1,13 @@
+# Precision guards (contract M6j S4), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# Guice: provides methods resolve uniquely; `bind().to()` pairs resolve ambiguously beside
+# the class-literal registrants (M5 S19(g)) — every candidate genuinely related, none exact.
+INJECTS rb-heuristic . . . `src/CacheConsumer.java`/CacheConsumer# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#provideCache(). [heuristic]
+INJECTS rb-heuristic . . . `src/Consumer.java`/Consumer# -> rb-heuristic . . . `src/ServiceImpl.java`/ServiceImpl# [ambiguous]
+INJECTS rb-heuristic . . . `src/Consumer.java`/Consumer# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#configure(). [ambiguous]
+INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/MainDb.java`/MainDb# [ambiguous]
+INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/MainDbImpl.java`/MainDbImpl# [ambiguous]
+INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/ShopModule.java`/ShopModule#configure(). [ambiguous]
+CALLS rb-heuristic . . . `src/Consumer.java`/Consumer#run(). -> rb-heuristic . . . `src/Service.java`/Service#serve(). [heuristic]
+CALLS rb-heuristic . . . `src/Store.java`/Store#stock(). -> rb-heuristic . . . `src/MainDb.java`/MainDb#load(). [heuristic]

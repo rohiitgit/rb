@@ -27,6 +27,9 @@ struct Syntax {
     literals: &'static [&'static str],
     /// Interpolations inside a literal (template substitutions, f-string fields).
     holes: &'static [&'static str],
+    /// Bare `$name` interpolations hide inside string content (Kotlin): decoded text
+    /// containing one is never literal.
+    dollar_interpolation: bool,
     /// Binary `+` expressions.
     concat: &'static [&'static str],
     /// Adjacent literals that the language joins (Python `"a" "b"`).
@@ -46,6 +49,7 @@ fn syntax(language: Language) -> Syntax {
         Language::TypeScript | Language::Tsx | Language::JavaScript => Syntax {
             literals: &["string", "template_string"],
             holes: &["template_substitution"],
+            dollar_interpolation: false,
             concat: &["binary_expression"],
             implicit_concat: &[],
             arguments: &["arguments"],
@@ -57,6 +61,7 @@ fn syntax(language: Language) -> Syntax {
         Language::Java => Syntax {
             literals: &["string_literal"],
             holes: &[],
+            dollar_interpolation: false,
             concat: &["binary_expression"],
             implicit_concat: &[],
             arguments: &["argument_list"],
@@ -68,6 +73,7 @@ fn syntax(language: Language) -> Syntax {
         Language::Python => Syntax {
             literals: &["string"],
             holes: &["interpolation"],
+            dollar_interpolation: false,
             concat: &["binary_operator"],
             implicit_concat: &["concatenated_string"],
             arguments: &["argument_list"],
@@ -79,6 +85,7 @@ fn syntax(language: Language) -> Syntax {
         Language::Go => Syntax {
             literals: &["interpreted_string_literal", "raw_string_literal"],
             holes: &[],
+            dollar_interpolation: false,
             concat: &["binary_expression"],
             implicit_concat: &[],
             arguments: &["argument_list"],
@@ -87,10 +94,25 @@ fn syntax(language: Language) -> Syntax {
             raw_literals: &["raw_string_literal"],
             text_blocks: false,
         },
-        // Contract M6i S2: string shapes land with Tier B (nothing matches until then).
-        Language::Kotlin | Language::CSharp => Syntax {
-            literals: &[],
-            holes: &[],
+        // Contract M6j S1: Kotlin string literals (interpolations are holes).
+        Language::Kotlin => Syntax {
+            literals: &["string_literal"],
+            holes: &["interpolation"],
+            dollar_interpolation: true,
+            concat: &[],
+            implicit_concat: &[],
+            arguments: &[],
+            calls: &[],
+            skip: &[],
+            raw_literals: &[],
+            text_blocks: false,
+        },
+        // Contract M6j S1: C# string literals (interpolations are holes; verbatim strings
+        // stay raw-text misses).
+        Language::CSharp => Syntax {
+            literals: &["string_literal"],
+            holes: &["interpolation"],
+            dollar_interpolation: false,
             concat: &[],
             implicit_concat: &[],
             arguments: &[],
@@ -120,7 +142,20 @@ pub(crate) fn string_expression(
     }
     let mut holes = 0;
     let text = flatten(node, &syn, source, &mut holes);
-    Some((text, holes == 0))
+    let dynamic = holes > 0 || (syn.dollar_interpolation && has_dollar_interpolation(&text));
+    Some((text, !dynamic))
+}
+
+/// Whether decoded text holds a bare `$name` interpolation (`$` followed by a letter,
+/// `_` or `{`; `$` before anything else, e.g. `$5`, is literal text).
+fn has_dollar_interpolation(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    (0..bytes.len()).any(|i| {
+        bytes[i] == b'$'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c == b'{')
+    })
 }
 
 /// A string expression of `language` as literal parts and holes (contract M4a S1), decoded like

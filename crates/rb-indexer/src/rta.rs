@@ -767,6 +767,7 @@ mod tests {
             depends: &depends,
             unparsed: &unparsed,
             manifests: &empty_manifests,
+            xml: &BTreeMap::new(),
         });
         let considered = implementing_types(&b.edge_sources(EdgeKind::Implements), &by_path, &keys);
         let manifests: BTreeMap<&str, String> =

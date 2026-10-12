@@ -1,0 +1,9 @@
+# Precision guards (contract M6j S4), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# Spring XML: constructor-arg and property refs resolve uniquely through the ids.
+INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/Db.java`/Db# [heuristic] {"qualifier":"db"}
+INJECTS rb-heuristic . . . `src/Store.java`/Store# -> rb-heuristic . . . `src/Helper.java`/Helper# [heuristic] {"qualifier":"helper"}
+INJECTS rb-heuristic . . . `src/Audit.java`/Audit# -> rb-heuristic . . . `src/Store.java`/Store# [heuristic] {"qualifier":"shop"}
+CALLS rb-heuristic . . . `src/Store.java`/Store#stock(). -> rb-heuristic . . . `src/Db.java`/Db#load(). [heuristic]
+CALLS rb-heuristic . . . `src/Store.java`/Store#stock(). -> rb-heuristic . . . `src/Helper.java`/Helper#help(). [heuristic]

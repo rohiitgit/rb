@@ -509,3 +509,11 @@
 ## 2026-10-12: the same-file parallel-edit race bites the edit tool too
 - **Mistake (caught by re-reading the function):** two edits to `resolve.rs` in one parallel block raced; last-write-wins silently dropped the match-arm fix while keeping the gate fix, and the test kept failing for a reason that looked semantic. Restatement of the existing parallel-edit rule, now with the mechanism: parallel calls snapshot the same file state.
 - **Rule:** one file, one edit per block — no exceptions, even for "independent" hunks. After any same-file sequence, re-read the region before testing.
+
+## 2026-10-12: mutant patterns rot when fmt moves code
+- **Mistake (caught by the battery failing open):** three P5 mutants reported SURVIVED/invalid after `cargo fmt` reflowed the target lines — the patterns no longer matched, so the tree ran clean. A stale pattern is indistinguishable from a surviving mutant in the log unless the harness asserts match counts both directions (ours does — that is what caught it).
+- **Rule:** re-run every battery after any formatting or refactor commit, and treat any `pattern count` traceback as a battery bug, never as a kill. Keep patterns short enough to survive reflows (single distinctive lines over multi-line blocks).
+
+## 2026-10-12: a passing bless can hide a stale-tree failure
+- **Mistake (caught by reading the dump, not the test result):** the csharp re-bless passed while producing zero INJECTS — the `RB_BLESS=1` run rewrites goldens from whatever the tree yields, so green means nothing until the blessed diff is reviewed row by row.
+- **Rule:** after every bless, `git diff` the golden before anything else; a bless that only adds coverage rows while the feature rows are missing is a red flag, not a pass.
