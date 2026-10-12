@@ -157,3 +157,37 @@ SUBSCRIBES included); fixture inventory from goldens — polyglot 7 endpoints (2
 edges in any golden (cycle rules pass vacuously; bite via planted violations), polyglot 3
 MIGRATES + 6 QUERIES. Baseline verify `var/m6h/logs/p0-baseline-*` running. DB holds only the 3
 pre-existing `fx_*` repos.
+
+2. **(phase 1) Rule module with relational twins.** `rb-store/src/check.rs`: `orphan_endpoints`
+(endpoints with no inbound `CONSUMES`), `unowned_table_writes` (insert/update/delete/merge
+`QUERIES` from a non-migrating service while another migrates; tables nobody migrates never
+fire), `service_cycles` (iterative Tarjan over stored Service → Service `DEPENDS_ON`;
+self-links count) as pure `Graph` functions plus one read-only `MATCH` with `ORDER BY` per
+rule. 5 units (3 rules + no-write-clauses + growth); 3/3 mutants killed.
+
+3. **(phase 2) `rb check` CLI gate.** `Command::Check` runs each rule's Cypher through the shared
+read-only `cypher()` path (statement timeout + row cap free), sorted lines, `--json`, `--rule`
+filter, exit 0/1/2 (errors map to 2, since anyhow failures exit 1). Live-fired: topo 0
+violations exit 0; polyglot exactly the 2 predicted orphans exit 1. AGE rebinding quirk fixed in
+R2 (no `MATCH` after `WITH`-alias; `OPTIONAL MATCH`es only). 26 cli units.
+
+4. **(phase 3) Check goldens and twin parity e2e.** `check_gates`: Cypher-twin == relational-twin
+per rule on topo, polyglot, java-spring-jpa and ts-express-prisma (orphans live on all four:
+1, 2, 1, 2); `check.txt` goldens (topo, polyglot); exit 0/1/2 asserts; `--rule` filter.
+Topo gains `GET /v1/logout` (live orphan on both rule fixtures) with 2 biting guards. Lessons:
+same-file edits never in parallel; revert mutants with the edit tool, never `git checkout --`.
+
+5. **(phase 4) Public-repository check legs.** `rb check` (head release) + source-read samples;
+twin equality stays in e2e (4 fixtures). piggymetrics @ `6bb2cf9d…` (full `6bb2cf9ddbca980b664d3edbb6ff775d75369278`):
+11 orphans, exit 1 — 9 true (UI/gateway-called only: account `GET /current`, `PUT /current`,
+`POST /`; auth `GET /users/current`; notification ×2; statistics `GET /current`, `GET /{}`),
+2 residue-misses sharing one root cause (`authClient.createUser` → `POST /uaa/users` and the
+statistics Feign `PUT /statistics/{name}` have real call sites but no edge: both context paths
+live only in config-server `shared/*.yml`, the declared M6g residue). Notably the notification
+Feign `GET /accounts/{name}` DOES stitch to account `GET /{}` by suffix — the misses are exactly
+the prefix+context-path cases. spring-kafka @ `6c8549…`: 6 orphans (samples demo REST, no repo
+callers — true; e.g. sample-02 `/send/unknown`). gateway @ `c5021b…`: 126 orphans, all
+test-harness backends (proxyexchange/httpbin/fallback/grpc); grpc sample: test sources reference
+`HelloService` but make no direct stub call (exercised through gateway routes) — true relative
+to repo code. 0 `unowned_table_writes` / `service_cycles` violations anywhere (no SQL tables, no
+stored S→S cycles there). 0 false violations in all samples.
