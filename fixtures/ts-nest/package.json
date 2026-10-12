@@ -1,0 +1,7 @@
+{
+  "name": "shop-api",
+  "version": "1.0.0",
+  "main": "src/main.ts",
+  "scripts": { "start": "ts-node src/main.ts" },
+  "dependencies": { "@nestjs/common": "^10.4.0" }
+}

@@ -472,6 +472,207 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
             resolve_point(&ctx, p, &mut out);
         }
     }
+    // Contract M6j S3: the NestJS lane merges here, so every caller of `resolve` sees one
+    // Resolution with shared buckets.
+    let nest = resolve_nest(inputs);
+    for (k, v) in nest.buckets {
+        *out.buckets.entry(k).or_default() += v;
+    }
+    for (k, v) in nest.gates {
+        *out.gates.entry(k).or_default() += v;
+    }
+    out.injections.extend(nest.injections);
+    out.diagnostics.extend(nest.diagnostics);
+    for (k, v) in nest.points.by_owner {
+        out.points.by_owner.entry(k).or_default().extend(v);
+    }
+    for (k, v) in nest.points.unique {
+        out.points.unique.insert(k, v);
+    }
+    out
+}
+
+/// NestJS resolution (contract M6j S3): a compact lane beside the Java engine. TypeScript
+/// has no scan roots, conditionals, Lombok, registrants or wrappers that matter here;
+/// points match beans by resolved type (tokens by qualifier-or-name), unique resolves
+/// heuristic, several resolves ambiguous, nothing rises above heuristic. Buckets merge
+/// with the Java lane's under the same names.
+pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
+    let mut out = Resolution::default();
+    for b in BUCKETS {
+        out.buckets.insert(b, 0);
+    }
+    let ts: Vec<(&'a str, &'a FileFacts)> = inputs
+        .files
+        .iter()
+        .filter(|(_, (language, _))| matches!(language, Language::TypeScript | Language::Tsx))
+        .map(|(path, (_, facts))| (*path, *facts))
+        .collect();
+    if ts.is_empty() {
+        return out;
+    }
+    let per_file: Vec<(&'a str, &'a FileFacts, FileDi)> = ts
+        .iter()
+        .map(|(path, facts)| (*path, *facts, spring::nest_di(facts)))
+        .collect();
+    struct NestBean<'x, 'y> {
+        path: &'x str,
+        bean: &'y Bean,
+        service: String,
+    }
+    let mut beans: Vec<NestBean<'_, '_>> = Vec::new();
+    for (path, _, d) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+        let service = (inputs.service_of)(path);
+        for bean in &d.beans {
+            beans.push(NestBean {
+                path,
+                bean,
+                service: service.clone(),
+            });
+        }
+    }
+    let mut by_type: BTreeMap<Sym<'a>, Vec<usize>> = BTreeMap::new();
+    for (i, b) in beans.iter().enumerate() {
+        for t in assignable(inputs.index, &[(b.path, b.bean.definition)]) {
+            work::tick(1);
+            by_type.entry(t).or_default().push(i);
+        }
+    }
+    let mut classpaths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (path, _, d) in &per_file {
+        let service = (inputs.service_of)(path);
+        let classpath = classpaths
+            .entry(service.clone())
+            .or_insert_with(|| {
+                crate::packages::classpath(&service, inputs.depends)
+                    .into_iter()
+                    .filter(|s| *s == service || !inputs.deployable.contains(s))
+                    .collect()
+            })
+            .clone();
+        for p in &d.points {
+            if is_test_path(path) {
+                *out.buckets.get_mut("test").unwrap() += 1;
+                continue;
+            }
+            out.points
+                .by_owner
+                .entry(((*path).to_owned(), p.owner))
+                .or_default()
+                .push(PointRef {
+                    name: p.name.clone(),
+                    element: p.element.clone(),
+                    span: p.span,
+                });
+            let mut gates: BTreeSet<&'static str> = BTreeSet::new();
+            if !d.surface.is_empty() {
+                gates.insert("surface");
+            }
+            gates.insert("scan_roots_unknown");
+            let mut candidates: Vec<usize> = Vec::new();
+            let mut resolution = "unique";
+            if let Some(q) = &p.qualifier {
+                // A token: beans explicitly carrying it as qualifier. Auto-names do
+                // not count (a class named `DB` does not serve token `'DB'` without
+                // a custom provider, which stays unread).
+                for (i, b) in beans.iter().enumerate() {
+                    work::tick(1);
+                    if !classpath.contains(&b.service) {
+                        continue;
+                    }
+                    if b.bean.qualifiers.iter().any(|x| x == q) {
+                        candidates.push(i);
+                    }
+                }
+                resolution = "qualifier";
+            } else {
+                let types = inputs
+                    .index
+                    .type_candidates(path, Some(p.owner), &p.element);
+                let mut set = BTreeSet::new();
+                for t in &types {
+                    for &i in by_type.get(t).into_iter().flatten() {
+                        work::tick(1);
+                        if classpath.contains(&beans[i].service) {
+                            set.insert(i);
+                        }
+                    }
+                }
+                candidates = set.into_iter().collect();
+            }
+            if candidates.is_empty() {
+                *out.buckets.get_mut("unresolved").unwrap() += 1;
+                out.diagnostics.push(site_diagnostic(
+                    "di_unresolved",
+                    path,
+                    p.span,
+                    &p.element,
+                    "no_bean",
+                ));
+                continue;
+            }
+            // Deterministic order: by target key.
+            candidates.sort_by(|a, b| {
+                inputs.keys[beans[*a].path][beans[*a].bean.definition]
+                    .cmp(&inputs.keys[beans[*b].path][beans[*b].bean.definition])
+            });
+            candidates.dedup();
+            let several = candidates.len() > 1;
+            let certainty = if several {
+                Certainty::Ambiguous
+            } else {
+                Certainty::Heuristic
+            };
+            let label = if several {
+                "ambiguous"
+            } else if gates.is_empty() {
+                "plain"
+            } else {
+                "capped"
+            };
+            *out.buckets.get_mut(label).unwrap() += 1;
+            for g in &gates {
+                *out.gates.entry(g).or_default() += 1;
+            }
+            if candidates.len() == 1 {
+                let b = &beans[candidates[0]];
+                out.points.unique.insert(
+                    ((*path).to_owned(), p.span),
+                    (b.path.to_owned(), b.bean.definition),
+                );
+            }
+            let src = inputs.keys[path][p.owner].clone();
+            for &i in &candidates {
+                let b = &beans[i];
+                let mut attrs = serde_json::Map::new();
+                attrs.insert("origin".into(), b.bean.origin.as_str().into());
+                attrs.insert("via".into(), p.form.as_str().into());
+                attrs.insert("resolution".into(), resolution.into());
+                if let Some(q) = &p.qualifier {
+                    attrs.insert("qualifier".into(), q.as_str().into());
+                }
+                if several {
+                    attrs.insert("candidates".into(), candidates.len().into());
+                }
+                if !gates.is_empty() {
+                    attrs.insert(
+                        "capped_by".into(),
+                        Value::Array(gates.iter().map(|g| Value::from(*g)).collect()),
+                    );
+                }
+                out.injections.push(Injection {
+                    src: src.clone(),
+                    dst: inputs.keys[b.path][b.bean.definition].clone(),
+                    certainty,
+                    attrs,
+                    at: Evidence {
+                        path: (*path).to_owned(),
+                        span: p.span,
+                    },
+                });
+            }
+        }
+    }
     out
 }
 

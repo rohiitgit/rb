@@ -773,11 +773,17 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                             .and_then(|v| calls::init(language, v, source, &chain_index))
                     }),
                 constant: b.constant,
-                // Contract M6j S1: Kotlin and C# bindings carry their annotations like
-                // Java's do (definition decorations ride the same arms).
+                // Contract M6j S1+S3: Kotlin, C# and TypeScript bindings carry their
+                // annotations like Java's do (definition decorations ride the same
+                // arms; TS parameter decorators attach through the `decorator`
+                // field for NestJS points).
                 decorations: if matches!(
                     language,
-                    Language::Java | Language::Kotlin | Language::CSharp
+                    Language::Java
+                        | Language::Kotlin
+                        | Language::CSharp
+                        | Language::TypeScript
+                        | Language::Tsx
                 ) {
                     decorations::decorations(language, b.node, source)
                 } else {

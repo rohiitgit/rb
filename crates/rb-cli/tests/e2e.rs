@@ -864,6 +864,13 @@ fn java_dagger_tier_b() {
     check_language_fixture("java-dagger", "dagger");
 }
 
+/// Contract M6j S4: the ts-nest fixture (NestJS injectables, controllers, constructor
+/// points and token qualifiers, no SCIP).
+#[test]
+fn ts_nest_tier_b() {
+    check_language_fixture("ts-nest", "nest");
+}
+
 /// Contract M6i S3: the kotlin-gradle fixture through scip-java. The Gradle Kotlin 2.2
 /// build indexes ok; every Tier B call has its exact twin with the same target; the dump is
 /// golden. Cached, fresh and second-name runs dump identically.

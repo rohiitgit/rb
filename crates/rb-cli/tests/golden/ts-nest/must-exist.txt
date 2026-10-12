@@ -1,0 +1,7 @@
+# Precision guards (contract M6j S4), checked against the `--no-scip` dump by the e2e.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
+# NestJS: constructor injection resolves uniquely; the string token stays unresolved.
+INJECTS rb-heuristic . . . `src/shop.controller.ts`/ShopController# -> rb-heuristic . . . `src/shop.service.ts`/ShopService# [heuristic]
+CALLS rb-heuristic . . . `src/shop.controller.ts`/ShopController#list(). -> rb-heuristic . . . `src/shop.service.ts`/ShopService#find(). [heuristic]
+REFERENCES rb-heuristic . . . `src/shop.controller.ts`/ShopController# -> rb-heuristic . . . `src/shop.service.ts`/ShopService# [heuristic]

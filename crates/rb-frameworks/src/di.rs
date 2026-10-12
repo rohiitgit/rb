@@ -39,6 +39,8 @@ const LOMBOK: &str = "lombok";
 const GUICE: &str = "com.google.inject";
 const GUICE_NAME: &str = "com.google.inject.name";
 const DAGGER: &str = "dagger";
+// Contract M6j S3: NestJS decorators live in `@nestjs/common`.
+const NEST: &str = "@nestjs/common";
 
 /// The class-level annotations that make a class a bean when it is component-scanned (S2),
 /// by package. `@SpringBootApplication` and `@SpringBootConfiguration` are meta-annotated with
@@ -362,6 +364,10 @@ fn understood(facts: &FileFacts, d: &Decoration) -> bool {
         || is_annotation(facts, d, DAGGER, "Provides")
         || is_annotation(facts, d, DAGGER, "Binds")
         || is_annotation(facts, d, DAGGER, "Component")
+        || is_annotation(facts, d, NEST, "Module")
+        || is_annotation(facts, d, NEST, "Injectable")
+        || is_annotation(facts, d, NEST, "Controller")
+        || is_annotation(facts, d, NEST, "Inject")
         || is_any(facts, d, RESOURCE, "Resource")
         || LOMBOK_NAMES
             .iter()
@@ -436,6 +442,7 @@ fn is_qualifier(facts: &FileFacts, d: &Decoration) -> bool {
     is_annotation(facts, d, BEANS_ANNOTATION, "Qualifier")
         || is_any(facts, d, INJECT, "Named")
         || is_annotation(facts, d, GUICE_NAME, "Named")
+        || is_any(facts, d, &[NEST], "Inject")
 }
 
 fn has(facts: &FileFacts, decorations: &[Decoration], package: &str, name: &str) -> bool {
@@ -621,15 +628,112 @@ pub fn di(
     out
 }
 
+/// NestJS dependency-injection facts per file (contract M6j S3): `@Injectable()` and
+/// `@Controller()` classes as beans, same-file `providers`/`controllers` entries naming
+/// undecorated classes as beans, constructor and `@Inject` field points. Custom providers
+/// (`useClass`/`useValue`/`useFactory`) and dynamic modules stay unread (residue).
+pub fn nest_di(facts: &FileFacts) -> FileDi {
+    let mut out = FileDi::default();
+    let defs = &facts.definitions;
+    // Bare class names listed under `providers`/`controllers` of any `@Module`.
+    let mut provided: BTreeSet<&str> = BTreeSet::new();
+    for def in defs {
+        for d in &def.decorations {
+            if !is_annotation(facts, d, NEST, "Module") {
+                continue;
+            }
+            for a in &d.args {
+                if !matches!(a.key.as_deref(), Some("providers" | "controllers")) {
+                    continue;
+                }
+                for item in &a.items {
+                    // Literals are tokens, objects are custom providers: only bare class
+                    // names declare beans.
+                    if !item.literal && !item.value.is_empty() && !item.value.contains('.') {
+                        provided.insert(item.value.as_str());
+                    }
+                }
+            }
+        }
+    }
+    let scopes = Scopes::new(facts);
+    for (i, def) in defs.iter().enumerate() {
+        if def.kind != DefKind::Class {
+            continue;
+        }
+        let decorated = def.decorations.iter().any(|d| {
+            is_annotation(facts, d, NEST, "Injectable")
+                || is_annotation(facts, d, NEST, "Controller")
+        });
+        let is_bean = decorated || provided.contains(def.name.as_str());
+        if is_bean {
+            out.beans.push(nest_bean(facts, i));
+            nest_constructor_points(facts, i, &scopes, &mut out);
+        } else if !foreign(facts, &def.decorations).is_empty() {
+            out.unread_classes.push(i);
+        }
+        for b in scopes.of(i).iter().filter(|b| b.member) {
+            // Constructor parameters ride the constructor rule above (they are member
+            // bindings in TypeScript); plain `@Inject` fields land here.
+            if b.parameter.is_some() {
+                continue;
+            }
+            if let Some(p) = annotated_field(facts, i, is_bean, b) {
+                out.points.push(p);
+            }
+        }
+    }
+    surface_of_facts(facts, &mut out.surface);
+    out
+}
+
+/// A NestJS bean record (contract M6j S3): named by the decapitalised class name.
+fn nest_bean(facts: &FileFacts, i: usize) -> Bean {
+    let def = &facts.definitions[i];
+    Bean {
+        definition: i,
+        origin: Origin::Injectable,
+        type_name: def.name.clone(),
+        generic: false,
+        names: vec![decapitalize(&short_name(&facts.definitions, i))],
+        qualifiers: qualifier_of(facts, &def.decorations).into_iter().collect(),
+        primary: false,
+        conditional: false,
+        annotations: foreign(facts, &def.decorations),
+        created: Vec::new(),
+        extends: Vec::new(),
+    }
+}
+
+/// The constructor points of a NestJS bean class (contract M6j S3): Nest injects every
+/// constructor parameter by type. TypeScript constructors are not definitions, so the rule
+/// reads member bindings carrying a parameter position scoped to the class; overload
+/// signatures would each contribute (residue — Nest beans do not overload constructors).
+/// Constructor parameters are skipped by the field loop below, so no point doubles.
+fn nest_constructor_points(facts: &FileFacts, class: usize, scopes: &Scopes<'_>, out: &mut FileDi) {
+    let mut params: Vec<&Binding> = scopes
+        .of(class)
+        .iter()
+        .copied()
+        .filter(|b| b.member && b.parameter.is_some())
+        .collect();
+    params.sort_by_key(|b| b.parameter);
+    for b in params {
+        out.points
+            .extend(point(facts, b, class, true, Form::Constructor));
+    }
+}
+
 fn has_any(facts: &FileFacts, decorations: &[Decoration], packages: &[&str], name: &str) -> bool {
     decorations.iter().any(|d| is_any(facts, d, packages, name))
 }
 
-/// `@Autowired`, `@Inject` (JSR-330 or Guice's own) or `@Resource`.
+/// `@Autowired`, `@Inject` (JSR-330, Guice's own or NestJS) or `@Resource`.
 fn has_any_inject(facts: &FileFacts, decorations: &[Decoration]) -> bool {
     has(facts, decorations, BEANS_ANNOTATION, "Autowired")
         || has_any(facts, decorations, INJECT, "Inject")
         || has(facts, decorations, GUICE, "Inject")
+        || has_any(facts, decorations, &[NEST], "Inject")
         || has_any(facts, decorations, RESOURCE, "Resource")
 }
 
@@ -2022,6 +2126,91 @@ mod tests {
     fn guice_field_and_setter_points() {
         let src = "package com.acme;\nimport com.google.inject.Inject;\nimport com.google.inject.Singleton;\n@Singleton class Store {\n  @Inject Db db;\n  @Inject public void setDb(Db db) {}\n}\n";
         assert_eq!(points(src), ["Store.field db: Db", "Store.setter db: Db"]);
+    }
+
+    /// `origin name: type [names] q=…` per NestJS bean.
+    fn nest_beans(src: &str) -> Vec<String> {
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let out = nest_di(&facts);
+        out.beans
+            .iter()
+            .map(|b| {
+                let mut s = format!(
+                    "{} {}: {} [{}]",
+                    b.origin.as_str(),
+                    facts.definitions[b.definition].name,
+                    b.type_name,
+                    b.names.join(",")
+                );
+                if !b.qualifiers.is_empty() {
+                    s += &format!(" q={}", b.qualifiers.join(","));
+                }
+                s
+            })
+            .collect()
+    }
+
+    /// `owner.form name: element q=…` per NestJS point.
+    fn nest_points(src: &str) -> Vec<String> {
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let out = nest_di(&facts);
+        out.points
+            .iter()
+            .map(|p| {
+                let mut s = format!(
+                    "{}.{} {}: {}",
+                    facts.definitions[p.owner].name,
+                    p.form.as_str(),
+                    p.name,
+                    p.element
+                );
+                if let Some(q) = &p.qualifier {
+                    s += &format!(" q={q}");
+                }
+                if !p.owner_is_bean {
+                    s += " not_a_bean";
+                }
+                s
+            })
+            .collect()
+    }
+    /// Contract M6j S3: NestJS injectables, controllers, constructor points and token
+    /// qualifiers; module metadata is understood.
+    #[test]
+    fn nest_injectables_controllers_points_and_tokens() {
+        let src = "import { Injectable, Inject, Controller, Get } from '@nestjs/common';\n@Injectable()\nexport class ShopService {\n  constructor(@Inject('DB') private db: Db) {}\n  @Inject() helper: Helper;\n}\n@Controller('shop')\nexport class ShopController {\n  constructor(private readonly svc: ShopService) {}\n  @Get()\n  list() { return null; }\n}\n";
+        assert_eq!(
+            nest_beans(src),
+            [
+                "injectable ShopService: ShopService [shopService]",
+                "injectable ShopController: ShopController [shopController]",
+            ]
+        );
+        assert_eq!(
+            nest_points(src),
+            [
+                "ShopService.constructor db: Db q=DB",
+                "ShopService.field helper: Helper",
+                "ShopController.constructor svc: ShopService",
+            ]
+        );
+    }
+
+    /// Contract M6j S3: same-file providers entries become beans; custom providers and
+    /// foreign decorators do not.
+    #[test]
+    fn nest_module_providers_and_decoys() {
+        let src = "import { Module, Injectable } from '@nestjs/common';\nimport { Component } from './other';\nclass Helper {}\n@Injectable()\nclass Real {}\n@Component()\nclass Widget {}\n@Module({ providers: [Helper, Real, { provide: 'X', useValue: 1 }] })\nclass M {}\n";
+        assert_eq!(
+            nest_beans(src),
+            [
+                "injectable Helper: Helper [helper]",
+                "injectable Real: Real [real]",
+            ]
+        );
+        // The foreign `@Component` taints its class (gate D keeps working on TS).
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        assert_eq!(nest_di(&facts).unread_classes.len(), 1);
     }
 
     /// Contract M6j S2 decoys: same-named annotations from other packages bind nothing;

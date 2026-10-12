@@ -1,0 +1,7 @@
+# Precision guards (contract M6j S4): forbidden edges. A non-`*` source must name a node
+# of the dump, so a misspelt key cannot pass vacuously.
+# DI is never exact; wiring never runs backwards; the string token never resolves to
+# the decoy `DB` bean (tokens match qualifiers only, never auto-names).
+INJECTS * -> * [exact]
+INJECTS rb-heuristic . . . `src/shop.service.ts`/ShopService# -> rb-heuristic . . . `src/shop.controller.ts`/ShopController# [heuristic]
+INJECTS rb-heuristic . . . `src/shop.service.ts`/ShopService# -> rb-heuristic . . . `src/db.ts`/DB# [heuristic]

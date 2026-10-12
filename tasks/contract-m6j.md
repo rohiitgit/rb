@@ -240,3 +240,15 @@ code. Fixtures `java-guice` + `java-dagger` with reviewed dump goldens and 8/5 g
 every guard proven biting (G1–G4 code mutants, F1–F4 fixture perturbations). 12/12 pack
 mutants + T1/T2 arg mutants killed. D4 amended: Dagger gets its own fixture (honest
 names over one mixed fixture).
+
+4. **(phase 3) NestJS.** TS binding decorations flow (the `decorator` field already
+covered parameters — a redundant arm was added and removed); `@Injectable()`/
+`@Controller()` classes → `injectable` beans; same-file `providers`/`controllers`
+entries name undecorated beans (custom providers stay unread); constructor parameters
+read as member bindings scoped to the class (TS ctors are not definitions — overloading
+is residue); `@Inject(token)` qualifiers with token-literal decoding; a compact
+`resolve_nest` lane (type match + qualifier-only token match, heuristic/ambiguous max,
+shared buckets). A `DB`-named decoy bean pins that tokens never match auto-names.
+Fixture `ts-nest` with reviewed dump golden and 3/3 guards. Tests-first; 6/6 pack
+mutants killed (providers[] masked the decorator gates until the unit dropped its
+`@Module`), lane bites proven end-to-end (exact-forcer, names-widening).
