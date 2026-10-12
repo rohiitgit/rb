@@ -1363,6 +1363,17 @@ namespace Acme {
         );
     }
 
+    /// Contract M6k pass 1: dotted file-scoped namespaces spell modules too (their
+    /// files silently lost same-namespace resolution before).
+    #[test]
+    fn csharp_dotted_file_scoped_namespaces_are_modules() {
+        let src = "namespace A.B.C;\npublic class K {}\n";
+        assert_eq!(
+            outline(Language::CSharp, src),
+            ["module A.B.C@0:10", "class K@1:13",]
+        );
+    }
+
     /// A record's compact canonical constructor is a constructor definition (named like the
     /// record) and the source of the calls in its body (contract M3b amendment 75).
     #[test]
