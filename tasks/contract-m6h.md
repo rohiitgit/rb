@@ -191,3 +191,19 @@ test-harness backends (proxyexchange/httpbin/fallback/grpc); grpc sample: test s
 `HelloService` but make no direct stub call (exercised through gateway routes) — true relative
 to repo code. 0 `unowned_table_writes` / `service_cycles` violations anywhere (no SQL tables, no
 stored S→S cycles there). 0 false violations in all samples.
+
+6. **(evaluator pass 1) VERDICT PASS with 4 fixes.** (`tasks/eval-m6h-pass1.md`): H1 AGE
+`MATCH`-after-`WITH` rebinding reworked to `OPTIONAL MATCH`es only (live-fired); H2 duplicate
+Cypher rows vs relational dedupe (`RETURN DISTINCT` + CLI sort+dedup + duplicate-writer unit);
+H3 truncation surfaced three ways (stderr, summary mark, JSON flag) with renderer units; H5
+R2/R3 live-nonempty proofs via scratch repos; A1 null-handling unit. 5/5 mutants killed.
+
+7. **(evaluator pass 2 + M6h close) VERDICT PASS.** Verification-only: every pass-1 repro
+re-run green on the final tree; R-DISTINCT, R-truncation and R-orphan re-killed from the clean
+tree and reverted; final verify `var/m6h/logs/p6-final-*` green — fmt, clippy `-D warnings`,
+874 workspace units, store 72, server 12, e2e 39/39 with containers, api 1/1 (150 sets
+identical), no `skipping:`, no listener, stub scan clean; twin parity re-derived on 4 fixtures;
+topo + check_gates e2e unblessed green. **M6h closed.** `PIPELINE` unbumped (rules read, never
+write; no golden pins anything new). Open items carried forward: config-server shared YAML
+(the piggy residue-miss root cause), custom rule files (F4, no demander), metric/threshold
+rules (residue).

@@ -497,3 +497,11 @@
 ## 2026-10-12: `git checkout -- <file>` discards uncommitted work (re-learned)
 - **Mistake (caught by the e2e):** reverting a guard-bite mutant with `git checkout --` wiped the file's uncommitted import + method; both had to be re-applied (and the re-apply then raced — see above).
 - **Rule:** revert mutants with the edit tool (exact inverse), never with checkout. This is the M3b lesson restated: it bites again the moment the working tree holds uncommitted fixture work.
+
+## 2026-10-12: a pinning assertion must match the exact defended text
+- **Mistake (caught by the mutant surviving):** the DISTINCT pin asserted `cypher.contains("DISTINCT")`, which also matches `COLLECT(DISTINCT o.key)` — dropping `RETURN DISTINCT` survived.
+- **Rule:** pin the exact defended fragment (`RETURN DISTINCT`), and always run the mutant once against the new assertion before counting it.
+
+## 2026-10-12: `--lib` on a binary-only package proves nothing
+- **Mistake (caught by reading the output):** a mutant battery reported SURVIVED because `cargo test -p rb-cli --lib` errors (no library targets) — the grep found no FAILED in a compile error.
+- **Rule:** the battery must distinguish test failure from harness failure: use the package's real test target (`--bin rb` here) and treat anything but an explicit `test result: FAILED` (or the expected failure line) as invalid, never as survived.

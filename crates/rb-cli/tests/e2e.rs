@@ -701,7 +701,10 @@ fn check_gates() {
             })
             .collect();
         actual.sort();
-        assert_eq!(actual, expected, "Cypher twin == relational twin on {fixture}");
+        assert_eq!(
+            actual, expected,
+            "Cypher twin == relational twin on {fixture}"
+        );
         assert_eq!(
             code,
             if expected.is_empty() { 0 } else { 1 },
@@ -717,7 +720,10 @@ fn check_gates() {
             if expected.is_empty() { 0 } else { 1 },
             "text exit code on {fixture}"
         );
-        let (code, stdout, _) = rb_exit(&url, &["check", "--repo", &name, "--rule", "service_cycles"]);
+        let (code, stdout, _) = rb_exit(
+            &url,
+            &["check", "--repo", &name, "--rule", "service_cycles"],
+        );
         assert_eq!(code, 0, "a clean rule filter exits 0");
         assert_eq!(stdout, "check: 0 violations\n");
         // An unknown rule exits 2, against a repository that exists.

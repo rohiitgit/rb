@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-10-12] (wall clock) M6h CLOSED (evaluator passes 1–2)
+- Phases 0–1 (amendments 1–2): preflight (baseline binary, `rb check` name free, read-only + timeout path, AGE labels, fixture inventory); rule module with relational twins (orphans, unowned writes, service cycles + Cypher each) — test-first, 3/3 mutants killed.
+- Phases 2–3 (amendments 3–4): `rb check` CLI gate (read-only path, sorted lines, JSON, exit 0/1/2; live-fired on topo + polyglot; AGE rebinding fix); check goldens + twin parity e2e on 4 fixtures (orphans live everywhere) + topo orphan endpoint with biting guards.
+- Phase 4 (amendment 5): public check legs — piggy 11 (9 true + 2 config-server-residue misses, one root cause), spring-kafka 6 true, gateway 126 true-or-harness; 0 false violations in samples.
+- Pass 1 (`tasks/eval-m6h-pass1.md`, amendment 6): VERDICT PASS with 4 fixes (H1 rebinding, H2 dedupe, H3 truncation, H5 live proofs); 5/5 mutants killed.
+- Pass 2 (`tasks/eval-m6h-pass2.md`, amendment 7): VERDICT PASS — repros re-run, 3/3 re-killed, final verify green (fmt, clippy, 874 units, store 72, server 12, e2e 39/39, api 1/1).
+- `PIPELINE` unbumped (rules read, never write).
+- Files: `crates/rb-store/src/check.rs`, `crates/rb-cli/src/main.rs`, `crates/rb-cli/tests/e2e.rs`, `fixtures/topo-packs/`; records `tasks/{contract-m6h,eval-m6h-pass1,eval-m6h-pass2,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-12] (wall clock) M6g CLOSED (evaluator passes 1–2)
 - Phases 0–2 (amendments 1–3): preflight (kafka + gateway pins, shape checks); topic packs (Kafka/Rabbit listeners + template sends, literals/placeholders/counted dynamics); topic graph (`Topic` + `PUBLISHES`/`SUBSCRIBES`, service-originated, placeholder resolution via Spring properties) — each test-first with killed mutants.
 - Phases 3–4 (amendments 4–5): gateway packs (nginx + Spring Gateway rewrites, longest-prefix, safe fallback, `via_gateway`) + host names (compose/k8s/`rb.toml` aliases, duplicates ambiguous) — each test-first with killed mutants.
