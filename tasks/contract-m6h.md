@@ -142,3 +142,18 @@ mutation runs per M4a harness rules.
 ## Amendments
 
 (none yet)
+
+## Amendments
+
+1. **(phase 0) Baselines, pins and shape checks.** Baseline binary `var/m6h/base/rb-m6gclose`
+(release, sha256 `236ed306…`; HEAD code == the M6g close tree — the contract commit adds no code).
+No new measurement pins (phase-6 reuse: M6g close dumps + p6-close2 e2e green baseline). Shape
+checks: `rb check` free (17 subcommands: Migrate/Index/Status/Snapshots/Dump/Find/Service/
+TableDeps/Callers/Impact/Path/Diff/Serve/Gc/Cache/Cypher/Prune); `Store::cypher` runs
+`REPEATABLE READ READ ONLY` + `SET LOCAL statement_timeout` (default 2s, max 30s) + `rb_reader`
+role; AGE projection iterates `NodeKind::ALL`/`EdgeKind::ALL` generically (Topic/PUBLISHES/
+SUBSCRIBES included); fixture inventory from goldens — polyglot 7 endpoints (2 orphans: `GET
+/api/v1/login`, `POST /internal/mfa/sms`), topo 1/1 consumed, no Service→Service `DEPENDS_ON`
+edges in any golden (cycle rules pass vacuously; bite via planted violations), polyglot 3
+MIGRATES + 6 QUERIES. Baseline verify `var/m6h/logs/p0-baseline-*` running. DB holds only the 3
+pre-existing `fx_*` repos.
