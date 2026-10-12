@@ -537,6 +537,7 @@ fn active_profiles(read: &[ConfigRead<'_>]) -> BTreeMap<String, BTreeSet<String>
     };
     let mut per_service: BTreeMap<String, Vec<(usize, BTreeSet<String>)>> = BTreeMap::new();
     for (path, text, kind, service, _) in read {
+        rb_frameworks::work::tick(1);
         // Only unconditional documents select profiles: a profile-gated document cannot
         // select itself.
         let base: BTreeMap<String, String> = match kind {
@@ -583,6 +584,7 @@ fn select_yaml_documents(
         return (base, profile);
     }
     for doc in rb_frameworks::fold::yaml_documents(text) {
+        rb_frameworks::work::tick(1);
         if !rb_frameworks::fold::conditional_document(&doc) {
             base.extend(doc);
         } else if document_profiles(&doc).iter().any(|p| active.contains(p)) {
@@ -679,6 +681,7 @@ fn spring_config(
     // first after the loop, so profile files beat base files.
     let mut selected: Vec<(String, usize, &str, BTreeMap<String, String>)> = Vec::new();
     for (path, text, kind, service, entries) in &read {
+        rb_frameworks::work::tick(1);
         let (path, text, kind, service) = (*path, *text, *kind, service.clone());
         let keys: BTreeSet<String> = entries.keys().cloned().collect();
         let active_here: BTreeSet<String> = active.get(&service).cloned().unwrap_or_default();
@@ -2607,6 +2610,40 @@ mod tests {
             diagnostics.iter().all(|d| d.kind != "spring_config_unread"),
             "a read file's context path is applied, not counted unread"
         );
+    }
+
+    /// Contract M6g S9, invariants 5–6: selecting 4× the configuration files costs at most
+    /// 5× the operations.
+    #[test]
+    fn spring_config_selection_grows_linearly() {
+        fn work(n: usize) -> u64 {
+            let res = "src/main/resources";
+            let mut files: Vec<(String, String)> = Vec::new();
+            for i in 0..n {
+                files.push((
+                    format!("s{i}/{res}/application.properties"),
+                    "spring.profiles.active=prod\n".to_owned(),
+                ));
+                files.push((
+                    format!("s{i}/{res}/application.yml"),
+                    "k: base\n---\nspring:\n  config:\n    activate:\n      on-profile: prod\nk: prod\n"
+                        .to_owned(),
+                ));
+                files.push((
+                    format!("s{i}/{res}/bootstrap.properties"),
+                    "k: boot\n".to_owned(),
+                ));
+            }
+            let config: BTreeMap<&str, String> =
+                files.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
+            let service_of = |p: &str| p.split('/').next().unwrap().to_owned();
+            rb_frameworks::work::take();
+            let (spring, _) = spring_config(&config, &service_of);
+            assert_eq!(spring.properties.len(), n);
+            rb_frameworks::work::take()
+        }
+        let (small, large) = (work(25), work(100));
+        assert!(small > 0 && large <= small * 5, "{small} -> {large}");
     }
 
     /// Contract M4a amendment 12 (evaluator pass 2, Q3): Spring Boot's `classpath:/config/`
