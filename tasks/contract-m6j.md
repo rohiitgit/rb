@@ -190,4 +190,16 @@ listener + stub checks, mutation runs per M4a harness rules.
 
 ## Amendments
 
-(none yet)
+1. **(phase 0) Baselines, pins and shape checks.** Baseline binary `var/m6j/base/rb-m6iclose`
+(release, sha256 `23723d89…`; rebuilt from HEAD — 0.48s no-op, so HEAD code == the M6i close
+tree: the contract commit adds no code). Grammar shapes (cargo registry, before any code):
+`-ng` has `annotation` (+ `modifiers` on class/object/function decls), `c-sharp` has
+`attribute_list` → `attribute` (with `name` field) + `modifier`; attachment rules NOT
+verified (phase 1 discovers them by parsing, M6i-D1-style). Measurement pins verified by
+`git ls-remote` (full SHAs): google/guice `b8cab7e4e947adb82e343586c267c5c367cf5cf1`
+(HEAD; `bind().to()` leg), google/dagger `5d4ee6ba…` (HEAD; backup), nestjs/nest
+`45146232…` (HEAD), mybatis/jpetstore-6 `344ef63d…` (HEAD; Spring-XML leg), spring-fu
+`8f8775ec…` (HEAD; Kotlin-beans leg), AutoMapper/AutoMapper `6e8697bc…` (M6i pin reused
+for the .NET leg — it carries DI tests). Sizes accepted per M5 precedent (parse-only
+`--no-scip` handled 1.7M lines; one repo at a time, remove + `VACUUM`). Baseline verify
+`var/m6j/logs/p0-baseline-*` running. DB holds only the 3 pre-existing `fx_*` repos.
