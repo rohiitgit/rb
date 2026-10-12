@@ -62,7 +62,9 @@ fn simple(name: &str) -> &str {
 }
 
 /// A listener annotation's topics: `topics` (string or array) or, for Rabbit, `queues`.
-/// Returns the literal/placeholder values plus whether any value was dynamic.
+/// Returns the literal/placeholder values plus whether any value was dynamic. A listener with
+/// no readable topic value (a pattern, partitions, bindings, or bare keys) is dynamic, never
+/// silent (evaluator pass 1, P18).
 fn annotation_topics(decoration: &Decoration) -> Option<(Vec<TopicName>, bool)> {
     let name = simple(&decoration.name);
     let key = match name {
@@ -70,10 +72,21 @@ fn annotation_topics(decoration: &Decoration) -> Option<(Vec<TopicName>, bool)> 
         "RabbitListener" => "queues",
         _ => return None,
     };
-    let arg = decoration
+    // Other topic-carrying keys (patterns, partitions, bindings): their values never resolve
+    // to a literal here, so any of them marks the listener dynamic.
+    let mut dynamic = decoration.args.iter().any(|a| {
+        matches!(
+            a.key.as_deref(),
+            Some("topicPattern" | "topicPartitions" | "partitions" | "bindings")
+        )
+    });
+    let Some(arg) = decoration
         .args
         .iter()
-        .find(|a| a.key.as_deref() == Some(key))?;
+        .find(|a| a.key.as_deref() == Some(key))
+    else {
+        return Some((Vec::new(), true));
+    };
     // A `${…}` value is a property reference (the extractor marks it literal): always a
     // placeholder, never a literal topic.
     let classify = |value: &str| {
@@ -84,7 +97,6 @@ fn annotation_topics(decoration: &Decoration) -> Option<(Vec<TopicName>, bool)> 
         }
     };
     let mut topics = Vec::new();
-    let mut dynamic = false;
     if arg.items.is_empty() {
         if arg.literal || is_placeholder(&arg.value) {
             topics.push(classify(&arg.value));
@@ -163,6 +175,11 @@ fn send(language: Language, facts: &FileFacts, chain: &rb_syntax::CallChain, out
         || receiver.ends_with("RabbitTemplate")
             && (first.name == "convertAndSend" || first.name == "send");
     if !is_template {
+        // `sendDefault` publishes to the configured default topic: unresolvable here, so
+        // counted dynamic, never silent (evaluator pass 1, P18).
+        if receiver.ends_with("KafkaTemplate") && first.name == "sendDefault" {
+            return dynamic_send(chain, out);
+        }
         return;
     }
     let arg = first.args.first();
@@ -286,6 +303,26 @@ mod tests {
             &extract(Language::Java, rabbit.as_bytes()).unwrap(),
         ));
         assert_eq!(sites, ["pub:jobs"]);
+    }
+
+    /// Contract M6g S1 (evaluator pass 1, P18): pattern/partitions/bindings listeners and
+    /// `sendDefault` publish to unresolvable topics: counted dynamic, never edges or silence.
+    #[test]
+    fn unresolvable_topic_forms_are_counted_dynamic() {
+        let src = "package p;\nimport org.springframework.kafka.annotation.KafkaListener;\nclass C {\n  @KafkaListener(topicPattern = \"events.*\")\n  void a(String m) {}\n  @KafkaListener(topicPartitions = @TopicPartition(topic = \"t\"))\n  void b(String m) {}\n  @KafkaListener(groupId = \"g\")\n  void c(String m) {}\n}\n";
+        let (sites, dynamic) = show(&topics(
+            Language::Java,
+            &extract(Language::Java, src.as_bytes()).unwrap(),
+        ));
+        assert!(sites.is_empty());
+        assert_eq!(dynamic, ["sub", "sub", "sub"]);
+        let src = "package p;\nimport org.springframework.kafka.core.KafkaTemplate;\nclass C {\n  KafkaTemplate<String, String> t;\n  void a(String v) {\n    t.sendDefault(\"v\");\n  }\n}\n";
+        let (sites, dynamic) = show(&topics(
+            Language::Java,
+            &extract(Language::Java, src.as_bytes()).unwrap(),
+        ));
+        assert!(sites.is_empty());
+        assert_eq!(dynamic, ["pub"]);
     }
 
     /// Contract M6g S1, invariants 5–6: scanning 4× the sites costs at most 5× the operations.

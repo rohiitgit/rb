@@ -1633,6 +1633,60 @@ mod tests {
         let unknown = vec![("login".to_owned(), "services/none".to_owned())];
         assert_eq!(one_aliased(&eps, &unknown, &call).0, Bucket::External);
     }
+
+    /// Contract M6g S3 (evaluator pass 1, P2): overlapping prefixes resolve longest-first,
+    /// whatever order the files stated them.
+    #[test]
+    fn gateway_rewrites_prefer_the_longest_prefix() {
+        let eps = vec![ep("POST", "/v1/login", AUTH)];
+        let services = services();
+        let stitcher = Stitcher::with_rewrites(
+            &eps,
+            &services,
+            vec![
+                GatewayRewrite {
+                    prefix: "/api/".into(),
+                    service: NOTIFICATION.into(),
+                },
+                GatewayRewrite {
+                    prefix: "/api/admin/".into(),
+                    service: AUTH.into(),
+                },
+            ],
+        );
+        // NOTIFICATION exposes nothing here, so only the longer rule survives the build.
+        assert_eq!(
+            stitcher
+                .rewrites
+                .iter()
+                .map(|r| r.prefix.as_str())
+                .collect::<Vec<_>>(),
+            ["/api/admin/"]
+        );
+        let both = Stitcher::with_rewrites(
+            &eps,
+            &services,
+            vec![
+                GatewayRewrite {
+                    prefix: "/api/".into(),
+                    service: AUTH.into(),
+                },
+                GatewayRewrite {
+                    prefix: "/api/admin/".into(),
+                    service: AUTH.into(),
+                },
+            ],
+        );
+        assert_eq!(
+            both.rewrites
+                .iter()
+                .map(|r| r.prefix.as_str())
+                .collect::<Vec<_>>(),
+            ["/api/admin/", "/api/"]
+        );
+    }
+
+    /// Contract M6g S3: resolving raw rules drops unknown and ambiguous targets, never edges.
     #[test]
     fn gateway_rewrite_resolution_drops_unknown_and_ambiguous_targets() {
         let services = services();

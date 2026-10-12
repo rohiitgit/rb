@@ -122,8 +122,9 @@ pub fn nginx_gateway(text: &str) -> GatewayFile {
     out
 }
 
-/// The host of a `proxy_pass` value (`http(s)://host[:port][/path]`), or `None` for variable
-/// targets (`$host`) and other schemes.
+/// The host of a `proxy_pass` value (`http(s)://host[:port]`), or `None` for variable
+/// targets (`$host`), other schemes, and values with a URI path: a path replaces the matched
+/// prefix instead of stripping it (evaluator pass 1, P9), so it never reads as a rewrite.
 fn proxy_host(value: &str) -> Option<String> {
     let value = value.strip_suffix(';').unwrap_or(value).trim();
     let after = value
@@ -132,8 +133,19 @@ fn proxy_host(value: &str) -> Option<String> {
     if after.contains('$') {
         return None;
     }
-    let host = after.split([':', '/']).next()?.trim();
-    (!host.is_empty()).then(|| host.to_owned())
+    let mut parts = after.splitn(2, '/');
+    let host = parts.next()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let host = host.split(':').next()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    match parts.next() {
+        None | Some("") => Some(host.to_owned()),
+        Some(_) => None,
+    }
 }
 
 /// Reads Spring Cloud Gateway routes: a `routes:` list (at any indent) whose items state a
@@ -264,12 +276,19 @@ fn flush_block(
 }
 
 /// A gateway `uri:` as a service host: `http(s)://host…` or `lb://service`. Anything else
-/// never reads.
+/// never reads — including values with a URI path (evaluator pass 1, P9).
 fn gateway_uri(value: &str) -> Option<String> {
     let value = value.split_whitespace().next().unwrap_or("");
     if let Some(rest) = value.strip_prefix("lb://") {
-        let name = rest.split('/').next().unwrap_or("").trim();
-        return (!name.is_empty()).then(|| name.to_owned());
+        let mut parts = rest.splitn(2, '/');
+        let name = parts.next().unwrap_or("").trim();
+        if name.is_empty() || name.contains([':', '$']) {
+            return None;
+        }
+        return match parts.next() {
+            None | Some("") => Some(name.to_owned()),
+            Some(_) => None,
+        };
     }
     proxy_host(value)
 }
@@ -302,10 +321,12 @@ mod tests {
     use crate::work;
 
     /// Contract M6g S3: nginx locations pin prefix + proxy host (single- and multi-line);
-    /// regex locations, rewrites, variable targets and malformed blocks stay unread.
+    /// regex locations, rewrites, variable targets, path-bearing targets (evaluator pass 1,
+    /// P9: a URI path replaces the prefix instead of stripping it) and malformed blocks stay
+    /// unread.
     #[test]
     fn nginx_locations_pin_prefix_and_proxy_host() {
-        let text = "server {\n  listen 80;\n  location /api/ { proxy_pass http://auth:8080; }\n  location = /health {\n    proxy_pass http://auth:8080/health;\n  }\n  location ~ ^/old { proxy_pass http://auth:8080; }\n  location /var/ {\n    proxy_pass $backend;\n  }\n  location /rw/ {\n    rewrite ^/rw/(.*) /$1 break;\n    proxy_pass http://auth:8080;\n  }\n  location /empty/ {\n  }\n}\n";
+        let text = "server {\n  listen 80;\n  location /api/ { proxy_pass http://auth:8080; }\n  location = /health {\n    proxy_pass http://auth:8080/health;\n  }\n  location /slash/ { proxy_pass http://auth:8080/; }\n  location ~ ^/old { proxy_pass http://auth:8080; }\n  location /var/ {\n    proxy_pass $backend;\n  }\n  location /rw/ {\n    rewrite ^/rw/(.*) /$1 break;\n    proxy_pass http://auth:8080;\n  }\n  location /empty/ {\n  }\n}\n";
         let file = nginx_gateway(text);
         assert_eq!(
             file.rules,
@@ -316,13 +337,13 @@ mod tests {
                     span: [2, 0, 2, 49],
                 },
                 GatewayRule {
-                    prefix: "/health".into(),
+                    prefix: "/slash/".into(),
                     target: "auth".into(),
-                    span: [3, 0, 3, 22],
+                    span: [6, 0, 6, 52],
                 },
             ]
         );
-        assert_eq!(file.unread, 3);
+        assert_eq!(file.unread, 4);
     }
 
     /// Contract M6g S3: Spring Gateway routes pin Path prefixes + uri hosts (`lb://` included);
