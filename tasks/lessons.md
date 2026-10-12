@@ -473,3 +473,19 @@
 ## 2026-10-12: content sniffing belongs in the reader, not the stage
 - **Mistake (caught by a probe test):** flow-JSON in a `.yaml` file silently read as empty YAML because the JSON sniff lived in the stage's dispatch while the reader never saw it.
 - **Rule:** format detection lives with the format readers (one place decides); stages dispatch by extension only.
+
+## 2026-10-12: a string literal is not a topic unless it names it exactly as written
+- **Mistake (caught by public-repo sampling):** `topics = "#{__x.topic}"` and 3-argument Rabbit `convertAndSend(exchange, routingKey, …)` edged as literal topics — 3 false `SUBSCRIBES` on spring-kafka plus an exchange-as-topic shape.
+- **Rule:** literal classification rejects anything computed-looking (`#{`, partial `${`) and arity-gates exchange-first sends; whole-value `${…}` stays a placeholder. Sampling a canonical repo (spring-kafka) is what caught it — units only had the shapes imagined in advance.
+
+## 2026-10-12: a URI path replaces the prefix instead of stripping it
+- **Mistake (caught by adversarial probing):** `proxy_pass http://auth:8080/health` read as a strip rule; had the stripped path matched an endpoint, the edge would have been false (the real route serves `/health`, not `/`).
+- **Rule:** any gateway target with a URI path is unread (a lone trailing `/` still reads); the no-candidate fallback is not a substitute for rejecting unmodellable forms at the reader.
+
+## 2026-10-12: uncompilable mutants give no verdict
+- **Mistake (caught by reading the battery output):** two mutants reported SURVIVED because the edit broke compilation (`!kafkaXXXX`, `r.prefixXXXX`) — `cargo test` errored, the grep found no FAILED, and the verdict was recorded wrong.
+- **Rule:** a kill counts only from a compiling tree; assert the build succeeds (or that the failure is a test assertion, not rustc) before recording KILLED/SURVIVED. Prefer mutations that cannot break compilation (wrong constants, dropped conditions, `|_| true`).
+
+## 2026-10-12: prove a vacuous measurement leg vacuous, or replace it
+- **Mistake (avoided by design):** apache/kafka @ pin carries no Spring-Kafka dependency, so its 625k-row identical dump proves nothing positive about topics.
+- **Rule:** check the leg can exercise the code first (here: a build-file grep for the frameworks); a vacuous leg gets a stated vacuity proof, and the positive proof moves to a repo that carries the forms (spring-kafka: +808 rows, samples read in source).

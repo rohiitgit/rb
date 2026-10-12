@@ -100,7 +100,6 @@ fn annotation_topics(decoration: &Decoration) -> Option<(Vec<TopicName>, bool)> 
         }
     };
     let mut topics = Vec::new();
-    let mut dynamic = dynamic;
     if arg.items.is_empty() {
         if arg.literal || is_placeholder(&arg.value) {
             match classify(&arg.value) {
