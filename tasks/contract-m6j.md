@@ -205,3 +205,16 @@ for the .NET leg — it carries DI tests). Sizes accepted per M5 precedent (pars
 `var/m6j/logs/p0-baseline-*` green (fmt, clippy `-D warnings`, 888 units, store 72, server
 12, e2e 42/42, api 1/1, no skips, no listener, stub scan clean). DB holds only the 3
 pre-existing `fx_*` repos.
+
+2. **(phase 1) Kotlin/C# decorations.** Annotations ride `modifiers`, attributes ride
+`attribute_list` (both Java-shaped, proven by S-exps); names (full paths) + literal args
+(keyed and positional) with a `value_argument`/`attribute_argument` arm each; string
+literals decode per language with `interpolation` holes plus a `dollar_interpolation`
+flag so bare `$name` never reads literal (C# verbatim stays a raw-text miss; use-site
+targets keep the name; `@file:` annotations correctly attach to nothing). Bindings carry
+decorations for Kotlin/C# (lib.rs gate); `class_parameter` binds (primary-ctor injection
+points). C# properties stay out (residue: S6 reads fields + ctor params). Tests-first (5
+units); 12/12 mutants killed — including a harness repair (uncompilable `Language::XXX`
+mutants give no verdict per the M6i lesson; non-unique REV patterns leave mutants in the
+tree — both bitten during the run and fixed with string-only mutants, unique both
+directions, plus an XXX sweep).

@@ -769,7 +769,12 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                             .and_then(|v| calls::init(language, v, source, &chain_index))
                     }),
                 constant: b.constant,
-                decorations: if language == Language::Java {
+                // Contract M6j S1: Kotlin and C# bindings carry their annotations like
+                // Java's do (definition decorations ride the same arms).
+                decorations: if matches!(
+                    language,
+                    Language::Java | Language::Kotlin | Language::CSharp
+                ) {
                     decorations::decorations(language, b.node, source)
                 } else {
                     Vec::new()

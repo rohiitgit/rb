@@ -51,8 +51,28 @@ pub(crate) fn decorations(language: Language, def: Node<'_>, source: &[u8]) -> V
             found
         }
         Language::Go => Vec::new(),
-        // Contract M6i S2: annotations land with Tier B.
-        Language::Kotlin | Language::CSharp => Vec::new(),
+        // Contract M6j S1: Kotlin annotations ride `modifiers`, like Java's.
+        Language::Kotlin => def
+            .children(&mut cursor)
+            .filter(|c| c.kind() == "modifiers")
+            .flat_map(|m| {
+                let mut c = m.walk();
+                m.named_children(&mut c)
+                    .filter(|a| a.kind() == "annotation")
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+        // Contract M6j S1: C# attributes ride `attribute_list` children of the declaration.
+        Language::CSharp => def
+            .children(&mut cursor)
+            .filter(|c| c.kind() == "attribute_list")
+            .flat_map(|l| {
+                let mut c = l.walk();
+                l.named_children(&mut c)
+                    .filter(|a| a.kind() == "attribute")
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
     };
     nodes
         .into_iter()
@@ -60,12 +80,59 @@ pub(crate) fn decorations(language: Language, def: Node<'_>, source: &[u8]) -> V
         .collect()
 }
 
+/// The annotated type of a Kotlin annotation: the first `user_type` descendant, whose text
+/// is the full path (`com.foo.Bar`). Bare `@Singleton`, argued `@Named("x")` and use-site
+/// `@get:Rule` share the shape.
+fn kotlin_annotation_type(node: Node<'_>) -> Option<Node<'_>> {
+    let mut c = node.walk();
+    for kid in node.named_children(&mut c) {
+        match kid.kind() {
+            "user_type" => return Some(kid),
+            "constructor_invocation" => {
+                if let Some(n) = kotlin_annotation_type(kid) {
+                    return Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `value_arguments` of a Kotlin annotation's constructor invocation, if any.
+fn kotlin_annotation_args(node: Node<'_>) -> Option<Node<'_>> {
+    let mut c = node.walk();
+    node.named_children(&mut c)
+        .filter(|n| n.kind() == "constructor_invocation")
+        .flat_map(|n| {
+            let mut c = n.walk();
+            n.named_children(&mut c)
+                .filter(|a| a.kind() == "value_arguments")
+                .collect::<Vec<_>>()
+        })
+        .next()
+}
+
+/// The `attribute_argument_list` child of a C# attribute, if any.
+fn csharp_attribute_args(node: Node<'_>) -> Option<Node<'_>> {
+    let mut c = node.walk();
+    node.named_children(&mut c)
+        .find(|n| n.kind() == "attribute_argument_list")
+}
+
 fn decoration(language: Language, node: Node<'_>, source: &[u8]) -> Decoration {
     // Java: annotation(name, arguments). Python/TS: decorator(<call | name expression>).
+    // Kotlin: annotation(user_type, constructor_invocation(value_arguments)). C#: attribute(name,
+    // attribute_argument_list).
     let (name_node, arguments) = match language {
         Language::Java => (
             node.child_by_field_name("name"),
             node.child_by_field_name("arguments"),
+        ),
+        Language::Kotlin => (kotlin_annotation_type(node), kotlin_annotation_args(node)),
+        Language::CSharp => (
+            node.child_by_field_name("name"),
+            csharp_attribute_args(node),
         ),
         _ => match node.named_child(0) {
             Some(call) if matches!(call.kind(), "call" | "call_expression") => (
@@ -117,6 +184,42 @@ fn decoration(language: Language, node: Node<'_>, source: &[u8]) -> Decoration {
                     }
                 }
                 "comment" => {}
+                // Kotlin `@Named(name = "x", count = 3)`: the key is the first identifier
+                // when two values ride one argument; a lone value has no key.
+                "value_argument" => {
+                    let mut vc = arg.walk();
+                    let kids: Vec<_> = arg.named_children(&mut vc).collect();
+                    let (key, value) = match kids.as_slice() {
+                        [k, v] if k.kind() == "identifier" => (Some(text(*k, source)), *v),
+                        [v] => (None, *v),
+                        _ => (None, arg),
+                    };
+                    let (text, literal) = value_text(language, value, source);
+                    args.push(DecorationArg {
+                        key,
+                        value: text,
+                        literal,
+                        items: items(language, value, source),
+                    });
+                }
+                // C# `[Route("api/x", Order = 1)]`: the key is the `name` field.
+                "attribute_argument" => {
+                    let key = field_text(arg, &["name"], source);
+                    let name_node = arg.child_by_field_name("name");
+                    let mut vc = arg.walk();
+                    let value_node = arg.named_children(&mut vc).find(|n| Some(*n) != name_node);
+                    let (value, literal) = value_node
+                        .map(|v| value_text(language, v, source))
+                        .unwrap_or_default();
+                    args.push(DecorationArg {
+                        key,
+                        value,
+                        literal,
+                        items: value_node
+                            .map(|v| items(language, v, source))
+                            .unwrap_or_default(),
+                    });
+                }
                 _ => {
                     let (value, literal) = value_text(language, arg, source);
                     args.push(DecorationArg {
@@ -725,6 +828,102 @@ mod tests {
             .flat_map(|d| d.supertypes.iter().map(|t| t.implements))
             .collect();
         assert_eq!(flags, [false, true, false]);
+    }
+
+    /// Contract M6j S1: Kotlin annotations pin names and literal arguments. Properties are
+    /// bindings, not definitions, so their decorations are read off the bindings.
+    #[test]
+    fn kotlin_annotations() {
+        let src = "@Singleton\nclass Foo {\n@Inject\nlateinit var svc: Svc\n@Named(\"x\")\nfun make(): X = X()\n}\n";
+        assert_eq!(
+            decorated(Language::Kotlin, src),
+            ["Foo: @Singleton()", "make: @Named(x)"]
+        );
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let bound: Vec<(String, String)> = facts
+            .bindings
+            .iter()
+            .flat_map(|b| {
+                b.decorations
+                    .iter()
+                    .map(|d| (b.name.clone(), d.name.clone()))
+            })
+            .collect();
+        assert_eq!(bound, [("svc".to_owned(), "Inject".to_owned())]);
+        let make = facts.definitions.iter().find(|d| d.name == "make").unwrap();
+        assert_eq!(make.decorations.len(), 1);
+        assert!(make.decorations[0].args[0].literal);
+    }
+
+    /// Contract M6j S1: Kotlin annotation arguments pin keys; use-site targets keep the
+    /// name. The top-level property is a binding, read off the bindings.
+    #[test]
+    fn kotlin_annotation_arguments() {
+        let src = "@Named(name = \"x\", count = 3)\nclass Baz {\n}\n@get:Rule\nval r: R\n";
+        assert_eq!(
+            decorated(Language::Kotlin, src),
+            ["Baz: @Named(name=x, count=3)"]
+        );
+        let facts = extract(Language::Kotlin, src.as_bytes()).unwrap();
+        let bound: Vec<(String, String)> = facts
+            .bindings
+            .iter()
+            .flat_map(|b| {
+                b.decorations
+                    .iter()
+                    .map(|d| (b.name.clone(), d.name.clone()))
+            })
+            .collect();
+        assert_eq!(bound, [("r".to_owned(), "Rule".to_owned())]);
+    }
+
+    /// Contract M6j S1: interpolated annotation arguments are holes, never literals.
+    #[test]
+    fn interpolated_annotation_arguments_are_holes() {
+        let kt = extract(
+            Language::Kotlin,
+            "@Named(\"hi $name\")\nclass A {\n}\n".as_bytes(),
+        )
+        .unwrap();
+        let a = kt.definitions.iter().find(|d| d.name == "A").unwrap();
+        assert_eq!(a.decorations.len(), 1);
+        assert_eq!(a.decorations[0].args.len(), 1);
+        assert!(!a.decorations[0].args[0].literal);
+        let cs = extract(
+            Language::CSharp,
+            "[Route($\"api/{c}\")]\nclass B {\n}\n".as_bytes(),
+        )
+        .unwrap();
+        let b = cs.definitions.iter().find(|d| d.name == "B").unwrap();
+        assert_eq!(b.decorations.len(), 1);
+        assert_eq!(b.decorations[0].args.len(), 1);
+        assert!(!b.decorations[0].args[0].literal);
+    }
+
+    /// Contract M6j S1: C# attributes pin names and literal arguments. Fields are bindings,
+    /// not definitions; properties stay out (residue: .NET packs read fields and ctor
+    /// parameters per the S6 claim).
+    #[test]
+    fn csharp_attributes() {
+        let src = "[Service]\npublic class Foo {\n[Inject]\nprivate readonly Svc svc;\n[Route(\"api/x\", Order = 1)]\npublic X Make() => null;\n}\n";
+        assert_eq!(
+            decorated(Language::CSharp, src),
+            ["Foo: @Service()", "Make: @Route(api/x, Order=1)"]
+        );
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let bound: Vec<(String, String)> = facts
+            .bindings
+            .iter()
+            .flat_map(|b| {
+                b.decorations
+                    .iter()
+                    .map(|d| (b.name.clone(), d.name.clone()))
+            })
+            .collect();
+        assert_eq!(bound, [("svc".to_owned(), "Inject".to_owned())]);
+        let make = facts.definitions.iter().find(|d| d.name == "Make").unwrap();
+        assert_eq!(make.decorations.len(), 1);
+        assert!(make.decorations[0].args[0].literal);
     }
 
     const JAVA: &str = r#"@Entity @Table(name = "users", schema = "auth")
