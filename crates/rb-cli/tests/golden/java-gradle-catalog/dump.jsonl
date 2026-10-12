@@ -43,5 +43,6 @@
 ["D","orphan_coverage",null,null,{"eligible":0,"kept":{"annotation":0,"convention":0,"default_export":0,"entry":0,"library":7,"mention":0,"supertype":0,"test":0},"symbols":7}]
 ["D","rta_coverage",null,null,{"kept":{"annotation":0,"default_export":0,"fragment":0,"language":0,"library":0,"mention":0,"string":0,"subtype":0,"surface":0,"test":0},"proven":0,"prunable_edges":0,"types":0}]
 ["D","scip_status",".",null,{"indexer":"scip-java","reason":"SCIP disabled (--no-scip)","status":"skipped","unpinned":false}]
+["D","unresolved_references","build.gradle.kts",null,{"calls":7,"external":0,"language":"kotlin","types":0}]
 ["D","unresolved_references","src/main/java/demo/Main.java",null,{"calls":1,"external":0,"language":"java","types":0}]
 ["D","unresolved_references","src/main/java/demo/Service.java",null,{"calls":0,"external":3,"language":"java","types":0}]

@@ -274,3 +274,13 @@ since).
 lagged until close. Metadata-only (`tool_versions` in snapshot data, never the canonical
 dump): no golden pins the string (grep proves it), the `pipeline` e2e assert is
 self-consistent, and the close verify below re-proves the exact bumped tree.
+
+8. **(close) `java-gradle-catalog` golden re-bless.** The close loop's only failure
+(`scip_java_gradle_catalog`, 41/42 green): `dump.jsonl` gained exactly the classified
+invariant-1 row (`build.gradle.kts` `unresolved_references`, 7 Kotlin calls), everything
+else byte-identical; `scip-status.txt` recomputed its summary from it (0 resolved of 7 →
+"0.0% … 7 unresolved", arithmetically correct — a single-file Gradle script has nothing
+in-repo to resolve to). No e2e had run on M6i code since phase 2, so no earlier loop could
+have caught it. A `.kt`/`.kts`/`.cs` census over all old fixtures proves this is the only
+stale golden (2 files, both here). Re-blessed with `RB_BLESS=1`, diff reviewed row by row,
+then re-run green without bless.
