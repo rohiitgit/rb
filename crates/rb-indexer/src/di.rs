@@ -18,10 +18,10 @@ use rb_model::{
     Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
     Provenance, Span,
 };
-use rb_syntax::{FileFacts, Language, MentionRole};
+use rb_syntax::{FileFacts, Language, MentionRole, RefKind};
 use serde_json::{Value, json};
 
-use crate::resolve::Index;
+use crate::resolve::{Container, Index};
 
 /// Supertype levels followed for assignability (invariant 8, as M3a).
 pub(crate) const MAX_SUPERTYPE_DEPTH: usize = 64;
@@ -46,6 +46,8 @@ pub(crate) struct Inputs<'a> {
     pub depends: &'a BTreeMap<String, BTreeSet<String>>,
     /// The raw-text scan of the files without facts (gate D's findings, gate M's words).
     pub unparsed: &'a RawScan,
+    /// Manifest texts by path, for the `lombok.config` chain (contract M6c S8).
+    pub manifests: &'a BTreeMap<&'a str, String>,
 }
 
 /// The coverage buckets (S7, amendment 2), in the order `rb status` prints them.
@@ -79,10 +81,22 @@ pub(crate) struct Resolution {
     pub buckets: BTreeMap<&'static str, usize>,
     /// Gate → points it capped.
     pub gates: BTreeMap<&'static str, usize>,
+    /// Points the S2 narrowing freed: capped under the broad mention rule but
+    /// plain under the narrowed one (contract M6c S2, invariant 4).
+    pub mention_lifted: usize,
+    /// Points whose qualifier a `lombok.config` chain restored and whose
+    /// qualifier filter kept candidates (contract M6c S8, invariant 4).
+    pub lombok_narrowed: usize,
+    /// Points that picked the single bean in exact type-arg agreement
+    /// (contract M6c S9, invariant 4).
+    pub type_args_narrowed: usize,
     pub diagnostics: Vec<Diagnostic>,
     /// The interfaces Spring Data repositories extend, by simple name, in every Java file
     /// (fragment interfaces for RTA's rule (h), D3).
     pub fragments: BTreeSet<String>,
+    /// Every Spring Data repository bean, as `(path, definition)` (contract M6c
+    /// S7): receivers typed by one resolve inherited calls to it.
+    pub spring_data: Vec<(String, usize)>,
     /// The main-source injection points and the beans they resolve to uniquely, for the bases
     /// of injected HTTP clients (contract M4b S21).
     pub points: Points,
@@ -113,6 +127,9 @@ struct BeanAt<'a, 'b> {
     package: &'a str,
     /// Types it is assignable to (itself and its resolved supertypes, transitively).
     types: BTreeSet<Sym<'a>>,
+    /// Its declared supertype clauses as (simple raw name, raw args), for
+    /// exact type-arg agreement (contract M6c S9).
+    clauses: Vec<(String, Vec<String>)>,
     /// A `@Bean` method whose return type did not resolve: assignable through the types it
     /// creates (gate `bean_type_inferred`).
     inferred: bool,
@@ -200,11 +217,17 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
         .map(|(path, (_, facts))| (*path, *facts))
         .collect();
     let bases = rb_frameworks::repository_bases(java.iter().flat_map(|(_, f)| &f.definitions));
+    // The `lombok.config` chain for Lombok-copied qualifiers (contract M6c S8).
+    let lombok = spring::LombokConfigs::build(inputs.manifests);
     let per_file: Vec<(&'a str, &'a FileFacts, FileDi)> = java
         .iter()
         .map(|&(path, facts)| {
             work::tick(1);
-            (path, facts, spring::di(Language::Java, facts, &bases))
+            (
+                path,
+                facts,
+                spring::di(Language::Java, facts, &bases, path, &lombok),
+            )
         })
         .collect();
 
@@ -217,20 +240,36 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
             .di_surface
             .iter()
             .any(|(path, _)| !is_test_path(path));
-    // Gate M (S6): names with a mention outside the allowed roles in any parsed Java file, or
-    // in an unparsed non-inert file.
+    // Gate M (S6, narrowed by S2): names with a mention outside the allowed
+    // roles in any parsed Java file — except `ClassLiteral` mentions in test
+    // paths, which register nothing in the application's context (contract
+    // M6c S2) — or in an unparsed non-inert file.
     let mut mentioned: BTreeSet<&str> = BTreeSet::new();
-    for (_, facts, _) in &per_file {
+    let mut mentioned_broad: BTreeSet<&str> = BTreeSet::new();
+    for (path, facts, _) in &per_file {
+        let test = is_test_path(path);
         for (name, roles) in &facts.mentions {
             work::tick(1);
             if roles.iter().any(|r| !MENTION_ALLOWED.contains(r)) {
-                mentioned.insert(name.as_str());
+                mentioned_broad.insert(name.as_str());
+                if !test
+                    || roles
+                        .iter()
+                        .any(|r| !MENTION_ALLOWED.contains(r) && *r != MentionRole::ClassLiteral)
+                {
+                    mentioned.insert(name.as_str());
+                }
             }
         }
     }
     let gate_m = |name: &str| {
         inputs.unparsed.words_unread
             || mentioned.contains(name)
+            || inputs.unparsed.words.contains(name)
+    };
+    let gate_m_broad = |name: &str| {
+        inputs.unparsed.words_unread
+            || mentioned_broad.contains(name)
             || inputs.unparsed.words.contains(name)
     };
 
@@ -306,6 +345,11 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                 service: service.clone(),
                 package,
                 types: assignable(index, &start),
+                clauses: facts.definitions[bean.definition]
+                    .supertypes
+                    .iter()
+                    .map(|s| (simple(&s.name).to_owned(), s.type_args.clone()))
+                    .collect(),
                 inferred,
             });
         }
@@ -338,6 +382,10 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
     }
     let registrants = registrants(index, &per_file);
     let literal_registrants = literal_registrants(index, &per_file);
+    let bean_registrants = bean_method_registrants(index, &per_file);
+    // Classes a `@Bean` method's returned object may be of, per returning
+    // method (contract M6c S6).
+    let bean_consumers = bean_method_consumers(index, &beans);
 
     let mut out = Resolution {
         fragments: per_file
@@ -351,6 +399,12 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
     for b in BUCKETS {
         out.buckets.insert(b, 0);
     }
+    // Every Spring Data repository bean, for inherited-call receivers (S7).
+    out.spring_data = beans
+        .iter()
+        .filter(|b| b.bean.origin == Origin::SpringData)
+        .map(|b| (b.path.to_owned(), b.bean.definition))
+        .collect();
     let mut classpaths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (path, facts, d) in &per_file {
         let test = is_test_path(path);
@@ -394,8 +448,11 @@ pub(crate) fn resolve<'a>(inputs: &Inputs<'a>) -> Resolution {
                 unread_by_type: &unread_by_type,
                 registrants: &registrants,
                 literal_registrants: &literal_registrants,
+                bean_registrants: &bean_registrants,
+                bean_consumers: &bean_consumers,
                 surface,
                 gate_m: &gate_m,
+                gate_m_broad: &gate_m_broad,
             };
             if test {
                 *out.buckets.get_mut("test").unwrap() += 1;
@@ -433,8 +490,18 @@ struct PointContext<'c, 'a> {
     /// Per type: the main-source classes assignable to it that a main-source class literal
     /// names, candidates beside the scanned beans (contract M5 S19 (g)).
     literal_registrants: &'c BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>>,
+    /// Per type: the main-source `@Bean` methods assignable to it whose declaring class a
+    /// main-source `@Import` names, candidates beside the scanned beans (contract M6c S1).
+    bean_registrants: &'c BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>>,
+    /// Per class: the main-source `@Bean` methods whose returned object may be
+    /// of it, consumers beside the scanned beans (contract M6c S6).
+    bean_consumers: &'c BTreeMap<Sym<'a>, Vec<usize>>,
     surface: bool,
     gate_m: &'c dyn Fn(&str) -> bool,
+    /// The broad mention rule (test-path class literals included): points it
+    /// would cap but `gate_m` frees are counted, never capped (contract M6c
+    /// S2, invariant 4).
+    gate_m_broad: &'c dyn Fn(&str) -> bool,
 }
 
 fn site_diagnostic(kind: &str, path: &str, span: Span, ty: &str, detail: &str) -> Diagnostic {
@@ -531,12 +598,153 @@ fn bean_name_for_gate(b: &BeanAt<'_, '_>) -> String {
     simple(&b.bean.type_name).to_owned()
 }
 
+/// Per type: the main-source `@Bean` methods assignable to it whose declaring
+/// class a main-source `@Import` names (contract M6c S1, M5 open item 13).
+/// Like class-literal registrants they join beside scanned beans (ambiguous);
+/// collections, candidate-less points and unnamed configs are unchanged.
+/// Literals in test sources register nothing.
+fn bean_method_registrants<'a>(
+    index: &Index<'a>,
+    per_file: &[(&'a str, &'a FileFacts, FileDi)],
+) -> BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>> {
+    // Simple names of classes a main-source `@Import` names (`X.class` args).
+    let mut imported: BTreeSet<&str> = BTreeSet::new();
+    for &(_, facts, _) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+        for def in &facts.definitions {
+            work::tick(1);
+            for d in def
+                .decorations
+                .iter()
+                .filter(|d| {
+                    rb_frameworks::routes::is_annotation(
+                        facts,
+                        d,
+                        "org.springframework.context.annotation",
+                        "Import",
+                    )
+                })
+                .flat_map(|d| {
+                    d.args.iter().map(|a| a.value.as_str()).chain(
+                        d.args
+                            .iter()
+                            .flat_map(|a| a.items.iter().map(|i| i.value.as_str())),
+                    )
+                })
+            {
+                if let Some(base) = d.strip_suffix(".class") {
+                    imported.insert(base.rsplit('.').next().unwrap_or(base));
+                }
+            }
+        }
+    }
+    let mut out: BTreeMap<Sym<'a>, BTreeSet<Sym<'a>>> = BTreeMap::new();
+    if imported.is_empty() {
+        return out;
+    }
+    for &(path, facts, _) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+        for (i, def) in facts.definitions.iter().enumerate() {
+            work::tick(1);
+            if def.kind != rb_syntax::DefKind::Class || !imported.contains(def.name.as_str()) {
+                continue;
+            }
+            for (m, method) in facts.definitions.iter().enumerate().filter(|(_, d)| {
+                d.kind == rb_syntax::DefKind::Method
+                    && d.parent == Some(i)
+                    && d.decorations.iter().any(|d| {
+                        rb_frameworks::routes::is_annotation(
+                            facts,
+                            d,
+                            "org.springframework.context.annotation",
+                            "Bean",
+                        )
+                    })
+            }) {
+                let written = method.return_type.as_deref().unwrap_or_default();
+                let head = written.split('<').next().unwrap_or_default().trim();
+                let mut start = index.type_candidates(path, Some(i), head);
+                start.extend(
+                    facts
+                        .references
+                        .iter()
+                        .filter(|r| r.kind == rb_syntax::RefKind::Class && r.enclosing == Some(m))
+                        .flat_map(|r| index.type_candidates(path, Some(m), &r.name)),
+                );
+                for t in assignable(index, &start) {
+                    out.entry(t).or_default().insert((path, m));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Per class, the main-source `@Bean` methods whose returned object may be of
+/// it (contract M6c S6): its symbol lies on the method's assignable closure or
+/// among the types its body creates (resolved as in `resolve` above, so no new
+/// fact kind is needed). The class's points resolve from each returning method.
+fn bean_method_consumers<'a>(
+    index: &Index<'a>,
+    beans: &[BeanAt<'a, '_>],
+) -> BTreeMap<Sym<'a>, Vec<usize>> {
+    let mut out: BTreeMap<Sym<'a>, Vec<usize>> = BTreeMap::new();
+    for (i, b) in beans.iter().enumerate() {
+        if b.bean.origin != Origin::BeanMethod {
+            continue;
+        }
+        work::tick(1);
+        let mut syms = b.types.clone();
+        for c in &b.bean.created {
+            for t in index.type_candidates(b.path, Some(b.bean.definition), c) {
+                syms.insert(t);
+            }
+        }
+        for t in syms {
+            out.entry(t).or_default().push(i);
+        }
+    }
+    out
+}
+
+/// Whether a bean's declared supertype clauses agree exactly with a point
+/// (contract M6c S9): a clause naming the point's raw type with pairwise
+/// equal simple args. Bare wildcards never agree; every other wildcard, bound
+/// or nesting already differs textually (marked point args, raw bean args),
+/// so equality alone refuses them.
+fn args_agree(point_raw: &str, point_args: &[String], clauses: &[(String, Vec<String>)]) -> bool {
+    clauses.iter().any(|(raw, args)| {
+        raw == point_raw
+            && args.len() == point_args.len()
+            && args
+                .iter()
+                .zip(point_args)
+                .all(|(b, p)| !b.contains('?') && simple(b) == *p)
+    })
+}
+
 fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resolution) {
     let inputs = ctx.inputs;
     let index = inputs.index;
     let defs = &ctx.facts.definitions;
     let bucket = |out: &mut Resolution, b: &'static str| *out.buckets.get_mut(b).unwrap() += 1;
-    if !p.owner_is_bean {
+    // New consumers (contract M6c S6): a `ConstraintValidator` implementation
+    // resolves from its class; a class a `@Bean` method returns resolves from
+    // each returning method. Anything else without a bean owner stays
+    // `not_a_bean`, as before.
+    let is_class = defs[p.owner].kind == rb_syntax::DefKind::Class;
+    let validator = !p.owner_is_bean
+        && is_class
+        && defs[p.owner].supertypes.iter().any(|s| {
+            s.implements && s.name.rsplit('.').next().unwrap_or(&s.name) == "ConstraintValidator"
+        });
+    let bean_methods: &[usize] = if !p.owner_is_bean && !validator && is_class {
+        ctx.bean_consumers
+            .get(&(ctx.path, p.owner))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    } else {
+        &[]
+    };
+    if !p.owner_is_bean && !validator && bean_methods.is_empty() {
         bucket(out, "not_a_bean");
         out.diagnostics.push(site_diagnostic(
             "di_not_a_bean",
@@ -547,6 +755,9 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         ));
         return;
     }
+    // S6 edges enter at `heuristic`, never above (D6, F2): the consumer link
+    // itself is unproven, so even several candidates stay heuristic.
+    let s6 = !p.owner_is_bean;
     let roots = ctx.roots;
     let components = roots.and_then(|r| r.components.as_ref());
     // The consumer must itself be scanned.
@@ -681,11 +892,23 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
     {
         gates.insert("mention");
     }
+    // Points the S2 narrowing frees: the broad rule would cap them, but the
+    // narrowed one does not (contract M6c S2, invariant 4).
+    let mention_broad = (ctx.gate_m_broad)(simple(&p.element))
+        || candidates
+            .iter()
+            .any(|&i| (ctx.gate_m_broad)(&bean_name_for_gate(&ctx.beans[i])))
+        || types
+            .iter()
+            .flat_map(|t| ctx.registrants.get(t).into_iter().flatten())
+            .any(|name| (ctx.gate_m_broad)(name));
 
     let collection = p.wrapper == Some(Wrapper::Collection);
-    // Classes a class literal registers (S19 (g)): candidates beside the scanned beans (a point
-    // left with no scanned bean is unresolved before any edge, as before); a collection keeps
-    // its scanned beans (the registrant still caps it, gate M).
+    // Classes a class literal registers (S19 (g)), and `@Bean` methods of an
+    // `@Import`-named config (contract M6c S1): candidates beside the scanned
+    // beans (a point left with no scanned bean is unresolved before any edge,
+    // as before); a collection keeps its scanned beans (the registrant still
+    // caps it, gate M).
     let registered: Vec<Sym<'_>> = if collection {
         Vec::new()
     } else {
@@ -696,6 +919,11 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         types
             .iter()
             .flat_map(|t| ctx.literal_registrants.get(t).into_iter().flatten())
+            .chain(
+                types
+                    .iter()
+                    .flat_map(|t| ctx.bean_registrants.get(t).into_iter().flatten()),
+            )
             .copied()
             .filter(|c| !scanned.contains(c))
             .collect::<BTreeSet<_>>()
@@ -727,6 +955,11 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         chosen.retain(|&i| named(i, q) || ctx.beans[i].bean.qualifiers.iter().any(|x| x == q));
         qualifier = Some(q.clone());
         resolution = "qualifier";
+        if p.copied_qualifier && !chosen.is_empty() {
+            // A `lombok.config`-restored qualifier that kept candidates: each
+            // narrowed point counted (contract M6c S8, invariant 4).
+            out.lombok_narrowed += 1;
+        }
         if chosen.is_empty() {
             bucket(out, "unresolved");
             out.diagnostics.push(site_diagnostic(
@@ -737,6 +970,24 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
                 "qualifier",
             ));
             return;
+        }
+    }
+    // Exact type-arg agreement (contract M6c S9): the one bean whose declared
+    // clause names the point's raw type with pairwise equal simple args.
+    // Wildcards, bounds, nesting and disagreement pick nothing, as before.
+    if !collection && chosen.len() > 1 && !p.type_args.is_empty() {
+        let agreeing: Vec<usize> = chosen
+            .iter()
+            .copied()
+            .filter(|&i| {
+                work::tick(1);
+                args_agree(simple(&p.type_name), &p.type_args, &ctx.beans[i].clauses)
+            })
+            .collect();
+        if agreeing.len() == 1 {
+            chosen = agreeing;
+            resolution = "type_args";
+            out.type_args_narrowed += 1;
         }
     }
     if !collection && !undecided && chosen.len() > 1 {
@@ -801,9 +1052,11 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         return;
     }
     // Conditionals among the consumer, the candidates and those narrowing removed.
+    let consumer_conditional =
+        consumer_conditional || bean_methods.iter().any(|&i| ctx.beans[i].bean.conditional);
     let conditional =
         consumer_conditional || candidates.iter().any(|&i| ctx.beans[i].bean.conditional);
-    let certainty = if several {
+    let certainty = if several && !s6 {
         Certainty::Ambiguous
     } else {
         Certainty::Heuristic
@@ -816,6 +1069,9 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
         "capped"
     };
     bucket(out, label);
+    if mention_broad && label == "plain" {
+        out.mention_lifted += 1;
+    }
     for g in &gates {
         *out.gates.entry(g).or_default() += 1;
     }
@@ -828,7 +1084,21 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             (b.path.to_owned(), b.bean.definition),
         );
     }
-    let src = inputs.keys[ctx.path][p.owner].clone();
+    // One bucket count per point, one edge per (consumer, candidate): a
+    // `@Bean`-returned class resolves once per returning method.
+    let srcs: Vec<String> = if bean_methods.is_empty() {
+        vec![inputs.keys[ctx.path][p.owner].clone()]
+    } else {
+        bean_methods
+            .iter()
+            .map(|&i| {
+                let b = &ctx.beans[i];
+                inputs.keys[b.path][b.bean.definition].clone()
+            })
+            .collect()
+    };
+    // This call's injections start here; `out` accumulates across points.
+    let base = out.injections.len();
     let targets = chosen
         .iter()
         .map(|&i| {
@@ -866,7 +1136,7 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             );
         }
         out.injections.push(Injection {
-            src: src.clone(),
+            src: String::new(),
             dst: inputs.keys[path][definition].clone(),
             certainty,
             attrs,
@@ -876,8 +1146,97 @@ fn resolve_point(ctx: &PointContext<'_, '_>, p: &InjectionPoint, out: &mut Resol
             },
         });
     }
+    // One bucket count per point above; fan out only this call's injections.
+    let made = out.injections.split_off(base);
+    out.injections.reserve(made.len() * srcs.len());
+    for src in &srcs {
+        for m in &made {
+            let mut e = m.clone();
+            e.src = src.clone();
+            out.injections.push(e);
+        }
+    }
 }
 
+/// Spring Data member names resolved through the repository interface
+/// (contract M6c S7): any other unresolved member stays unresolved, as before.
+const INHERITED_CALLS: &[&str] = &["save", "find", "get", "delete", "count", "exists"];
+
+/// Links inherited Spring Data calls (contract M6c S7): a call of an
+/// allow-listed name on a receiver typed by a Spring Data repository bean,
+/// which Tier B leaves unlinked (the member is inherited, never declared),
+/// links to the repository interface node with `inherited`, heuristic. Calls
+/// Tier B links itself, other receivers and other names stay as they are.
+pub(crate) fn add_inherited_calls<'a>(
+    b: &mut GraphBuilder,
+    index: &Index<'a>,
+    files: &BTreeMap<&'a str, (Language, &'a FileFacts)>,
+    keys: &BTreeMap<&'a str, Vec<String>>,
+    spring_data: &[(String, usize)],
+    // Files SCIP documents exactly (contract M3b S7): scip-java owns their
+    // calls, including inherited ones, so no heuristic edge may touch them.
+    exact: &BTreeSet<&'a str>,
+) -> anyhow::Result<Vec<Diagnostic>> {
+    let repos: BTreeSet<(&str, usize)> =
+        spring_data.iter().map(|(p, i)| (p.as_str(), *i)).collect();
+    for (&path, (language, facts)) in files {
+        if *language != Language::Java || exact.contains(path) {
+            continue;
+        }
+        let source = |enclosing: Option<usize>| match enclosing {
+            Some(i) => NodeKey::new(NodeKind::Symbol, keys[path][i].clone()),
+            None => NodeKey::new(NodeKind::File, path),
+        };
+        for r in &facts.references {
+            if r.kind != RefKind::Call {
+                continue;
+            }
+            let Some(q) = r.qualifier.as_deref() else {
+                continue;
+            };
+            if !INHERITED_CALLS.iter().any(|p| r.name.starts_with(p)) {
+                continue;
+            }
+            work::tick(1);
+            // Never double an edge Tier B links itself (a declared member).
+            if !index
+                .call(path, r.enclosing, &r.name, Some(q), Some(r.span))
+                .is_empty()
+            {
+                continue;
+            }
+            let mut targets = BTreeSet::new();
+            if let Some(Container::Types(types)) =
+                index.container(path, r.enclosing, q, Some(r.span))
+            {
+                for t in types {
+                    if repos.contains(&(t.0, t.1)) {
+                        targets.insert(keys[t.0][t.1].clone());
+                    }
+                }
+            }
+            for dst in targets {
+                let mut attrs = serde_json::Map::new();
+                attrs.insert("inherited".into(), true.into());
+                b.add_edge(
+                    NewEdge::new(
+                        source(r.enclosing),
+                        EdgeKind::Calls,
+                        NodeKey::new(NodeKind::Symbol, dst),
+                        Provenance::Heuristic,
+                        Certainty::Heuristic,
+                    )
+                    .attrs(attrs)
+                    .evidence(Evidence {
+                        path: path.to_owned(),
+                        span: r.span,
+                    }),
+                )?;
+            }
+        }
+    }
+    Ok(Vec::new())
+}
 /// Adds the `INJECTS` edges (one per `(owner, bean)`: the best site's certainty and attributes,
 /// every site as evidence, `sites = n`; invariant 3), the `di_*` diagnostics and one
 /// `di_coverage`.
@@ -909,15 +1268,30 @@ pub(crate) fn add_injects(b: &mut GraphBuilder, r: Resolution) -> anyhow::Result
     }
     let mut diagnostics = r.diagnostics;
     let points: usize = r.buckets.values().sum();
+    let mut detail = json!({
+        "points": points,
+        "buckets": r.buckets,
+        "gates": r.gates,
+    });
+    // Contract M6c S2 (D3, invariant 4): lifted points ride along only when
+    // non-zero, so unrelated dumps stay byte-identical.
+    if r.mention_lifted > 0 {
+        detail["mention_lifted"] = r.mention_lifted.into();
+    }
+    // Contract M6c S8 (D3, invariant 4): narrowed Lombok-qualifier points,
+    // likewise non-zero-only.
+    if r.lombok_narrowed > 0 {
+        detail["lombok_narrowed"] = r.lombok_narrowed.into();
+    }
+    // Contract M6c S9 (D3, invariant 4): exact type-arg picks, likewise.
+    if r.type_args_narrowed > 0 {
+        detail["type_args_narrowed"] = r.type_args_narrowed.into();
+    }
     diagnostics.push(Diagnostic {
         kind: "di_coverage".into(),
         path: None,
         span: None,
-        detail: json!({
-            "points": points,
-            "buckets": r.buckets,
-            "gates": r.gates,
-        }),
+        detail,
     });
     Ok(diagnostics)
 }
@@ -943,12 +1317,23 @@ mod tests {
     /// the descriptor), the buckets and the gates.
     struct Run {
         edges: Vec<String>,
+        /// `CALLS` edges, Tier B's and inherited (contract M6c S7).
+        calls: Vec<String>,
         buckets: BTreeMap<&'static str, usize>,
         gates: BTreeMap<&'static str, usize>,
         diagnostics: Vec<String>,
+        lifted: usize,
+        narrowed: usize,
+        type_args_narrowed: usize,
+        coverage: Value,
     }
 
-    fn run_with(files: &[(&str, &str)], services: &[(&str, &str, bool)], unparsed: RawScan) -> Run {
+    fn run_with(
+        files: &[(&str, &str)],
+        services: &[(&str, &str, bool)],
+        unparsed: RawScan,
+        manifests: &[(&str, &str)],
+    ) -> Run {
         let facts: Vec<(String, FileFacts)> = files
             .iter()
             .map(|(p, src)| {
@@ -989,6 +1374,10 @@ mod tests {
                     .insert(d.to_owned());
             }
         }
+        let manifests: BTreeMap<&str, String> = manifests
+            .iter()
+            .map(|(p, t)| (*p, (*t).to_owned()))
+            .collect();
         let r = resolve(&Inputs {
             files: &by_path,
             keys: &keys,
@@ -997,6 +1386,7 @@ mod tests {
             deployable: &deployable,
             depends: &depends,
             unparsed: &unparsed,
+            manifests: &manifests,
         });
         let short = |k: &str| {
             k.rsplit_once("`/")
@@ -1014,9 +1404,42 @@ mod tests {
             crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
         }
         let (buckets, gates) = (r.buckets.clone(), r.gates.clone());
-        let diagnostics = add_injects(&mut b, r).unwrap();
+        let lifted = r.mention_lifted;
+        let narrowed = r.lombok_narrowed;
+        let type_args_narrowed = r.type_args_narrowed;
+        let spring_data = r.spring_data.clone();
+        // Tier B first, as in `assemble`: the inherited producer must see the
+        // edges Tier B links itself to avoid doubling them.
+        let mut diagnostics = crate::resolve::add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
+        diagnostics.extend(add_injects(&mut b, r).unwrap());
+        // Inherited calls run after the injections, as in `assemble` (no
+        // exact files without SCIP).
+        add_inherited_calls(
+            &mut b,
+            &index,
+            &by_path,
+            &keys,
+            &spring_data,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let g = b.finish().unwrap();
         let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+        let mut calls: Vec<String> = g
+            .edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| {
+                format!(
+                    "{} -> {} [{}] {}",
+                    short(&key(e.src)),
+                    short(&key(e.dst)),
+                    e.certainty.as_str(),
+                    Value::Object(e.attrs.clone())
+                )
+            })
+            .collect();
+        calls.sort();
         let mut edges: Vec<String> = g
             .edges()
             .iter()
@@ -1045,6 +1468,7 @@ mod tests {
         };
         Run {
             edges,
+            calls,
             buckets: r.buckets.into_iter().filter(|(_, n)| *n > 0).collect(),
             gates: r.gates,
             diagnostics: r
@@ -1052,11 +1476,20 @@ mod tests {
                 .iter()
                 .map(|d| format!("{} {}", d.kind, d.detail))
                 .collect(),
+            lifted,
+            narrowed,
+            type_args_narrowed,
+            coverage: r
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == "di_coverage")
+                .map(|d| d.detail.clone())
+                .unwrap_or(Value::Null),
         }
     }
 
     fn run(files: &[(&str, &str)]) -> Run {
-        run_with(files, &[], RawScan::default())
+        run_with(files, &[], RawScan::default(), &[])
     }
 
     const APP: (&str, &str) = (
@@ -1168,7 +1601,7 @@ mod tests {
             di_surface: vec![("src/main/kotlin/C.kt".into(), "raw Bean".into())],
             ..RawScan::default()
         };
-        let r = run_with(&[APP, ("src/main/java/com/acme/A.java", &s)], &[], raw);
+        let r = run_with(&[APP, ("src/main/java/com/acme/A.java", &s)], &[], raw, &[]);
         assert_eq!(gate(&r), ["surface"]);
         // Gate D ignores test sources (amendment 3).
         let t = "package com.acme;\nimport org.springframework.context.annotation.FilterType;\nclass T {}\n";
@@ -1185,7 +1618,7 @@ mod tests {
             words: BTreeSet::from(["Repo".to_owned()]),
             ..RawScan::default()
         };
-        let r = run_with(&[APP, ("src/main/java/com/acme/A.java", &s)], &[], raw);
+        let r = run_with(&[APP, ("src/main/java/com/acme/A.java", &s)], &[], raw, &[]);
         assert_eq!(gate(&r), ["mention"]);
         // Controls stay plain: a logger, `new` in a test, an unrelated `@Import`.
         let r = run(&[
@@ -1212,6 +1645,7 @@ mod tests {
             ],
             &[("svc", "", true), ("lib", "", false)],
             RawScan::default(),
+            &[],
         );
         assert_eq!(gate(&r), ["classpath_unknown"]);
         // On the classpath, it is a second candidate.
@@ -1223,6 +1657,7 @@ mod tests {
             ],
             &[("svc", "lib", true), ("lib", "", false)],
             RawScan::default(),
+            &[],
         );
         assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
         // A deployable service is never on another's classpath, nor a gate.
@@ -1234,6 +1669,7 @@ mod tests {
             ],
             &[("svc", "lib", true), ("lib", "", true)],
             RawScan::default(),
+            &[],
         );
         assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
     }
@@ -1359,6 +1795,504 @@ mod tests {
         );
     }
 
+    /// Contract M6c S1 (M5 open item 13): an `@Import`-named config's `@Bean`
+    /// methods join a point's candidates beside the scanned beans, so the
+    /// point is `ambiguous` over all of them and no tie-breaker runs past
+    /// them. A collection, a point with no scanned candidate, an unnamed
+    /// config and an `@Import` naming an unrelated class change nothing.
+    #[test]
+    fn bean_method_registrants_join_as_candidates() {
+        let app = |import: &str| {
+            format!(
+                "package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.context.annotation.Import;\n@SpringBootApplication {import} public class App {{}}\n"
+            )
+        };
+        let main = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
+        );
+        let config = "package com.other;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\n@Configuration public class SmsConfig {\n@Bean public com.acme.Notifier sms() { return null; }\n}\n";
+        let attrs = |origin: &str, n: usize| {
+            format!(
+                r#"{{"candidates":{n},"capped_by":["mention"],"origin":"{origin}","resolution":"ambiguous","sites":1,"via":"constructor"}}"#
+            )
+        };
+        // The repro: one scanned bean and the imported config's `@Bean` method.
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert_eq!(
+            r.edges,
+            [
+                format!(
+                    "Alerts# -> EmailNotifier# [ambiguous] {}",
+                    attrs("stereotype", 2)
+                ),
+                format!(
+                    "Alerts# -> SmsConfig#sms(). [ambiguous] {}",
+                    attrs("registrant", 2)
+                ),
+            ]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
+        // Two scanned beans, one `@Primary`: no primary pick past the registrant.
+        let main2 = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Component @Primary class PushNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
+        );
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main2),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert_eq!(r.edges.len(), 3);
+        assert!(
+            r.edges
+                .iter()
+                .any(|e| e.starts_with("Alerts# -> SmsConfig#sms(). [ambiguous]"))
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
+        // A collection holds the scanned beans; the registrant only caps.
+        let mainc = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(List<Notifier> n) {} }\n",
+        );
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &mainc),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert_eq!(
+            r.edges,
+            [r#"Alerts# -> EmailNotifier# [heuristic] {"capped_by":["mention"],"collection":true,"origin":"stereotype","resolution":"collection","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        // No scanned candidate: unresolved as before (no edge to the registrant alone).
+        let mainu =
+            src("public interface Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n");
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &mainu),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert!(r.edges.is_empty(), "{:?}", r.edges);
+        assert_eq!(r.buckets, BTreeMap::from([("unresolved", 1)]));
+        // An unnamed config: the plain row (its `@Bean` method joins nothing).
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+        ]);
+        assert_eq!(
+            r.edges,
+            [r#"Alerts# -> EmailNotifier# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        // An `@Import` naming an unrelated class: the plain row.
+        let unrelated = "package com.other;\npublic class Audit {}\n";
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.Audit.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+            ("src/main/java/com/other/U.java", unrelated),
+        ]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]), "{:?}", r.edges);
+        // An array `@Import` names each class: the config joins, the audit does not.
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import({com.other.SmsConfig.class, com.other.Audit.class})"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+            ("src/main/java/com/other/U.java", unrelated),
+        ]);
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert!(
+            r.edges.iter().any(|e| e.contains("SmsConfig#sms().")),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(
+            r.buckets,
+            BTreeMap::from([("ambiguous", 1)]),
+            "{:?}",
+            r.edges
+        );
+        // A plain method of a named config (no `@Bean`) joins nothing.
+        let plain_method = "package com.other;\nimport org.springframework.context.annotation.Configuration;\n@Configuration public class PlainConfig {\npublic com.acme.Notifier helper() { return null; }\n}\n";
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.other.PlainConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", plain_method),
+        ]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]), "{:?}", r.edges);
+        // An `@Import` only in a test source registers nothing (and since
+        // contract M6c S2 caps nothing either: the plain row).
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", config),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                &app("@Import(com.other.SmsConfig.class)"),
+            ),
+        ]);
+        assert_eq!(
+            r.edges,
+            [r#"Alerts# -> EmailNotifier# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        // A scanned config's `@Bean` method is already a candidate: it joins
+        // once (no duplicate registrant edge), ambiguous with the bean.
+        let local = "package com.acme;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\n@Configuration public class LocalConfig {\n@Bean public Notifier sms() { return null; }\n}\n";
+        let r = run(&[
+            (
+                "src/main/java/com/acme/App.java",
+                &app("@Import(com.acme.LocalConfig.class)"),
+            ),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/acme/C.java", local),
+        ]);
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert!(
+            r.edges
+                .iter()
+                .filter(|e| e.contains("LocalConfig#sms()."))
+                .count()
+                == 1,
+            "{:?}",
+            r.edges
+        );
+        assert!(
+            r.edges.iter().all(|e| e.contains(r#""candidates":2"#)),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(
+            r.buckets,
+            BTreeMap::from([("ambiguous", 1)]),
+            "{:?}",
+            r.edges
+        );
+    }
+
+    /// Contract M6c S6 (M4b open item 4): injection points of `@Bean`-returned
+    /// objects and of `ConstraintValidator` implementations resolve to
+    /// candidates as new `heuristic` edges; nothing else changes bucket. The
+    /// `@Bean`-method point resolves once per returning method (one bucket
+    /// count, one edge per method); several candidates stay `heuristic`, never
+    /// `ambiguous`.
+    #[test]
+    fn non_bean_consumers_resolve_as_heuristic_edges() {
+        // A validator's member resolves from the validator class; a plain
+        // non-bean class's member stays `not_a_bean`.
+        let r = one(
+            "interface Payload {}\n@Component class Dep {}\nclass MyValidator implements ConstraintValidator<Payload, String> { @Autowired Dep d; }\nclass Plain { @Autowired Dep d; }\n",
+        );
+        assert_eq!(
+            r.edges,
+            [r#"MyValidator# -> Dep# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"field"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("not_a_bean", 1), ("plain", 1)]));
+        // An object a `@Bean` method returns resolves from the method, once
+        // per returning method; two candidates stay heuristic.
+        let r = one(
+            "interface Filter {}\n@Component class Dep {}\n@Component class Other {}\nclass JwtFilter implements Filter { @Autowired Dep d; }\n@Configuration class Cfg { @Bean Filter filter() { return new JwtFilter(); } @Bean Filter backup() { return new JwtFilter(); } }\n@Service class NeedsOther { @Autowired Other o; }\n",
+        );
+        assert_eq!(r.edges.len(), 3, "{:?}", r.edges);
+        assert!(
+            r.edges.iter().any(|e| e
+                == r#"Cfg#filter(). -> Dep# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"field"}"#),
+            "{:?}",
+            r.edges
+        );
+        assert!(
+            r.edges.iter().any(|e| e
+                == r#"Cfg#backup(). -> Dep# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"field"}"#),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 2)]));
+        // Two candidates for a validator's member: the `ambiguous` bucket, but
+        // the edges stay `heuristic` (D6: no Gate-A-style proof is attempted).
+        let r = one(
+            "interface P {}\n@Component class D1 implements P {}\n@Component class D2 implements P {}\nclass V implements ConstraintValidator<P, String> { @Autowired P p; }\n",
+        );
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert!(
+            r.edges.iter().all(|e| e.contains("[heuristic]")
+                && e.contains(r#""resolution":"ambiguous""#)
+                && e.contains(r#""candidates":2"#)
+                && e.starts_with("V# -> D")),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]));
+    }
+
+    /// Contract M6c S9: a point picks the single bean in exact simple-name
+    /// type-arg agreement (capped by the generic gate, counted); wildcards,
+    /// bounds, nesting and disagreement stay ambiguous.
+    #[test]
+    fn exact_type_arg_agreement_picks_one() {
+        let stores = "interface Store<T> {}\n@Component class StringStore implements Store<String> {}\n@Component class IntStore implements Store<Integer> {}\n";
+        // Agreement: the `String` point picks `StringStore` alone.
+        let r = one(&format!(
+            "{stores}@Service class Catalog {{ Catalog(Store<String> store) {{}} }}\n"
+        ));
+        assert_eq!(
+            r.edges,
+            [r#"Catalog# -> StringStore# [heuristic] {"capped_by":["generic"],"origin":"stereotype","resolution":"type_args","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]));
+        assert_eq!(r.type_args_narrowed, 1);
+        // Disagreement keeps both.
+        let r = one(&format!(
+            "{stores}@Service class Catalog {{ Catalog(Store<Long> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 0);
+        // A wildcard, a bound and nesting never agree.
+        for arg in ["?", "? extends String", "List<String>"] {
+            let r = one(&format!(
+                "{stores}@Service class Catalog {{ Catalog(Store<{arg}> store) {{}} }}\n"
+            ));
+            assert_eq!(r.edges.len(), 2, "{arg}: {:?}", r.edges);
+            assert_eq!(r.type_args_narrowed, 0, "{arg}");
+        }
+        // Qualified clause args agree by simple name.
+        let r = one(&format!(
+            "{stores}@Component class QBox implements com.acme.Store<com.acme.Sms> {{}}\n@Service class Catalog {{ Catalog(Store<Sms> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 1, "{:?}", r.edges);
+        assert!(r.edges[0].contains("QBox#"), "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 1);
+        // A nested bean clause never agrees, even for a non-nested point.
+        let r = one(&format!(
+            "{stores}@Component class NBox implements Store<List<X>> {{}}\n@Service class Catalog {{ Catalog(Store<List> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 3, "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 0);
+        // Bare wildcards never agree, even with each other.
+        let r = one(&format!(
+            "{stores}@Component class WBox implements Store<?> {{}}\n@Service class Catalog {{ Catalog(Store<?> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 3, "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 0);
+        // A nested point never agrees, even with a raw clause of that name.
+        let r = one(&format!(
+            "{stores}@Component class ListBox implements Store<List> {{}}\n@Service class Catalog {{ Catalog(Store<List<X>> store) {{}} }}\n"
+        ));
+        assert_eq!(r.edges.len(), 3, "{:?}", r.edges);
+        assert_eq!(r.type_args_narrowed, 0);
+    }
+
+    /// Contract M6c S8: a field qualifier a `lombok.config` chain lists rides
+    /// the generated parameter, narrows to the qualified bean, and counts;
+    /// unlisted chains keep the old capped-ambiguous row.
+    #[test]
+    fn lombok_listed_qualifiers_narrow_and_count() {
+        let beans = "interface Hasher {}\n@Component class Bcrypt implements Hasher {}\n@Component(\"plain\") class Plain implements Hasher {}\n";
+        let svc = "import lombok.RequiredArgsConstructor;\n@Service @RequiredArgsConstructor class Mail { @Qualifier(\"plain\") private final Hasher hasher; }\n";
+        let files = [
+            APP,
+            (
+                "src/main/java/com/acme/A.java",
+                &src(&format!("{beans}{svc}")),
+            ),
+        ];
+        let listed: &[(&str, &str)] = &[(
+            "lombok.config",
+            "lombok.copyableAnnotations = [Qualifier]\n",
+        )];
+        let r = run_with(&files, &[], RawScan::default(), listed);
+        assert_eq!(
+            r.edges,
+            [r#"Mail# -> Plain# [heuristic] {"origin":"stereotype","qualifier":"plain","resolution":"qualifier","sites":1,"via":"constructor"}"#.to_owned()]
+        );
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        assert_eq!(r.narrowed, 1);
+        assert_eq!(r.coverage["lombok_narrowed"], 1);
+        // Unlisted: the old row (recorded annotation, no qualifier).
+        let r = run(&files);
+        assert_eq!(r.edges.len(), 2, "{:?}", r.edges);
+        assert!(
+            r.edges.iter().all(|e| e.contains("[ambiguous]")),
+            "{:?}",
+            r.edges
+        );
+        assert_eq!(
+            r.buckets,
+            BTreeMap::from([("ambiguous", 1)]),
+            "{:?}",
+            r.coverage
+        );
+        assert_eq!(r.narrowed, 0);
+    }
+
+    /// Contract M6c S7: an allow-listed Spring Data member name called on a
+    /// repository-typed receiver resolves to the repository interface node
+    /// with `inherited`; any other unresolved member stays unresolved, and a
+    /// member Tier B links itself is never doubled.
+    #[test]
+    fn inherited_spring_data_calls_resolve_to_the_interface() {
+        let repo = "interface User {}\ninterface UserRepository extends org.springframework.data.jpa.repository.JpaRepository<User, Long> {}\n";
+        let svc = "@Service class Signup { @Autowired UserRepository users; void register(User u) { users.save(u); } void lookup(long id) { users.findById(id); } void audit(User u) { users.customAudit(u); } }\n";
+        let helper = "@Component class Helper {}\n@Service class Other { @Autowired Helper helper; void run() { helper.save(null); } }\n";
+        let r = one(&format!("{repo}{svc}{helper}"));
+        assert_eq!(
+            r.calls,
+            [
+                r#"Signup#lookup(). -> UserRepository# [heuristic] {"inherited":true}"#.to_owned(),
+                r#"Signup#register(). -> UserRepository# [heuristic] {"inherited":true}"#
+                    .to_owned(),
+            ]
+        );
+        // A declared member is edged by Tier B itself, never doubled.
+        let strict = "interface User {}\ninterface StrictRepo extends org.springframework.data.jpa.repository.JpaRepository<User, Long> { User save(User u); }\n@Service class S { @Autowired StrictRepo r; void go(User u) { r.save(u); } }\n";
+        let r = one(strict);
+        assert_eq!(r.calls.len(), 1, "{:?}", r.calls);
+        assert!(
+            !r.calls[0].contains("inherited") && r.calls[0].contains("StrictRepo#save()."),
+            "{:?}",
+            r.calls
+        );
+    }
+
+    /// Invariant 9: inherited-call resolution grows linearly (counted, 4× → ≤
+    /// 5×): one Tier B probe per allow-listed qualified call, each first-win.
+    #[test]
+    fn inherited_calls_grow_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut body = String::from(
+                "interface User {}\ninterface UserRepository extends org.springframework.data.jpa.repository.JpaRepository<User, Long> {}\n@Service class Signup { @Autowired UserRepository users;\n",
+            );
+            for i in 0..n {
+                body += &format!("  void register{i}(User u) {{ users.save(u); }}\n");
+            }
+            body += "}\n";
+            work::take();
+            let r = one(&body);
+            // Every call edged: the walk ran, the ratio below is not vacuous.
+            assert_eq!(r.calls.len(), n, "{n}");
+            work::take()
+        }
+        let (small, large) = (work_for(25), work_for(100));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Invariant 9: exact type-arg agreement grows linearly (counted, 4× → ≤
+    /// 5×): one clause scan per candidate of each generic point.
+    #[test]
+    fn type_arg_agreement_grows_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let mut body = String::from(
+                "interface Store<T> {}\n@Component class StringStore implements Store<String> {}\n@Component class IntStore implements Store<Integer> {}\n",
+            );
+            for i in 0..n {
+                body += &format!(
+                    "@Service class Catalog{i} {{ Catalog{i}(Store<String> store) {{}} }}\n"
+                );
+            }
+            work::take();
+            let r = one(&body);
+            // Every point agreed: the walk ran, the ratio below is not vacuous.
+            assert_eq!(r.type_args_narrowed, n, "{n}");
+            work::take()
+        }
+        let (small, large) = (work_for(25), work_for(100));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M6c S2 (M4b open item 5): a class literal in a test source no
+    /// longer caps a main-source point — whether it names a registrant, the
+    /// bean, or the injected type; every other disallowed role still caps
+    /// everywhere, and main-source literals cap as before. Each point the
+    /// narrowing frees is counted (`mention_lifted`).
+    #[test]
+    fn test_source_class_literals_stop_capping() {
+        let app = |import: &str| {
+            format!(
+                "package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.context.annotation.Import;\n@SpringBootApplication {import} public class App {{}}\n"
+            )
+        };
+        let main = src(
+            "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
+        );
+        let sms = "package com.other;\nimport org.springframework.context.annotation.Primary;\n@Primary public class SmsNotifier implements com.acme.Notifier {}\n";
+        let plain = "Alerts# -> EmailNotifier# [heuristic] {\"origin\":\"stereotype\",\"resolution\":\"unique\",\"sites\":1,\"via\":\"constructor\"}";
+        // A test literal naming a registrant frees the point (was capped).
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            ("src/main/java/com/other/S.java", sms),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                &app("@Import(com.other.SmsNotifier.class)"),
+            ),
+        ]);
+        assert_eq!(r.edges, [plain.to_owned()]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        assert_eq!(r.lifted, 1);
+        assert_eq!(r.coverage["mention_lifted"], 1);
+        // A test literal naming the bean frees it too.
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                &app("@Import(com.acme.EmailNotifier.class)"),
+            ),
+        ]);
+        assert_eq!(r.edges, [plain.to_owned()]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        assert_eq!(r.lifted, 1);
+        assert_eq!(r.coverage["mention_lifted"], 1);
+        // A test literal naming the injected type frees it too.
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                &app("@Import(com.acme.Notifier.class)"),
+            ),
+        ]);
+        assert_eq!(r.edges, [plain.to_owned()]);
+        assert_eq!(r.buckets, BTreeMap::from([("plain", 1)]));
+        assert_eq!(r.lifted, 1);
+        assert_eq!(r.coverage["mention_lifted"], 1);
+        // Any other disallowed role in a test source still caps (an argument
+        // is `Other`).
+        let r = run(&[
+            ("src/main/java/com/acme/App.java", &app("")),
+            ("src/main/java/com/acme/A.java", &main),
+            (
+                "src/test/java/com/acme/AlertsTest.java",
+                "package com.acme;\nclass AlertsTest { void t() { check(EmailNotifier); } }\n",
+            ),
+        ]);
+        assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]));
+        assert_eq!(r.lifted, 0);
+        assert!(r.coverage.get("mention_lifted").is_none());
+    }
+
     /// Contract M5 S19 (g) (M4b open item 23 (a)): a main-source class named by a class literal
     /// (`@Import(X.class)`) and assignable to the injected type is a candidate beside the scanned
     /// beans, so the point is `ambiguous` over all of them and no tie-breaker (`@Primary`, the
@@ -1453,7 +2387,8 @@ mod tests {
         ]);
         assert!(r.edges.is_empty(), "{:?}", r.edges);
         assert_eq!(r.buckets, BTreeMap::from([("unresolved", 1)]));
-        // The literal only in a test source: no candidate, the point is capped by `mention`.
+        // The literal only in a test source: no candidate, and since contract
+        // M6c S2 no cap either — the plain row.
         let main = src(
             "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
         );
@@ -1470,7 +2405,7 @@ mod tests {
         assert_eq!(
             r.edges,
             [
-                r#"Alerts# -> EmailNotifier# [heuristic] {"capped_by":["mention"],"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#
+                r#"Alerts# -> EmailNotifier# [heuristic] {"origin":"stereotype","resolution":"unique","sites":1,"via":"constructor"}"#
             ]
         );
     }
@@ -1488,13 +2423,10 @@ mod tests {
         let main = src(
             "public interface Notifier {}\n@Component class EmailNotifier implements Notifier {}\n@Service class Alerts { Alerts(Notifier n) {} }\n",
         );
-        let edge = |r: &Run| -> String {
-            assert_eq!(r.edges.len(), 1, "{:?}", r.edges);
-            r.edges[0].clone()
-        };
         // A class named by a class literal and assignable is a candidate since contract M5
         // S19 (g) (`registrants_named_by_a_class_literal_are_candidates`); a configuration class
-        // whose `@Bean` method returns the type still only caps (residue, amendment 10).
+        // whose `@Bean` method returns the type joins as a registrant since contract M6c S1
+        // (`bean_method_registrants_join_as_candidates`) — the residue above, closed.
         for (other, import) in [
             (
                 "package com.other;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.context.annotation.Primary;\n@Configuration public class SmsConfig { @Bean @Primary com.acme.Notifier sms() { return null; } }\n",
@@ -1511,12 +2443,20 @@ mod tests {
                 ("src/main/java/com/acme/A.java", &main),
                 ("src/main/java/com/other/S.java", other),
             ]);
-            let e = edge(&r);
+            assert_eq!(r.edges.len(), 2, "{other}: {:?}", r.edges);
             assert!(
-                e.contains("EmailNotifier#") && e.contains(r#""capped_by":["mention"]"#),
-                "{other}: {e}"
+                r.edges[0].contains("EmailNotifier#")
+                    && r.edges[0].contains(r#""capped_by":["mention"]"#),
+                "{other}: {:?}",
+                r.edges
             );
-            assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]), "{other}");
+            assert!(
+                r.edges[1].contains("SmsConfig#sms().")
+                    && r.edges[1].contains(r#""origin":"registrant""#),
+                "{other}: {:?}",
+                r.edges
+            );
+            assert_eq!(r.buckets, BTreeMap::from([("ambiguous", 1)]), "{other}");
         }
         // Control: the same class, named nowhere, registers nothing.
         let app = app("");
@@ -1545,17 +2485,19 @@ mod tests {
                 r.edges
             );
         };
-        // Y5: generically distinct candidates.
+        // Y5: generically distinct candidates. Predicted update (M6c S9a):
+        // exact type-arg agreement picks the single bean (capped by the
+        // generic gate, counted) instead of staying ambiguous.
         let stores = "interface Store<T> {}\n@Component class StringStore implements Store<String> {}\n@Component @Primary class IntStore implements Store<Integer> {}\n";
         let r = one(&format!(
             "{stores}@Service class Catalog {{ Catalog(Store<String> store) {{}} }}\n"
         ));
-        several(&r, 2);
-        assert!(
-            r.edges[0].contains(r#""capped_by":["generic"]"#),
-            "{:?}",
-            r.edges
+        assert_eq!(
+            r.edges,
+            [r#"Catalog# -> StringStore# [heuristic] {"capped_by":["generic"],"origin":"stereotype","resolution":"type_args","sites":1,"via":"constructor"}"#.to_owned()]
         );
+        assert_eq!(r.buckets, BTreeMap::from([("capped", 1)]));
+        assert_eq!(r.type_args_narrowed, 1);
         // A wrapper whose element has type arguments of its own.
         let r = one(&format!(
             "{stores}@Service class Catalog {{ Catalog(Optional<Store<String>> store) {{}} }}\n"
@@ -1804,6 +2746,7 @@ mod tests {
             deployable: &empty,
             depends: &depends,
             unparsed: &raw,
+            manifests: &BTreeMap::new(),
         });
         assert_eq!(r.injections.len(), n);
         work::take()

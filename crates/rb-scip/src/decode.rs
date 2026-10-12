@@ -47,8 +47,8 @@ pub struct Document {
 /// Why a document the index has does not own its file (contract M3b amendment 64): a sign that
 /// the indexer and Tree-sitter read the file differently, so the indexer's positions may name
 /// other tokens than Tree-sitter's. The decoder decides `not_utf8`, `text_differs`,
-/// `encoding_ambiguous`, `comment_terminator` and `structural_escape`; its caller
-/// `source_encoding` ([`crate::jobs::maven_source_encoding`]); the join the last two.
+/// `encoding_ambiguous`, `comment_terminator`, `structural_escape` and `restructured`; its
+/// caller `source_encoding` ([`crate::jobs::maven_source_encoding`]); the join the last two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Rejection {
     /// The blob is not valid UTF-8, which Tree-sitter's spans and the column conversion assume.
@@ -74,10 +74,14 @@ pub enum Rejection {
     /// scip-java: a reference Tree-sitter places in another definition than the index's own
     /// enclosing ranges do (contract M3b amendment 68).
     StructureDisagreement,
+    /// Not scip-java: the blob holds a line-start `-->` or `>>>>>>>` restructuring marker
+    /// (contract M6e S12). Tree-sitter parses it cleanly while scip-typescript may read it
+    /// structurally, so the whole file stays Tier B.
+    Restructured,
 }
 
 impl Rejection {
-    pub const ALL: [Rejection; 8] = [
+    pub const ALL: [Rejection; 9] = [
         Rejection::NotUtf8,
         Rejection::TextDiffers,
         Rejection::SourceEncoding,
@@ -86,6 +90,7 @@ impl Rejection {
         Rejection::StructuralEscape,
         Rejection::DefinitionDisagreement,
         Rejection::StructureDisagreement,
+        Rejection::Restructured,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -98,6 +103,7 @@ impl Rejection {
             Rejection::StructuralEscape => "structural_escape",
             Rejection::DefinitionDisagreement => "definition_disagreement",
             Rejection::StructureDisagreement => "structure_disagreement",
+            Rejection::Restructured => "restructured",
         }
     }
 }
@@ -303,12 +309,27 @@ fn rejection(blob: &[u8], text: &str, scip_java: bool) -> Option<Rejection> {
         return Some(Rejection::TextDiffers);
     }
     if !scip_java {
-        return None;
+        return has_restructuring_marker(blob).then_some(Rejection::Restructured);
     }
     if has_javac_only_line_terminator(blob) {
         return Some(Rejection::CommentTerminator);
     }
     has_structural_escape(blob).then_some(Rejection::StructuralEscape)
+}
+
+/// A line-start `-->` or `>>>>>>>` restructuring marker (contract M6e S12): the first
+/// non-blank character of a `\n`-separated line (`\r\n` endings tolerated). Mid-line `-->`
+/// (`x --> 0`) never matches; anything else on the line may follow.
+fn has_restructuring_marker(blob: &[u8]) -> bool {
+    blob.split(|&b| b == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let start = line
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        let trimmed = &line[start..];
+        trimmed.starts_with(b"-->") || trimmed.starts_with(b">>>>>>>")
+    })
 }
 
 /// A lone `\r`, or a Unicode escape `\u000a`/`\u000d` (any number of `u`, either case; JLS
@@ -1347,8 +1368,57 @@ mod tests {
                 "comment_terminator",
                 "structural_escape",
                 "definition_disagreement",
-                "structure_disagreement"
+                "structure_disagreement",
+                "restructured"
             ]
+        );
+    }
+
+    /// Contract M6e S12: a scip-typescript document holding a line-start `-->` or `>>>>>>>`
+    /// is rejected at the input (whole-file Tier B): scip-typescript may read restructuring
+    /// markers structurally while Tree-sitter parses them cleanly. Calibrated to 0 incidence
+    /// on class-validator @ 2e1a5c2, ofetch @ 1dbc37f and hono (618 TS/JS files, strict and
+    /// indented). Mid-line `-->` (`x --> 0`) never rejects; scip-java never rejects for these.
+    #[test]
+    fn typescript_restructuring_markers_reject_the_document() {
+        let conflict: &[u8] =
+            b"<<<<<<< HEAD\nconst a = 1;\n=======\nconst a = 2;\n>>>>>>> branch\n";
+        assert_eq!(
+            decoded_document("scip-typescript", "", Some(conflict)).rejected,
+            Some(Rejection::Restructured)
+        );
+        for marker in [
+            &b"--> end\n"[..],
+            &b"  --> end\r\n"[..],
+            &b"\t>>>>>>> branch\n"[..],
+        ] {
+            assert_eq!(
+                decoded_document("scip-typescript", "", Some(marker)).rejected,
+                Some(Rejection::Restructured),
+                "{}",
+                String::from_utf8_lossy(marker)
+            );
+            assert_eq!(
+                decoded_document("scip-java", "", Some(marker)).rejected,
+                None,
+                "{}",
+                String::from_utf8_lossy(marker)
+            );
+        }
+        // Mid-line `-->` is an operator, not a marker; a commented marker names no marker.
+        for clean in [&b"const x = a --> 0;\n"[..], &b"// >>>>>>> note\n"[..]] {
+            assert_eq!(
+                decoded_document("scip-typescript", "", Some(clean)).rejected,
+                None,
+                "{}",
+                String::from_utf8_lossy(clean)
+            );
+        }
+        // Safe-direction pin: a line-start marker inside a template literal still rejects
+        // (coverage cost only, never a false edge).
+        assert_eq!(
+            decoded_document("scip-typescript", "", Some(b"const s = `\n--> x`;\n")).rejected,
+            Some(Rejection::Restructured)
         );
     }
 

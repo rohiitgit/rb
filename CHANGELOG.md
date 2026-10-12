@@ -1,5 +1,33 @@
 # Changelog
 
+## [2026-10-12] (wall clock) M6f CLOSED (evaluator passes 1–2)
+- Phases 0–2 (amendments 1–3): preflight (grpc-go + OAI pins, proto binds); OpenAPI JSON/YAML reader; proto service reader — each test-first with killed mutants.
+- Phases 3–4 (amendments 4–5): spec endpoints under the shared key (GRPC keys, diagnostics) + handler join for free; MyBatis mapper XML to tables via rb-sql (Element attrs/ends).
+- Phases 5–6 + S4b (amendments 6–8): generated-client packs, operation/RPC stitching (synthetic cap, own-service rule), interface handler roll-down via IMPLEMENTS.
+- Phase 7 (amendment 9): contract-packs fixture (Maven + nested webapp), e2e + 5 goldens + 12/3 guards, every line read, 4 guard-bite mutants.
+- Phase 8 (amendment 10): grpc-go classified (52 synthetic CONSUMES, 869 correctly-unmatched residue) + deterministic; OAI identical + reader breadth.
+- Pass 1 (`tasks/eval-m6f-pass1.md`): VERDICT PASS with one fix (YAML/JSON dispatch layer) + polyglot churn fix (URL-claimed chains, framework denylist).
+- Pass 2 (`tasks/eval-m6f-pass2.md`): VERDICT PASS — probes re-run, mutants re-killed, invariant 1, determinism; close verify green (fmt, clippy, 842 units + 25 cli-bin, store 66, server 12, e2e 37/37, api 1/1).
+- `PIPELINE` `m6c-5` → `m6f-1` (first dump change: the new fixture; pre-existing dumps byte-identical).
+- Files: `crates/rb-frameworks/src/{spec,endpoint,routes,clients}.rs`, `crates/rb-indexer/src/{routes,sql,packages,lib,stitch}`, `crates/rb-model/src/graph.rs`, `crates/rb-cli/src/main.rs`; records `tasks/{contract-m6f,eval-m6f-pass1,eval-m6f-pass2,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-12] (wall clock) M6e CLOSED (evaluator passes 1–2)
+- Phases 0–7 (amendments 1–8): Gradle image/fetch/versions/fixture, pnpm-yarn readers/workspaces/fixture — each test-first with killed mutants; no dump change throughout.
+- Phases 8–9 (amendments 9–10): go.work workspaces + excludes; Maven classifiers riding the key with `<type>` recorded. Full verifies green unblessed.
+- Phase 10 (amendment 11): tsconfig scoping (partition only, no edge moves), per-document five-source encodings (D9 corrected by scratch measurement: pom beats compilerArgs both ways), N3 `restructured` rejection (0/618 calibration). Growth ratio green.
+- Phase 11 (amendment 12): jcommander identical + deterministic, Gradle SCIP ok 45.3s (1,218/1,218 defs, 1,355 exact CALLS, 20/20 samples) after allow-listing `plugins-artifacts.gradle.org` (probed 200; key moved by design); ofetch 12 pnpm pins classified + sampled; class-validator S10 live-fire 42 = 38 + 4.
+- Pass 1 (`tasks/eval-m6e-pass1.md`): VERDICT PASS — 12-probe battery, 5 new probe tests, no blockers.
+- Pass 2 (`tasks/eval-m6e-pass2.md`): VERDICT PASS — probes re-run, mutants re-killed, invariant 1, determinism; close verify green (fmt, clippy, 822 units + 25 cli-bin, store 66, server 12, e2e 36/36, api 1/1).
+- **Verification** (`var/m6e/logs/p12-close-*`): all green, no `skipping:`, no listener, stub scan clean. `PIPELINE` unbumped (`m6c-5`).
+- Files: `crates/rb-scip/src/{jobs,decode,lib,egress,orchestrate,hash}.rs`, `crates/rb-indexer/src/{packages,projects,scip,lib}.rs`, `crates/rb-cli/src/main.rs`; records `tasks/{contract-m6e,eval-m6e-pass1,eval-m6e-pass2,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-11] (wall clock) M6d CLOSED (evaluator passes 1–2)
+- Pass 1 (amendment 14): 3 parallel evaluators, 2 blocking + 9 non-blocking findings; blockers fixed test-first (tool_versions `scip_go`/`scip_python` identities, absolute-path `replace` never joins a service) + claim-breaking hardening (chi `Handle` args, double-include expansion, dispatcher `url=`/`method=` kwargs, `gomod/` split pin, `GOTOOLCHAIN`/`GOFLAGS` in fetch env); rest recorded with reasons.
+- Phase 12 (amendment 15): S13 growth audit found chi (15.85×) and FastAPI (18×) superlinear — fixed test-first (per-file function sweep; adjacency + memoised levels + cycle gate), 4 ratio tests + 1 cycle pin, 6/6 mutants killed; requests/httpx + member packs linear as built. `PIP_TIMEOUT=60` with `RECIPE_PY m6d-py-4` (measured pip read-timeout flake through the emulated stack). Invariant 1 vs `027a54f`: 4/7 fixtures identical, rest added-only W rows + 1 explained shift; two-name determinism everywhere.
+- Pass 2 (`tasks/eval-m6d-pass2.md`): VERDICT PASS — every finding's repro + controls, suite (fmt, clippy, 765 unit + 25 cli-bin, store 66, server 12, e2e 34/34, api 1/1 over 150 sets), 22/22 mutants re-killed (p1/p2/p3/p12/eval1 scripts), invariant 1, determinism; no `skipping:`, no listener, stub scan clean.
+- **Verification** (`var/m6d/logs/close-*`): fmt, clippy clean; unit 765 + 25 cli-bin; `rb-store` 66/66, `rb-server` 12/12; e2e 34/34, api 1/1. The M3a wall-clock test flaked twice under load 7-10 and passes alone (M3b-cited).
+- Files: `crates/rb-frameworks/src/{routes,clients}.rs`, `crates/rb-scip/src/orchestrate.rs`; records `tasks/{contract-m6d,eval-m6d-pass2,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `README.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-09] (wall clock) M6a CLOSED (evaluator passes 1–2)
 - Pass 1 (`tasks/eval-m6a-pass1.md`): PASS — baseline reproduced, S1–S20 re-derived, 6/7 mutants killed; Z1 (fixed as amendment 12), Z2 (note).
 - Pass 2 (`tasks/eval-m6a-pass2.md`): PASS — Z1 holds, suite green, invariant 1 re-derived with a fresh HEAD release, M1/M4/M6 killed; O1 + wall-clock flake non-blocking. Contract amendment 13. Next: M6b.

@@ -1,0 +1,18 @@
+# Precision guards for the contract-packs fixture (contract M6f S7),
+# checked against the SCIP dump.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# S3: spec and proto endpoints are exact.
+EXPOSES . -> HTTP GET /users @. [exact]
+EXPOSES . -> HTTP POST /users @. [exact]
+EXPOSES . -> GRPC acme.Greeter/SayHello @. [exact]
+EXPOSES . -> GRPC acme.Users/Get @. [exact]
+EXPOSES . -> GRPC acme.Users/Watch @. [exact]
+# S4b: the interface declaration stays exact, each implementor is heuristic.
+HANDLED_BY HTTP GET /users @. -> scip-java maven maven/acme/contract-packs 1.0.0 acme/UsersApi#listUsers(). [exact]
+HANDLED_BY HTTP GET /users @. -> scip-java maven maven/acme/contract-packs 1.0.0 acme/UserController#listUsers(). [heuristic]
+HANDLED_BY HTTP GET /users/{} @. -> scip-java maven maven/acme/contract-packs 1.0.0 acme/UserController#getUser(). [heuristic]
+# S6: generated calls stitch synthetic, by operation and RPC name.
+CONSUMES webapp/client.ts -> HTTP GET /users @. [synthetic] {"match": "operation"}
+CONSUMES webapp/client.ts -> GRPC acme.Users/Get @. [synthetic] {"match": "rpc"}
+# S5: mapper statements reach their tables exactly.
+QUERIES src/main/resources/mapper/UserMapper.xml -> public.users [exact]

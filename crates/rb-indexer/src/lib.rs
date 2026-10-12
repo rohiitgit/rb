@@ -92,7 +92,28 @@ use serde_json::{Value, json};
 /// job (D5, D6).
 /// `m6b-1` gin groups passed as parameters compose from their call sites (S2).
 /// `m6b-2` Express construction chains and anonymous default-exported routers (S3).
-pub const PIPELINE: &str = "m6b-2";
+/// `m6b-3` in-process and empty-URL Go requests are `unmatched`, never edges (S4).
+/// `m6b-4` axios and certainty folding: cross-file spreads, by-name configs, ordered Spring
+/// statements (S5).
+/// `m6b-5` constructor-assigned members fold from their single write (S6).
+/// `m6b-6` userinfo holes match within the literal host (S7).
+/// `m6b-7` discovery narrowing: parsed-file words cap only through
+/// import-resolved known types or single-literal keys (S8).
+/// `m6b-8` client breadth: got/ky/superagent/undici fetch-class sites,
+/// HttpClient and axios member forms capped (S9).
+/// `m6c-1` module objects: tsconfig `paths` + package `exports`/`main`
+/// exact resolution for Tier B and RTA (M6c S4).
+/// `m6c-2` non-bean consumers: `@Bean`-returned objects resolve from each
+/// returning method, `ConstraintValidator`s from their class, always at
+/// `heuristic` (M6c S6).
+/// `m6c-3` inherited Spring Data calls: allow-listed member names on
+/// repository-typed receivers link to the interface node with `inherited`
+/// (M6c S7).
+/// `m6c-4` Lombok qualifiers: a field qualifier a `lombok.config` chain lists
+/// rides the generated parameter and narrows, counted (M6c S8).
+/// `m6c-5` exact type-arg agreement: the single bean in simple-name agreement
+/// picks at `heuristic`, capped by the generic gate, counted (M6c S9a).
+pub const PIPELINE: &str = "m6f-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -224,6 +245,22 @@ pub fn index_commit(
         .filter(|f| packages::is_input(&f.path) && !f.binary)
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
+    let specs = manifest
+        .files
+        .iter()
+        .filter(|f| {
+            (rb_frameworks::spec::is_spec_input(&f.path)
+                || rb_frameworks::spec::is_proto_input(&f.path))
+                && !f.binary
+        })
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<_>>()?;
+    let mappers = manifest
+        .files
+        .iter()
+        .filter(|f| f.path.ends_with(".xml") && !f.binary)
+        .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
+        .collect::<anyhow::Result<_>>()?;
     let content = Content {
         facts: facts_by_path,
         sql: texts("sql")?,
@@ -233,6 +270,8 @@ pub fn index_commit(
         config,
         unparsed,
         manifests,
+        specs,
+        mappers,
         words,
     };
 
@@ -308,6 +347,11 @@ pub struct Content<'a> {
     pub unparsed: rb_frameworks::clients::RawScan,
     /// `package.json`, npm lockfiles, `go.mod` and `pom.xml` texts (contract M4b S15).
     pub manifests: BTreeMap<&'a str, String>,
+    /// OpenAPI/Swagger and `.proto` texts by path (contract M6f S3).
+    pub specs: BTreeMap<&'a str, String>,
+    /// `*.xml` texts by path; MyBatis mappers read by root tag, everything else skipped
+    /// (contract M6f S5).
+    pub mappers: BTreeMap<&'a str, String>,
     /// Where the definitions' names occur in every non-binary file (contract M4b S12 (f)); the
     /// default is "not scanned", under which no symbol is orphan-eligible.
     pub words: liveness::Words,
@@ -559,8 +603,10 @@ pub fn assemble(
     let mut b = GraphBuilder::new();
 
     // Services: one per project, plus the root as `unassigned` if files lie outside all projects.
+    let app_services = app_services(boundaries, &content.facts);
+    let deployable = deployable_services(boundaries, &app_services);
     for p in boundaries.projects() {
-        b.add_node(service_key(&p.dir), &p.name, service_attrs(p))?;
+        b.add_node(service_key(&p.dir), &p.name, service_attrs(p, &deployable))?;
     }
     let unassigned = service_key(boundaries::ROOT_DIR);
 
@@ -645,6 +691,9 @@ pub fn assemble(
     // `Service -DEPENDS_ON-> Package` (design §5.5): per service and package, the first site of
     // the service's files that names the package is the one evidence.
     let mut packages: BTreeMap<(NodeKey, String), (rb_scip::Package, Evidence)> = BTreeMap::new();
+    // `tsconfig*.json` scopes for partitioning `files_without_document` (contract M6e S10).
+    let ts_scopes =
+        rb_scip::TsScopes::build(content.manifests.iter().map(|(p, t)| (*p, t.as_str())));
     for project in &content.scip {
         let files: BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)> = content
             .facts
@@ -660,6 +709,7 @@ pub fn assemble(
                     &files,
                     &keys,
                     scip::indexed_languages(project.indexer),
+                    &ts_scopes,
                 );
                 for (path, routes) in &file_routes {
                     for r in &routes.routes {
@@ -774,6 +824,10 @@ pub fn assemble(
         .map(|(path, text)| (*path, text.as_str()))
         .collect();
     let index = resolve::Index::new(&content.facts, &content.go_modules, &keys);
+    // Exact manifest resolution for bare specifiers (contract M6c S4), shared
+    // by Tier B and RTA (F4).
+    let aliases = rta::AliasMaps::build(&content.manifests);
+    let index = index.with_aliases(aliases.clone());
     diagnostics.extend(resolve::add_edges(&mut b, &index, &exact_files)?);
     // Endpoints (contract M4a S4–S8): Spring's context path from each service's
     // `application.properties`; a YAML file that sets one is counted as unread.
@@ -792,13 +846,9 @@ pub fn assemble(
             (!ctx.is_empty()).then(|| (service.clone(), ctx.to_owned()))
         })
         .collect();
+    let has_project = |path: &str| boundaries.project_for(path).is_some();
     // Spring DI (contract M4b S4–S8): `INJECTS` from injection points to beans.
-    let deployable: BTreeSet<String> = boundaries
-        .projects()
-        .iter()
-        .filter(|p| p.deployable)
-        .map(|p| p.dir.clone())
-        .collect();
+    // (`deployable` computed above: manifest-detected plus `@SpringBootApplication` modules.)
     let depends = di::package_dependencies(&manifest_edges);
     let mut resolution = di::resolve(&di::Inputs {
         files: &content.facts,
@@ -808,10 +858,22 @@ pub fn assemble(
         deployable: &deployable,
         depends: &depends,
         unparsed: &content.unparsed,
+        manifests: &content.manifests,
     });
     let fragments = resolution.fragments.clone();
     let points = std::mem::take(&mut resolution.points);
+    let spring_data = resolution.spring_data.clone();
     diagnostics.extend(di::add_injects(&mut b, resolution)?);
+    // Inherited Spring Data calls (contract M6c S7): allow-listed member
+    // names on repository-typed receivers link to the interface node.
+    diagnostics.extend(di::add_inherited_calls(
+        &mut b,
+        &index,
+        &content.facts,
+        &keys,
+        &spring_data,
+        &exact_files,
+    )?);
     // RTA (contract M4b S9, D4): after every `IMPLEMENTS` producer (SCIP, Tier B).
     let considered =
         rta::implementing_types(&b.edge_sources(EdgeKind::Implements), &content.facts, &keys);
@@ -823,6 +885,7 @@ pub fn assemble(
             unparsed: &content.unparsed,
             words: &content.words,
             fragments: &fragments,
+            aliases: &aliases,
         },
         &considered,
     );
@@ -838,6 +901,8 @@ pub fn assemble(
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &spring.unread,
+            specs: &content.specs,
+            has_project: &has_project,
         },
     )?;
     diagnostics.extend(route_diagnostics);
@@ -876,6 +941,9 @@ pub fn assemble(
     }
     for (path, text) in &content.sql {
         diagnostics.extend(sql::add_migrations(&mut b, path, text)?);
+    }
+    for (path, text) in &content.mappers {
+        diagnostics.extend(sql::add_mapper_queries(&mut b, path, text)?);
     }
     // Entry kinds and orphan eligibility (contract M4b S11, S12), after every edge producer.
     diagnostics.push(liveness::apply(
@@ -952,11 +1020,17 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
                 .collect::<serde_json::Map<String, Value>>(),
         });
         // Contract M6a D3: written only when non-zero, so a project without Lombok dumps as
-        // before M6a.
+        // before M6a. Contract M6e S10 likewise: a project with no out-of-scope file and no
+        // unread tsconfig pattern dumps as before M6e.
         for (key, n) in [
             ("lombok_removed", c.lombok_removed),
             ("documents_lombok", c.documents_lombok),
             ("documents_outside_root", c.documents_outside_root),
+            (
+                "files_without_document_out_of_scope",
+                c.files_without_document_out_of_scope,
+            ),
+            ("tsconfig_unread", c.tsconfig_unread),
         ] {
             if n > 0 {
                 detail["coverage"][key] = n.into();
@@ -1020,12 +1094,69 @@ fn add_owners(
     Ok(())
 }
 
+/// Services holding a main-source `@SpringBootApplication` class: deployable
+/// even when their manifests say otherwise (contract M6c S3) — a Maven module
+/// inheriting its build from a parent pom, Gradle without the plugin text.
+/// Test sources never count: a test application class runs nothing in the
+/// deployed context. The carrier must be runnable itself (concrete and
+/// top-level or static, as for bean classes): an abstract or
+/// non-static-nested carrier never flips (evaluator pass 1, C5).
+fn app_services(
+    boundaries: &Boundaries,
+    facts: &BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)>,
+) -> BTreeSet<String> {
+    facts
+        .iter()
+        .filter(|(path, (language, facts))| {
+            rb_frameworks::work::tick(1);
+            *language == rb_syntax::Language::Java
+                && !rb_model::is_test_path(path)
+                && facts.definitions.iter().any(|d| {
+                    d.kind == rb_syntax::DefKind::Class
+                        && !d.modifiers.iter().any(|m| m == "abstract")
+                        && d.parent.is_none_or(|p| {
+                            facts.definitions[p].kind == rb_syntax::DefKind::Interface
+                                || d.modifiers.iter().any(|m| m == "static")
+                        })
+                        && d.decorations.iter().any(|deco| {
+                            rb_frameworks::routes::is_annotation(
+                                facts,
+                                deco,
+                                "org.springframework.boot.autoconfigure",
+                                "SpringBootApplication",
+                            )
+                        })
+                })
+        })
+        .filter_map(|(path, _)| {
+            rb_frameworks::work::tick(1);
+            boundaries.project_for(path).map(|p| p.dir.clone())
+        })
+        .collect()
+}
+
+/// Services runnable in production: manifest-detected deployables plus modules
+/// holding a main-source `@SpringBootApplication` class (contract M6c S3).
+/// One predicate feeds service roles, the DI classpath and RTA alike, so a
+/// module is never `role=service` without being deployable, or vice versa.
+fn deployable_services(
+    boundaries: &Boundaries,
+    app_services: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    boundaries
+        .projects()
+        .iter()
+        .filter(|p| p.deployable || app_services.contains(&p.dir))
+        .map(|p| p.dir.clone())
+        .collect()
+}
+
 fn service_key(dir: &str) -> NodeKey {
     NodeKey::new(NodeKind::Service, dir)
 }
 
-fn service_attrs(p: &Project) -> Attrs {
-    let role = if p.deployable {
+fn service_attrs(p: &Project, deployable: &BTreeSet<String>) -> Attrs {
+    let role = if deployable.contains(&p.dir) {
         ServiceRole::Service
     } else {
         ServiceRole::Library
@@ -1504,6 +1635,194 @@ mod tests {
         .clone();
         assert_eq!(calls(&g), [(main, helper, Provenance::Heuristic)]);
         assert_eq!(files_without_document(&diagnostics), 0);
+    }
+
+    /// Contract M6c S3: a module holding a main-source `@SpringBootApplication`
+    /// class is deployable even when its manifests say otherwise (a Maven
+    /// module inheriting its build, Gradle without the plugin text). A module
+    /// without one, and an app class in test sources, stay library.
+    #[test]
+    fn spring_boot_application_class_makes_a_library_deployable() {
+        let app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public class App {}\n",
+        )
+        .unwrap();
+        let plain = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\npublic class Plain {}\n",
+        )
+        .unwrap();
+        let test_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public class TestApp {}\n",
+        )
+        .unwrap();
+        let ts_app = rb_syntax::extract(
+            rb_syntax::Language::TypeScript,
+            b"import { SpringBootApplication } from 'org.springframework.boot.autoconfigure';\n@SpringBootApplication class App {}\n",
+        )
+        .unwrap();
+        let meth_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nclass Holder {\n@SpringBootApplication void m() {}\n}\n",
+        )
+        .unwrap();
+        // Evaluator pass 1, C5: an abstract or non-static-nested carrier can
+        // never be the application — no flip.
+        let abstract_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public abstract class AbsApp {}\n",
+        )
+        .unwrap();
+        // An interface carrier is not a class either (discriminates the kind
+        // gate from the parent rule: top-level and concrete, only the kind
+        // blocks it).
+        let iface_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public interface AppIfc {}\n",
+        )
+        .unwrap();
+        let nested_app = rb_syntax::extract(
+            rb_syntax::Language::Java,
+            b"package com.acme;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nclass Outer {\n@SpringBootApplication class Inner {}\n}\n",
+        )
+        .unwrap();
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: [
+                "svc/pom.xml",
+                "svc/src/main/java/com/acme/App.java",
+                "other/pom.xml",
+                "other/src/main/java/com/acme/Plain.java",
+                "testonly/pom.xml",
+                "testonly/src/test/java/com/acme/TestApp.java",
+                "tslib/package.json",
+                "tslib/src/app.ts",
+                "meth/pom.xml",
+                "meth/src/main/java/com/acme/Holder.java",
+                "abs/pom.xml",
+                "abs/src/main/java/com/acme/AbsApp.java",
+                "nest/pom.xml",
+                "nest/src/main/java/com/acme/Outer.java",
+                "iface/pom.xml",
+                "iface/src/main/java/com/acme/AppIfc.java",
+            ]
+            .into_iter()
+            .map(entry)
+            .collect(),
+            skipped: vec![],
+        };
+        let library = |dir: &str, manifest: &str| {
+            let mut p = project(dir, manifest);
+            p.deployable = false;
+            p
+        };
+        let boundaries = Boundaries::new(
+            vec![
+                library("svc", "svc/pom.xml"),
+                library("other", "other/pom.xml"),
+                library("testonly", "testonly/pom.xml"),
+                library("tslib", "tslib/package.json"),
+                library("meth", "meth/pom.xml"),
+                library("abs", "abs/pom.xml"),
+                library("nest", "nest/pom.xml"),
+                library("iface", "iface/pom.xml"),
+            ],
+            vec![],
+        );
+        let content = Content {
+            facts: BTreeMap::from([
+                (
+                    "svc/src/main/java/com/acme/App.java",
+                    (rb_syntax::Language::Java, &app),
+                ),
+                (
+                    "other/src/main/java/com/acme/Plain.java",
+                    (rb_syntax::Language::Java, &plain),
+                ),
+                (
+                    "testonly/src/test/java/com/acme/TestApp.java",
+                    (rb_syntax::Language::Java, &test_app),
+                ),
+                (
+                    "tslib/src/app.ts",
+                    (rb_syntax::Language::TypeScript, &ts_app),
+                ),
+                (
+                    "meth/src/main/java/com/acme/Holder.java",
+                    (rb_syntax::Language::Java, &meth_app),
+                ),
+                (
+                    "abs/src/main/java/com/acme/AbsApp.java",
+                    (rb_syntax::Language::Java, &abstract_app),
+                ),
+                (
+                    "nest/src/main/java/com/acme/Outer.java",
+                    (rb_syntax::Language::Java, &nested_app),
+                ),
+                (
+                    "iface/src/main/java/com/acme/AppIfc.java",
+                    (rb_syntax::Language::Java, &iface_app),
+                ),
+            ]),
+            ..Content::default()
+        };
+        let (g, _) = assemble(&manifest, None, &boundaries, &content).unwrap();
+        let role = |key: &str| {
+            g.nodes().iter().find(|n| n.key == key).unwrap().attrs["role"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(role("svc"), "service");
+        assert_eq!(role("other"), "library");
+        assert_eq!(role("testonly"), "library");
+        assert_eq!(role("tslib"), "library");
+        assert_eq!(role("meth"), "library");
+        assert_eq!(role("abs"), "library");
+        assert_eq!(role("nest"), "library");
+        assert_eq!(role("iface"), "library");
+    }
+
+    /// Contract M6c S3, invariant 9: one app class per module costs linear
+    /// work — 4× the modules makes at most 5× the counted steps. Counted, not
+    /// timed, so machine load cannot fail it.
+    #[test]
+    fn app_services_grows_linearly() {
+        fn work(n: usize) -> u64 {
+            let srcs: Vec<String> = (0..n)
+                .map(|i| format!("package m{i};\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@SpringBootApplication public class App{i} {{}}\n"))
+                .collect();
+            let facts: Vec<rb_syntax::FileFacts> = srcs
+                .iter()
+                .map(|s| rb_syntax::extract(rb_syntax::Language::Java, s.as_bytes()).unwrap())
+                .collect();
+            let paths: Vec<String> = (0..n)
+                .map(|i| format!("m{i}/src/main/java/m{i}/App{i}.java"))
+                .collect();
+            let map: BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)> = paths
+                .iter()
+                .zip(&facts)
+                .map(|(p, f)| (p.as_str(), (rb_syntax::Language::Java, f)))
+                .collect();
+            let boundaries = Boundaries::new(
+                (0..n)
+                    .map(|i| {
+                        let mut p = project(&format!("m{i}"), &format!("m{i}/pom.xml"));
+                        p.deployable = false;
+                        p
+                    })
+                    .collect(),
+                vec![],
+            );
+            rb_frameworks::work::take();
+            let found = app_services(&boundaries, &map);
+            assert_eq!(found.len(), n);
+            rb_frameworks::work::take()
+        }
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
     /// Contract M3b amendment 15: a TypeScript file the index has no document for (excluded by

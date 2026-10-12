@@ -1,9 +1,9 @@
 .	acme	library	8 files
-apps/web	@acme/web	service	7 files
+apps/web	@acme/web	service	9 files
 gateway	edge-gateway	service	1 file
 packages/shared	@acme/shared	library	3 files
 services/auth	auth-service	service	7 files
 services/billing	github.com/acme/billing	library	3 files
-services/billing/cmd/billing	billing	service	1 file
+services/billing/cmd/billing	billing	service	2 files
 services/broken	broken	library	2 files
 services/notification	notification	service	5 files

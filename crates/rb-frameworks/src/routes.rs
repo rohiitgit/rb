@@ -21,6 +21,8 @@ pub enum Framework {
     Spring,
     Express,
     Gin,
+    Chi,
+    FastAPI,
     NetHttp,
 }
 
@@ -30,6 +32,8 @@ impl Framework {
             Framework::Spring => "spring",
             Framework::Express => "express",
             Framework::Gin => "gin",
+            Framework::Chi => "chi",
+            Framework::FastAPI => "fastapi",
             Framework::NetHttp => "net/http",
         }
     }
@@ -133,6 +137,20 @@ pub struct FileRoutes {
     pub routers: Vec<RouterDecl>,
     pub mounts: Vec<Mount>,
     pub diagnostics: Vec<RouteDiagnostic>,
+    /// Mappings on interface methods (contract M6f S4b): counted, not resolved (D12 — no
+    /// endpoints from interfaces alone). A spec operation matching one is handled by the
+    /// method's implementors.
+    pub interface_routes: Vec<InterfaceRoute>,
+}
+
+/// One mapping on an interface method: the composed raw path, methods, the method's
+/// definition and the mapping's span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceRoute {
+    pub path: String,
+    pub methods: Vec<String>,
+    pub def: usize,
+    pub span: Span,
 }
 
 /// Every route fact of one file.
@@ -144,9 +162,10 @@ pub fn routes(language: Language, facts: &FileFacts) -> FileRoutes {
         Language::TypeScript | Language::Tsx | Language::JavaScript => express(facts, &mut out),
         Language::Go => {
             gin(facts, &mut out);
+            chi(facts, &mut out);
             net_http(facts, &mut out);
         }
-        Language::Python => {}
+        Language::Python => fastapi(facts, &mut out),
     }
     out
 }
@@ -466,13 +485,36 @@ fn spring(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 {
                     continue;
                 }
+                let class_paths: Vec<String> = def
+                    .decorations
+                    .iter()
+                    .find(|d| is_annotation(facts, d, SPRING_WEB, "RequestMapping"))
+                    .map(|d| mapping_paths(d).unwrap_or_default())
+                    .unwrap_or_else(|| vec![String::new()]);
                 for &m in &methods {
-                    for (d, _) in mappings(facts, &defs[m].decorations) {
+                    for (d, fixed) in mappings(facts, &defs[m].decorations) {
                         out.diagnostics.push(RouteDiagnostic {
                             kind: "route_on_interface",
                             span: d.span,
                             detail: format!("{}#{}", def.name, defs[m].name),
                         });
+                        // Recorded for spec-operation joining (contract M6f S4b); dynamic
+                        // paths stay out silently (counted above).
+                        let Ok(paths) = mapping_paths(d) else {
+                            continue;
+                        };
+                        let verbs =
+                            fixed.map_or_else(|| mapping_methods(d), |f| vec![f.to_owned()]);
+                        for prefix in &class_paths {
+                            for path in &paths {
+                                out.interface_routes.push(InterfaceRoute {
+                                    path: join(prefix, path),
+                                    methods: verbs.clone(),
+                                    def: m,
+                                    span: d.span,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -877,6 +919,714 @@ fn gin(facts: &FileScope<'_>, out: &mut FileRoutes) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Go: chi (contract M6d S9)
+
+/// chi import paths (v5 current, v4 the legacy module name).
+const CHI_MODULES: &[&str] = &["github.com/go-chi/chi/v5", "github.com/go-chi/chi"];
+
+/// The local name of a chi import: its alias, or the package name (the last
+/// path segment, past a `/vN` major-version suffix).
+fn chi_import_name(facts: &FileFacts, module: &str) -> Option<String> {
+    facts
+        .imports
+        .iter()
+        .find(|i| i.module == module)
+        .and_then(|i| match i.alias.as_deref() {
+            Some("_" | ".") => None,
+            Some(a) => Some(a.to_owned()),
+            None => {
+                let mut segments: Vec<&str> = module.split('/').collect();
+                if segments.last().is_some_and(|s| {
+                    s.len() > 1 && s.starts_with('v') && s[1..].bytes().all(|b| b.is_ascii_digit())
+                }) {
+                    segments.pop();
+                }
+                segments.last().map(|s| (*s).to_owned())
+            }
+        })
+}
+
+/// chi verbs, as written (Go is case-sensitive and the API spells them so).
+const CHI_VERBS: &[&str] = &[
+    "Get", "Post", "Put", "Delete", "Patch", "Head", "Options", "Trace", "Connect",
+];
+
+/// Whether a span lies within another (start and end comparisons).
+fn within(inner: Span, outer: Span) -> bool {
+    (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
+}
+
+/// The argument functions of one file: (span, chain index, link index,
+/// argument index), in chain order. Built once per file on first use, so a
+/// closure parameter resolves to its `Route`/`Group` call without scanning
+/// every chain per parameter (contract M6d S13: the per-parameter scan made
+/// sibling `Route` closures quadratic).
+#[derive(Default)]
+struct FuncCache {
+    built: bool,
+    /// Parameter binding index → (chain index, link index) of the innermost
+    /// argument function containing the parameter's declaration, if any.
+    /// Argument spans are syntax nodes, so they nest or are disjoint, and
+    /// the innermost container of a declaration site is the literal
+    /// declaring it; the sweep below evaluates exactly the minimum the old
+    /// per-parameter scan computed (smallest span, ties in chain order).
+    by_param: HashMap<usize, Option<(usize, usize)>>,
+}
+
+impl FuncCache {
+    /// The call taking the parameter's function literal, if any.
+    fn containing(&mut self, facts: &FileScope<'_>, param: usize) -> Option<(usize, usize)> {
+        if !self.built {
+            self.build(facts);
+        }
+        self.by_param.get(&param).copied().flatten()
+    }
+
+    fn build(&mut self, facts: &FileScope<'_>) {
+        self.built = true;
+        let mut funcs: Vec<(Span, usize, usize, usize)> = Vec::new();
+        for (ci, c) in facts.chains.iter().enumerate() {
+            for (li, link) in c.links.iter().enumerate() {
+                for (ai, arg) in link.args.iter().enumerate() {
+                    if let Arg::Function { span } = arg {
+                        funcs.push((*span, ci, li, ai));
+                    }
+                }
+            }
+        }
+        let mut params: Vec<(Span, usize)> = Vec::new();
+        for (bi, b) in facts.bindings.iter().enumerate() {
+            if b.parameter.is_some() {
+                params.push((b.span, bi));
+            }
+        }
+        if funcs.is_empty() || params.is_empty() {
+            return;
+        }
+        // Innermost-first: the event sort below is stable, so pre-sorting
+        // fixes the order opens at one position push in — smallest span on
+        // top, ties in chain order, which is the old scan's rule (strictly
+        // smaller replaces, so the first of equals wins).
+        funcs.sort_by(|a, b| {
+            span_size(&a.0)
+                .cmp(&span_size(&b.0))
+                .then(a.1.cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Kind {
+            Close,
+            Open,
+            Query,
+        }
+        // At one position closes come first (a function ending where a
+        // parameter starts does not contain it), then opens (one starting
+        // there does), then the queries. Opens are inserted in reverse
+        // function order so the stable sort pushes smallest-first.
+        let mut events: Vec<((i32, i32), Kind, usize)> = Vec::new();
+        for (fi, (s, _, _, _)) in funcs.iter().enumerate().rev() {
+            events.push(((s[0], s[1]), Kind::Open, fi));
+        }
+        for (fi, (s, _, _, _)) in funcs.iter().enumerate() {
+            events.push(((s[2], s[3]), Kind::Close, fi));
+        }
+        for (pi, (s, _)) in params.iter().enumerate() {
+            events.push(((s[0], s[1]), Kind::Query, pi));
+        }
+        events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut stack: Vec<usize> = Vec::new();
+        for (_, kind, idx) in events {
+            match kind {
+                Kind::Close => {
+                    if stack.last() == Some(&idx) {
+                        stack.pop();
+                    } else if let Some(pos) = stack.iter().rposition(|&f| f == idx) {
+                        stack.remove(pos);
+                    }
+                }
+                Kind::Open => stack.push(idx),
+                Kind::Query => {
+                    let (pspan, bi) = params[idx];
+                    let mut answer = None;
+                    while let Some(&fi) = stack.last() {
+                        let (fspan, ci, li, _) = funcs[fi];
+                        if within(pspan, fspan) {
+                            answer = Some((ci, li));
+                            break;
+                        }
+                        stack.pop();
+                    }
+                    self.by_param.insert(bi, answer);
+                }
+            }
+        }
+    }
+}
+
+/// Resolution state for one file's chi receivers: the per-parameter
+/// prefix memo, the in-progress guard, and the function index. Bundled so
+/// the recursive resolver stays under clippy's argument limit.
+struct ChiState {
+    funcs: FuncCache,
+    memo: HashMap<usize, Option<Option<String>>>,
+    in_progress: HashSet<usize>,
+}
+
+/// The prefix a chi receiver name stands for: `Some(Some(p))` known,
+/// `Some(None)` unknown-but-chi (a dynamic `Route` prefix or the depth
+/// cap), `None` not chi. Bindings to `NewRouter`/`NewMux` root at `""`;
+/// closure parameters resolve through their `Route`/`Group` call (memoised:
+/// each parameter resolves once no matter how many inner chains name it).
+fn chi_prefix(
+    facts: &FileScope<'_>,
+    chi: &str,
+    name: &str,
+    at: Span,
+    state: &mut ChiState,
+    depth: usize,
+) -> Option<Option<String>> {
+    let bi = facts.binding_index_at(name, at)?;
+    let b = &facts.bindings[bi];
+    // `r := chi.NewRouter()` / `chi.NewMux()`.
+    if let Some(c) = init_chain(facts, b)
+        && let (Some(root), [link]) = (c.root.as_deref(), c.links.as_slice())
+        && root == chi
+        && matches!(link.name.as_str(), "NewRouter" | "NewMux")
+    {
+        return Some(Some(String::new()));
+    }
+    // `sub := r.With(mw)` (middleware does not change the prefix).
+    if let Some(c) = init_chain(facts, b)
+        && let (Some(root), links) = (c.root.as_deref(), c.links.as_slice())
+        && !links.is_empty()
+        && links.iter().all(|l| l.name == "With")
+    {
+        if depth + 1 >= MAX_GROUP_DEPTH || !state.in_progress.insert(bi) {
+            return Some(None);
+        }
+        let found = chi_prefix(facts, chi, root, c.span, state, depth + 1);
+        state.in_progress.remove(&bi);
+        return found;
+    }
+    // A closure parameter: through its `Route`/`Group` call. Anything else
+    // (a named function's parameter, a plain variable) is not chi.
+    b.parameter?;
+    if let Some(known) = state.memo.get(&bi) {
+        return known.clone();
+    }
+    if depth >= MAX_GROUP_DEPTH || !state.in_progress.insert(bi) {
+        return Some(None);
+    }
+    let found = chi_closure_prefix(facts, chi, bi, state, depth + 1);
+    state.in_progress.remove(&bi);
+    state.memo.insert(bi, found.clone());
+    found
+}
+
+/// The prefix of the `Route(literal)` (or prefix-less `Group`) call taking
+/// the parameter's function, composed over the call's own receiver. `None`
+/// for named functions and non-chi calls. `Mount` stays out (topology
+/// packs' job); a `Mount`ed sub-router's routes resolve where it is built.
+fn chi_closure_prefix(
+    facts: &FileScope<'_>,
+    chi: &str,
+    param_idx: usize,
+    state: &mut ChiState,
+    depth: usize,
+) -> Option<Option<String>> {
+    // The parameter's own function literal, through the per-file index:
+    // nested `Route` calls contain everything inside them too.
+    let (ci, li) = state.funcs.containing(facts, param_idx)?;
+    let chain = &facts.chains[ci];
+    // All links before the terminal carry middleware (`With`); the terminal
+    // declares the group.
+    let terminal = chain.links.last()?;
+    if chain.links.len() - 1 != li || !chain.links[..li].iter().all(|l| l.name == "With") {
+        return None;
+    }
+    let root = chain.root.as_deref()?;
+    let outer = chi_prefix(facts, chi, root, chain.span, state, depth)?;
+    match terminal.name.as_str() {
+        "Route" if terminal.args.len() >= 2 => Some(match literal(&terminal.args[0]) {
+            Some(p) => outer.map(|a| join(&a, &p)),
+            None => None,
+        }),
+        "Group" => Some(outer),
+        _ => None,
+    }
+}
+
+/// The rough size of a span, for innermost-function selection.
+fn span_size(span: &Span) -> i64 {
+    i64::from(span[2] - span[0]) * 1_000_000 + i64::from(span[3] - span[1])
+}
+
+fn chi(facts: &FileScope<'_>, out: &mut FileRoutes) {
+    let Some(chi) = CHI_MODULES.iter().find_map(|m| chi_import_name(facts, m)) else {
+        return;
+    };
+    let mut state = ChiState {
+        funcs: FuncCache::default(),
+        memo: HashMap::new(),
+        in_progress: HashSet::new(),
+    };
+    for chain in &facts.chains {
+        let Some(last) = chain.links.last() else {
+            continue;
+        };
+        let (method, args) = match last.name.as_str() {
+            v if CHI_VERBS.contains(&v) && last.args.len() >= 2 => (norm_method(v), &last.args[..]),
+            "Method" if last.args.len() >= 3 => {
+                let Some(m) = go_method(&last.args[0]) else {
+                    continue;
+                };
+                (m, &last.args[1..])
+            }
+            "Handle" if last.args.len() >= 2 => (ANY.to_owned(), &last.args[..]),
+            _ => continue,
+        };
+        // Links before the last carry middleware (`With`); the receiver
+        // resolves first.
+        if !chain.links[..chain.links.len() - 1]
+            .iter()
+            .all(|l| l.name == "With")
+        {
+            continue;
+        }
+        let Some(root) = chain.root.as_deref() else {
+            continue;
+        };
+        let Some(prefix) = chi_prefix(facts, &chi, root, chain.span, &mut state, 0) else {
+            continue;
+        };
+        let Some(path) = literal(&args[0]) else {
+            dynamic(out, chain.span, format!("{:?}", args[0]));
+            continue;
+        };
+        let (path, base) = match prefix {
+            Some(p) => (join(&p, &path), RouteBase::Root),
+            // An unknown prefix always comes from a closure parameter
+            // (`chi_prefix`); its binding keys the endpoint.
+            None => match facts.binding_index_at(root, chain.span) {
+                Some(receiver) => (path, RouteBase::Unknown(receiver)),
+                None => continue,
+            },
+        };
+        out.routes.push(RouteFact {
+            framework: Framework::Chi,
+            method,
+            path,
+            base,
+            handler: handler(facts, &args[1..]),
+            span: chain.span,
+            enclosing: chain.enclosing,
+            host: None,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// Python: FastAPI (contract M6d S9)
+
+/// FastAPI decorator methods, as written.
+const FASTAPI_METHODS: &[&str] = &[
+    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+];
+
+/// A FastAPI app or router bound in this file: its own prefix (`None` when
+/// a `prefix` keyword is present but not a literal; `""` for apps and when
+/// absent), and the binding for endpoint identity.
+struct FastAPIApp {
+    prefix: Option<String>,
+    binding: usize,
+}
+
+fn fastapi(facts: &FileScope<'_>, out: &mut FileRoutes) {
+    // Import gates (contract invariant 6): the `fastapi` module and
+    // from-imported constructors, unshadowed where read.
+    let mut module: Option<String> = None;
+    // From-imported constructor locals: true for `APIRouter`.
+    let mut ctors: HashMap<String, bool> = HashMap::new();
+    for i in &facts.imports {
+        if i.module != "fastapi" {
+            continue;
+        }
+        if let Some(alias) = i.alias.as_deref() {
+            module = Some(alias.to_owned());
+        } else {
+            module = Some("fastapi".to_owned());
+        }
+        for n in &i.names {
+            if n.name == "APIRouter" {
+                ctors.insert(n.local.clone(), true);
+            } else if n.name == "FastAPI" {
+                ctors.insert(n.local.clone(), false);
+            }
+        }
+    }
+    let unshadowed = |name: &str, at: Span| facts.binding_index_at(name, at).is_none();
+    // Apps and routers: `app = FastAPI()`, `router = APIRouter(prefix=…)`,
+    // through the module or a from-imported constructor.
+    let mut apps: HashMap<usize, FastAPIApp> = HashMap::new();
+    for (bi, b) in facts.bindings.iter().enumerate().filter(|(_, b)| !b.member) {
+        let Some(c) = init_chain(facts, b) else {
+            continue;
+        };
+        let (root, links) = (c.root.as_deref(), c.links.as_slice());
+        let [link] = links else {
+            continue;
+        };
+        // `None` when not a FastAPI construction.
+        let found: Option<bool> = match (root, link.name.as_str()) {
+            (Some(r), "FastAPI") if Some(r) == module.as_deref() && unshadowed(r, c.span) => {
+                Some(false)
+            }
+            (Some(r), "APIRouter") if Some(r) == module.as_deref() && unshadowed(r, c.span) => {
+                Some(true)
+            }
+            (None, name) if ctors.contains_key(name) && unshadowed(name, c.span) => {
+                Some(ctors[name])
+            }
+            _ => None,
+        };
+        let Some(is_router) = found else {
+            continue;
+        };
+        let prefix = if is_router {
+            match crate::clients::kwarg(&link.args, "prefix") {
+                None => Some(String::new()),
+                Some(arg) => literal(arg),
+            }
+        } else {
+            Some(String::new())
+        };
+        apps.insert(
+            bi,
+            FastAPIApp {
+                prefix,
+                binding: bi,
+            },
+        );
+    }
+    // Routes per decorator, with the local path and the router they hang
+    // off (`None` for apps); prefixes compose in the post-pass below.
+    let mut locals: Vec<String> = Vec::new();
+    let mut routers_of: Vec<Option<usize>> = Vec::new();
+    for (di, d) in facts.facts.definitions.iter().enumerate() {
+        if !matches!(d.kind, DefKind::Function | DefKind::Method) {
+            continue;
+        }
+        for deco in &d.decorations {
+            let Some((obj, method)) = deco.name.rsplit_once('.') else {
+                continue;
+            };
+            if obj.contains('.') {
+                continue;
+            }
+            let Some(bi) = facts.binding_index_at(obj, deco.span) else {
+                continue;
+            };
+            let Some(app) = apps.get(&bi) else {
+                continue;
+            };
+            let methods: Vec<String> = if FASTAPI_METHODS.contains(&method) {
+                vec![norm_method(method)]
+            } else if method == "api_route" {
+                match deco
+                    .args
+                    .iter()
+                    .find(|a| a.key.as_deref() == Some("methods"))
+                {
+                    // Starlette serves an `api_route` without methods on all
+                    // of them, like gin's `Any`.
+                    None => vec![ANY.to_owned()],
+                    Some(m) if !m.items.is_empty() && m.items.iter().all(|i| i.literal) => {
+                        m.items.iter().map(|i| norm_method(&i.value)).collect()
+                    }
+                    // A non-literal method set cannot be enumerated: dynamic.
+                    _ => continue,
+                }
+            } else {
+                continue;
+            };
+            let Some(path) = deco
+                .args
+                .iter()
+                .find(|a| a.key.is_none())
+                .filter(|a| a.literal)
+                .map(|a| a.value.clone())
+            else {
+                dynamic(out, deco.span, format!("@{obj}.{method}"));
+                continue;
+            };
+            for m in methods {
+                out.routes.push(RouteFact {
+                    framework: Framework::FastAPI,
+                    method: m,
+                    path: path.clone(),
+                    base: match &app.prefix {
+                        Some(_) => RouteBase::Root,
+                        None => RouteBase::Unknown(app.binding),
+                    },
+                    handler: Handler::Definition(di),
+                    span: deco.span,
+                    enclosing: Some(di),
+                    host: None,
+                });
+                locals.push(path.clone());
+                routers_of.push(Some(bi));
+            }
+        }
+    }
+    // `app.include_router(router)` / `router.include_router(sub)` edges:
+    // (parent binding, child binding, extra prefix).
+    let mut includes: Vec<(usize, usize, String)> = Vec::new();
+    for chain in &facts.chains {
+        let Some(last) = chain.links.last() else {
+            continue;
+        };
+        if last.name != "include_router" || chain.links.len() != 1 {
+            continue;
+        }
+        let Some(root) = chain.root.as_deref() else {
+            continue;
+        };
+        if root.contains('.') {
+            continue;
+        }
+        let Some(parent) = facts.binding_index_at(root, chain.span) else {
+            continue;
+        };
+        if !apps.contains_key(&parent) {
+            continue;
+        }
+        let Some(Arg::Name { text, .. }) = last.args.first() else {
+            continue;
+        };
+        if text.contains('.') {
+            continue;
+        }
+        let Some(child) = facts.binding_index_at(text, chain.span) else {
+            continue;
+        };
+        if !apps.contains_key(&child) || child == parent {
+            continue;
+        }
+        let extra = match crate::clients::kwarg(&last.args, "prefix") {
+            None => String::new(),
+            Some(arg) => match literal(arg) {
+                Some(p) => p,
+                None => continue,
+            },
+        };
+        includes.push((parent, child, extra));
+    }
+    // Full prefixes per router: its own, under every include edge into it
+    // (an include cycle or unknown component composes nothing: the route
+    // keeps its collected path). Parents per router, in edge order: one
+    // linear pass, so composing does not rescan every edge per level
+    // (contract M6d S13).
+    let mut parents_of: HashMap<usize, Vec<(usize, String)>> = HashMap::new();
+    for (parent, child, extra) in &includes {
+        crate::work::tick(1);
+        parents_of
+            .entry(*child)
+            .or_default()
+            .push((*parent, extra.clone()));
+    }
+    // Whether the include edges hold a directed cycle (iterative DFS, one
+    // linear pass). Shared-prefix memoisation below is only valid when no
+    // composition path revisits a router; a cyclic file keeps the legacy
+    // per-route walk (a router including its includer is degenerate input).
+    fn has_include_cycle(includes: &[(usize, usize, String)]) -> bool {
+        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (parent, child, _) in includes {
+            crate::work::tick(1);
+            children.entry(*parent).or_default().push(*child);
+        }
+        let mut color: HashMap<usize, u8> = HashMap::new();
+        for &root in children.keys() {
+            if color.contains_key(&root) {
+                continue;
+            }
+            color.insert(root, 1);
+            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+            while let Some((node, ci)) = stack.pop() {
+                let kids: &[usize] = children.get(&node).map_or(&[], Vec::as_slice);
+                if ci < kids.len() {
+                    stack.push((node, ci + 1));
+                    let next = kids[ci];
+                    crate::work::tick(1);
+                    match color.get(&next) {
+                        Some(1) => return true,
+                        Some(_) => {}
+                        None => {
+                            color.insert(next, 1);
+                            stack.push((next, 0));
+                        }
+                    }
+                } else {
+                    color.insert(node, 2);
+                }
+            }
+        }
+        false
+    }
+    fn full_prefix(
+        apps: &HashMap<usize, FastAPIApp>,
+        includes: &[(usize, usize, String)],
+        router: usize,
+        seen: &mut HashSet<usize>,
+        depth: usize,
+    ) -> Vec<String> {
+        if depth >= MAX_GROUP_DEPTH || !seen.insert(router) {
+            return Vec::new();
+        }
+        let own = match apps.get(&router) {
+            Some(FastAPIApp {
+                prefix: Some(p), ..
+            }) => p.clone(),
+            _ => {
+                seen.remove(&router);
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        let mut included = false;
+        for (parent, child, extra) in includes {
+            crate::work::tick(1);
+            if *child != router {
+                continue;
+            }
+            included = true;
+            for base in full_prefix(apps, includes, *parent, seen, depth + 1) {
+                out.push(join(&join(&base, extra), &own));
+            }
+        }
+        if !included {
+            out.push(own);
+        }
+        seen.remove(&router);
+        out
+    }
+    /// Shared-prefix composition over an acyclic include graph: (prefix,
+    /// levels above the router) per router, memoised by router. Levels
+    /// replace the legacy walk's depth parameter: a path of k edges reaches
+    /// exactly the calls below the depth cap, so the top level keeps levels
+    /// below `MAX_GROUP_DEPTH`. Diamond paths still expand per path
+    /// (amendment 14 F4: a router included twice serves both), which bounds
+    /// work by the output. The `seen` guard never fires on an acyclic graph
+    /// (firing means a repeated router on one path, i.e. a cycle), so
+    /// memoised values are path-independent; it stays as termination
+    /// defense, exactly as in the legacy walk.
+    fn full_prefix_levels(
+        apps: &HashMap<usize, FastAPIApp>,
+        parents_of: &HashMap<usize, Vec<(usize, String)>>,
+        router: usize,
+        seen: &mut HashSet<usize>,
+        memo: &mut HashMap<usize, Vec<(String, usize)>>,
+    ) -> Vec<(String, usize)> {
+        if let Some(hit) = memo.get(&router) {
+            return hit.clone();
+        }
+        if !seen.insert(router) {
+            return Vec::new();
+        }
+        let own = match apps.get(&router) {
+            Some(FastAPIApp {
+                prefix: Some(p), ..
+            }) => p.clone(),
+            _ => {
+                seen.remove(&router);
+                memo.insert(router, Vec::new());
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        let mut included = false;
+        if let Some(parents) = parents_of.get(&router) {
+            for (parent, extra) in parents {
+                crate::work::tick(1);
+                included = true;
+                for (base, levels) in full_prefix_levels(apps, parents_of, *parent, seen, memo) {
+                    out.push((join(&join(&base, extra), &own), levels + 1));
+                }
+            }
+        }
+        if !included {
+            out.push((own, 0));
+        }
+        seen.remove(&router);
+        memo.insert(router, out.clone());
+        out
+    }
+    // One prefix list per router: a route's composition is a pure function
+    // of its router, so routes sharing one share the work.
+    let mut seen_routers = HashSet::new();
+    let mut routers = Vec::new();
+    for router in routers_of.iter().flatten() {
+        if seen_routers.insert(*router) {
+            routers.push(*router);
+        }
+    }
+    let mut composed: HashMap<usize, Vec<String>> = HashMap::new();
+    if has_include_cycle(&includes) {
+        for router in &routers {
+            composed.insert(
+                *router,
+                full_prefix(&apps, &includes, *router, &mut HashSet::new(), 0),
+            );
+        }
+    } else {
+        let mut memo: HashMap<usize, Vec<(String, usize)>> = HashMap::new();
+        for router in &routers {
+            composed.insert(
+                *router,
+                full_prefix_levels(&apps, &parents_of, *router, &mut HashSet::new(), &mut memo)
+                    .into_iter()
+                    .filter(|(_, levels)| *levels < MAX_GROUP_DEPTH)
+                    .map(|(prefix, _)| prefix)
+                    .collect(),
+            );
+        }
+    }
+    // Compose include_router edges into router paths: one row per prefix
+    // (a router included twice serves both).
+    let mut rewritten: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, route) in out.routes.iter().enumerate() {
+        let (Some(router), Some(local)) = (routers_of.get(i).copied().flatten(), locals.get(i))
+        else {
+            continue;
+        };
+        // Zero (unknown) or identical prefixes: keep the collected row.
+        let fresh: Vec<String> = composed.get(&router).map_or(Vec::new(), |prefixes| {
+            prefixes
+                .iter()
+                .map(|prefix| join(prefix, local))
+                .filter(|composed| composed != &route.path)
+                .collect()
+        });
+        if !fresh.is_empty() {
+            rewritten.push((i, fresh));
+        }
+    }
+    for (i, paths) in rewritten {
+        let mut paths = paths.into_iter();
+        if let Some(first) = paths.next() {
+            out.routes[i].path = first;
+        }
+        for path in paths {
+            let mut clone = out.routes[i].clone();
+            clone.path = path;
+            out.routes.push(clone);
+        }
+    }
+}
+
+/// A method argument: a string, or `http.MethodX`.
 /// A method argument: a string, or `http.MethodX`.
 pub(crate) fn go_method(arg: &Arg) -> Option<String> {
     if let Some(m) = literal(arg) {
@@ -1295,6 +2045,180 @@ public class AuthController {
         assert!(
             summary(Language::Go, &aliased)
                 .contains(&"POST /billing/invoices/{}/pay root name payInvoice".to_owned())
+        );
+    }
+
+    /// Contract M6d S9: chi routers enter as routes — top-level verbs,
+    /// nested `Route` prefixes, prefix-less `Group`, `With` middleware
+    /// chains, and `Method` dispatchers. Handler names resolve like gin's.
+    #[test]
+    fn chi_verbs_nested_routes_and_middleware() {
+        let src = "package main\nimport \"github.com/go-chi/chi/v5\"\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Get(\"/health\", health)\n\tr.Route(\"/api\", func(r chi.Router) {\n\t\tr.Post(\"/login\", login)\n\t\tr.Route(\"/v1\", func(r chi.Router) {\n\t\t\tr.Get(\"/users\", users)\n\t\t})\n\t})\n\tr.Group(func(r chi.Router) {\n\t\tr.Delete(\"/cache\", clear)\n\t})\n\tr.With(auth).Put(\"/profile\", update)\n\tsub := r.With(auth)\n\tsub.Get(\"/priv\", priv)\n\tr.Method(\"PATCH\", \"/patch\", patcher)\n\tr.Handle(\"/raw\", raw)\n}\n";
+        assert_eq!(
+            summary(Language::Go, src),
+            [
+                "GET /health root name health",
+                "POST /api/login root name login",
+                "GET /api/v1/users root name users",
+                "DELETE /cache root name clear",
+                "PUT /profile root name update",
+                "GET /priv root name priv",
+                "PATCH /patch root name patcher",
+                "ANY /raw root name raw",
+            ]
+        );
+        // Without the chi import nothing is a chi route; an aliased import
+        // and `NewMux` work the same.
+        let no_import = src.replace("\nimport \"github.com/go-chi/chi/v5\"", "");
+        assert!(summary(Language::Go, &no_import).is_empty());
+        let aliased = src
+            .replace(
+                "\"github.com/go-chi/chi/v5\"",
+                "c \"github.com/go-chi/chi/v5\"",
+            )
+            .replace("chi.NewRouter()", "c.NewMux()");
+        assert!(
+            summary(Language::Go, &aliased).contains(&"POST /api/login root name login".to_owned())
+        );
+    }
+
+    /// Contract M6d S9 boundaries: dynamic paths count, `Use` mounts no
+    /// routes, `Mount` stays out (topology packs' job), and a named
+    /// register function's router parameter does not resolve (cross-function
+    /// group folding is the gin endpoint stage's job, not chi's inline one).
+    #[test]
+    fn chi_dynamic_mount_and_named_registers_stay_out() {
+        let src = "package main\nimport \"github.com/go-chi/chi/v5\"\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Get(p, h)\n\tr.Use(auth)\n\tr.Mount(\"/sub\", sub)\n\tr.With(func(r chi.Router) http.Handler {\n\t\tr.Get(\"/inner\", h)\n\t\treturn h\n\t}).Get(\"/w\", w)\n\tr.Foo(bar).Get(\"/direct\", h)\n\tr.Foo(bar).Route(\"/bad\", func(r chi.Router) {\n\t\tr.Get(\"/x\", h)\n\t})\n}\nfunc Register(r chi.Router) {\n\tr.Get(\"/x\", h)\n}\n";
+        assert_eq!(summary(Language::Go, src), ["GET /w root name w"]);
+        assert_eq!(
+            diagnostics(Language::Go, src),
+            [(
+                "route_path_dynamic".to_owned(),
+                "Name { text: \"p\", span: [4, 7, 4, 8] }".to_owned()
+            )]
+        );
+    }
+
+    /// S13: n sibling `Route` closures (n distinct parameters, each resolving
+    /// through its own `Route` call) cost linear work: 4× the closures makes
+    /// at most 5× the counted steps. Counted, not timed, so machine load
+    /// cannot fail it. Parameters are distinctly named to isolate the chi
+    /// walk: same-name shadowing bindings scan linearly in the shared
+    /// `binding_index_at` machinery (pre-existing, all packs alike —
+    /// measured 15.6× on this shape with one shared name, recorded in the
+    /// contract amendment, not introduced here).
+    #[test]
+    fn chi_sibling_routes_grow_linearly() {
+        let source = |n: usize| {
+            let mut src = "package main\nimport \"github.com/go-chi/chi/v5\"\nfunc main() {\nr := chi.NewRouter()\n"
+                .to_owned();
+            for i in 0..n {
+                src.push_str(&format!(
+                    "r.Route(\"/p{i}\", func(r{i} chi.Router) {{\nr{i}.Get(\"/x\", h)\n}})\n"
+                ));
+            }
+            src.push_str("}\n");
+            src
+        };
+        let work = |n: usize| {
+            let facts = extract(Language::Go, source(n).as_bytes()).unwrap();
+            crate::work::take();
+            let r = routes(Language::Go, &facts);
+            assert_eq!(r.routes.len(), n);
+            crate::work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// Contract M6d S9: FastAPI decorators enter as routes — app and router
+    /// verbs, `APIRouter` prefixes, and `include_router` composition (with
+    /// its own prefix). Handlers are the decorated functions.
+    #[test]
+    fn fastapi_decorators_prefixes_and_includes() {
+        let src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\nrouter = APIRouter(prefix=\"/api\")\nv1 = APIRouter()\n\n@app.get(\"/health\")\ndef health():\n    pass\n\n@router.post(\"/login\")\ndef login():\n    pass\n\n@v1.get(\"/users\")\ndef users():\n    pass\n\n@v1.delete(\"/users/{id}\")\ndef drop_user():\n    pass\n\napp.include_router(router)\napp.include_router(v1, prefix=\"/v1\")\napp.include_router(router, prefix=\"/v2\")\n";
+        assert_eq!(
+            summary(Language::Python, src),
+            [
+                "GET /health root def health",
+                "POST /api/login root def login",
+                "GET /v1/users root def users",
+                "DELETE /v1/users/{} root def drop_user",
+                "POST /v2/api/login root def login",
+            ]
+        );
+        // Without the fastapi import nothing is a route.
+        let no_import = src.replace("from fastapi import FastAPI, APIRouter\n", "");
+        assert!(summary(Language::Python, &no_import).is_empty());
+    }
+
+    /// S13: an include cycle keeps the legacy per-route walk — a router
+    /// including its includer is degenerate input, and shared-prefix
+    /// memoisation is only valid when no path revisits a router. This pins
+    /// the legacy rows (a route keeps its collected path where the cycle
+    /// cuts composition); the always-memo mutant serves y at `/y`.
+    #[test]
+    fn fastapi_include_cycles_keep_legacy_rows() {
+        let src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\na = APIRouter(prefix=\"/a\")\nb = APIRouter(prefix=\"/b\")\n\n@app.get(\"/h\")\ndef h():\n    pass\n\n@a.get(\"/x\")\ndef x():\n    pass\n\n@b.get(\"/y\")\ndef y():\n    pass\n\napp.include_router(a)\na.include_router(b)\nb.include_router(a)\n";
+        assert_eq!(
+            summary(Language::Python, src),
+            [
+                "GET /h root def h",
+                "GET /a/x root def x",
+                "GET /a/b/y root def y",
+            ]
+        );
+    }
+
+    /// S13: n routers in one include chain (one route per router, each
+    /// composing over every ancestor) cost linear work: 4× the routers
+    /// makes at most 5× the counted steps. Counted, not timed, so machine
+    /// load cannot fail it. Diamond includes fan out by design (each path
+    /// serves the route, amendment 14 F4), so the ratio shape is a chain,
+    /// whose work must stay linear in the input.
+    #[test]
+    fn fastapi_include_chains_grow_linearly() {
+        let source = |n: usize| {
+            let mut src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\n".to_owned();
+            for i in 0..n {
+                src.push_str(&format!("r{i} = APIRouter(prefix=\"/s{i}\")\n"));
+            }
+            for i in 0..n {
+                src.push_str(&format!("@r{i}.get(\"/x\")\ndef h{i}():\n    pass\n\n"));
+            }
+            src.push_str("app.include_router(r0)\n");
+            for i in 0..(n - 1) {
+                src.push_str(&format!("r{i}.include_router(r{})\n", i + 1));
+            }
+            src
+        };
+        let work = |n: usize| {
+            let facts = extract(Language::Python, source(n).as_bytes()).unwrap();
+            crate::work::take();
+            let r = routes(Language::Python, &facts);
+            assert_eq!(r.routes.len(), n);
+            crate::work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// Contract M6d S9 boundaries: dynamic paths count, `api_route` spreads
+    /// its literal methods, websockets and undecorated functions stay out.
+    #[test]
+    fn fastapi_dynamic_api_route_and_non_routes() {
+        let src = "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get(p)\ndef dyn():\n    pass\n\n@app.api_route(\"/x\", methods=[\"GET\", \"POST\"])\ndef multi():\n    pass\n\n@app.api_route(\"/any\")\ndef any_method():\n    pass\n\n@app.websocket(\"/ws\")\nasync def ws():\n    pass\n\ndef plain():\n    pass\n";
+        assert_eq!(
+            summary(Language::Python, src),
+            [
+                "GET /x root def multi",
+                "POST /x root def multi",
+                "ANY /any root def any_method",
+            ]
+        );
+        assert_eq!(
+            diagnostics(Language::Python, src),
+            [("route_path_dynamic".to_owned(), "@app.get".to_owned())]
         );
     }
 

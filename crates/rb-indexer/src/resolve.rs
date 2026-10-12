@@ -228,7 +228,8 @@ fn is_builtin(language: Language, name: &str) -> bool {
 }
 
 /// What a qualifier such as `this.repo` or `util` stands for.
-enum Container<'a> {
+/// A call qualifier's receiver.
+pub(crate) enum Container<'a> {
     Types(Vec<Sym<'a>>),
     Module(Vec<&'a str>),
 }
@@ -311,6 +312,17 @@ impl<'a> Locals<'a> {
     }
 }
 
+/// The §5.4 level a simple name resolves at: the first level with candidates
+/// (contract M6c S5). `Miss` means no level produced any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeLevel {
+    Local,
+    Import,
+    SamePackage,
+    ImportOnDemand,
+    Miss,
+}
+
 /// The package a file's same-package level searches: `("", package)` for Java, `(dir, package)`
 /// for Go (a directory may also hold an external `_test` package).
 fn package_key<'a>(
@@ -351,6 +363,32 @@ fn is_callable(kind: DefKind) -> bool {
 }
 
 impl<'a> Index<'a> {
+    /// Exact manifest resolution for bare specifiers (contract M6c S4).
+    /// Default (no manifests) resolves nothing, as before.
+    pub(crate) fn with_aliases(mut self, aliases: crate::rta::AliasMaps) -> Self {
+        self.modules = self.modules.with_aliases(aliases);
+        self.imports = Self::resolve_imports(self.files, &self.modules);
+        self
+    }
+
+    fn resolve_imports(
+        files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
+        modules: &Modules<'a>,
+    ) -> BTreeMap<&'a str, Vec<Vec<&'a str>>> {
+        let mut imports = BTreeMap::new();
+        for (&path, (_, facts)) in files {
+            imports.insert(
+                path,
+                facts
+                    .imports
+                    .iter()
+                    .map(|i| modules.resolve(path, i))
+                    .collect(),
+            );
+        }
+        imports
+    }
+
     pub(crate) fn new(
         files: &'a BTreeMap<&'a str, (Language, &'a FileFacts)>,
         go_modules: &'a BTreeMap<String, String>,
@@ -358,7 +396,6 @@ impl<'a> Index<'a> {
     ) -> Self {
         let modules = Modules::new(files, go_modules);
         let mut scopes = BTreeMap::new();
-        let mut imports = BTreeMap::new();
         let mut raw_locals: BTreeMap<&str, BTreeMap<&str, Vec<&Binding>>> = BTreeMap::new();
         let mut defs_by_name: BTreeMap<&str, BTreeMap<&str, Vec<usize>>> = BTreeMap::new();
         let mut fields: BTreeMap<&str, BTreeMap<(usize, &str), Vec<&Binding>>> = BTreeMap::new();
@@ -407,15 +444,8 @@ impl<'a> Index<'a> {
                 table.entry(d.name.as_str()).or_default().push(i);
             }
             scopes.insert(path, sc);
-            imports.insert(
-                path,
-                facts
-                    .imports
-                    .iter()
-                    .map(|i| modules.resolve(path, i))
-                    .collect(),
-            );
         }
+        let imports = Self::resolve_imports(files, &modules);
         Index {
             files,
             modules,
@@ -561,6 +591,38 @@ impl<'a> Index<'a> {
             })
     }
 
+    /// Whether `path` has an on-demand import reaching no repository file
+    /// (contract M6c S5): a wildcard import (Java `.*`, Python `*`) or a Go dot-import
+    /// of a package or module with no repository file. Static imports never count, as in
+    /// [`Index::imported_from_outside`]. A wildcard binds every head, so the check needs
+    /// no name.
+    pub(crate) fn on_demand_from_outside(&self, path: &'a str) -> bool {
+        let language = self.language(path);
+        self.facts(path)
+            .imports
+            .iter()
+            .zip(&self.imports[path])
+            .any(|(import, targets)| {
+                let on_demand = import.wildcard
+                    || (language == Language::Go && import.alias.as_deref() == Some("."));
+                !import.is_static && on_demand && targets.is_empty()
+            })
+    }
+
+    /// The level a simple type name resolves at (contract M6c S5): the first §5.4 level
+    /// with candidates. Dotted names take the container path instead, which has no level.
+    pub(crate) fn type_level(
+        &self,
+        path: &'a str,
+        scope: Option<usize>,
+        name: &str,
+    ) -> Option<TypeLevel> {
+        if name.contains('.') {
+            return None;
+        }
+        Some(self.levels(path, scope, name, is_type, false).1)
+    }
+
     /// The resolved direct supertypes of a type (all candidates of each declared name).
     pub(crate) fn direct_supertypes(&self, t: (&'a str, usize)) -> Vec<(&'a str, usize)> {
         self.supertypes(t)
@@ -655,7 +717,7 @@ impl<'a> Index<'a> {
                 found
             };
         }
-        self.levels(path, scope, name, is_type, false)
+        self.levels(path, scope, name, is_type, false).0
     }
 
     /// A fully qualified Java class name (`com.acme.util.Strings`).
@@ -673,7 +735,8 @@ impl<'a> Index<'a> {
 
     /// The §5.4 levels for a simple name: lexical scopes, the same file, imports, the same
     /// package. The first level with candidates wins. `callable` selects call semantics: class
-    /// bodies are scopes only in Java, and there through inheritance.
+    /// bodies are scopes only in Java, and there through inheritance. Returns the winners and
+    /// the level that produced them (contract M6c S5).
     fn levels(
         &self,
         path: &'a str,
@@ -681,7 +744,7 @@ impl<'a> Index<'a> {
         name: &str,
         want: fn(DefKind) -> bool,
         callable: bool,
-    ) -> Vec<Sym<'a>> {
+    ) -> (Vec<Sym<'a>>, TypeLevel) {
         let language = self.language(path);
         let defs = &self.facts(path).definitions;
         for a in self.ancestors(path, scope) {
@@ -695,27 +758,35 @@ impl<'a> Index<'a> {
                 self.named(path, Some(a), name, want)
             };
             if !found.is_empty() {
-                return found;
+                return (found, TypeLevel::Local);
             }
         }
         let found = self.named(path, None, name, want);
         if !found.is_empty() {
-            return found;
+            return (found, TypeLevel::Local);
         }
         // Java (JLS §6.4.1): single-type imports shadow the package, which shadows on-demand
         // (wildcard) imports. Elsewhere imports come before the package.
         let found = self.imported(path, name, want, false);
         if !found.is_empty() {
-            return found;
+            return (found, TypeLevel::Import);
         }
         if self.language(path) == Language::Java {
             let found = self.same_package(path, name, want);
             if !found.is_empty() {
-                return found;
+                return (found, TypeLevel::SamePackage);
             }
-            return self.imported(path, name, want, true);
+            let found = self.imported(path, name, want, true);
+            if !found.is_empty() {
+                return (found, TypeLevel::ImportOnDemand);
+            }
+            return (Vec::new(), TypeLevel::Miss);
         }
-        self.same_package(path, name, want)
+        let found = self.same_package(path, name, want);
+        if !found.is_empty() {
+            return (found, TypeLevel::SamePackage);
+        }
+        (Vec::new(), TypeLevel::Miss)
     }
 
     /// The definition that binding `b` of `name` also is: the kept symbol declared by the same
@@ -942,7 +1013,7 @@ impl<'a> Index<'a> {
     }
 
     /// What the dotted qualifier `q` of a member call stands for, or `None` when unknown.
-    fn container(
+    pub(crate) fn container(
         &self,
         path: &'a str,
         scope: Option<usize>,
@@ -1078,8 +1149,10 @@ impl<'a> Index<'a> {
         (!found.is_empty()).then_some(Container::Types(found))
     }
 
-    /// Candidates of a call reference, each with the edge it gives.
-    fn call(
+    /// Candidates of a call reference, each with the edge it gives. Shared
+    /// with the inherited-call producer (contract M6c S7), which must not
+    /// double an edge Tier B links itself.
+    pub(crate) fn call(
         &self,
         path: &'a str,
         scope: Option<usize>,
@@ -1096,7 +1169,7 @@ impl<'a> Index<'a> {
             .filter(|b| !b.member);
         let found = match (qualifier, variable) {
             (None, Some(b)) => self.defines(path, name, b).into_iter().collect(),
-            (None, None) => self.levels(path, scope, name, is_callable, true),
+            (None, None) => self.levels(path, scope, name, is_callable, true).0,
             (Some(q), _) => match self.container(path, scope, q, at) {
                 Some(Container::Types(ts)) => ts
                     .into_iter()

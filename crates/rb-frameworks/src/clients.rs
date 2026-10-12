@@ -10,8 +10,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rb_syntax::{
-    Arg, Binding, CallChain, Decoration, DefKind, FileFacts, Init, Language, Span, StrTemplate,
-    TemplatePart, TokenRole,
+    Arg, Binding, CallChain, CallLink, Decoration, DefKind, FileFacts, Init, Language, ObjectEntry,
+    Span, StrTemplate, TemplatePart, TokenRole,
 };
 
 use crate::endpoint::norm_method;
@@ -27,6 +27,10 @@ pub enum ClientKind {
     RestClient,
     Feign,
     GoHttp,
+    /// An OpenAPI-generator client call (contract M6f S6): stitched by operationId.
+    OpenApi,
+    /// A gRPC stub call (contract M6f S6): stitched by service and RPC name.
+    Grpc,
 }
 
 impl ClientKind {
@@ -39,6 +43,8 @@ impl ClientKind {
             ClientKind::RestClient => "rest_client",
             ClientKind::Feign => "feign",
             ClientKind::GoHttp => "net/http",
+            ClientKind::OpenApi => "openapi",
+            ClientKind::Grpc => "grpc",
         }
     }
 }
@@ -62,7 +68,7 @@ pub enum UrlValue {
 }
 
 impl UrlValue {
-    fn of(arg: Option<&Arg>) -> Self {
+    pub(crate) fn of(arg: Option<&Arg>) -> Self {
         match arg {
             Some(Arg::Template { template }) => UrlValue::Template(template.clone()),
             Some(Arg::Name { text, span }) => UrlValue::Name {
@@ -134,6 +140,39 @@ pub struct AxiosInstance {
 pub struct FileClients {
     pub calls: Vec<ClientCall>,
     pub axios_instances: Vec<AxiosInstance>,
+    /// Spans of the file's `NewRequest` call chains whose request value
+    /// reaches an in-process sink (contract M6b S4), in source order. The
+    /// indexer turns these sites `unmatched`, never edges.
+    pub in_process: BTreeSet<Span>,
+    /// Generated-client call sites (contract M6f S6): operationId/RPC candidates the indexer
+    /// matches against spec operations, in source order.
+    pub generated: Vec<GeneratedCall>,
+}
+
+/// A generated client (OpenAPI generator, gRPC stub): what names the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedKind {
+    OpenApi,
+    Grpc,
+}
+
+impl GeneratedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeneratedKind::OpenApi => "openapi",
+            GeneratedKind::Grpc => "grpc",
+        }
+    }
+}
+
+/// One generated-client call site: the operation (operationId or RPC name), its carrier (the
+/// `*Api` receiver or stub class/service, for scoping) and the call's span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedCall {
+    pub kind: GeneratedKind,
+    pub operation: String,
+    pub carrier: String,
+    pub span: Span,
 }
 
 /// Every client call site of one file, in source order per pack.
@@ -144,15 +183,29 @@ pub fn clients(language: Language, facts: &FileFacts) -> FileClients {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             fetch(facts, &mut out);
             axios(facts, &mut out, &Gate::new(facts.facts));
+            fetch_class(facts, &mut out);
+            http_client(facts, &mut out);
+            let claimed = claimed(&out);
+            generated_calls(Language::TypeScript, facts, &mut out, &claimed);
         }
         Language::Java => {
             let bases = SpringBases::new(facts, Gate::new(facts.facts));
             rest_template(facts, &mut out, &bases);
             web_client(facts, &mut out, &bases);
             feign(facts, &mut out);
+            let claimed = claimed(&out);
+            generated_calls(Language::Java, facts, &mut out, &claimed);
         }
-        Language::Go => go_http(facts, &mut out),
-        Language::Python => {}
+        Language::Go => {
+            go_http(facts, &mut out);
+            let claimed = claimed(&out);
+            generated_calls(Language::Go, facts, &mut out, &claimed);
+        }
+        Language::Python => {
+            requests_httpx(facts, &mut out);
+            let claimed = claimed(&out);
+            generated_calls(Language::Python, facts, &mut out, &claimed);
+        }
     }
     out
 }
@@ -315,6 +368,16 @@ pub fn global_hooks(language: Language, facts: &FileFacts) -> Vec<ClientKind> {
                 out.push(ClientKind::Fetch);
             }
             let (names, requires) = module_names(facts, "axios", &["default"], true);
+            // A module name read as a destructured member's object (`const {
+            // get } = axios`) reconfigures nothing (contract M6b S9): the
+            // pack reads the member call, capped, at that binding.
+            let member_src = |t: &rb_syntax::NameToken| {
+                crate::work::tick(1);
+                facts.bindings.iter().any(|b| {
+                    matches!(&b.init, Some(Init::Member { object, .. }) if object == &t.name)
+                        && within(t.span, b.span)
+                })
+            };
             if any_token(&|t| match &t.role {
                 // The module named outside its import or `require` declarations (amendment
                 // 17): `import x = require(…)`, `require(…).default`, a destructured or bare
@@ -323,12 +386,112 @@ pub fn global_hooks(language: Language, facts: &FileFacts) -> Vec<ClientKind> {
                     is_module(&t.name, "axios") && !declared(&["axios"], &requires, t)
                 }
                 TokenRole::Callee => false,
+                // Reading a request member to call or alias it (`axios.get`,
+                // `const get = axios.get`) reconfigures nothing; reading or
+                // writing anything else (`axios.defaults`, `axios.default`)
+                // may.
+                TokenRole::Member { name } => {
+                    names.contains(&t.name)
+                        && !(AXIOS_VERBS.contains(&name.as_str()) || name == "request")
+                }
                 TokenRole::Receiver { call } => {
                     names.contains(&t.name) && !AXIOS_MODULE_CALLS.contains(&call.as_str())
                 }
-                _ => names.contains(&t.name) && !declared(&["axios"], &requires, t),
+                _ => {
+                    names.contains(&t.name) && !declared(&["axios"], &requires, t) && !member_src(t)
+                }
             }) {
                 out.push(ClientKind::Axios);
+            }
+            // Fetch-class libraries and `HttpClient` (contract M6b S9): every
+            // token of a module binding outside its allow-listed roles hooks
+            // `fetch` — the module named outside its declarations, a receiver
+            // of anything but a verb or configuration call, aliasing,
+            // exporting, passing. A direct call is the pack's site.
+            // `got.paginate`/`got.stream` read without returning a response:
+            // allow-listed, not sites (residue).
+            for (module, exported, verbs, config, extra) in [
+                (
+                    "got",
+                    &["default"] as &[&str],
+                    GOT_KY_VERBS,
+                    &["extend"] as &[&str],
+                    &["paginate", "stream"] as &[&str],
+                ),
+                (
+                    "ky",
+                    &["default"] as &[&str],
+                    GOT_KY_VERBS,
+                    &["extend", "create"] as &[&str],
+                    &[] as &[&str],
+                ),
+                (
+                    "ky-universal",
+                    &["default"] as &[&str],
+                    GOT_KY_VERBS,
+                    &["extend", "create"] as &[&str],
+                    &[] as &[&str],
+                ),
+                (
+                    "superagent",
+                    &["default"] as &[&str],
+                    SUPERAGENT_VERBS,
+                    &["agent"] as &[&str],
+                    &[] as &[&str],
+                ),
+                (
+                    "undici",
+                    &["request"] as &[&str],
+                    &["request"] as &[&str],
+                    &[] as &[&str],
+                    &[] as &[&str],
+                ),
+            ] {
+                let (names, requires) = module_names(facts, module, exported, true);
+                if any_token(&|t| match &t.role {
+                    TokenRole::Callee => false,
+                    TokenRole::Member { name } => {
+                        names.contains(&t.name) && !verbs.contains(&name.as_str())
+                    }
+                    TokenRole::Receiver { call } => {
+                        names.contains(&t.name)
+                            && !verbs.contains(&call.as_str())
+                            && !config.contains(&call.as_str())
+                            && !extra.contains(&call.as_str())
+                    }
+                    _ => {
+                        names.contains(&t.name)
+                            && !declared(&[module], &requires, t)
+                            && !member_src(t)
+                    }
+                }) {
+                    out.push(ClientKind::Fetch);
+                }
+            }
+            // `HttpClient` providers and interceptors configure every client
+            // (contract M6b S9): any non-import mention of their names hooks
+            // `fetch`. The `HttpClient` name itself never hooks (its import
+            // and type mentions are the normal injection use).
+            if facts
+                .imports
+                .iter()
+                .any(|i| is_module(&i.module, "@angular/common/http"))
+                && [
+                    "HTTP_INTERCEPTORS",
+                    "HttpInterceptor",
+                    "HttpHandler",
+                    "provideHttpClient",
+                    "withInterceptors",
+                    "withInterceptorsFromDi",
+                ]
+                .iter()
+                .any(|n| {
+                    facts.mentions.get(*n).is_some_and(|roles| {
+                        roles.iter().any(|r| *r != rb_syntax::MentionRole::Import)
+                    })
+                })
+            {
+                out.push(ClientKind::Fetch);
             }
         }
         Language::Go => {
@@ -456,9 +619,20 @@ pub fn feign_config_key(key: &str) -> bool {
 pub struct RawScan {
     /// The client kinds some such file may reconfigure: every site of them is capped.
     pub hooks: BTreeSet<ClientKind>,
-    /// Some such file configures service discovery or load balancing, which may bind a
+    /// Some file without facts configures service discovery or load balancing, which may bind a
     /// service name to any host: no host-by-name stitch (F1) is `synthetic`.
+    /// Parsed files no longer feed this (contract M6b S8): their text feeds
+    /// `discovery_parsed` (broad, counted only) and `discovery_literal`
+    /// (narrowed, caps) instead.
     pub discovery: bool,
+    /// Some parsed file's text spells a discovery key path or word
+    /// ([`discovery_text`], contract M5 S19 (a)): the broad rule, kept for the
+    /// S8 lift count only — it never caps (contract M6b S8).
+    pub discovery_parsed: bool,
+    /// Some parsed file holds discovery key segments inside one
+    /// brace-delimited span ([`single_literal_discovery`]): the narrowed text
+    /// evidence, which caps (contract M6b S8, D7).
+    pub discovery_literal: bool,
     /// DI-surface findings (contract M4b S6 gate D) as `(path, what)`
     /// ([`crate::di::surface_text`]).
     pub di_surface: Vec<(String, String)>,
@@ -502,7 +676,10 @@ pub fn text_words(text: &str) -> BTreeSet<String> {
 /// [`rb_syntax::surface_names`]) and a qualified `feign.` use; Go's process-wide clients, in Go
 /// files only ([`raw_scan`]).
 const RAW_SURFACE: &[(ClientKind, &[&str])] = &[
-    (ClientKind::Fetch, &["fetch"]),
+    (
+        ClientKind::Fetch,
+        &["fetch", "got", "ky", "superagent", "undici"],
+    ),
     (ClientKind::Axios, &["axios"]),
     (
         ClientKind::Feign,
@@ -580,7 +757,14 @@ pub(crate) fn inert(path: &str) -> bool {
         Some("md" | "markdown" | "txt" | "rst" | "adoc")
     ) || matches!(
         name,
-        "package-lock.json" | "npm-shrinkwrap.json" | "yarn.lock" | "pnpm-lock.yaml"
+        "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            // Python lockfiles only record what the manifests declare, as
+            // above (contract M6d S6).
+            | "poetry.lock"
+            | "uv.lock"
     )
 }
 
@@ -686,6 +870,202 @@ pub fn discovery_text(path: &str, text: &str) -> bool {
     DISCOVERY_WORDS.iter().any(|w| has_word(&normalised, w)) || json_discovery(text)
 }
 
+/// Simple names of types that configure service discovery or load balancing
+/// (contract M6b S8; evaluator pass 1, E2): Spring Cloud LoadBalancer's and
+/// Ribbon's configuration types (the type entries of [`DISCOVERY_WORDS`])
+/// plus the load-balancer itself, which routes through instance suppliers. Any
+/// other spelling — a comment, a UI string, an unrelated class from the same
+/// package tree — is not positively identified evidence.
+const DISCOVERY_TYPES: &[&str] = &[
+    "LoadBalancerClient",
+    "LoadBalancerClients",
+    "ReactorLoadBalancer",
+    "RibbonClient",
+    "RibbonClients",
+    "ServiceInstanceListSupplier",
+];
+
+/// The qualifier and simple name of a type as written (`a.b.C` → (`a.b`,
+/// `C`); `C` → (`None`, `C`)), cut at any type arguments (`C<X>` → `C`).
+fn split_type(name: &str) -> (Option<&str>, &str) {
+    let bare = name.split('<').next().unwrap_or(name).trim();
+    match bare.rsplit_once('.') {
+        Some((q, s)) => (Some(q), s),
+        None => (None, bare),
+    }
+}
+
+/// Whether a parsed file positively resolves discovery or load-balancer
+/// configuration (contract M6b S8, D7): a use of a [`DISCOVERY_TYPES`] name —
+/// an annotation or decorator, a supertype head, a declared field or parameter
+/// type (type arguments included) or a method return type — that resolves
+/// through imports to a discovery package (an explicit single-type import
+/// binding it, or an on-demand import of a discovery package, which cannot
+/// attribute the use, so stays capped), or is fully qualified under a
+/// discovery package. Static imports bind members, never types. A bare use
+/// with no import to resolve through is not evidence (it may be the
+/// repository's own type of that name); neither is a type nested in another
+/// type's arguments outside a binding's recorded ones.
+pub fn discovery_resolved(facts: &FileFacts) -> bool {
+    let resolves = |qual: Option<&str>, simple: &str| {
+        if !DISCOVERY_TYPES.contains(&simple) {
+            return false;
+        }
+        if let Some(q) = qual {
+            return discovery_package(q);
+        }
+        facts.imports.iter().any(|i| {
+            !i.is_static
+                && discovery_package(&i.module)
+                && (i.names.iter().any(|n| n.local == simple) || i.wildcard)
+        })
+    };
+    facts.definitions.iter().any(|d| {
+        d.decorations.iter().any(|deco| {
+            let (q, s) = split_type(&deco.name);
+            resolves(q, s)
+        }) || d.supertypes.iter().any(|s| {
+            let (q, sm) = split_type(&s.name);
+            resolves(q, sm)
+        }) || d.return_type.as_ref().is_some_and(|r| {
+            let (q, sm) = split_type(r);
+            resolves(q, sm)
+        })
+    }) || facts.bindings.iter().any(|b| {
+        let (q, s) = split_type(&b.type_name);
+        resolves(q, s)
+            || b.type_args.iter().any(|a| {
+                // Type arguments are recorded as simple names (a bounded
+                // wildcard keeps its `?` mark, stripped for resolution here):
+                // only an import can resolve them.
+                let a = a.strip_prefix('?').unwrap_or(a);
+                DISCOVERY_TYPES.contains(&a)
+                    && facts.imports.iter().any(|i| {
+                        !i.is_static
+                            && discovery_package(&i.module)
+                            && (i.names.iter().any(|n| n.local == *a) || i.wildcard)
+                    })
+            })
+    })
+}
+
+/// Whether a parsed file's facts positively resolve discovery or
+/// load-balancer configuration (contract M6b S8, D7): Java only — the known
+/// types are Java types — with a use resolving through imports (see
+/// [`discovery_resolved`]).
+pub fn discovery_facts(language: Language, facts: &FileFacts) -> bool {
+    language == Language::Java && discovery_resolved(facts)
+}
+
+/// The broad discovery rule against the narrowed one, `(broad, narrowed)`
+/// (contract M6b S8, D7; invariant 6). Broad is raw-file evidence
+/// (`unparsed.discovery`), parsed-file discovery words
+/// (`unparsed.discovery_parsed`), or an unresolved Java import naming a
+/// discovery package; narrowed is raw-file evidence, parsed-file
+/// single-literal keys (`unparsed.discovery_literal`), or import-resolved
+/// known types ([`discovery_facts`]). A split (broad without narrowed) is
+/// what the stitcher's `discovery_lifted` count counts.
+pub fn discovery_flags<'a>(
+    unparsed: &RawScan,
+    files: impl IntoIterator<Item = (Language, &'a FileFacts)>,
+) -> (bool, bool) {
+    let mut broad_java = false;
+    let mut resolved = false;
+    for (language, facts) in files {
+        resolved |= discovery_facts(language, facts);
+        if language != Language::Java {
+            continue;
+        }
+        broad_java |= facts.imports.iter().any(|i| discovery_package(&i.module))
+            || facts
+                .definitions
+                .iter()
+                .flat_map(|d| &d.decorations)
+                .any(|d| {
+                    d.name
+                        .rsplit_once('.')
+                        .is_some_and(|(q, _)| discovery_package(q))
+                });
+    }
+    let broad = unparsed.discovery || unparsed.discovery_parsed || broad_java;
+    let narrowed = unparsed.discovery || unparsed.discovery_literal || resolved;
+    (broad, narrowed)
+}
+
+/// Whether one brace-delimited span of `text` holds key segments spelling a
+/// discovery key path ([`json_discovery`]'s segments, contract M6b S8):
+/// `spring`, `cloud` and `discovery` or `loadbalancer` co-occurring inside a
+/// single object literal. Nested literals count — their keys sit inside the
+/// outer literal too, so each popped span's segments merge into its parent —
+/// while sibling literals and brace-free key lists never combine. A single
+/// linear pass with a brace stack, so 4× the input costs ~4× the counted work
+/// (invariant 9). Unbalanced text can only cap (an unclosed span is checked at
+/// the end); a stray `}` may split a span (documented residue, as with the
+/// structure-free rule this narrows).
+pub fn single_literal_discovery(text: &str) -> bool {
+    fn hit(segments: &HashSet<String>) -> bool {
+        segments.contains("spring")
+            && segments.contains("cloud")
+            && (segments.contains("discovery") || segments.contains("loadbalancer"))
+    }
+    // The key rule mirrors [`json_key_segments`]: a run of identifier
+    // characters followed, past quotes, backslashes and spaces, by a `:` that
+    // is not `::`.
+    let bytes = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'$' | b'.');
+    let mut stack: Vec<HashSet<String>> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        crate::work::tick(1);
+        let c = bytes[i];
+        if c == b'{' {
+            stack.push(HashSet::new());
+            i += 1;
+            continue;
+        }
+        if c == b'}' {
+            if let Some(top) = stack.pop() {
+                if hit(&top) {
+                    return true;
+                }
+                if let Some(parent) = stack.last_mut() {
+                    parent.extend(top);
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if !ident(c) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        let mut j = i;
+        while j < bytes.len() && matches!(bytes[j], b'"' | b'\'' | b'\\' | b' ' | b'\t') {
+            j += 1;
+        }
+        if bytes.get(j) == Some(&b':')
+            && bytes.get(j + 1) != Some(&b':')
+            && let Some(top) = stack.last_mut()
+        {
+            for seg in text[start..i].split('.') {
+                let seg: String = seg
+                    .chars()
+                    .filter(|c| !matches!(c, '-' | '_'))
+                    .flat_map(char::to_lowercase)
+                    .collect();
+                if !seg.is_empty() {
+                    top.insert(seg);
+                }
+            }
+        }
+    }
+    stack.into_iter().any(|segments| hit(&segments))
+}
+
 /// The raw-text scan of one file without token facts (contract M4a amendment 17, evaluator
 /// pass 7, W1, W2, W4): a language M4a does not parse (Kotlin, Groovy, Scala, Vue, Svelte,
 /// HTML, …), a generated file, one too large to parse, or any other text. Each name of
@@ -739,6 +1119,17 @@ fn entry<'a>(arg: Option<&'a Arg>, key: &str) -> Option<&'a Arg> {
         }
         _ => None,
     }
+}
+
+/// The first `key` entry among call keyword arguments (each reads as a
+/// single-entry object, so any `Arg::Object` in the way is a keyword).
+pub(crate) fn kwarg<'a>(args: &'a [Arg], key: &str) -> Option<&'a Arg> {
+    args.iter()
+        .filter_map(|a| match a {
+            Arg::Object { entries, .. } => entries.iter().find(|e| e.key == key).map(|e| &e.value),
+            _ => None,
+        })
+        .next()
 }
 
 /// A method from an object literal's `method` entry: `Some(None)` when the object has a
@@ -812,6 +1203,832 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
             source: chain.enclosing,
             injected: None,
             base_verified: None,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// fetch-class libraries: got, ky, superagent, undici, and Angular HttpClient
+// (contract M6b S9)
+
+/// TS/JS HTTP client modules that enter as fetch-class sites.
+const FETCH_CLASS_MODULES: &[&str] = &["got", "ky", "ky-universal", "superagent", "undici"];
+
+/// Verbs of `got` and `ky`.
+const GOT_KY_VERBS: &[&str] = &["get", "post", "put", "patch", "head", "delete", "options"];
+
+/// Verbs of `superagent` (`del` is its `delete` alias).
+const SUPERAGENT_VERBS: &[&str] = &[
+    "get", "post", "put", "patch", "head", "delete", "options", "del",
+];
+
+/// A configured carrier: a name bound to `got.extend`, `ky.extend` /
+/// `ky.create` or `superagent.agent`, with the verbs it takes.
+#[derive(Clone, Copy)]
+enum Carrier {
+    Got,
+    Ky,
+    Superagent,
+}
+
+impl Carrier {
+    fn verbs(self) -> &'static [&'static str] {
+        match self {
+            Carrier::Got | Carrier::Ky => GOT_KY_VERBS,
+            Carrier::Superagent => SUPERAGENT_VERBS,
+        }
+    }
+}
+
+/// The object a callee-name binding destructures (`const { get } = axios`):
+/// the object as written and the binding, when the call's name resolves to
+/// that binding (contract M6b S9). Covers `Init::Member` (`const { get } =
+/// axios`, `const { get } = require("axios")`) and a member path kept as a
+/// name (`const get = axios.get`).
+fn member_object(facts: &FileScope<'_>, chain: &CallChain, name: &str) -> Option<(String, usize)> {
+    let bi = facts.binding_index_at(name, chain.span)?;
+    match &facts.bindings[bi].init {
+        Some(Init::Member { object, .. }) => Some((object.clone(), bi)),
+        Some(Init::Name { text, .. }) => text
+            .rsplit_once('.')
+            .map(|(object, _)| (object.to_owned(), bi)),
+        _ => None,
+    }
+}
+
+/// `got`, `ky`, `superagent` and `undici` as fetch-class sites (contract M6b
+/// S9): module verbs and direct calls with import/`require` gates (the
+/// `undici` `request` name, or its namespace's `request` member), destructured
+/// members, and calls on configured carriers (`got.extend`, `ky.extend` /
+/// `ky.create`, `superagent.agent` results). Carrier and member sites never
+/// rise above `heuristic`; an `undici` pool or client is no fetch-class shape
+/// (residue).
+fn fetch_class(facts: &FileScope<'_>, out: &mut FileClients) {
+    let got = module_names(facts, "got", &["default"], true);
+    let ky = {
+        let (mut names, mut requires) = module_names(facts, "ky", &["default"], true);
+        let (u_names, u_requires) = module_names(facts, "ky-universal", &["default"], true);
+        names.extend(u_names);
+        requires.extend(u_requires);
+        (names, requires)
+    };
+    let sa = module_names(facts, "superagent", &["default"], true);
+    let undici = module_names(facts, "undici", &["request"], true);
+    // `name` at `at` is one of the module's local names, not shadowed by a
+    // parameter or variable in effect there (as for `is_axios`); the `require`
+    // binding is the module.
+    let is_lib = |names: &(Vec<String>, HashSet<usize>), name: &str, at: Span| {
+        names.0.iter().any(|n| n == name)
+            && facts
+                .binding_index_at(name, at)
+                .is_none_or(|bi| names.1.contains(&bi))
+    };
+    // A destructured object is the module itself (`const { get } =
+    // require("got")`, with no import) or one of its local names; a shadowed
+    // module name resolves to the shadowing binding, never the module.
+    let is_lib_or_module =
+        |names: &(Vec<String>, HashSet<usize>), modules: &[&str], object: &str, at: Span| {
+            is_lib(names, object, at)
+                || modules.iter().any(|m| is_module(object, m))
+                    && facts.binding_index_at(object, at).is_none()
+        };
+    // Configured carriers: `const api = got.extend(…)` and kin.
+    let mut carriers: HashMap<usize, Carrier> = HashMap::new();
+    for (bi, b) in facts.bindings.iter().enumerate().filter(|(_, b)| !b.member) {
+        let Some(c) = init_chain(facts, b) else {
+            continue;
+        };
+        if let (Some(root), [link]) = (c.root.as_deref(), c.links.as_slice()) {
+            let carrier = if is_lib(&got, root, c.span) && link.name == "extend" {
+                Some(Carrier::Got)
+            } else if is_lib(&ky, root, c.span) && matches!(link.name.as_str(), "extend" | "create")
+            {
+                Some(Carrier::Ky)
+            } else if is_lib(&sa, root, c.span) && link.name == "agent" {
+                Some(Carrier::Superagent)
+            } else {
+                None
+            };
+            if let Some(carrier) = carrier {
+                carriers.insert(bi, carrier);
+            }
+        }
+    }
+    // A fetch-class site: `url` from the verb's first argument, `capped` for
+    // configured carriers and destructured members (contract M6b S9, D8).
+    let site =
+        |chain: &CallChain, method: Option<String>, url: Option<&Arg>, capped: bool| ClientCall {
+            kind: ClientKind::Fetch,
+            method,
+            url: UrlValue::of(url),
+            base: None,
+            instance: None,
+            span: chain.span,
+            source: chain.enclosing,
+            injected: None,
+            base_verified: capped.then_some(false),
+        };
+    // A direct call's method from its options (`got(url, { method })`,
+    // `request(url, { method })`), `GET` by default as for `fetch`.
+    let opts_method = |args: &[Arg]| match args.get(1) {
+        None => Some("GET".to_owned()),
+        Some(Arg::Object { .. }) => method_entry(args.get(1)).unwrap_or(Some("GET".to_owned())),
+        Some(_) => None,
+    };
+    // Options that reconfigure the request (evaluator pass 1, E1):
+    // interceptor `hooks` everywhere, a custom `agent` transport for `got`.
+    // Only inline objects read: a spread may hide either, and a name may hide
+    // anything, so both cap.
+    let configured_opts = |keys: &[&str], args: &[Arg]| match args.get(1) {
+        None => false,
+        Some(Arg::Object { entries, .. }) => entries
+            .iter()
+            .any(|e| e.key == "..." || keys.contains(&e.key.as_str())),
+        Some(_) => true,
+    };
+    // A verb-site method (`del` is `superagent`'s `delete` alias).
+    let verb_method = |verb: &str| {
+        Some(if verb == "del" {
+            "DELETE".to_owned()
+        } else {
+            norm_method(verb)
+        })
+    };
+    // A `superagent` plugin (`.use`) reconfigures the request (evaluator pass
+    // 1, E1): any `use` link past the call itself caps the site. A leading
+    // `use` is no site at all (the module call is missed, and the token
+    // hooks).
+    let plugin = |chain: &CallChain| chain.links.iter().skip(1).any(|l| l.name == "use");
+    for chain in &facts.chains {
+        let Some(first) = chain.links.first() else {
+            continue;
+        };
+        if chain.root.is_none() {
+            if first.args.is_empty() {
+                continue;
+            }
+            if is_lib(&got, &first.name, chain.span) {
+                out.calls.push(site(
+                    chain,
+                    opts_method(&first.args),
+                    first.args.first(),
+                    configured_opts(&["hooks", "agent"], &first.args),
+                ));
+                continue;
+            }
+            if is_lib(&ky, &first.name, chain.span) {
+                out.calls.push(site(
+                    chain,
+                    opts_method(&first.args),
+                    first.args.first(),
+                    configured_opts(&["hooks"], &first.args),
+                ));
+                continue;
+            }
+            if is_lib(&sa, &first.name, chain.span) {
+                let (method, url) = match first.args.as_slice() {
+                    [url] => (Some("GET".to_owned()), Some(url)),
+                    [m, url] => (literal(m).map(|m| norm_method(&m)), Some(url)),
+                    _ => (None, None),
+                };
+                if url.is_some() {
+                    out.calls.push(site(chain, method, url, plugin(chain)));
+                }
+                continue;
+            }
+            if is_lib(&undici, &first.name, chain.span) {
+                out.calls.push(site(
+                    chain,
+                    opts_method(&first.args),
+                    first.args.first(),
+                    configured_opts(&["dispatcher"], &first.args),
+                ));
+                continue;
+            }
+            // Destructured members (`const { get } = got`): capped.
+            if let Some((object, bi)) = member_object(facts, chain, &first.name) {
+                let at = facts.bindings[bi].span;
+                let mut capped = |method: Option<String>, url: Option<&Arg>| {
+                    out.calls.push(site(chain, method, url, true));
+                };
+                if (is_lib_or_module(&got, &["got"], &object, at)
+                    || is_lib_or_module(&ky, &["ky", "ky-universal"], &object, at))
+                    && GOT_KY_VERBS.contains(&first.name.as_str())
+                    || is_lib_or_module(&sa, &["superagent"], &object, at)
+                        && SUPERAGENT_VERBS.contains(&first.name.as_str())
+                {
+                    capped(verb_method(&first.name), first.args.first());
+                } else if is_lib_or_module(&undici, &["undici"], &object, at)
+                    && first.name == "request"
+                {
+                    capped(opts_method(&first.args), first.args.first());
+                } else if let Some(carrier) = facts
+                    .binding_index_at(&object, at)
+                    .and_then(|oi| carriers.get(&oi))
+                    && carrier.verbs().contains(&first.name.as_str())
+                {
+                    capped(verb_method(&first.name), first.args.first());
+                }
+            }
+            continue;
+        }
+        let root = chain.root.as_deref().unwrap_or_default();
+        if is_lib(&got, root, chain.span) && GOT_KY_VERBS.contains(&first.name.as_str()) {
+            out.calls.push(site(
+                chain,
+                verb_method(&first.name),
+                first.args.first(),
+                configured_opts(&["hooks", "agent"], &first.args),
+            ));
+            continue;
+        }
+        if is_lib(&ky, root, chain.span) && GOT_KY_VERBS.contains(&first.name.as_str()) {
+            out.calls.push(site(
+                chain,
+                verb_method(&first.name),
+                first.args.first(),
+                configured_opts(&["hooks"], &first.args),
+            ));
+            continue;
+        }
+        if is_lib(&sa, root, chain.span) && SUPERAGENT_VERBS.contains(&first.name.as_str()) {
+            out.calls.push(site(
+                chain,
+                verb_method(&first.name),
+                first.args.first(),
+                plugin(chain),
+            ));
+            continue;
+        }
+        if is_lib(&undici, root, chain.span) && first.name == "request" && !first.args.is_empty() {
+            out.calls.push(site(
+                chain,
+                opts_method(&first.args),
+                first.args.first(),
+                false,
+            ));
+            continue;
+        }
+        // Calls on a configured carrier: capped.
+        if let Some(carrier) = facts
+            .binding_index_at(root, chain.span)
+            .and_then(|bi| carriers.get(&bi))
+            && carrier.verbs().contains(&first.name.as_str())
+        {
+            out.calls.push(site(
+                chain,
+                verb_method(&first.name),
+                first.args.first(),
+                true,
+            ));
+        }
+    }
+}
+
+/// `requests` and `httpx` as fetch-class sites (contract M6d S7): module
+/// verbs and `request`/`stream` dispatchers behind import gates, session
+/// receivers bound directly to `Session`/`Client`/`AsyncClient`
+/// constructions, and anonymous inline instances — all with the same verb
+/// allow-list on both libraries. `base_url` folds as the base; every
+/// carrier site caps at `heuristic` (fine-grained carrier verification is
+/// S8). `send`, `build_request`, `mount` and other non-verb members are no
+/// sites; `urllib3`/`aiohttp` stay out (residue).
+fn requests_httpx(facts: &FileScope<'_>, out: &mut FileClients) {
+    /// Verbs of both libraries (`request`, and httpx's `stream`, dispatch).
+    const VERBS: &[&str] = &["get", "options", "head", "post", "put", "patch", "delete"];
+    /// Plain per-call keyword arguments: anything else, or a spread, may
+    /// reroute and caps (evaluator-pass-1 parity). `requests` hooks are
+    /// response-only, so they stay plain; `httpx` request hooks rewrite.
+    const REQUESTS_CALL_KEYS: &[&str] = &[
+        "params",
+        "data",
+        "json",
+        "files",
+        "headers",
+        "cookies",
+        "auth",
+        "timeout",
+        "allow_redirects",
+        "proxies",
+        "hooks",
+        "stream",
+        "verify",
+        "cert",
+    ];
+    const HTTPX_CALL_KEYS: &[&str] = &[
+        "params",
+        "content",
+        "data",
+        "files",
+        "json",
+        "headers",
+        "cookies",
+        "auth",
+        "proxy",
+        "timeout",
+        "follow_redirects",
+        "verify",
+    ];
+    // Local names for the two modules: an alias, or the top package (so
+    // `import requests.api` still roots `requests`), plus the submodule
+    // paths calls are written through. From-imported verbs/dispatchers and
+    // constructors keep their own maps: a bare `get(…)` is a response, never
+    // a session.
+    let mut roots: HashMap<String, bool> = HashMap::new();
+    // From-imported verbs/dispatchers: local name to (is-httpx, name as
+    // imported). Constructors keep their own map: a bare `get(…)` is a
+    // response, never a session.
+    let mut verbs: HashMap<String, (bool, String)> = HashMap::new();
+    let mut ctors: HashMap<String, bool> = HashMap::new();
+    for i in &facts.imports {
+        let requests = i.module == "requests" || i.module.starts_with("requests.");
+        let httpx = i.module == "httpx" || i.module.starts_with("httpx.");
+        if !requests && !httpx {
+            continue;
+        }
+        if let Some(alias) = i.alias.as_deref() {
+            roots.insert(alias.to_owned(), httpx);
+        } else {
+            roots.insert(
+                i.module.split('.').next().unwrap_or(&i.module).to_owned(),
+                httpx,
+            );
+        }
+        for n in &i.names {
+            if VERBS.contains(&n.name.as_str())
+                || n.name == "request"
+                || (httpx && n.name == "stream")
+            {
+                verbs.insert(n.local.clone(), (httpx, n.name.clone()));
+            } else if (!httpx && n.name == "Session")
+                || (httpx && (n.name == "Client" || n.name == "AsyncClient"))
+            {
+                ctors.insert(n.local.clone(), httpx);
+            }
+        }
+    }
+    // `name` at `at` still names its import: no shadowing binding in effect.
+    let unshadowed = |name: &str, at: Span| facts.binding_index_at(name, at).is_none();
+    // The module a call roots at, looking through the `api`/`sessions`
+    // submodule paths calls are written through (so `rq.api.get` counts
+    // under `import requests as rq` too).
+    let mod_root = |name: &str| {
+        let bare = name
+            .strip_suffix(".api")
+            .or_else(|| name.strip_suffix(".sessions"))
+            .unwrap_or(name);
+        roots.get(bare).or_else(|| roots.get(name))
+    };
+    let is_root = |httpx: bool, name: &str, at: Span| {
+        mod_root(name).is_some_and(|h| *h == httpx) && unshadowed(name, at)
+    };
+    // The first `url`-shaped argument: an explicit `url` keyword, else the
+    // first positional (kwargs read as single-entry objects, so any
+    // `Arg::Object` in the way is a keyword). `None` when neither names one.
+    let url_arg = |args: &[Arg]| {
+        for a in args {
+            if let Arg::Object { entries, .. } = a {
+                if let Some(e) = entries.iter().find(|e| e.key == "url") {
+                    return Some(e.value.clone());
+                }
+            } else {
+                return Some(a.clone());
+            }
+        }
+        None
+    };
+    // Whether the call's keywords may reroute: any key outside the plain
+    // list (a spread reads as `...`, which is outside every list). `url`
+    // and `method` never count: the dispatcher's native slots, inert on a
+    // verb call.
+    let configured = |allowed: &[&str], args: &[Arg]| {
+        args.iter()
+            .flat_map(|a| match a {
+                Arg::Object { entries, .. } => entries.iter().collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .any(|e| e.key != "url" && e.key != "method" && !allowed.contains(&e.key.as_str()))
+    };
+    let site = |span: Span,
+                enclosing: Option<usize>,
+                method: Option<String>,
+                url: UrlValue,
+                base: Option<UrlValue>,
+                capped: bool| {
+        ClientCall {
+            kind: ClientKind::Fetch,
+            method,
+            url,
+            base,
+            instance: None,
+            span,
+            source: enclosing,
+            injected: None,
+            base_verified: capped.then_some(false),
+        }
+    };
+    // A dispatcher method (`request(method, url)`, `stream(method, url)`):
+    // a literal method, else unknown (the fold may still read a name).
+    let dispatch_method = |args: &[Arg]| {
+        args.first()
+            .and_then(literal)
+            .map(|m| norm_method(&m))
+            .or_else(|| {
+                kwarg(args, "method")
+                    .and_then(literal)
+                    .map(|m| norm_method(&m))
+            })
+    };
+    // Whether `(root, link)` constructs a session, and for which library:
+    // `Session`/`Client`/`AsyncClient` on their module, or a from-imported
+    // constructor alone.
+    let ctor_of = |root: Option<&str>, link: &CallLink, at: Span| -> Option<bool> {
+        match (root, link.name.as_str()) {
+            (Some(r), "Session") if is_root(false, r, at) => Some(false),
+            (Some(r), "Client" | "AsyncClient") if is_root(true, r, at) => Some(true),
+            (None, name) if unshadowed(name, at) => ctors.get(name).copied(),
+            _ => None,
+        }
+    };
+    // A session receiver: a non-member name bound directly to a session
+    // construction, with the base its `base_url` states (requests sessions
+    // take none). Factories wait for no phase (dynamic); member receivers
+    // resolve below.
+    let session = |name: &str, at: Span| -> Option<(bool, Option<UrlValue>)> {
+        let bi = facts.binding_index_at(name, at)?;
+        let b = &facts.bindings[bi];
+        if b.member {
+            return None;
+        }
+        let chain = init_chain(facts, b)?;
+        let (root, [link]) = (chain.root.as_deref(), chain.links.as_slice()) else {
+            return None;
+        };
+        let httpx = ctor_of(root, link, b.span)?;
+        let base = httpx
+            .then(|| kwarg(&link.args, "base_url").map(|a| UrlValue::of(Some(a))))
+            .flatten();
+        Some((httpx, base))
+    };
+    // Session-typed names: dotted constructor paths under an imported
+    // module, or bare from-imported constructor locals.
+    let session_type = |t: &str| -> Option<bool> {
+        match t {
+            "requests.Session" if roots.values().any(|h| !h) => Some(false),
+            "httpx.Client" | "httpx.AsyncClient" if roots.values().any(|h| *h) => Some(true),
+            name => ctors.get(name).copied(),
+        }
+    };
+    // A local name carrying a session type but no construction (an
+    // injected client). A construction decides first, so this never doubles
+    // the session above.
+    let typed_local = |name: &str, at: Span| -> Option<bool> {
+        let bi = facts.binding_index_at(name, at)?;
+        let b = &facts.bindings[bi];
+        if b.member || b.init.is_some() {
+            return None;
+        }
+        std::iter::once(&b.type_name)
+            .chain(b.type_args.iter())
+            .find_map(|t| session_type(t))
+    };
+    // Member sessions by (class scope, member name): construction wins over
+    // a bare annotation, anything else conflicting goes dynamic (an
+    // annotation never runs, so it cannot overwrite; two constructions may
+    // run in either order).
+    #[derive(Clone, PartialEq)]
+    enum MemberRes {
+        Dynamic,
+        Annot(bool),
+        Made(bool, Option<UrlValue>),
+    }
+    let resolve_member = |b: &Binding| -> MemberRes {
+        use MemberRes::{Annot, Dynamic, Made};
+        match &b.init {
+            Some(Init::Call { .. }) => {
+                let chain = init_chain(facts, b);
+                match chain.map(|c| (c.root.as_deref(), c.links.as_slice())) {
+                    Some((root, [link])) => match ctor_of(root, link, b.span) {
+                        Some(httpx) => {
+                            let base = httpx
+                                .then(|| {
+                                    kwarg(&link.args, "base_url").map(|a| UrlValue::of(Some(a)))
+                                })
+                                .flatten();
+                            Made(httpx, base)
+                        }
+                        None => Dynamic,
+                    },
+                    _ => Dynamic,
+                }
+            }
+            _ => {
+                if b.init.is_some() {
+                    return Dynamic;
+                }
+                match std::iter::once(&b.type_name)
+                    .chain(b.type_args.iter())
+                    .find_map(|t| session_type(t))
+                {
+                    Some(httpx) => Annot(httpx),
+                    None => Dynamic,
+                }
+            }
+        }
+    };
+    fn merge_member(a: MemberRes, b: MemberRes) -> MemberRes {
+        use MemberRes::{Annot, Dynamic, Made};
+        match (a, b) {
+            (Dynamic, _) | (_, Dynamic) => Dynamic,
+            (Annot(x), Annot(y)) if x == y => Annot(x),
+            (Annot(_), m @ Made(..)) | (m @ Made(..), Annot(_)) => m,
+            (x, y) if x == y => x,
+            _ => Dynamic,
+        }
+    }
+    let mut member_sessions: HashMap<(usize, String), MemberRes> = HashMap::new();
+    for b in facts.bindings.iter() {
+        // Class-body bindings (member writes and bare annotations) by their
+        // class; method locals live under function scopes and never join.
+        let Some(scope) = b.scope else {
+            continue;
+        };
+        if !matches!(
+            facts.facts.definitions.get(scope).map(|d| d.kind),
+            Some(DefKind::Class)
+        ) {
+            continue;
+        }
+        let resolved = resolve_member(b);
+        member_sessions
+            .entry((scope, b.name.clone()))
+            .and_modify(|slot| {
+                *slot = merge_member(slot.clone(), resolved.clone());
+            })
+            .or_insert(resolved);
+    }
+    // A verb or dispatcher site on a known receiver: `url` from the verb's
+    // first argument (kept unknown when unnamed), the dispatcher's second.
+    // `None` when the shape names no URL (an empty call, a dispatcher
+    // without one).
+    let verb_site = |link: &CallLink,
+                     span: Span,
+                     enclosing: Option<usize>,
+                     verb: &str,
+                     httpx: bool,
+                     base: Option<UrlValue>,
+                     capped: bool|
+     -> Option<ClientCall> {
+        if VERBS.contains(&verb) {
+            if link.args.is_empty() {
+                return None;
+            }
+            let url = url_arg(&link.args)
+                .map(|a| UrlValue::of(Some(&a)))
+                .unwrap_or(UrlValue::Unknown);
+            Some(site(
+                span,
+                enclosing,
+                Some(norm_method(verb)),
+                url,
+                base,
+                capped
+                    || configured(
+                        if httpx {
+                            HTTPX_CALL_KEYS
+                        } else {
+                            REQUESTS_CALL_KEYS
+                        },
+                        &link.args,
+                    ),
+            ))
+        } else if verb == "request" || (httpx && verb == "stream") {
+            // A positional URL, else a `url` keyword (a keyword `Object` in
+            // the slot never reads as the URL); anything else unnamed keeps
+            // an Unknown site, as for `fetch`.
+            let url = match link.args.get(1) {
+                Some(Arg::Template { .. } | Arg::Name { .. }) => link.args.get(1).cloned(),
+                Some(_) => kwarg(&link.args, "url")
+                    .cloned()
+                    .or_else(|| link.args.get(1).cloned()),
+                None => kwarg(&link.args, "url").cloned(),
+            }?;
+            Some(site(
+                span,
+                enclosing,
+                dispatch_method(&link.args),
+                UrlValue::of(Some(&url)),
+                base,
+                capped
+                    || configured(
+                        if httpx {
+                            HTTPX_CALL_KEYS
+                        } else {
+                            REQUESTS_CALL_KEYS
+                        },
+                        &link.args,
+                    ),
+            ))
+        } else {
+            None
+        }
+    };
+    for chain in &facts.chains {
+        let Some(first) = chain.links.first() else {
+            continue;
+        };
+        // An anonymous inline instance (`Session().post(…)`,
+        // `Client(base_url=…).get(…)`): the verb is the second link, capped.
+        if let [ctor, verb] = chain.links.as_slice()
+            && let Some(httpx) = ctor_of(chain.root.as_deref(), ctor, chain.span)
+            && let Some(call) = verb_site(
+                verb,
+                chain.span,
+                chain.enclosing,
+                &verb.name,
+                httpx,
+                httpx
+                    .then(|| kwarg(&ctor.args, "base_url").map(|a| UrlValue::of(Some(a))))
+                    .flatten(),
+                true,
+            )
+        {
+            out.calls.push(call);
+            continue;
+        }
+        if chain.root.is_none() {
+            // A from-imported verb or dispatcher, unshadowed.
+            if unshadowed(&first.name, chain.span)
+                && let Some((httpx, verb)) = verbs.get(&first.name)
+                && let Some(call) = verb_site(
+                    first,
+                    chain.span,
+                    chain.enclosing,
+                    verb,
+                    *httpx,
+                    None,
+                    false,
+                )
+            {
+                out.calls.push(call);
+            }
+            continue;
+        }
+        let root = chain.root.as_deref().unwrap_or_default();
+        // A module verb or dispatcher.
+        for httpx in [false, true] {
+            if is_root(httpx, root, chain.span)
+                && let Some(call) = verb_site(
+                    first,
+                    chain.span,
+                    chain.enclosing,
+                    &first.name,
+                    httpx,
+                    None,
+                    false,
+                )
+            {
+                out.calls.push(call);
+            }
+        }
+        // A session receiver: capped.
+        if let Some((httpx, base)) = session(root, chain.span)
+            && let Some(call) = verb_site(
+                first,
+                chain.span,
+                chain.enclosing,
+                &first.name,
+                httpx,
+                base,
+                true,
+            )
+        {
+            out.calls.push(call);
+        }
+        // A `self.`/`cls.` member receiver, through the enclosing class:
+        // capped. Deeper paths stay dynamic.
+        if let Some((obj, member)) = root.split_once('.')
+            && (obj == "self" || obj == "cls")
+            && !member.contains('.')
+            && let Some(class) = {
+                let mut scope = chain.enclosing;
+                loop {
+                    match scope {
+                        Some(d) if facts.facts.definitions[d].kind == DefKind::Class => {
+                            break Some(d);
+                        }
+                        Some(d) => scope = facts.facts.definitions[d].parent,
+                        None => break None,
+                    }
+                }
+            }
+            && let Some(res) = member_sessions.get(&(class, member.to_owned()))
+            && let (httpx, base) = match res {
+                MemberRes::Made(httpx, base) => (*httpx, base.clone()),
+                MemberRes::Annot(httpx) => (*httpx, None),
+                MemberRes::Dynamic => continue,
+            }
+            && let Some(call) = verb_site(
+                first,
+                chain.span,
+                chain.enclosing,
+                &first.name,
+                httpx,
+                base,
+                true,
+            )
+        {
+            out.calls.push(call);
+        }
+        // A local name carrying a session type but no construction (an
+        // injected client): capped. A construction decides first, so this
+        // never doubles the session above.
+        if !root.contains('.')
+            && let Some(httpx) = typed_local(root, chain.span)
+            && let Some(call) = verb_site(
+                first,
+                chain.span,
+                chain.enclosing,
+                &first.name,
+                httpx,
+                None,
+                true,
+            )
+        {
+            out.calls.push(call);
+        }
+    }
+}
+/// Angular `HttpClient` calls (contract M6b S9, D8): verbs and
+/// `request(method, url)` on a receiver typed `HttpClient` — a constructor
+/// parameter property, field or local — with the `@angular/common/http`
+/// import present. Every site is capped at `heuristic`: repository providers
+/// and interceptors are a global hook, and per-instance proof is later scope.
+fn http_client(facts: &FileScope<'_>, out: &mut FileClients) {
+    if !facts.imports.iter().any(|i| {
+        is_module(&i.module, "@angular/common/http")
+            && i.names.iter().any(|n| n.name == "HttpClient")
+    }) {
+        return;
+    }
+    // Whether the receiver is typed `HttpClient`: a member of the call's class
+    // or a local in effect at the call.
+    let typed = |root: &str, chain: &CallChain| {
+        if let Some(member) = root.strip_prefix("this.") {
+            if member.contains('.') {
+                return false;
+            }
+            facts.members(member).iter().any(|&bi| {
+                let b = &facts.bindings[bi];
+                b.type_name == "HttpClient" && {
+                    let mut enclosing = chain.enclosing;
+                    while let Some(d) = enclosing {
+                        if Some(d) == b.scope {
+                            return true;
+                        }
+                        enclosing = facts.definitions[d].parent;
+                    }
+                    b.scope.is_none()
+                }
+            })
+        } else if root.contains('.') {
+            false
+        } else {
+            facts
+                .binding_index_at(root, chain.span)
+                .is_some_and(|bi| facts.bindings[bi].type_name == "HttpClient")
+        }
+    };
+    for chain in &facts.chains {
+        let Some(first) = chain.links.first() else {
+            continue;
+        };
+        let Some(root) = chain.root.as_deref() else {
+            continue;
+        };
+        if !typed(root, chain) || first.args.is_empty() {
+            continue;
+        }
+        let (method, url) = if first.name == "request" {
+            match first.args.as_slice() {
+                [m, url, ..] => (literal(m).map(|m| norm_method(&m)), Some(url)),
+                _ => continue,
+            }
+        } else if AXIOS_VERBS.contains(&first.name.as_str()) {
+            (Some(norm_method(&first.name)), first.args.first())
+        } else {
+            continue;
+        };
+        out.calls.push(ClientCall {
+            kind: ClientKind::Fetch,
+            method,
+            url: UrlValue::of(url),
+            base: None,
+            instance: None,
+            span: chain.span,
+            source: chain.enclosing,
+            injected: None,
+            base_verified: Some(false),
         });
     }
 }
@@ -931,6 +2148,70 @@ fn verdict(plain: bool, base_from_carrier: bool) -> Option<bool> {
     }
 }
 
+/// A call to an axios member outside the module object (contract M6b S9): a
+/// destructured verb (`const { get } = axios`, `const { get } =
+/// require("axios")`, `const get = axios.get`, including from a local
+/// instance) or an inline `require("axios")` chain. Capped: no Gate-A proof
+/// for the destructured carrier in S9 scope.
+fn axios_member(
+    facts: &FileScope<'_>,
+    chain: &CallChain,
+    link: &rb_syntax::CallLink,
+    names: &[String],
+    requires: &HashSet<usize>,
+    instances: &HashMap<usize, (Option<UrlValue>, bool)>,
+) -> Option<ClientCall> {
+    // An inline `require("axios")` chain: `require("axios").get(…)`.
+    if link.name == "require"
+        && let Some(next) = chain.links.get(1)
+        && let Some(m) = link.args.first().and_then(literal)
+        && is_module(&m, "axios")
+        && let Some(mut call) = axios_request(facts, chain, next, None, None)
+    {
+        call.base_verified = Some(false);
+        return Some(call);
+    }
+    if !AXIOS_VERBS.contains(&link.name.as_str()) && link.name != "request" {
+        return None;
+    }
+    let is_axios_at = |name: &str, at: Span| {
+        names.iter().any(|n| n == name)
+            && facts
+                .binding_index_at(name, at)
+                .is_none_or(|bi| requires.contains(&bi))
+            // The module itself (`const { get } = require("axios")`, with no
+            // import); a shadowed module name resolves to its binding, never
+            // the module.
+            || is_module(name, "axios") && facts.binding_index_at(name, at).is_none()
+    };
+    let bound = facts.binding_index_at(&link.name, chain.span)?;
+    let b = &facts.bindings[bound];
+    // The axios object the name destructures, shadow-checked where it is
+    // read: the module (capped) or a local instance (its base and verdict).
+    let (base, carrier): (Option<UrlValue>, Option<(bool, bool)>) = match &b.init {
+        Some(Init::Member { object, .. }) if is_axios_at(object, b.span) => (None, None),
+        Some(Init::Member { object, .. }) => match facts
+            .binding_index_at(object, b.span)
+            .and_then(|bi| instances.get(&bi))
+        {
+            Some((base, verified)) => (base.clone(), Some((*verified, base.is_some()))),
+            None => return None,
+        },
+        Some(Init::Name { text, .. }) => match text.rsplit_once('.') {
+            Some((object, _)) if is_axios_at(object, b.span) => (None, None),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut call = axios_request(facts, chain, link, base, None)?;
+    if let Some((plain, from_carrier)) = carrier {
+        call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
+    } else {
+        call.base_verified = Some(false);
+    }
+    Some(call)
+}
+
 fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
     let (names, requires) = module_names(facts, "axios", &["default"], true);
     // `name` at `at` is the axios module: one of its local names, not shadowed by a parameter
@@ -952,7 +2233,7 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
             && link.name == "create"
         {
             let verified = plain_config(link.args.first()) && gate.unchanged(bi, AXIOS_REQUESTS);
-            let base = create_base(link.args.first());
+            let base = create_base(facts, link.args.first());
             out.axios_instances.push(AxiosInstance {
                 name: b.name.clone(),
                 base: base.clone(),
@@ -965,7 +2246,15 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
     let imported: HashSet<&str> = facts
         .imports
         .iter()
-        .filter(|i| !is_module(&i.module, "axios"))
+        .filter(|i| {
+            !is_module(&i.module, "axios")
+                // Fetch-class modules resolve through `fetch_class`, not the
+                // axios imported-instance fallback (contract M6b S9: no
+                // axios-instance double).
+                && !FETCH_CLASS_MODULES
+                    .iter()
+                    .any(|m| is_module(&i.module, m))
+        })
         .flat_map(|i| {
             i.names
                 .iter()
@@ -980,12 +2269,38 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
         // `axios(url | config)`, `axios(url, config)`.
         if chain.root.is_none() {
             if is_axios(&first.name, chain.span) && !first.args.is_empty() {
+                // A config passed by name reads the object it names
+                // (contract M6b S5).
+                let resolved;
                 let call = match first.args.first() {
                     Some(config @ Arg::Object { .. }) => {
                         config_call(facts, chain, None, None, config)
                     }
+                    Some(Arg::Name { span, .. }) => {
+                        resolved =
+                            config_entries(facts, first.args.first()).map(|entries| Arg::Object {
+                                span: *span,
+                                entries: entries.to_vec(),
+                            });
+                        match resolved.as_ref() {
+                            Some(config) => config_call(facts, chain, None, None, config),
+                            None => axios_call(
+                                facts,
+                                chain,
+                                None,
+                                None,
+                                first.args.first(),
+                                None,
+                                first.args.get(1),
+                            ),
+                        }
+                    }
                     url => axios_call(facts, chain, None, None, url, None, first.args.get(1)),
                 };
+                out.calls.push(call);
+            } else if let Some(call) =
+                axios_member(facts, chain, first, &names, &requires, &instances)
+            {
                 out.calls.push(call);
             }
             continue;
@@ -1000,12 +2315,22 @@ fn axios(facts: &FileScope<'_>, out: &mut FileClients, gate: &Gate<'_>) {
             && let Some(link) = chain.links.get(1)
         {
             let plain = plain_config(first.args.first());
-            let base = create_base(first.args.first());
+            let base = create_base(facts, first.args.first());
             let from_carrier = base.is_some();
             if let Some(mut call) = axios_request(facts, chain, link, base, None) {
                 call.base_verified = verdict(plain && call.base_verified.is_none(), from_carrier);
                 out.calls.push(call);
             }
+            continue;
+        }
+        // Calls through the namespace's `default` member (`axios.default.get(…)`,
+        // contract M6b S9): the module object under interop, capped.
+        if let Some(default) = root.strip_suffix(".default")
+            && is_axios(default, chain.span)
+            && let Some(mut call) = axios_request(facts, chain, first, None, None)
+        {
+            call.base_verified = Some(false);
+            out.calls.push(call);
             continue;
         }
         // The module itself (a bare module client), a local instance (its Gate A verdict), or
@@ -1063,31 +2388,98 @@ fn axios_request(
     if verb != "request" {
         return None;
     }
+    // A config passed by name reads the object it names (contract M6b S5).
+    let resolved;
     Some(match link.args.first() {
         Some(config @ Arg::Object { .. }) => config_call(facts, chain, base, instance, config),
+        Some(Arg::Name { span, .. }) => {
+            resolved = config_entries(facts, link.args.first()).map(|entries| Arg::Object {
+                span: *span,
+                entries: entries.to_vec(),
+            });
+            match resolved.as_ref() {
+                Some(config) => config_call(facts, chain, base, instance, config),
+                None => unknown_request(facts, chain, base, instance),
+            }
+        }
         // A config that cannot be read: no URL, method or base, and not plain.
-        _ => ClientCall {
-            method: None,
-            url: UrlValue::Unknown,
-            base: Some(UrlValue::Unknown),
-            base_verified: Some(false),
-            ..axios_call(facts, chain, base, instance, None, None, None)
-        },
+        _ => unknown_request(facts, chain, base, instance),
     })
 }
 
-/// The base an `axios.create(config)` states (its last `baseURL`). A spread anywhere in the
-/// config makes the instance's carrier not plain ([`plain_config`]; spreads are never folded),
-/// so a spread after `baseURL` that may replace it leaves the base unverified.
-fn create_base(config: Option<&Arg>) -> Option<UrlValue> {
-    let Some(Arg::Object { entries, .. }) = config else {
-        return None;
-    };
-    entries
-        .iter()
-        .rev()
-        .find(|e| e.key == "baseURL")
-        .map(|e| UrlValue::of(Some(&e.value)))
+/// `request(config)` with a config that cannot be read: no URL, method or
+/// base, and not plain.
+fn unknown_request(
+    facts: &FileScope<'_>,
+    chain: &CallChain,
+    base: Option<UrlValue>,
+    instance: Option<String>,
+) -> ClientCall {
+    ClientCall {
+        method: None,
+        url: UrlValue::Unknown,
+        base: Some(UrlValue::Unknown),
+        base_verified: Some(false),
+        ..axios_call(facts, chain, base, instance, None, None, None)
+    }
+}
+
+/// The base an `axios.create(config)` states. An inline object or one named
+/// by a same-file binding reads its last `baseURL`, contested by a later
+/// spread as in [`config_base`]; a name that is not an object here (a URL
+/// string, a parameter) is kept for the indexer, which folds it; anything
+/// else states no base. A spread anywhere in the config makes the
+/// instance's carrier not plain ([`plain_config`]; spreads are never
+/// folded), so a spread after `baseURL` that may replace it leaves the base
+/// unverified.
+fn create_base(facts: &FileScope<'_>, config: Option<&Arg>) -> Option<UrlValue> {
+    if let Some(entries) = config_entries(facts, config) {
+        return match entries
+            .iter()
+            .rev()
+            .find(|e| e.key == "baseURL" || e.key == "...")
+        {
+            Some(e) if e.key == "baseURL" => Some(UrlValue::of(Some(&e.value))),
+            Some(_) => {
+                let mut candidates = Vec::new();
+                object_base_candidates(facts, entries, &mut HashSet::new(), &mut candidates);
+                Some(if candidates.is_empty() {
+                    UrlValue::Unknown
+                } else {
+                    UrlValue::Contested(candidates)
+                })
+            }
+            None => None,
+        };
+    }
+    match config? {
+        Arg::Name { text, span } => Some(UrlValue::Name {
+            text: text.clone(),
+            span: *span,
+        }),
+        _ => None,
+    }
+}
+
+/// The entries of a config object: inline, or named by a same-file object
+/// binding (contract M6b S5). Anything else (a parameter, an import, a call)
+/// is unreadable here; spreads it cannot read are named for the indexer by
+/// [`object_base_candidates`].
+fn config_entries<'a>(
+    facts: &'a FileScope<'_>,
+    config: Option<&'a Arg>,
+) -> Option<&'a [ObjectEntry]> {
+    match config? {
+        Arg::Object { entries, .. } => Some(entries),
+        Arg::Name { text, span } => match facts.binding_index_at(text, *span) {
+            Some(bi) => match &facts.bindings[bi].init {
+                Some(Init::Object { entries }) => Some(entries),
+                _ => None,
+            },
+            None => None,
+        },
+        _ => None,
+    }
 }
 
 /// The base a request config states (contract M4a amendment 12, Q1): `None` when the call has
@@ -1095,42 +2487,43 @@ fn create_base(config: Option<&Arg>) -> Option<UrlValue> {
 /// base applies; otherwise the stated base, [`UrlValue::Unknown`] when it cannot be read (a
 /// config that is not an object literal, a `baseURL` that is not a string or a name), and
 /// [`UrlValue::Contested`] when a spread may set it and the file states values it may take
-/// (contract M5 S19 (f): [`object_base_candidates`]).
+/// (contract M5 S19 (f): [`object_base_candidates`]). A config named by a same-file object
+/// binding reads its entries (contract M6b S5).
 fn config_base(facts: &FileScope<'_>, config: Option<&Arg>) -> Option<UrlValue> {
-    match config? {
-        Arg::Object { entries, .. } => {
-            match entries
-                .iter()
-                .rev()
-                .find(|e| e.key == "baseURL" || e.key == "...")
-            {
-                Some(e) if e.key == "baseURL" => Some(UrlValue::of(Some(&e.value))),
-                Some(_) => {
-                    let mut candidates = Vec::new();
-                    object_base_candidates(facts, entries, &mut HashSet::new(), &mut candidates);
-                    Some(if candidates.is_empty() {
-                        UrlValue::Unknown
-                    } else {
-                        UrlValue::Contested(candidates)
-                    })
-                }
-                None => None,
-            }
+    let config = config?;
+    let Some(entries) = config_entries(facts, Some(config)) else {
+        return Some(UrlValue::Unknown);
+    };
+    match entries
+        .iter()
+        .rev()
+        .find(|e| e.key == "baseURL" || e.key == "...")
+    {
+        Some(e) if e.key == "baseURL" => Some(UrlValue::of(Some(&e.value))),
+        Some(_) => {
+            let mut candidates = Vec::new();
+            object_base_candidates(facts, entries, &mut HashSet::new(), &mut candidates);
+            Some(if candidates.is_empty() {
+                UrlValue::Unknown
+            } else {
+                UrlValue::Contested(candidates)
+            })
         }
-        _ => Some(UrlValue::Unknown),
+        None => None,
     }
 }
 
 /// How many spread bindings [`object_base_candidates`] follows for one config.
-const MAX_SPREADS: usize = 4;
+pub(crate) const MAX_SPREADS: usize = 4;
 
 /// The `baseURL` values an object literal's entries may leave in effect (contract M5 S19 (f)),
 /// added to `out` in source order without repeats: from the last `baseURL` entry on, that
 /// entry's value and, for each later spread naming a binding initialised with an object literal
 /// (`const stripeOpts = { baseURL: … }`), the values of that object, followed the same way
-/// through its own spreads (a visited set and [`MAX_SPREADS`] bound the walk). A spread
-/// of anything else (a parameter, a call) names no value. Only readable values (a string or a
-/// name) are candidates.
+/// through its own spreads (a visited set and [`MAX_SPREADS`] bound the walk). A spread of
+/// anything else names its value (contract M6b S5): a parameter, an import or an unresolved
+/// name stays a name for the indexer, which folds it through its unique declaration. Only
+/// readable values (a string or a name) are candidates.
 fn object_base_candidates(
     facts: &FileScope<'_>,
     entries: &[rb_syntax::ObjectEntry],
@@ -1156,18 +2549,58 @@ fn object_base_candidates(
             continue;
         };
         let Some(bi) = facts.binding_index_at(text, *span) else {
+            // Not bound here (an import, a parameter): name it for the
+            // indexer, which folds it through its unique declaration.
+            let value = UrlValue::Name {
+                text: text.clone(),
+                span: *span,
+            };
+            if !out.iter().any(|v| same_value(v, &value)) {
+                out.push(value);
+            }
             continue;
         };
         if let Some(Init::Object { entries }) = &facts.bindings[bi].init
             && seen.insert(bi)
         {
             object_base_candidates(facts, entries, seen, out);
+        } else if facts.bindings[bi].init.is_none()
+            && !out
+                .iter()
+                .any(|v| matches!(v, UrlValue::Name { text: t, .. } if t == text))
+        {
+            // Bound but unreadable here (a parameter): same, name it.
+            out.push(UrlValue::Name {
+                text: text.clone(),
+                span: *span,
+            });
         }
     }
 }
 
+/// A config passed by name that names nothing readable here and no string
+/// (contract M6b S5): a parameter, an import, or anything not an object or a
+/// string literal. Its call is dynamic (below), never suffix-matched on its
+/// tail; a name that folds to a URL keeps today's handling.
+fn unreadable_config(facts: &FileScope<'_>, config: Option<&Arg>) -> bool {
+    let Some(Arg::Name { text, span }) = config else {
+        return false;
+    };
+    if config_entries(facts, config).is_some() {
+        return false;
+    }
+    !matches!(
+        facts
+            .binding_index_at(text, *span)
+            .and_then(|bi| facts.bindings[bi].init.as_ref()),
+        Some(Init::Template { .. })
+    )
+}
+
 /// An axios call with its URL argument (`url`), its method (`None`: from the config, default
 /// GET) and its request config: a base the config states replaces the instance's `base`.
+/// A config passed by name that names nothing readable makes the call dynamic, whatever the
+/// URL (contract M6b S5).
 fn axios_call(
     facts: &FileScope<'_>,
     chain: &CallChain,
@@ -1182,6 +2615,27 @@ fn axios_call(
         Some(Arg::Object { .. }) => method_entry(config).unwrap_or(Some("GET".to_owned())),
         Some(_) => None,
     });
+    // A config passed by name reads the object it names (contract M6b S5):
+    // its entries decide the base and Gate A plainness below.
+    let resolved;
+    let config = match config {
+        Some(Arg::Name { span, .. }) => match config_entries(facts, config) {
+            Some(entries) => {
+                resolved = Arg::Object {
+                    span: *span,
+                    entries: entries.to_vec(),
+                };
+                Some(&resolved)
+            }
+            None => config,
+        },
+        _ => config,
+    };
+    let url = if unreadable_config(facts, config) {
+        None
+    } else {
+        url
+    };
     ClientCall {
         kind: ClientKind::Axios,
         method,
@@ -1671,6 +3125,11 @@ impl<'s, 'f> SpringBases<'s, 'f> {
     /// configures is injected: its base is left to the indexer, which reads the `@Bean` method
     /// its injection point resolves to (contract M4b S21; such an instance is never a plain
     /// carrier, so its base is never verified).
+    ///
+    /// Contract M6b S5: configuring statements are ordered by source position, later wins.
+    /// A statement the file cannot read keeps the agreed-or-contested rule (its value could
+    /// be anywhere). Any second configuring statement already fails the carrier scan, so a
+    /// later-wins base never reaches `synthetic`.
     fn of(&self, receiver: Option<usize>) -> SpringBase {
         let unknown = SpringBase {
             value: UrlValue::Unknown,
@@ -1681,53 +3140,100 @@ impl<'s, 'f> SpringBases<'s, 'f> {
             return unknown;
         };
         let b = &self.facts.bindings[bi];
-        let mut facts: Vec<BaseFact> = Vec::new();
+        // (source position, what was stated), the initialiser first.
+        let mut stated: Vec<(Span, BaseFact)> = Vec::new();
+        let mut unreadable = false;
         match &b.init {
             Some(Init::Call { chain }) => {
                 if let Some(c) = self.facts.chains.get(*chain) {
-                    facts.push(chain_base(self.facts, c, c.links.len()));
+                    match chain_base(self.facts, c, c.links.len()) {
+                        fact @ (BaseFact::Stated(_) | BaseFact::Fresh) => {
+                            stated.push((c.span, fact));
+                        }
+                        BaseFact::Unreadable => unreadable = true,
+                    }
                 }
             }
             // A constructor argument (a request factory, converters) sets no root URI.
-            Some(Init::New { .. }) => facts.push(BaseFact::Fresh),
-            Some(_) => facts.push(BaseFact::Unreadable),
+            Some(Init::New { .. }) => stated.push((b.span, BaseFact::Fresh)),
+            Some(_) => unreadable = true,
             None => {}
         }
         for &ci in self.configured.get(&bi).into_iter().flatten() {
             let c = &self.facts.chains[ci];
-            facts.push(chain_base(self.facts, c, c.links.len()));
+            match chain_base(self.facts, c, c.links.len()) {
+                fact @ (BaseFact::Stated(_) | BaseFact::Fresh) => {
+                    stated.push((c.span, fact));
+                }
+                BaseFact::Unreadable => unreadable = true,
+            }
         }
-        if facts.is_empty() {
+        if stated.is_empty() && !unreadable {
             return SpringBase {
                 injected: true,
                 ..unknown
             };
         }
-        let Some(value) = agreed(&facts) else {
+        if unreadable {
             // Several bases, or one that cannot be read: the stated ones are the candidates
             // (contract M5 S19 (f)).
-            let mut candidates: Vec<UrlValue> = Vec::new();
-            for f in &facts {
-                if let BaseFact::Stated(v) = f
-                    && *v != UrlValue::Unknown
-                    && !candidates.iter().any(|c| same_value(c, v))
-                {
-                    candidates.push(v.clone());
-                }
-            }
+            return self.contested(&stated, unknown);
+        }
+        // Every statement read: agreement as before, else the later statement wins.
+        let values: Vec<&UrlValue> = stated
+            .iter()
+            .filter_map(|(_, f)| match f {
+                BaseFact::Stated(v) => Some(v),
+                BaseFact::Fresh | BaseFact::Unreadable => None,
+            })
+            .collect();
+        let Some(first) = values.first() else {
             return SpringBase {
-                value: if candidates.is_empty() {
-                    UrlValue::Unknown
-                } else {
-                    UrlValue::Contested(candidates)
-                },
+                value: UrlValue::Unknown,
                 ..unknown
             };
         };
+        if values.iter().all(|v| same_value(v, first)) {
+            return SpringBase {
+                value: (*first).clone(),
+                injected: false,
+                read: true,
+            };
+        }
+        stated.sort_by_key(|(span, _)| (span[0], span[1], span[2], span[3]));
+        let last = stated.iter().rev().find_map(|(_, f)| match f {
+            BaseFact::Stated(v) if *v != UrlValue::Unknown => Some(v.clone()),
+            _ => None,
+        });
+        match last {
+            Some(value) => SpringBase {
+                value,
+                injected: false,
+                read: true,
+            },
+            None => self.contested(&stated, unknown),
+        }
+    }
+
+    /// The stated values as candidates (contract M5 S19 (f)): contested when
+    /// they name anything readable, unknown otherwise.
+    fn contested(&self, stated: &[(Span, BaseFact)], unknown: SpringBase) -> SpringBase {
+        let mut candidates: Vec<UrlValue> = Vec::new();
+        for (_, f) in stated {
+            if let BaseFact::Stated(v) = f
+                && *v != UrlValue::Unknown
+                && !candidates.iter().any(|c| same_value(c, v))
+            {
+                candidates.push(v.clone());
+            }
+        }
         SpringBase {
-            value,
-            injected: false,
-            read: true,
+            value: if candidates.is_empty() {
+                UrlValue::Unknown
+            } else {
+                UrlValue::Contested(candidates)
+            },
+            ..unknown
         }
     }
 }
@@ -1750,7 +3256,7 @@ fn agreed(facts: &[BaseFact]) -> Option<UrlValue> {
 }
 
 /// Two URL values with the same text (spans aside).
-fn same_value(a: &UrlValue, b: &UrlValue) -> bool {
+pub(crate) fn same_value(a: &UrlValue, b: &UrlValue) -> bool {
     match (a, b) {
         (UrlValue::Template(x), UrlValue::Template(y)) => {
             x.parts.len() == y.parts.len()
@@ -2016,11 +3522,12 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
                 };
                 (Some(norm_method(m)), link.args.first())
             }
-            "NewRequest" if on_package && link.args.len() >= 2 => {
-                (go_method(&link.args[0]), link.args.get(1))
-            }
-            "NewRequestWithContext" if on_package && link.args.len() >= 3 => {
-                (go_method(&link.args[1]), link.args.get(2))
+            name @ ("NewRequest" | "NewRequestWithContext") if go_new_request(&http, chain) => {
+                if name == "NewRequest" {
+                    (go_method(&link.args[0]), link.args.get(1))
+                } else {
+                    (go_method(&link.args[1]), link.args.get(2))
+                }
             }
             _ => continue,
         };
@@ -2048,6 +3555,382 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             base_verified: (!bare).then_some(false),
         });
     }
+    // A request that never leaves the process is no client call (contract M6b
+    // S4); the indexer buckets these spans `unmatched`, never edges.
+    out.in_process = go_in_process(facts, &http, import_name("net/http/httptest").as_deref());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Go in-process requests (contract M6b S4)
+
+/// How deep the sink walk follows a request through same-file helpers before
+/// it stops (contract invariant 8: bounded work).
+const MAX_SINK_DEPTH: usize = 8;
+
+/// A `net/http` request construction: `NewRequest` (method, URL, body) or
+/// `NewRequestWithContext` (context, method, URL, body) on the `net/http`
+/// import. The same gate as the client sites in [`go_http`], so a marked
+/// span is always a site.
+fn go_new_request(http: &str, chain: &CallChain) -> bool {
+    let (Some(root), [link]) = (chain.root.as_deref(), chain.links.as_slice()) else {
+        return false;
+    };
+    root == http
+        && match link.name.as_str() {
+            "NewRequest" => link.args.len() >= 2,
+            "NewRequestWithContext" => link.args.len() >= 3,
+            _ => false,
+        }
+}
+
+/// Whether `inner` lies within `outer` (start and end comparisons).
+fn within(inner: Span, outer: Span) -> bool {
+    (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
+}
+
+/// The bindings `binding_index_at` could resolve `name` to in `def`: the
+/// same-named ones in the definition, its ancestors and the file scope.
+/// Anything else is disjoint from the definition, so its extent can never
+/// hold a site in it.
+fn resolve_candidates(
+    facts: &FileScope<'_>,
+    by_scope: &HashMap<(Option<usize>, &str), Vec<usize>>,
+    def: Option<usize>,
+    name: &str,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut scope = def;
+    loop {
+        if let Some(found) = by_scope.get(&(scope, name)) {
+            crate::work::tick(found.len());
+            out.extend(found.iter().copied());
+        }
+        match scope {
+            Some(d) => scope = facts.facts.definitions[d].parent,
+            None => break,
+        }
+    }
+    out
+}
+
+/// What `name` means at `at`: `binding_index_at`'s filter (the visible
+/// extent holds the site) and maximum (the innermost declaration wins) over
+/// the candidates — the same answer, without scanning every same-named
+/// binding per site.
+fn resolve_at(facts: &FileScope<'_>, candidates: &[usize], at: Span) -> Option<usize> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|&bi| {
+            let v = facts.bindings[bi].visible;
+            (v[0], v[1]) <= (at[0], at[1]) && (at[0], at[1]) <= (v[2], v[3])
+        })
+        .max_by_key(|&bi| {
+            let v = facts.bindings[bi].visible;
+            (v[0], v[1])
+        })
+}
+
+/// What `name` means at `at` in `def`, cached per (definition, name):
+/// each distinct pair scans once no matter how many sites name it, which
+/// keeps the sink walk linear.
+fn winner(
+    facts: &FileScope<'_>,
+    by_scope: &HashMap<(Option<usize>, &str), Vec<usize>>,
+    resolved: &mut HashMap<(Option<usize>, String), Vec<usize>>,
+    def: Option<usize>,
+    name: &str,
+    at: Span,
+) -> Option<usize> {
+    let candidates = resolved
+        .entry((def, name.to_owned()))
+        .or_insert_with(|| resolve_candidates(facts, by_scope, def, name));
+    resolve_at(facts, candidates, at)
+}
+
+/// A recorder value in a call: a recorder-bound name, or a recorder
+/// construction inline.
+fn with_recorder(
+    facts: &FileScope<'_>,
+    by_scope: &HashMap<(Option<usize>, &str), Vec<usize>>,
+    resolved: &mut HashMap<(Option<usize>, String), Vec<usize>>,
+    recorder_bindings: &HashSet<usize>,
+    recorder_chains: &HashSet<usize>,
+    def: Option<usize>,
+    link: &CallLink,
+) -> bool {
+    link.args.iter().any(|other| match other {
+        Arg::Name { text, span } => winner(facts, by_scope, resolved, def, text, *span)
+            .is_some_and(|o| recorder_bindings.contains(&o)),
+        Arg::Other { span } => recorder_chains
+            .iter()
+            .any(|&r| within(facts.chains[r].span, *span)),
+        _ => false,
+    })
+}
+
+/// Spans of the `http.NewRequest` call chains whose request value reaches an
+/// in-process sink (contract M6b S4).
+///
+/// The allow-list, each matched on positively identified forms only:
+/// - the request's name is an argument of a `ServeHTTP` call (any receiver:
+///   a `ServeHTTP` method means a handler);
+/// - the request's name is passed to the same call as an `httptest` recorder
+///   value (a binding built by `httptest.NewRecorder`/`NewResponseRecorder`,
+///   or one built inline), as in a direct handler invocation;
+/// - the request's name is passed to a handler registered on a `ServeMux`
+///   (`Handle`/`HandleFunc` with two arguments on the package functions or a
+///   `ServeMux`-typed or `NewServeMux`-built receiver, mirroring the route
+///   pack's gate; a `HandlerFunc` conversion names its function).
+///   Registration is file-global: any direct call of the registered handler
+///   in the file is in-process (the handler runs in-process with that
+///   request).
+///
+/// The walk starts at each `NewRequest` site and follows the request's name
+/// through same-file helper calls (a positional bare-name argument into a
+/// uniquely named plain function), up to [`MAX_SINK_DEPTH`] deep, with a
+/// visited set. Every use site must resolve to the request's own binding
+/// ([`FileScope::binding_index_at`]), so a shadowing same-named local can
+/// only stop the walk, never mark. A request also passed to `Do` keeps its
+/// edge (sent both ways: the network wins).
+///
+/// Out of scope by construction: a hand-rolled recorder (no recognised
+/// construction); a request held in a member (`s.req`); a request built and
+/// served across files; a reassigned request name (the first binding wins);
+/// a multi-value passthrough (`f(http.NewRequest(…))`, uncompilable except
+/// into a `(*Request, error)` pair, which no sink shape takes by parts).
+fn go_in_process(facts: &FileScope<'_>, http: &str, httptest: Option<&str>) -> BTreeSet<Span> {
+    let mut new_requests = Vec::new();
+    let mut recorder_chains: HashSet<usize> = HashSet::new();
+    // `http.HandlerFunc(f)` conversions by span, for mux registrations.
+    let mut handlerfuncs: Vec<(Span, String)> = Vec::new();
+    let mut by_enclosing: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
+    for (i, chain) in facts.chains.iter().enumerate() {
+        crate::work::tick(1);
+        if go_new_request(http, chain) {
+            new_requests.push(i);
+        }
+        if httptest.is_some_and(|h| {
+            chain.root.as_deref() == Some(h)
+                && matches!(chain.links.as_slice(), [link]
+                    if matches!(link.name.as_str(), "NewRecorder" | "NewResponseRecorder"))
+        }) {
+            recorder_chains.insert(i);
+        }
+        if chain.root.as_deref() == Some(http)
+            && let [link] = chain.links.as_slice()
+            && link.name == "HandlerFunc"
+            && let Some(Arg::Name { text, .. }) = link.args.first()
+        {
+            handlerfuncs.push((chain.span, text.clone()));
+        }
+        by_enclosing.entry(chain.enclosing).or_default().push(i);
+    }
+    if new_requests.is_empty() {
+        return BTreeSet::new();
+    }
+    // Bindings built by a recorder chain, and handlers registered on a mux.
+    let mut recorder_bindings: HashSet<usize> = HashSet::new();
+    for (bi, b) in facts.bindings.iter().enumerate() {
+        crate::work::tick(1);
+        if matches!(&b.init, Some(Init::Call { chain }) if recorder_chains.contains(chain)) {
+            recorder_bindings.insert(bi);
+        }
+    }
+    let is_mux = |root: &str, at: Span| {
+        root == http
+            || facts.binding_at(root, at).is_some_and(|b| {
+                b.type_name == format!("{http}.ServeMux")
+                    || matches!(&b.init, Some(Init::Call { chain }) if facts.chains.get(*chain).is_some_and(|c| {
+                        c.root.as_deref() == Some(http)
+                            && c.links.len() == 1
+                            && c.links[0].name == "NewServeMux"
+                    }))
+            })
+    };
+    let mut mux_handlers: HashSet<String> = HashSet::new();
+    for chain in facts.chains.iter() {
+        crate::work::tick(1);
+        let Some(last) = chain.links.last() else {
+            continue;
+        };
+        if !matches!(last.name.as_str(), "Handle" | "HandleFunc") || last.args.len() != 2 {
+            continue;
+        }
+        let Some(root) = chain.root.as_deref() else {
+            continue;
+        };
+        if !is_mux(root, chain.span) {
+            continue;
+        }
+        for arg in &last.args[1..] {
+            match arg {
+                Arg::Name { text, .. } => {
+                    mux_handlers.insert(text.clone());
+                }
+                Arg::Other { span } => {
+                    // `mux.Handle(p, http.HandlerFunc(f))` names `f`.
+                    mux_handlers.extend(
+                        handlerfuncs
+                            .iter()
+                            .filter(|(at, _)| within(*at, *span))
+                            .map(|(_, name)| name.clone()),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    // Non-member bindings by (scope, name): the same index
+    // `binding_index_at` walks, grouped once (one pass, linear). A visit
+    // resolves a name from the scopes that can win for it — its own
+    // definition, its ancestors, the file — instead of scanning every
+    // same-named binding per site (which made the walk quadratic in the
+    // file). The filter and the maximum are `binding_index_at`'s own, so
+    // the answer is identical; a winner always lives in one of these
+    // scopes (anything else is disjoint from the definition).
+    let mut by_scope: HashMap<(Option<usize>, &str), Vec<usize>> = HashMap::new();
+    for (bi, b) in facts.bindings.iter().enumerate() {
+        crate::work::tick(1);
+        if !b.member {
+            by_scope
+                .entry((b.scope, b.name.as_str()))
+                .or_default()
+                .push(bi);
+        }
+    }
+    // Plain same-file functions by name, and their parameters by position.
+    let mut funcs: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (di, d) in facts.facts.definitions.iter().enumerate() {
+        crate::work::tick(1);
+        if d.kind == DefKind::Function {
+            funcs.entry(d.name.as_str()).or_default().push(di);
+        }
+    }
+    let mut params: HashMap<(usize, u32), Vec<usize>> = HashMap::new();
+    for (bi, b) in facts.bindings.iter().enumerate() {
+        crate::work::tick(1);
+        if let (Some(scope), Some(position)) = (b.scope, b.parameter) {
+            params.entry((scope, position)).or_default().push(bi);
+        }
+    }
+    // A request-carrying name: a non-member binding whose statement holds a
+    // `NewRequest` chain and no sibling chain (`req, err := …`; a wrapper or
+    // a `range` puts a sibling chain in the statement, and stays out). One
+    // pass over the bindings and, per candidate, one over the chains: linear
+    // in the file per `NewRequest` site.
+    let mut sunk: HashSet<usize> = HashSet::new();
+    let mut net: HashSet<usize> = HashSet::new();
+    let mut visited: HashSet<(Option<usize>, usize)> = HashSet::new();
+    // (definition, binding, request chains, depth).
+    let mut work: Vec<(Option<usize>, usize, Vec<usize>, usize)> = Vec::new();
+    for &nr in &new_requests {
+        let span = facts.chains[nr].span;
+        let enclosing = facts.chains[nr].enclosing;
+        for (bi, b) in facts.bindings.iter().enumerate() {
+            crate::work::tick(1);
+            if b.member || !within(span, b.span) {
+                continue;
+            }
+            let mut siblings = 0;
+            for (ci, c) in facts.chains.iter().enumerate() {
+                crate::work::tick(1);
+                if ci != nr && within(c.span, b.span) && !within(c.span, span) {
+                    siblings += 1;
+                }
+            }
+            if siblings == 0 && visited.insert((enclosing, bi)) {
+                work.push((enclosing, bi, vec![nr], 0));
+            }
+        }
+    }
+    // What a name means in the visited definition, cached per
+    // (definition, name): each distinct pair scans once no matter how many
+    // sites name it, which keeps the walk linear.
+    let mut resolved: HashMap<(Option<usize>, String), Vec<usize>> = HashMap::new();
+    while let Some((def, binding, requests, depth)) = work.pop() {
+        let Some(members) = by_enclosing.get(&def) else {
+            continue;
+        };
+        for &ci in members {
+            let chain = &facts.chains[ci];
+            // A callee the mux rule can name: a bare `h(…)` or `r.m(…)`.
+            let callee = if chain.links.len() == 1 {
+                match &chain.root {
+                    None => chain.links[0].name.clone(),
+                    Some(root) => format!("{root}.{}", chain.links[0].name),
+                }
+            } else {
+                String::new()
+            };
+            for link in &chain.links {
+                for (k, arg) in link.args.iter().enumerate() {
+                    crate::work::tick(1);
+                    // The request by name (resolving to its own binding), by
+                    // inline construction, or not at all.
+                    let carried = matches!(arg, Arg::Name { text, span }
+                        if winner(facts, &by_scope, &mut resolved, def, text, *span) == Some(binding));
+                    let inline: Vec<usize> = new_requests
+                        .iter()
+                        .copied()
+                        .filter(|&n| {
+                            matches!(arg, Arg::Other { span } if within(facts.chains[n].span, *span))
+                        })
+                        .collect();
+                    if link.name == "ServeHTTP" && carried {
+                        sunk.extend(requests.iter().copied());
+                    }
+                    if link.name == "Do" && carried {
+                        net.extend(requests.iter().copied());
+                    }
+                    if carried {
+                        if with_recorder(
+                            facts,
+                            &by_scope,
+                            &mut resolved,
+                            &recorder_bindings,
+                            &recorder_chains,
+                            def,
+                            link,
+                        ) {
+                            sunk.extend(requests.iter().copied());
+                        }
+                        if mux_handlers.contains(&callee) {
+                            sunk.extend(requests.iter().copied());
+                        }
+                        // Through a same-file helper: a positional bare-name
+                        // argument into a uniquely named plain function.
+                        if depth < MAX_SINK_DEPTH
+                            && chain.root.is_none()
+                            && chain.links.len() == 1
+                            && let Some([target]) = funcs.get(link.name.as_str()).map(Vec::as_slice)
+                            && let Some([param]) =
+                                params.get(&(*target, k as u32)).map(Vec::as_slice)
+                            && visited.insert((Some(*target), *param))
+                        {
+                            work.push((Some(*target), *param, requests.clone(), depth + 1));
+                        }
+                    }
+                    for n in inline {
+                        if with_recorder(
+                            facts,
+                            &by_scope,
+                            &mut resolved,
+                            &recorder_bindings,
+                            &recorder_chains,
+                            def,
+                            link,
+                        ) {
+                            sunk.insert(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sunk.difference(&net)
+        .map(|&n| facts.chains[n].span)
+        .collect()
 }
 
 /// `<root>.<name>(lit, args…)` at `span` — Go's `fmt.Sprintf`, Java's `String.format` — as a
@@ -2103,6 +3986,234 @@ fn format_template(
         parts.push(TemplatePart::Lit { text });
     }
     Some(StrTemplate { parts, span })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Generated clients (contract M6f S6): OpenAPI-generator operation calls and gRPC stub calls.
+// Per-file candidates; the indexer keeps only the ones naming a spec operation or RPC, so the
+// pack stays generous within its allow-list and the join stays strict.
+
+/// The last `.`-segment of a dotted path.
+fn last_segment(path: &str) -> &str {
+    path.rsplit('.').next().unwrap_or(path)
+}
+
+/// An inline construction's type (`new UsersApi()` → `UsersApi`), or `None`.
+fn constructed(root: &str) -> Option<&str> {
+    let root = root.strip_prefix("new ")?;
+    let type_name = root.split('(').next()?.trim();
+    (!type_name.is_empty()).then_some(type_name)
+}
+
+/// A `New*Client` constructor call's service (`NewGreeterClient` → `Greeter`); empty when the
+/// name carries none.
+fn client_service(name: &str) -> Option<&str> {
+    let inner = name.strip_prefix("New")?.strip_suffix("Client")?;
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// A `*Client` type's service (`GreeterClient` → `Greeter`); empty when it carries none.
+fn client_type(name: &str) -> Option<&str> {
+    let inner = name.strip_suffix("Client")?;
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// Framework HTTP client types: `*Client`-shaped but never generated stubs (Angular
+/// `HttpClient`, Spring `WebClient`/`RestClient`). Bindings and constructions of these types
+/// are URL calls (or nothing), never gRPC candidates.
+fn is_framework_client(type_name: &str) -> bool {
+    let simple = type_name.rsplit('.').next().unwrap_or(type_name);
+    matches!(simple, "HttpClient" | "WebClient" | "RestClient")
+}
+
+/// The binding `root` names and its type, when it resolves to one binding.
+fn binding_type<'f>(
+    facts: &'f FileScope<'_>,
+    language: Language,
+    root: &str,
+    at: Span,
+) -> Option<&'f str> {
+    let bi = local_binding(facts, language, root, at)?;
+    Some(facts.bindings[bi].type_name.as_str())
+}
+
+/// OperationId/RPC candidates of one file: single-link calls on `*Api` receivers or
+/// `*Api`-typed bindings (OpenAPI), `*Grpc` roots with 2+ links, inline `new *Stub`
+/// constructions, `*Stub`-typed bindings (gRPC Java), and calls on bindings built by
+/// `New*Client` constructors or `new *Client` (gRPC Go/TypeScript). Multi-link chains name
+/// navigation, not operations — only the last link of a stub chain reads as the RPC.
+/// The spans URL packs already claimed as call sites.
+fn claimed(out: &FileClients) -> HashSet<Span> {
+    out.calls.iter().map(|c| c.span).collect()
+}
+
+fn generated_calls(
+    language: Language,
+    facts: &FileScope<'_>,
+    out: &mut FileClients,
+    claimed: &HashSet<Span>,
+) {
+    for chain in &facts.chains {
+        crate::work::tick(1);
+        // A chain the URL packs already read as a call site is an HTTP client, whatever its
+        // receiver is named (`mailApi.post`, Angular `this.http.post`): never a second,
+        // generated reading of the same call.
+        if claimed.contains(&chain.span) {
+            continue;
+        }
+        let (Some(root), links) = (chain.root.as_deref(), chain.links.as_slice()) else {
+            continue;
+        };
+        let [only] = links else {
+            // A stub chain's last link is its RPC; anything else multi-link is navigation.
+            if matches!(
+                language,
+                Language::Java
+                    | Language::Go
+                    | Language::TypeScript
+                    | Language::Tsx
+                    | Language::JavaScript
+            ) && links.len() >= 2
+                && let Some(last) = links.last()
+                && !last.name.is_empty()
+            {
+                grpc_chain(out, root, last);
+            }
+            continue;
+        };
+        if only.name.is_empty() {
+            continue;
+        }
+        let simplified = constructed(root).unwrap_or(root);
+        let simple = last_segment(simplified.split('(').next().unwrap_or(simplified));
+        // OpenAPI: `*Api` receivers, inline constructions and `*Api`-typed bindings.
+        if simple.ends_with("Api") {
+            out.generated.push(GeneratedCall {
+                kind: GeneratedKind::OpenApi,
+                operation: only.name.clone(),
+                carrier: simplified.to_owned(),
+                span: only.span,
+            });
+            continue;
+        }
+        if matches!(
+            language,
+            Language::Java | Language::TypeScript | Language::Tsx | Language::JavaScript
+        ) && let Some(type_name) = binding_type(facts, language, root, chain.span)
+            && last_segment(type_name).ends_with("Api")
+        {
+            out.generated.push(GeneratedCall {
+                kind: GeneratedKind::OpenApi,
+                operation: only.name.clone(),
+                carrier: root.to_owned(),
+                span: only.span,
+            });
+            continue;
+        }
+        // gRPC Java: `*Stub`-typed bindings and inline `new *Stub`.
+        if language == Language::Java {
+            if let Some(type_name) = binding_type(facts, language, root, chain.span)
+                && last_segment(type_name).ends_with("Stub")
+            {
+                out.generated.push(GeneratedCall {
+                    kind: GeneratedKind::Grpc,
+                    operation: only.name.clone(),
+                    carrier: root.to_owned(),
+                    span: only.span,
+                });
+                continue;
+            }
+            if let Some(type_name) = constructed(root)
+                && last_segment(type_name).ends_with("Stub")
+                && !only.name.ends_with("Stub")
+            {
+                out.generated.push(GeneratedCall {
+                    kind: GeneratedKind::Grpc,
+                    operation: only.name.clone(),
+                    carrier: type_name.to_owned(),
+                    span: only.span,
+                });
+                continue;
+            }
+        }
+        // gRPC Go/TypeScript: bindings whose type is a `*Client` (TypeScript `new`), whose
+        // initialiser calls a `New*Client` constructor, or whose own statement holds exactly
+        // one such constructor (Go `client, _ := pb.NewGreeterClient(conn)`, whose binding
+        // carries no initialiser: the M6b-S4 statement-span association).
+        if matches!(
+            language,
+            Language::Go | Language::TypeScript | Language::Tsx | Language::JavaScript
+        ) && let Some(bi) = local_binding(facts, language, root, chain.span)
+        {
+            let binding = &facts.bindings[bi];
+            let mut service = (!is_framework_client(&binding.type_name))
+                .then(|| client_type(last_segment(&binding.type_name)))
+                .flatten()
+                .map(str::to_owned);
+            if service.is_none() {
+                match &binding.init {
+                    Some(Init::Call { chain: ci }) => {
+                        if let Some(init_chain) = facts.chains.get(*ci) {
+                            crate::work::tick(init_chain.links.len());
+                            for link in init_chain.links.iter().rev() {
+                                if let Some(svc) = client_service(&link.name) {
+                                    service = Some(svc.to_owned());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Init::New { type_name, .. }) if !is_framework_client(type_name) => {
+                        service = client_type(last_segment(type_name)).map(str::to_owned);
+                    }
+                    None => {
+                        let mut found = Vec::new();
+                        for candidate in facts.chains.iter() {
+                            crate::work::tick(1);
+                            if !within(candidate.span, binding.span) {
+                                continue;
+                            }
+                            for link in candidate.links.iter().rev() {
+                                if let Some(svc) = client_service(&link.name) {
+                                    found.push(svc.to_owned());
+                                    break;
+                                }
+                            }
+                        }
+                        found.sort();
+                        found.dedup();
+                        if let [one] = found.as_slice() {
+                            service = Some(one.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(service) = service {
+                out.generated.push(GeneratedCall {
+                    kind: GeneratedKind::Grpc,
+                    operation: only.name.clone(),
+                    carrier: service,
+                    span: only.span,
+                });
+            }
+        }
+    }
+}
+
+/// A multi-link chain's last link as a gRPC RPC when its root names the stub (`*Grpc` roots,
+/// inline `new *Stub` constructions).
+fn grpc_chain(out: &mut FileClients, root: &str, last: &CallLink) {
+    let simplified = constructed(root).unwrap_or(root);
+    let simple = last_segment(simplified.split('(').next().unwrap_or(simplified));
+    if simple.ends_with("Grpc") || simple.ends_with("Stub") {
+        out.generated.push(GeneratedCall {
+            kind: GeneratedKind::Grpc,
+            operation: last.name.clone(),
+            carrier: simplified.to_owned(),
+            span: last.span,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2351,17 +4462,18 @@ mod tests {
                 "axios POST '/charges' base='https://api.stripe.com'",
                 "axios POST '/charges' base='http://orders'",
                 "axios GET '/a' base='http://orders'",
-                // A request config that is not a plain object literal (a variable, a spread)
-                // may hold an `adapter`: not plain, whatever the base (amendment 15).
-                "axios GET '/b' base=? unverified",
-                "axios GET '/c' base=? unverified",
+                // A request config passed by name that names nothing readable
+                // is dynamic (contract M6b S5); a spread it cannot read names
+                // its value for cross-file resolution.
+                "axios GET ? base=? unverified",
+                "axios GET '/c' base=?[cfg] unverified",
                 "axios GET '/d' base='https://x.io' unverified",
                 "axios GET '/e' base=?",
                 "axios GET '/f' base=B",
                 "axios POST '/h'",
-                "axios PUT '/i' base=? unverified",
+                "axios PUT ? base=? unverified",
                 "axios ? ? base=? unverified",
-                "axios ? '/j' base=? unverified",
+                "axios ? ? base=? unverified",
                 "axios DELETE '/k' base='https://api.stripe.com'",
                 "axios GET '/l' base='https://api.stripe.com' instance=shared",
                 "axios GET '/m' instance=shared",
@@ -2394,7 +4506,7 @@ mod tests {
                 "rest_template GET '/v' base='http://visits' unverified",
                 "web_client GET '/v1/charges' base='https://api.stripe.com' unverified",
                 // Two bases: contested, with both as candidates (contract M5 S19 (f)).
-                "web_client GET '/z' base=?['http://a'|'http://b'] unverified",
+                "web_client GET '/z' base='http://b' unverified",
                 "web_client GET '/u' base='http://users' unverified",
             ]
         );
@@ -2504,7 +4616,7 @@ mod tests {
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
-                "axios GET '/orders/1' base='http://orders' unverified",
+                "axios GET '/orders/1' base=?['http://orders'|'https://api.stripe.com'] unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios POST '/orders/1' base='http://orders' unverified",
@@ -2596,7 +4708,7 @@ mod tests {
             calls(Language::TypeScript, ts),
             [
                 "axios GET '/orders/1' base='http://orders'",
-                "axios POST '/orders' base='http://orders' unverified",
+                "axios POST '/orders' base=?['http://orders'|o] unverified",
                 "axios GET '/r'",
             ]
         );
@@ -2665,7 +4777,7 @@ mod tests {
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
-                "axios GET 'http://orders/orders/1' unverified",
+                "axios GET 'http://orders/orders/1' base=cfg unverified",
                 "axios GET 'http://orders/orders/1' unverified",
                 "axios GET 'http://orders/orders/1' unverified",
                 "axios GET '/orders/1' base='http://orders'",
@@ -2969,6 +5081,16 @@ mod tests {
                 .words
                 .is_empty()
         );
+        // Python lockfiles only record what the manifests declare: prose in
+        // them (a `transport` hook word in a description) scans nothing.
+        for lock in ["svc/poetry.lock", "svc/uv.lock"] {
+            assert!(
+                raw_scan(lock, Some("transport adapter hooks dispatcher"))
+                    .words
+                    .is_empty(),
+                "{lock}"
+            );
+        }
         assert!(
             raw_scan("w/package-lock.json", Some("KafkaAuditSink"))
                 .words
@@ -3218,6 +5340,668 @@ mod tests {
         }
     }
 
+    /// Contract M6b S8 (D7): a discovery word in parsed code caps only when a
+    /// use of a known discovery/load-balancer type resolves through imports to
+    /// a discovery package (an explicit single-type import, or an on-demand
+    /// one — unresolved, so capped), or is fully qualified under one. Bare
+    /// words in comments, unused imports, unrelated types from the same
+    /// package tree, static imports and Eureka's keys do not resolve.
+    #[test]
+    fn discovery_resolved_types_through_imports() {
+        use rb_syntax::Language::Java;
+        let resolved = |src: &str| {
+            let facts = extract(Java, src.as_bytes()).unwrap();
+            discovery_resolved(&facts)
+        };
+        for src in [
+            // An imported annotation, used.
+            "import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\n@LoadBalancerClient(name = \"orders\")\nclass Lb {}\n",
+            // Fully qualified, no import (contract M5 S19 (a)'s case, narrowed
+            // to a known type).
+            "@org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient(name = \"orders\")\nclass Lb {}\n",
+            // On-demand: the use cannot be attributed, so capped.
+            "import org.springframework.cloud.loadbalancer.annotation.*;\n@LoadBalancerClient(name = \"orders\")\nclass Lb {}\n",
+            // Ribbon's configuration type, imported and used.
+            "import org.springframework.cloud.netflix.ribbon.RibbonClient;\n@RibbonClient(name = \"orders\")\nclass R {}\n",
+            // A supertype head through its import.
+            "import org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier;\nclass S implements ServiceInstanceListSupplier {}\n",
+            // A declared field type through its import.
+            "import org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier;\nclass S {\nServiceInstanceListSupplier s;\n}\n",
+            // A fully qualified return type (contract M5 S19 (a)'s row).
+            "class Lb {\n@Bean org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier s() { return null; }\n}\n",
+            // Evaluator pass 1: the load-balancer itself routes through
+            // instance suppliers, so its types resolve too.
+            "import org.springframework.cloud.loadbalancer.core.ReactorLoadBalancer;\nclass S {\nReactorLoadBalancer lb;\n}\n",
+            "class S {\norg.springframework.cloud.loadbalancer.core.ReactorLoadBalancer lb;\n}\n",
+        ] {
+            assert!(resolved(src), "{src}");
+        }
+        for src in [
+            // A bare word in a comment resolves to nothing.
+            "// the ribbon loadbalancerclient balances\nclass A {}\n",
+            // An import with no use configures nothing.
+            "import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\nclass A {}\n",
+            // An unrelated type from the same package tree is not evidence.
+            "import org.springframework.cloud.loadbalancer.foo.Other;\n@Other\nclass A {}\n",
+            // Eureka resolves names to registered instances (F1's
+            // convention): not discovery configuration.
+            "import org.springframework.cloud.client.discovery.EnableDiscoveryClient;\n@EnableDiscoveryClient\nclass A {}\n",
+            // `@LoadBalanced` is not a discovery type (contract M5 S19 (a)'s
+            // negative row).
+            "import org.springframework.cloud.client.loadbalancer.LoadBalanced;\nclass B {\n@LoadBalanced Object rt;\n}\n",
+            // A type use cannot come from a static import.
+            "import static org.springframework.cloud.loadbalancer.annotation.*;\n@LoadBalancerClient\nclass A {}\n",
+            // A bare annotation with no import to resolve through.
+            "@LoadBalancerClient\nclass A {}\n",
+            // Evaluator pass 1: the same simple name from another package is
+            // not discovery configuration.
+            "import com.example.LoadBalancerClient;\n@LoadBalancerClient\nclass A {}\n",
+            // Evaluator pass 1: an import that binds nothing used is not
+            // evidence either (unused imports never cap).
+            "import org.springframework.cloud.loadbalancer.annotation.Other;\n@LoadBalancerClient\nclass A {}\n",
+        ] {
+            assert!(!resolved(src), "{src}");
+        }
+    }
+
+    /// Contract M6b S8: the facts rule is Java-only — the known types are
+    /// Java types. A Java-shaped import in another language resolves nothing.
+    #[test]
+    fn discovery_facts_are_java_only() {
+        use rb_syntax::Language::{Java, TypeScript};
+        let java = extract(
+            Java,
+            b"import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\n@LoadBalancerClient\nclass Lb {}\n",
+        )
+        .unwrap();
+        assert!(discovery_facts(Java, &java));
+        let ts = extract(
+            TypeScript,
+            b"import { LoadBalancerClient } from \"org.springframework.cloud.loadbalancer.annotation\";\nconst x: LoadBalancerClient = y;\n",
+        )
+        .unwrap();
+        // The facts alone resolve (the import binds the name) ...
+        assert!(discovery_resolved(&ts));
+        // ... but outside Java they are not evidence.
+        assert!(!discovery_facts(TypeScript, &ts));
+    }
+
+    /// Contract M6b S8: the broad rule against the narrowed rule, side by
+    /// side. Broad is raw-file evidence, parsed-file discovery words, or an
+    /// unresolved Java import; narrowed is raw-file evidence, parsed-file
+    /// single-literal keys, or import-resolved known types. A split (broad
+    /// without narrowed) is what `discovery_lifted` counts downstream.
+    #[test]
+    fn discovery_flags_splits_broad_and_narrowed() {
+        use rb_syntax::Language::{Java, TypeScript};
+        let java_used = extract(
+            Java,
+            b"import org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient;\n@LoadBalancerClient\nclass Lb {}\n",
+        )
+        .unwrap();
+        let java_bare_import = extract(
+            Java,
+            b"import org.springframework.cloud.netflix.ribbon.RibbonClient;\nclass R {}\n",
+        )
+        .unwrap();
+        let ts = extract(TypeScript, b"export const x = 1;\n").unwrap();
+        let java_plain = extract(Java, b"class A {}\n").unwrap();
+        fn files<'a>(
+            j: &'a rb_syntax::FileFacts,
+            t: &'a rb_syntax::FileFacts,
+        ) -> Vec<(rb_syntax::Language, &'a rb_syntax::FileFacts)> {
+            vec![(Java, j), (TypeScript, t)]
+        }
+        // Nothing anywhere: no evidence either way.
+        assert_eq!(
+            discovery_flags(
+                &RawScan::default(),
+                files(&java_plain, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (false, false)
+        );
+        // Resolved types narrow without broadening beyond the import (which
+        // already broadens): both hold.
+        assert_eq!(
+            discovery_flags(
+                &RawScan::default(),
+                files(&java_used, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (true, true)
+        );
+        // A bare import broadens (unresolved) but resolves nothing: split.
+        assert_eq!(
+            discovery_flags(
+                &RawScan::default(),
+                files(&java_bare_import, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (true, false)
+        );
+        // Parsed-file words broaden without resolving: split.
+        assert_eq!(
+            discovery_flags(
+                &RawScan {
+                    discovery_parsed: true,
+                    ..RawScan::default()
+                },
+                files(&java_plain, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (true, false)
+        );
+        // Raw-file evidence stays capped under both rules.
+        assert_eq!(
+            discovery_flags(
+                &RawScan {
+                    discovery: true,
+                    ..RawScan::default()
+                },
+                files(&java_bare_import, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (true, true)
+        );
+        // Single-literal keys narrow without the broad words.
+        assert_eq!(
+            discovery_flags(
+                &RawScan {
+                    discovery_literal: true,
+                    ..RawScan::default()
+                },
+                files(&java_plain, &ts).iter().map(|(l, f)| (*l, *f))
+            ),
+            (false, true)
+        );
+    }
+    /// Contract M6b S8 (D7): JSON-style keys cap parsed-file text only when
+    /// they co-occur inside one brace-delimited span — nested literals count
+    /// (their keys sit inside the outer literal too), while sibling literals
+    /// and brace-free key lists do not combine.
+    #[test]
+    fn single_literal_discovery_needs_one_literal() {
+        for text in [
+            // One flat literal.
+            "const c = { spring: 1, cloud: 2, discovery: 3 };\n",
+            // Nested: every key sits inside the outer literal.
+            "const c = { spring: { cloud: { discovery: { x: 1 } } } };\n",
+            // `SPRING_APPLICATION_JSON` in code (contract M5 S19 (a)'s shape).
+            "process.env.SPRING_APPLICATION_JSON = JSON.stringify({ spring: { cloud: { 'load-balancer': { x: 1 } } } });\n",
+            // Escaped JSON in a string still sits inside the outer braces.
+            "{\"env\":[{\"name\":\"X\",\"value\":\"{\\\"spring\\\":{\\\"cloud\\\":{\\\"consul\\\":{\\\"discovery\\\":{}}}}}\"}]}",
+            // Dotted keys in one literal.
+            "{ \"spring.cloud\": { \"consul\": { \"discovery\": true } } }",
+        ] {
+            assert!(single_literal_discovery(text), "{text}");
+        }
+        for text in [
+            // The same three keys in three sibling literals stay separate.
+            "const a = { spring: 1 };\nconst b = { cloud: 2 };\nconst c = { discovery: 3 };\n",
+            // Key lists without braces are not one literal.
+            "spring:\ncloud:\ndiscovery:\n",
+            // Eureka's keys are not discovery configuration.
+            "{\"eureka\":{\"client\":{\"serviceUrl\":{\"defaultZone\":\"http://r/eureka\"}}}}",
+            // `discovery` as a value is not a key.
+            "{\"name\":\"discovery\",\"cloud\":\"x\"}",
+            // Two of three is not a discovery path.
+            "{ spring: 1, cloud: 2 }",
+        ] {
+            assert!(!single_literal_discovery(text), "{text}");
+        }
+    }
+
+    /// Contract M6b S8, invariant 9: one brace-delimited literal per line
+    /// costs linear work — 4× the literals makes at most 5× the counted
+    /// steps. Counted, not timed, so machine load cannot fail it. The input
+    /// never hits, so the scan runs end to end (an early hit would measure a
+    /// constant).
+    #[test]
+    fn single_literal_discovery_grows_linearly() {
+        fn work(n: usize) -> u64 {
+            let mut text = String::new();
+            for i in 0..n {
+                text.push_str(&format!(
+                    "const c{i} = {{ spring: {{ cloud: {{ x: {i} }} }} }};\n"
+                ));
+            }
+            crate::work::take();
+            assert!(!single_literal_discovery(&text));
+            crate::work::take()
+        }
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// Contract M6b S9: `got`, `ky`, `superagent` and `undici` enter as
+    /// fetch-class sites — module verbs and direct calls with import/require
+    /// gates. `superagent.del` is `DELETE`; a direct `got`/`ky` call reads its
+    /// method from the options like `fetch`. Each row is exactly one site: no
+    /// axios-instance double (the `imported` fallback skips the new modules).
+    #[test]
+    fn fetch_class_library_sites() {
+        let src = "import got from \"got\";\nimport ky from \"ky\";\nimport request from \"superagent\";\nimport { request as urequest } from \"undici\";\nimport * as undici from \"undici\";\nexport async function f() {\n  await got.get(\"http://orders/a\");\n  await got(\"http://orders/b\", { method: \"POST\" });\n  await ky.post(\"http://orders/c\");\n  await ky(\"http://orders/d\");\n  await request.get(\"http://orders/e\");\n  await request(\"DELETE\", \"http://orders/f\");\n  await request.del(\"http://orders/g\");\n  await urequest(\"http://orders/h\", { method: \"POST\" });\n  await undici.request(\"http://orders/i\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "fetch GET 'http://orders/a'",
+                "fetch POST 'http://orders/b'",
+                "fetch POST 'http://orders/c'",
+                "fetch GET 'http://orders/d'",
+                "fetch GET 'http://orders/e'",
+                "fetch DELETE 'http://orders/f'",
+                "fetch DELETE 'http://orders/g'",
+                "fetch POST 'http://orders/h'",
+                "fetch GET 'http://orders/i'",
+            ]
+        );
+        // The controls: a shadowed module name and an unimported name give
+        // nothing, and an undici `Client` is not a fetch-class shape.
+        let shadowed = "import got from \"got\";\nexport async function f(got: any) {\n  await got.get(\"http://orders/a\");\n}\n";
+        assert!(calls(Language::TypeScript, shadowed).is_empty());
+        let plain = "export async function f() {\n  await got.get(\"http://orders/a\");\n}\n";
+        assert!(calls(Language::TypeScript, plain).is_empty());
+        let pooled = "import { Pool } from \"undici\";\nconst pool = new Pool(\"http://orders\");\nexport async function f() {\n  const r = await pool.request({ path: \"/a\", method: \"GET\" });\n}\n";
+        assert!(calls(Language::TypeScript, pooled).is_empty());
+        // A destructured member is a capped site, like the module's own.
+        let destructured = "const { get } = require(\"got\");\nexport async function f() {\n  await get(\"http://orders/x\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, destructured),
+            ["fetch GET 'http://orders/x' unverified"]
+        );
+    }
+
+    /// Evaluator pass 1 (S9): a `superagent` plugin (`.use`) and `got`/`ky`
+    /// interceptor or transport options (`hooks`, `agent`) reconfigure the
+    /// request — capped even on the module. Unreadable (by-name) options cap
+    /// too.
+    #[test]
+    fn evaluator_pass1_reconfigured_fetch_class_calls_are_capped() {
+        let src = "import got from \"got\";\nimport ky from \"ky\";\nimport request from \"superagent\";\nimport { request as urequest } from \"undici\";\nexport async function f(plugin: any, opts: any) {\n  await request.get(\"http://orders/a\").use(plugin);\n  await got(\"http://orders/b\", { hooks: {} });\n  await got.get(\"http://orders/c\", { agent: {} });\n  await ky.post(\"http://orders/d\", { hooks: {} });\n  await ky(\"http://orders/e\", opts);\n  await urequest(\"http://orders/f\", { dispatcher: {} });\n  await got(\"http://orders/g\", { ...opts });\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "fetch GET 'http://orders/a' unverified",
+                "fetch GET 'http://orders/b' unverified",
+                "fetch GET 'http://orders/c' unverified",
+                "fetch POST 'http://orders/d' unverified",
+                "fetch ? 'http://orders/e' unverified",
+                "fetch GET 'http://orders/f' unverified",
+                "fetch GET 'http://orders/g' unverified",
+            ]
+        );
+    }
+
+    /// Contract M6b S9: instances built by `got.extend`, `ky.extend`,
+    /// `ky.create` and `superagent.agent` are configured carriers — their
+    /// calls stitch, but never above `heuristic`.
+    #[test]
+    fn configured_instances_are_capped() {
+        let src = "import got from \"got\";\nimport ky from \"ky\";\nimport request from \"superagent\";\nconst api = got.extend({ prefixUrl: \"http://orders\" });\nconst kapi = ky.create({ prefixUrl: \"http://orders\" });\nconst agent = request.agent();\nexport async function f() {\n  await api.get(\"/a\");\n  await kapi.post(\"/b\");\n  await agent.get(\"http://orders/c\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "fetch GET '/a' unverified",
+                "fetch POST '/b' unverified",
+                "fetch GET 'http://orders/c' unverified",
+            ]
+        );
+        // A non-verb on a carrier is no site.
+        let other = "import got from \"got\";\nconst api = got.extend({});\nexport async function f() {\n  await api.unknown(\"/a\");\n}\n";
+        assert!(calls(Language::TypeScript, other).is_empty());
+    }
+
+    /// Contract M6d S7: `requests` and `httpx` enter as fetch-class sites —
+    /// module verbs and `request(method, url)` dispatchers behind import
+    /// gates, with the same verb allow-list on both. A shadowed or
+    /// unimported module name and an unlisted member give nothing.
+    #[test]
+    fn requests_httpx_module_sites() {
+        let src = "import requests\nimport httpx\n\ndef f(URL, METHOD):\n    requests.get(\"http://orders/a\")\n    requests.post(URL, headers=H)\n    requests.request(\"DELETE\", \"http://orders/b\")\n    requests.request(METHOD, URL)\n    httpx.get(\"http://orders/c\")\n    httpx.request(\"post\", \"http://orders/d\")\n    httpx.get(url=\"http://orders/e\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch GET 'http://orders/a'",
+                "fetch POST URL",
+                "fetch DELETE 'http://orders/b'",
+                "fetch ? URL",
+                "fetch GET 'http://orders/c'",
+                "fetch POST 'http://orders/d'",
+                "fetch GET 'http://orders/e'",
+            ]
+        );
+        // The controls: a shadowed module name, an unimported name, an
+        // unlisted member, a missing URL and a residue library give nothing.
+        let shadowed =
+            "import requests\n\ndef f(requests):\n    requests.get(\"http://orders/a\")\n";
+        assert!(calls(Language::Python, shadowed).is_empty());
+        let plain = "def f():\n    requests.get(\"http://orders/a\")\n";
+        assert!(calls(Language::Python, plain).is_empty());
+        let other = "import requests\n\ndef f():\n    requests.fetch(\"http://orders/a\")\n    requests.get()\n";
+        assert!(calls(Language::Python, other).is_empty());
+        let residue =
+            "import urllib3\n\ndef f():\n    urllib3.request(\"GET\", \"http://orders/a\")\n";
+        assert!(calls(Language::Python, residue).is_empty());
+        // A from-imported verb shadowed by a parameter gives nothing either.
+        let shadowed_from =
+            "from requests import get\n\ndef f(get):\n    get(\"http://orders/a\")\n";
+        assert!(calls(Language::Python, shadowed_from).is_empty());
+    }
+
+    /// Contract M6d S7: session receivers — a name directly bound to
+    /// `requests.Session()`, `httpx.Client(...)` or `httpx.AsyncClient(...)`
+    /// — take the same verbs, with `base_url` folded as the base. Every
+    /// carrier site caps at `heuristic`, like the configured carriers of the
+    /// TS fetch class.
+    #[test]
+    fn requests_httpx_session_sites_fold_base_url() {
+        let src = "import requests\nimport httpx\n\ns = requests.Session()\nc = httpx.Client(base_url=\"http://orders\")\na = httpx.AsyncClient(base_url=BASE)\n\ndef f(URL):\n    s.get(\"http://orders/a\")\n    s.request(\"post\", URL)\n    c.get(\"/b\")\n    c.post(\"/c\", json=J)\n    a.delete(\"/d\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch GET 'http://orders/a' unverified",
+                "fetch POST URL unverified",
+                "fetch GET '/b' base='http://orders' unverified",
+                "fetch POST '/c' base='http://orders' unverified",
+                "fetch DELETE '/d' base=BASE unverified",
+            ]
+        );
+    }
+
+    /// Contract M6d S7: aliased modules, from-imported verbs and
+    /// constructors, and anonymous inline instances (`Session().post(…)`).
+    #[test]
+    fn requests_httpx_aliases_from_imports_and_inline_instances() {
+        let src = "import requests as rq\nfrom httpx import Client, get as hget\nfrom requests import Session, get as rget\n\ndef f(URL):\n    rq.put(\"http://orders/a\")\n    hget(\"http://orders/b\")\n    rget(URL)\n    Session().post(\"http://orders/c\")\n    Client(base_url=\"http://orders\").delete(\"/d\")\n    rq.api.get(\"http://orders/e\")\n    rq.sessions.Session().head(\"http://orders/f\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch PUT 'http://orders/a'",
+                "fetch GET 'http://orders/b'",
+                "fetch GET URL",
+                "fetch POST 'http://orders/c' unverified",
+                "fetch DELETE '/d' base='http://orders' unverified",
+                "fetch GET 'http://orders/e'",
+                "fetch HEAD 'http://orders/f' unverified",
+            ]
+        );
+    }
+
+    /// Contract M6d S7, evaluator-pass-1 parity: configuration surfaces that
+    /// may reroute cap the site. `requests` hooks are response-only, so they
+    /// stay plain; `httpx` transports, mounts, event hooks and extensions,
+    /// unknown keys and spreads cap — as do all carrier sites. A `url`
+    /// keyword reads like a positional one, including on dispatchers.
+    #[test]
+    fn requests_httpx_reconfigured_calls_are_capped() {
+        let src = "import requests\nimport httpx\n\ns = requests.Session()\nc = httpx.Client(base_url=\"http://orders\", transport=T)\nc2 = httpx.Client(base_url=\"http://orders\", unknown_opt=1)\n\ndef f(opts, H, E):\n    requests.get(\"http://orders/a\", hooks=H)\n    requests.get(\"http://orders/b\", unknown_opt=1)\n    requests.get(\"http://orders/c\", **opts)\n    httpx.get(\"http://orders/d\", extensions=E)\n    s.get(\"http://orders/e\")\n    c.get(\"/f\")\n    c2.get(\"/g\")\n    requests.request(\"GET\", url=\"http://orders/h\")\n    httpx.request(method=\"POST\", url=\"http://orders/i\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch GET 'http://orders/a'",
+                "fetch GET 'http://orders/b' unverified",
+                "fetch GET 'http://orders/c' unverified",
+                "fetch GET 'http://orders/d' unverified",
+                "fetch GET 'http://orders/e' unverified",
+                "fetch GET '/f' base='http://orders' unverified",
+                "fetch GET '/g' base='http://orders' unverified",
+                "fetch GET 'http://orders/h'",
+                "fetch POST 'http://orders/i'",
+            ]
+        );
+    }
+
+    /// Contract M6d S7 boundaries: `send`, `build_request`, header/mount
+    /// calls and non-verb members are no sites; a factory-built session, a
+    /// member receiver and an unbound `Session` reference wait for S8.
+    #[test]
+    fn requests_httpx_non_sites_stay_out() {
+        let src = "import requests\nimport httpx\n\ns = requests.Session()\nc = httpx.Client(base_url=\"http://orders\")\nplain = requests.Session\nmade = get_session()\n\ndef f(prep, url):\n    c.send(prep)\n    c.build_request(\"GET\", url)\n    s.headers.update({\"a\": \"b\"})\n    s.mount(\"http://\", adapter)\n    s.close()\n    c.unknown(url)\n    plain.get(url)\n    made.get(url)\n    self.session.get(url)\n";
+        assert!(calls(Language::Python, src).is_empty());
+        // A from-imported constructor shadowed by a rebinding builds nothing.
+        let shadowed_ctor = "from httpx import Client\nClient = make_client()\n\ndef f():\n    Client(base_url=\"http://orders\").get(\"/a\")\n";
+        assert!(calls(Language::Python, shadowed_ctor).is_empty());
+    }
+
+    /// Contract M6d S8: `self.` member receivers — a member bound once to a
+    /// session construction — resolve like plain sessions (capped), with the
+    /// constructor's `base_url` as the base. Anything else on `self.` stays
+    /// out.
+    #[test]
+    fn self_session_members_resolve() {
+        let src = "import requests\nimport httpx\n\nclass C:\n    def __init__(self):\n        self.session = requests.Session()\n        self.client = httpx.Client(base_url=\"http://orders\")\n        self.repo = Repo()\n    def run(self, url):\n        self.session.get(url)\n        self.client.post(\"/a\", json=J)\n        self.repo.get(url)\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            [
+                "fetch GET url unverified",
+                "fetch POST '/a' base='http://orders' unverified",
+            ]
+        );
+        // A bare annotation plus an assignment resolves to the construction.
+        let annotated = "import httpx\n\nclass D:\n    cli: httpx.Client\n    def __init__(self):\n        self.cli = httpx.Client(base_url=\"http://orders\")\n    def run(self):\n        self.cli.get(\"/a\")\n";
+        assert_eq!(
+            calls(Language::Python, annotated),
+            ["fetch GET '/a' base='http://orders' unverified"]
+        );
+    }
+
+    /// Contract M6d S8: a session-typed parameter or member (FastAPI
+    /// `Depends` shape) counts as a capped receiver when its type names a
+    /// session constructor under an imported module; without the import, or
+    /// untyped, it stays dynamic. Subscripted annotations (`Optional[.]`,
+    /// unions) are out of scope — the extractor keeps no Python type
+    /// arguments.
+    #[test]
+    fn session_typed_parameters_count_when_imported() {
+        let src = "import httpx\n\nclass C:\n    def run(self, s: httpx.Client, u):\n        s.get(\"http://a\")\n        u.get(\"http://c\")\n";
+        assert_eq!(
+            calls(Language::Python, src),
+            ["fetch GET 'http://a' unverified"]
+        );
+        let unimported =
+            "class C:\n    def run(self, s: httpx.Client):\n        s.get(\"http://a\")\n";
+        assert!(calls(Language::Python, unimported).is_empty());
+        // A bare class-level annotation (injected elsewhere) resolves too.
+        let member_ann = "import httpx\n\nclass C:\n    s: httpx.Client\n    def run(self):\n        self.s.get(\"http://a\")\n";
+        assert_eq!(
+            calls(Language::Python, member_ann),
+            ["fetch GET 'http://a' unverified"]
+        );
+    }
+
+    /// Contract M6d S8 boundaries: a factory-built or twice-bound member, a
+    /// `None` member, a deeper path, an unknown member and a bare name with
+    /// only a member present stay dynamic.
+    #[test]
+    fn ambiguous_members_stay_dynamic() {
+        let src = "import requests\nimport httpx\n\ndef make_session():\n    return requests.Session()\n\nclass C:\n    def __init__(self, flag):\n        if flag:\n            self.s = requests.Session()\n        else:\n            self.s = make_session()\n        self.n = None\n    def run(self, url):\n        self.s.get(url)\n        self.n.get(url)\n        self.a.b.get(url)\n        self.missing.get(url)\n        session.get(url)\n";
+        assert!(calls(Language::Python, src).is_empty());
+        // A member of another class, a foreign receiver and a construction
+        // shadowed by an annotation stay out.
+        let other = "import requests\nimport httpx\n\nclass A:\n    def __init__(self):\n        self.s = requests.Session()\nclass B:\n    def run(self, url, helper, t):\n        self.s.get(url)\n        helper.session.get(url)\n";
+        assert!(calls(Language::Python, other).is_empty());
+        let annotated = "import httpx\n\ndef make_client():\n    return httpx.Client()\n\ndef f(url):\n    t: httpx.Client = make_client()\n    t.get(url)\n";
+        assert!(calls(Language::Python, annotated).is_empty());
+    }
+
+    /// S13: n `requests`/`httpx` call sites (module verbs, session verbs)
+    /// cost linear work: 4× the sites makes at most 5× the counted steps.
+    /// Counted, not timed, so machine load cannot fail it.
+    #[test]
+    fn python_client_sites_grow_linearly() {
+        let source = |n: usize| {
+            let mut src =
+                "import requests\nimport httpx\ns = requests.Session()\nc = httpx.Client()\n\ndef f():\n"
+                    .to_owned();
+            for i in 0..n {
+                src.push_str(&format!(
+                    "    requests.get(\"http://a/{i}\")\n    s.post(\"http://b/{i}\")\n    c.put(\"http://c/{i}\")\n"
+                ));
+            }
+            src
+        };
+        let work = |n: usize| {
+            let found = calls(Language::Python, &source(n));
+            assert_eq!(found.len(), 3 * n);
+            crate::work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// S13: n methods calling `self.` session members cost linear work: 4×
+    /// the methods makes at most 5× the counted steps. Counted, not timed.
+    #[test]
+    fn python_member_sites_grow_linearly() {
+        let source = |n: usize| {
+            let mut src = "import requests\nimport httpx\n\nclass C:\n    def __init__(self):\n        self.client = httpx.Client(base_url=\"http://orders\")\n        self.session = requests.Session()\n"
+                .to_owned();
+            for i in 0..n {
+                src.push_str(&format!(
+                    "    def m{i}(self):\n        self.client.get(\"http://a/{i}\")\n        self.session.post(\"http://b/{i}\")\n"
+                ));
+            }
+            src
+        };
+        let work = |n: usize| {
+            let found = calls(Language::Python, &source(n));
+            assert_eq!(found.len(), 2 * n);
+            crate::work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// Contract M6b S9 (D8): Angular `HttpClient` calls enter capped at
+    /// `heuristic` — injected (a constructor parameter property or field) or
+    /// local, verbs and `request(method, url)`. Without the
+    /// `@angular/common/http` import the same shape gives nothing (it may be
+    /// the repository's own type of that name).
+    #[test]
+    fn http_client_sites_are_capped() {
+        let src = "import { HttpClient } from \"@angular/common/http\";\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.get(\"http://orders/a\");\n  }\n  send(x: string) {\n    return this.http.post(\"http://orders/b\", { x });\n  }\n  remove(id: string) {\n    return this.http.request(\"delete\", \"http://orders/c\");\n  }\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "fetch GET 'http://orders/a' unverified",
+                "fetch POST 'http://orders/b' unverified",
+                "fetch DELETE 'http://orders/c' unverified",
+            ]
+        );
+        let own = "class HttpClient {\n  get(u: string) { return u; }\n}\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.get(\"http://orders/a\");\n  }\n}\n";
+        assert!(calls(Language::TypeScript, own).is_empty());
+        // An import from the module that does not name `HttpClient` gates
+        // nothing out: the type may still be the repository's own.
+        let other_import = "import { HttpHeaders } from \"@angular/common/http\";\nclass HttpClient {\n  get(u: string) { return u; }\n}\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.get(\"http://orders/a\");\n  }\n}\n";
+        assert!(calls(Language::TypeScript, other_import).is_empty());
+        // A `request` with no URL is no site; an unknown verb is no site.
+        let nourl = "import { HttpClient } from \"@angular/common/http\";\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.request(\"delete\");\n  }\n  jsonp(url: string) {\n    return this.http.jsonp(url, \"cb\");\n  }\n}\n";
+        assert!(calls(Language::TypeScript, nourl).is_empty());
+    }
+
+    /// Contract M6b S9: the axios member forms enter capped at `heuristic` —
+    /// destructured verbs (from the module or a `require`), an inline
+    /// `require("axios")` chain, and calls through `axios.default`.
+    #[test]
+    fn axios_member_forms_are_capped() {
+        let src = "import axios from \"axios\";\nconst { get } = axios;\nconst { post } = require(\"axios\");\nexport async function f() {\n  await get(\"/a\");\n  await post(\"/b\", { x: 1 });\n  await require(\"axios\").put(\"/c\", { x: 1 });\n  await axios.default.delete(\"/d\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios GET '/a' unverified",
+                "axios POST '/b' unverified",
+                "axios PUT '/c' unverified",
+                "axios DELETE '/d' unverified",
+            ]
+        );
+        // The control: a destructured verb of another module is no axios member.
+        let other = "import { get } from \"./api\";\nexport async function f() {\n  await get(\"/a\");\n}\n";
+        assert!(calls(Language::TypeScript, other).is_empty());
+        // Evaluator pass 1: a verb destructured from a local instance reads
+        // the instance's base (capped: the destructured carrier has no Gate-A
+        // proof).
+        let inst = "import axios from \"axios\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nconst { get } = api;\nexport async function f() {\n  await get(\"/x\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, inst),
+            ["axios GET '/x' base='http://orders' unverified"]
+        );
+    }
+
+    /// Contract M6b S9: the repository-wide token scan covers the new
+    /// libraries' configuration surfaces. Imports, plain calls and configured
+    /// instances (allow-listed, per-site capped) are clean; any other role of
+    /// a module name, and any `HttpClient` provider/interceptor use, hooks
+    /// `fetch`.
+    #[test]
+    fn global_hooks_of_new_libraries() {
+        use ClientKind::Fetch;
+        let hooks = |src: &str| {
+            global_hooks(
+                Language::TypeScript,
+                &extract(Language::TypeScript, src.as_bytes()).unwrap(),
+            )
+        };
+        for clean in [
+            "import got from \"got\";\ngot.get(\"/a\");\ngot(\"/b\");\nconst api = got.extend({});\napi.get(\"/c\");\nfor await (const r of got.paginate(\"/d\")) {}\n",
+            "import ky from \"ky\";\nimport kyU from \"ky-universal\";\nky.post(\"/a\");\nconst k = ky.create({});\nk.get(\"/b\");\nkyU.get(\"/c\");\n",
+            "import request from \"superagent\";\nrequest.get(\"/a\");\nrequest(\"DELETE\", \"/b\");\nconst agent = request.agent();\nagent.get(\"/c\");\n",
+            "import { request } from \"undici\";\nimport * as undici from \"undici\";\nrequest(\"/a\");\nundici.request(\"/b\");\n",
+            "import { HttpClient } from \"@angular/common/http\";\nclass S {\n  constructor(private http: HttpClient) {}\n  run() {\n    return this.http.get(\"/a\");\n  }\n}\n",
+            // A destructured member's object, and a request member read to
+            // alias it, reconfigure nothing (contract M6b S9).
+            "import axios from \"axios\";\nconst { get } = axios;\nget(\"/a\");\n",
+            "import axios from \"axios\";\nconst get = axios.get;\nget(\"/a\");\n",
+            "import got from \"got\";\nconst { get } = require(\"got\");\nget(\"/a\");\n",
+            // Reading a request member to alias it reconfigures nothing.
+            "import got from \"got\";\nconst get = got.get;\nget(\"/a\");\n",
+        ] {
+            assert!(hooks(clean).is_empty(), "{clean}");
+        }
+        for tainted in [
+            // A bare configuration reference stands in for its use.
+            "import got from \"got\";\nconst e = got.extend;\n",
+            "const ky = require(\"ky\");\nmodule.exports = { ky };\n",
+            // `superagent` re-exported or aliased.
+            "import request from \"superagent\";\nexport { request };\n",
+            "import kyU from \"ky-universal\";\nexport { kyU };\n",
+            // HttpClient providers and interceptors configure every client.
+            "import { HTTP_INTERCEPTORS } from \"@angular/common/http\";\nexport const providers = [{ provide: HTTP_INTERCEPTORS, useClass: X, multi: true }];\n",
+            "import { HttpInterceptor } from \"@angular/common/http\";\nexport class AuthInterceptor implements HttpInterceptor {}\n",
+            "import { provideHttpClient, withInterceptors } from \"@angular/common/http\";\nexport const providers = [provideHttpClient(withInterceptors([x]))];\n",
+        ] {
+            assert_eq!(hooks(tainted), [Fetch], "{tainted}");
+        }
+    }
+
+    /// Contract M6b S9: unparsed files taint `fetch` on the new libraries'
+    /// words; prose and lockfiles stay inert, and `request` alone (far too
+    /// common) never taints.
+    #[test]
+    fn raw_scan_new_library_words() {
+        use ClientKind::Fetch;
+        for (path, text) in [
+            ("w/x.vue", "import got from 'got'; got.get(u);"),
+            ("w/x.svelte", "import ky from 'ky'; ky.post(u);"),
+            ("w/x.html", "const request = require('superagent');"),
+            ("w/x.js", "const { request } = require('undici');"),
+        ] {
+            assert_eq!(
+                raw_scan(path, Some(text))
+                    .hooks
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                [Fetch],
+                "{path}: {text}"
+            );
+        }
+        for (path, text) in [
+            ("w/x.js", "request.get(u);"),
+            ("README.md", "got ky superagent undici"),
+            ("w/package-lock.json", "\"node_modules/got\""),
+        ] {
+            assert!(
+                raw_scan(path, Some(text)).hooks.is_empty(),
+                "{path}: {text}"
+            );
+        }
+    }
+
     /// Contract M5 S19 (b) (M4a open item 22 (c)): XML comments are read, so a hook in a
     /// comment taints, and so does one after a `<!--` inside CDATA (which used to hide it up to
     /// the next `-->`).
@@ -3247,12 +6031,100 @@ mod tests {
         );
     }
 
+    /// Contract M6b S5: an `axios.create` whose last base-setting entry is
+    /// a spread is contested, like a request config; a spread before the
+    /// last `baseURL` is shadowed (later properties win in the literal).
+    /// `create(cfg)` reads a same-file object or URL it names, and states
+    /// no base otherwise (as before).
+    #[test]
+    fn axios_create_spread_bases() {
+        let src = "import axios from \"axios\";\nimport { extOpts } from \"./opts\";\nconst API = \"http://gateway\";\nconst local = { baseURL: \"http://orders\" };\nexport async function f() {\n  const spreadOnly = axios.create({ ...local });\n  const shadowed = axios.create({ ...local, baseURL: \"http://a\" });\n  const overriding = axios.create({ baseURL: \"http://b\", ...local });\n  const imported = axios.create({ ...extOpts });\n  const byName = axios.create(local);\n  const byString = axios.create(API);\n  const byParam = axios.create(cfg);\n  await spreadOnly.get(\"/s\");\n  await shadowed.get(\"/s\");\n  await overriding.get(\"/o\");\n  await imported.get(\"/i\");\n  await byName.get(\"/n\");\n  await byString.get(\"/u\");\n  await byParam.get(\"/p\");\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios GET '/s' base=?['http://orders'] unverified",
+                "axios GET '/s' base='http://a' unverified",
+                "axios GET '/o' base=?['http://b'|'http://orders'] unverified",
+                "axios GET '/i' base=?[extOpts] unverified",
+                "axios GET '/n' base='http://orders' unverified",
+                "axios GET '/u' base=API unverified",
+                "axios GET '/p' base=cfg unverified",
+            ]
+        );
+    }
+
+    /// Contract M6b S5: a config passed by name reads the object it names —
+    /// `axios(cfg)` parses `url`/`method`/`baseURL` from its entries, and a
+    /// request config in an object binding replaces the instance's base. A
+    /// name that folds to a URL stays a URL; one that names nothing readable
+    /// is dynamic, never suffix-matched on its tail.
+    #[test]
+    fn axios_by_name_configs() {
+        let src = "import axios from \"axios\";\nconst api = axios.create({ baseURL: \"http://orders\" });\nconst API = \"http://gateway/orders/1\";\nconst cfg = { url: \"/x\", method: \"post\", baseURL: \"http://pay\" };\nconst rcfg = { url: \"/r\", method: \"delete\" };\nconst headers = { headers: {} };\nexport async function f(params) {\n  await axios(cfg);\n  await axios(API);\n  await axios(params);\n  await axios.request(rcfg);\n  await axios.request(params);\n  await api.get(\"/h\", headers);\n  await api.get(\"/u\", API);\n  await api.get(\"/p\", params);\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios POST '/x' base='http://pay'",
+                "axios GET API",
+                "axios GET params",
+                "axios DELETE '/r'",
+                "axios ? ? base=? unverified",
+                "axios GET '/h' base='http://orders'",
+                "axios GET '/u' base=? unverified",
+                "axios GET ? base=? unverified",
+            ]
+        );
+    }
+
+    /// Contract M6b S5: a spread the file cannot read names its value for
+    /// the indexer, which folds it through a uniquely resolved declaration
+    /// (a same-file object is expanded here as before).
+    #[test]
+    fn object_spread_names_unreadable_forms() {
+        let src = "import axios from \"axios\";\nimport { extOpts } from \"./opts\";\nconst local = { baseURL: \"http://orders\" };\nexport async function f(cfg) {\n  await axios.get(\"/a\", { ...local });\n  await axios.get(\"/b\", { ...extOpts });\n  await axios.get(\"/c\", { ...cfg });\n  await axios.get(\"/d\", { ...missing });\n}\n";
+        assert_eq!(
+            calls(Language::TypeScript, src),
+            [
+                "axios GET '/a' base=?['http://orders'] unverified",
+                "axios GET '/b' base=?[extOpts] unverified",
+                "axios GET '/c' base=?[cfg] unverified",
+                "axios GET '/d' base=?[missing] unverified",
+            ]
+        );
+    }
+
+    /// Contract M6b S5: Spring configuring statements are ordered by source
+    /// position, later wins. An unreadable statement anywhere keeps the
+    /// agreed-or-contested rule (its value could be anywhere).
+    #[test]
+    fn spring_configuring_statements_later_wins() {
+        let two = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C {\n  private final RestTemplate rt = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  C() { rt.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://users\")); }\n  String m() { return rt.getForObject(\"/x\", String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, two),
+            ["rest_template GET '/x' base='https://users' unverified"]
+        );
+        // One statement: as before.
+        let one = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nclass C {\n  private final RestTemplate rt = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  String m() { return rt.getForObject(\"/x\", String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, one),
+            ["rest_template GET '/x' base='http://orders' unverified"]
+        );
+        // An unreadable statement keeps the contested rule.
+        let mixed = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C {\n  private final RestTemplate rt;\n  C(RestTemplateBuilder b) { this.rt = b.build(); }\n  void n() { rt.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://users\")); }\n  String m() { return rt.getForObject(\"/x\", String.class); }\n}\n";
+        assert_eq!(
+            calls(Language::Java, mixed),
+            ["rest_template GET '/x' base=?['https://users'] unverified"]
+        );
+    }
+
     /// Contract M5 S19 (f) (M4a open item 21, part): a base that cannot be decided names the
     /// values the file states it may take. An axios request config whose last base-setting
     /// entry is a spread: the spread's object literal (one held by a binding, followed through
-    /// nested spreads) and the `baseURL` before it; a Spring client configured with two
-    /// bases: both. An unreadable config (`cfg`, t25) or a spread of a parameter names none,
-    /// and a `baseURL` after the spread decides the base.
+    /// nested spreads) and the `baseURL` before it. Contract M6b S5: a spread nothing here
+    /// resolves names its value for the indexer (which folds it through its unique
+    /// declaration), and Spring configuring statements are ordered by source position instead
+    /// (later wins), so `j07` now reads the setter's base while the contested rule stays for
+    /// any unreadable statement.
     #[test]
     fn contested_bases_name_their_candidates() {
         let ts = "import axios from \"axios\";\nconst api10 = axios.create({ baseURL: \"http://orders\" });\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst nested = { ...stripeOpts, timeout: 1 };\nconst ordersOpts = { baseURL: \"http://orders\" };\nconst self = { ...self };\nexport async function f(cfg) {\n  await api10.get(\"/orders/1\", { ...stripeOpts });\n  await api10.get(\"/orders/1\", cfg);\n  await api10.get(\"/orders/1\", { baseURL: \"http://orders\", ...stripeOpts });\n  await api10.get(\"/orders/1\", { ...stripeOpts, baseURL: \"http://orders\" });\n  await api10.get(\"/orders/1\", { ...nested });\n  await api10.get(\"/orders/1\", { ...ordersOpts });\n  await api10.get(\"/orders/1\", { ...self });\n  await api10.get(\"/orders/1\", { ...cfg });\n}\n";
@@ -3260,21 +6132,19 @@ mod tests {
             calls(Language::TypeScript, ts),
             [
                 "axios GET '/orders/1' base=?['https://api.stripe.com'] unverified",
-                "axios GET '/orders/1' base=? unverified",
+                "axios GET ? base=? unverified",
                 "axios GET '/orders/1' base=?['http://orders'|'https://api.stripe.com'] unverified",
                 "axios GET '/orders/1' base='http://orders' unverified",
                 "axios GET '/orders/1' base=?['https://api.stripe.com'] unverified",
                 "axios GET '/orders/1' base=?['http://orders'] unverified",
-                "axios GET '/orders/1' base=? unverified",
-                "axios GET '/orders/1' base=? unverified",
+                "axios GET '/orders/1' base=?[self] unverified",
+                "axios GET '/orders/1' base=?[cfg] unverified",
             ]
         );
         let j07 = "package p;\nimport org.springframework.web.client.RestTemplate;\nimport org.springframework.boot.web.client.RestTemplateBuilder;\nimport org.springframework.web.util.DefaultUriBuilderFactory;\nclass C7 {\n  private final RestTemplate rt7 = new RestTemplateBuilder().rootUri(\"http://orders\").build();\n  C7() { rt7.setUriTemplateHandler(new DefaultUriBuilderFactory(\"https://api.stripe.com\")); }\n  String j07() { return rt7.getForObject(\"/orders/1\", String.class); }\n}\n";
         assert_eq!(
             calls(Language::Java, j07),
-            [
-                "rest_template GET '/orders/1' base=?['http://orders'|'https://api.stripe.com'] unverified"
-            ]
+            ["rest_template GET '/orders/1' base='https://api.stripe.com' unverified"]
         );
     }
 
@@ -3345,5 +6215,267 @@ mod tests {
         );
         let no_import = src.replace("\t\"net/http\"\n", "");
         assert!(calls(Language::Go, &no_import).is_empty());
+    }
+
+    /// The span of `needle`'s first occurrence, derived from the source, never
+    /// hand-counted (single-line needles only; columns are bytes, as extracted).
+    fn span_of(src: &str, needle: &str) -> Span {
+        let start = src.find(needle).unwrap();
+        let row = src[..start].matches('\n').count() as i32;
+        let line_start = src[..start].rfind('\n').map_or(0, |i| i + 1);
+        let end = start + needle.len();
+        assert!(
+            !src[start..end].contains('\n'),
+            "needle spans lines: {needle}"
+        );
+        [
+            row,
+            (start - line_start) as i32,
+            row,
+            (end - line_start) as i32,
+        ]
+    }
+
+    /// Spans of the file's `NewRequest` call chains whose request value reaches
+    /// an in-process sink (contract M6b S4).
+    fn in_process(src: &str) -> BTreeSet<Span> {
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        clients(Language::Go, &facts).in_process
+    }
+
+    /// Contract M6b S4: a request passed to `ServeHTTP` never stitches,
+    /// whether the handler is a `HandlerFunc` value (mattermost's API handler
+    /// tests) or a mux (its web test). A request the file sends over the
+    /// network (`Do`) is no in-process site.
+    #[test]
+    fn go_in_process_serve_http() {
+        let src = "package main\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n)\nfunc outgoing() {\n\treq, err := http.NewRequest(\"GET\", \"/api\", nil)\n\t_ = err\n\thttpRecorder := httptest.NewRecorder()\n\thandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})\n\thandler.ServeHTTP(httpRecorder, req)\n}\nfunc web() {\n\treq, err := http.NewRequest(\"GET\", \"/web\", nil)\n\t_ = err\n\tres := httptest.NewRecorder()\n\trouter.ServeHTTP(res, req)\n\t_ = res\n}\nfunc live(client *http.Client) {\n\treq, err := http.NewRequest(\"GET\", \"http://orders/orders/1\", nil)\n\t_ = err\n\tclient.Do(req)\n}\n";
+        // Each site has its own URL, so each span is addressed unambiguously.
+        assert_eq!(
+            in_process(src),
+            BTreeSet::from([
+                span_of(src, "http.NewRequest(\"GET\", \"/api\", nil)"),
+                span_of(src, "http.NewRequest(\"GET\", \"/web\", nil)"),
+            ]),
+            "{:?}",
+            in_process(src)
+        );
+    }
+
+    /// Contract M6b S4: a request handed to a handler alongside an
+    /// `httptest` recorder never stitches (mattermost's image-proxy tests,
+    /// `proxy.GetImage(recorder, request, …)`). A direct call with no
+    /// recorder in it is no sink (mattermost's CSRF test passes its request
+    /// to a method with no recorder; only its empty URL excludes it).
+    #[test]
+    fn go_in_process_recorder_co_pass() {
+        let src = "package main\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n)\nfunc image() {\n\trecorder := httptest.NewRecorder()\n\trequest, _ := http.NewRequest(http.MethodGet, \"/image.png\", nil)\n\tproxy.GetImage(recorder, request, \"http://mock/image.png\")\n\t_ = recorder\n}\nfunc check() {\n\tr, _ := http.NewRequest(http.MethodGet, \"/csrf\", nil)\n\tif !checkToken(r) {\n\t}\n}\nfunc checkToken(r *http.Request) bool {\n\treturn true\n}\n";
+        assert_eq!(
+            in_process(src),
+            BTreeSet::from([span_of(
+                src,
+                "http.NewRequest(http.MethodGet, \"/image.png\", nil)"
+            )]),
+            "{:?}",
+            in_process(src)
+        );
+    }
+
+    /// Contract M6b S4: a request passed to a handler registered on a
+    /// `ServeMux` never stitches. Registration is file-global: any direct
+    /// call of the registered handler in the file is in-process (the handler
+    /// runs in-process with that request). Without the registration the same
+    /// direct call is no sink.
+    #[test]
+    fn go_in_process_mux_registered_handler() {
+        let served = "package main\nimport \"net/http\"\nfunc echo(w http.ResponseWriter, r *http.Request) {}\nfunc served() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/echo\", echo)\n\treq, _ := http.NewRequest(\"POST\", \"http://orders/echo\", nil)\n\techo(nil, req)\n}\n";
+        assert_eq!(
+            in_process(served),
+            BTreeSet::from([span_of(
+                served,
+                "http.NewRequest(\"POST\", \"http://orders/echo\", nil)"
+            )]),
+            "{:?}",
+            in_process(served)
+        );
+        let direct = "package main\nimport \"net/http\"\nfunc echo(w http.ResponseWriter, r *http.Request) {}\nfunc direct() {\n\treq, _ := http.NewRequest(\"POST\", \"http://orders/direct\", nil)\n\techo(nil, req)\n}\n";
+        assert!(in_process(direct).is_empty(), "{:?}", in_process(direct));
+    }
+
+    /// Contract M6b S4, residue: a request sent both in-process and over the
+    /// network keeps its network edge — the sink marks, the `Do` unmarks.
+    #[test]
+    fn go_in_process_network_send_keeps_the_edge() {
+        let src = "package main\nimport \"net/http\"\nfunc both(client *http.Client, mux *http.ServeMux) {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/orders/1\", nil)\n\tclient.Do(req)\n\tmux.ServeHTTP(nil, req)\n}\n";
+        assert!(in_process(src).is_empty(), "{:?}", in_process(src));
+    }
+
+    /// Contract M6b S4: the walk follows a request through a same-file
+    /// helper (`top` builds, `helper` serves). A shadowed same-named local
+    /// and an unrelated same-named string stay out: use sites must resolve
+    /// to the request's own binding.
+    #[test]
+    fn go_in_process_through_a_helper() {
+        let src = "package main\nimport \"net/http\"\nfunc helper(req *http.Request) {\n\tmux.ServeHTTP(nil, req)\n}\nfunc top() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/x\", nil)\n\thelper(req)\n}\nfunc shadowed() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/y\", nil)\n\t_ = req\n}\nfunc other() {\n\treq := \"not a request\"\n\tserve(nil, req)\n}\nfunc serve(w http.ResponseWriter, r *http.Request) {}\n";
+        assert_eq!(
+            in_process(src),
+            BTreeSet::from([span_of(
+                src,
+                "http.NewRequest(\"GET\", \"http://orders/x\", nil)"
+            )]),
+            "{:?}",
+            in_process(src)
+        );
+    }
+
+    /// Evaluator pass 1 (S4): a hand-rolled recorder (an own `ResponseWriter`
+    /// implementation, not `httptest`) is not a recognised sink — a request
+    /// served through it stays stitched.
+    #[test]
+    fn go_in_process_hand_rolled_recorder_is_not_a_sink() {
+        let src = "package main\nimport \"net/http\"\ntype R struct { h http.Header }\nfunc (r *R) Header() http.Header { return r.h }\nfunc (r *R) Write(b []byte) (int, error) { return len(b), nil }\nfunc (r *R) WriteHeader(int) {}\nfunc handler(w http.ResponseWriter, r *http.Request) {}\nfunc t() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/x\", nil)\n\trec := &R{}\n\thandler(rec, req)\n}\n";
+        assert!(in_process(src).is_empty(), "{:?}", in_process(src));
+    }
+
+    /// Contract M6b S4: a request wrapped before naming (`x := wrap(…)`)
+    /// is not seeded — the name holds the wrapper's result, not the request
+    /// (safe direction: the site stays stitched).
+    #[test]
+    fn go_in_process_wrapped_requests_are_not_seeded() {
+        let src = "package main\nimport \"net/http\"\nfunc wrap(r *http.Request) *http.Request {\n\treturn r\n}\nfunc top() {\n\tx := wrap(http.NewRequest(\"GET\", \"http://orders/x\", nil))\n\tmux.ServeHTTP(nil, x)\n}\n";
+        assert!(in_process(src).is_empty(), "{:?}", in_process(src));
+    }
+
+    /// Contract M6b S4, invariant 9: n helpers each serving the same request
+    /// costs linear work — 4× the helpers makes at most 5× the counted
+    /// steps. Counted, not timed, so machine load cannot fail it.
+    #[test]
+    fn go_in_process_grows_linearly() {
+        fn work(n: usize) -> u64 {
+            let mut src = "package main\nimport \"net/http\"\n".to_owned();
+            for i in 0..n {
+                src.push_str(&format!(
+                    "func f{i}(req *http.Request) {{ mux.ServeHTTP(nil, req) }}\n"
+                ));
+            }
+            src.push_str(
+                "func top() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/x\", nil)\n",
+            );
+            for i in 0..n {
+                src.push_str(&format!("\tf{i}(req)\n"));
+            }
+            src.push_str("}\n");
+            let facts = extract(Language::Go, src.as_bytes()).unwrap();
+            crate::work::take();
+            let found = clients(Language::Go, &facts).in_process;
+            assert_eq!(found.len(), 1);
+            crate::work::take()
+        }
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// Contract M6b S4: mutually delegating helpers terminate (visited set)
+    /// in bounded counted work. Without the visited set this input revisits
+    /// every level three times per level and blows past the bound (measured:
+    /// 124 ops with it, 9,958 without).
+    #[test]
+    fn go_in_process_cycles_terminate() {
+        let src = "package main\nimport \"net/http\"\nfunc a(req *http.Request) {\n\tb(req)\n\tb(req)\n\tb(req)\n}\nfunc b(req *http.Request) {\n\ta(req)\n\ta(req)\n\ta(req)\n}\nfunc top() {\n\treq, _ := http.NewRequest(\"GET\", \"http://orders/x\", nil)\n\ta(req)\n}\n";
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        crate::work::take();
+        let found = clients(Language::Go, &facts).in_process;
+        let ops = crate::work::take();
+        assert!(found.is_empty(), "{found:?}");
+        assert!(ops < 1000, "{ops} counted operations");
+    }
+
+    /// `kind operation @carrier` per generated call.
+    fn generated(language: Language, src: &str) -> Vec<String> {
+        let facts = extract(language, src.as_bytes()).unwrap();
+        clients(language, &facts)
+            .generated
+            .iter()
+            .map(|c| format!("{} {} @{}", c.kind.as_str(), c.operation, c.carrier))
+            .collect()
+    }
+
+    /// Contract M6f S6: calls on `*Api` receivers (or `*Api`-typed bindings) are
+    /// operationId candidates; anything else is not.
+    #[test]
+    fn openapi_api_receivers_are_operation_candidates() {
+        let src = "import { DefaultApi } from './gen';\nconst usersApi = new DefaultApi();\nexport async function f(id) {\n  await usersApi.listUsers();\n  await new DefaultApi().addUser(id);\n  await api.list();\n  await service.list();\n}\n";
+        assert_eq!(
+            generated(Language::TypeScript, src),
+            ["openapi listUsers @usersApi", "openapi addUser @DefaultApi"]
+        );
+        let java = "class C {\n  UsersApi api;\n  void f() {\n    api.getUser(1);\n    new UsersApi().addUser(2);\n    service.list();\n  }\n}\n";
+        assert_eq!(
+            generated(Language::Java, java),
+            ["openapi getUser @api", "openapi addUser @UsersApi"]
+        );
+    }
+
+    /// Contract M6f S6: gRPC stub chains (a `*Grpc` root with 2+ links, or an inline
+    /// `new *Stub`) and `New*Client`-typed bindings pin their RPC.
+    #[test]
+    fn grpc_stub_chains_and_typed_bindings_pin_their_rpc() {
+        let java = "class C {\n  void f(Object ch, Object req) {\n    GreeterGrpc.newBlockingStub(ch).sayHello(req);\n    GreeterGrpc.newFutureStub(ch).watch(req);\n    foo.bar(req);\n  }\n}\n";
+        assert_eq!(
+            generated(Language::Java, java),
+            ["grpc sayHello @GreeterGrpc", "grpc watch @GreeterGrpc"]
+        );
+        let go = "package main\nimport pb \"example.com/helloworld\"\nfunc f(conn Conn, ctx Ctx, req Req) {\n  client, _ := pb.NewGreeterClient(conn)\n  client.SayHello(ctx, req)\n  db.Query(req)\n}\n";
+        assert_eq!(generated(Language::Go, go), ["grpc SayHello @Greeter"]);
+        let ts = "import { GreeterClient } from './gen';\nexport function f(addr, x) {\n  const client = new GreeterClient(addr);\n  client.sayHello(x);\n  other.ping(x);\n}\n";
+        assert_eq!(
+            generated(Language::TypeScript, ts),
+            ["grpc sayHello @Greeter"]
+        );
+    }
+
+    /// Contract M6f S6, invariant 5: scanning 4× the chains costs at most 5× the operations.
+    #[test]
+    fn generated_call_scanning_grows_linearly() {
+        let work = |n: usize| {
+            let mut src = String::from("class C {\n  void f(Object ch) {\n");
+            for i in 0..n {
+                src.push_str(&format!("    Api{i}Grpc.newStub(ch).m{i}(x);\n"));
+                src.push_str(&format!("    plain{i}(x);\n"));
+            }
+            src.push_str("  }\n}\n");
+            let facts = extract(Language::Java, src.as_bytes()).unwrap();
+            crate::work::take();
+            let out = clients(Language::Java, &facts);
+            assert_eq!(out.generated.len(), n);
+            crate::work::take()
+        };
+        let (small, large) = (work(50), work(200));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Evaluator pass 1, M6f-9 (polyglot churn): a chain the URL packs already read is an
+    /// HTTP client, whatever its receiver is named — never a second, generated reading.
+    #[test]
+    fn url_claimed_chains_are_never_generated_candidates() {
+        let src = "import got from 'got';\nconst mailApi = got.extend({ prefixUrl: 'http://n' });\nexport async function f(email: string) {\n  return mailApi.post('http://notification/internal/mfa/email', { json: { email } });\n}\n";
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let out = clients(Language::TypeScript, &facts);
+        assert!(!out.calls.is_empty());
+        assert!(out.generated.is_empty());
+        let ng = "export class MailClient {\n  constructor(private http: HttpClient) {}\n  send(email: string) {\n    return this.http.post('http://notification/internal/mfa/email', { email });\n  }\n}\n";
+        let facts = extract(Language::TypeScript, ng.as_bytes()).unwrap();
+        assert!(clients(Language::TypeScript, &facts).generated.is_empty());
+    }
+    /// A dot import of `net/http` (and of `net/httptest`) is outside the
+    /// import gate, as for the client sites themselves (S11): no sink is
+    /// recognised there.
+    #[test]
+    fn go_in_process_needs_qualified_imports() {
+        let src = "package main\nimport (\n\t. \"net/http\"\n\t. \"net/http/httptest\"\n)\nfunc t() {\n\treq, _ := NewRequest(\"GET\", \"/x\", nil)\n\trec := NewRecorder()\n\tServeHTTP(rec, req)\n}\n";
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        let out = clients(Language::Go, &facts);
+        assert!(out.calls.is_empty());
+        assert!(out.in_process.is_empty());
     }
 }

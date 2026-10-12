@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 /// the cache key uses its image ID, resolved at run time by [`crate::Runner::image_id`]; when the
 /// image is absent the job is `unsupported` and nothing builds it implicitly.
 pub const SCIP_JAVA_IMAGE: &str = "rb-scip-java:0.13.1";
+/// The scip-go image: built locally from `docker/scip-go` (no published image
+/// is suitable). Like scip-java, a local image has no registry digest, so the
+/// cache key uses its image ID, resolved at run time; when absent the job is
+/// `unsupported` and nothing builds it implicitly.
+pub const SCIP_GO_IMAGE: &str = "rb-scip-go:0.2.7";
+/// scip-python v0.6.6 is published for linux/amd64 only; on arm64 hosts it
+/// runs emulated (like scip-typescript). Pinned by digest after measuring
+/// against the disk budget (contract M6d S2).
+pub const SCIP_PYTHON_IMAGE: &str = "sourcegraph/scip-python@sha256:1847528ce710f58d13200e8c0237f8028342eee3f8a073a9f6109107f930be23";
 /// scip-typescript 0.4.0 is published for linux/amd64 only; on arm64 hosts it runs emulated.
 pub const SCIP_TYPESCRIPT_IMAGE: &str = "sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845";
 
@@ -17,6 +26,8 @@ pub const SCIP_TYPESCRIPT_IMAGE: &str = "sourcegraph/scip-typescript@sha256:028c
 pub enum Indexer {
     ScipJava,
     ScipTypescript,
+    ScipGo,
+    ScipPython,
 }
 
 impl Indexer {
@@ -24,6 +35,8 @@ impl Indexer {
         match self {
             Indexer::ScipJava => "scip-java",
             Indexer::ScipTypescript => "scip-typescript",
+            Indexer::ScipGo => "scip-go",
+            Indexer::ScipPython => "scip-python",
         }
     }
 }
@@ -38,6 +51,16 @@ pub enum Fetch {
     Gradle,
     /// `npm ci`, `yarn install --frozen-lockfile` or `pnpm install --frozen-lockfile`.
     Npm { lockfile: NodeLock },
+    /// `go mod download`: reproducible only with a `go.sum` alongside (else
+    /// the job is `unpinned`, as with an unlockfiled npm install).
+    Go,
+    /// Python environment resolution (contract M6d S4): lockfile-driven
+    /// installs only — the locked tree for a `poetry.lock`, pins without
+    /// transitive dependencies for a `requirements.txt`, the project itself
+    /// without dependencies otherwise (a `uv.lock` has no installer in the
+    /// image, so it takes the project-only path; S6 reads its versions).
+    /// Reproducible only with a `poetry.lock` alongside.
+    Python { lockfile: PythonLock },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -46,6 +69,18 @@ pub enum NodeLock {
     Yarn,
     Pnpm,
     /// No lockfile: the fetch is `npm install`, which is not reproducible; recorded on the job.
+    None,
+}
+
+/// Which lockfile a Python job's fetch installs from (contract M6d S4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PythonLock {
+    /// A `poetry.lock`: `poetry install` of the locked tree, reproducible.
+    Poetry,
+    /// A `requirements.txt`: `pip install --no-deps`, pins only.
+    Requirements,
+    /// Anything else (including a `uv.lock`, whose installer is not in the
+    /// image): `pip install --no-deps -e .`, the project only.
     None,
 }
 
@@ -68,8 +103,7 @@ pub struct Job {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ungrouped {
     pub root: String,
-    /// `workspace_glob_unsupported`, `workspace_without_lockfile`,
-    /// `workspace_lockfile_unsupported` (only `pnpm-lock.yaml`), `yarn_berry` or
+    /// `workspace_glob_unsupported`, `workspace_without_lockfile`, `yarn_berry` or
     /// `manifest_unreadable` (a `package.json` that is not JSON, or a `workspaces` value of
     /// another shape).
     pub reason: &'static str,
@@ -191,6 +225,45 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             unpinned: lockfile == NodeLock::None,
         });
     }
+    // Go: every go.mod directory builds independently (workspaces are M6e).
+    let mut go_roots = dirs_with("go.mod");
+    go_roots.sort();
+    go_roots.dedup();
+    for root in go_roots {
+        out.push(Job {
+            root: root.clone(),
+            indexer: Indexer::ScipGo,
+            fetch: Fetch::Go,
+            projects: Vec::new(),
+            unpinned: !has(&join(&root, "go.sum")),
+        });
+    }
+    // Python: every pyproject.toml/setup.py directory is a job (contract M6d
+    // S2); the fetch installs from its lockfile (S4).
+    let mut python_roots: Vec<String> = dirs_with("pyproject.toml")
+        .into_iter()
+        .chain(dirs_with("setup.py"))
+        .collect();
+    python_roots.sort();
+    python_roots.dedup();
+    for root in python_roots {
+        // The strongest pin wins: a poetry.lock pins the whole tree, a
+        // requirements.txt its pins only, anything else the project alone.
+        let lockfile = if has(&join(&root, "poetry.lock")) {
+            PythonLock::Poetry
+        } else if has(&join(&root, "requirements.txt")) {
+            PythonLock::Requirements
+        } else {
+            PythonLock::None
+        };
+        out.push(Job {
+            root: root.clone(),
+            indexer: Indexer::ScipPython,
+            fetch: Fetch::Python { lockfile },
+            projects: Vec::new(),
+            unpinned: lockfile != PythonLock::Poetry,
+        });
+    }
     out.sort_by(|a, b| (a.root.as_str(), a.indexer).cmp(&(b.root.as_str(), b.indexer)));
     Plan {
         jobs: out,
@@ -258,7 +331,15 @@ fn workspaces<'a>(
             .map(workspace_patterns)
         {
             Some(Ok(Some(patterns))) => patterns,
-            Some(Ok(None)) => continue,
+            // pnpm workspaces declare members in `pnpm-workspace.yaml`
+            // (contract M6e S6); a root with neither is a plain root.
+            Some(Ok(None)) => match read(&join(root, "pnpm-workspace.yaml"))
+                .as_deref()
+                .map(pnpm_workspace_patterns)
+            {
+                Some(Some(patterns)) => patterns,
+                _ => continue,
+            },
             Some(Err(())) | None => {
                 ungrouped("manifest_unreadable");
                 continue;
@@ -274,8 +355,7 @@ fn workspaces<'a>(
             }
             NodeLock::Yarn
         } else if has(&join(root, "pnpm-lock.yaml")) {
-            ungrouped("workspace_lockfile_unsupported");
-            continue;
+            NodeLock::Pnpm
         } else {
             ungrouped("workspace_without_lockfile");
             continue;
@@ -338,7 +418,8 @@ fn workspace_patterns(bytes: &[u8]) -> Result<Option<Vec<String>>, ()> {
 
 /// A Yarn ≥ 2 lockfile: its first line that is neither blank nor a `#` comment starts
 /// `__metadata:` (Yarn v1's lockfiles start with `# yarn lockfile v1` and entries).
-fn is_yarn_berry(text: &[u8]) -> bool {
+/// `pub(crate)` for the fetch phase's Berry refusal (contract M6e S6).
+pub(crate) fn is_yarn_berry(text: &[u8]) -> bool {
     String::from_utf8_lossy(text)
         .lines()
         .map(str::trim)
@@ -346,7 +427,38 @@ fn is_yarn_berry(text: &[u8]) -> bool {
         .is_some_and(|l| l.starts_with("__metadata:"))
 }
 
-/// One segment of an allowed workspace pattern (contract M6a D5).
+/// `pnpm-workspace.yaml`'s `packages:` globs, hand-read (contract M6e S6: no YAML
+/// parser; the glob allow-list below validates). `None` when the file declares
+/// none (a scalar or missing `packages:` is not a workspace).
+fn pnpm_workspace_patterns(bytes: &[u8]) -> Option<Vec<String>> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out: Option<Vec<String>> = None;
+    for line in text.lines() {
+        if line.starts_with([' ', '\t']) {
+            if let Some(patterns) = out.as_mut()
+                && let Some(item) = line.trim().strip_prefix("- ")
+            {
+                let item = item.trim().trim_matches('\'').trim_matches('"');
+                if !item.is_empty() {
+                    patterns.push(item.to_owned());
+                }
+            }
+            continue;
+        }
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        if out.is_some() {
+            // Any second top-level key ends the list.
+            break;
+        }
+        if body == "packages:" {
+            out = Some(Vec::new());
+        }
+    }
+    out
+}
 enum Segment {
     Literal(String),
     /// `*`: exactly one directory.
@@ -384,7 +496,7 @@ fn parse_pattern(pattern: &str) -> Option<Vec<Segment>> {
 /// A workspace's patterns as a trie of segments: a path is matched by walking it once,
 /// following its literal child and the `*` child at each level, each node at most once (no
 /// backtracking beyond the final `**`, invariant 9).
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Trie {
     literal: BTreeMap<String, Trie>,
     star: Option<Box<Trie>>,
@@ -528,6 +640,139 @@ pub fn maven_source_encoding(poms: &[&[u8]]) -> Option<String> {
         .find(|value| !value.eq_ignore_ascii_case("UTF-8") && !value.eq_ignore_ascii_case("UTF8"))
 }
 
+/// The inputs to [`effective_encoding`]: a job's poms (repository path, bytes), its
+/// `.mvn/maven.config` bytes when exported, and the explicit `-D` flags of the Maven
+/// invocation (highest precedence; the pipeline passes no encoding `-D` flag — `java_runs`
+/// passes only `-DskipTests`, Develocity and logger flags — so the slot is structurally empty
+/// and unit-tested only).
+pub struct EncodingInputs<'a> {
+    pub poms: Vec<(&'a str, &'a [u8])>,
+    pub maven_config: Option<&'a [u8]>,
+    pub cli: &'a [String],
+}
+
+/// Whether `value` names UTF-8 (any spelling the readers accept).
+fn is_utf8(value: &str) -> bool {
+    value.eq_ignore_ascii_case("UTF-8") || value.eq_ignore_ascii_case("UTF8")
+}
+
+/// The `-encoding` value a pom's `<compilerArg>` entries declare, if any: the value after the
+/// last `-encoding` entry in document order (javac's own last-wins; a dangling `-encoding`
+/// declares nothing).
+fn compiler_arg_encoding(pom: &str) -> Option<String> {
+    let args: Vec<String> = simple_elements(pom)
+        .into_iter()
+        .filter(|(name, _)| name == "compilerArg")
+        .map(|(_, value)| value)
+        .collect();
+    args.iter()
+        .rposition(|a| a == "-encoding")
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// A `-Dname=value` flag naming one of the encoding properties, if `token` is one: the value.
+/// Both `-Dname=value` and `-D name=value` (two tokens) forms; anything else names nothing.
+fn d_flag<'a>(token: &'a str, next: Option<&'a str>) -> Option<String> {
+    const NAMES: [&str; 3] = [
+        "encoding",
+        "project.build.sourceEncoding",
+        "maven.compiler.encoding",
+    ];
+    let assignment = token
+        .strip_prefix("-D")
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            if token == "-D" {
+                next.map(str::to_owned)
+            } else {
+                None
+            }
+        })?;
+    let (name, value) = assignment.split_once('=')?;
+    NAMES.contains(&name).then(|| value.to_owned())
+}
+
+/// The encoding the last `-D` flag of `tokens` (whitespace-split) declares, if any.
+fn d_flag_encoding(tokens: &[&str]) -> Option<String> {
+    let mut out = None;
+    for (i, token) in tokens.iter().enumerate() {
+        if let Some(value) = d_flag(token, tokens.get(i + 1).copied()) {
+            out = Some(value);
+        }
+    }
+    out
+}
+
+/// The encoding elements one pom declares, `${property}` resolved through its own simple
+/// elements: the first declaration in document order, UTF-8 included (`None` only when the
+/// pom declares nothing). The resolver is `maven_source_encoding`'s, scoped to this pom.
+fn pom_declaration(pom: &[u8]) -> Option<String> {
+    let elements: Vec<(String, String)> = simple_elements(&String::from_utf8_lossy(pom));
+    let resolve = |value: &str| -> String {
+        let mut value = value.to_owned();
+        // A bounded chain of `${a}` → `${b}` → value.
+        for _ in 0..8 {
+            let Some(name) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+                break;
+            };
+            match elements.iter().find(|(n, _)| n == name) {
+                Some((_, v)) => value.clone_from(v),
+                None => break,
+            }
+        }
+        value
+    };
+    elements
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "project.build.sourceEncoding" | "maven.compiler.encoding" | "encoding"
+            )
+        })
+        .map(|(_, value)| resolve(value))
+        .next()
+}
+
+/// The javac source encoding one document reads (contract M6e S11; D9's compilerArgs
+/// position corrected by measurement): the highest precedence slot that declares one wins —
+/// the document's own module first (the nearest pom at or above it; a module's declaration
+/// over its ancestors', as Maven resolves), then the build-wide `.mvn/maven.config` `-D`,
+/// then explicit `-D` flags; `compilerArgs -encoding` reads lowest. Measured on
+/// `rb-scip-java:0.13.1` with a 0xE9 source (an unmappable-character error names the
+/// effective encoding): the pom literal wins both directions over `compilerArgs`, while
+/// `.mvn/maven.config` beats the pom and explicit `-D` beats the config file. `None` when no
+/// slot declares, or the winning declaration is UTF-8: javac then reads UTF-8 (measured).
+/// Anything unreadable (a dangling `-encoding`, garbage config lines, a flag without `=`, a
+/// non-UTF-8 config file) declares nothing and keeps the higher slot's reading. Per-document
+/// so a mixed build (an ISO root with a UTF-8 module) rejects exactly the ISO-read files
+/// instead of trusting either side for all.
+pub fn effective_encoding(doc: &str, inputs: &EncodingInputs) -> Option<String> {
+    let dir = doc.rsplit_once('/').map_or("", |(d, _)| d);
+    // The pom chain above the document, nearest first.
+    let mut chain: Vec<(&str, &[u8])> = inputs
+        .poms
+        .iter()
+        .filter(|(path, _)| {
+            let pom_dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+            pom_dir.is_empty() || dir == pom_dir || dir.starts_with(&format!("{pom_dir}/"))
+        })
+        .map(|(path, bytes)| (*path, *bytes))
+        .collect();
+    chain.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+    let pom = chain.iter().find_map(|(_, bytes)| pom_declaration(bytes));
+    let arg = chain
+        .iter()
+        .find_map(|(_, bytes)| compiler_arg_encoding(&String::from_utf8_lossy(bytes)));
+    let config = inputs
+        .maven_config
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|text| d_flag_encoding(&text.split_whitespace().collect::<Vec<_>>()));
+    let cli = d_flag_encoding(&inputs.cli.iter().map(String::as_str).collect::<Vec<_>>());
+    cli.or(config).or(pom).or(arg).filter(|v| !is_utf8(v))
+}
+
 /// `<name>text</name>` elements whose content holds no markup, outside comments, with the
 /// content trimmed.
 fn simple_elements(xml: &str) -> Vec<(String, String)> {
@@ -553,6 +798,404 @@ fn simple_elements(xml: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// A tsconfig scoping key: absent, known (compiled), or present but unusable (contract M6e
+/// S10). An unknown key makes membership undecidable (fail-open), never empty.
+#[derive(Debug, Clone)]
+enum Field<T> {
+    Absent,
+    Known(T),
+    Unknown,
+}
+
+/// One resolved `tsconfig*.json` scope: its directory and its `include`/`exclude` glob tries
+/// and `files` set. `extends` is already resolved (the child's keys replace the base's).
+struct TsScope {
+    dir: String,
+    include: Field<Trie>,
+    exclude: Field<Trie>,
+    files: Field<BTreeSet<String>>,
+}
+
+/// The `tsconfig*.json` scopes of a commit (contract M6e S10, D8): `include`/`exclude`/`files`
+/// (+ `extends`, bounded by depth 8 with a cycle guard) read through the workspace glob
+/// allow-list ([`parse_pattern`]); anything beyond it stays unread and counted in [`unread`].
+/// Membership only explains `files_without_document` — the indexer owns inclusion, so no edge
+/// may move because of this reader.
+pub struct TsScopes {
+    scopes: BTreeMap<String, TsScope>,
+    /// Unread patterns, entries, files and links per tsconfig path.
+    unread_by_scope: BTreeMap<String, usize>,
+    /// Patterns, entries, files and links beyond the allow-list: each counted once.
+    pub unread: usize,
+}
+
+/// `text` with its `//` and `/* */` comments removed (string-aware; JSON itself has only
+/// `"` strings, which is all this strips around).
+fn strip_json_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut start = 0;
+    let mut quote = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if quote {
+            if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => {
+                quote = true;
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                out.push_str(&text[start..i]);
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                start = i;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                out.push_str(&text[start..i]);
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    out.push_str(&text[start..]);
+    out
+}
+
+/// A `files` entry as a path relative to its tsconfig directory: one leading `./` ignored;
+/// `None` for absolute paths, backslashes, empty segments and escapes above the directory.
+fn normalise_rel(entry: &str) -> Option<String> {
+    let entry = entry.strip_prefix("./").unwrap_or(entry);
+    if entry.is_empty() || entry.starts_with('/') || entry.contains('\\') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for seg in entry.split('/') {
+        match seg {
+            "" | "." => return None,
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// An `extends` target joined to its tsconfig's directory, lexically (`None` for absolute
+/// paths, backslashes and escapes above the repository root).
+fn join_tsconfig(dir: &str, target: &str) -> Option<String> {
+    if target.is_empty() || target.starts_with('/') || target.contains('\\') {
+        return None;
+    }
+    let mut parts: Vec<&str> = if dir.is_empty() {
+        Vec::new()
+    } else {
+        dir.split('/').collect()
+    };
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+impl TsScopes {
+    /// Builds the scopes from `(path, text)` pairs (`tsconfig*.json` entries only; everything
+    /// else ignored). Never fails: an unreadable file contributes no scope.
+    pub fn build<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let texts: BTreeMap<&str, &str> = files.into_iter().collect();
+        let mut out = Self {
+            scopes: BTreeMap::new(),
+            unread_by_scope: BTreeMap::new(),
+            unread: 0,
+        };
+        let mut paths: Vec<&str> = texts
+            .keys()
+            .filter(|p| {
+                p.rsplit('/')
+                    .next()
+                    .is_some_and(|n| n.starts_with("tsconfig."))
+            })
+            .copied()
+            .collect();
+        paths.sort();
+        for path in paths {
+            let mut visited = Vec::new();
+            match Self::resolve(path, &texts, &mut visited, 0) {
+                Some((scope, unread)) => {
+                    out.unread += unread;
+                    out.unread_by_scope.insert(path.to_owned(), unread);
+                    out.scopes.insert(path.to_owned(), scope);
+                }
+                None => {
+                    out.unread += 1;
+                    out.unread_by_scope.insert(path.to_owned(), 1);
+                }
+            }
+        }
+        out
+    }
+
+    /// The unread count of the scopes at or below `root` (`""`: every scope): the project
+    /// detail for `files_without_document` partitioning (contract M6e S10).
+    pub fn unread_under(&self, root: &str) -> usize {
+        self.unread_by_scope
+            .iter()
+            .filter(|(path, _)| {
+                let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+                root.is_empty() || dir == root || dir.starts_with(&format!("{root}/"))
+            })
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// The scope at `path` with its `extends` chain resolved (child keys replace the base's),
+    /// plus the unread count. `None` when the file itself does not parse.
+    fn resolve(
+        path: &str,
+        texts: &BTreeMap<&str, &str>,
+        visited: &mut Vec<String>,
+        depth: usize,
+    ) -> Option<(TsScope, usize)> {
+        if depth > 8 || visited.iter().any(|v| v == path) {
+            return None;
+        }
+        let text = texts.get(path)?;
+        let json: serde_json::Value = serde_json::from_str(&strip_json_comments(text)).ok()?;
+        let dir = path.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
+        let mut unread = 0;
+        let mut base: Option<TsScope> = None;
+        let mut broken = false;
+        if let Some(extends) = json.get("extends") {
+            match extends.as_str() {
+                Some(target) => {
+                    let base_path = join_tsconfig(&dir, target);
+                    match base_path.filter(|p| texts.contains_key(p.as_str())) {
+                        Some(found) => {
+                            visited.push(path.to_owned());
+                            match Self::resolve(&found, texts, visited, depth + 1) {
+                                Some((scope, u)) => {
+                                    unread += u;
+                                    base = Some(scope);
+                                }
+                                None => {
+                                    unread += 1;
+                                    broken = true;
+                                }
+                            }
+                            visited.pop();
+                        }
+                        None => {
+                            unread += 1;
+                            broken = true;
+                        }
+                    }
+                }
+                // A present non-string `extends` is ignored (the scope stands alone), counted.
+                None => unread += 1,
+            }
+        }
+        let include = Self::glob_field(
+            json.get("include"),
+            base.as_ref().map(|b| &b.include),
+            broken,
+            &mut unread,
+        );
+        let exclude = Self::glob_field(
+            json.get("exclude"),
+            base.as_ref().map(|b| &b.exclude),
+            broken,
+            &mut unread,
+        );
+        let files = Self::files_field(
+            json.get("files"),
+            base.as_ref().map(|b| &b.files),
+            broken,
+            &mut unread,
+        );
+        Some((
+            TsScope {
+                dir,
+                include,
+                exclude,
+                files,
+            },
+            unread,
+        ))
+    }
+
+    /// One glob key (`include`/`exclude`): the child's array when present (non-string entries
+    /// skipped and counted; present but with no usable entry left means unknown), else the
+    /// base's, else absent — or unknown when the chain broke before naming one.
+    fn glob_field(
+        own: Option<&serde_json::Value>,
+        base: Option<&Field<Trie>>,
+        broken: bool,
+        unread: &mut usize,
+    ) -> Field<Trie> {
+        match own {
+            None => match (base, broken) {
+                (Some(field), _) => field.clone(),
+                (None, true) => Field::Unknown,
+                (None, false) => Field::Absent,
+            },
+            Some(value) => {
+                let Some(items) = value.as_array() else {
+                    *unread += 1;
+                    return Field::Unknown;
+                };
+                let mut trie = Trie::default();
+                let mut usable = 0;
+                for item in items {
+                    match item
+                        .as_str()
+                        .map(|s| s.strip_prefix("./").unwrap_or(s))
+                        .and_then(parse_pattern)
+                    {
+                        Some(mut segments) => {
+                            // A wildcard-free pattern names a directory: it covers the
+                            // whole subtree (`"src"` ≡ `"src/**/*"`, TypeScript's
+                            // rule) as well as the path itself (an exact file).
+                            // Inserted in both forms here, so the workspace globs
+                            // sharing the trie keep their own meaning.
+                            if segments.iter().all(|s| matches!(s, Segment::Literal(_))) {
+                                trie.insert(&segments);
+                                segments.push(Segment::Rest);
+                            }
+                            trie.insert(&segments);
+                            usable += 1;
+                        }
+                        None => *unread += 1,
+                    }
+                }
+                if usable == 0 && !items.is_empty() {
+                    Field::Unknown
+                } else {
+                    Field::Known(trie)
+                }
+            }
+        }
+    }
+
+    /// One `files` key, same shape with exact relative paths instead of globs.
+    fn files_field(
+        own: Option<&serde_json::Value>,
+        base: Option<&Field<BTreeSet<String>>>,
+        broken: bool,
+        unread: &mut usize,
+    ) -> Field<BTreeSet<String>> {
+        match own {
+            None => match (base, broken) {
+                (Some(field), _) => field.clone(),
+                (None, true) => Field::Unknown,
+                (None, false) => Field::Absent,
+            },
+            Some(value) => {
+                let Some(items) = value.as_array() else {
+                    *unread += 1;
+                    return Field::Unknown;
+                };
+                let mut set = BTreeSet::new();
+                let mut usable = 0;
+                for item in items {
+                    match item.as_str().and_then(normalise_rel) {
+                        Some(path) => {
+                            set.insert(path);
+                            usable += 1;
+                        }
+                        None => *unread += 1,
+                    }
+                }
+                if usable == 0 && !items.is_empty() {
+                    Field::Unknown
+                } else {
+                    Field::Known(set)
+                }
+            }
+        }
+    }
+
+    /// Whether `file` (a repository path) is positively outside its governing tsconfig's
+    /// scope: false when no tsconfig governs it or its membership is unreadable (fail-open:
+    /// the file stays in the unexplained bucket). The governing scope is the nearest
+    /// directory at or above the file holding a tsconfig (sorted-first path on ties).
+    pub fn out_of_scope(&self, file: &str) -> bool {
+        let mut best: Option<(&str, &TsScope)> = None;
+        for (path, scope) in &self.scopes {
+            tick(1);
+            let dir = scope.dir.as_str();
+            if !(dir.is_empty() || file.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))) {
+                continue;
+            }
+            let nearer = match &best {
+                None => true,
+                Some((p, s)) => {
+                    dir.len() > s.dir.len() || (dir.len() == s.dir.len() && path.as_str() < *p)
+                }
+            };
+            if nearer {
+                best = Some((path.as_str(), scope));
+            }
+        }
+        let Some((_, scope)) = best else {
+            return false;
+        };
+        let rel = if scope.dir.is_empty() {
+            file
+        } else {
+            &file[scope.dir.len() + 1..]
+        };
+        let segments: Vec<&str> = rel.split('/').collect();
+        match &scope.files {
+            Field::Known(set) => !set.contains(rel),
+            Field::Unknown => false,
+            Field::Absent => {
+                let matched = match &scope.include {
+                    Field::Known(trie) => trie.matches(&segments),
+                    Field::Unknown => return false,
+                    Field::Absent => true,
+                };
+                if !matched {
+                    return true;
+                }
+                match &scope.exclude {
+                    Field::Known(trie) => trie.matches(&segments),
+                    Field::Unknown => false,
+                    Field::Absent => false,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +1235,8 @@ mod tests {
                 let fetch = match j.fetch {
                     Fetch::Maven => "maven".to_owned(),
                     Fetch::Gradle => "gradle".to_owned(),
+                    Fetch::Go => "go".to_owned(),
+                    Fetch::Python { lockfile } => format!("python({lockfile:?})"),
                     Fetch::Npm { lockfile } => format!("npm({lockfile:?})"),
                 };
                 let mut s = format!("{} {} {fetch}", j.indexer.as_str(), j.root);
@@ -629,6 +1274,70 @@ mod tests {
                 "scip-java  maven",
                 "scip-java legacy gradle",
                 "scip-java tools gradle",
+            ]
+        );
+    }
+
+    #[test]
+    fn go_modules_are_their_own_jobs() {
+        // Each go.mod directory builds independently (workspaces are M6e);
+        // without a go.sum alongside, the fetch is not reproducible.
+        let files = ["go.mod", "go.sum", "main.go", "tools/go.mod", "lib/go.mod"];
+        assert_eq!(
+            summary(&files),
+            [
+                "scip-go  go",
+                "scip-go lib go unpinned",
+                "scip-go tools go unpinned"
+            ]
+        );
+    }
+
+    #[test]
+    fn python_roots_are_their_own_jobs() {
+        // Contract M6d S2: every pyproject.toml/setup.py directory is a job.
+        // Contract M6d S4: without a lockfile the fetch installs the project
+        // only (unpinned).
+        let files = [
+            "pyproject.toml",
+            "pkg/main.py",
+            "libs/pyproject.toml",
+            "tools/setup.py",
+        ];
+        assert_eq!(
+            summary(&files),
+            [
+                "scip-python  python(None) unpinned",
+                "scip-python libs python(None) unpinned",
+                "scip-python tools python(None) unpinned",
+            ]
+        );
+    }
+
+    #[test]
+    fn python_fetches_are_lockfile_driven() {
+        // Contract M6d S4: a poetry.lock installs the locked tree
+        // (reproducible); a requirements.txt installs its pins without
+        // transitive dependencies; anything else installs the project only.
+        // A uv.lock has no installer in the image, so it takes the
+        // project-only path (S6 reads its versions).
+        let files = [
+            "pyproject.toml",
+            "poetry.lock",
+            "libs/pyproject.toml",
+            "libs/requirements.txt",
+            "tools/setup.py",
+            "tools/uv.lock",
+            "tools/pyproject.toml",
+            "bare/pyproject.toml",
+        ];
+        assert_eq!(
+            summary(&files),
+            [
+                "scip-python  python(Poetry)",
+                "scip-python bare python(None) unpinned",
+                "scip-python libs python(Requirements) unpinned",
+                "scip-python tools python(None) unpinned",
             ]
         );
     }
@@ -684,6 +1393,8 @@ mod tests {
             [
                 "scip-typescript apps/web npm(None) [.] unpinned",
                 "scip-java services/auth maven",
+                // Contract M6d S1: go.mod directories are ScipGo jobs.
+                "scip-go services/billing go unpinned",
             ]
         );
         assert!(jobs(&["README.md"], &|_| None).jobs.is_empty());
@@ -743,6 +1454,172 @@ mod tests {
             )])
             .as_deref(),
             Some("${missing}")
+        );
+    }
+
+    /// Contract M6e S11: the effective javac encoding resolves per document from all five
+    /// configuration sources in documented precedence (lowest first): `compilerArgs
+    /// -encoding`, pom literals (the nearest pom's declaration over its ancestors'),
+    /// `.mvn/maven.config` `-D`, explicit `-D` flags (the pipeline passes none). Anything
+    /// unreadable keeps the higher slot's reading (or UTF-8).
+    #[test]
+    fn effective_encoding_follows_the_five_source_precedence() {
+        let case = |doc: &str, paths: &[(&str, &str)], config: Option<&str>, cli: &[&str]| {
+            let owned: Vec<(String, Vec<u8>)> = paths
+                .iter()
+                .map(|(p, t)| ((*p).to_owned(), t.as_bytes().to_vec()))
+                .collect();
+            let config = config.map(str::to_owned);
+            let cli: Vec<String> = cli.iter().map(|s| (*s).to_owned()).collect();
+            let poms: Vec<(&str, &[u8])> = owned
+                .iter()
+                .map(|(p, t)| (p.as_str(), t.as_slice()))
+                .collect();
+            let borrowed = EncodingInputs {
+                poms,
+                maven_config: config.as_deref().map(str::as_bytes),
+                cli: &cli,
+            };
+            effective_encoding(doc, &borrowed).clone()
+        };
+        let iso = "<project><properties><project.build.sourceEncoding>ISO-8859-1</project.build.sourceEncoding></properties></project>";
+        let utf8 = "<project><properties><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties></project>";
+        let arg = |v: &str| {
+            format!(
+                "<project><build><plugins><plugin><configuration><compilerArgs><compilerArg>-encoding</compilerArg><compilerArg>{v}</compilerArg></compilerArgs></configuration></plugin></plugins></build></project>"
+            )
+        };
+        // Nothing anywhere: today's UTF-8 reading.
+        assert_eq!(case("A.java", &[], None, &[]), None);
+        assert_eq!(case("A.java", &[("pom.xml", utf8)], None, &[]), None);
+        // The nearest pom governs each document: a module ISO build rejects its own files
+        // while the UTF-8 root's files stay trusted, and vice versa (no per-job unsafe
+        // corner).
+        assert_eq!(
+            case(
+                "mod/B.java",
+                &[("pom.xml", utf8), ("mod/pom.xml", iso)],
+                None,
+                &[]
+            )
+            .as_deref(),
+            Some("ISO-8859-1")
+        );
+        assert_eq!(
+            case(
+                "A.java",
+                &[("pom.xml", utf8), ("mod/pom.xml", iso)],
+                None,
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            case(
+                "A.java",
+                &[("pom.xml", iso), ("mod/pom.xml", utf8)],
+                None,
+                &[]
+            )
+            .as_deref(),
+            Some("ISO-8859-1")
+        );
+        assert_eq!(
+            case(
+                "mod/B.java",
+                &[("pom.xml", iso), ("mod/pom.xml", utf8)],
+                None,
+                &[]
+            ),
+            None
+        );
+        // A pom governs its subtree only: the module's ISO declaration does not touch the
+        // root's files, and a nested file answers to the nearest pom.
+        assert_eq!(case("A.java", &[("mod/pom.xml", iso)], None, &[]), None);
+        assert_eq!(
+            case(
+                "mod/sub/C.java",
+                &[("pom.xml", utf8), ("mod/pom.xml", iso)],
+                None,
+                &[]
+            )
+            .as_deref(),
+            Some("ISO-8859-1")
+        );
+        // `compilerArgs -encoding` reads lowest (measured): a pom literal beats it, but it
+        // still declares when the poms are silent, nearest likewise.
+        assert_eq!(
+            case("A.java", &[("pom.xml", &arg("ISO-8859-1"))], None, &[]).as_deref(),
+            Some("ISO-8859-1")
+        );
+        assert_eq!(
+            case(
+                "mod/B.java",
+                &[("pom.xml", iso), ("mod/pom.xml", &arg("UTF-8"))],
+                None,
+                &[]
+            )
+            .as_deref(),
+            Some("ISO-8859-1")
+        );
+        assert_eq!(
+            case(
+                "mod/B.java",
+                &[
+                    ("pom.xml", &arg("ISO-8859-1")),
+                    ("mod/pom.xml", &arg("UTF-8"))
+                ],
+                None,
+                &[]
+            ),
+            None
+        );
+        // `.mvn/maven.config -D` beats `compilerArgs`.
+        assert_eq!(
+            case(
+                "A.java",
+                &[("pom.xml", &arg("ISO-8859-1"))],
+                Some("-Dproject.build.sourceEncoding=UTF-8"),
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            case(
+                "A.java",
+                &[("pom.xml", utf8)],
+                Some("-Dencoding=ISO-8859-1"),
+                &[]
+            )
+            .as_deref(),
+            Some("ISO-8859-1")
+        );
+        // Explicit `-D` flags beat the config file.
+        assert_eq!(
+            case(
+                "A.java",
+                &[("pom.xml", utf8)],
+                Some("-Dproject.build.sourceEncoding=ISO-8859-1"),
+                &["-Dproject.build.sourceEncoding=UTF-8"]
+            ),
+            None
+        );
+        // Unreadable anywhere keeps the higher slot's reading: a dangling `-encoding`, garbage
+        // config lines, and a `-D` without `=` name nothing. An unresolvable `${…}` value is a
+        // declaration, like the pom reader's `${missing}`: fail-safe away from UTF-8.
+        assert_eq!(
+            case(
+                "A.java",
+                &[("pom.xml", iso)],
+                Some("not an option\n-Dencoding"),
+                &["-Dencoding"]
+            )
+            .as_deref(),
+            Some("ISO-8859-1")
+        );
+        assert_eq!(
+            case("A.java", &[("pom.xml", &arg("${enc}"))], None, &[]).as_deref(),
+            Some("${enc}")
         );
     }
 
@@ -907,8 +1784,9 @@ mod tests {
     }
 
     /// A root without `package-lock.json` or `yarn.lock` (`polyglot-monorepo`'s shape: npm
-    /// would resolve every member afresh), a Yarn ≥ 2 lockfile and a pnpm lockfile are not
-    /// grouped, each with its reason; the jobs are today's.
+    /// would resolve every member afresh) and a Yarn ≥ 2 lockfile are not
+    /// grouped, each with its reason; pnpm roots group through `pnpm-workspace.yaml`
+    /// (contract M6e S6); the jobs are today's.
     #[test]
     fn a_workspace_without_a_supported_lockfile_is_ungrouped() {
         let polyglot = [
@@ -959,7 +1837,7 @@ mod tests {
         );
         assert_eq!(
             ungrouped("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
-            [" workspace_lockfile_unsupported"]
+            Vec::<String>::new()
         );
         assert_eq!(
             ungrouped(
@@ -967,6 +1845,68 @@ mod tests {
                 "# yarn lockfile v1\n\n\"a@1\":\n  version \"1\"\n"
             ),
             Vec::<String>::new()
+        );
+    }
+
+    /// Contract M6e S6: pnpm workspaces group like npm ones — members come from
+    /// `pnpm-workspace.yaml` `packages:` globs through the same allow-list engine, and the
+    /// root job fetches with pnpm from its lockfile. A root with a pnpm lockfile but no
+    /// workspace file is a plain single-package job (no reason recorded).
+    #[test]
+    fn pnpm_workspace_file_patterns() {
+        assert_eq!(
+            pnpm_workspace_patterns(b"packages:\n  - 'a/*'\n  - b/c\n"),
+            Some(vec!["a/*".to_owned(), "b/c".to_owned()])
+        );
+        assert_eq!(
+            pnpm_workspace_patterns(b"# comment\npackages:\n"),
+            Some(vec![])
+        );
+        assert_eq!(pnpm_workspace_patterns(b"packages: ['a']\n"), None);
+        assert_eq!(pnpm_workspace_patterns(b"other: 1\n"), None);
+    }
+
+    #[test]
+    fn pnpm_workspaces_group_through_the_workspace_file() {
+        let files = [
+            "package.json",
+            "pnpm-workspace.yaml",
+            "pnpm-lock.yaml",
+            "packages/a/package.json",
+            "packages/a/tsconfig.json",
+            "packages/b/package.json",
+            "packages/b/tsconfig.json",
+            "legacy/package.json",
+            "legacy/tsconfig.json",
+        ];
+        let (jobs, ungrouped) = workspace_summary(
+            &files,
+            &[
+                ("package.json", r#"{"name": "root"}"#),
+                ("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n"),
+            ],
+        );
+        assert_eq!(
+            jobs,
+            vec![
+                "scip-typescript  npm(Pnpm) [packages/a,packages/b] {packages/a,packages/b}"
+                    .to_owned(),
+                "scip-typescript legacy npm(None) [.] unpinned".to_owned(),
+            ]
+        );
+        assert!(ungrouped.is_empty(), "{ungrouped:?}");
+        // No workspace file: plain roots keep today's jobs (the root lock
+        // alone groups nothing and records no reason).
+        let (jobs, ungrouped) =
+            workspace_summary(&files, &[("package.json", r#"{"name": "root"}"#)]);
+        assert!(ungrouped.is_empty(), "{ungrouped:?}");
+        assert_eq!(
+            jobs,
+            vec![
+                "scip-typescript legacy npm(None) [.] unpinned".to_owned(),
+                "scip-typescript packages/a npm(None) [.] unpinned".to_owned(),
+                "scip-typescript packages/b npm(None) [.] unpinned".to_owned(),
+            ]
         );
     }
 
@@ -1082,5 +2022,141 @@ mod tests {
             shadowed_membership_work_for(400),
         );
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M6e S10 (tsconfig scoping): `include`/`exclude`/`files` decide per-file
+    /// membership under the governing (nearest) tsconfig; anything unreadable fails open (the
+    /// file stays unexplained, never wrongly out of scope).
+    #[test]
+    fn tsconfig_scopes_explain_out_of_scope_files() {
+        let scopes = |files: &[(&str, &str)]| TsScopes::build(files.iter().copied());
+        let scoped = scopes(&[(
+            "tsconfig.json",
+            r#"{"include": ["src"], "exclude": ["src/gen"]}"#,
+        )]);
+        assert!(!scoped.out_of_scope("src/a.ts"));
+        assert!(scoped.out_of_scope("src/gen/b.ts"));
+        assert!(scoped.out_of_scope("test/c.ts"));
+        assert_eq!(scoped.unread, 0);
+        // `files` lists exact paths; comments do not break the read.
+        let listed = scopes(&[(
+            "app/tsconfig.json",
+            "// keep\n{\"files\": [\"main.ts\", \"./lib/x.ts\"]}",
+        )]);
+        assert!(!listed.out_of_scope("app/main.ts"));
+        assert!(!listed.out_of_scope("app/lib/x.ts"));
+        assert!(listed.out_of_scope("app/other.ts"));
+        // No include/files: everything not excluded is in scope.
+        let open = scopes(&[("tsconfig.json", r#"{"exclude": ["dist"]}"#)]);
+        assert!(!open.out_of_scope("src/a.ts"));
+        assert!(open.out_of_scope("dist/a.ts"));
+        // No governing tsconfig, or an unreadable one, fails open.
+        assert!(!scopes(&[]).out_of_scope("src/a.ts"));
+        assert!(!scopes(&[("tsconfig.json", "{broken")]).out_of_scope("src/a.ts"));
+        assert_eq!(scopes(&[("tsconfig.json", "{broken")]).unread, 1);
+        // Globs beyond the allow-list (`{a,b}`, `?`, `!`) stay unread and fail open.
+        let wild = scopes(&[("tsconfig.json", r#"{"include": ["src/{a,b}", "?.ts"]}"#)]);
+        assert!(!wild.out_of_scope("src/a.ts"));
+        assert_eq!(wild.unread, 2);
+        // Non-string entries are skipped and counted; a key left with no usable entry is
+        // unknown, not empty.
+        let mixed = scopes(&[(
+            "tsconfig.json",
+            r#"{"include": [42], "exclude": ["dist", null]}"#,
+        )]);
+        assert!(!mixed.out_of_scope("src/a.ts"));
+        assert!(!mixed.out_of_scope("dist/a.ts"));
+        assert_eq!(mixed.unread, 2);
+    }
+
+    /// Contract M6e S10: `extends` resolves relatively with the child's keys winning, bounded
+    /// by depth 8 with a cycle guard; an unresolvable chain leaves membership unknown.
+    #[test]
+    fn tsconfig_extends_resolve_bounded() {
+        let scopes = |files: &[(&str, &str)]| TsScopes::build(files.iter().copied());
+        // The child's `exclude` replaces the base's; the base's `include` fills in.
+        let s = scopes(&[
+            (
+                "base.json",
+                r#"{"include": ["src"], "exclude": ["src/a.ts"]}"#,
+            ),
+            (
+                "app/tsconfig.json",
+                r#"{"extends": "../base.json", "exclude": ["src/b.ts"]}"#,
+            ),
+        ]);
+        assert!(!s.out_of_scope("app/src/x.ts"));
+        assert!(!s.out_of_scope("app/src/a.ts"));
+        assert!(s.out_of_scope("app/src/b.ts"));
+        assert_eq!(s.unread, 0);
+        // Deviation, fail-open: an extension-less file pattern (`"src/c"`) does not take on
+        // TypeScript's inferred extensions, so `src/c.ts` stays unexplained rather than
+        // wrongly out of scope. Directory patterns cover their subtree regardless.
+        let ext = scopes(&[("tsconfig.json", r#"{"exclude": ["src/c", "src/gen"]}"#)]);
+        assert!(!ext.out_of_scope("src/c.ts"));
+        assert!(ext.out_of_scope("src/gen/c.ts"));
+        // A cycle and a missing base leave membership unknown, counted once each.
+        let looped = scopes(&[
+            ("a/tsconfig.json", r#"{"extends": "../b/tsconfig.json"}"#),
+            ("b/tsconfig.json", r#"{"extends": "../a/tsconfig.json"}"#),
+        ]);
+        assert!(!looped.out_of_scope("a/x.ts"));
+        assert_eq!(looped.unread, 2);
+        let missing = scopes(&[("app/tsconfig.json", r#"{"extends": "./nope.json"}"#)]);
+        assert!(!missing.out_of_scope("app/x.ts"));
+        assert_eq!(missing.unread, 1);
+        // Nine chained extends exceed the depth cap.
+        let owned: Vec<(String, String)> = (0..10)
+            .map(|i| {
+                (
+                    format!("d{i}/tsconfig.json"),
+                    format!("{{\"extends\": \"../d{}/tsconfig.json\"}}", i + 1),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
+        let deep = scopes(&refs);
+        assert!(!deep.out_of_scope("d0/x.ts"));
+        assert!(deep.unread >= 1);
+    }
+
+    /// Contract M6e S10, invariant 6: scoping 4× the files costs at most 5× the operations.
+    #[test]
+    fn tsconfig_scope_membership_grows_linearly() {
+        let work = |n: usize| {
+            let text = r#"{"include": ["src", "lib/*"], "exclude": ["src/gen", "lib/internal"]}"#;
+            let scopes = TsScopes::build([("tsconfig.json", text)]);
+            let files: Vec<String> = (0..n)
+                .flat_map(|i| {
+                    [
+                        format!("src/a{i}.ts"),
+                        format!("src/gen/b{i}.ts"),
+                        format!("lib/x{i}/c.ts"),
+                        format!("test/d{i}.ts"),
+                    ]
+                })
+                .collect();
+            work::take();
+            for f in &files {
+                let _ = scopes.out_of_scope(f);
+            }
+            work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Evaluator pass 1, M6e-12 (S10): a pattern escaping the tsconfig directory stays
+    /// unread and fails open.
+    #[test]
+    fn tsconfig_patterns_escaping_their_directory_stay_unread() {
+        let scopes =
+            TsScopes::build([("tsconfig.json", r#"{"include": ["../o", "/abs", "src"]}"#)]);
+        assert!(!scopes.out_of_scope("src/a.ts"));
+        assert!(scopes.out_of_scope("o/a.ts"));
+        assert_eq!(scopes.unread, 2);
     }
 }

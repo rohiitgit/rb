@@ -1,0 +1,13 @@
+openapi: 3.0.0
+info:
+  title: packs
+  version: 1.0.0
+paths:
+  /users:
+    get:
+      operationId: listUsers
+    post:
+      operationId: addUser
+  /users/{id}:
+    get:
+      operationId: getUser

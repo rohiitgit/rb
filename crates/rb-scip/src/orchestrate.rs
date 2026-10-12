@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::egress::{CLIENT_CONFIG_AT, Egress, PROXY_IMAGE};
-use crate::jobs::{Fetch, Indexer, Job, NodeLock, SCIP_JAVA_IMAGE, SCIP_TYPESCRIPT_IMAGE};
+use crate::jobs::{
+    Fetch, Indexer, Job, NodeLock, PythonLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_PYTHON_IMAGE,
+    SCIP_TYPESCRIPT_IMAGE,
+};
 use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
 
 /// scip-java's fetch and index recipe, part of each of its jobs' cache keys (contract M3b
@@ -23,16 +26,39 @@ pub const RECIPE_JAVA: &str = "m5-egress-1";
 /// (D7).
 pub const RECIPE_TS: &str = "m6a-ts-1";
 
+/// scip-go's recipe (contract M6d S1/S3): `go mod download`, then `scip-go`
+/// offline. Bumped like [`RECIPE_JAVA`].
+pub const RECIPE_GO: &str = "m6d-go-1";
+
+/// scip-python's recipe (contract M6d S2/S4): environment resolution, then
+/// `scip-python index` offline. Bumped like [`RECIPE_JAVA`]. `m6d-py-2`:
+/// the fetch installs lockfile-driven environments (S4; `m6d-py-1`
+/// fetched nothing). `m6d-py-3`: pip ignores `requires-python` (S11 — the
+/// image's 3.10 predates some lockfiles' floors; versions stay pinned).
+/// `m6d-py-4`: pip reads with a 60 s socket timeout (phase 12 — the 15 s
+/// default trips on slow wheel reads through the emulated stack).
+pub const RECIPE_PY: &str = "m6d-py-4";
+
+/// scip-java's Gradle recipe (contract M6e S2): dependency resolution plus one
+/// online build in the fetch phase, then `scip-java index --build-tool Gradle`
+/// offline. Bumped like [`RECIPE_JAVA`]. Separate from it because the fetch
+/// commands differ: a Maven-fetched index must never serve a Gradle job.
+pub const RECIPE_GRADLE: &str = "m6e-gradle-1";
+
 /// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
 /// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
-/// other budget settings change no index and are not part of it.
-pub fn recipe(indexer: Indexer, budget: &Budget) -> String {
-    match indexer {
-        Indexer::ScipJava if budget.maven_threads > 1 => {
+/// other budget settings change no index and are not part of it. Gradle jobs carry
+/// [`RECIPE_GRADLE`] (threads are a Maven-reactor setting; Gradle commands take none).
+pub fn recipe(job: &Job, budget: &Budget) -> String {
+    match (&job.indexer, &job.fetch) {
+        (Indexer::ScipJava, Fetch::Gradle) => RECIPE_GRADLE.to_owned(),
+        (Indexer::ScipJava, _) if budget.maven_threads > 1 => {
             format!("{RECIPE_JAVA}+T{}", budget.maven_threads)
         }
-        Indexer::ScipJava => RECIPE_JAVA.to_owned(),
-        Indexer::ScipTypescript => RECIPE_TS.to_owned(),
+        (Indexer::ScipJava, _) => RECIPE_JAVA.to_owned(),
+        (Indexer::ScipGo, _) => RECIPE_GO.to_owned(),
+        (Indexer::ScipPython, _) => RECIPE_PY.to_owned(),
+        (Indexer::ScipTypescript, _) => RECIPE_TS.to_owned(),
     }
 }
 
@@ -189,6 +215,8 @@ pub fn image_for(job: &Job) -> &'static str {
     match job.indexer {
         Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
         Indexer::ScipJava => SCIP_JAVA_IMAGE,
+        Indexer::ScipGo => SCIP_GO_IMAGE,
+        Indexer::ScipPython => SCIP_PYTHON_IMAGE,
     }
 }
 
@@ -203,6 +231,8 @@ pub struct Images {
     /// scip-typescript needs no field: its jobs run by, cache under and are identified by the
     /// pinned digest reference (Docker pulls it when absent; contract M3b amendment 48).
     pub java: Result<String, String>,
+    /// scip-go: like scip-java, a locally built image identified by ID.
+    pub go: Result<String, String>,
     /// The egress proxy image (contract M5 S21): its ID, or the reason every job is
     /// `unsupported` (no fetch runs without the proxy; nothing builds it implicitly).
     pub proxy: Result<String, String>,
@@ -215,6 +245,12 @@ impl Images {
                 format!(
                     "scip-java: image {SCIP_JAVA_IMAGE} is not available locally; build it as \
                      docker/scip-java/README.md describes"
+                )
+            }),
+            go: runner.image_id(SCIP_GO_IMAGE).ok_or_else(|| {
+                format!(
+                    "scip-go: image {SCIP_GO_IMAGE} is not available locally; build it as \
+                     docker/scip-go/README.md describes"
                 )
             }),
             proxy: runner.image_id(PROXY_IMAGE).ok_or_else(|| {
@@ -232,6 +268,7 @@ impl Images {
             java: Err(format!(
                 "scip-java: image {SCIP_JAVA_IMAGE} was not looked up"
             )),
+            go: Err(format!("scip-go: image {SCIP_GO_IMAGE} was not looked up")),
             proxy: Err(format!(
                 "egress proxy: image {PROXY_IMAGE} was not looked up"
             )),
@@ -244,7 +281,9 @@ impl Images {
     pub fn for_job(&self, job: &Job) -> Result<String, String> {
         let image = match job.indexer {
             Indexer::ScipTypescript => Ok(SCIP_TYPESCRIPT_IMAGE.to_owned()),
+            Indexer::ScipPython => Ok(SCIP_PYTHON_IMAGE.to_owned()),
             Indexer::ScipJava => self.java.clone(),
+            Indexer::ScipGo => self.go.clone(),
         }?;
         self.proxy.as_ref().map_err(Clone::clone)?;
         Ok(image)
@@ -255,7 +294,9 @@ impl Images {
     pub fn identity(&self, indexer: Indexer) -> &str {
         match indexer {
             Indexer::ScipJava => self.java.as_deref().unwrap_or("absent"),
+            Indexer::ScipGo => self.go.as_deref().unwrap_or("absent"),
             Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
+            Indexer::ScipPython => SCIP_PYTHON_IMAGE,
         }
     }
 }
@@ -283,14 +324,32 @@ pub fn run_job(
     runner: &dyn Runner,
 ) -> anyhow::Result<ScipRun> {
     let started = std::time::Instant::now();
-    if job.fetch == Fetch::Gradle {
-        // Only the Maven path is verified (contract M3b amendment 8); Gradle is M6.
-        return Ok(ScipRun {
-            status: RunStatus::Unsupported("scip-java Gradle builds are not verified yet".into()),
-            index: None,
-            stderr_tail: String::new(),
-            elapsed: Duration::ZERO,
-        });
+    if let Fetch::Npm { lockfile } = &job.fetch {
+        // A Yarn Berry root never fetches: the image holds classic yarn 1.22.22
+        // (measured in preflight), so a Berry install would fail on its lockfile;
+        // versions still pin from it (contract M6e S5). Before anything is exported.
+        if *lockfile == NodeLock::Yarn {
+            let lock = if job.root.is_empty() {
+                "yarn.lock".to_owned()
+            } else {
+                format!("{}/yarn.lock", job.root)
+            };
+            if files
+                .iter()
+                .find(|(p, _)| p == &lock)
+                .is_some_and(|(_, b)| crate::jobs::is_yarn_berry(b))
+            {
+                return Ok(ScipRun {
+                    status: RunStatus::Unsupported(
+                        "Yarn Berry installs need a Berry binary; the image holds classic yarn 1.22.22"
+                            .into(),
+                    ),
+                    index: None,
+                    stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                });
+            }
+        }
     }
     let instance = format!(
         "{}-{}-{}",
@@ -311,7 +370,12 @@ pub fn run_job(
     let result = (|| -> anyhow::Result<ScipRun> {
         let (mut fetches, mut index) = match job.indexer {
             Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
+            Indexer::ScipJava if job.fetch == Fetch::Gradle => {
+                gradle_runs(image, work_dir, cache_dir, budget)?
+            }
             Indexer::ScipJava => java_runs(image, work_dir, cache_dir, budget)?,
+            Indexer::ScipGo => go_runs(image, work_dir, cache_dir, budget)?,
+            Indexer::ScipPython => python_runs(job, image, work_dir, cache_dir, budget)?,
         };
         for fetch in &mut fetches {
             fetch.name = Some(format!("{name}-fetch"));
@@ -342,6 +406,12 @@ pub fn run_job(
             })?;
             for fetch in &mut fetches {
                 fetch.env.extend(crate::egress::proxy_env(&address));
+                if job.fetch == Fetch::Gradle {
+                    // Gradle reads proxy configuration from JVM system properties, not the
+                    // environment (contract M6e S2); `--no-daemon` keeps everything in the
+                    // launcher JVM, so `GRADLE_OPTS` reaches dependency resolution.
+                    fetch.env.push(crate::egress::gradle_proxy_opts(&address));
+                }
                 fetch
                     .readonly
                     .push((client.clone(), CLIENT_CONFIG_AT.to_owned()));
@@ -563,6 +633,9 @@ fn typescript_runs(
         Fetch::Maven | Fetch::Gradle => {
             anyhow::bail!("a Java fetch on a TypeScript job")
         }
+        Fetch::Go | Fetch::Python { .. } => {
+            anyhow::bail!("a Go/Python fetch on a TypeScript job")
+        }
     };
     let fetch = ContainerRun {
         entrypoint: Some(entrypoint.into()),
@@ -669,6 +742,238 @@ fn java_runs(
         ..base
     };
     Ok((fetches, index))
+}
+
+/// The fetch and index invocations for a scip-java Gradle job (docker/scip-java/README.md).
+/// The fetch phase resolves dependencies (`dependencies`) and then does one online build, so
+/// that the index phase can run the same build with `--offline` under `--network none`.
+/// Arguments after `--` replace scip-java's default Gradle arguments, so they are repeated
+/// plus `--offline`. `--console=plain` keeps progress spinners out of the stderr tail;
+/// `--no-daemon` fits ephemeral containers (no daemon is ever reused); `--no-build-cache`
+/// forces compilation to run, so javac with the SemanticDB plugin always emits (a cache hit
+/// would skip it, the spring-retry lesson of contract M3b amendment 47). The repository's
+/// wrapper stays unexported ([`export`]), so the image's `gradle` is always the one used.
+fn gradle_runs(
+    image: &str,
+    work_dir: &Path,
+    cache_dir: &Path,
+    budget: &Budget,
+) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
+    let workdir = crate::runner::absolute(work_dir)?;
+    let gradle_home = crate::runner::absolute(cache_dir)?.join("gradle");
+    std::fs::create_dir_all(&gradle_home)?;
+    let base = ContainerRun {
+        name: None,
+        image: image.into(),
+        platform: None,
+        workdir,
+        mount_at: "/sources".into(),
+        cwd: String::new(),
+        caches: vec![(gradle_home, "/root/.gradle".into())],
+        readonly: Vec::new(),
+        // Explicit (the default is also `/root/.gradle` for root): the fetch
+        // must never write where another repository's reads.
+        env: vec![("GRADLE_USER_HOME".into(), "/root/.gradle".into())],
+        network: Network::Fetch,
+        cpus: budget.cpus,
+        memory: budget.memory.clone(),
+        timeout: budget.fetch_timeout,
+        entrypoint: None,
+        args: Vec::new(),
+    };
+    let flags = [
+        "--console=plain",
+        "--quiet",
+        "--no-daemon",
+        "--no-build-cache",
+    ];
+    let gradle = |tasks: &[&str]| ContainerRun {
+        args: ["gradle"]
+            .iter()
+            .chain(flags.iter())
+            .chain(tasks.iter())
+            .map(|s| (*s).to_owned())
+            .collect(),
+        ..base.clone()
+    };
+    let fetches = vec![
+        gradle(&["dependencies"]),
+        gradle(&["clean", "compileJava", "compileTestJava"]),
+    ];
+    let index = ContainerRun {
+        network: Network::None,
+        timeout: budget.index_timeout,
+        args: [
+            "scip-java",
+            "index",
+            "--build-tool",
+            "Gradle",
+            "--",
+            "--offline",
+            "--console=plain",
+            "--no-daemon",
+            "--no-build-cache",
+            "clean",
+            "compileJava",
+            "compileTestJava",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect(),
+        ..base
+    };
+    Ok((fetches, index))
+}
+/// The fetch and index invocations for a scip-go job (docker/scip-go/README.md).
+/// The fetch phase downloads the module graph into the repository's Go module
+/// cache (`go mod download`); the index phase runs `scip-go` offline
+/// (contract M6d S1; proxy settings and lockfile discipline harden in S3/S4).
+fn go_runs(
+    image: &str,
+    work_dir: &Path,
+    cache_dir: &Path,
+    budget: &Budget,
+) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
+    let workdir = crate::runner::absolute(work_dir)?;
+    let gomod = crate::runner::absolute(cache_dir)?.join("gomod");
+    std::fs::create_dir_all(&gomod)?;
+    let base = ContainerRun {
+        name: None,
+        image: image.into(),
+        platform: None,
+        workdir,
+        mount_at: "/sources".into(),
+        cwd: String::new(),
+        caches: vec![(gomod, "/root/go/pkg/mod".into())],
+        readonly: Vec::new(),
+        // Contract M6d S3: the checksum database lives outside the
+        // allow-list, so verification is off; `go.sum` still verifies the
+        // modules it pins. `GOFLAGS=-mod=mod` rides from the image. The
+        // proxy is pinned (no `,direct` git fallback outside the
+        // allow-list; S11: it would only fail closed, slowly). The toolchain
+        // is pinned too (evaluator pass 1, E1-5): a newer-toolchain repo
+        // fails closed instead of downloading one from outside the list.
+        env: vec![
+            ("GOSUMDB".into(), "off".into()),
+            ("GOPROXY".into(), "https://proxy.golang.org".into()),
+            ("GOTOOLCHAIN".into(), "local".into()),
+            ("GOFLAGS".into(), "-mod=mod".into()),
+        ],
+        network: Network::Fetch,
+        cpus: budget.cpus,
+        memory: budget.memory.clone(),
+        timeout: budget.fetch_timeout,
+        entrypoint: None,
+        args: Vec::new(),
+    };
+    let mut fetch = base.clone();
+    fetch.args = ["go", "mod", "download"].map(String::from).to_vec();
+    let index = ContainerRun {
+        network: Network::None,
+        timeout: budget.index_timeout,
+        args: ["scip-go"].map(String::from).to_vec(),
+        ..base
+    };
+    Ok((vec![fetch], index))
+}
+
+/// The fetch and index invocations for a scip-python job (contract M6d S4).
+/// The fetch phase resolves the environment behind the egress proxy, driven
+/// only by what the job's root pins: a `poetry.lock` installs the locked
+/// tree without the root project, a `requirements.txt` installs its pins
+/// without transitive dependencies, anything else installs the project
+/// itself without dependencies (so an unlisted host is never reached for an
+/// unpinned tree, and third-party names stay unresolved — the safe
+/// direction). The index runs `scip-python index` offline; the image exists
+/// for linux/amd64 only, so the job is pinned there like scip-typescript's.
+fn python_runs(
+    job: &Job,
+    image: &str,
+    work_dir: &Path,
+    cache_dir: &Path,
+    budget: &Budget,
+) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
+    let lockfile = match job.fetch {
+        Fetch::Python { lockfile } => lockfile,
+        _ => anyhow::bail!("a non-Python fetch on a Python job"),
+    };
+    let workdir = crate::runner::absolute(work_dir)?;
+    let pip_cache = crate::runner::absolute(cache_dir)?.join("pip");
+    std::fs::create_dir_all(&pip_cache)?;
+    let mut caches = vec![(pip_cache, "/root/.cache/pip".into())];
+    if lockfile == PythonLock::Poetry {
+        let poetry_cache = crate::runner::absolute(cache_dir)?.join("pypoetry");
+        std::fs::create_dir_all(&poetry_cache)?;
+        caches.push((poetry_cache, "/root/.cache/pypoetry".into()));
+    }
+    let base = ContainerRun {
+        name: None,
+        image: image.into(),
+        platform: Some("linux/amd64".into()),
+        workdir,
+        mount_at: "/src".into(),
+        // Like scip-typescript's job roots (contract M6a D7): the container
+        // starts in the job's root; revisited with evidence in S5.
+        cwd: job.root.clone(),
+        caches,
+        readonly: Vec::new(),
+        // pip's update notice depends on the cache's state (contract M5 S22).
+        // `PIP_TIMEOUT` (phase 12: pip's 15 s default read timeout trips on
+        // slow wheel reads through the emulated stack — measured 19 s ok /
+        // 87 s ok / 33 s and 54 s read-timeout failures on one fixture fetch,
+        // so 60 s of headroom without masking real outages, which the fetch
+        // budget still bounds).
+        env: vec![
+            ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
+            ("PIP_TIMEOUT".into(), "60".into()),
+        ],
+        network: Network::Fetch,
+        cpus: budget.cpus,
+        memory: budget.memory.clone(),
+        timeout: budget.fetch_timeout,
+        entrypoint: None,
+        args: Vec::new(),
+    };
+    let args: Vec<String> = match lockfile {
+        PythonLock::Poetry => ["poetry", "install", "--no-root", "--no-interaction"].to_vec(),
+        // `--ignore-requires-python`: the image's interpreter (3.10) predates
+        // some lockfiles' floors (S11: a `>=3.14` floor fails the fetch
+        // otherwise); versions stay pinned, and what the older runtime cannot
+        // parse stays a counted gap. Never `--no-deps`-less: transitive trees
+        // stay out.
+        PythonLock::Requirements => [
+            "pip",
+            "install",
+            "--no-deps",
+            "--ignore-requires-python",
+            "-r",
+            "requirements.txt",
+        ]
+        .to_vec(),
+        PythonLock::None => [
+            "pip",
+            "install",
+            "--no-deps",
+            "--ignore-requires-python",
+            "-e",
+            ".",
+        ]
+        .to_vec(),
+    }
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let fetch = ContainerRun {
+        args,
+        ..base.clone()
+    };
+    let index = ContainerRun {
+        network: Network::None,
+        timeout: budget.index_timeout,
+        args: ["scip-python", "index"].map(String::from).to_vec(),
+        ..base
+    };
+    Ok((vec![fetch], index))
 }
 
 fn once(s: &str) -> std::iter::Once<&str> {
@@ -826,6 +1131,162 @@ mod tests {
             fetch,
             projects: Vec::new(),
             unpinned: false,
+        }
+    }
+
+    /// Contract M6e S6: a Yarn Berry root never fetches (the image holds
+    /// classic yarn 1.22.22, measured in preflight): `unsupported` with the
+    /// reason, before anything is exported or run.
+    #[test]
+    fn berry_jobs_are_unsupported_and_export_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(false, false);
+        let files = vec![
+            ("apps/web/package.json".to_owned(), b"{}".to_vec()),
+            (
+                "apps/web/yarn.lock".to_owned(),
+                b"__metadata:\n  version: 8\n".to_vec(),
+            ),
+        ];
+        let run = run_job(
+            &ts_job(NodeLock::Yarn),
+            "sha256:ts",
+            &files,
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(
+            run.status,
+            RunStatus::Unsupported(
+                "Yarn Berry installs need a Berry binary; the image holds classic yarn 1.22.22"
+                    .into()
+            )
+        );
+        assert!(fake.runs.borrow().is_empty());
+        assert!(!tmp.path().join("w").exists(), "nothing is exported");
+        // A classic lockfile still runs.
+        let files = vec![
+            ("apps/web/package.json".to_owned(), b"{}".to_vec()),
+            (
+                "apps/web/yarn.lock".to_owned(),
+                b"# yarn lockfile v1\n".to_vec(),
+            ),
+        ];
+        let run = run_job(
+            &ts_job(NodeLock::Yarn),
+            "sha256:ts",
+            &files,
+            &tmp.path().join("w2"),
+            &tmp.path().join("c2"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert!(!matches!(run.status, RunStatus::Unsupported(_)));
+        assert!(!fake.runs.borrow().is_empty());
+    }
+
+    fn go_job() -> Job {
+        Job {
+            root: "svc".into(),
+            indexer: Indexer::ScipGo,
+            fetch: Fetch::Go,
+            projects: Vec::new(),
+            unpinned: false,
+        }
+    }
+
+    fn python_job(lockfile: PythonLock) -> Job {
+        Job {
+            root: "svc".into(),
+            indexer: Indexer::ScipPython,
+            fetch: Fetch::Python { lockfile },
+            projects: Vec::new(),
+            unpinned: lockfile != PythonLock::Poetry,
+        }
+    }
+
+    /// Contract M6d S1: a Go job fetches with `go mod download` on the fetch
+    /// network (module cache mounted) and indexes with `scip-go` offline.
+    /// Contract M6d S3: the fetch pins `GOSUMDB=off` (the checksum database
+    /// is outside the allow-list; `go.sum` still verifies when present) and
+    /// `GOPROXY` to the module proxy (S11: no `,direct` git fallback outside
+    /// the allow-list).
+    #[test]
+    fn go_job_runs_download_then_scip_go() {
+        let lines = argv_lines(&go_job(), "sha256:go", &Budget::default());
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("--network rb-scip-fetch")
+                && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
+                && lines[0].contains("go mod download")
+                && lines[0].contains("/root/go/pkg/mod")
+                && lines[0].contains("-e GOSUMDB=off")
+                && lines[0].contains("-e GOPROXY=https://proxy.golang.org")
+                && lines[0].contains("-e GOTOOLCHAIN=local")
+                && lines[0].contains("-e GOFLAGS=-mod=mod"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("--network none") && lines[1].ends_with("scip-go"),
+            "{}",
+            lines[1]
+        );
+    }
+
+    /// Contract M6d S4: a Python job's fetch resolves its environment behind
+    /// the proxy — the locked tree for a poetry.lock, pins without transitive
+    /// dependencies for a requirements.txt, the project only otherwise (a
+    /// uv.lock has no installer in the image) — and the index stays an
+    /// offline `scip-python index` on the emulated platform. pip's version
+    /// check is off in every phase (contract M5 S22: its notice depends on
+    /// the cache's state).
+    #[test]
+    fn python_jobs_fetch_lockfile_driven_environments_then_index_offline() {
+        for (lockfile, fetch, cache) in [
+            (
+                PythonLock::Poetry,
+                "poetry install --no-root --no-interaction",
+                "/root/.cache/pypoetry",
+            ),
+            (
+                PythonLock::Requirements,
+                "pip install --no-deps --ignore-requires-python -r requirements.txt",
+                "/root/.cache/pip",
+            ),
+            (
+                PythonLock::None,
+                "pip install --no-deps --ignore-requires-python -e .",
+                "/root/.cache/pip",
+            ),
+        ] {
+            let lines = argv_lines(&python_job(lockfile), "sha256:py", &Budget::default());
+            assert_eq!(lines.len(), 2, "{lockfile:?}");
+            assert!(
+                lines[0].contains("--network rb-scip-fetch")
+                    && lines[0].contains("--platform linux/amd64")
+                    && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
+                    && lines[0].contains(fetch)
+                    && lines[0].contains(cache)
+                    && lines[0].contains("-e PIP_DISABLE_PIP_VERSION_CHECK=1")
+                    && lines[0].contains("-e PIP_TIMEOUT=60"),
+                "{lockfile:?}: {}",
+                lines[0]
+            );
+            assert!(
+                lines[1].contains("--network none")
+                    && lines[1].contains("--platform linux/amd64")
+                    && lines[1].contains("-v <work>:/src -w /src")
+                    && lines[1].ends_with("scip-python index"),
+                "{lockfile:?}: {}",
+                lines[1]
+            );
         }
     }
 
@@ -1135,7 +1596,7 @@ mod tests {
             *fake.proxies.borrow(),
             [
                 format!(
-                    "start rb-egress-{instance} registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443"
+                    "start rb-egress-{instance} files.pythonhosted.org:443,plugins-artifacts.gradle.org:443,plugins.gradle.org:443,proxy.golang.org:443,pypi.org:443,registry.npmjs.org:443,registry.yarnpkg.com:443,repo.maven.apache.org:443,repo.spring.io:443,repo1.maven.org:443,storage.googleapis.com:443"
                 ),
                 format!("stop rb-egress-{instance}"),
             ]
@@ -1326,27 +1787,43 @@ mod tests {
     }
 
     #[test]
-    fn gradle_jobs_and_a_missing_java_image_are_unsupported_and_exports_refuse_unsafe_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fake = Fake::new(false, false);
-        let run = run_job(
-            &java_job(Fetch::Gradle),
-            JAVA_ID,
-            &files(),
-            &tmp.path().join("w"),
-            &tmp.path().join("c"),
-            &Budget::default(),
-            &Egress::default(),
-            &fake,
-        )
-        .unwrap();
-        assert_eq!(
-            run.status,
-            RunStatus::Unsupported("scip-java Gradle builds are not verified yet".into())
+    fn gradle_job_resolves_builds_then_indexes_offline() {
+        let lines = argv_lines(&java_job(Fetch::Gradle), "sha256:java", &Budget::default());
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].contains("--network rb-scip-fetch")
+                && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
+                && lines[0].contains(
+                    "gradle --console=plain --quiet --no-daemon --no-build-cache dependencies"
+                )
+                && lines[0].contains("/root/.gradle")
+                && lines[0].contains("-e GRADLE_USER_HOME=/root/.gradle")
+                && lines[0].contains("-e GRADLE_OPTS=-Dhttps.proxyHost="),
+            "{}",
+            lines[0]
         );
-        assert!(fake.runs.borrow().is_empty());
-        assert!(!tmp.path().join("w").exists(), "nothing is exported");
+        assert!(
+            lines[1].contains("--network rb-scip-fetch")
+                && lines[1].contains(
+                    "gradle --console=plain --quiet --no-daemon --no-build-cache clean compileJava compileTestJava"
+                )
+                && lines[1].contains("/root/.gradle"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("--network none")
+                && lines[2].contains("scip-java index --build-tool Gradle")
+                && lines[2].contains("-- --offline --console=plain --no-daemon --no-build-cache")
+                && lines[2].contains("clean compileJava compileTestJava"),
+            "{}",
+            lines[2]
+        );
+    }
 
+    #[test]
+    fn a_missing_java_image_is_unsupported_and_exports_refuse_unsafe_paths() {
+        let tmp = tempfile::tempdir().unwrap();
         let no_image = Fake {
             java_image: false,
             ..Fake::new(false, false)
@@ -1478,9 +1955,18 @@ mod tests {
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m6a-ts-1"));
-        assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
+        assert_eq!(RECIPE_PY, "m6d-py-4");
+        assert_eq!(RECIPE_GRADLE, "m6e-gradle-1");
         assert_eq!(
-            recipe(Indexer::ScipTypescript, &Budget::default()),
+            recipe(&java_job(Fetch::Maven), &Budget::default()),
+            RECIPE_JAVA
+        );
+        assert_eq!(
+            recipe(&java_job(Fetch::Gradle), &Budget::default()),
+            RECIPE_GRADLE
+        );
+        assert_eq!(
+            recipe(&ts_job(NodeLock::PackageLock), &Budget::default()),
             RECIPE_TS
         );
         let tmp = tempfile::tempdir().unwrap();
@@ -1637,18 +2123,22 @@ mod tests {
             assert!(line.ends_with(" -T 4"), "{line}");
             assert!(line.contains(" --cpus 8 --memory 6g "), "{line}");
         }
-        assert_eq!(recipe(Indexer::ScipJava, &threaded), "m5-egress-1+T4");
-        assert_eq!(recipe(Indexer::ScipJava, &Budget::default()), RECIPE_JAVA);
-        assert_eq!(recipe(Indexer::ScipTypescript, &threaded), RECIPE_TS);
+        assert_eq!(recipe(&java_job(Fetch::Maven), &threaded), "m5-egress-1+T4");
+        assert_eq!(
+            recipe(&java_job(Fetch::Maven), &Budget::default()),
+            RECIPE_JAVA
+        );
+        assert_eq!(recipe(&java_job(Fetch::Gradle), &threaded), RECIPE_GRADLE);
+        assert_eq!(recipe(&ts_job(NodeLock::PackageLock), &threaded), RECIPE_TS);
         let files = [("pom.xml", "1")];
         assert_ne!(
             crate::project_input_hash(
-                &recipe(Indexer::ScipJava, &threaded),
+                &recipe(&java_job(Fetch::Maven), &threaded),
                 files,
                 &Egress::default()
             ),
             crate::project_input_hash(
-                &recipe(Indexer::ScipJava, &Budget::default()),
+                &recipe(&java_job(Fetch::Maven), &Budget::default()),
                 files,
                 &Egress::default()
             ),

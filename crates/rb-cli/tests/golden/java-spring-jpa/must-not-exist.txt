@@ -12,8 +12,8 @@ INJECTS * -> * [synthetic]
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher#
 # @Primary wins for DefaultAuthService's unqualified hasher.
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/PlainHasher#
-# Name fallback picks one notifier: not the other.
-INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/EmailNotifier#
+# Name fallback lost to the `@Import` registrant (contract M6c S1): both
+# scanned beans stay candidates beside the registrant (see must-exist).
 # A same-named @Service from another package is no stereotype: never a candidate.
 INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/support/ReportNotifier.java`/ReportNotifier#
 # The @Bean method is the bean; the class it instantiates is not a candidate.
@@ -25,3 +25,16 @@ IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/Log
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/LogAuditSink# -> * {"impl_instantiated":false}
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/UserRepositoryCustomImpl.java`/UserRepositoryCustomImpl#touch(). -> * {"impl_instantiated":false}
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/UserRepositoryCustomImpl.java`/UserRepositoryCustomImpl# -> * {"impl_instantiated":false}
+# Contract M6c S6: the returned class and the validator are never targets
+# themselves (the `@Bean` method is the target for the class).
+INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/JwtFilter.java`/JwtFilter#
+INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java`/EmailValidator#
+# Contract M6c S7: the declared `findByEmail` is edged by Tier B itself (to the
+# method), never duplicated to the interface.
+CALLS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService#authenticate(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository#
+# Contract M6c S8: the service class itself is never an injection target.
+INJECTS * -> rb-heuristic . . . `src/main/java/com/acme/auth/MailService.java`/MailService#
+# Contract M6c S9: the disagreeing bean is never picked.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/Channel.java`/Campaigns# -> rb-heuristic . . . `src/main/java/com/acme/auth/Channel.java`/EmailChannel#
+# Contract M6c S1: a registrant never resolves alone (no single edge to it).
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/Alerts.java`/Alerts# -> rb-heuristic . . . `src/main/java/com/other/SmsConfig.java`/SmsConfig#sms(). [heuristic]

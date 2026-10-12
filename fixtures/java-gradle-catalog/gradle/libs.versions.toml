@@ -1,0 +1,5 @@
+[versions]
+lang = "3.20.0"
+
+[libraries]
+lang3 = { module = "org.apache.commons:commons-lang3", version.ref = "lang" }

@@ -1,0 +1,11 @@
+public.users  (table users)
+precision=cha
+├─ Migrations
+│    schema.sql  create  db/schema.sql:1  [exact, schema assumed]  (contract-packs)
+├─ Accessed by
+│    contract-packs (.)
+│      UserMapper.xml  read+insert  src/main/resources/mapper/UserMapper.xml:4  [exact, schema assumed]
+├─ Services (callers up to entry points) (1)
+│    contract-packs (.)  insert+read  direct  [exact]
+│      entry points: top-level 1
+└─ Through APIs: none

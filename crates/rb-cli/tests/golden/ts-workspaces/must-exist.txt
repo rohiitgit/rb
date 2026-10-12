@@ -12,3 +12,7 @@ IMPLEMENTS scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Other#n(). -> scip
 IMPLEMENTS scip-typescript npm @ws/app 1.0.0 src/`svc.ts`/Svc#m(). -> scip-typescript npm @ws/core 1.0.0 src/`shapes.ts`/Mid#m(). [exact]
 # legacy/ is not a member: its own (unpinned) job.
 CALLS scip-typescript npm legacy 1.0.0 src/`old.ts`/caller(). -> scip-typescript npm legacy 1.0.0 src/`old.ts`/old(). [exact]
+# Contract M6c S4: a `tsconfig.json` `paths` alias resolves exactly (Tier B
+# without SCIP, scip-typescript with it) — and an unresolvable bare specifier
+# stays external.
+CALLS scip-typescript npm legacy 1.0.0 src/`main.ts`/run(). -> scip-typescript npm legacy 1.0.0 src/models/`user.ts`/helper(). [exact]

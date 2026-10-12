@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="acme.UserMapper">
+  <select id="findAll" resultType="string">
+    SELECT name FROM users
+  </select>
+  <insert id="insert">
+    INSERT INTO users (name) VALUES (#{name})
+  </insert>
+  <select id="dynamic">
+    SELECT name FROM users
+    <if test="name != null">AND name = #{name}</if>
+  </select>
+</mapper>

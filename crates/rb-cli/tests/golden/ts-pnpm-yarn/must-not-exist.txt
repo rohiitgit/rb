@@ -1,0 +1,5 @@
+# Anti-guards for the ts-pnpm-yarn fixture (contract M6e S7).
+# No pinned dependency stays unresolved; no lockfile goes unread.
+DEPENDS_ON pnpm/packages/app -> npm/semver@?
+DEPENDS_ON pnpm/packages/lib -> npm/is-odd@?
+DEPENDS_ON yarn -> npm/semver@?

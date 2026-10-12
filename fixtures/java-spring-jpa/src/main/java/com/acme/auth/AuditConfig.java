@@ -9,6 +9,11 @@ public class AuditConfig {
     AuditSink auditSink() {
         return new LogAuditSink();
     }
+
+    @Bean
+    JwtFilter jwtFilter() {
+        return new JwtFilter();
+    }
 }
 
 /** Receives one line per security-relevant event. */

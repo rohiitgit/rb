@@ -1,0 +1,7 @@
+# Precision guards for the ts-pnpm-yarn fixture (contract M6e S7),
+# checked against the SCIP dump.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# S5: pnpm and yarn locks pin exact versions from ranges.
+DEPENDS_ON pnpm/packages/app -> npm/semver@7.8.5 [exact] {"version_from": "pnpm_lock"}
+DEPENDS_ON pnpm/packages/lib -> npm/is-odd@3.0.1 [exact] {"version_from": "pnpm_lock"}
+DEPENDS_ON yarn -> npm/semver@7.8.5 [exact] {"version_from": "yarn_lock"}

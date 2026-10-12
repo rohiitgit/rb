@@ -297,3 +297,179 @@
 ## 2026-10-09: a sorted scan with a segment-aware predicate breaks on the string boundary
 - **Mistake:** workspace member discovery scanned sorted package roots with `take_while(is_under)`, asserting "roots strictly under follow it in sorted order". A sibling (`mods-old`) sorts between the root and its members (`-` below `/`), so the scan stopped early and members fell back to unpinned jobs (evaluator pass 1, Z1).
 - **Rule:** when a scan over sorted paths uses a segment-aware predicate (`is_under`, "strictly under"), the `take_while` boundary must be the *string* predicate (shared prefix ⇒ contiguous run) with the segment check as a per-item filter — never the reverse. Test with a sibling whose post-root character sorts below `/` (`-`, `.`, `+`), plus a growth shape with such siblings.
+
+## 2026-10-10: never `git checkout --` a file with uncommitted work; verify the restore path first
+- **Mistake:** during phase-4 mutant runs, `git checkout -- crates/rb-frameworks/src/clients.rs` (meant to revert a mutant) discarded the whole phase's uncommitted implementation. Restored from a `/tmp` backup, verified by the test suite — but the backup's freshness had to be established after the fact.
+- **Rule:** revert mutants by re-applying the saved bytes (`cp` back the pre-mutant copy), never by `git checkout --`. Before any destructive command, confirm the restore source exists and is current (`diff` it against the tree if unsure). Keep one clearly-named pre-mutant copy per file under `/tmp` for the duration of the mutation runs.
+
+## 2026-10-10: Go's `httptest` lives at `net/http/httptest`, and a wrong import path fails silent
+- **Mistake (caught by tests):** the S4 sink walk looked up `net/httptest`; Go's package is `net/http/httptest`, so no recorder chain was ever recognised and three tests came back empty. The import gate returned `None` exactly as designed for a missing import — the design worked, the constant was wrong.
+- **Rule:** import-path constants get a positive unit each (a probe asserting the alias resolves), and a failing sink test is debugged by printing the gate's inputs (the resolved import names, the recognised chain indices) before doubting the walk.
+
+## 2026-10-10: a shared DB container bind-mounts its own checkout's `var/`
+- **Mistake (environment):** this workspace's e2e failed on AGE loads because the running compose database (started from the original checkout) bind-mounts that checkout's `var/age-load`, not this workspace's. Replacing this workspace's (gitignored) `var/age-load` with a symlink to the mounted directory fixed it.
+- **Rule:** when e2e fails on loader paths with a shared database, inspect the container's mounts (`docker inspect … .Mounts`) and point the workspace's gitignored load dir at the mounted source. Never restart or move the shared database for a workspace-local problem.
+
+## 2026-10-10: axios verbs take data before config — a config in arg 1 is data
+- **Mistake (caught by e2e):** the S5 fixture wrote `axios.post(url, { ...extOpts })`, putting the spread config in the data position (`post`/`put`/`patch` take `(url, data, config)`); the site stitched exactly like the config-less control, and the stitch unit drafted the same way failed first for the same reason. Only `get`/`delete`/`head`/`options` take `(url, config)`.
+- **Rule:** when a fixture or unit exercises a request config, match the verb's arity first (`get(url, config)` for two-arg configs, `post(url, data, config)` for three); assert the pack-level `base=` rendering in the unit before trusting the stitch-level bucket. A config-shaped second argument to a three-arg verb is data, silently.
+
+## 2026-10-10: per-site folder rebuilds fail growth ratios — amortize per file
+- **Mistake (caught by the growth test):** the S6 member proof built its per-file index inside a fold that production runs per site: 25→100 members measured 15×. The scopes cache had the same latent shape (a fresh `Folder` per fold); no existing growth test exercised it because none folded densely.
+- **Rule:** per-file work (lookup indexes, proof tables, clean-fold memo) belongs in one `Folder` shared across a file's folds, with a fresh step budget per fold so budget semantics are unchanged. Growth-test the shared shape production runs; a per-call folder in the test measures construction, not the walk.
+
+## 2026-10-10: insert-only edits anchored on single unique lines
+- **Mistake (repeated):** several `edit` calls spanned existing code that the replacement then dropped (a test body, a function signature line, a loop header) — each caught by `git diff`/build, each repaired by hand. Multi-line `oldString` is most dangerous at its edges.
+- **Rule:** prefer pure insertions (`oldString` = one unique anchor line, `newString` = anchor + new content). When replacing, re-read the region first and keep `oldString` minimal; `git diff --stat` after every batch of edits, before running anything. Corroborated 2026-10-10 (S8): in multi-edit batches against one file, single edits silently failed to land despite reporting success (a missing `let lifted`, a missing coverage insert, a missing helper field) — each caught only by grepping for the new text. Never trust a batch result; verify every hunk individually (`grep` the new symbol, `git diff` the file) before building.
+
+## 2026-10-10: a growth test on hitting input measures a constant
+- **Mistake (caught by a surviving mutant):** the S8 single-literal growth test used hitting input, so the scan early-returned after the first line at both sizes and a scan-to-EOF quadratic mutant survived (ratio ~1×). The first quadratic mutant (quadratic in nesting, not input size) survived for the same reason the test was blind: it scaled the wrong dimension.
+- **Rule:** growth inputs must force the full walk (no-hit input for early-exit scans), and the mutant must be quadratic in the scaled dimension (input size, not depth). Record both numbers: correct code within the bound, the quadratic mutant past it (S8: mutant 693,100 → 11,503,300 vs the 5× bound).
+
+## 2026-10-10: e2e materialises only git-tracked fixture files, and dump goldens live in structure_goldens
+- **Mistake (caught by a too-fast pass):** the S9 fixture file was untracked, so `fixture_repo` (which copies `git ls-files`) silently excluded it and `polyglot_monorepo` passed in 3s testing nothing new. Separately, `polyglot_monorepo` covers only guards/determinism — `dump.jsonl`, `status-*`, cards and finds are compared by `polyglot_monorepo_structure_goldens`.
+- **Rule:** `git add` fixture files before their first e2e run (staging suffices for `ls-files`); after guards go green, run the structure/scip/diff/path/caller tests for the golden churn, classify every hunk before `RB_BLESS=1`, and re-run the full suite green. A passing e2e faster than the fixture's known index time deserves suspicion, not celebration.
+
+## 2026-10-10: cargo swallows eprintln — run test binaries directly for probes
+- **Mistake (repeated):** `cargo test -- --nocapture` showed no probe output three times; the test binary run directly (`./target/debug/deps/<hash> <filter> --nocapture`) printed immediately.
+- **Rule:** debug-print through the test binary's path (find the fresh hash by `ls -t`), not through cargo. Delete probe tests before committing (they also shift unit counts).
+
+## 2026-10-10: evaluator pass 1 must probe configuration surfaces and allow-list edges
+- **Finding (fixed):** the S9 battery passed with plain sites through reconfigured calls (`superagent.use`, `got`/`ky` `hooks`) because no probe exercised them; the S8 allow-list missed a corpus-evidenced routing type (`ReactorLoadBalancer`).
+- **Rule:** for every new client form, probe its configuration surfaces (plugins, interceptors, hooks, custom transports, by-name/spread options) expecting caps; for every narrowing allow-list, probe its boundary types (same-name foreign types, unresolved imports, sibling types in the same tree) expecting both caps and lifts. Survivors that force new rows are the mechanism working — record them as such.
+
+## 2026-10-10: zsh does not word-split — arrays for argv, never strings
+- **Mistake (repeated 3×):** `set -- $spec`, unquoted `$ARGS`, and `echo ===` produced mangled URLs/flags and syntax errors in measurement scripts.
+- **Rule:** in zsh pass argv as arrays (`args=(...)`, `"${args[@]}"`) or functions with positional params; never unquoted string expansion, never `echo ===`. Verify each script's first real effect (clone lands, binary runs) before the batch.
+
+## 2026-10-10: SCIP symbol keys quote the basename, not the path
+- **Mistake:** the new S4 must-exist guard wrote the nested callee as ``src/`models/user.ts`/helper()``; the real key is ``src/models/`user.ts`/helper()`` (directory + backticked basename). The SCIP test failed on the guard while the edge existed.
+- **Rule:** never hand-write a guard key for a nested path: dump the fixture once and copy the key byte-for-byte (or simulate `guard_failures` against the dump before blessing).
+
+## 2026-10-10: a surviving mutant can indict the test, not the code
+- **Mistake:** the exports-exact-drop mutant survived because the test's exact-vs-`./*` case also resolves through the longest-match loop — the exact-first loop looked redundant. It is not: `./a` vs the longer pattern `./a*` resolves differently.
+- **Rule:** when a mutant survives, check whether the test lacks the discriminating shape before touching the code; add the minimal shape (`./a`-vs-`./a*`) that only the mechanism under test decides.
+
+## 2026-10-10: expose the level, don't mirror the walk
+- **Mistake (avoided):** the first S5 sketch mirrored `levels()` order in a second function to answer "did resolution reach on-demand". A second walk drifts from the first the moment either changes.
+- **Rule:** when a decision needs to know which branch a search took, return the branch from the search (here `levels()` returns its winning `TypeLevel`). One walk, no drift. The `callable=false` path never touches `members()`, so the extra return is recursion-safe by construction.
+
+## 2026-10-10: fan out only the current call's slice of a shared accumulator
+- **Mistake:** the S6 edge fan-out did `std::mem::take(&mut out.injections)` and re-sourced every injection — but `out` accumulates across points, so one point's consumers overwrote all previous points' sources (caught by the test: `NeedsOther → Dep` with `sites: 2`).
+- **Rule:** when post-processing an accumulator inside a per-item call, `split_off` the length taken before the call's own pushes and fan out only that suffix.
+
+## 2026-10-10: `fixture_repo` copies `git ls-files` — stage new fixture files first
+- **Mistake:** the S6 bless ran with two new fixture files untracked, so the e2e indexed a partial fixture (tracked edit present, new files absent) and blessed wrong goldens; caught by the Integr's card counts (+1 symbol instead of +5).
+- **Rule:** `git add` new fixture files before any bless run, and sanity-check the blessed diff's file/symbol counts against the fixture change before classifying.
+
+## 2026-10-10: same-key edges merge — isolate negative cases in their own method
+- **Mistake:** the S7 allow-list-drop mutant survived because the non-listed `customAudit` call shared its method with the listed `save` call: both edges have the same (source, kind, target, attrs) and merge in the builder, so the extra edge was invisible.
+- **Rule:** when a test pins the absence of an edge, give the negative case a source no positive case shares (its own method). Merged evidence is invisible to edge-list asserts.
+
+## 2026-10-10: Tier B defers to SCIP on exact files — so must every heuristic producer
+- **Mistake:** the S7 producer edged SCIP-documented files and failed the M3b S7 assert (`heuristic code edge in a SCIP-ok project`): `add_edges` skips `exact_files`, but the new producer did not know about the set.
+- **Rule:** every heuristic edge producer takes the exact-files set and skips it. The pre-gate bless failure is the kill proof for the gate-drop mutant.
+
+## 2026-10-11: accumulation order decides what `+=` means — pin the primary use
+- **Mistake:** the first S8 chain reader accumulated nearest-first, so a root `=` wiped nearer `+=` additions — breaking the primary `+=` pattern (base list at root, extras below). Caught by writing the accumulation test, which failed.
+- **Rule:** apply config chains root-first (`=` replaces, `+=` appends, `!` clears) and pin the root-`=`-plus-subdir-`+=` shape explicitly; it is the reason `+=` exists.
+
+## 2026-10-11: a shadowing exact match hides the mechanism a mutant removes
+- **Mistake:** the S8 stop-drop mutant survived because the test's nearer `=` shadowed the farther entries anyway — the stop boundary never decided anything.
+- **Rule:** when pinning precedence/shielding, use the weakest nearby form (`+=`, not `=`) so only the mechanism under test decides the outcome. Same family as the same-key-merge lesson.
+
+## 2026-10-11: survivors can prove checks redundant — remove, don't duplicate-cover
+- **Mistake (recovered):** two S9a refusal checks survived their mutants. Tracing showed the `?` mark plus exact equality already refuses every shape but bare-`?`-vs-`?` — the checks were unobservable by construction.
+- **Rule:** when a survivor analysis shows the mechanism already enforces the property, remove the redundant check (one load-bearing refusal + the `WBox` row) instead of keeping defense-in-depth that no test can bite. Joint coverage (S2 precedent) is for provably inseparable arms, not redundant ones.
+
+## 2026-10-11: print the input before theorizing about the pipeline
+- **Mistake:** the S9a `WBox` failure (0 points) triggered theories about caches, pollution, merges and parallelism across a dozen experiments — the row had lost its parameter name (`Catalog(Store<?>)`) in an edit, so no binding existed. The byte dump (`WREAL`) found it in one run.
+- **Rule:** a mysteriously empty result gets an input byte-dump first, theories second. And verify script edits by reading them back immediately (`{{}}`/`\\n` mangling hides in heredocs).
+
+## 2026-10-11: shape checks must cover root manifests, not just the code dir
+- **Mistake:** phase-0 recorded "no tsconfig paths/exports in jhipster's webapp" — true of the webapp dir, false of the repo: the ROOT `tsconfig.json` carries a full `paths` map with a `"*"` catch-all. S4's repo leg looked vacuous until measurement proved it substantive (+14 exact references).
+- **Rule:** when scoping manifest-driven features, enumerate the manifests (`find -name <manifest>`) at the repo root first, then check their CONTENT everywhere — never generalize from the code directory alone.
+
+## 2026-10-11: mutant anchors must be line-anchored, scripts written atomically
+- **Mistake (recovered):** an S9a/S3 mutant anchor matched twice (indented copy inside a test expectation); and a script edit truncated its own file (`open(w)` before an exception).
+- **Rule:** anchor mutants on declaration lines (with preceding-line context when the entry line repeats); write scripts with `write()` to a temp file + atomic rename, never `open(w)` before computing content.
+
+## 2026-10-11: struct-field additions must update every literal constructor — `--all-targets` is the check
+- **Mistake (found, predates this phase):** M6d phase 1 added `Images.go` but left `tool_versions_record_image_identities_when_scip_is_on` constructing `Images{java, proxy}` — so `cargo clippy --workspace --all-targets` and the `rb` bin tests have been broken since phase 1, while phase 1–3 verifications reported clean (they evidently ran clippy without `--all-targets`, or only lib tests).
+- **Rule:** adding a field to a struct ends with `cargo clippy --workspace --all-targets` (not just `--workspace`) green; grep for literal constructors of the struct in test code, which the compiler only reaches under `--all-targets`/`--tests`.
+
+## 2026-10-11: append contract amendments anchored on the previous amendment's tail, never the shared header
+- **Mistake (twice):** the edit anchored on `## Amendments\n\n<N>. **...**` and replaced the next amendment's opener with the new text — once deleting amendment 4's opener (caught by grep before commit), once inverting amendments 5/6 (repaired by swapping the single-line blocks).
+- **Rule:** anchor amendment appends on the previous amendment's unique TAIL text (its last sentence), and verify with `grep -n "phase N)"` that numbering and order are chronological before committing.
+
+## 2026-10-11: mutant scripts must assert the mutation landed (and quote zsh safely)
+- **Mistake (recovered):** three mutant runs were vacuous — two replaced text with itself (no-op "survivors"/"kills"), one anchor matched nothing after `cargo fmt` rewrapped the line; plus `echo ===` keeps breaking zsh commands (unquoted `==`).
+- **Rule:** every mutant case asserts `count == 1` (already done) AND re-reads the file to confirm `new in text` before running tests; never `echo ===` (use `---`); re-check anchors after any fmt pass.
+
+## 2026-10-11: from-imported names need provenance, not just membership
+- **Mistake (caught by test):** the first S7 draft stored from-imported verbs as bare locals and checked the LOCAL against the verb list — `get as hget` never matched. Aliased imports must carry (original, local) through every allow-list check.
+- **Rule:** any allow-list keyed on imported names maps local → original and decides on the original; add an aliased-import case to every such test from the start.
+
+## 2026-10-11: never `git checkout -- <file>` to undo a mutant (or anything)
+- **Mistake (recovered, costly):** a manual `git checkout -- crates/…/scip.rs` to undo a mutant reverted the entire S9b implementation + tests (they were uncommitted); rewritten from context and re-verified (mutants re-killed, suites re-run).
+- **Rule:** mutant scripts restore bytes in `finally` (already the rule) — and for ANY manual undo use `git diff` to inspect first, `git stash`/`edit` to revert precisely; `checkout -- <file>` is banned while uncommitted work exists. (Extends the M3b `git checkout` lesson and the amendment-append rule: destructive commands need a pre-check.)
+
+## 2026-10-11: e2e `rb()` shells `target/debug/rb`, which `cargo test` does not refresh
+- **Mistake (recovered, ~1 h):** two fixture bless runs failed on rows the fixed code produces; manual runs with the same binary passed. Root cause chain: `cargo test` builds the test harness (which printed NEW guard text, looking current) but `rb()` shells `target/debug/rb`, refreshed only by explicit `cargo build -p rb-cli` — last run before the fixes. Suspected cache poisoning, fixture staleness, and guard-key typos (one real: endpoint keys carry the `HTTP` prefix) before finding it.
+- **Rule:** always `cargo build -p rb-cli` after touching anything the binary embeds, before any e2e run. When an e2e result contradicts a manual run of the "same" binary, check binary mtimes first (`ls -la target/debug/rb`), mechanism second.
+
+## 2026-10-11: no heavy builds while an e2e container phase runs
+- **Mistake (recovered, ~2 h):** two `cargo test -p rb-frameworks` runs during the p12 e2e's SCIP suites starved the emulated scip-python fetch: one egress probe got HTTP 200 with curl exit 28 (timeout), and pip's wheel reads timed out (`ReadTimeoutError: files.pythonhosted.org`), failing the shop fetch — which then CACHED as `failed` and replayed into the re-run. The 32 unaffected passes stayed valid (contention fails, it does not forge goldens).
+- **Rule:** while any e2e/api suite with containers runs, the tree is read-only for builds: no `cargo` invocations beyond reading logs. Reads and `.md` edits are free; compiles wait. When a container-phase failure shows a timeout signature (curl 28, pip read timeouts), suspect contention first and re-run the test alone before theorizing.
+
+## 2026-10-11: a cached fetch failure replays — read its tail, overwrite on the same layout
+- **Mistake (recovered):** the shop failure replayed as `failed (cached)` in the re-run. The diagnosis came from `rb.scip_index.stderr_tail` (the pip traceback, not the status line). The first overwrite attempt used a nested copy (`fixtures/…` under `/tmp/x/`), which hashes differently — the input hash covers job-relative paths, so only the same layout overwrites the row.
+- **Rule:** a `failed` scip row is diagnosed from its `stderr_tail` and cleared by a successful `--no-cache --force` run over the SAME directory layout (write-only cache), never by deleting the row; confirm the row reads `ok` afterwards. Name manual repos `t_*` so the e2e start-up clean-up removes them.
+
+## 2026-10-11: a vacuous comparison proves nothing — assert non-empty first
+- **Mistake (caught before recording):** the first invariant-1 sweep passed invalid repo names (dashes); every index failed, every dump was empty, and all seven fixtures compared SAME. The second run asserted byte counts and found three real diffs.
+- **Rule:** any dump-comparison script prints byte counts and asserts non-zero before diffing; an all-SAME result over empty files is a harness bug, not a pass.
+
+## 2026-10-11: pip's 15 s default timeout is marginal through the emulated stack
+- **Mistake (avoided by measuring):** one fixture fetch read `19 s ok` / `87 s ok` / `33 s` and `54 s` read-timeout failures across four attempts — same packages, same proxy. The failures are slow-pipe reads (`files.pythonhosted.org`), not dead servers.
+- **Rule:** bulk-transfer tool timeouts are sized from measurements, not defaults: `PIP_TIMEOUT=60` (env, pinnable like F7's Go env) with a recipe bump (`m6d-py-4`) so stale rows cannot serve. Do not touch unmeasured tools (Poetry showed no flake).
+
+## 2026-10-11: a growth-test shape measures one walk — isolate it
+- **Mistake (caught by the numbers):** the chi ratio test with one shared closure name measured 15.6× AFTER the sweep fix: the dominant cost was the shared `binding_index_at` same-name extent scan (pre-existing, all packs alike), not the chi walk. Distinct names isolate the new walk (the `packs_grow_linearly` precedent).
+- **Rule:** a ratio test for a new walk uses distinct names/bindings; a same-name shape measures shared machinery and is recorded as an observation (with numbers), not asserted. If the numbers do not move after the fix, the test measures the wrong thing — re-derive before re-fixing.
+
+## 2026-10-11: a mutant harness asserts the mutation landed — after patching
+- **Mistake (caught at once):** my harness asserted `new in s` BEFORE `s.replace`, rejecting all four multi-line mutants as "new text missing".
+- **Rule:** the count assertion guards the anchor; the landed assertion (`new in s`) runs AFTER the replacement. A "PATCH FAILED" on a known-good anchor means the guard is inverted — read the traceback, not the tree.
+
+## 2026-10-11: `for x in vec` across if/else branches moves
+- **Mistake (caught by the compiler):** computing per-router prefixes in `if cyclic {} else {}` moved `routers` in the first branch.
+- **Rule:** iterate by reference (`for r in &routers`) when more than one branch consumes the collection; the compiler error is the signal, not the design.
+
+## 2026-10-11: a lookup test needs a positive row, not just None cases
+- **Mistake (caught by the e2e fixture):** the catalog unit test asserted a dangling `version.ref` resolves to `None` — true under the bug too, because dotted `version.ref` never resolved at all (TOML nests it under `version`, which the match never looked inside). The suite was green and the fixture guard caught it.
+- **Rule:** every lookup test has a positive resolution row for each reference form (plain, dotted-nested, quoted-literal); a test that only asserts absences is vacuous against a resolver that resolves nothing.
+
+## 2026-10-11: TOML dotted keys nest, even inline
+- **Mistake (same fix):** `{ module = "g:a", version.ref = "lang" }` parses as `{ module = "g:a", version = { ref = "lang" } }` — `table.get("version.ref")` is always `None`.
+- **Rule:** when reading TOML with dotted keys, match on the nested table (`version` → `ref`), never on the dotted literal; cover both spellings in the reader test.
+
+## 2026-10-12: a resolver mutant needs paths that separate depth from sort order
+- **Mistake (caught at once):** the "first-sorted-wins" mutant on the module-override rule survived: every test path (`mod/pom.xml`) also sorted first, so depth-wins and first-wins agreed everywhere.
+- **Rule:** when two orderings could both explain the cases, add a row where they disagree (`zmod/` sorts after the root pom; same-depth ties go sorted-first) before counting the mutant killed.
+
+## 2026-10-12: measure a hypothesized precedence before coding it
+- **Mistake (caught by the scratch build):** D9 placed `compilerArgs -encoding` above the pom literal by documentation reasoning; the real image shows the pom literal winning both directions (the plugin's own `-encoding` reaches javac first).
+- **Rule:** a precedence taken from docs is a hypothesis until a scratch build observes it; the observable here is cheap (a 0xE9 source: the unmappable-character error names the effective encoding). Code the measured order and record the deviation in the contract.
+
+## 2026-10-12: a job-level verdict can have an unsafe corner a per-entity verdict has not
+- **Mistake (caught by design review before any use):** per-job deepest-wins for encodings would trust an ISO root's files under a UTF-8 module verdict — silently accepting misread files.
+- **Rule:** when one verdict covers entities with different configurations, resolve per entity (per-document nearest-pom here); mixed-configuration tests (root-ISO/module-UTF-8 both ways) pin each side. No prior binary shipped the weaker rule.
+
+## 2026-10-12: URL-claimed chains are never generated candidates
+- **Mistake (caught by golden churn):** generated packs fired on real HTTP clients named `*Api` (`mailApi.post`) and Angular `HttpClient` params — 3 false `http_unmatched` diagnostics plus coverage inflation on polyglot.
+- **Rule:** a chain the URL packs already read (exact span equality, verified empirically) is skipped by generated packs; framework HTTP client types (`HttpClient`, `WebClient`, `RestClient`) are denied stub candidacy even unclaimed. Both rules test-first with killed mutants.
+
+## 2026-10-12: content sniffing belongs in the reader, not the stage
+- **Mistake (caught by a probe test):** flow-JSON in a `.yaml` file silently read as empty YAML because the JSON sniff lived in the stage's dispatch while the reader never saw it.
+- **Rule:** format detection lives with the format readers (one place decides); stages dispatch by extension only.

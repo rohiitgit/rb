@@ -1,4 +1,4 @@
-diff snapshot <from> of <repo> @ 45240eff4a4e → snapshot <live> of <repo> @ 4aab1ccd468a
+diff snapshot <from> of <repo> @ b9b990373146 → snapshot <live> of <repo> @ 9e82497c2631
 endpoints: 1 added, 0 removed
   + POST /internal/mfa/push  [notification]
 table access: 1 added, 1 removed

@@ -43,6 +43,8 @@ pub(crate) struct Inputs<'a> {
     pub words: &'a Words,
     /// The interfaces Spring Data repositories extend, by simple name (fragments, D3).
     pub fragments: &'a BTreeSet<String>,
+    /// Exact manifest resolution for module objects (contract M6c S4).
+    pub aliases: &'a AliasMaps,
 }
 
 /// The proof over a snapshot: the types considered, each with its first failing rule or
@@ -200,11 +202,271 @@ pub(crate) fn prove<'a>(inputs: &Inputs<'a>, considered: &BTreeSet<Sym<'a>>) -> 
     Proof { types }
 }
 
-/// Whether the module specifier `spec`, written in `from`, may name the file `path` (Y7). A
-/// relative specifier is resolved as Node and TypeScript do, extensions and `index` included;
-/// any other (a package, a path alias) may name a file whose stem or any directory is its last
-/// segment; `*` (a computed `require`/`import()`) may name any file.
-fn module_may_name(from: &str, spec: &str, path: &str) -> bool {
+/// Exact manifest resolution (contract M6c S4): `tsconfig.json` `paths`
+/// aliases and `package.json` `exports`/`main` subpaths. Anything
+/// unresolvable — a missing file, a multi-star or computed pattern, an
+/// unknown package, `extends` chains, non-string targets — resolves to
+/// nothing, and callers keep every type, as before.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AliasMaps {
+    /// `(tsconfig dir, base dir, [(pattern, [targets])])`, longest dir first.
+    tsconfigs: Vec<TsconfigEntry>,
+    /// package name → `(dir, exports entries, main)`, longest dir first.
+    packages: Vec<PackageEntry>,
+}
+
+/// One `tsconfig.json` `paths` scope: its dir, base dir and pattern targets.
+type TsconfigEntry = (String, String, Vec<(String, Vec<String>)>);
+/// One named package: name, dir, exports entries and `main` fallback.
+type PackageEntry = (String, String, Vec<(String, String)>, Option<String>);
+
+impl AliasMaps {
+    /// Builds the maps from manifest texts by path (`tsconfig.json` and
+    /// `package.json` entries; everything else ignored). Never fails: an
+    /// unreadable manifest contributes nothing.
+    pub fn build(manifests: &BTreeMap<&str, String>) -> Self {
+        let mut tsconfigs = Vec::new();
+        let mut packages = Vec::new();
+        for (path, text) in manifests {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let dir = match path.rfind('/') {
+                Some(i) => path[..i].to_owned(),
+                None => String::new(),
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            if name == "tsconfig.json" {
+                let options = json.get("compilerOptions");
+                let base = options
+                    .and_then(|o| o.get("baseUrl"))
+                    .and_then(|b| b.as_str())
+                    .unwrap_or_default();
+                let base = if base.is_empty() {
+                    dir.clone()
+                } else {
+                    join_dir(&dir, base)
+                };
+                let mut paths = Vec::new();
+                if let Some(map) = options
+                    .and_then(|o| o.get("paths"))
+                    .and_then(|p| p.as_object())
+                {
+                    for (pattern, targets) in map {
+                        if pattern.matches('*').count() > 1 {
+                            continue;
+                        }
+                        let targets: Vec<String> = targets
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|t| t.as_str())
+                                    .map(|t| join_dir(&base, t))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !targets.is_empty() {
+                            paths.push((pattern.clone(), targets));
+                        }
+                    }
+                }
+                tsconfigs.push((dir, base, paths));
+            } else if name == "package.json" {
+                let pkg_name = json
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                if pkg_name.is_empty() {
+                    continue;
+                }
+                let mut exports = Vec::new();
+                if let Some(e) = json.get("exports") {
+                    if let Some(s) = e.as_str() {
+                        exports.push((".".to_owned(), join_dir(&dir, s)));
+                    } else if let Some(map) = e.as_object() {
+                        for (sub, target) in map {
+                            let Some(target) = Self::export_target(target) else {
+                                continue;
+                            };
+                            exports.push((sub.clone(), join_dir(&dir, &target)));
+                        }
+                    }
+                }
+                let main = json
+                    .get("main")
+                    .and_then(|m| m.as_str())
+                    .map(|m| join_dir(&dir, m));
+                packages.push((pkg_name, dir, exports, main));
+            }
+        }
+        tsconfigs.sort_by_key(|a: &TsconfigEntry| std::cmp::Reverse(a.0.len()));
+        packages.sort_by_key(|a: &PackageEntry| std::cmp::Reverse(a.1.len()));
+        AliasMaps {
+            tsconfigs,
+            packages,
+        }
+    }
+
+    /// A string export target: a plain string, or the `default` (else first
+    /// string-valued) condition of a conditions object.
+    fn export_target(target: &serde_json::Value) -> Option<String> {
+        if let Some(s) = target.as_str() {
+            return Some(s.to_owned());
+        }
+        target.as_object().and_then(|map| {
+            map.get("default")
+                .and_then(|d| d.as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    map.values()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_owned)
+                        .next()
+                })
+        })
+    }
+
+    /// Resolves `spec` written in `from` to a repo-relative path, or `None`
+    /// when no manifest resolves it exactly. Relative specifiers and `*` are
+    /// not manifest business (the existing rules handle them). Precedence
+    /// follows the tools: an exact key beats any pattern, and of the matching
+    /// patterns the longest wins (TypeScript's longest-prefix rule, Node's
+    /// `PATTERN_KEY_COMPARE`); a pattern with several targets is ambiguous, so
+    /// it resolves nothing and the caller keeps every type (contract M6c D4).
+    pub fn resolve(&self, from: &str, spec: &str) -> Option<String> {
+        if spec.starts_with('.') || spec == "*" || spec.contains("://") {
+            return None;
+        }
+        // `tsconfig.json` `paths`: nearest scope wins.
+        if let Some((_, _, paths)) = self.tsconfigs.iter().find(|(dir, _, _)| {
+            dir.is_empty() || from == dir.as_str() || from.starts_with(&format!("{dir}/"))
+        }) {
+            let mut best: Option<(usize, &str, String)> = None;
+            for (pattern, targets) in paths {
+                work::tick(1);
+                let [target] = targets.as_slice() else {
+                    continue;
+                };
+                if let Some(rest) = match_pattern(pattern, spec)
+                    && best.as_ref().is_none_or(|(len, _, _)| pattern.len() > *len)
+                {
+                    best = Some((pattern.len(), target.as_str(), rest));
+                }
+            }
+            if let Some((_, target, rest)) = best {
+                return Some(substitute(target, &rest));
+            }
+        }
+        // `package.json` `exports`/`main`: nearest package wins.
+        let (name, sub) = split_package(spec)?;
+        let (_, _dir, exports, main) = self.packages.iter().find(|(n, d, _, _)| {
+            n == &name && (d.is_empty() || from == d.as_str() || from.starts_with(&format!("{d}/")))
+        })?;
+        if !exports.is_empty() {
+            for (key, target) in exports {
+                work::tick(1);
+                if key.as_str() == sub {
+                    return Some(target.clone());
+                }
+            }
+            let mut best: Option<(usize, &str, String)> = None;
+            for (key, target) in exports {
+                work::tick(1);
+                if let Some(rest) = match_subpath(key, &sub)
+                    && best.as_ref().is_none_or(|(len, _, _)| key.len() > *len)
+                {
+                    best = Some((key.len(), target, rest));
+                }
+            }
+            return best.map(|(_, target, rest)| substitute(target, &rest));
+        }
+        if sub == "." {
+            return main.clone();
+        }
+        None
+    }
+}
+
+/// Joins a manifest-relative path onto a repo-relative dir.
+fn join_dir(dir: &str, path: &str) -> String {
+    let path = path.trim_start_matches("./");
+    if dir.is_empty() {
+        path.trim_end_matches('/').to_owned()
+    } else {
+        format!(
+            "{}/{}",
+            dir.trim_end_matches('/'),
+            path.trim_end_matches('/')
+        )
+    }
+}
+
+/// Splits a pattern with at most one `*` against text: the matched middle, or
+/// `Some("")` for an exact key.
+fn match_pattern(pattern: &str, text: &str) -> Option<String> {
+    match pattern.split_once('*') {
+        None => (pattern == text).then(String::new),
+        Some((pre, post)) => text
+            .strip_prefix(pre)
+            .and_then(|t| t.strip_suffix(post))
+            .map(str::to_owned),
+    }
+}
+
+/// Matches an exports subpath key (`./x`, `./x/*`) against a `./`-less sub
+/// (`./x`, `./x/y`): the matched middle for patterns.
+fn match_subpath(key: &str, sub: &str) -> Option<String> {
+    let key = key.strip_prefix("./").unwrap_or(key);
+    let sub = sub.strip_prefix("./").unwrap_or(sub);
+    match_pattern(key, sub)
+}
+
+/// Substitutes a single-`*` match into a target, or returns a `*`-less target
+/// unchanged (exact keys carry an empty match).
+fn substitute(target: &str, rest: &str) -> String {
+    match target.split_once('*') {
+        None => target.to_owned(),
+        Some((pre, post)) => format!("{pre}{rest}{post}"),
+    }
+}
+
+/// Splits a bare specifier into its package name and `./`-less subpath
+/// (`@scope/pkg/sub` → (`@scope/pkg`, `./sub`); `pkg` → (`pkg`, `.`)).
+fn split_package(spec: &str) -> Option<(String, String)> {
+    let mut parts = spec.split('/');
+    let first = parts.next()?;
+    if first.is_empty() {
+        return None;
+    }
+    let name = if let Some(scope) = first.strip_prefix('@') {
+        format!("@{scope}/{}", parts.next()?)
+    } else {
+        first.to_owned()
+    };
+    let rest: Vec<&str> = parts.collect();
+    let sub = if rest.is_empty() {
+        ".".to_owned()
+    } else {
+        format!("./{}", rest.join("/"))
+    };
+    Some((name, sub))
+}
+
+/// Whether the module specifier `spec`, written in `from`, may name the file `path` (Y7,
+/// narrowed by S4): an exactly manifest-resolved specifier names only its file; a specifier
+/// resolved to another real file names that file, never this one; anything unresolvable falls
+/// through to the rules below. A relative specifier is resolved as Node and TypeScript do,
+/// extensions and `index` included; any other (a package, a path alias) may name a file whose
+/// stem or any directory is its last segment; `*` (a computed `require`/`import()`) may name
+/// any file.
+fn module_may_name(
+    from: &str,
+    spec: &str,
+    path: &str,
+    aliases: &AliasMaps,
+    files: &BTreeMap<&str, (Language, &FileFacts)>,
+) -> bool {
     const EXTENSIONS: &[&str] = &[
         ".d.ts", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
     ];
@@ -235,6 +497,27 @@ fn module_may_name(from: &str, spec: &str, path: &str) -> bool {
             }
         }
         return strip(&parts.join("/")) == target;
+    }
+    // Exact manifest resolution first (contract M6c S4): a resolved specifier
+    // names only its file; resolved to another real file it names that file,
+    // never this one; resolved nowhere it falls through to the approximate
+    // rule below (like an unresolvable import: keep-all).
+    if let Some(resolved) = aliases.resolve(from, spec) {
+        let stated = strip(&resolved);
+        if stated == target {
+            return true;
+        }
+        let mut elsewhere = false;
+        for p in files.keys() {
+            work::tick(1);
+            if strip(p) == stated {
+                elsewhere = true;
+                break;
+            }
+        }
+        if elsewhere {
+            return false;
+        }
     }
     let spec = strip(spec);
     let last = spec.rsplit('/').next().unwrap_or(&spec);
@@ -285,7 +568,7 @@ fn own_rule(inputs: &Inputs<'_>, (path, i): Sym<'_>, seen: &Seen<'_>) -> Option<
         || (language != Language::Java
             && module_objects
                 .iter()
-                .any(|(from, spec)| module_may_name(from, spec, path)))
+                .any(|(from, spec)| module_may_name(from, spec, path, inputs.aliases, inputs.files)))
     {
         return Some("mention");
     }
@@ -474,6 +757,7 @@ mod tests {
         let service_of = |p: &str| p.split('/').next().unwrap_or_default().to_owned();
         let deployable = BTreeSet::from(["svc".to_owned()]);
         let depends = BTreeMap::new();
+        let empty_manifests: BTreeMap<&str, String> = BTreeMap::new();
         let resolution = crate::di::resolve(&crate::di::Inputs {
             files: &by_path,
             keys: &keys,
@@ -482,8 +766,13 @@ mod tests {
             deployable: &deployable,
             depends: &depends,
             unparsed: &unparsed,
+            manifests: &empty_manifests,
         });
         let considered = implementing_types(&b.edge_sources(EdgeKind::Implements), &by_path, &keys);
+        let manifests: BTreeMap<&str, String> =
+            texts.iter().map(|(p, t)| (*p, (*t).to_owned())).collect();
+        let aliases = AliasMaps::build(&manifests);
+
         let proof = prove(
             &Inputs {
                 files: &by_path,
@@ -492,6 +781,7 @@ mod tests {
                 unparsed: &unparsed,
                 words: &words,
                 fragments: &resolution.fragments,
+                aliases: &aliases,
             },
             &considered,
         );
@@ -910,6 +1200,164 @@ mod tests {
         }
     }
 
+    /// Contract M6c S4: `tsconfig.json` `paths` aliases and `package.json`
+    /// `exports` resolve module objects exactly — a type named only through an
+    /// exactly-resolved alias is proven when otherwise clean; an unresolvable
+    /// alias or unknown package keeps every type, as before.
+    #[test]
+    fn manifest_aliases_resolve_module_objects_exactly() {
+        let user = "export interface User { id: string }\nexport class DbUser implements User { id: string = \"\"; }\n";
+        let profile = "export interface Profile { id: string }\nexport class DbProfile implements Profile { id: string = \"\"; }\n";
+        let find = |files: &[(&str, &str)], texts: &[(&str, &str)]| -> Vec<String> {
+            let mut out: Vec<String> = run_full(files, texts, RawScan::default())
+                .types
+                .into_iter()
+                .filter(|t| t.starts_with("DbUser") || t.starts_with("DbProfile"))
+                .collect();
+            out.sort();
+            out
+        };
+        let decl_a = "svc/src/models/user.ts";
+        let decl_b = "svc/src/other/user.ts";
+        let user_file = (
+            "svc/src/main.ts",
+            "import * as m from '@models/user';\nexport const all = m;\n",
+        );
+        let tsconfig = (
+            "svc/tsconfig.json",
+            "{ \"compilerOptions\": { \"paths\": { \"@models/*\": [\"src/models/*\"] } } }",
+        );
+        // Exact: the resolved file's type is kept, the same-stemmed other is proven.
+        assert_eq!(
+            find(&[(decl_a, user), (decl_b, profile), user_file], &[tsconfig]),
+            ["DbProfile: proven", "DbUser: mention"]
+        );
+        // An alias to nowhere resolves nothing: both kept, as before.
+        let nowhere = (
+            "svc/tsconfig.json",
+            "{ \"compilerOptions\": { \"paths\": { \"@models/*\": [\"src/elsewhere/*\"] } } }",
+        );
+        assert_eq!(
+            find(&[(decl_a, user), (decl_b, profile), user_file], &[nowhere]),
+            ["DbProfile: mention", "DbUser: mention"]
+        );
+        // A pattern with several targets is ambiguous (D4): both kept, as before.
+        let multi = (
+            "svc/tsconfig.json",
+            "{ \"compilerOptions\": { \"paths\": { \"@models/*\": [\"src/models/*\", \"src/other/*\"] } } }",
+        );
+        assert_eq!(
+            find(&[(decl_a, user), (decl_b, profile), user_file], &[multi]),
+            ["DbProfile: mention", "DbUser: mention"]
+        );
+        // An unknown package keeps every type, as before.
+        let other_user = (
+            "svc/src/main.ts",
+            "import * as m from '@other/user';\nexport const all = m;\n",
+        );
+        assert_eq!(
+            find(
+                &[(decl_a, user), (decl_b, profile), other_user],
+                &[tsconfig]
+            ),
+            ["DbProfile: mention", "DbUser: mention"]
+        );
+        // `package.json` `exports` resolve exactly too.
+        let pkg = (
+            "svc/package.json",
+            "{ \"name\": \"@acme/models\", \"exports\": { \"./user\": \"./src/models/user.ts\" } }",
+        );
+        let pkg_user = (
+            "svc/src/main.ts",
+            "import * as m from '@acme/models/user';\nexport const all = m;\n",
+        );
+        assert_eq!(
+            find(&[(decl_a, user), (decl_b, profile), pkg_user], &[pkg]),
+            ["DbProfile: proven", "DbUser: mention"]
+        );
+    }
+
+    /// Contract M6c S4/D4: precedence is exact-beats-pattern with longest-pattern
+    /// winning, and a pattern with several targets resolves nothing (keep-all).
+    #[test]
+    fn alias_resolution_precedence_and_ambiguity() {
+        let maps = |texts: &[(&str, &str)]| {
+            AliasMaps::build(&texts.iter().map(|(p, t)| (*p, (*t).to_owned())).collect())
+        };
+        // A pattern with several targets is ambiguous: resolves nothing.
+        let multi = maps(&[(
+            "svc/tsconfig.json",
+            "{ \"compilerOptions\": { \"paths\": { \"@m/*\": [\"src/a/*\", \"src/b/*\"] } } }",
+        )]);
+        assert_eq!(multi.resolve("svc/src/main.ts", "@m/user"), None);
+        // Longest pattern wins over map order.
+        let longest = maps(&[(
+            "svc/tsconfig.json",
+            "{ \"compilerOptions\": { \"paths\": {
+                \"@m/*\": [\"src/generic/*\"],
+                \"@m/special/*\": [\"src/special/*\"] } } }",
+        )]);
+        assert_eq!(
+            longest.resolve("svc/src/main.ts", "@m/special/user"),
+            Some("svc/src/special/user".to_owned())
+        );
+        assert_eq!(
+            longest.resolve("svc/src/main.ts", "@m/other"),
+            Some("svc/src/generic/other".to_owned())
+        );
+        // `exports`: an exact subpath beats a pattern even when the pattern
+        // sorts first; of several patterns the longest wins.
+        let exports = maps(&[(
+            "svc/package.json",
+            "{ \"name\": \"@acme/m\", \"exports\": {
+                \"./*\": \"./src/fallback/*.ts\",
+                \"./user\": \"./src/models/user.ts\",
+                \"./a/*\": \"./src/a/*.ts\",
+                \"./a\": \"./src/exact-a.ts\",
+                \"./a*\": \"./src/star-a.ts\" } }",
+        )]);
+        assert_eq!(
+            exports.resolve("svc/src/main.ts", "@acme/m/user"),
+            Some("svc/src/models/user.ts".to_owned())
+        );
+        assert_eq!(
+            exports.resolve("svc/src/main.ts", "@acme/m/a/x"),
+            Some("svc/src/a/x.ts".to_owned())
+        );
+        assert_eq!(
+            exports.resolve("svc/src/main.ts", "@acme/m/other"),
+            Some("svc/src/fallback/other.ts".to_owned())
+        );
+        // The exact key beats even a longer pattern (`./a*` would win on
+        // length alone through the pattern loop).
+        assert_eq!(
+            exports.resolve("svc/src/main.ts", "@acme/m/a"),
+            Some("svc/src/exact-a.ts".to_owned())
+        );
+    }
+
+    /// Invariant 9: alias resolution grows linearly (counted, 4× → ≤ 5×).
+    #[test]
+    fn alias_resolution_grows_linearly() {
+        fn work_for(n: usize) -> u64 {
+            let manifests = BTreeMap::from([(
+                "svc/tsconfig.json",
+                "{ \"compilerOptions\": { \"paths\": { \"@models/*\": [\"src/models/*\"] } } }"
+                    .to_owned(),
+            )]);
+            let aliases = AliasMaps::build(&manifests);
+            work::take();
+            for i in 0..n {
+                // One pattern per tsconfig (config-bounded); specifiers scale
+                // with the repo, so per-resolve work is constant.
+                let _ = aliases.resolve("svc/src/main.ts", &format!("@models/u{i}"));
+            }
+            work::take()
+        }
+        let (small, large) = (work_for(50), work_for(200));
+        assert!(large <= small * 5, "{small} -> {large}");
+    }
+
     /// Evaluator pass 1, Y12 (mutant R4): an instantiated subtype that is no `IMPLEMENTS`
     /// source itself (its head does not resolve) still keeps the type it names.
     #[test]
@@ -974,6 +1422,7 @@ mod tests {
             &names,
         );
         work::take();
+        let no_aliases = AliasMaps::default();
         let proof = prove(
             &Inputs {
                 files: &by_path,
@@ -982,6 +1431,7 @@ mod tests {
                 unparsed: &raw,
                 words: &words,
                 fragments: &fragments,
+                aliases: &no_aliases,
             },
             &considered,
         );

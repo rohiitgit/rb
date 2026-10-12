@@ -1,0 +1,5 @@
+callers of Checkout().  main.go:29  [github.com/acme/shop]
+precision=cha
+  main().  main.go:35  [github.com/acme/shop]  exact  (entry: main)
+  payInvoice().  main.go:55  [github.com/acme/shop]  exact  (entry: endpoint POST /billing/pay)
+certainty: exact 2

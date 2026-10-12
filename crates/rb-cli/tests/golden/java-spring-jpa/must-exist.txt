@@ -13,16 +13,36 @@ INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/Aut
 # Profile-conditional candidates: ambiguous, never a single edge (a setter point).
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Tokens.java`/JwtIssuer# [ambiguous] {"candidates":2,"conditional":true,"via":"setter"}
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Tokens.java`/DevIssuer# [ambiguous] {"candidates":2,"conditional":true,"via":"setter"}
-# List<Notifier>: every candidate, capped by the non-Spring @Service decoy (annotation_unread).
-INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/EmailNotifier# [heuristic] {"capped_by":["annotation_unread"],"collection":true}
-INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/SmsNotifier# [heuristic] {"capped_by":["annotation_unread"],"collection":true}
+# List<Notifier>: every scanned candidate, capped by the non-Spring @Service decoy (annotation_unread);
+# the `@Import` registrant caps by mention but never joins a collection.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/EmailNotifier# [heuristic] {"capped_by":["annotation_unread","mention"],"collection":true}
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/SmsNotifier# [heuristic] {"capped_by":["annotation_unread","mention"],"collection":true}
 # A @Bean factory is the target, and Spring Data's repository interface is a bean of its own type.
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditConfig#auditSink(). [heuristic] {"origin":"bean_method","resolution":"unique"}
 INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository# [heuristic] {"origin":"spring_data","resolution":"unique"}
-# Name fallback: `Notifier smsNotifier` picks the bean named smsNotifier, capped by_name.
-INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/SmsNotifier# [heuristic] {"by_name":true,"capped_by":["annotation_unread","by_name"],"resolution":"name"}
+# Name fallback lost to the `@Import` registrant (contract M6c S1): the
+# registrant joins beside the scanned beans, blocking the name pick, so the
+# point is ambiguous over all three, capped by the mention.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/DefaultAuthService.java`/DefaultAuthService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Notifier.java`/SmsNotifier# [ambiguous] {"candidates":3,"capped_by":["annotation_unread","mention"],"resolution":"ambiguous"}
+# Contract M6c S1: an `@Import`-named config's `@Bean` method joins as a
+# registrant candidate, never a lone edge.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/Alerts.java`/Alerts# -> rb-heuristic . . . `src/main/java/com/other/SmsConfig.java`/SmsConfig#sms(). [ambiguous] {"candidates":3,"capped_by":["annotation_unread","mention"],"origin":"registrant","resolution":"ambiguous"}
 # Contract M4b S9: KafkaAuditSink is never instantiated; its type and method dispatch steps are flagged.
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/KafkaAuditSink# -> rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditSink# [heuristic] {"impl_instantiated":false}
 IMPLEMENTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/KafkaAuditSink#record(). -> rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditSink#record(). [heuristic] {"impl_instantiated":false}
 # Contract M4b S15: a parent-managed starter is declared, its version unresolved.
 DEPENDS_ON . -> maven/org.springframework.boot/spring-boot-starter-web@? [exact] {"version_from":"unresolved"}
+# Contract M6c S6: an object a `@Bean` method returns resolves from the method,
+# a `ConstraintValidator` from its class — both plain `heuristic` edges.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/AuditConfig.java`/AuditConfig#jwtFilter(). -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher# [heuristic] {"origin":"stereotype","resolution":"unique","via":"field"}
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/EmailValidator.java`/EmailValidator# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/BcryptHasher# [heuristic] {"origin":"stereotype","resolution":"unique","via":"field"}
+# Contract M6c S7: inherited Spring Data operations resolve to the repository
+# interface with `inherited`.
+CALLS rb-heuristic . . . `src/main/java/com/acme/auth/SignupService.java`/SignupService#register(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository# [heuristic] {"inherited":true}
+CALLS rb-heuristic . . . `src/main/java/com/acme/auth/SignupService.java`/SignupService#lookup(). -> rb-heuristic . . . `src/main/java/com/acme/auth/UserRepository.java`/UserRepository# [heuristic] {"inherited":true}
+# Contract M6c S8: the `lombok.config`-listed field qualifier rides the
+# generated parameter and narrows to the qualified bean.
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/MailService.java`/MailService# -> rb-heuristic . . . `src/main/java/com/acme/auth/Hashing.java`/PlainHasher# [heuristic] {"origin":"stereotype","qualifier":"plainHasher","resolution":"qualifier","via":"constructor"}
+# Contract M6c S9: exact type-arg agreement picks the single bean (capped by
+# the generic gate, counted).
+INJECTS rb-heuristic . . . `src/main/java/com/acme/auth/Channel.java`/Campaigns# -> rb-heuristic . . . `src/main/java/com/acme/auth/Channel.java`/SmsChannel# [heuristic] {"capped_by":["generic"],"origin":"stereotype","resolution":"type_args","via":"constructor"}

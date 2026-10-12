@@ -1,0 +1,11 @@
+# Precision guards for the java-gradle-catalog fixture (contract M6e S4),
+# checked against the SCIP dump.
+# One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
+# S3: catalog and literal pins resolve to exact versions.
+DEPENDS_ON . -> maven/com.google.code.gson/gson@2.13.1 [exact] {"version_from": "literal"}
+DEPENDS_ON . -> maven/org.apache.commons/commons-lang3@3.20.0 [exact] {"version_from": "catalog"}
+DEPENDS_ON . -> maven/junit/junit@4.13.2 [exact] {"version_from": "literal", "scope": "test"}
+# S4: exact calls through the Gradle index (scip-java keys carry `.` for the
+# undeclared module and version, as measured on the smoke build).
+CALLS scip-java maven . . demo/Main#run(). -> scip-java maven . . demo/Service#process(). [exact]
+CALLS scip-java maven . . demo/Service#process(). -> scip-java maven . . demo/Helper#exclaim(). [exact]

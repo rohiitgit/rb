@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package acme;
+
+service Greeter {
+  rpc SayHello (HelloReq) returns (HelloResp);
+  rpc SayBye (ByeReq) returns (ByeResp);
+}
+
+service Users {
+  rpc Get (GetReq) returns (GetResp);
+  rpc Watch (WatchReq) returns (stream WatchResp);
+}
+
+message HelloReq {}
+message HelloResp {}
+message ByeReq {}
+message ByeResp {}
+message GetReq {}
+message GetResp {}
+message WatchReq {}
+message WatchResp {}

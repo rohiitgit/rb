@@ -225,7 +225,7 @@ pub(crate) fn run_projects(
             }
         };
         let input_hash = rb_scip::project_input_hash(
-            &rb_scip::recipe(job.indexer, &options.budget),
+            &rb_scip::recipe(&job, &options.budget),
             exported.iter().copied(),
             &options.egress,
         );
@@ -248,9 +248,16 @@ pub(crate) fn run_projects(
                 let exported = exported
                     .iter()
                     .map(|(path, blob)| {
+                        // Contract M6d S1/S2: scip-go exports like scip-java
+                        // (root-relative); scip-python is repository-shaped
+                        // like scip-typescript; both revisited with evidence in S5.
                         let path = match job.indexer {
-                            rb_scip::Indexer::ScipJava => relative(path, &job.root),
-                            rb_scip::Indexer::ScipTypescript => (*path).to_owned(),
+                            rb_scip::Indexer::ScipJava | rb_scip::Indexer::ScipGo => {
+                                relative(path, &job.root)
+                            }
+                            rb_scip::Indexer::ScipTypescript | rb_scip::Indexer::ScipPython => {
+                                (*path).to_owned()
+                            }
                         };
                         Ok((path, read_blob(blob)?))
                     })
@@ -291,7 +298,13 @@ pub(crate) fn run_projects(
             match rb_scip::decode(bytes, &source_of) {
                 Ok(mut index) => {
                     if job.fetch == rb_scip::jobs::Fetch::Maven {
-                        reject_for_source_encoding(&mut index, &under_root, read_blob, &source_of);
+                        reject_for_source_encoding(
+                            &mut index,
+                            &job.root,
+                            &under_root,
+                            read_blob,
+                            &source_of,
+                        );
                     }
                     project.index = Some(index);
                 }
@@ -345,22 +358,25 @@ pub(crate) fn job_files<'b>(
             .collect()
     };
     let mut files = under(&job.root);
-    let lockfile = matches!(
-        job.fetch,
+    // Link targets outside the root but inside the repository: npm lockfile
+    // links, or Yarn `file:`/`link:` dependencies (contract M6e S6).
+    let targets: Vec<String> = match &job.fetch {
         rb_scip::jobs::Fetch::Npm {
-            lockfile: rb_scip::jobs::NodeLock::PackageLock
-        }
-    )
-    .then(|| read_path(&join_root(&job.root, "package-lock.json")))
-    .flatten();
-    let Some(lockfile) = lockfile else {
-        return Ok(JobFiles {
-            files,
-            link_targets: 0,
-        });
+            lockfile: rb_scip::jobs::NodeLock::PackageLock,
+        } => match read_path(&join_root(&job.root, "package-lock.json")) {
+            Some(lockfile) => link_targets(&job.root, &lockfile)?,
+            None => Vec::new(),
+        },
+        rb_scip::jobs::Fetch::Npm {
+            lockfile: rb_scip::jobs::NodeLock::Yarn,
+        } => match read_path(&join_root(&job.root, "package.json")) {
+            Some(manifest) => yarn_file_targets(&job.root, &manifest)?,
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
     };
     let mut exported_targets = 0;
-    for target in link_targets(&job.root, &lockfile)? {
+    for target in targets {
         let target_files: Vec<(&str, &str)> = under(&target)
             .into_iter()
             .filter(|(p, _)| !p.split('/').any(|segment| segment == "node_modules"))
@@ -374,6 +390,32 @@ pub(crate) fn job_files<'b>(
         files,
         link_targets: exported_targets,
     })
+}
+
+/// Resolve one link candidate lexically against `root` (`.` and `..` folded,
+/// nothing on disk followed): `None` when it stays under the root (already
+/// exported), the directory when it names an in-repository target outside it,
+/// `Err` when it leaves the repository (its path is not reported).
+fn resolve_link(root: &str, candidate: &str) -> Result<Option<String>, String> {
+    if candidate.starts_with('/') {
+        return Err(LINK_OUTSIDE.to_owned());
+    }
+    let mut at: Vec<&str> = if root.is_empty() {
+        Vec::new()
+    } else {
+        root.split('/').collect()
+    };
+    for segment in candidate.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                at.pop().ok_or_else(|| LINK_OUTSIDE.to_owned())?;
+            }
+            name => at.push(name),
+        }
+    }
+    let dir = at.join("/");
+    Ok((!(dir == root || in_root(&dir, root))).then_some(dir))
 }
 
 /// The directories a `package-lock.json` (v2 or v3) at `root` links to inside the repository
@@ -402,22 +444,7 @@ pub(crate) fn link_targets(root: &str, lockfile: &[u8]) -> Result<Vec<String>, S
             .filter(|r| !r.starts_with('/') && !r.contains(':'));
         let candidates = [key.starts_with("../").then_some(key.as_str()), resolved];
         for candidate in candidates.into_iter().flatten() {
-            let mut at: Vec<&str> = if root.is_empty() {
-                Vec::new()
-            } else {
-                root.split('/').collect()
-            };
-            for segment in candidate.split('/') {
-                match segment {
-                    "" | "." => {}
-                    ".." => {
-                        at.pop().ok_or_else(|| LINK_OUTSIDE.to_owned())?;
-                    }
-                    name => at.push(name),
-                }
-            }
-            let dir = at.join("/");
-            if !(dir == root || in_root(&dir, root)) {
+            if let Some(dir) = resolve_link(root, candidate)? {
                 targets.insert(dir);
             }
         }
@@ -425,34 +452,110 @@ pub(crate) fn link_targets(root: &str, lockfile: &[u8]) -> Result<Vec<String>, S
     Ok(targets.into_iter().collect())
 }
 
-/// Contract M3b amendment 64 (`source_encoding`): when a Maven build declares a source encoding
-/// other than UTF-8 in any of its poms, javac reads every non-ASCII file differently from
-/// Tree-sitter, so each such document is rejected. The decoder's reasons found earlier stay,
-/// except `encoding_ambiguous` (amendment 69): the pom's declaration is the more specific
-/// signal and is recorded instead.
+/// The directories a `package.json` at `root` names through Yarn `file:`/`link:`
+/// dependencies, inside the repository and outside `root`, sorted and distinct
+/// (contract M6e S6): every `dependencies`/`devDependencies`/`peerDependencies`/
+/// `optionalDependencies` value starting with `file:` or `link:`, resolved
+/// lexically like [`link_targets`]. `portal:` stays out (residue); an absolute
+/// local path fails closed (unlike registry URLs, it names a real dependency).
+fn yarn_file_targets(root: &str, manifest: &[u8]) -> Result<Vec<String>, String> {
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return Ok(Vec::new());
+    };
+    let mut targets = BTreeSet::new();
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(deps) = manifest.get(section).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (_name, range) in deps {
+            rb_frameworks::work::tick(1);
+            let Some(range) = range.as_str() else {
+                continue;
+            };
+            let Some(path) = range
+                .strip_prefix("file:")
+                .or_else(|| range.strip_prefix("link:"))
+            else {
+                continue;
+            };
+            if path.contains(':') {
+                continue;
+            }
+            if let Some(dir) = resolve_link(root, path)? {
+                targets.insert(dir);
+            }
+        }
+    }
+    Ok(targets.into_iter().collect())
+}
+
+/// Contract M3b amendment 64 (`source_encoding`), generalised by M6e S11: a Maven document
+/// whose effective encoding ([`rb_scip::effective_encoding`]: its module's pom literals,
+/// `compilerArgs -encoding`, the build-wide `.mvn/maven.config` `-D`, explicit `-D` flags) is
+/// other than UTF-8 is read by javac differently from Tree-sitter, so each such non-ASCII
+/// document is rejected. The verdict is per document, so a mixed build rejects exactly its
+/// ISO-read files. The decoder's reasons found earlier stay, except `encoding_ambiguous`
+/// (amendment 69): the build's declaration is the more specific signal and is recorded
+/// instead.
 fn reject_for_source_encoding(
     index: &mut ScipIndex,
+    root: &str,
     under_root: &[(&str, &str)],
     read_blob: &dyn Fn(&str) -> anyhow::Result<Vec<u8>>,
     source_of: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) {
-    let poms: Vec<Vec<u8>> = under_root
+    let poms: Vec<(&str, Vec<u8>)> = under_root
         .iter()
         .filter(|(path, _)| path.rsplit('/').next() == Some("pom.xml"))
-        .filter_map(|(_, blob)| read_blob(blob).ok())
+        .filter_map(|(path, blob)| {
+            let bytes = read_blob(blob).ok()?;
+            strip_root(root, path).map(|rel| (rel, bytes))
+        })
         .collect();
-    let poms: Vec<&[u8]> = poms.iter().map(Vec::as_slice).collect();
-    if rb_scip::maven_source_encoding(&poms).is_none() {
-        return;
-    }
+    // The shallowest `.mvn/maven.config` under the root is the build's own (Maven reads the
+    // top-level one); anything deeper belongs to a nested build with its own job.
+    let mut configs: Vec<(&str, Vec<u8>)> = under_root
+        .iter()
+        .filter(|(path, _)| path.ends_with(".mvn/maven.config"))
+        .filter_map(|(path, blob)| {
+            let bytes = read_blob(blob).ok()?;
+            strip_root(root, path).map(|rel| (rel, bytes))
+        })
+        .collect();
+    configs.sort();
+    configs.sort_by_key(|(path, _)| path.matches('/').count());
+    let inputs = rb_scip::EncodingInputs {
+        poms: poms
+            .iter()
+            .map(|(path, bytes)| (*path, bytes.as_slice()))
+            .collect(),
+        maven_config: configs.first().map(|(_, bytes)| bytes.as_slice()),
+        // The pipeline's Maven invocations pass no encoding `-D` flag.
+        cli: &[],
+    };
     for doc in &mut index.documents {
         if matches!(
             doc.rejected,
             None | Some(rb_scip::Rejection::EncodingAmbiguous)
         ) && source_of(&doc.path).is_some_and(|text| !text.is_ascii())
+            && rb_scip::effective_encoding(&doc.path, &inputs).is_some()
         {
             doc.rejected = Some(rb_scip::Rejection::SourceEncoding);
         }
+    }
+}
+
+/// `path` below `root`, without the `root/` prefix (`""` is the repository root).
+fn strip_root<'a>(root: &str, path: &'a str) -> Option<&'a str> {
+    if root.is_empty() {
+        Some(path)
+    } else {
+        path.strip_prefix(root)?.strip_prefix('/')
     }
 }
 
@@ -903,6 +1006,96 @@ mod tests {
         );
     }
 
+    /// Contract M6e S11: the verdict is per document — a UTF-8 root with an ISO-8859-1 module
+    /// rejects exactly the module's non-ASCII documents, and the module's UTF-8 declaration
+    /// likewise shields only its own files.
+    #[test]
+    fn a_mixed_encoding_build_rejects_exactly_its_iso_read_documents() {
+        use protobuf::Message as _;
+        let text = "class C { /* \u{e9} */ int aa() { return 0; } }\n";
+        let index = scip::types::Index {
+            metadata: Some(scip::types::Metadata {
+                tool_info: Some(scip::types::ToolInfo {
+                    name: "scip-java".into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            documents: ["src/A.java", "mod/B.java"]
+                .map(|path| scip::types::Document {
+                    relative_path: path.into(),
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+        let run = |root_pom: &str, mod_pom: &str| {
+            let tmp = tempfile::tempdir().unwrap();
+            let files = vec![
+                entry("svc/pom.xml", "1"),
+                entry("svc/mod/pom.xml", "2"),
+                entry("svc/src/A.java", "3"),
+                entry("svc/mod/B.java", "4"),
+            ];
+            let pom = |encoding: &str| {
+                format!(
+                    "<project><properties><project.build.sourceEncoding>{encoding}</project.build.sourceEncoding></properties></project>"
+                )
+            };
+            let sources: HashMap<String, Vec<u8>> = HashMap::from([
+                ("1".repeat(40), pom(root_pom).into_bytes()),
+                ("2".repeat(40), pom(mod_pom).into_bytes()),
+                ("3".repeat(40), text.into()),
+                ("4".repeat(40), text.into()),
+            ]);
+            let read = |blob: &str| Ok(sources[blob].clone());
+            let fake = Fake::new(index.clone(), false, true);
+            let opts = options(tmp.path(), &fake);
+            run_projects(
+                &files,
+                &read,
+                &Mode::Run(&fake),
+                &opts,
+                &mut MemCache::default(),
+            )
+            .unwrap()
+            .0[0]
+                .index
+                .as_ref()
+                .unwrap()
+                .documents
+                .iter()
+                .map(|d| (d.path.clone(), d.rejected))
+                .collect::<Vec<_>>()
+        };
+        // The module's ISO declaration rejects only the module's file.
+        assert_eq!(
+            run("UTF-8", "ISO-8859-1"),
+            [
+                (
+                    "mod/B.java".to_owned(),
+                    Some(rb_scip::Rejection::SourceEncoding)
+                ),
+                ("src/A.java".to_owned(), None),
+            ]
+        );
+        // And the root's ISO declaration rejects only the root's file.
+        assert_eq!(
+            run("ISO-8859-1", "UTF-8"),
+            [
+                ("mod/B.java".to_owned(), None),
+                (
+                    "src/A.java".to_owned(),
+                    Some(rb_scip::Rejection::SourceEncoding)
+                ),
+            ]
+        );
+    }
+
     /// Contract M3b amendments 30 and 31: a `docker run` the client or daemon refused (exit 125)
     /// is an `environment` outcome and a phase over its budget a `timeout` naming the phase and
     /// the budget; neither is written to the cache, so the next run tries again. A cached row
@@ -1083,6 +1276,58 @@ mod tests {
                 .then(|| br#"{"lockfileVersion": 1, "dependencies": {"@ws/core": {"version": "file:../../packages/core"}}}"#.to_vec())
         };
         assert_eq!(job_files(&job, &blobs, &v1).unwrap().files.len(), 4);
+    }
+
+    /// Contract M6e S6: Yarn `file:`/`link:` dependencies resolve in-repository
+    /// like npm link targets (lexically, nothing on disk followed): their files
+    /// export with the job and count; a target leaving the repository is
+    /// `unsupported`; `portal:` stays out (residue) and absolute paths fail
+    /// closed (unlike registry URLs, an absolute local path is a real dep).
+    #[test]
+    fn yarn_file_link_targets_resolve_in_repository() {
+        let manifest = r#"{"dependencies": {"core": "file:../../packages/core", "linked": "link:../../packages/linked", "tarball": "file:../../pkgs/a.tgz", "ported": "portal:../../packages/ported"}}"#;
+        let paths = [
+            "tools/e2e/package.json",
+            "tools/e2e/yarn.lock",
+            "tools/e2e/src/check.ts",
+            "packages/core/package.json",
+            "packages/core/src/index.ts",
+            "packages/core/node_modules/dep/index.js",
+            "packages/linked/package.json",
+            "packages/linked/src/index.ts",
+            "packages/ported/package.json",
+            "packages/ported/src/index.ts",
+        ];
+        let blobs: BTreeMap<&str, &str> = paths.iter().map(|p| (*p, "b")).collect();
+        let read =
+            |path: &str| (path == "tools/e2e/package.json").then(|| manifest.as_bytes().to_vec());
+        let job = ts_job("tools/e2e", rb_scip::jobs::NodeLock::Yarn);
+        let selected = job_files(&job, &blobs, &read).unwrap();
+        assert_eq!(selected.link_targets, 2, "core + linked");
+        let files: Vec<&str> = selected.files.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            files,
+            [
+                "packages/core/package.json",
+                "packages/core/src/index.ts",
+                "packages/linked/package.json",
+                "packages/linked/src/index.ts",
+                "tools/e2e/package.json",
+                "tools/e2e/src/check.ts",
+                "tools/e2e/yarn.lock",
+            ]
+        );
+        // An absolute local path fails closed; a target leaving the
+        // repository is unsupported.
+        for manifest in [
+            r#"{"dependencies": {"remote": "file:/opt/lib"}}"#,
+            r#"{"dependencies": {"outside": "file:../../../../escape"}}"#,
+        ] {
+            let read = |path: &str| {
+                (path == "tools/e2e/package.json").then(|| manifest.as_bytes().to_vec())
+            };
+            assert!(job_files(&job, &blobs, &read).is_err());
+        }
     }
 
     /// A link that leaves the repository makes the job `unsupported` with a reason that names

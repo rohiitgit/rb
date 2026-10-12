@@ -1,14 +1,14 @@
 # rb-scip-java
 
 A slim, reproducible container image that runs [scip-java](https://github.com/scip-code/scip-java)
-0.13.1 against a Maven project. Repository Brain uses it to produce `index.scip` for Java
+0.13.1 against a Maven or Gradle project. Repository Brain uses it to produce `index.scip` for Java
 sources; the index is then decoded by `rb-scip` and joined with Tree-sitter facts by `rb-indexer`.
 
 ## Why not the official image
 
 `sourcegraph/scip-java` is 6.75 GB: it bundles several JDKs, Gradle, sbt, Bazel and more.
-This image is one pinned JDK plus Maven plus the scip-java launcher, about 930 MB unpacked
-(310 MB compressed), and every ingredient is fetched from its canonical URL and verified
+This image is one pinned JDK plus Maven, Gradle and the scip-java launcher, about 1.23 GB unpacked
+(about 930 MB before Gradle), and every ingredient is fetched from its canonical URL and verified
 against a checksum recorded in the Dockerfile, so a rebuild yields the same tools.
 
 ## What is in it
@@ -17,6 +17,7 @@ against a checksum recorded in the Dockerfile, so a rebuild yields the same tool
 | --- | --- | --- |
 | Eclipse Temurin JDK 21 (Ubuntu 26.04) | `eclipse-temurin:21-jdk@sha256:4d06038800655fe1211760cd561de70ef2ed7a47f5d69255e9834414602b7026` (index digest) | pulled by digest |
 | Apache Maven 3.9.16 | `https://archive.apache.org/dist/maven/maven-3/3.9.16/binaries/apache-maven-3.9.16-bin.tar.gz` | sha512 `831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6` |
+| Gradle 8.14.6 | `https://services.gradle.org/distributions/gradle-8.14.6-bin.zip` | sha256 `7988ed071b2a07900e2ec715fca15c6ab72bce6db433af301fa7fa7e9407bd24` |
 | scip-java CLI v0.13.1 | `https://github.com/scip-code/scip-java/releases/download/v0.13.1/scip-java-v0.13.1` (86,321,571 bytes) | sha256 `a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe` |
 
 The scip-java release asset is a coursier standalone bootstrap: every jar it needs is embedded,

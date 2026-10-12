@@ -3,7 +3,7 @@
   "repo": "<repo>",
   "snapshot": {
     "id": "<live>",
-    "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223"
+    "commit_sha": "b9b990373146294a722fda273fa36a7bcae61ca2"
   },
   "query": {},
   "limits": {},
@@ -12,12 +12,12 @@
     "name": "<repo>",
     "live": {
       "id": "<live>",
-      "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223",
+      "commit_sha": "b9b990373146294a722fda273fa36a7bcae61ca2",
       "age_graph": "rb_<repo>_<live>"
     },
-    "nodes": 105,
-    "edges": 174,
-    "diagnostics": 28,
+    "nodes": 129,
+    "edges": 218,
+    "diagnostics": 35,
     "snapshots": 1,
     "coverage": {
       "sql": {
@@ -27,23 +27,25 @@
         "tables": 4
       },
       "code": {
-        "resolved": 5,
+        "resolved": 8,
         "ambiguous": 0,
-        "unresolved": 20,
-        "external": 26,
+        "unresolved": 28,
+        "external": 57,
         "exact_calls": 0
       },
       "http": {
         "routes": 7,
         "services": 3,
-        "sites": 9,
+        "sites": 25,
         "buckets": {
           "ambiguous": 1,
           "dynamic": 1,
-          "external": 1,
-          "heuristic": 2,
+          "external": 2,
+          "heuristic": 13,
+          "http_empty_url": 1,
+          "http_in_process": 2,
           "self": 2,
-          "synthetic": 2,
+          "synthetic": 3,
           "too_ambiguous": 0,
           "unmatched": 0
         }
@@ -107,6 +109,15 @@
             "unpinned": false
           },
           "path": "services/auth"
+        },
+        {
+          "detail": {
+            "indexer": "scip-go",
+            "reason": "SCIP disabled (--no-scip)",
+            "status": "skipped",
+            "unpinned": true
+          },
+          "path": "services/billing"
         },
         {
           "detail": {

@@ -5,10 +5,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rb_frameworks::endpoint::{endpoint_key, endpoint_name, norm_path, prefix_unknown_key};
+use rb_frameworks::endpoint::{
+    endpoint_key, endpoint_name, grpc_key, norm_path, prefix_unknown_key,
+};
 use rb_frameworks::routes::{
-    FileRoutes, FileScope, Framework, Handler, RouteBase, RouterKind, binding_identity,
-    gin_group_prefix,
+    FileRoutes, FileScope, Framework, Handler, InterfaceRoute, RouteBase, RouterKind,
+    binding_identity, gin_group_prefix,
 };
 use rb_model::{
     Attrs, Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
@@ -40,6 +42,10 @@ pub(crate) struct Inputs<'a, 'r> {
     /// Services with Spring configuration M4a does not read (`config_unread`, evaluator pass 1,
     /// P7): their endpoints' deployed prefix may be missing.
     pub config_unread: &'a BTreeSet<String>,
+    /// OpenAPI/Swagger and `.proto` texts by path (contract M6f S3).
+    pub specs: &'a BTreeMap<&'a str, String>,
+    /// Whether a path lies in any project (a spec outside all projects stays endpoint-less).
+    pub has_project: &'a dyn Fn(&str) -> bool,
 }
 
 /// The token a handler name ends with (`login` in `ctrl.login`) and its span, when the name is
@@ -229,6 +235,9 @@ struct Registration {
     /// Call sites a parameter group's prefix was composed from (contract M6b S2):
     /// the registration's file and span stay in `at`.
     composed_from: Vec<Evidence>,
+    /// From an OpenAPI/proto spec (contract M6f S3): never carries a handler itself; it joins
+    /// one through the shared key when a code route registers the same endpoint.
+    from_spec: bool,
 }
 
 /// An endpoint the stage added, as stitching reads it (contract M4a S13).
@@ -248,6 +257,8 @@ pub(crate) struct EndpointRef {
     /// The service has Spring configuration M4a does not read (`config_unread`), so its deployed
     /// prefix may be missing (evaluator pass 1, P7).
     pub prefix_maybe_incomplete: bool,
+    /// Operation IDs its spec registrations state (contract M6f S6).
+    pub operations: Vec<String>,
 }
 
 #[derive(Default)]
@@ -256,6 +267,9 @@ struct Endpoint {
     path: String,
     service: String,
     frameworks: BTreeSet<&'static str>,
+    /// Operation IDs its spec registrations state (contract M6f S6, for stitching generated
+    /// calls by operation name).
+    operations: BTreeSet<String>,
     /// The router of an endpoint whose prefix is unknown (part of its key, amendment 10).
     router: Option<String>,
     /// `ServeMux` host patterns of its registrations (P8).
@@ -565,10 +579,12 @@ pub(crate) fn add_endpoints(
                         span: r.span,
                     },
                     composed_from,
+                    from_spec: false,
                 });
             }
         }
     }
+    add_spec_endpoints(b, &mut endpoints, &mut diagnostics, inputs);
     let added = endpoints
         .into_iter()
         .map(|(key, e)| {
@@ -577,6 +593,176 @@ pub(crate) fn add_endpoints(
         })
         .collect::<anyhow::Result<_>>()?;
     Ok((diagnostics, added))
+}
+
+/// Spec operations and proto RPCs as endpoint registrations under the shared key space, so a
+/// code route for the same method+path joins its handler for free (contract M6f S3/S4).
+/// Unreadable specs are counted (`openapi_unread`); specs outside any project stay
+/// endpoint-less and counted; operations with no code route are kept, exact, unhandled and
+/// counted per registration.
+fn add_spec_endpoints(
+    b: &GraphBuilder,
+    endpoints: &mut BTreeMap<String, Endpoint>,
+    diagnostics: &mut Vec<Diagnostic>,
+    inputs: &Inputs<'_, '_>,
+) {
+    let diag = |kind: &str, path: &str, span: Span, detail: serde_json::Value| Diagnostic {
+        kind: kind.to_owned(),
+        path: Some(path.to_owned()),
+        span: Some(span),
+        detail,
+    };
+    let mut specs: Vec<(&str, &String)> = inputs.specs.iter().map(|(p, t)| (*p, t)).collect();
+    specs.sort();
+    // Interface mappings by service (contract M6f S4b): a spec operation matching one is
+    // handled by the declaration and its implementors.
+    let mut interfaces: BTreeMap<String, Vec<(&str, &InterfaceRoute)>> = BTreeMap::new();
+    for (path, file) in inputs.routes {
+        rb_frameworks::work::tick(1);
+        if file.interface_routes.is_empty() {
+            continue;
+        }
+        let service = (inputs.service_of)(path);
+        for route in &file.interface_routes {
+            rb_frameworks::work::tick(1);
+            interfaces
+                .entry(service.clone())
+                .or_default()
+                .push((path, route));
+        }
+    }
+    for (spec_path, text) in specs {
+        rb_frameworks::work::tick(1);
+        if !(inputs.has_project)(spec_path) {
+            diagnostics.push(diag(
+                "spec_outside_project",
+                spec_path,
+                [0, 0, 0, 0],
+                json!({}),
+            ));
+            continue;
+        }
+        let service = (inputs.service_of)(spec_path);
+        if spec_path.ends_with(".proto") {
+            for svc in rb_frameworks::spec::proto_services(text) {
+                for rpc in svc.rpcs {
+                    let target = if svc.package.is_empty() {
+                        format!("{}/{}", svc.name, rpc.name)
+                    } else {
+                        format!("{}.{}/{}", svc.package, svc.name, rpc.name)
+                    };
+                    let key = grpc_key(&svc.package, &svc.name, &rpc.name, &service);
+                    let e = endpoints.entry(key).or_insert_with(|| Endpoint {
+                        method: "GRPC".into(),
+                        path: target,
+                        service: service.clone(),
+                        router: None,
+                        ..Endpoint::default()
+                    });
+                    e.frameworks.insert("grpc");
+                    e.any_host = true;
+                    e.registrations.push(Registration {
+                        path_certainty: Certainty::Exact,
+                        handler: Vec::new(),
+                        candidates: 0,
+                        at: Evidence {
+                            path: spec_path.to_owned(),
+                            span: rpc.span,
+                        },
+                        composed_from: Vec::new(),
+                        from_spec: true,
+                    });
+                }
+            }
+            continue;
+        }
+        let ops = if spec_path.ends_with(".json") {
+            rb_frameworks::spec::openapi_json(text)
+        } else {
+            rb_frameworks::spec::openapi_yaml(text)
+        };
+        let Some(ops) = ops else {
+            diagnostics.push(diag("openapi_unread", spec_path, [0, 0, 0, 0], json!({})));
+            continue;
+        };
+        for op in ops {
+            rb_frameworks::work::tick(1);
+            let norm = norm_path(&op.path);
+            let key = endpoint_key(&op.method, &norm, &service);
+            let e = endpoints.entry(key).or_insert_with(|| Endpoint {
+                method: op.method.clone(),
+                path: norm.clone(),
+                service: service.clone(),
+                router: None,
+                ..Endpoint::default()
+            });
+            e.frameworks.insert("openapi");
+            if !op.operation.is_empty() {
+                e.operations.insert(op.operation.clone());
+            }
+            e.any_host = true;
+            e.registrations.push(Registration {
+                path_certainty: Certainty::Exact,
+                handler: Vec::new(),
+                candidates: 0,
+                at: Evidence {
+                    path: spec_path.to_owned(),
+                    span: op.span,
+                },
+                composed_from: Vec::new(),
+                from_spec: true,
+            });
+            // Interface mappings the operation matches (contract M6f S4b): handled by the
+            // declaration (`exact`) and each implementor (`heuristic`).
+            if let Some(routes) = interfaces.get(&service) {
+                for (ipath, route) in routes {
+                    rb_frameworks::work::tick(1);
+                    if !route.methods.iter().any(|m| m == &op.method)
+                        || norm_path(&route.path) != norm
+                    {
+                        continue;
+                    }
+                    let iface =
+                        NodeKey::new(NodeKind::Symbol, inputs.keys[*ipath][route.def].clone());
+                    let mut handler = vec![(iface.clone(), Certainty::Exact, None)];
+                    for implementor in b.implementors(&iface) {
+                        if implementor == iface {
+                            continue;
+                        }
+                        handler.push((implementor, Certainty::Heuristic, None));
+                    }
+                    e.registrations.push(Registration {
+                        path_certainty: Certainty::Exact,
+                        handler,
+                        candidates: 0,
+                        at: Evidence {
+                            path: (*ipath).to_owned(),
+                            span: route.span,
+                        },
+                        composed_from: Vec::new(),
+                        from_spec: true,
+                    });
+                }
+            }
+        }
+    }
+    for e in endpoints.values() {
+        if e.registrations.iter().all(|r| r.handler.is_empty()) {
+            for r in e.registrations.iter().filter(|r| r.from_spec) {
+                let detail = if e.method == "GRPC" {
+                    json!({ "target": e.path })
+                } else {
+                    json!({ "method": e.method, "path": e.path })
+                };
+                diagnostics.push(diag(
+                    "spec_operation_unhandled",
+                    &r.at.path,
+                    r.at.span,
+                    detail,
+                ));
+            }
+        }
+    }
 }
 
 /// A route's handler targets, each with its certainty and, for an inline function, its span;
@@ -646,6 +832,12 @@ fn add_endpoint(
         "frameworks".into(),
         e.frameworks.iter().copied().collect::<Vec<_>>().into(),
     );
+    if !e.operations.is_empty() {
+        attrs.insert(
+            "operations".into(),
+            e.operations.iter().cloned().collect::<Vec<_>>().into(),
+        );
+    }
     if let Some(router) = &e.router {
         attrs.insert("prefix_unknown".into(), true.into());
         attrs.insert("router".into(), router.clone().into());
@@ -747,6 +939,7 @@ fn add_endpoint(
         certainty: exposes,
         hosts,
         prefix_maybe_incomplete: unread,
+        operations: e.operations.into_iter().collect(),
     })
 }
 
@@ -765,6 +958,14 @@ mod tests {
     /// Indexes `files` (path, language, source) with every file in the service named by its
     /// first path segment, and `context_paths` per service.
     fn build(files: &[(&str, Language, &str)], context_paths: &[(&str, &str)]) -> Built {
+        build_with_specs(files, &[], context_paths)
+    }
+
+    fn build_with_specs(
+        files: &[(&str, Language, &str)],
+        specs: &[(&str, &str)],
+        context_paths: &[(&str, &str)],
+    ) -> Built {
         let facts: Vec<(String, Language, FileFacts)> = files
             .iter()
             .map(|(p, l, src)| {
@@ -775,11 +976,16 @@ mod tests {
                 )
             })
             .collect();
-        build_from(&facts, context_paths, &BTreeMap::new(), &[])
+        let specs: Vec<(String, String)> = specs
+            .iter()
+            .map(|(p, t)| ((*p).to_owned(), (*t).to_owned()))
+            .collect();
+        build_from(&facts, &specs, context_paths, &BTreeMap::new(), &[])
     }
 
     fn build_from(
         facts: &[(String, Language, FileFacts)],
+        specs: &[(String, String)],
         context_paths: &[(&str, &str)],
         exact: &BTreeMap<(&str, Span), String>,
         config_unread: &[&str],
@@ -809,12 +1015,46 @@ mod tests {
             }
             crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
         }
+        for (path, _) in specs {
+            // Spec files are manifest files (File nodes with `IN_SERVICE` in the real
+            // pipeline): the harness mirrors that so spec evidence validates.
+            b.add_node(
+                NodeKey::new(NodeKind::File, path.as_str()),
+                path.as_str(),
+                Attrs::new(),
+            )
+            .unwrap();
+            let s = NodeKey::new(NodeKind::Service, service_of(path));
+            if !b.has_node(&s) {
+                b.add_node(s.clone(), service_of(path), Attrs::new())
+                    .unwrap();
+            }
+            b.add_edge(NewEdge::new(
+                NodeKey::new(NodeKind::File, path.as_str()),
+                EdgeKind::InService,
+                s,
+                Provenance::Manifest,
+                Certainty::Exact,
+            ))
+            .unwrap();
+        }
         let context_paths: BTreeMap<String, String> = context_paths
             .iter()
             .map(|(s, c)| ((*s).to_owned(), (*c).to_owned()))
             .collect();
         let config_unread: BTreeSet<String> =
             config_unread.iter().map(|s| (*s).to_owned()).collect();
+        // Tier B resolution, as production runs it before this stage: calls, types and
+        // `IMPLEMENTS` edges exist for handler roll-down (contract M6f S4b).
+        let mut tier_b = crate::resolve::add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
+        let spec_texts: BTreeMap<&str, String> =
+            specs.iter().map(|(p, t)| (p.as_str(), t.clone())).collect();
+        let has_project = |p: &str| {
+            let service = p.split('/').next().unwrap_or(p);
+            by_path
+                .keys()
+                .any(|f| f.split('/').next().unwrap_or(*f) == service)
+        };
         let inputs = Inputs {
             files: &by_path,
             routes: &routes,
@@ -824,8 +1064,11 @@ mod tests {
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &config_unread,
+            specs: &spec_texts,
+            has_project: &has_project,
         };
-        let (diagnostics, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
+        let (mut diagnostics, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
+        diagnostics.splice(0..0, tier_b.drain(..));
         Built {
             graph: b.finish().unwrap(),
             diagnostics,
@@ -890,7 +1133,15 @@ mod tests {
         let row = AUTH[..arrow].matches('\n').count() as i64;
         assert_eq!(login.attrs["handler_spans"][0][0], row);
         assert_eq!(login.evidence[0].path, "api/src/routes/auth.ts");
-        assert!(built.diagnostics.is_empty(), "{:?}", diagnostics(&built));
+        // Tier B resolution runs in this harness as in production, so its
+        // `unresolved_references` counts ride along; no route diagnostic.
+        assert!(
+            diagnostics(&built)
+                .iter()
+                .all(|d| d.starts_with("unresolved_references")),
+            "{:?}",
+            diagnostics(&built)
+        );
         let node = g
             .nodes()
             .iter()
@@ -1136,6 +1387,8 @@ mod tests {
                 service_of: &service_of,
                 context_paths: &context,
                 config_unread: &unread,
+                specs: &BTreeMap::new(),
+                has_project: &|_: &str| true,
             };
             let (_, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
             assert_eq!(endpoints.len(), 2);
@@ -1299,6 +1552,8 @@ mod tests {
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &config_unread,
+            specs: &BTreeMap::new(),
+            has_project: &|_: &str| true,
         };
         let (diagnostics, _) = add_endpoints(&mut b, &inputs).unwrap();
         let built = Built {
@@ -1313,6 +1568,120 @@ mod tests {
                 "HANDLED_BY HTTP GET /api/users/login @users -> rb-heuristic . . . `users/routers.go`/Login(). [heuristic]",
             ]
         );
+    }
+
+    /// Contract M6f S3/S4: spec operations become endpoints under the shared key, so a code
+    /// route for the same method+path joins its handler for free; an operation with no code
+    /// route is kept, exact, unhandled and counted.
+    #[test]
+    fn spec_operations_become_endpoints_and_join_code_routes() {
+        let app = "import express from \"express\";\nexport const app = express();\napp.get(\"/users\", (req, res) => res.end());\napp.post(\"/users\", (req, res) => res.end());\n";
+        let spec = "openapi: 3.0.0\npaths:\n  /users:\n    get:\n      operationId: listUsers\n    post:\n      operationId: addUser\n  /missing:\n    get:\n      operationId: getMissing\n";
+        let built = build_with_specs(
+            &[("api/src/app.ts", Language::TypeScript, app)],
+            &[("api/openapi.yaml", spec)],
+            &[],
+        );
+        assert_eq!(
+            edges(&built),
+            [
+                "EXPOSES api -> HTTP GET /missing @api [exact]",
+                "EXPOSES api -> HTTP GET /users @api [exact]",
+                "EXPOSES api -> HTTP POST /users @api [exact]",
+                "HANDLED_BY HTTP GET /users @api -> api/src/app.ts [exact]",
+                "HANDLED_BY HTTP POST /users @api -> api/src/app.ts [exact]",
+            ]
+        );
+        let diag = diagnostics(&built);
+        assert!(
+            diag.iter()
+                .any(|d| d.starts_with("spec_operation_unhandled")),
+            "{diag:?}"
+        );
+        assert!(
+            !diag.iter().any(|d| d.starts_with("openapi_unread")),
+            "{diag:?}"
+        );
+        // Operation IDs ride the endpoint refs for generated-call stitching (S6).
+        let ops: Vec<(&str, Vec<&str>)> = built
+            .endpoints
+            .iter()
+            .map(|e| {
+                (
+                    e.key.as_str(),
+                    e.operations.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert!(ops.contains(&("HTTP GET /users @api", vec!["listUsers"])));
+        assert!(ops.contains(&("HTTP POST /users @api", vec!["addUser"])));
+        assert!(ops.contains(&("HTTP GET /missing @api", vec!["getMissing"])));
+    }
+
+    /// Contract M6f S4b: a spec operation matching an interface mapping is handled by the
+    /// interface declaration (`exact`) and its implementors (`heuristic`); without a spec,
+    /// interface mappings stay invisible (D12).
+    #[test]
+    fn spec_operations_on_interfaces_roll_down_to_implementors() {
+        let api = "package p;\nimport org.springframework.web.bind.annotation.*;\npublic interface UsersApi {\n  @GetMapping(\"/users\")\n  String list();\n}\n";
+        let ctrl = "package p;\nclass UserController implements UsersApi {\n  public String list() { return \"\"; }\n}\n";
+        let spec = "openapi: 3.0.0\npaths:\n  /users:\n    get:\n      operationId: listUsers\n";
+        let files = [
+            ("api/UsersApi.java", Language::Java, api),
+            ("api/UserController.java", Language::Java, ctrl),
+        ];
+        let built = build_with_specs(&files, &[("api/openapi.yaml", spec)], &[]);
+        assert_eq!(
+            edges(&built),
+            [
+                "EXPOSES api -> HTTP GET /users @api [exact]",
+                "HANDLED_BY HTTP GET /users @api -> rb-heuristic . . . `api/UserController.java`/UserController#list(). [heuristic]",
+                "HANDLED_BY HTTP GET /users @api -> rb-heuristic . . . `api/UsersApi.java`/UsersApi#list(). [exact]",
+            ]
+        );
+        // Without the spec the interface mapping stays invisible.
+        let built = build(&files, &[]);
+        assert!(edges(&built).is_empty());
+        assert!(
+            diagnostics(&built)
+                .iter()
+                .any(|d| d.starts_with("route_on_interface")),
+            "{:?}",
+            diagnostics(&built)
+        );
+    }
+
+    /// Contract M6f S3: proto services become `GRPC` endpoints of their service; a spec
+    /// outside any project stays endpoint-less and counted; an unreadable spec is counted.
+    #[test]
+    fn proto_services_and_unread_specs_are_counted() {
+        let proto =
+            "syntax = \"proto3\";\npackage acme;\nservice Users {\n  rpc Get (A) returns (B);\n}\n";
+        let built = build_with_specs(
+            &[(
+                "api/src/a.ts",
+                Language::TypeScript,
+                "export const a = 1;\n",
+            )],
+            &[
+                ("api/svc.proto", proto),
+                ("docs/openapi.yaml", "openapi: 3.0.0\npaths:\n"),
+                ("api/broken.yaml", "openapi: 3.0.0\npaths:\n  /x:\n"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built),
+            ["EXPOSES api -> GRPC acme.Users/Get @api [exact]",]
+        );
+        let diag = diagnostics(&built);
+        for kind in [
+            "spec_operation_unhandled",
+            "spec_outside_project",
+            "openapi_unread",
+        ] {
+            assert!(diag.iter().any(|d| d.starts_with(kind)), "{kind}: {diag:?}");
+        }
     }
 
     /// S2 fallback: a dynamic group argument folds to nothing, so the unknown node
@@ -1400,6 +1769,8 @@ mod tests {
                 service_of: &service_of,
                 context_paths: &context_paths,
                 config_unread: &config_unread,
+                specs: &BTreeMap::new(),
+                has_project: &|_: &str| true,
             };
             rb_frameworks::work::take();
             let (_, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
@@ -1481,7 +1852,7 @@ mod tests {
             )
         })
         .collect();
-        let built = build_from(&facts, &[], &BTreeMap::new(), &["stats"]);
+        let built = build_from(&facts, &[], &[], &BTreeMap::new(), &["stats"]);
         let attrs = |key: &str| {
             built
                 .graph
@@ -1556,7 +1927,7 @@ mod tests {
         let col = (start - app[..start].rfind('\n').unwrap() - 1) as i32;
         let handler = rb_syntax::symbol_keys("svc/handlers.ts", &facts[1].2)[0].clone();
         let certainty = |exact: &BTreeMap<(&str, Span), String>| {
-            let built = build_from(&facts, &[], exact, &[]);
+            let built = build_from(&facts, &[], &[], exact, &[]);
             let g = &built.graph;
             let e = g
                 .edges()

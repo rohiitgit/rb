@@ -1,6 +1,7 @@
-  code: 23.1% of references to own code resolved (3 resolved, 0 ambiguous, 10 unresolved; 18 external); 2 exact calls (scip)
+  code: 14.3% of references to own code resolved (2 resolved, 0 ambiguous, 12 unresolved; 14 external); 6 exact calls (scip)
   scip: apps/web scip-typescript failed unpinned (fetch phase)
   scip: packages/shared scip-typescript ok unpinned, definitions matched 1/1 (0 by name), definitions without occurrence 0, references matched 0, external 0, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0, documents rejected 0, relationships dropped 0 (0 in project, 0 anonymous)
   scip: services/auth scip-java ok, definitions matched 13/13 (1 by name), definitions without occurrence 0, references matched 2, external 4, undocumented 0, local 0, unanchored 0, unmatched 0, unconverted 0, documents rejected 0, relationships dropped 0 (0 in project, 0 anonymous)
+  scip: services/billing scip-go ok unpinned, definitions matched 14/14 (0 by name), definitions without occurrence 0, references matched 4, external 10, undocumented 0, local 0, unanchored 0, unmatched 44, unconverted 0, documents rejected 0, 1 documents outside the root, relationships dropped 0 (0 in project, 0 anonymous)
   scip: services/broken scip-java failed (fetch phase)
   scip: services/notification scip-typescript ok unpinned, definitions matched 3/3 (0 by name), definitions without occurrence 0, references matched 0, external 2, undocumented 0, local 2, unanchored 0, unmatched 10, unconverted 0, documents rejected 0, relationships dropped 0 (0 in project, 0 anonymous)

@@ -16,6 +16,8 @@ pub(crate) struct Modules<'a> {
     go_modules: &'a BTreeMap<String, String>,
     /// Directory → its Go files.
     go_dirs: BTreeMap<&'a str, Vec<&'a str>>,
+    /// Exact manifest resolution for bare specifiers (contract M6c S4).
+    aliases: crate::rta::AliasMaps,
 }
 
 /// Extensions a TS/JS specifier may omit, in the order TypeScript tries them.
@@ -60,7 +62,15 @@ impl<'a> Modules<'a> {
             python_modules,
             go_modules,
             go_dirs,
+            aliases: crate::rta::AliasMaps::default(),
         }
+    }
+
+    /// Exact manifest resolution for bare specifiers (contract M6c S4).
+    /// Default (no manifests) resolves nothing, as before.
+    pub(crate) fn with_aliases(mut self, aliases: crate::rta::AliasMaps) -> Self {
+        self.aliases = aliases;
+        self
     }
 
     /// The files `import` (written in the file at `from`) refers to, sorted. Empty for external
@@ -86,12 +96,23 @@ impl<'a> Modules<'a> {
         self.files.get_key_value(path).map(|(k, _)| *k)
     }
 
-    /// Relative specifiers only; bare ones (`express`, `@scope/x`) are packages.
+    /// Relative specifiers resolve against the file; bare ones (`express`,
+    /// `@scope/x`) resolve exactly through manifests first (contract M6c S4),
+    /// else are packages.
     fn ecmascript(&self, from: &str, spec: &str) -> Option<&'a str> {
         if !spec.starts_with('.') {
-            return None;
+            return self
+                .aliases
+                .resolve(from, spec)
+                .and_then(|base| self.probe(base));
         }
         let base = join(dir(from), spec)?;
+        self.probe(base)
+    }
+
+    /// The first existing file a resolved base names (TypeScript's extension
+    /// and `index` conventions).
+    fn probe(&self, base: String) -> Option<&'a str> {
         // `./x.js` may name `x.ts` (TypeScript's ESM convention).
         let stem = [".js", ".jsx", ".mjs", ".cjs"]
             .iter()
@@ -348,6 +369,78 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Contract M6c S4: bare specifiers resolve exactly through manifests in
+    /// Tier B; unresolvable specs stay external.
+    #[test]
+    fn bare_specifiers_resolve_through_manifests() {
+        let ts = Language::TypeScript;
+        let files: Vec<(String, Language, FileFacts)> = [
+            ("svc/src/models/user.ts", ts, "export const x = 1;\n"),
+            (
+                "svc/src/main.ts",
+                ts,
+                "import { x } from '@models/user';\nimport { y } from '@other/user';\nconsole.log(x, y);\n",
+            ),
+        ]
+        .iter()
+        .map(|(p, l, src)| {
+            (
+                (*p).to_owned(),
+                *l,
+                rb_syntax::extract(*l, src.as_bytes()).unwrap(),
+            )
+        })
+        .collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = files
+            .iter()
+            .map(|(p, l, f)| (p.as_str(), (*l, f)))
+            .collect();
+        let go: BTreeMap<String, String> = BTreeMap::new();
+        let manifests: BTreeMap<&str, String> = [(
+            "svc/tsconfig.json",
+            "{ \"compilerOptions\": { \"paths\": { \"@models/*\": [\"src/models/*\"] } } }"
+                .to_owned(),
+        )]
+        .into_iter()
+        .collect();
+        let modules =
+            Modules::new(&by_path, &go).with_aliases(crate::rta::AliasMaps::build(&manifests));
+        let got: Vec<Vec<String>> = by_path["svc/src/main.ts"]
+            .1
+            .imports
+            .iter()
+            .map(|i| {
+                modules
+                    .resolve("svc/src/main.ts", i)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                vec!["svc/src/models/user.ts".to_owned()],
+                Vec::<String>::new()
+            ]
+        );
+        // Without manifests both stay external.
+        let plain = Modules::new(&by_path, &go);
+        let got: Vec<Vec<String>> = by_path["svc/src/main.ts"]
+            .1
+            .imports
+            .iter()
+            .map(|i| {
+                plain
+                    .resolve("svc/src/main.ts", i)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(got, [Vec::<String>::new(), Vec::<String>::new()]);
     }
 
     #[test]

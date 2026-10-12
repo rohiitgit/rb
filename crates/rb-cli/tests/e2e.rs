@@ -2920,6 +2920,13 @@ fn scip_image_identity_is_part_of_the_tool_configuration() {
         rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE,
         "{tools}"
     );
+    // Contract M6d S1 (evaluator pass 1, E1-1): the go and python identities
+    // ride the same record (the java fixture has neither job).
+    assert_eq!(
+        tools["scip_python"],
+        rb_scip::jobs::SCIP_PYTHON_IMAGE,
+        "{tools}"
+    );
     // Amendment 44: an `unsupported` job did not finish, so with the image still absent the
     // snapshot is rebuilt (cheaply: facts and index caches are warm), not "up to date".
     let again = rb_with_path(&url, &["index", path, "--repo", &name], Some(&shimmed));
@@ -2936,6 +2943,12 @@ fn scip_image_identity_is_part_of_the_tool_configuration() {
     let tools = store.live_snapshot(&name).unwrap().unwrap().tool_versions;
     assert!(
         tools["scip_java"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("sha256:")),
+        "{tools}"
+    );
+    assert!(
+        tools["scip_go"]
             .as_str()
             .is_some_and(|id| id.starts_with("sha256:")),
         "{tools}"
@@ -3074,6 +3087,14 @@ fn scip_egress_probes_from_a_fetch_container() {
     let script = r#"exec 1>&2
 code() { curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$@" 2>/dev/null; echo " exit=$?"; }
 echo "allowed $(code https://repo.maven.apache.org/maven2/)"
+echo "gomod $(code https://proxy.golang.org/github.com/go-chi/chi/v5/@latest)"
+echo "gosum $(code https://sum.golang.org/)"
+echo "pypi $(code https://pypi.org/pypi/requests/json)"
+echo "files $(code https://files.pythonhosted.org/)"
+echo "testpypi $(code https://test.pypi.org/simple/)"
+echo "gcs $(code https://storage.googleapis.com/)"
+echo "plugins $(code https://plugins.gradle.org/)"
+echo "distrib $(code https://services.gradle.org/)"
 echo "host $(code https://example.com/)"
 echo "plain $(code -x "$http_proxy" http://repo.maven.apache.org/maven2/)"
 echo "ip $(code https://1.1.1.1/)"
@@ -3128,6 +3149,33 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
     eprintln!("egress probes:\n{}", outcome.stderr_tail);
     assert!(outcome.ok(), "{}", outcome.stderr_tail);
     assert_eq!(result("allowed"), "200 exit=0");
+    assert_eq!(result("gomod"), "200 exit=0");
+    assert!(
+        result("gosum").starts_with("000 exit=") && result("gosum") != "000 exit=0",
+        "gosum: {}",
+        result("gosum")
+    );
+    assert_eq!(result("pypi"), "200 exit=0");
+    // Contract M6d S4: the file host answers (its root is a 404), while the
+    // same-org test index stays refused. S11: the Go proxy's storage bucket
+    // answers (its root is a 400).
+    assert_eq!(result("files"), "404 exit=0");
+    assert_eq!(result("gcs"), "400 exit=0");
+    // Contract M6e S2: the Gradle plugin portal answers through the proxy.
+    // services.gradle.org (the distribution host) stays refused: nothing at
+    // runtime dials it (the wrapper is never used), and a build that did
+    // would fail closed with a named refusal.
+    assert_eq!(result("plugins"), "200 exit=0");
+    assert!(
+        result("distrib").starts_with("000 exit=") && result("distrib") != "000 exit=0",
+        "distrib: {}",
+        result("distrib")
+    );
+    assert!(
+        result("testpypi").starts_with("000 exit=") && result("testpypi") != "000 exit=0",
+        "testpypi: {}",
+        result("testpypi")
+    );
     for refused in ["host", "ip", "direct", "gateway"] {
         let r = result(refused);
         assert!(
@@ -3143,7 +3191,13 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
         [
             "1.1.1.1:443",
             "example.com:443",
-            "http://repo.maven.apache.org/maven2/"
+            "http://repo.maven.apache.org/maven2/",
+            // Contract M6e S2: the distribution host stays refused.
+            "services.gradle.org:443",
+            // Contract M6d S3: the checksum database stays refused.
+            "sum.golang.org:443",
+            // Contract M6d S4: the same-org test index stays refused.
+            "test.pypi.org:443"
         ],
         "{log}"
     );
@@ -3151,6 +3205,170 @@ timeout 5 bash -c 'echo x > /dev/udp/8.8.8.8/53' 2> /dev/null; echo "udp exit=$?
     assert!(!log.contains("CONNECT 192.168.65.254"), "{log}");
 }
 
+/// Docker answering and the local scip-go image built (docker/scip-go/README.md); the
+/// reason to skip otherwise. The image is never built implicitly.
+fn scip_go_available() -> Result<(), String> {
+    use rb_scip::Runner as _;
+    rb_scip::docker_available()?;
+    let image = rb_scip::jobs::SCIP_GO_IMAGE;
+    rb_scip::DockerRunner::default()
+        .image_id(image)
+        .map(|_| ())
+        .ok_or_else(|| format!("{image} is not built; see docker/scip-go/README.md"))
+}
+
+/// Contract M6d S9: the chi/SQL fixture. Nested `Route` prefixes, `Group`,
+/// `With` chains and verbs become endpoints; `database/sql` sites become
+/// `QUERIES`; the two implicit `Payer` implementations get `IMPLEMENTS`
+/// edges (method and type) without any declared heritage (guards); call
+/// dispatch through the interface stays unmatched (RTA through Go interfaces
+/// is future work, recorded as residue). The `go.sum`-pinned fetch makes the
+/// job reproducible.
+#[test]
+fn scip_go_chi_sqlx() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_go_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "go-chi-sqlx";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipgo_{}", std::process::id());
+    let other = format!("t_scipgo2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!("scip_go_chi_sqlx: first index {:.1?}", started.elapsed());
+    assert!(
+        first.contains("scip: . scip-go ok") && !first.contains("unpinned"),
+        "{first}"
+    );
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!("scip_go_chi_sqlx guard failures:\n{}", failures.join("\n"));
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-checkout.txt",
+        &rb(&url, &["callers", "Checkout", "--repo", &name]),
+    );
+    let package = "scip-go gomod github.com/acme/shop . ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "", ".") >= 7,
+        "{dump}"
+    );
+    // The manifest and SCIP chi edges share one `go/` node (contract M6d S5).
+    assert_eq!(
+        dump.lines()
+            .filter(|l| l.contains("[\"N\",\"package\",\"go/github.com/go-chi/chi/v5@v5.3.2\""))
+            .count(),
+        1,
+        "{dump}"
+    );
+    assert!(!dump.contains("gomod/github.com/go-chi"), "{dump}");
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("scip: . scip-go ok (cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        fresh.contains("scip: . scip-go ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
+/// Contract M6d S9: the FastAPI/SQLAlchemy fixture. Decorators, prefixes
+/// and includes become endpoints; `__tablename__` models and f-string/literal
+/// SQL become `QUERIES`; intra-repo imports resolve exact both ways;
+/// `uv.lock` pins versions while the non-member client service stays `?`;
+/// session/plain `requests`/`httpx` sites stitch cross-service (guards).
+#[test]
+fn scip_python_fastapi_sqlalchemy() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = rb_scip::docker_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "python-fastapi-sqlalchemy";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scippy_{}", std::process::id());
+    let other = format!("t_scippy2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!(
+        "scip_python_fastapi_sqlalchemy: first index {:.1?}",
+        started.elapsed()
+    );
+    for line in [
+        "scip: client scip-python ok",
+        "scip: services/shop scip-python ok",
+    ] {
+        assert!(first.contains(line), "{line} in {first}");
+    }
+    assert!(first.contains("unpinned"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!(
+            "scip_python_fastapi_sqlalchemy guard failures:\n{}",
+            failures.join("\n")
+        );
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-active-users.txt",
+        &rb(&url, &["callers", "active_users", "--repo", &name]),
+    );
+    let package = "scip-python python shop 0.1.0 ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "services/shop/", "services/shop") >= 2,
+        "{dump}"
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(
+        second.contains("scip: services/shop scip-python ok (cached"),
+        "{second}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        fresh.contains("scip: services/shop scip-python ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
 /// Docker answering and the local scip-java image built (docker/scip-java/README.md); the
 /// reason to skip otherwise. The image is never built implicitly.
 fn scip_java_available() -> Result<(), String> {
@@ -3460,6 +3678,159 @@ fn scip_java_lombok() {
     assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
 }
 
+/// Contract M6e S4: the Gradle fixture. The `java-gradle-catalog` root job resolves its
+/// environment (Kotlin DSL + version catalog) behind the proxy and indexes offline with
+/// `scip-java index --build-tool Gradle`, so `Main.run → Service.process → Helper.exclaim`
+/// is exact and the catalog/literal pins are exact `DEPENDS_ON` rows (guards); cached, fresh
+/// from an emptied per-repository cache and a second repository name dump identically.
+#[test]
+fn scip_java_gradle_catalog() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "java-gradle-catalog";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipgradle_{}", std::process::id());
+    let other = format!("t_scipgradle2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!(
+        "scip_java_gradle_catalog: first index {:.1?}",
+        started.elapsed()
+    );
+    assert!(first.contains("scip: . scip-java ok"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!(
+            "scip_java_gradle_catalog guard failures:\n{}",
+            failures.join("\n")
+        );
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-process.txt",
+        &rb(&url, &["callers", "Service.process", "--repo", &name]),
+    );
+    let package = "scip-java maven . . ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "src/", ".") >= 2,
+        "{dump}"
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("scip: . scip-java ok (cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        fresh.contains("scip: . scip-java ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
+/// Contract M6f S7: the contract-packs fixture. `openapi.yaml` (3 operations) and `svc.proto`
+/// (3 services... see fixture: Greeter + Users) become exact endpoints of the root service; the
+/// spec operations matching the committed `UsersApi` interface are handled by its declaration
+/// (`exact`) and `UserController` (`heuristic`); `POST /users` and the GRPC methods stay
+/// unhandled and counted. `OrderClient`'s operationId call and stub call stitch `synthetic`
+/// `CONSUMES` edges, as do the TypeScript client's; `UserMapper.xml` statements reach
+/// `public.users` exactly (the `<if>` statement is a counted diagnostic). Cached, fresh from an
+/// emptied per-repository cache and a second repository name dump identically.
+#[test]
+fn scip_contract_packs() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = rb_scip::docker_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    if let Err(reason) = scip_java_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "contract-packs";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scippacks_{}", std::process::id());
+    let other = format!("t_scippacks2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    eprintln!("scip_contract_packs: first index {:.1?}", started.elapsed());
+    assert!(
+        first.contains("scip-java ok") || first.contains("scip: . scip-java ok"),
+        "{first}"
+    );
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!(
+            "scip_contract_packs guard failures:\n{}",
+            failures.join("\n")
+        );
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    golden(
+        fixture,
+        "scip-callers-listusers.txt",
+        &rb(
+            &url,
+            &["callers", "UserController.listUsers", "--repo", &name],
+        ),
+    );
+    golden(
+        fixture,
+        "scip-path-getusers.txt",
+        &rb(&url, &["path", "GET /users", "--repo", &name]),
+    );
+    golden(
+        fixture,
+        "table-deps-users.txt",
+        &rb(&url, &["table-deps", "public.users", "--repo", &name]),
+    );
+    let package = "scip-java maven maven/acme/contract-packs 1.0.0 ";
+    assert!(
+        assert_exact_code_edges(&dump, package, "src/", ".") >= 2,
+        "{dump}"
+    );
+
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("(cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(!fresh.contains("(cached"), "{fresh}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 /// Contract M6a S11: the npm-workspaces fixture. The root's job is grouped (`workspace 2
 /// members`, fetched at the root from its lockfile, offline: every package is local) and indexes
 /// both members, so `packages/app`'s call into `packages/core` is exact through the workspace
@@ -3532,6 +3903,52 @@ fn scip_ts_workspaces() {
     assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
 }
 
+/// Contract M6e S7: the pnpm/yarn lockfile fixture. The `pnpm` root groups two members
+/// (`workspace 2 members`, fetched at the root with pnpm) and the `yarn` service keeps its
+/// own classic job; ranges pin to exact `DEPENDS_ON` rows per format (guards); cached, fresh
+/// and a second repository name dump identically.
+#[test]
+fn scip_ts_pnpm_yarn() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = rb_scip::docker_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "ts-pnpm-yarn";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scippnpy_{}", std::process::id());
+    let other = format!("t_scippnpy2_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone(), other.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &name, "--no-scip"]);
+    golden(fixture, "dump.jsonl", &rb(&url, &["dump", "--repo", &name]));
+
+    let first = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(first.contains("scip-typescript ok"), "{first}");
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    let failures = guard_failures(fixture, &dump);
+    if !failures.is_empty() {
+        eprintln!("scip_ts_pnpm_yarn guard failures:\n{}", failures.join("\n"));
+    }
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    let cached = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(cached.contains("(cached"), "{cached}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(!fresh.contains("(cached"), "{fresh}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump, "fresh");
+    rb(&url, &["index", path, "--repo", &other]);
+    assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
+}
+
 /// Contract M3b S10 and invariant 4: a monorepo mixing a Maven project that indexes, one that
 /// fails to build on purpose (`services/broken`), and TypeScript packages. `rb index` succeeds,
 /// the failed project keeps its stderr tail and stays heuristic, the others are exact.
@@ -3599,6 +4016,30 @@ fn scip_polyglot_monorepo() {
     let auth_package = "scip-java maven maven/com.acme/auth-service 1.4.0 ";
     assert!(
         assert_exact_code_edges(&dump, auth_package, "services/auth/", "services/auth") >= 1,
+        "{dump}"
+    );
+    // Contract M6d S5: the manifest and SCIP gin edges share one
+    // `go/<module>@<version>` node (no `gomod/` row survives); the stdlib
+    // pseudo-module keys under the same manager.
+    let gin = "go/github.com/gin-gonic/gin@v1.10.0";
+    assert_eq!(
+        dump.lines()
+            .filter(|l| l.contains(&format!("[\"N\",\"package\",\"{gin}\"")))
+            .count(),
+        1,
+        "{dump}"
+    );
+    assert!(!dump.contains("gomod/github.com/gin-gonic/gin"), "{dump}");
+    for provenance in ["\"manifest\"", "\"scip\""] {
+        assert!(
+            dump.lines().any(|l| l.contains(&format!(
+                "\"DEPENDS_ON\",\"package\",\"{gin}\",{provenance}"
+            ))),
+            "{provenance} gin edge in {dump}"
+        );
+    }
+    assert!(
+        dump.contains("[\"N\",\"package\",\"go/github.com/golang/go/src@go1.23\""),
         "{dump}"
     );
     // S8: the ok Maven service lists its packages; the failed one has no `scip` package, only

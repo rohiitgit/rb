@@ -1,0 +1,8 @@
+# Precision guards for the go-chi-sqlx fixture (contract M6d S9): what must
+# not appear. A cross-implementation or reverse-twin IMPLEMENTS would mean
+# the attestation gate over-fires; a `gomod/` package row would mean the S5
+# key unification regressed.
+IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Card#Pay(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Cash#Pay().
+IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Payer# -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Card#
+DEPENDS_ON * -> gomod/github.com/go-chi/chi/v5@v5.3.2
+DEPENDS_ON * -> gomod/github.com/golang/go/src@go1.23

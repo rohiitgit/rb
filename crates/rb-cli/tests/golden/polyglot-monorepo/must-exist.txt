@@ -23,6 +23,28 @@ CONSUMES rb-heuristic . . . `services/billing/cmd/billing/main.go`/notifyPaid().
 CONSUMES rb-heuristic . . . `apps/web/src/api/billing.ts`/payInvoice(). -> HTTP POST /billing/invoices/{}/pay @services/billing/cmd/billing [heuristic] {"base":"unresolved","match":"suffix"}
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /internal/mfa/email @services/notification [ambiguous] {"candidates":2}
 CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resend(). -> HTTP POST /internal/mfa/email @services/billing/cmd/billing [ambiguous] {"candidates":2}
+# Contract M6b S5: a config passed by name reads the object it names, so the
+# service base restricts the call to notification's endpoint alone.
+CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/resendViaCfg(). -> HTTP POST /internal/mfa/email @services/notification [synthetic]
+# Contract M6b S6: a member assigned once in a constructor folds, so the
+# host restricts the call to notification's endpoint alone. (Heuristic, not
+# synthetic: a `fetch` word in broken/pom.xml caps fetch repo-wide.)
+CONSUMES rb-heuristic . . . `apps/web/src/api/mfa.ts`/NotifyClient#ping(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+# Contract M6b S9: fetch-class libraries stitch like fetch with hook proofs
+# (heuristic here, not synthetic: a `fetch` word in broken/pom.xml caps fetch
+# repo-wide, as above).
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/fetchHealthViaGot(). -> HTTP GET /health @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaGot(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaGotExtended(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/fetchHealthViaKy(). -> HTTP GET /health @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaKyExtended(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/fetchHealthViaSuperagent(). -> HTTP GET /health @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/sendMailViaAgent(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/fetchHealthViaUndici(). -> HTTP GET /health @services/notification [heuristic]
+# Contract M6b S9 (D8): Angular HttpClient and axios member forms enter capped
+# at heuristic.
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/MailClient#send(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
+CONSUMES rb-heuristic . . . `apps/web/src/api/clients.ts`/resendViaMember(). -> HTTP POST /internal/mfa/email @services/notification [heuristic]
 # Contract M4b S8: a Feign client is a bean under @EnableFeignClients, a @Repository class a stereotype.
 INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient# [heuristic] {"origin":"feign","resolution":"unique"}
 INJECTS rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController# -> rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/UserDao.java`/UserDao# [heuristic] {"origin":"stereotype","resolution":"unique"}

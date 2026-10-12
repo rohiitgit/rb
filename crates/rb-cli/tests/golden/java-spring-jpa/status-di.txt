@@ -1,1 +1,1 @@
-  di: 9 injection points: 5 plain, 2 capped, 1 ambiguous, 1 not a bean
+  di: 16 injection points: 9 plain, 2 capped, 3 ambiguous, 1 not a bean, 1 test

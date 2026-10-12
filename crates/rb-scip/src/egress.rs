@@ -22,14 +22,28 @@ pub const PROXY_PORT: u16 = 8888;
 pub const PROXY_CONFIG_AT: &str = "/etc/tinyproxy";
 pub const CLIENT_CONFIG_AT: &str = "/rb-egress";
 
-/// The registries the built-in recipes fetch from: Maven Central (both of its host names) and
-/// the npm and Yarn registries. The fixtures' fetches reach only `repo.maven.apache.org` and
-/// `registry.npmjs.org` (measured through an open proxy, contract M5 amendment 12).
+/// The registries the built-in recipes fetch from: Maven Central (both of its host names),
+/// the npm and Yarn registries, the Go module proxy (contract M6d S3) with the Google-hosted
+/// bucket it redirects large downloads to (measured in S11: `go mod download` serves module
+/// zips from signed `storage.googleapis.com` URLs; refusing it fails closed on real modules),
+/// PyPI with its file host (contract M6d S4), the Gradle plugin portal (contract M6e S2;
+/// the distribution host stays refused — nothing at runtime dials it since the wrapper is
+/// never used) with the artifact host its markers download from (measured in phase 11: the
+/// `plugins.gradle.org/m2` marker resolves to `plugins-artifacts.gradle.org`; refusing it
+/// fails closed on real Gradle plugins). The fixtures' fetches reach only
+/// `repo.maven.apache.org` and `registry.npmjs.org` (measured through an open proxy, contract
+/// M5 amendment 12).
 pub const REGISTRIES: &[&str] = &[
+    "files.pythonhosted.org",
+    "plugins-artifacts.gradle.org",
+    "plugins.gradle.org",
+    "proxy.golang.org",
+    "pypi.org",
     "registry.npmjs.org",
     "registry.yarnpkg.com",
     "repo.maven.apache.org",
     "repo1.maven.org",
+    "storage.googleapis.com",
 ];
 
 /// The fetch phase's allow-list: [`REGISTRIES`] plus the extra hosts the indexing host
@@ -149,6 +163,20 @@ pub fn proxy_env(address: &str) -> Vec<(String, String)> {
     .collect()
 }
 
+/// JVM system properties sending Gradle through the proxy at `address`, as one
+/// `GRADLE_OPTS` entry (Gradle reads proxy configuration from system properties, not the
+/// environment; contract M6e S2). Extended onto Gradle fetches at run time beside
+/// [`proxy_env`], when the per-run address is known.
+pub fn gradle_proxy_opts(address: &str) -> (String, String) {
+    (
+        "GRADLE_OPTS".into(),
+        format!(
+            "-Dhttps.proxyHost={address} -Dhttps.proxyPort={PROXY_PORT} \
+             -Dhttp.proxyHost={address} -Dhttp.proxyPort={PROXY_PORT}"
+        ),
+    )
+}
+
 /// The hosts the proxy refused, from its log (`Proxying refused on filtered url "…"`), sorted
 /// and without repeats: the log's timestamps and order are not functions of the commit.
 pub fn refusals(log: &str) -> Vec<String> {
@@ -175,11 +203,17 @@ mod tests {
         assert_eq!(
             extra.hosts,
             [
+                "files.pythonhosted.org",
+                "plugins-artifacts.gradle.org",
+                "plugins.gradle.org",
+                "proxy.golang.org",
+                "pypi.org",
                 "registry.npmjs.org",
                 "registry.yarnpkg.com",
                 "repo.maven.apache.org",
                 "repo.spring.io",
-                "repo1.maven.org"
+                "repo1.maven.org",
+                "storage.googleapis.com"
             ]
         );
         for bad in [
@@ -196,6 +230,21 @@ mod tests {
         ] {
             assert!(Egress::with(&[bad.to_owned()]).is_err(), "{bad:?}");
         }
+    }
+
+    /// Contract M6e S2/F3 (phase 11): the Gradle plugin portal serves artifact downloads
+    /// from `plugins-artifacts.gradle.org` (measured on jcommander: resolving the
+    /// `plugins.gradle.org/m2` marker GETs that host, and the fetch fails closed without it).
+    /// Probed 200 direct before allow-listing; the distribution host stays refused
+    /// (wrapper-only).
+    #[test]
+    fn gradle_plugin_artifact_downloads_are_allow_listed() {
+        assert!(REGISTRIES.contains(&"plugins-artifacts.gradle.org"));
+        assert!(
+            Egress::default()
+                .proxy_filter()
+                .contains("plugins-artifacts.gradle.org:443\n")
+        );
     }
 
     #[test]
@@ -215,7 +264,7 @@ mod tests {
         }
         assert_eq!(
             e.proxy_filter(),
-            "registry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\n"
+            "files.pythonhosted.org:443\nplugins-artifacts.gradle.org:443\nplugins.gradle.org:443\nproxy.golang.org:443\npypi.org:443\nregistry.npmjs.org:443\nregistry.yarnpkg.com:443\nrepo.maven.apache.org:443\nrepo1.maven.org:443\nstorage.googleapis.com:443\n"
         );
         let tmp = tempfile::tempdir().unwrap();
         e.write_config(tmp.path()).unwrap();
@@ -246,6 +295,13 @@ mod tests {
             "npm_config_https_proxy".into(),
             "http://172.30.0.2:8888".into()
         )));
+        assert_eq!(
+            gradle_proxy_opts("172.30.0.2"),
+            (
+                "GRADLE_OPTS".into(),
+                "-Dhttps.proxyHost=172.30.0.2 -Dhttps.proxyPort=8888 -Dhttp.proxyHost=172.30.0.2 -Dhttp.proxyPort=8888".into()
+            )
+        );
     }
 
     #[test]

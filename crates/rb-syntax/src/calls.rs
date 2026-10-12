@@ -280,6 +280,38 @@ fn summary(language: Language, syn: &Syntax, node: Node<'_>, source: &[u8], dept
             entries,
         };
     }
+    // Python keyword arguments read as single-entry objects (contract M6d S7),
+    // so packs can fold `base_url` and cap on unknown keys; values read one
+    // level deep, as object pairs do.
+    if node.kind() == "keyword_argument" {
+        let (Some(name), Some(value)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("value"),
+        ) else {
+            return Arg::Other { span: span(node) };
+        };
+        return Arg::Object {
+            span: span(node),
+            entries: vec![ObjectEntry {
+                key: text(name, source),
+                value: summary(language, syn, value, source, depth + 1),
+            }],
+        };
+    }
+    // A `**cfg` splat may hide any key (as `...cfg` does).
+    if node.kind() == "dictionary_splat" {
+        return Arg::Object {
+            span: span(node),
+            entries: vec![ObjectEntry {
+                key: "...".into(),
+                value: node
+                    .named_child(0)
+                    .map_or(Arg::Other { span: span(node) }, |v| {
+                        summary(language, syn, v, source, depth + 1)
+                    }),
+            }],
+        };
+    }
     if language == Language::Java && node.kind() == "object_creation_expression" && depth == 0 {
         let type_name = node
             .child_by_field_name("type")
@@ -665,7 +697,28 @@ mod tests {
         let src = "def f():\n    requests.get(f\"{BASE}/users\", timeout=3).json()\n";
         assert_eq!(
             outline(Language::Python, src),
-            ["requests.get('{BASE}/users', ?).json()"]
+            ["requests.get('{BASE}/users', {timeout: ?}).json()"]
+        );
+    }
+
+    /// Contract M6d S7: Python keyword arguments read as single-entry objects
+    /// (so packs can fold `base_url` and cap on unknown keys); a `**` splat
+    /// keeps the `...` entry and caps downstream like `...cfg`. Values read
+    /// one level deep, as object pairs do.
+    #[test]
+    fn python_keyword_arguments_read_as_single_entry_objects() {
+        let src = "def f():\n    httpx.Client(base_url=BASE, timeout=3)\n    requests.get(URL, headers=H, **opts)\n";
+        assert_eq!(
+            outline(Language::Python, src),
+            [
+                "httpx.Client({base_url: BASE}, {timeout: ?})",
+                "requests.get(URL, {headers: H}, {...: opts})",
+            ]
+        );
+        let dict = "def f():\n    requests.get(URL, headers={\"a\": \"b\"})\n";
+        assert_eq!(
+            outline(Language::Python, dict),
+            ["requests.get(URL, {headers: ?})"]
         );
     }
 

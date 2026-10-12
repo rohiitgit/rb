@@ -69,6 +69,159 @@ pub(crate) fn text_plan<'f>(
     (plan, diagnostics)
 }
 
+/// One MyBatis mapper statement: its `id`, folded SQL text and span from the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MapperStmt {
+    pub id: String,
+    pub sql: String,
+    pub span: rb_model::Span,
+}
+
+/// A MyBatis mapper file read: its `namespace`, plain statements and dynamic-skipped
+/// statement ids with spans and reasons.
+pub(crate) struct MapperFile {
+    pub namespace: String,
+    pub stmts: Vec<MapperStmt>,
+    pub dynamic: Vec<(String, rb_model::Span, &'static str)>,
+}
+
+/// Statement tags a mapper file may hold; anything else (dynamic tags like `<if>`, fragments)
+/// is out of the allow-list.
+const MAPPER_STATEMENTS: &[&str] = &["select", "insert", "update", "delete"];
+
+/// Dynamic MyBatis tags: a statement holding any of these is skipped and counted, since its
+/// SQL depends on runtime conditions (contract M6f S5 residue).
+const MAPPER_DYNAMIC: &[&str] = &[
+    "if",
+    "choose",
+    "when",
+    "otherwise",
+    "foreach",
+    "where",
+    "trim",
+    "set",
+    "include",
+    "bind",
+];
+
+/// Reads a MyBatis mapper file: its `namespace`, plain statements and dynamic-skipped
+/// statement ids with spans. `None` when the root is not `<mapper>` (poms and other XML pass
+/// through untouched). `#{p}` and `${p}` placeholders fold to `?` (table extraction only).
+pub(crate) fn mapper_file(text: &str) -> Option<MapperFile> {
+    let root = crate::packages::parse_xml(text)?;
+    if root.name != "mapper" {
+        return None;
+    }
+    let namespace = root.attr("namespace").unwrap_or_default().to_owned();
+    let mut stmts = Vec::new();
+    let mut dynamic = Vec::new();
+    for child in &root.children {
+        if !MAPPER_STATEMENTS.contains(&child.name.as_str()) {
+            continue;
+        }
+        let span = span_of(text, (child.start, child.end));
+        let id = child.attr("id").unwrap_or_default().to_owned();
+        // Any element child (dynamic tags, `<include>`, nested `<selectKey>`) takes the
+        // statement out of the allow-list: pure-text statements only, skipped ones counted
+        // with their reason.
+        if !child.children.is_empty() {
+            let reason = if child
+                .children
+                .iter()
+                .any(|c| MAPPER_DYNAMIC.contains(&c.name.as_str()))
+            {
+                "dynamic"
+            } else {
+                "nested"
+            };
+            dynamic.push((id, span, reason));
+            continue;
+        }
+        stmts.push(MapperStmt {
+            id,
+            sql: fold_placeholders(&child.text),
+            span,
+        });
+    }
+    Some(MapperFile {
+        namespace,
+        stmts,
+        dynamic,
+    })
+}
+
+/// `#{p}` and `${p}` placeholders become `?` (an unclosed placeholder ends the fold; the
+/// statement still reads).
+fn fold_placeholders(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(['#', '$']) {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        if tail.starts_with("#{") || tail.starts_with("${") {
+            match tail.find('}') {
+                Some(end) => {
+                    out.push('?');
+                    rest = &tail[end + 1..];
+                }
+                None => {
+                    out.push_str(tail);
+                    rest = "";
+                }
+            }
+        } else {
+            out.push_str(&tail[..1]);
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Adds exact `QUERIES` edges for a MyBatis mapper file's plain statements, from the file;
+/// dynamic statements and parse failures become counted diagnostics, never edges.
+pub(crate) fn add_mapper_queries(
+    b: &mut GraphBuilder,
+    path: &str,
+    text: &str,
+) -> anyhow::Result<Vec<Diagnostic>> {
+    let Some(MapperFile {
+        namespace,
+        stmts,
+        dynamic,
+    }) = mapper_file(text)
+    else {
+        return Ok(Vec::new());
+    };
+    let file = NodeKey::new(NodeKind::File, path);
+    let mut access = Accesses::default();
+    let mut diagnostics = Vec::new();
+    for stmt in &stmts {
+        let analysis = rb_sql::analyze(&stmt.sql);
+        let at = Evidence {
+            path: path.to_owned(),
+            span: stmt.span,
+        };
+        if let Some(first) = analysis.errors.first() {
+            let callee = format!("{namespace}.{}", stmt.id);
+            diagnostics.push(unparsed(path, Some(stmt.span), &first.error, Some(&callee)));
+        }
+        for table in analysis.statements.iter().flat_map(|s| &s.tables) {
+            access.record(&file, table, Certainty::Exact, &at);
+        }
+    }
+    access.emit(b, EdgeKind::Queries, Provenance::SqlFile)?;
+    for (id, span, reason) in &dynamic {
+        diagnostics.push(Diagnostic {
+            kind: "mybatis_dynamic".into(),
+            path: Some(path.to_owned()),
+            span: Some(*span),
+            detail: json!({ "namespace": namespace, "id": id, "reason": reason }),
+        });
+    }
+    Ok(diagnostics)
+}
+
 /// Adds `MIGRATES` edges for every statement of a `.sql` file. Statements that do not parse are
 /// diagnostics; they never hide the ones that do.
 pub(crate) fn add_migrations(
@@ -329,6 +482,60 @@ mod tests {
             .map(|n| n.name.as_str())
             .collect();
         assert_eq!(tables, ["roles", "users"]);
+    }
+
+    /// Contract M6f S5: mapper statements pin namespace, id, folded SQL and spans from the
+    /// tree; dynamic statements are skipped and counted; non-mapper XML yields nothing.
+    #[test]
+    fn mybatis_mapper_statements_pin_namespace_id_and_sql() {
+        let xml = "<?xml version=\"1.0\"?>\n<mapper namespace=\"com.acme.UserMapper\">\n  <select id=\"findAll\" resultType=\"User\">\n    SELECT id, name FROM users\n  </select>\n  <select id=\"findById\" resultMap=\"m\">\n    SELECT id FROM users WHERE id = #{id}\n  </select>\n  <insert id=\"insert\">INSERT INTO users (name) VALUES (#{name})</insert>\n  <select id=\"dyn\">SELECT a FROM t <if test=\"x != null\">AND x = #{x}</if></select>\n  <select id=\"sub\">SELECT a FROM t WHERE x IN ${xs}</select>\n</mapper>\n";
+        let MapperFile {
+            namespace,
+            stmts,
+            dynamic,
+        } = mapper_file(xml).unwrap();
+        assert_eq!(namespace, "com.acme.UserMapper");
+        assert_eq!(
+            stmts.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["findAll", "findById", "insert", "sub"]
+        );
+        assert!(
+            stmts
+                .iter()
+                .all(|s| !s.sql.contains("#{") && !s.sql.contains("${"))
+        );
+        assert!(stmts[1].sql.contains('?'));
+        // Spans come from the tree: the statement tags, never hand-counted.
+        let row_of = |span: rb_model::Span| span[0];
+        assert_eq!(
+            stmts.iter().map(|s| row_of(s.span)).collect::<Vec<_>>(),
+            [2, 5, 8, 10]
+        );
+        assert_eq!(dynamic.len(), 1);
+        assert_eq!(dynamic[0].0, "dyn");
+        // Anything else is not a mapper; a namespace-less mapper still reads.
+        assert!(mapper_file("<project><a/></project>").is_none());
+        assert!(mapper_file("))) garbage (((").is_none());
+        let no_ns = mapper_file("<mapper><select id=\"s\">SELECT 1</select></mapper>").unwrap();
+        assert_eq!(no_ns.namespace, "");
+        assert_eq!(no_ns.stmts.len(), 1);
+    }
+
+    /// Contract M6f S5: mapper statements become exact `QUERIES` from their file; dynamic
+    /// statements become counted diagnostics, never edges.
+    #[test]
+    fn mybatis_mapper_queries_reach_their_tables() {
+        let xml = "<mapper namespace=\"com.acme.M\">\n  <select id=\"findAll\">\n    SELECT id FROM users\n  </select>\n  <select id=\"dyn\">SELECT a FROM t <if test=\"x\">AND x = 1</if></select>\n  <select id=\"bad\">SELECT FROM WHERE</select>\n</mapper>\n";
+        let (g, diagnostics) = graph_with("db/UserMapper.xml", |b| {
+            add_mapper_queries(b, "db/UserMapper.xml", xml).unwrap()
+        });
+        assert_eq!(
+            edges(&g, EdgeKind::Queries),
+            [r#"UserMapper.xml -> public.users ops=["read"] Exact assumed @1"#]
+        );
+        let kinds: Vec<&str> = diagnostics.iter().map(|d| d.kind.as_str()).collect();
+        assert_eq!(kinds, ["unparsed_sql", "mybatis_dynamic"]);
+        assert_eq!(diagnostics[1].detail["id"], json!("dyn"));
     }
 
     #[test]

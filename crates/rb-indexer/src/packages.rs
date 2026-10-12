@@ -19,7 +19,33 @@ pub(crate) fn is_input(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     matches!(
         name,
-        "package.json" | "package-lock.json" | "npm-shrinkwrap.json" | "go.mod" | "pom.xml"
+        "package.json"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "go.mod"
+            | "go.work"
+            | "pom.xml"
+            // `yarn.lock`/`pnpm-lock.yaml` pin `npm/` versions (contract M6e
+            // S5); `npm-shrinkwrap.json` stays npm-read.
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            // `build.gradle(.kts)` dependencies and `libs.versions.toml`
+            // catalogs feed `maven/` package edges (contract M6e S3).
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "libs.versions.toml"
+            // `pyproject.toml` direct dependencies feed `py/` package edges;
+            // `poetry.lock`/`uv.lock` pin their versions (contract M6d S6).
+            // `requirements.txt`/`Pipfile` files are noticed, never read.
+            | "pyproject.toml"
+            | "poetry.lock"
+            | "uv.lock"
+            // `lombok.config` texts feed qualifier-copying resolution (contract
+            // M6c S8); the packages stage ignores unknown basenames.
+            | "lombok.config"
+            // `tsconfig.json` texts feed exact alias resolution (contract M6c
+            // S4); the packages stage ignores unknown basenames.
+            | "tsconfig.json"
     )
 }
 
@@ -222,23 +248,298 @@ fn lock_version(
     None
 }
 
-/// The lockfile governing a service directory: the nearest directory, from the service's up to
-/// the root, holding `npm-shrinkwrap.json` or `package-lock.json` (`Ok`), or else `yarn.lock` or
-/// `pnpm-lock.yaml` (`Err`, not read).
-fn lockfile_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<Result<String, String>> {
+/// A yarn blockade: spec names to pinned versions (`npm:` alias specs key
+/// by their alias; the real name resolves through [`npm_alias`]).
+struct YarnLock {
+    versions: BTreeMap<String, Vec<String>>,
+}
+
+/// Whether yarn.lock text is Berry (`__metadata:` first) or v1.
+fn is_yarn_berry_text(text: &str) -> bool {
+    text.lines().any(|l| {
+        let l = l.trim();
+        !(l.is_empty() || l.starts_with('#')) && l == "__metadata:"
+    })
+}
+
+/// Split a yarn spec: `alias@npm:real@range` → (`alias`, its real package);
+/// anything else `name@range` → (`name`, none). `None` when malformed.
+fn yarn_spec(spec: &str) -> Option<(String, Option<String>)> {
+    if let Some((name, rest)) = spec.split_once("@npm:") {
+        if name.is_empty() || name.contains('@') {
+            return None;
+        }
+        let real = npm_alias(&format!("npm:{rest}")).map(str::to_owned)?;
+        return Some((name.to_owned(), Some(real)));
+    }
+    let (name, range) = if let Some(rest) = spec.strip_prefix('@') {
+        let at = rest.rfind('@')?;
+        (format!("@{}", &rest[..at]), Some(&rest[at + 1..]))
+    } else {
+        let (name, range) = spec.split_once('@')?;
+        (name.to_owned(), Some(range))
+    };
+    if name.is_empty() || range.is_some_and(str::is_empty) {
+        return None;
+    }
+    Some((name, None))
+}
+
+/// Record one pin, deduped.
+fn yarn_pin(versions: &mut BTreeMap<String, Vec<String>>, spec: &str, version: &str) {
+    let versions = versions.entry(spec.to_owned()).or_default();
+    if !versions.iter().any(|v| v == version) {
+        versions.push(version.to_owned());
+    }
+}
+
+/// A yarn.lock text (v1 blockade or Berry resolutions) to spec names and
+/// versions. Never fails: garbage yields no blocks, and every dep then
+/// reports a missing entry (safe `?`).
+fn yarn_lock(text: &str) -> YarnLock {
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if is_yarn_berry_text(text) {
+        // `"name@npm:^1":` entries pin through `resolution: "name@npm:1.2.3"`
+        // (or the `version:` field when no resolution is stated); anything
+        // but `@npm:` descriptors (workspace/file/link) stays out.
+        let mut key: Option<String> = None;
+        for line in text.lines() {
+            let body = line.trim();
+            if body.starts_with('"') && body.ends_with("\":") {
+                key = Some(body[1..body.len() - 2].to_owned());
+                continue;
+            }
+            let Some(k) = key.as_deref() else {
+                continue;
+            };
+            if body.is_empty() {
+                key = None;
+                continue;
+            }
+            if let Some(rest) = body.strip_prefix("resolution:") {
+                if let Some(r) = unquote(rest.trim())
+                    && let Some((real, v)) = r.split_once("@npm:")
+                    && !real.is_empty()
+                    && !v.is_empty()
+                    && let Some((spec, _)) = yarn_spec(k)
+                {
+                    yarn_pin(&mut versions, &spec, v);
+                }
+                continue;
+            }
+            if let Some(rest) = body.strip_prefix("version:") {
+                // Only `@npm:` descriptors pin (workspace/file/link keys
+                // never reach versions, even when they state one).
+                if !k.contains("@npm:") {
+                    continue;
+                }
+                if let Some(v) = unquote(rest.trim()) {
+                    let Some((spec, _)) = yarn_spec(k) else {
+                        continue;
+                    };
+                    yarn_pin(&mut versions, &spec, &v);
+                }
+            }
+        }
+        return YarnLock { versions };
+    }
+    // v1: unindented `"spec":` headers (comma-separated aliases share the
+    // block) with an indented `version "x"` line each.
+    let mut specs: Vec<String> = Vec::new();
+    let mut version: Option<String> = None;
+    let mut flush = |specs: &mut Vec<String>, version: &mut Option<String>| {
+        if let Some(v) = version.take() {
+            for spec in specs.drain(..) {
+                let Some((name, _)) = yarn_spec(&spec) else {
+                    continue;
+                };
+                yarn_pin(&mut versions, &name, &v);
+            }
+        } else {
+            specs.clear();
+        }
+    };
+    for line in text.lines() {
+        if line.starts_with([' ', '\t']) {
+            // v1 `version "x"` and Berry `version: x` (colon optional); first
+            // wins, so a nested dependency literally named `version` cannot
+            // override the block's pin.
+            if version.is_none()
+                && let Some(v) = line
+                    .trim()
+                    .strip_prefix("version")
+                    .and_then(|v| unquote(v.trim().trim_start_matches(':').trim()))
+            {
+                version = Some(v);
+            }
+            continue;
+        }
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            flush(&mut specs, &mut version);
+            continue;
+        }
+        if body.ends_with(':') {
+            // A new header closes the open block.
+            flush(&mut specs, &mut version);
+            let header = body.strip_suffix(':').unwrap_or_default().trim();
+            for part in header.split(',') {
+                specs.push(part.trim().trim_matches('"').to_owned());
+            }
+            continue;
+        }
+        flush(&mut specs, &mut version);
+    }
+    flush(&mut specs, &mut version);
+    YarnLock { versions }
+}
+
+/// A pnpm `packages:` map: package name to pinned versions. Only lockfile
+/// major 9 parses (pnpm 9/10); anything else, a missing `packages:` map or
+/// malformed YAML is unreadable, never inferred (contract M6e S5).
+fn pnpm_lock(text: &str) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut lines = text.lines().peekable();
+    // `lockfileVersion: '9.0'` (major 9, quoted or bare).
+    let mut major = None;
+    for line in lines.by_ref() {
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = body.strip_prefix("lockfileVersion:") else {
+            return Err("no lockfileVersion".to_owned());
+        };
+        let version = rest.trim().trim_matches('\'').trim_matches('"').to_owned();
+        major = Some(version.split('.').next().unwrap_or_default().to_owned());
+        break;
+    }
+    if major.as_deref() != Some("9") {
+        return Err(format!(
+            "unsupported lockfileVersion {}",
+            major.unwrap_or_default()
+        ));
+    }
+    // The `packages:` map: two-space `name@version:` keys (peer suffixes in
+    // parens stripped, scoped names kept). Indented content lines ignored.
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut in_packages = false;
+    let mut saw_packages = false;
+    for line in lines {
+        if line.starts_with([' ', '\t']) {
+            if !in_packages {
+                continue;
+            }
+            if line.starts_with("  ") && !line.starts_with("   ") {
+                let key = line.trim().strip_suffix(':').unwrap_or_default();
+                let key = key.trim_matches('\'').trim_matches('"');
+                let key = key.split('(').next().unwrap_or_default();
+                let Some((name, v)) = key.rsplit_once('@') else {
+                    continue;
+                };
+                if name.is_empty() || !v.starts_with(|c: char| c.is_ascii_digit()) {
+                    continue;
+                }
+                let versions = versions.entry(name.to_owned()).or_default();
+                if !versions.iter().any(|e| e == v) {
+                    versions.push(v.to_owned());
+                }
+            }
+            continue;
+        }
+        let body = line.trim();
+        if body.is_empty() || body.starts_with('#') {
+            continue;
+        }
+        if body == "packages:" {
+            in_packages = true;
+            saw_packages = true;
+            continue;
+        }
+        // Any other top-level key ends the map.
+        if in_packages {
+            break;
+        }
+        // Lines before `packages:` that are not the version are ignored.
+    }
+    if !saw_packages {
+        return Err("no packages".to_owned());
+    }
+    Ok(versions)
+}
+/// A governing lockfile's kind: npm JSON, a yarn blockade, or a pnpm map.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LockKind {
+    Npm,
+    Yarn,
+    Pnpm,
+}
+
+/// A governing lockfile, parsed.
+enum Lock {
+    Npm {
+        path: String,
+        packages: serde_json::Map<String, Value>,
+        rel: String,
+    },
+    Yarn {
+        path: String,
+        lock: YarnLock,
+    },
+    Pnpm {
+        path: String,
+        versions: BTreeMap<String, Vec<String>>,
+    },
+}
+
+/// Resolve one dependency against pinned reads: the single read pins
+/// `Exact`, several distinct reads clear to `@?` (`Heuristic`, Maven
+/// duplicate rule), none reports a missing entry (`unresolved`).
+fn pin_reads(
+    reads: &[String],
+    from: &'static str,
+    m: &str,
+    dep: &Dep,
+    service: &str,
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> (String, &'static str, Certainty, Vec<String>) {
+    let mut distinct: Vec<String> = Vec::new();
+    for v in reads {
+        if !distinct.contains(v) {
+            distinct.push(v.clone());
+        }
+    }
+    match distinct.as_slice() {
+        [] => {
+            diagnostics.push(diagnostic(
+                "lockfile_missing_entry",
+                m,
+                Some(dep.span),
+                json!({ "service": service, "name": dep.name, "lockfile": path }),
+            ));
+            (String::new(), "unresolved", Certainty::Exact, Vec::new())
+        }
+        [v] => (v.clone(), from, Certainty::Exact, Vec::new()),
+        many => (String::new(), from, Certainty::Heuristic, many.to_vec()),
+    }
+}
+
+/// The lockfile governing a service directory: the nearest directory holding one, npm-first
+/// per directory (`package-lock.json` over `yarn.lock` over `pnpm-lock.yaml`, mirroring
+/// `node_lock`), then up toward the root.
+fn lockfile_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<(LockKind, String)> {
     let mut dir = Some(service_dir);
     while let Some(d) = dir {
         let prefix = dir_prefix(d);
-        for name in ["npm-shrinkwrap.json", "package-lock.json"] {
+        for (kind, name) in [
+            (LockKind::Npm, "npm-shrinkwrap.json"),
+            (LockKind::Npm, "package-lock.json"),
+            (LockKind::Yarn, "yarn.lock"),
+            (LockKind::Pnpm, "pnpm-lock.yaml"),
+        ] {
             let path = format!("{prefix}{name}");
             if paths.contains(path.as_str()) {
-                return Some(Ok(path));
-            }
-        }
-        for name in ["yarn.lock", "pnpm-lock.yaml"] {
-            let path = format!("{prefix}{name}");
-            if paths.contains(path.as_str()) {
-                return Some(Err(path));
+                return Some((kind, path));
             }
         }
         dir = parent_dir(d);
@@ -247,6 +548,21 @@ fn lockfile_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<Result<Stri
 }
 
 /// The package an npm alias installs: `npm:bar@^1` → `bar`, `npm:@s/p@2` → `@s/p`.
+/// The version catalog governing a Gradle build file: the nearest
+/// `gradle/libs.versions.toml` at or above the build file's directory
+/// (contract M6e S3; mirrors `lockfile_for`).
+fn catalog_for(build_path: &str, paths: &BTreeSet<&str>) -> Option<String> {
+    let mut dir = Some(build_path.rsplit_once('/').map_or("", |(d, _)| d));
+    while let Some(d) = dir {
+        let path = format!("{}gradle/libs.versions.toml", dir_prefix(d));
+        if paths.contains(path.as_str()) {
+            return Some(path);
+        }
+        dir = parent_dir(d);
+    }
+    None
+}
+
 fn npm_alias(declared: &str) -> Option<&str> {
     let spec = declared.trim().strip_prefix("npm:")?;
     let name = match spec.rfind('@') {
@@ -270,11 +586,13 @@ fn npm_range_is_local(range: &str, service_dir: &str, target_dir: &str) -> bool 
         .is_some_and(|d| d == target_dir)
 }
 
-/// `go.mod`'s direct requirements (no `// indirect`) and its `replace` directives.
+/// `go.mod`'s direct requirements (no `// indirect`), its `replace` directives
+/// and its `exclude` directives.
 #[derive(Debug, Default)]
 struct GoMod {
     requires: Vec<(Dep, String)>,
     replaces: Vec<Replace>,
+    excludes: Vec<(String, String)>,
 }
 
 /// `replace <module> [<version>] => <target> [<version>]`.
@@ -319,6 +637,12 @@ impl GoMod {
                     .filter(of)
                     .find(|r| r.from_version.is_none())
             })
+    }
+
+    fn excluded(&self, module: &str, version: &str) -> bool {
+        self.excludes
+            .iter()
+            .any(|(m, v)| m == module && v == version)
     }
 }
 
@@ -386,24 +710,507 @@ fn go_mod(text: &str) -> GoMod {
                     }
                 }
             }
+            "exclude" => {
+                let mut words = rest.split_whitespace().map(unquote);
+                if let (Some(module), Some(version)) = (words.next(), words.next()) {
+                    out.excludes.push((module, version));
+                }
+            }
             _ => {}
         }
     }
     out
 }
 
-/// A minimal XML element: name, direct text, children, and where its start tag begins.
+/// A `go.work` workspace: `use` member directories, workspace `replace`
+/// directives (which win over a member module's own) and `exclude` directives
+/// (contract M6e S8). Only the allow-listed directives are read; `go`,
+/// `toolchain` and anything else are ignored.
 #[derive(Debug, Default)]
-struct Element {
+struct GoWork {
+    uses: Vec<String>,
+    replaces: Vec<Replace>,
+    excludes: Vec<(String, String)>,
+}
+
+impl GoWork {
+    /// The `replace` that applies to `module` at `version`: one naming that version, else one
+    /// naming none (Go's rule; mirrors [`GoMod::replace_for`]).
+    fn replace_for(&self, module: &str, version: &str) -> Option<&Replace> {
+        let of = |r: &&Replace| r.module == module;
+        self.replaces
+            .iter()
+            .filter(of)
+            .find(|r| r.from_version.as_deref() == Some(version))
+            .or_else(|| {
+                self.replaces
+                    .iter()
+                    .filter(of)
+                    .find(|r| r.from_version.is_none())
+            })
+    }
+
+    fn excluded(&self, module: &str, version: &str) -> bool {
+        self.excludes
+            .iter()
+            .any(|(m, v)| m == module && v == version)
+    }
+}
+
+fn go_work(text: &str) -> GoWork {
+    let mut out = GoWork::default();
+    let mut block: Option<&str> = None;
+    for line in text.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let code = raw.split("//").next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        let (directive, rest) = match block {
+            Some(_) if code == ")" => {
+                block = None;
+                continue;
+            }
+            Some(d) => (d, code),
+            None => {
+                let (d, rest) = code.split_once(char::is_whitespace).unwrap_or((code, ""));
+                let rest = rest.trim();
+                if rest == "(" {
+                    block = Some(match d {
+                        "use" => "use",
+                        "replace" => "replace",
+                        "exclude" => "exclude",
+                        _ => "other",
+                    });
+                    continue;
+                }
+                (d, rest)
+            }
+        };
+        let unquote = |s: &str| s.trim_matches('"').to_owned();
+        match directive {
+            "use" => {
+                if let Some(dir) = rest.split_whitespace().next() {
+                    out.uses.push(unquote(dir));
+                }
+            }
+            "replace" => {
+                if let Some((from, to)) = rest.split_once("=>") {
+                    let mut from = from.split_whitespace().map(unquote);
+                    let mut to = to.split_whitespace().map(unquote);
+                    if let (Some(module), Some(target)) = (from.next(), to.next()) {
+                        out.replaces.push(Replace {
+                            module,
+                            from_version: from.next(),
+                            target,
+                            to_version: to.next(),
+                        });
+                    }
+                }
+            }
+            "exclude" => {
+                let mut words = rest.split_whitespace().map(unquote);
+                if let (Some(module), Some(version)) = (words.next(), words.next()) {
+                    out.excludes.push((module, version));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The `go.work` governing a service directory: the nearest `go.work` at or
+/// above it (contract M6e S8; mirrors `catalog_for`).
+fn go_work_for(service_dir: &str, paths: &BTreeSet<&str>) -> Option<String> {
+    let mut dir = Some(service_dir);
+    while let Some(d) = dir {
+        let path = format!("{}go.work", dir_prefix(d));
+        if paths.contains(path.as_str()) {
+            return Some(path);
+        }
+        dir = parent_dir(d);
+    }
+    None
+}
+
+/// A PEP 503 canonical project name: lowercased with every run of `-_.`
+/// folded to one `-`.
+fn pep503(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut in_sep = false;
+    for c in name.to_lowercase().chars() {
+        if c == '-' || c == '_' || c == '.' {
+            if !in_sep {
+                out.push('-');
+                in_sep = true;
+            }
+        } else {
+            out.push(c);
+            in_sep = false;
+        }
+    }
+    out
+}
+
+/// Whether `name` is shaped like a dependency name (leading alphanumerics,
+/// then alphanumerics and `-_.`).
+fn valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// A PEP 508 requirement string: (canonical name, declared spec as written,
+/// raw name length for evidence). Extras stay out of the name, markers after
+/// `;` and URL targets after `@` never become versions; a parenthesised spec
+/// is tolerated. `None` for anything without a leading name.
+fn pep508(req: &str) -> Option<(String, String, usize)> {
+    let head = req.split(';').next()?.trim();
+    if head.is_empty() {
+        return None;
+    }
+    // A direct reference (`name[extras]@url`): the version is never pinned.
+    if let Some((name, _)) = head.split_once('@') {
+        let name = name.split('[').next()?.trim();
+        if !valid_name(name) {
+            return None;
+        }
+        return Some((pep503(name), String::new(), name.len()));
+    }
+    let len = head
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .map(|(i, c)| i + c.len_utf8())
+        .last()?;
+    let name = &head[..len];
+    if !valid_name(name) {
+        return None;
+    }
+    let mut rest = head[len..].trim_start();
+    if let Some(after) = rest.strip_prefix('[') {
+        rest = after.find(']').map(|end| &after[end + 1..])?.trim_start();
+    }
+    let rest = rest.trim();
+    let declared = rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(rest)
+        .trim()
+        .to_owned();
+    Some((pep503(name), declared, len))
+}
+
+/// One direct runtime dependency from a `pyproject.toml`, with its evidence span.
+struct PyDep {
     name: String,
-    text: String,
-    children: Vec<Element>,
-    start: usize,
+    declared: String,
+    span: Span,
+}
+
+/// The span of TOML key `key` at/after `from` (bare, single- or
+/// double-quoted); the key's own characters. Deterministic for any text.
+fn key_span(text: &str, key: &str, from: usize) -> Span {
+    let spellings = [key.to_string(), format!("\"{key}\""), format!("'{key}'")];
+    let mut found: Option<(usize, usize)> = None;
+    for spelling in &spellings {
+        let mut at = from;
+        while let Some(i) = text.get(at..).and_then(|rest| rest.find(spelling.as_str())) {
+            let start = at + i;
+            at = start + 1;
+            let after = &text[start + spelling.len()..];
+            let is_bare = !spelling.starts_with(['"', '\'']);
+            let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
+            // A key is followed by `=`; a bare key also starts its line.
+            if !after.trim_start_matches([' ', '\t']).starts_with('=') {
+                continue;
+            }
+            if is_bare && start != 0 && !text[line_start..start].trim().is_empty() {
+                continue;
+            }
+            let inner = if is_bare {
+                (start, start + key.len())
+            } else {
+                (start + 1, start + 1 + key.len())
+            };
+            if found.is_none_or(|(s, _)| inner.0 < s) {
+                found = Some(inner);
+            }
+            break;
+        }
+    }
+    match found {
+        Some((start, end)) => span_of(text, start, end),
+        None => span_of(text, from, from),
+    }
+}
+
+/// Direct runtime dependencies: `[project].dependencies` (PEP 508 strings)
+/// and `[tool.poetry.dependencies]` (constraints or inline tables; `python`
+/// is the runtime). Poetry groups, extras and optional dependencies are out
+/// of scope (contract M6d S6). Unparseable entries name no dependency.
+fn pyproject_deps(text: &str) -> Vec<PyDep> {
+    let table: toml::Table = match toml::from_str(text) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Some(deps) = table
+        .get("project")
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_array())
+    {
+        let from = text.find("[project]").unwrap_or(0);
+        for item in deps {
+            let Some(req) = item.as_str() else {
+                continue;
+            };
+            let Some((name, declared, len)) = pep508(req) else {
+                continue;
+            };
+            let start = text[from..].find(req).map(|i| from + i).unwrap_or(from);
+            out.push(PyDep {
+                name,
+                declared,
+                span: span_of(text, start, start + len),
+            });
+        }
+    }
+    if let Some(deps) = table
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        let from = text.find("[tool.poetry.dependencies]").unwrap_or(0);
+        for (key, value) in deps {
+            if key == "python" {
+                continue;
+            }
+            // A constraint string, an inline table's `version`, or the first
+            // of several: anything else (a bare git/path/url table, an empty
+            // list) declares no pin.
+            let declared = match value {
+                toml::Value::String(s) => s.clone(),
+                toml::Value::Table(t) => t
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                toml::Value::Array(items) => items
+                    .iter()
+                    .find_map(|item| match item {
+                        toml::Value::String(s) => Some(s.clone()),
+                        toml::Value::Table(t) => {
+                            t.get("version").and_then(|v| v.as_str()).map(str::to_owned)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                _ => continue,
+            };
+            out.push(PyDep {
+                name: pep503(key),
+                declared,
+                span: key_span(text, key, from),
+            });
+        }
+    }
+    out
+}
+
+/// name → version for registry-source `[[package]]` entries; `Err` when the
+/// TOML does not parse or names no packages. A git/directory/editable/url
+/// source never pins (contract M6d S6: lockfiles pin, never infer).
+fn poetry_lock(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|_| "invalid TOML".to_owned())?;
+    let mut out = BTreeMap::new();
+    let pkgs = table
+        .get("package")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| "no packages".to_owned())?;
+    for entry in pkgs {
+        let (Some(name), Some(version)) = (
+            entry.get("name").and_then(|n| n.as_str()),
+            entry.get("version").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let pinnable = match entry.get("source") {
+            None => true,
+            Some(source) => source
+                .get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t == "legacy"),
+        };
+        if pinnable {
+            out.insert(pep503(name), version.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// name → version for registry-source `[[package]]` entries of a `uv.lock`
+/// (same pinnability rule as [`poetry_lock`]: a `registry` source, or none).
+fn uv_lock(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|_| "invalid TOML".to_owned())?;
+    let mut out = BTreeMap::new();
+    let pkgs = table
+        .get("package")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| "no packages".to_owned())?;
+    for entry in pkgs {
+        let (Some(name), Some(version)) = (
+            entry.get("name").and_then(|n| n.as_str()),
+            entry.get("version").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let pinnable = match entry.get("source") {
+            None => true,
+            Some(source) => source
+                .as_table()
+                .is_some_and(|s| s.contains_key("registry")),
+        };
+        if pinnable {
+            out.insert(pep503(name), version.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// Which lockfile's versions pin a service's Python dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockSource {
+    Poetry,
+    Uv,
+}
+
+/// A lockfile relevant to a service: one that pins, or one noticed but never
+/// read (contract M4b: `Pipfile`/`requirements` pinning is residue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PyLock {
+    Read(String, LockSource),
+    Unread(String),
+}
+
+/// The `[tool.uv.workspace] members` of a `pyproject.toml`, if any.
+fn uv_workspace_members(text: &str) -> Vec<String> {
+    toml::from_str::<toml::Table>(text)
+        .ok()
+        .and_then(|t| {
+            t.get("tool")?
+                .get("uv")?
+                .get("workspace")?
+                .get("members")?
+                .as_array()
+                .cloned()
+        })
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Whether workspace member pattern `member` (`backend`, `packages/*`)
+/// selects `rel` (the service directory relative to the workspace root).
+fn workspace_member(member: &str, rel: &str) -> bool {
+    if let Some(prefix) = member.strip_suffix("/*") {
+        rel.strip_prefix(prefix)
+            .is_some_and(|r| !r.is_empty() && !r.trim_start_matches('/').contains('/'))
+    } else {
+        member.trim_end_matches('/') == rel
+    }
+}
+
+/// The lockfile governing `service_dir` (the `here` form: `""` for the root):
+/// a same-directory `poetry.lock` (winning ties), then `uv.lock`, then an
+/// unread shape; then the nearest ancestor `uv.lock` whose workspace lists
+/// the service, then ancestors' unread shapes. A `poetry.lock` above never
+/// governs below (poetry has no workspaces).
+fn py_lockfile_for(
+    service_dir: &str,
+    paths: &BTreeSet<&str>,
+    texts: &BTreeMap<&str, String>,
+) -> Option<PyLock> {
+    let at = |dir: &str, name: &str| {
+        let prefix = dir_prefix(dir);
+        let path = format!("{prefix}{name}");
+        paths.contains(path.as_str()).then_some(path)
+    };
+    const UNREAD: [&str; 3] = ["requirements.txt", "Pipfile.lock", "Pipfile"];
+    if let Some(path) = at(service_dir, "poetry.lock") {
+        return Some(PyLock::Read(path, LockSource::Poetry));
+    }
+    if let Some(path) = at(service_dir, "uv.lock") {
+        return Some(PyLock::Read(path, LockSource::Uv));
+    }
+    for name in UNREAD {
+        if let Some(path) = at(service_dir, name) {
+            return Some(PyLock::Unread(path));
+        }
+    }
+    let mut dir = parent_dir(service_dir);
+    while let Some(d) = dir {
+        if let Some(path) = at(d, "uv.lock") {
+            let manifest = if d.is_empty() {
+                "pyproject.toml".to_owned()
+            } else {
+                format!("{d}/pyproject.toml")
+            };
+            let rel = if d.is_empty() {
+                service_dir.to_owned()
+            } else {
+                service_dir
+                    .strip_prefix(&format!("{d}/"))
+                    .unwrap_or(service_dir)
+                    .to_owned()
+            };
+            let member = texts
+                .get(manifest.as_str())
+                .map(|t| {
+                    uv_workspace_members(t)
+                        .iter()
+                        .any(|m| workspace_member(m, &rel))
+                })
+                .unwrap_or(false);
+            if member {
+                return Some(PyLock::Read(path, LockSource::Uv));
+            }
+        }
+        for name in UNREAD {
+            if let Some(path) = at(d, name) {
+                return Some(PyLock::Unread(path));
+            }
+        }
+        dir = parent_dir(d);
+    }
+    None
+}
+#[derive(Debug, Default)]
+/// A minimal XML element: name, attributes, direct text, children, and where its start tag
+/// begins and its end tag (or self-close) ends. Attributes beyond `name="value"` shapes are
+/// skipped, never fatal (contract M6f S5).
+pub(crate) struct Element {
+    pub(crate) name: String,
+    attrs: Vec<(String, String)>,
+    pub(crate) text: String,
+    pub(crate) children: Vec<Element>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 impl Element {
     fn child(&self, name: &str) -> Option<&Element> {
         self.children.iter().find(|c| c.name == name)
+    }
+
+    /// The value of attribute `name`, if stated as `name="value"` or `name='value'`.
+    pub(crate) fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
 
     fn text_of(&self, name: &str) -> Option<&str> {
@@ -424,9 +1231,9 @@ impl Element {
 }
 
 /// Parses an XML document into its root element; comments, processing instructions and
-/// declarations are skipped, CDATA is text, attributes are ignored. `None` when the tags do not
-/// balance.
-fn parse_xml(text: &str) -> Option<Element> {
+/// declarations are skipped, CDATA is text, attributes are kept (`name="value"` shapes).
+/// `None` when the tags do not balance.
+pub(crate) fn parse_xml(text: &str) -> Option<Element> {
     let mut stack: Vec<Element> = vec![Element::default()];
     let mut i = 0;
     let bytes = text.as_bytes();
@@ -449,27 +1256,62 @@ fn parse_xml(text: &str) -> Option<Element> {
         } else if let Some(body) = rest.strip_prefix("</") {
             let end = body.find('>')?;
             let name = body[..end].trim();
-            let done = stack.pop()?;
+            let mut done = stack.pop()?;
             if done.name != name || stack.is_empty() {
                 return None;
             }
+            done.end = i + 2 + end + 1;
             stack.last_mut()?.children.push(done);
             i += 2 + end + 1;
         } else {
             let end = rest.find('>')?;
             let tag = &rest[1..end];
             let closed = tag.ends_with('/');
-            let name = tag
-                .trim_end_matches('/')
+            let tag = tag.trim_end_matches('/');
+            let name_len = tag
                 .split(|c: char| c.is_whitespace())
-                .next()?
-                .to_owned();
-            let element = Element {
-                name,
+                .next()
+                .map_or(0, str::len);
+            if name_len == 0 {
+                return None;
+            }
+            let mut element = Element {
+                name: tag[..name_len].to_owned(),
                 start: i,
                 ..Element::default()
             };
+            // Attributes (`name="value"`), quote-aware so spaces and `=` inside values
+            // survive; malformed attributes end the list, never the element.
+            let mut attrs = tag[name_len..].trim_start();
+            loop {
+                let key_len = attrs
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(b))
+                    .count();
+                if key_len == 0 {
+                    break;
+                }
+                let after = attrs[key_len..].trim_start();
+                let Some(value) = after.strip_prefix('=') else {
+                    break;
+                };
+                let value = value.trim_start();
+                let Some(quote) = value.as_bytes().first() else {
+                    break;
+                };
+                if *quote != b'"' && *quote != b'\'' {
+                    break;
+                }
+                let Some(close) = value[1..].find(char::from(*quote)) else {
+                    break;
+                };
+                element
+                    .attrs
+                    .push((attrs[..key_len].to_owned(), decode(&value[1..close + 1])));
+                attrs = value[close + 2..].trim_start();
+            }
             if closed {
+                element.end = i + end + 1;
                 stack.last_mut()?.children.push(element);
             } else {
                 stack.push(element);
@@ -498,11 +1340,12 @@ struct Pom {
     group: String,
     artifact: String,
     version: String,
-    /// Each dependency (named `<groupId>/<artifactId>`) with its version, empty when
-    /// unresolved, the version's source (`literal`, `property` or `unresolved`), and the
+    /// Each dependency (named `<groupId>/<artifactId>[/<classifier>]`) with its version, empty
+    /// when unresolved, the version's source (`literal`, `property` or `unresolved`), the
     /// conflicting versions when the artifact is declared twice, or its property defined twice,
-    /// with different values (evaluator pass 1, Y8, Y11).
-    deps: Vec<(Dep, String, &'static str, Vec<String>)>,
+    /// with different values (evaluator pass 1, Y8, Y11), and its `<type>` as written (recorded,
+    /// never keyed; contract M6e S9).
+    deps: Vec<(Dep, String, &'static str, Vec<String>, String)>,
 }
 
 /// A `${…}` reference in a pom, read.
@@ -578,6 +1421,17 @@ fn pom(text: &str) -> Option<Pom> {
         if group.is_empty() || artifact.is_empty() {
             continue;
         }
+        // The classifier rides the key (`group/artifact[/classifier]`); a
+        // property-shaped classifier names no classifier (fail-safe: it
+        // merges with the plain GA, as today). `<type>` is recorded, never
+        // keyed (contract M6e S9).
+        let classifier = d.text_of("classifier").unwrap_or_default();
+        let classifier = if !classifier.is_empty() && !classifier.contains("${") {
+            classifier
+        } else {
+            ""
+        };
+        let typ = d.text_of("type").unwrap_or_default().to_owned();
         let declared = d.text_of("version").unwrap_or_default();
         let mut conflict = Vec::new();
         let (version, from) = if declared.is_empty() {
@@ -604,9 +1458,14 @@ fn pom(text: &str) -> Option<Pom> {
         };
         let at = d.child("artifactId").map_or(d.start, |a| a.start);
         let end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+        let name = if classifier.is_empty() {
+            format!("{group}/{artifact}")
+        } else {
+            format!("{group}/{artifact}/{classifier}")
+        };
         deps.push((
             Dep {
-                name: format!("{group}/{artifact}"),
+                name,
                 declared: declared.to_owned(),
                 scope,
                 span: span_of(text, at, end),
@@ -614,13 +1473,14 @@ fn pom(text: &str) -> Option<Pom> {
             version,
             from,
             conflict,
+            typ,
         ));
     }
     // An artifact declared twice: Maven keeps one declaration (and warns), so with different
     // versions none is the stated one (Y8). The first declaration stays, unresolved, listing
     // every version read.
     let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (dep, version, _, conflict) in &deps {
+    for (dep, version, _, conflict, _) in &deps {
         let read = if conflict.is_empty() {
             vec![if !version.is_empty() {
                 version.clone()
@@ -640,8 +1500,8 @@ fn pom(text: &str) -> Option<Pom> {
         }
     }
     let mut kept = BTreeSet::new();
-    deps.retain(|(dep, _, _, _)| kept.insert(dep.name.clone()));
-    for (dep, version, from, conflict) in &mut deps {
+    deps.retain(|(dep, _, _, _, _)| kept.insert(dep.name.clone()));
+    for (dep, version, from, conflict, _) in &mut deps {
         let read = &versions[&dep.name];
         if read.len() > 1 {
             version.clear();
@@ -663,6 +1523,482 @@ fn attrs(pairs: &[(&str, &str)]) -> Attrs {
         .filter(|(_, v)| !v.is_empty())
         .map(|(k, v)| ((*k).to_owned(), Value::from(*v)))
         .collect()
+}
+
+/// A Gradle version catalog (`gradle/libs.versions.toml`): alias → (module
+/// `group:artifact`, version if the catalog states one). Versions resolve
+/// through `[versions]`; a dangling `version.ref` names the module with no
+/// version (safe `?` at use, never an error). Anything outside the
+/// allow-listed shapes makes the whole catalog unreadable (contract M6e S3:
+/// deny-default on structure, lenient on forward-compatible additions —
+/// unknown root sections like `[plugins]`/`[bundles]` are ignored, while a
+/// malformed `[libraries]` entry fails the read).
+fn gradle_catalog(text: &str) -> Result<BTreeMap<String, (String, Option<String>)>, String> {
+    let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let mut versions: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(v) = table.get("versions") {
+        let v = v
+            .as_table()
+            .ok_or_else(|| "versions is not a table".to_owned())?;
+        // Rich versions (`lang = { strictly = … }`) are deliberately not
+        // resolved: the entry is skipped, so references to it dangle to `?`
+        // instead of taking the whole catalog down with them.
+        for (k, val) in v {
+            if let Some(s) = val.as_str() {
+                versions.insert(k.clone(), s.to_owned());
+            }
+        }
+    }
+    fn libraries(
+        table: &toml::Table,
+        prefix: &str,
+        versions: &BTreeMap<String, String>,
+        out: &mut BTreeMap<String, (String, Option<String>)>,
+    ) -> Result<(), String> {
+        for (k, val) in table {
+            let alias = if prefix.is_empty() {
+                k.clone()
+            } else {
+                format!("{prefix}.{k}")
+            };
+            match val {
+                toml::Value::String(s) => {
+                    let mut parts = s.split(':');
+                    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                        (Some(g), Some(a), v, None) => {
+                            out.insert(alias, (format!("{g}:{a}"), v.map(str::to_owned)));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "library {alias:?} is not group:artifact[:version]"
+                            ));
+                        }
+                    }
+                }
+                toml::Value::Table(t) if t.contains_key("module") => {
+                    let module = t
+                        .get("module")
+                        .and_then(toml::Value::as_str)
+                        .ok_or_else(|| format!("library {alias:?} has no string module"))?;
+                    if module.split(':').count() != 2 {
+                        return Err(format!("library {alias:?} module is not group:artifact"));
+                    }
+                    // `version = "x"` wins; a dotted `version.ref` parses as a
+                    // nested table; anything else dangles to `?`.
+                    let version = match t.get("version") {
+                        Some(toml::Value::String(v)) => Some(v.clone()),
+                        Some(toml::Value::Table(t)) => match t.get("ref") {
+                            Some(toml::Value::String(r)) => versions.get(r).cloned(),
+                            _ => None,
+                        },
+                        _ => match t.get("version.ref") {
+                            Some(toml::Value::String(r)) => versions.get(r).cloned(),
+                            _ => None,
+                        },
+                    };
+                    out.insert(alias, (module.to_owned(), version));
+                }
+                toml::Value::Table(t) => libraries(t, &alias, versions, out)?,
+                _ => {
+                    return Err(format!("library {alias:?} is not a string or table"));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = BTreeMap::new();
+    if let Some(l) = table.get("libraries") {
+        libraries(
+            l.as_table()
+                .ok_or_else(|| "libraries is not a table".to_owned())?,
+            "",
+            &versions,
+            &mut out,
+        )?;
+    }
+    Ok(out)
+}
+
+/// One Gradle dependency with its resolved version, mirroring `Pom.deps`.
+struct GradleDep {
+    dep: Dep,
+    version: String,
+    from: &'static str,
+    conflict: Vec<String>,
+}
+
+/// Dependency configurations read, with the scope each reports (contract
+/// M6e S3: allow-listed; custom configurations stay out).
+const GRADLE_CONFIGS: &[(&str, &str)] = &[
+    ("testImplementation", "test"),
+    ("testRuntimeOnly", "test"),
+    ("implementation", "runtime"),
+    ("compileOnly", "compile"),
+    ("runtimeOnly", "runtime"),
+    ("api", "runtime"),
+];
+
+/// `line` without a `//` comment (a `//` inside quotes is kept). Byte-safe:
+/// only ASCII bytes decide, and a multibyte character never contains one.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if quote.is_none() && b == b'\\' {
+            escaped = true;
+        } else if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+        } else if Some(b) == quote {
+            quote = None;
+        } else if quote.is_none() && b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return line.get(..i).unwrap_or(line);
+        }
+        i += 1;
+    }
+    line
+}
+
+/// The content of the first balanced parenthesis group of `s` (which starts
+/// just after the opening paren), skipping quoted spans; `None` when
+/// unbalanced. Byte-safe: never splits a character, returns `None` instead.
+fn paren_group(s: &str) -> Option<&str> {
+    let mut depth = 1u32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, b) {
+            (None, b'\\') => escaped = true,
+            (None, b'(') => depth += 1,
+            (None, b')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return s.get(..i);
+                }
+            }
+            (None, b'"') | (None, b'\'') => quote = Some(b),
+            (Some(q), b) if b == q => quote = None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A quoted string's content (`"…"`, `'…`), or the bare token itself.
+fn unquote(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.len() >= 2
+        && ((token.starts_with('"') && token.ends_with('"'))
+            || (token.starts_with('\'') && token.ends_with('\'')))
+    {
+        Some(token[1..token.len() - 1].to_owned())
+    } else if token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'$'))
+    {
+        Some(token.to_owned())
+    } else {
+        None
+    }
+}
+
+/// A `group:artifact[:version]` coordinate, or `None` outside the shape.
+/// An interpolated (`$`) version resolves to nothing (safe `?`).
+fn gav(text: &str) -> Option<(String, String, Option<String>)> {
+    let mut parts = text.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(g), Some(a), v, None)
+            if !g.is_empty() && !a.is_empty() && !g.contains('$') && !a.contains('$') =>
+        {
+            let version = match v {
+                Some(v) if !v.is_empty() && !v.contains('$') => Some(v.to_owned()),
+                _ => None,
+            };
+            Some((
+                format!("{g}/{a}"),
+                v.unwrap_or_default().to_owned(),
+                version,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Split on top-level commas (commas inside quotes do not split); `None`
+/// when quotes are unbalanced.
+fn split_top_level(text: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, b) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quote.is_none() && b == b'\\' {
+            escaped = true;
+        } else if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+        } else if Some(b) == quote {
+            quote = None;
+        } else if quote.is_none() && b == b',' {
+            parts.push(text.get(start..i)?);
+            start = i + 1;
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    parts.push(text.get(start..)?);
+    Some(parts)
+}
+
+/// Whether `text` holds a top-level `:` or `=` (outside quotes): a map or
+/// named-argument form rather than a single coordinate.
+fn has_top_level_pair(text: &str) -> bool {
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for b in text.bytes() {
+        if escaped {
+            escaped = false;
+        } else if quote.is_none() && b == b'\\' {
+            escaped = true;
+        } else if quote.is_none() && (b == b'"' || b == b'\'') {
+            quote = Some(b);
+        } else if Some(b) == quote {
+            quote = None;
+        } else if quote.is_none() && (b == b':' || b == b'=') {
+            return true;
+        }
+    }
+    false
+}
+
+/// One dependency spec: (name `group/artifact`, declared version expression,
+/// resolved version, source). `None` outside the allow-listed shapes
+/// (contract M6e S3).
+fn gradle_spec(
+    spec: &str,
+    catalog: &BTreeMap<String, (String, Option<String>)>,
+) -> Option<(String, String, Option<String>, &'static str)> {
+    let spec = spec.trim();
+    // One `platform()`/`enforcedPlatform()` layer unwraps to the platform
+    // artifact itself; deeper nesting and `project()` references stay out.
+    let mut inner = spec;
+    for prefix in ["platform", "enforcedPlatform"] {
+        if let Some(rest) = inner.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            inner = paren_group(rest.strip_prefix('(')?)?;
+            let nested = inner.trim_start();
+            if nested.starts_with("platform(") || nested.starts_with("enforcedPlatform(") {
+                return None;
+            }
+            break;
+        }
+    }
+    if inner.trim_start().starts_with("project(") {
+        return None;
+    }
+    // A `libs.` catalog reference (bare or parenthesised; the paren group
+    // already isolated it).
+    let token = inner.trim();
+    if let Some(alias) = token.strip_prefix("libs.") {
+        if !alias
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+            || alias.is_empty()
+        {
+            return None;
+        }
+        return match catalog.get(alias) {
+            Some((module, version)) => {
+                let mut parts = module.split(':');
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(g), Some(a), None) => Some((
+                        format!("{g}/{a}"),
+                        token.to_owned(),
+                        version.clone(),
+                        if version.is_some() {
+                            "catalog"
+                        } else {
+                            "unresolved"
+                        },
+                    )),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+    }
+    // Map / named-argument form (`group: 'g', name: 'a', version: 'v'`).
+    if has_top_level_pair(token) {
+        let parts = split_top_level(token)?;
+        let mut group = None;
+        let mut name = None;
+        let mut module = None;
+        let mut version = None;
+        for part in parts {
+            let mut kv = part.splitn(2, [':', '=']);
+            let (k, v) = (kv.next()?.trim(), kv.next()?.trim());
+            let k = unquote(k)?;
+            let v = unquote(v)?;
+            match k.as_str() {
+                "group" => group = Some(v),
+                "name" => name = Some(v),
+                "module" => module = Some(v),
+                "version" => version = Some(v),
+                _ => return None,
+            }
+        }
+        let (g, a) = match (group, name, module) {
+            (Some(g), Some(a), _) if !g.contains('$') && !a.contains('$') => (g, a),
+            (None, None, Some(m)) => match m.split_once(':') {
+                Some((g, a)) if !g.contains('$') && !a.contains('$') => {
+                    (g.to_owned(), a.to_owned())
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        return match version {
+            Some(v) if !v.is_empty() && !v.contains('$') => {
+                Some((format!("{g}/{a}"), v.clone(), Some(v), "literal"))
+            }
+            _ => Some((
+                format!("{g}/{a}"),
+                version.unwrap_or_default(),
+                None,
+                "unresolved",
+            )),
+        };
+    }
+    // Triple form (`"g", "a", "v"`) or a single coordinate.
+    if token.contains(',') {
+        let parts = split_top_level(token)?;
+        if parts.len() != 2 && parts.len() != 3 {
+            return None;
+        }
+        let gav: Vec<String> = parts
+            .iter()
+            .map(|p| unquote(p.trim()).unwrap_or_default())
+            .collect();
+        let (g, a) = (gav[0].clone(), gav[1].clone());
+        if g.is_empty() || a.is_empty() || g.contains('$') || a.contains('$') {
+            return None;
+        }
+        return match gav.get(2).map(String::as_str) {
+            None | Some("") => Some((format!("{g}/{a}"), String::new(), None, "unresolved")),
+            Some(v) if v.contains('$') => {
+                Some((format!("{g}/{a}"), v.to_owned(), None, "unresolved"))
+            }
+            Some(v) => Some((
+                format!("{g}/{a}"),
+                v.to_owned(),
+                Some(v.to_owned()),
+                "literal",
+            )),
+        };
+    }
+    // A single `group:artifact[:version]` string.
+    let token = unquote(token)?;
+    let (name, declared, version) = gav(&token)?;
+    let from = if version.is_some() {
+        "literal"
+    } else {
+        "unresolved"
+    };
+    Some((name, declared, version, from))
+}
+
+/// The dependencies a Gradle build file declares (both DSLs): literals,
+/// `libs.` catalog references and `platform()`-wrapped literals.
+/// `project()` references, multi-line blocks and anything outside the
+/// allow-listed shapes stay out (contract M6e S3). Duplicates mirror Maven:
+/// the first declaration stays, cleared to `@?` when versions differ.
+fn gradle_deps(text: &str, catalog: &BTreeMap<String, (String, Option<String>)>) -> Vec<GradleDep> {
+    let mut deps: Vec<GradleDep> = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let stripped = strip_line_comment(line);
+        let body = stripped.trim_start();
+        if body.is_empty() {
+            continue;
+        }
+        // Longest-first: `testImplementation` wins over `implementation`.
+        // No trailing-boundary check: followers are strict (a parenthesis
+        // or an exact spec), so a longer identifier can never parse — proven
+        // when its mutant survived (contract M6e amendment 4), and the
+        // `implementationX` row below pins the behavior.
+        let Some((config, scope)) = GRADLE_CONFIGS.iter().find(|&(c, _)| body.starts_with(c))
+        else {
+            continue;
+        };
+        let kw_start = start + (stripped.len() - body.len());
+        let rest = body[config.len()..].trim_start();
+        let rest_start = kw_start + config.len() + (body[config.len()..].len() - rest.len());
+        // Parenthesised form: the first balanced group; bare form: the rest
+        // of the line must be exactly one spec.
+        let (spec, spec_end) = if let Some(after) = rest.strip_prefix('(') {
+            let Some(group) = paren_group(after) else {
+                continue;
+            };
+            let end = rest_start + 1 + group.len() + 1;
+            (group, end)
+        } else {
+            (rest, rest_start + rest.len())
+        };
+        let Some((name, declared, version, from)) = gradle_spec(spec, catalog) else {
+            continue;
+        };
+        deps.push(GradleDep {
+            dep: Dep {
+                name,
+                declared,
+                scope,
+                span: span_of(text, kw_start, spec_end),
+            },
+            version: version.unwrap_or_default(),
+            from,
+            conflict: Vec::new(),
+        });
+    }
+    // An artifact declared twice: Maven keeps one declaration (and warns), so with
+    // different versions none is the stated one. First stays, listing every version read.
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for d in &deps {
+        let read = if d.version.is_empty() {
+            if d.dep.declared.is_empty() {
+                "?".to_owned()
+            } else {
+                d.dep.declared.clone()
+            }
+        } else {
+            d.version.clone()
+        };
+        let seen = versions.entry(d.dep.name.clone()).or_default();
+        if !seen.contains(&read) {
+            seen.push(read);
+        }
+    }
+    let mut kept = BTreeSet::new();
+    deps.retain(|d| kept.insert(d.dep.name.clone()));
+    for d in &mut deps {
+        if versions[&d.dep.name].len() > 1 {
+            d.version.clear();
+            d.from = "unresolved";
+            d.conflict.clone_from(&versions[&d.dep.name]);
+        }
+    }
+    deps
 }
 
 fn diagnostic(kind: &str, path: &str, span: Option<Span>, detail: Value) -> Diagnostic {
@@ -713,6 +2049,45 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
         }
     }
     let rel_dir = |dir: &str| dir_prefix(dir).trim_end_matches('/').to_owned();
+    // `go.work` workspaces (contract M6e S8): every workspace by path, and
+    // per workspace the module path each `use` member directory provides, so
+    // `use` directories join services even where they are not projects of
+    // their own. A use directory that leaves the repository is ignored.
+    let mut works: BTreeMap<String, GoWork> = BTreeMap::new();
+    let mut work_members: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    for (path, text) in inputs.texts.iter() {
+        if path.rsplit('/').next().unwrap_or(path) != "go.work" {
+            continue;
+        }
+        let work = go_work(text);
+        let work_dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+        let mut members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for u in &work.uses {
+            let Some(dir) = join(work_dir, u) else {
+                continue;
+            };
+            let mod_path = if dir.is_empty() {
+                "go.mod".to_owned()
+            } else {
+                format!("{dir}/go.mod")
+            };
+            if let Some(module) = inputs
+                .texts
+                .get(mod_path.as_str())
+                .and_then(|t| boundaries::go_module_path(t))
+            {
+                let dirs = members.entry(module).or_default();
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        work_members.insert((*path).to_owned(), members);
+        works.insert((*path).to_owned(), work);
+    }
+    // Catalogs already reported unreadable (one diagnostic per catalog, not
+    // per build file using it).
+    let mut catalog_unread: BTreeSet<String> = BTreeSet::new();
     for p in inputs.projects {
         let service = p.dir.as_str();
         let here = rel_dir(service);
@@ -731,7 +2106,7 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                     };
                     // The lockfile, read once per service.
                     let lock = match lockfile_for(&here, inputs.paths) {
-                        Some(Ok(path)) => {
+                        Some((LockKind::Npm, path)) => {
                             let lock_dir = path.rsplit_once('/').map_or("", |(d, _)| d);
                             let rel = here
                                 .strip_prefix(lock_dir)
@@ -742,7 +2117,11 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                     // A lockfile above the service governs it only as a
                                     // workspace it lists.
                                     if rel.is_empty() || packages.contains_key(rel) {
-                                        Some((path.clone(), packages, rel.to_owned()))
+                                        Some(Lock::Npm {
+                                            path: path.clone(),
+                                            packages,
+                                            rel: rel.to_owned(),
+                                        })
                                     } else {
                                         None
                                     }
@@ -759,14 +2138,29 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                 None => None,
                             }
                         }
-                        Some(Err(path)) => {
-                            diagnostics.push(diagnostic(
-                                "lockfile_unread",
-                                &path,
-                                None,
-                                json!({ "service": service }),
-                            ));
-                            None
+                        Some((LockKind::Yarn, path)) => {
+                            inputs.texts.get(path.as_str()).map(|text| Lock::Yarn {
+                                path: path.clone(),
+                                lock: yarn_lock(text),
+                            })
+                        }
+                        Some((LockKind::Pnpm, path)) => {
+                            match inputs.texts.get(path.as_str()).map(|t| pnpm_lock(t)) {
+                                Some(Ok(versions)) => Some(Lock::Pnpm {
+                                    path: path.clone(),
+                                    versions,
+                                }),
+                                Some(Err(reason)) => {
+                                    diagnostics.push(diagnostic(
+                                        "lockfile_unreadable",
+                                        &path,
+                                        None,
+                                        json!({ "service": service, "reason": reason }),
+                                    ));
+                                    None
+                                }
+                                None => None,
+                            }
                         }
                         None => None,
                     };
@@ -801,28 +2195,60 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             continue;
                         }
                         let real = aliased.map(str::to_owned);
-                        let (version, from) = match &lock {
-                            Some((path, packages, rel)) => {
-                                match lock_version(packages, rel, &dep.name) {
-                                    Some(v) => (v, "lockfile"),
-                                    None => {
-                                        diagnostics.push(diagnostic(
+                        let (version, from, certainty, conflict) = match &lock {
+                            Some(Lock::Npm {
+                                path,
+                                packages,
+                                rel,
+                            }) => match lock_version(packages, rel, &dep.name) {
+                                Some(v) => (v, "lockfile", Certainty::Exact, Vec::new()),
+                                None => {
+                                    diagnostics.push(diagnostic(
                                             "lockfile_missing_entry",
                                             m,
                                             Some(dep.span),
                                             json!({ "service": service, "name": dep.name, "lockfile": path }),
                                         ));
-                                        (String::new(), "unresolved")
-                                    }
+                                    (String::new(), "unresolved", Certainty::Exact, Vec::new())
                                 }
+                            },
+                            Some(Lock::Yarn { path, lock }) => pin_reads(
+                                lock.versions.get(&dep.name).map_or(&[], Vec::as_slice),
+                                "yarn_lock",
+                                m,
+                                &dep,
+                                service,
+                                path,
+                                &mut diagnostics,
+                            ),
+                            Some(Lock::Pnpm { path, versions }) => {
+                                let key = real.as_deref().unwrap_or(&dep.name);
+                                pin_reads(
+                                    versions.get(key).map_or(&[], Vec::as_slice),
+                                    "pnpm_lock",
+                                    m,
+                                    &dep,
+                                    service,
+                                    path,
+                                    &mut diagnostics,
+                                )
                             }
-                            None => (String::new(), "unresolved"),
+                            None => (String::new(), "unresolved", Certainty::Exact, Vec::new()),
                         };
                         let alias = if real.is_some() {
                             dep.name.as_str()
                         } else {
                             ""
                         };
+                        let mut attrs = attrs(&[
+                            ("alias", alias),
+                            ("declared", &dep.declared),
+                            ("scope", dep.scope),
+                            ("version_from", from),
+                        ]);
+                        if !conflict.is_empty() {
+                            attrs.insert("versions".into(), json!(conflict));
+                        }
                         edges.push(ManifestEdge {
                             service: service.to_owned(),
                             target: Target::Package(Package {
@@ -830,24 +2256,65 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                                 name: real.unwrap_or_else(|| dep.name.clone()),
                                 version,
                             }),
-                            certainty: Certainty::Exact,
-                            attrs: attrs(&[
-                                ("alias", alias),
-                                ("declared", &dep.declared),
-                                ("scope", dep.scope),
-                                ("version_from", from),
-                            ]),
+                            certainty,
+                            attrs,
                             evidence: evidence(dep.span),
                         });
                     }
                 }
                 "go.mod" => {
                     let parsed = go_mod(text);
+                    // The governing workspace, if any: its replaces win over
+                    // the module's own, joined at the workspace root, and its
+                    // `use` members join services by module path (S8).
+                    let work_path = go_work_for(&here, inputs.paths);
+                    let work = work_path.as_deref().and_then(|p| works.get(p));
+                    let work_dir = work_path
+                        .as_deref()
+                        .map(|p| p.rsplit_once('/').map_or("", |(d, _)| d))
+                        .unwrap_or("");
                     for (dep, version) in &parsed.requires {
-                        let replace = parsed.replace_for(&dep.name, version);
+                        // An excluded required version resolves to `?` with a
+                        // diagnostic: MVS would pick an unknowable next
+                        // version, so the reader never guesses (S8).
+                        let excluded = parsed.excluded(&dep.name, version)
+                            || work.is_some_and(|w| w.excluded(&dep.name, version));
+                        if excluded {
+                            diagnostics.push(diagnostic(
+                                "go_excluded",
+                                m,
+                                Some(dep.span),
+                                json!({ "service": service, "name": dep.name }),
+                            ));
+                            edges.push(ManifestEdge {
+                                service: service.to_owned(),
+                                target: Target::Package(Package {
+                                    manager: "go",
+                                    name: dep.name.clone(),
+                                    version: String::new(),
+                                }),
+                                certainty: Certainty::Exact,
+                                attrs: attrs(&[
+                                    ("declared", &dep.declared),
+                                    ("scope", dep.scope),
+                                    ("version_from", "unresolved"),
+                                ]),
+                                evidence: evidence(dep.span),
+                            });
+                            continue;
+                        }
+                        let (replace, base) =
+                            match work.and_then(|w| w.replace_for(&dep.name, version)) {
+                                Some(r) => (Some(r), work_dir),
+                                None => (parsed.replace_for(&dep.name, version), here.as_str()),
+                            };
+                        // Only a relative directory joins a service: an
+                        // absolute path (`/b`) is a filesystem path, never a
+                        // repo-relative directory (evaluator pass 1, E2-1).
+                        // It stays a local replace for the version logic below.
                         let local = replace
-                            .filter(|r| r.local())
-                            .and_then(|r| join(&here, &r.target));
+                            .filter(|r| r.target.starts_with("./") || r.target.starts_with("../"))
+                            .and_then(|r| join(base, &r.target));
                         let by_dir: Vec<&str> = local
                             .as_deref()
                             .map(|d| {
@@ -866,11 +2333,28 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             // module: not the module path's own package (Y10).
                             (Vec::new(), Certainty::Heuristic)
                         } else {
-                            match go_modules.get(&dep.name).map(Vec::as_slice) {
-                                Some([one]) => (vec![*one], Certainty::Heuristic),
-                                Some(many) => (many.to_vec(), Certainty::Ambiguous),
-                                None => (Vec::new(), Certainty::Heuristic),
+                            // Module-path candidates: the workspace's `use`
+                            // members first, then every known module (deduped;
+                            // members that are also projects appear once).
+                            let mut names: Vec<&str> = Vec::new();
+                            if let Some(members) = work_path
+                                .as_deref()
+                                .and_then(|p| work_members.get(p))
+                                .and_then(|m| m.get(&dep.name))
+                            {
+                                names.extend(members.iter().map(String::as_str));
                             }
+                            if let Some(known) = go_modules.get(&dep.name) {
+                                names.extend(known.iter().copied());
+                            }
+                            names.sort();
+                            names.dedup();
+                            let certainty = if names.len() <= 1 {
+                                Certainty::Heuristic
+                            } else {
+                                Certainty::Ambiguous
+                            };
+                            (names, certainty)
                         };
                         let targets: Vec<&str> =
                             targets.into_iter().filter(|t| *t != service).collect();
@@ -919,13 +2403,92 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                         });
                     }
                 }
+                "pyproject.toml" => {
+                    let deps = pyproject_deps(text);
+                    if deps.is_empty() {
+                        continue;
+                    }
+                    // The governing lockfile, read once per service.
+                    let lock = match py_lockfile_for(&here, inputs.paths, inputs.texts) {
+                        Some(PyLock::Read(path, source)) => {
+                            let reader = match source {
+                                LockSource::Poetry => poetry_lock,
+                                LockSource::Uv => uv_lock,
+                            };
+                            let from = match source {
+                                LockSource::Poetry => "poetry_lock",
+                                LockSource::Uv => "uv_lock",
+                            };
+                            match inputs.texts.get(path.as_str()).map(|t| reader(t)) {
+                                Some(Ok(packages)) => Some((path, packages, from)),
+                                Some(Err(reason)) => {
+                                    diagnostics.push(diagnostic(
+                                        "lockfile_unreadable",
+                                        &path,
+                                        None,
+                                        json!({ "service": service, "reason": reason }),
+                                    ));
+                                    None
+                                }
+                                None => None,
+                            }
+                        }
+                        Some(PyLock::Unread(path)) => {
+                            diagnostics.push(diagnostic(
+                                "lockfile_unread",
+                                &path,
+                                None,
+                                json!({ "service": service }),
+                            ));
+                            None
+                        }
+                        None => None,
+                    };
+                    for dep in deps {
+                        let (version, from) = match &lock {
+                            Some((path, packages, from)) => match packages.get(&dep.name) {
+                                Some(v) => (v.clone(), *from),
+                                None => {
+                                    diagnostics.push(diagnostic(
+                                        "lockfile_missing_entry",
+                                        m,
+                                        Some(dep.span),
+                                        json!({ "service": service, "name": dep.name, "lockfile": path }),
+                                    ));
+                                    (String::new(), "unresolved")
+                                }
+                            },
+                            None => (String::new(), "unresolved"),
+                        };
+                        edges.push(ManifestEdge {
+                            service: service.to_owned(),
+                            target: Target::Package(Package {
+                                manager: "py",
+                                name: dep.name.clone(),
+                                version,
+                            }),
+                            certainty: Certainty::Exact,
+                            attrs: attrs(&[
+                                ("declared", &dep.declared),
+                                ("scope", "runtime"),
+                                ("version_from", from),
+                            ]),
+                            evidence: evidence(dep.span),
+                        });
+                    }
+                }
                 "pom.xml" => {
                     let Some(pom) = poms.get(m.as_str()) else {
                         continue;
                     };
-                    for (dep, version, from, conflict) in &pom.deps {
-                        let (group, artifact) =
-                            dep.name.split_once('/').unwrap_or((dep.name.as_str(), ""));
+                    for (dep, version, from, conflict, typ) in &pom.deps {
+                        // Service identities are GA only: a classified
+                        // dependency still joins the service providing it.
+                        let mut segs = dep.name.splitn(3, '/');
+                        let (group, artifact) = (
+                            segs.next().unwrap_or_default(),
+                            segs.next().unwrap_or_default(),
+                        );
                         if let Some(modules) = maven.get(&(group.to_owned(), artifact.to_owned())) {
                             let modules: Vec<&(&str, String)> =
                                 modules.iter().filter(|(d, _)| *d != service).collect();
@@ -963,6 +2526,7 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                         let mut attrs = attrs(&[
                             ("declared", &dep.declared),
                             ("scope", dep.scope),
+                            ("type", typ),
                             ("version_from", from),
                         ]);
                         if !conflict.is_empty() {
@@ -978,6 +2542,55 @@ pub(crate) fn dependencies(inputs: &Inputs<'_>) -> (Vec<ManifestEdge>, Vec<Diagn
                             certainty,
                             attrs,
                             evidence: evidence(dep.span),
+                        });
+                    }
+                }
+                "build.gradle" | "build.gradle.kts" => {
+                    // The governing catalog (nearest `gradle/libs.versions.toml`
+                    // above the build file); an unreadable one is one
+                    // diagnostic, and its `libs.` references stay unresolved.
+                    let mut catalog = BTreeMap::new();
+                    if let Some(path) = catalog_for(m, inputs.paths)
+                        && let Some(text) = inputs.texts.get(path.as_str())
+                    {
+                        match gradle_catalog(text) {
+                            Ok(read) => catalog = read,
+                            Err(reason) => {
+                                if catalog_unread.insert(path.clone()) {
+                                    diagnostics.push(diagnostic(
+                                        "catalog_unreadable",
+                                        &path,
+                                        None,
+                                        json!({ "service": service, "reason": reason }),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    for d in gradle_deps(text, &catalog) {
+                        let certainty = if !d.conflict.is_empty() {
+                            Certainty::Heuristic
+                        } else {
+                            Certainty::Exact
+                        };
+                        let mut attrs = attrs(&[
+                            ("declared", &d.dep.declared),
+                            ("scope", d.dep.scope),
+                            ("version_from", d.from),
+                        ]);
+                        if !d.conflict.is_empty() {
+                            attrs.insert("versions".into(), json!(d.conflict));
+                        }
+                        edges.push(ManifestEdge {
+                            service: service.to_owned(),
+                            target: Target::Package(Package {
+                                manager: "maven",
+                                name: d.dep.name.clone(),
+                                version: d.version.clone(),
+                            }),
+                            certainty,
+                            attrs,
+                            evidence: evidence(d.dep.span),
                         });
                     }
                 }
@@ -1093,6 +2706,424 @@ mod tests {
         (edges, diagnostics)
     }
 
+    /// Contract M6c S4: `tsconfig.json` texts reach the manifest readers that
+    /// feed exact alias resolution.
+    #[test]
+    fn tsconfig_json_is_a_manifest_input() {
+        assert!(is_input("svc/tsconfig.json"));
+        assert!(is_input("tsconfig.json"));
+        assert!(!is_input("svc/tsconfig.json.bak"));
+    }
+
+    /// Contract M6c S8: `lombok.config` texts reach the manifest readers that
+    /// feed qualifier-copying resolution.
+    #[test]
+    fn lombok_config_is_a_manifest_input() {
+        assert!(is_input("svc/lombok.config"));
+        assert!(is_input("lombok.config"));
+        assert!(!is_input("svc/lombok.config.bak"));
+    }
+
+    /// Contract M6e S5: `yarn.lock` and `pnpm-lock.yaml` reach the manifest
+    /// readers that feed `npm/` package edges.
+    #[test]
+    fn yarn_and_pnpm_lockfiles_are_manifest_inputs() {
+        assert!(is_input("svc/yarn.lock"));
+        assert!(is_input("svc/pnpm-lock.yaml"));
+        assert!(is_input("yarn.lock"));
+        assert!(!is_input("svc/yarn.lock.bak"));
+    }
+
+    /// Contract M6e S5: yarn v1 blockade — multi-header blocks share one
+    /// version, quoted scoped headers parse, `npm:` alias specs resolve to
+    /// the real package, version-less blocks are skipped, comments ignored.
+    #[test]
+    fn yarn_v1_blocks_versions_and_aliases() {
+        let lock = yarn_lock(
+            "# yarn lockfile v1\n\n\"@scope/name@^1.0.0\", \"@scope/name@~1.0.0\":\n  version \"1.2.3\"\n  resolved \"https://registry.yarnpkg.com/@scope/name/-/name-1.2.3.tgz\"\n\nbare@^2:\n  version \"2.0.0\"\n\n\"alias@npm:real@^1\":\n  version \"1.0.1\"\n\nnoversion@^1:\n  resolved \"https://example.com/x.tgz\"\n",
+        );
+        assert_eq!(lock.versions.get("bare"), Some(&vec!["2.0.0".to_owned()]));
+        assert_eq!(lock.versions.get("alias"), Some(&vec!["1.0.1".to_owned()]));
+        assert!(!lock.versions.contains_key("noversion"));
+        // Two majors for one name both survive for the duplicate rule.
+        let lock = yarn_lock("a@^1:\n  version \"1.0.0\"\n\na@^2:\n  version \"2.0.0\"\n");
+        assert_eq!(
+            lock.versions.get("a"),
+            Some(&vec!["1.0.0".to_owned(), "2.0.0".to_owned()])
+        );
+    }
+
+    /// Contract M6e S5: Berry lockfiles gate on `__metadata` and pin through
+    /// `resolution:`; non-`npm:` descriptors (workspace/file/link) stay out.
+    #[test]
+    fn yarn_berry_entries_pin_through_resolutions() {
+        let lock = yarn_lock(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"name@npm:^1.0.0\":\n  version: 1.2.3\n  resolution: \"name@npm:1.2.3\"\n  checksum: abc\n\n\"alias@npm:real@^1\":\n  version: 1.0.1\n  resolution: \"real@npm:1.0.1\"\n\n\"local@workspace:.\":\n  version: 0.0.0-use.local\n  resolution: \"local@workspace:.\"\n",
+        );
+        assert_eq!(lock.versions.get("name"), Some(&vec!["1.2.3".to_owned()]));
+        assert_eq!(lock.versions.get("alias"), Some(&vec!["1.0.1".to_owned()]));
+        assert!(!lock.versions.contains_key("local"));
+    }
+
+    /// Contract M6e S5: pnpm v9 `packages:` keys pin versions (peer suffixes
+    /// stripped, scoped names kept); other majors and missing `packages:`
+    /// are unreadable, never inferred.
+    #[test]
+    fn pnpm_packages_peers_and_major_gate() {
+        let versions = pnpm_lock(
+            "lockfileVersion: '9.0'\npackages:\n  foo@1.0.0:\n    resolution: {integrity: sha512-x}\n  bar@2.0.0(bar@3.0.0):\n    resolution: {integrity: sha512-y}\n  '@scope/baz@4.1.0':\n    resolution: {integrity: sha512-z}\n",
+        )
+        .unwrap();
+        assert_eq!(versions.get("foo"), Some(&vec!["1.0.0".to_owned()]));
+        assert_eq!(versions.get("bar"), Some(&vec!["2.0.0".to_owned()]));
+        assert_eq!(versions.get("@scope/baz"), Some(&vec!["4.1.0".to_owned()]));
+        assert!(pnpm_lock("lockfileVersion: '6.0'\npackages:\n  foo@1.0.0:\n").is_err());
+        assert!(pnpm_lock("lockfileVersion: '9.0'\n").is_err());
+        assert!(pnpm_lock("not: [yaml").is_err());
+    }
+
+    /// Contract M6e S5, edge level: yarn/pnpm locks govern by nearness with
+    /// npm-first ties; pins are `Exact` with per-format `version_from`;
+    /// missing entries and multi-major duplicates resolve safe.
+    #[test]
+    fn yarn_and_pnpm_govern_pins_and_duplicates() {
+        let projects = [
+            project("y", &["y/package.json"]),
+            project("p", &["p/package.json"]),
+            project("n", &["n/package.json"]),
+        ];
+        let manifest = r#"{ "dependencies": { "a": "^1", "b": "^2", "c": "^1", "d": "^1", "e": "npm:real@^1" } }"#;
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("y/package.json", manifest),
+                (
+                    "y/yarn.lock",
+                    "a@^1:\n  version \"1.0.0\"\n\nb@^2:\n  version \"2.0.0\"\n\nb@^3:\n  version \"3.0.0\"\n\n\"e@npm:real@^1\":\n  version \"5.0.0\"\n",
+                ),
+                ("p/package.json", manifest),
+                (
+                    "p/pnpm-lock.yaml",
+                    "lockfileVersion: '9.0'\npackages:\n  a@1.0.0:\n  c@3.0.0:\n  real@5.0.0:\n",
+                ),
+                ("n/package.json", manifest),
+                (
+                    "n/package-lock.json",
+                    r#"{ "lockfileVersion": 3, "packages": {} }"#,
+                ),
+                ("n/yarn.lock", "a@^1:\n  version \"9.9.9\"\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"y -> npm/a@1.0.0 [exact] {"declared":"^1","scope":"runtime","version_from":"yarn_lock"}"#,
+                r#"y -> npm/b@? [heuristic] {"declared":"^2","scope":"runtime","version_from":"yarn_lock","versions":["2.0.0","3.0.0"]}"#,
+                r#"y -> npm/c@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"y -> npm/d@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"y -> npm/real@5.0.0 [exact] {"alias":"e","declared":"npm:real@^1","scope":"runtime","version_from":"yarn_lock"}"#,
+                r#"p -> npm/a@1.0.0 [exact] {"declared":"^1","scope":"runtime","version_from":"pnpm_lock"}"#,
+                r#"p -> npm/b@? [exact] {"declared":"^2","scope":"runtime","version_from":"unresolved"}"#,
+                r#"p -> npm/c@3.0.0 [exact] {"declared":"^1","scope":"runtime","version_from":"pnpm_lock"}"#,
+                r#"p -> npm/d@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"p -> npm/real@5.0.0 [exact] {"alias":"e","declared":"npm:real@^1","scope":"runtime","version_from":"pnpm_lock"}"#,
+                r#"n -> npm/a@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"n -> npm/b@? [exact] {"declared":"^2","scope":"runtime","version_from":"unresolved"}"#,
+                r#"n -> npm/c@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"n -> npm/d@? [exact] {"declared":"^1","scope":"runtime","version_from":"unresolved"}"#,
+                r#"n -> npm/real@? [exact] {"alias":"e","declared":"npm:real@^1","scope":"runtime","version_from":"unresolved"}"#,
+            ]
+        );
+        let mut diagnostics = diagnostics;
+        diagnostics.sort();
+        assert_eq!(
+            diagnostics,
+            [
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry n/package.json",
+                "lockfile_missing_entry p/package.json",
+                "lockfile_missing_entry p/package.json",
+                "lockfile_missing_entry y/package.json",
+                "lockfile_missing_entry y/package.json",
+            ]
+        );
+    }
+
+    /// Contract M6e S8: `go.work` workspaces — `use` members join services,
+    /// workspace replaces win over module replaces, and excluded required
+    /// versions resolve to `?` with a diagnostic.
+    #[test]
+    fn go_work_use_replace_and_exclude() {
+        let projects = [
+            project("app", &["app/go.mod"]),
+            project("lib", &["lib/go.mod"]),
+        ];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                (
+                    "go.work",
+                    "go 1.23\n\nuse ./app\nuse (\n\t./lib\n)\n\nreplace example.com/lib => ./lib\n",
+                ),
+                (
+                    "app/go.mod",
+                    "module example.com/app\n\ngo 1.23\n\nrequire (\n\texample.com/lib v0.0.0\n\tgithub.com/gin-gonic/gin v1.10.0\n\texample.com/stale v1.0.0\n)\n\nreplace example.com/lib => example.com/fork v1.0.0\n\nexclude example.com/stale v1.0.0\n",
+                ),
+                ("lib/go.mod", "module example.com/lib\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"app -> service lib [synthetic] {"declared":"v0.0.0","scope":"runtime","via":"package"}"#,
+                r#"app -> go/github.com/gin-gonic/gin@v1.10.0 [synthetic] {"declared":"v1.10.0","scope":"runtime","version_from":"go_mod"}"#,
+                r#"app -> go/example.com/stale@? [exact] {"declared":"v1.0.0","scope":"runtime","version_from":"unresolved"}"#,
+            ]
+        );
+        let mut diagnostics = diagnostics;
+        diagnostics.sort();
+        assert_eq!(diagnostics, ["go_excluded app/go.mod"]);
+        // Two members sharing one module path stay ambiguous.
+        let projects = [
+            project("app", &["app/go.mod"]),
+            project("lib", &["lib/go.mod"]),
+            project("lib2", &["lib2/go.mod"]),
+        ];
+        let (edges, _) = run(
+            &projects,
+            &[
+                ("go.work", "go 1.23\nuse ./app\nuse ./lib\nuse ./lib2\n"),
+                (
+                    "app/go.mod",
+                    "module example.com/app\n\nrequire example.com/lib v0.0.0\n",
+                ),
+                ("lib/go.mod", "module example.com/lib\n"),
+                ("lib2/go.mod", "module example.com/lib\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"app -> service lib [ambiguous] {"declared":"v0.0.0","scope":"runtime","via":"package"}"#,
+                r#"app -> service lib2 [ambiguous] {"declared":"v0.0.0","scope":"runtime","via":"package"}"#,
+            ]
+        );
+    }
+
+    /// Contract M6e S8: `go.work` files reach the manifest readers that feed
+    /// `go/` package edges.
+    #[test]
+    fn go_work_files_are_manifest_inputs() {
+        assert!(is_input("go.work"));
+        assert!(is_input("svc/go.work"));
+        assert!(!is_input("svc/go.work.bak"));
+    }
+
+    /// Contract M6e S8: `go.work` shapes — single and block `use`, `replace`
+    /// directives, `go`/`toolchain` lines and garbage ignored.
+    #[test]
+    fn go_work_use_and_replace_shapes() {
+        let w = go_work(
+            "go 1.23\n\ntoolchain go1.24.0\nuse ./a\nuse (\n\t./b\n\t./c\n)\n\nreplace example.com/x => ./x\nreplace example.com/y v1.0.0 => example.com/z v2.0.0\ngarbage )(\n",
+        );
+        assert_eq!(
+            w.uses,
+            vec!["./a".to_owned(), "./b".to_owned(), "./c".to_owned()]
+        );
+        assert_eq!(w.replaces.len(), 2);
+        assert_eq!(w.replaces[0].target, "./x");
+        let w = go_work("go 1.23\n");
+        assert!(w.uses.is_empty() && w.replaces.is_empty());
+    }
+
+    /// Contract M6e S3: version catalogs resolve `module` + `version` /
+    /// `version.ref` / short `group:artifact:version` entries; a dangling
+    /// ref resolves to nothing; bad TOML is unreadable, never inferred.
+    #[test]
+    fn gradle_catalogs_resolve_libraries_versions_and_refs() {
+        let catalog = gradle_catalog(
+            "[versions]\nlang = \"3.20.0\"\ngson = \"2.13.1\"\n[libraries]\nlang3 = { module = \"org.apache.commons:commons-lang3\", version = \"3.20.0\" }\ngson = { module = \"com.google.code.gson:gson\", version.ref = \"gson\" }\nshort = \"org.example:short:1.2.3\"\ndangling = { module = \"org.example:dangling\", version.ref = \"missing\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.get("lang3"),
+            Some(&(
+                "org.apache.commons:commons-lang3".to_owned(),
+                Some("3.20.0".to_owned())
+            ))
+        );
+        assert_eq!(
+            catalog.get("gson"),
+            Some(&(
+                "com.google.code.gson:gson".to_owned(),
+                Some("2.13.1".to_owned())
+            ))
+        );
+        assert_eq!(
+            catalog.get("short"),
+            Some(&("org.example:short".to_owned(), Some("1.2.3".to_owned())))
+        );
+        assert_eq!(
+            catalog.get("dangling"),
+            Some(&("org.example:dangling".to_owned(), None))
+        );
+        assert!(gradle_catalog("[[[nope").is_err());
+        assert!(gradle_catalog("[libraries]\nlang3 = 42\n").is_err());
+    }
+
+    /// Contract M6e S3: Kotlin-DSL literals across the allow-listed
+    /// configurations — parenthesised, triple-argument, named-argument and
+    /// `libs.` forms; `platform()` unwraps; `$`-interpolated versions stay
+    /// unresolved; commented lines give nothing.
+    #[test]
+    fn gradle_kotlin_literals_and_catalog_refs() {
+        let catalog = gradle_catalog(
+            "[libraries]\nlang3 = { module = \"org.apache.commons:commons-lang3\", version = \"3.20.0\" }\nodd = { module = \"org.example:odd\", version = \"3.0.1\" }\n",
+        )
+        .unwrap();
+        let deps = gradle_deps(
+            "plugins { id(\"java\") }\ndependencies {\n    implementation(\"org.apache.commons:commons-lang3:3.20.0\")\n    api(\"com.google.code.gson\", \"gson\", \"2.13.1\")\n    testImplementation(libs.odd)\n    compileOnly(group = \"org.example\", name = \"bare\", version = \"1.0\")\n    runtimeOnly(\"org.example:interp:${v}\")\n    implementation(platform(\"org.example:bom:2.0\"))\n    // implementation(\"org.example:commented:9.9\")\n}\n",
+            &catalog,
+        );
+        let row =
+            |d: &GradleDep| format!("{}|{}|{}|{}", d.dep.name, d.version, d.from, d.dep.scope);
+        let rows: Vec<String> = deps.iter().map(row).collect();
+        assert_eq!(
+            rows,
+            [
+                "org.apache.commons/commons-lang3|3.20.0|literal|runtime",
+                "com.google.code.gson/gson|2.13.1|literal|runtime",
+                "org.example/odd|3.0.1|catalog|test",
+                "org.example/bare|1.0|literal|compile",
+                "org.example/interp||unresolved|runtime",
+                "org.example/bom|2.0|literal|runtime",
+            ]
+        );
+    }
+
+    /// Contract M6e S3: Groovy-DSL literals — single quotes, bare (no
+    /// parens), map notation and `libs.` forms; `project()` references and
+    /// multi-line blocks stay out.
+    #[test]
+    fn gradle_groovy_literals_maps_and_bare_forms() {
+        let catalog = gradle_catalog(
+            "[libraries]\nodd = { module = \"org.example:is-odd\", version = \"3.0.1\" }\n",
+        )
+        .unwrap();
+        let deps = gradle_deps(
+            "dependencies {\n    implementation 'org.apache.commons:commons-lang3:3.20.0'\n    implementation \"org.example:bare:1.1\"\n    implementation group: 'org.example', name: 'mapped', version: '2.0'\n    testImplementation libs.odd\n    implementation project(':lib')\n    implementation(\"org.example:multi\",\n        \"1.2\")\n    implementation 'org.example:trail:1.0' // trailing comment\n    implementationX(\"org.example:nope:1.0\")\n}\n",
+            &catalog,
+        );
+        let rows: Vec<String> = deps
+            .iter()
+            .map(|d| format!("{}|{}|{}|{}", d.dep.name, d.version, d.from, d.dep.scope))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "org.apache.commons/commons-lang3|3.20.0|literal|runtime",
+                "org.example/bare|1.1|literal|runtime",
+                "org.example/mapped|2.0|literal|runtime",
+                "org.example/is-odd|3.0.1|catalog|test",
+                "org.example/trail|1.0|literal|runtime",
+            ]
+        );
+    }
+
+    /// Contract M6e S3: a repeated artifact at two versions keeps the first
+    /// and clears it to `@?` with `versions` (the Maven duplicate rule).
+    #[test]
+    fn gradle_duplicate_artifacts_keep_the_first_as_unknown() {
+        let projects = [project("a", &["a/build.gradle"])];
+        let (edges, _) = run(
+            &projects,
+            &[(
+                "a/build.gradle",
+                "dependencies {\n    implementation(\"org.example:dup:1.0\")\n    implementation(\"org.example:dup:2.0\")\n}\n",
+            )],
+        );
+        assert_eq!(
+            edges,
+            [
+                "a -> maven/org.example/dup@? [heuristic] {\"declared\":\"1.0\",\"scope\":\"runtime\",\"version_from\":\"unresolved\",\"versions\":[\"1.0\",\"2.0\"]}"
+            ]
+        );
+    }
+
+    /// Contract M6e S3: the governing catalog is the nearest
+    /// `gradle/libs.versions.toml` at or above the build file.
+    #[test]
+    fn gradle_catalogs_govern_from_the_nearest_ancestor() {
+        let projects = [project("a", &["a/sub/build.gradle"])];
+        let (edges, _) = run(
+            &projects,
+            &[
+                (
+                    "a/sub/build.gradle",
+                    "dependencies {\n    implementation(libs.odd)\n}\n",
+                ),
+                (
+                    "a/gradle/libs.versions.toml",
+                    "[libraries]\nodd = { module = \"org.example:odd\", version = \"3.0.1\" }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                "a -> maven/org.example/odd@3.0.1 [exact] {\"declared\":\"libs.odd\",\"scope\":\"runtime\",\"version_from\":\"catalog\"}"
+            ]
+        );
+    }
+
+    /// Contract M6e S3, edge level: literals are `Exact`, catalog pins are
+    /// `Exact` with `version_from: catalog`, unresolvable versions are
+    /// `Exact` with `version_from: unresolved`, and an unreadable catalog is
+    /// a diagnostic (its `libs.` refs stay unresolved).
+    #[test]
+    fn gradle_edges_versions_and_catalog_diagnostics() {
+        let projects = [
+            project("k", &["k/build.gradle.kts", "k/gradle/libs.versions.toml"]),
+            project("g", &["g/build.gradle", "g/gradle/libs.versions.toml"]),
+        ];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                (
+                    "k/build.gradle.kts",
+                    "dependencies {\n    implementation(\"org.apache.commons:commons-lang3:3.20.0\")\n    testImplementation(libs.odd)\n    implementation(\"org.example:interp:${v}\")\n    implementation(libs.ghost)\n}\n",
+                ),
+                (
+                    "k/gradle/libs.versions.toml",
+                    "[libraries]\nlang3 = { module = \"org.apache.commons:commons-lang3\", version = \"3.20.0\" }\nodd = { module = \"org.example:odd\", version = \"3.0.1\" }\nghost = { module = \"org.example:ghost\" }\n",
+                ),
+                (
+                    "g/build.gradle",
+                    "dependencies {\n    implementation 'org.example:mapped:4.0'\n    implementation(\"org.example:bare\")\n}\n",
+                ),
+                ("g/gradle/libs.versions.toml", "[[[nope"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                "k -> maven/org.apache.commons/commons-lang3@3.20.0 [exact] {\"declared\":\"3.20.0\",\"scope\":\"runtime\",\"version_from\":\"literal\"}",
+                "k -> maven/org.example/odd@3.0.1 [exact] {\"declared\":\"libs.odd\",\"scope\":\"test\",\"version_from\":\"catalog\"}",
+                "k -> maven/org.example/interp@? [exact] {\"declared\":\"${v}\",\"scope\":\"runtime\",\"version_from\":\"unresolved\"}",
+                "k -> maven/org.example/ghost@? [exact] {\"declared\":\"libs.ghost\",\"scope\":\"runtime\",\"version_from\":\"unresolved\"}",
+                "g -> maven/org.example/mapped@4.0 [exact] {\"declared\":\"4.0\",\"scope\":\"runtime\",\"version_from\":\"literal\"}",
+                "g -> maven/org.example/bare@? [exact] {\"scope\":\"runtime\",\"version_from\":\"unresolved\"}",
+            ]
+        );
+        assert_eq!(
+            diagnostics,
+            ["catalog_unreadable g/gradle/libs.versions.toml"]
+        );
+    }
+
     const LOCK: &str = r#"{
   "name": "root", "lockfileVersion": 3,
   "packages": {
@@ -1168,16 +3199,10 @@ mod tests {
             edges,
             [
                 r#"a -> npm/express@? [exact] {"declared":"^4","scope":"runtime","version_from":"unresolved"}"#,
-                r#"b -> npm/express@? [exact] {"declared":"^4","scope":"runtime","version_from":"unresolved"}"#,
+                r#"b -> npm/express@4.19.2 [exact] {"declared":"^4","scope":"runtime","version_from":"yarn_lock"}"#,
             ]
         );
-        assert_eq!(
-            diagnostics,
-            [
-                "lockfile_unreadable a/package-lock.json",
-                "lockfile_unread b/yarn.lock"
-            ]
-        );
+        assert_eq!(diagnostics, ["lockfile_unreadable a/package-lock.json"]);
         let (_, diagnostics) = run(
             &projects[..1],
             &[
@@ -1334,6 +3359,30 @@ mod tests {
         assert!(parse_xml("<project><a></project>").is_none());
     }
 
+    /// Contract M6f S5: the XML reader keeps attributes and end offsets (for MyBatis mapper
+    /// statements); existing pom reads are unchanged.
+    #[test]
+    fn xml_elements_carry_attributes_and_end_offsets() {
+        let root = parse_xml("<mapper namespace=\"com.acme.M\" ><select id='findAll'>SELECT 1</select><br/></mapper>").unwrap();
+        assert_eq!(root.attr("namespace"), Some("com.acme.M"));
+        assert_eq!(root.attr("missing"), None);
+        let select = &root.children[0];
+        assert_eq!(select.name, "select");
+        assert_eq!(select.attr("id"), Some("findAll"));
+        assert_eq!(select.text.trim(), "SELECT 1");
+        // End offsets come from the tree, never hand-counted.
+        assert_eq!(
+            &"<mapper namespace=\"com.acme.M\" ><select id='findAll'>SELECT 1</select><br/></mapper>"
+                [select.start..select.end],
+            "<select id='findAll'>SELECT 1</select>"
+        );
+        assert_eq!(root.children[1].name, "br");
+        // A malformed attribute is skipped, not fatal.
+        let bad = parse_xml("<a b=noquotes>c</a>").unwrap();
+        assert_eq!(bad.attr("b"), None);
+        assert_eq!(bad.text, "c");
+    }
+
     /// Evaluator pass 1, Y8 and Y11: an artifact declared twice with different versions, or
     /// a property defined twice with different values, has no exact version: one `heuristic`
     /// edge to the `@?` key listing the versions. The same version twice stays exact.
@@ -1387,6 +3436,160 @@ mod tests {
         );
     }
 
+    /// Contract M6e S9: the package key carries the Maven classifier — the
+    /// same GA with different classifiers never merges, while a true
+    /// duplicate (same full key, different versions) still clears to `@?`.
+    /// `<type>` is recorded on the edge, never keyed.
+    #[test]
+    fn pom_classifiers_ride_the_package_key() {
+        let projects = [project("svc", &["svc/pom.xml"])];
+        let pom = |body: &str| -> String {
+            format!(
+                "<project><groupId>g</groupId><artifactId>svc</artifactId><version>1</version><dependencies>{body}</dependencies></project>"
+            )
+        };
+        let dep = |artifact: &str, classifier: &str, extra: &str, version: &str| {
+            format!(
+                "<dependency><groupId>org.example</groupId><artifactId>{artifact}</artifactId><classifier>{classifier}</classifier>{extra}<version>{version}</version></dependency>"
+            )
+        };
+        // The same GA plain and classified keeps three exact edges.
+        let mixed = pom(&format!(
+            "{}{}{}",
+            dep("lib", "", "", "3.0"),
+            dep("lib", "tests", "", "1.0"),
+            dep("lib", "sources", "<type>java-source</type>", "2.0"),
+        ));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &mixed)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/lib@3.0 [exact] {"declared":"3.0","scope":"runtime","version_from":"literal"}"#,
+                r#"svc -> maven/org.example/lib/tests@1.0 [exact] {"declared":"1.0","scope":"runtime","version_from":"literal"}"#,
+                r#"svc -> maven/org.example/lib/sources@2.0 [exact] {"declared":"2.0","scope":"runtime","type":"java-source","version_from":"literal"}"#,
+            ]
+        );
+        // The same full key twice with different versions clears to `@?`.
+        let twice = pom(&format!(
+            "{}{}",
+            dep("lib", "tests", "", "1.0"),
+            dep("lib", "tests", "", "2.0")
+        ));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &twice)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/lib/tests@? [heuristic] {"declared":"1.0","scope":"runtime","version_from":"unresolved","versions":["1.0","2.0"]}"#
+            ]
+        );
+        // A property-shaped classifier names no classifier.
+        let prop = pom(&dep("lib", "${c}", "", "1.0"));
+        let (edges, _) = run(&projects, &[("svc/pom.xml", &prop)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/lib@1.0 [exact] {"declared":"1.0","scope":"runtime","version_from":"literal"}"#,
+            ]
+        );
+    }
+
+    /// Contract M6e S9: a classified dependency still joins the service that
+    /// provides its GA.
+    #[test]
+    fn pom_classified_dependencies_join_their_service() {
+        let projects = [
+            project("svc", &["svc/pom.xml"]),
+            project("lib", &["lib/pom.xml"]),
+        ];
+        let (edges, _) = run(
+            &projects,
+            &[
+                (
+                    "svc/pom.xml",
+                    "<project><groupId>g</groupId><artifactId>svc</artifactId><dependencies><dependency><groupId>org.example</groupId><artifactId>lib</artifactId><classifier>tests</classifier><version>1.0</version></dependency></dependencies></project>",
+                ),
+                (
+                    "lib/pom.xml",
+                    "<project><groupId>org.example</groupId><artifactId>lib</artifactId><version>1.0</version></project>",
+                ),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> service lib [synthetic] {"declared":"1.0","scope":"runtime","via":"package"}"#
+            ]
+        );
+    }
+
+    /// Evaluator pass 1, M6e-12 (S9): the same classified declaration twice with the same
+    /// version stays one exact edge (no conflict); a `go.work` `use` escaping the repository
+    /// is ignored without breaking the workspace.
+    #[test]
+    fn duplicate_classifiers_and_escaping_workspace_uses() {
+        let projects = [project("svc", &["svc/pom.xml"])];
+        let twice = "<project><groupId>g</groupId><artifactId>svc</artifactId><dependencies><dependency><groupId>org.example</groupId><artifactId>lib</artifactId><classifier>tests</classifier><version>1.0</version></dependency><dependency><groupId>org.example</groupId><artifactId>lib</artifactId><classifier>tests</classifier><version>1.0</version></dependency></dependencies></project>";
+        let (edges, _) = run(&projects, &[("svc/pom.xml", twice)]);
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> maven/org.example/lib/tests@1.0 [exact] {"declared":"1.0","scope":"runtime","version_from":"literal"}"#
+            ]
+        );
+        let projects = [project("app", &["app/go.mod"])];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("go.work", "go 1.23\nuse ../outside\nuse ./app\n"),
+                (
+                    "app/go.mod",
+                    "module example.com/app\n\ngo 1.23\n\nrequire github.com/gin-gonic/gin v1.10.0\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"app -> go/github.com/gin-gonic/gin@v1.10.0 [synthetic] {"declared":"v1.10.0","scope":"runtime","version_from":"go_mod"}"#,
+            ]
+        );
+        assert!(diagnostics.is_empty());
+    }
+
+    /// Evaluator pass 1, M6e-12 (S8): the nearest `go.work` governs each service — `app`'s
+    /// own workspace replace wins over the root's dangling one.
+    #[test]
+    fn nearest_go_work_governs_each_service() {
+        let projects = [
+            project("app", &["app/go.mod"]),
+            project("lib", &["lib/go.mod"]),
+        ];
+        let (edges, _) = run(
+            &projects,
+            &[
+                (
+                    "go.work",
+                    "go 1.23\n\nuse ./app\nuse ./lib\n\nreplace example.com/lib => ./missing\n",
+                ),
+                (
+                    "app/go.work",
+                    "go 1.23\n\nuse ../lib\n\nreplace example.com/lib => ../lib\n",
+                ),
+                (
+                    "app/go.mod",
+                    "module example.com/app\n\ngo 1.23\n\nrequire example.com/lib v0.0.0\n",
+                ),
+                ("lib/go.mod", "module example.com/lib\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"app -> service lib [synthetic] {"declared":"v0.0.0","scope":"runtime","via":"package"}"#,
+            ]
+        );
+    }
+
     /// Evaluator pass 1, Y9: an npm alias (`"foo": "npm:bar@^1"`) installs `bar`: the key is
     /// the real package with the lockfile's version, and the alias is an attribute.
     #[test]
@@ -1411,6 +3614,31 @@ mod tests {
                 r#"web -> npm/bar@1.2.3 [exact] {"alias":"foo","declared":"npm:bar@^1.0.0","scope":"runtime","version_from":"lockfile"}"#,
                 r#"web -> npm/real@? [exact] {"alias":"nolock","declared":"npm:real@1","scope":"runtime","version_from":"unresolved"}"#,
                 r#"web -> npm/@s/pkg@2.0.0 [exact] {"alias":"sc","declared":"npm:@s/pkg@^2","scope":"runtime","version_from":"lockfile"}"#,
+            ]
+        );
+    }
+
+    /// Evaluator pass 1, E2-1: an absolute-path `replace` target joins no
+    /// service: `/b` is a filesystem path, never the repo-relative `a/b`
+    /// below the service. The version stays unresolved (Y10), as for any
+    /// directory replace.
+    #[test]
+    fn absolute_replace_paths_never_join_a_service() {
+        let projects = [project("a", &["a/go.mod"]), project("a/b", &["a/b/go.mod"])];
+        let (edges, _) = run(
+            &projects,
+            &[
+                (
+                    "a/go.mod",
+                    "module example.com/a\n\nrequire example.com/dep v1.0.0\nreplace example.com/dep => /b\n",
+                ),
+                ("a/b/go.mod", "module example.com/dep\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"a -> go/example.com/dep@? [exact] {"declared":"v1.0.0","replaced":"/b","scope":"runtime","version_from":"unresolved"}"#,
             ]
         );
     }
@@ -1446,5 +3674,345 @@ mod tests {
         assert_eq!(got, ["a", "b", "c", "d"]);
         let got: Vec<String> = classpath("d", &depends).into_iter().collect();
         assert_eq!(got, ["d"]);
+    }
+
+    /// Contract M6d S6: PEP 508 requirement strings split into a canonical
+    /// name and the declared spec as written; extras, markers and URL targets
+    /// never become versions; anything else names no dependency.
+    #[test]
+    fn pep508_requirements_split_names_and_specs() {
+        let req = |s: &str| pep508(s).map(|(n, d, _)| (n, d));
+        assert_eq!(
+            req("fastapi[standard]>=0.141.1,<1.0.0"),
+            Some(("fastapi".into(), ">=0.141.1,<1.0.0".into()))
+        );
+        assert_eq!(req("Requests>=2"), Some(("requests".into(), ">=2".into())));
+        assert_eq!(req("foo_bar.baz"), Some(("foo-bar-baz".into(), "".into())));
+        assert_eq!(
+            req("pwdlib[argon2,bcrypt]>=0.3.1"),
+            Some(("pwdlib".into(), ">=0.3.1".into()))
+        );
+        assert_eq!(
+            req("pyjwt>=2.15.0,<3.0.0; python_version >= '3.9'"),
+            Some(("pyjwt".into(), ">=2.15.0,<3.0.0".into()))
+        );
+        assert_eq!(
+            req("name @ https://example.com/name-1.0.tar.gz"),
+            Some(("name".into(), "".into()))
+        );
+        assert_eq!(
+            req("name[extra]@ https://example.com/n.tgz"),
+            Some(("name".into(), "".into()))
+        );
+        // A parenthesised spec is tolerated; anything without a name is not a dep.
+        assert_eq!(req("legacy (>=2)"), Some(("legacy".into(), ">=2".into())));
+        assert_eq!(req(""), None);
+        assert_eq!(req(">=2"), None);
+        assert_eq!(req("; python_version >= '3'"), None);
+        assert_eq!(req("[extra]>=2"), None);
+        assert_eq!(req("foo[bar>=2"), None);
+    }
+
+    /// Contract M6d S6: names canonicalise per PEP 503.
+    #[test]
+    fn pep503_folds_case_and_separators() {
+        assert_eq!(pep503("Requests"), "requests");
+        assert_eq!(pep503("foo_bar.baz-qux"), "foo-bar-baz-qux");
+        assert_eq!(pep503("a__b..c--d"), "a-b-c-d");
+    }
+
+    /// Contract M6d S6: `pyproject.toml` and both lockfiles are manifest inputs.
+    #[test]
+    fn python_manifests_are_inputs() {
+        for f in [
+            "pyproject.toml",
+            "poetry.lock",
+            "uv.lock",
+            "svc/pyproject.toml",
+        ] {
+            assert!(is_input(f), "{f}");
+        }
+        assert!(!is_input("svc/requirements.txt"));
+        assert!(!is_input("svc/Pipfile.lock"));
+    }
+
+    const POETRY_PYPROJECT: &str = r#"[tool.poetry]
+name = "svc"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4"
+requests = "^2.32.0"
+shaped = { version = "^1.0", extras = ["fast"] }
+gitted = { git = "https://example.com/gitted.git", rev = "abc" }
+pathed = { path = "../pathed" }
+multi = [{ version = "^2.0", python = ">=3.10" }, { version = "^1.0", python = "<3.10" }]
+"#;
+
+    const POETRY_LOCK: &str = r#"[[package]]
+name = "requests"
+version = "2.32.3"
+
+[[package]]
+name = "shaped"
+version = "1.2.0"
+
+[[package]]
+name = "gitted"
+version = "0.4.0"
+
+[package.source]
+type = "git"
+url = "https://example.com/gitted.git"
+
+[[package]]
+name = "transitive"
+version = "9.9.9"
+"#;
+
+    /// Contract M6d S6: a `poetry.lock` pins exact registry versions; a git
+    /// source never pins; transitive entries and `[tool.poetry]` extras stay
+    /// out; `python` is the runtime, not a dependency.
+    #[test]
+    fn poetry_lock_pins_exact_registry_versions() {
+        let projects = [project("svc", &["svc/pyproject.toml"])];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("svc/pyproject.toml", POETRY_PYPROJECT),
+                ("svc/poetry.lock", POETRY_LOCK),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> py/gitted@? [exact] {"scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> py/multi@? [exact] {"declared":"^2.0","scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> py/pathed@? [exact] {"scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> py/requests@2.32.3 [exact] {"declared":"^2.32.0","scope":"runtime","version_from":"poetry_lock"}"#,
+                r#"svc -> py/shaped@1.2.0 [exact] {"declared":"^1.0","scope":"runtime","version_from":"poetry_lock"}"#,
+            ]
+        );
+        assert_eq!(
+            diagnostics,
+            [
+                "lockfile_missing_entry svc/pyproject.toml",
+                "lockfile_missing_entry svc/pyproject.toml",
+                "lockfile_missing_entry svc/pyproject.toml"
+            ]
+        );
+    }
+
+    const PEP621_PYPROJECT: &str = r#"[project]
+name = "app"
+version = "0.1.0"
+dependencies = [
+    "fastapi[standard]>=0.141.1,<1.0.0",
+    "httpx<1.0.0,>=0.25.1",
+    "bare",
+    "missing>=1.0",
+]
+"#;
+
+    const UV_LOCK: &str = r#"version = 1
+
+[[package]]
+name = "fastapi"
+version = "0.143.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "editable-root"
+version = "0.1.0"
+source = { editable = "." }
+"#;
+
+    /// Contract M6d S6: PEP 621 dependencies pin from the governing `uv.lock`;
+    /// a dep the lock does not list stays `?` with a counted diagnostic.
+    #[test]
+    fn uv_lock_pins_pep621_dependencies() {
+        let projects = [project("svc", &["svc/pyproject.toml"])];
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("svc/pyproject.toml", PEP621_PYPROJECT),
+                ("svc/uv.lock", UV_LOCK),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"svc -> py/fastapi@0.143.0 [exact] {"declared":">=0.141.1,<1.0.0","scope":"runtime","version_from":"uv_lock"}"#,
+                r#"svc -> py/httpx@0.28.1 [exact] {"declared":"<1.0.0,>=0.25.1","scope":"runtime","version_from":"uv_lock"}"#,
+                r#"svc -> py/bare@? [exact] {"scope":"runtime","version_from":"unresolved"}"#,
+                r#"svc -> py/missing@? [exact] {"declared":">=1.0","scope":"runtime","version_from":"unresolved"}"#,
+            ]
+        );
+        assert_eq!(
+            diagnostics,
+            [
+                "lockfile_missing_entry svc/pyproject.toml",
+                "lockfile_missing_entry svc/pyproject.toml"
+            ]
+        );
+    }
+
+    const UV_ROOT_PYPROJECT: &str = r#"[tool.uv.workspace]
+members = ["backend", "packages/*"]
+"#;
+
+    /// Contract M6d S6: a `uv.lock` governs its own directory and the
+    /// workspace members the root lists (exact or one-level `*`); an
+    /// unrelated nested project keeps `?`. A `poetry.lock` above never
+    /// governs below (poetry has no workspaces). Both locks in one directory:
+    /// poetry wins.
+    #[test]
+    fn uv_lock_governs_members_and_poetry_stays_local() {
+        let projects = [
+            project(".", &["pyproject.toml"]),
+            project("backend", &["backend/pyproject.toml"]),
+            project("packages/a", &["packages/a/pyproject.toml"]),
+            project("other", &["other/pyproject.toml"]),
+            project("nested", &["nested/pyproject.toml"]),
+            project("both", &["both/pyproject.toml"]),
+        ];
+        let backend = "[project]\nname = \"app\"\ndependencies = [\"httpx>=0.25\"]\n";
+        let (edges, _) = run(
+            &projects,
+            &[
+                ("pyproject.toml", UV_ROOT_PYPROJECT),
+                ("uv.lock", UV_LOCK),
+                ("backend/pyproject.toml", backend),
+                ("packages/a/pyproject.toml", backend),
+                ("other/pyproject.toml", backend),
+                ("nested/pyproject.toml", backend),
+                ("poetry.lock", POETRY_LOCK),
+                (
+                    "nested/poetry.lock",
+                    "[[package]]\nname = \"httpx\"\nversion = \"0.1.0\"\n",
+                ),
+                ("both/pyproject.toml", backend),
+                (
+                    "both/poetry.lock",
+                    "[[package]]\nname = \"httpx\"\nversion = \"0.2.0\"\n",
+                ),
+                ("both/uv.lock", UV_LOCK),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"backend -> py/httpx@0.28.1 [exact] {"declared":">=0.25","scope":"runtime","version_from":"uv_lock"}"#,
+                r#"packages/a -> py/httpx@0.28.1 [exact] {"declared":">=0.25","scope":"runtime","version_from":"uv_lock"}"#,
+                r#"other -> py/httpx@? [exact] {"declared":">=0.25","scope":"runtime","version_from":"unresolved"}"#,
+                r#"nested -> py/httpx@0.1.0 [exact] {"declared":">=0.25","scope":"runtime","version_from":"poetry_lock"}"#,
+                r#"both -> py/httpx@0.2.0 [exact] {"declared":">=0.25","scope":"runtime","version_from":"poetry_lock"}"#,
+            ]
+        );
+    }
+
+    /// Contract M6d S6: an unreadable lockfile is a counted diagnostic, and a
+    /// `requirements.txt`/`Pipfile` is noticed but never read (residue).
+    #[test]
+    fn unreadable_and_unread_python_lockfiles() {
+        let projects = [
+            project("a", &["a/pyproject.toml"]),
+            project("b", &["b/pyproject.toml"]),
+        ];
+        let manifest = "[project]\nname = \"x\"\ndependencies = [\"httpx>=0.25\"]\n";
+        let (edges, diagnostics) = run(
+            &projects,
+            &[
+                ("a/pyproject.toml", manifest),
+                ("a/poetry.lock", "[[package]"),
+                ("b/pyproject.toml", manifest),
+                ("b/requirements.txt", "httpx==0.28.1\n"),
+            ],
+        );
+        assert_eq!(
+            edges,
+            [
+                r#"a -> py/httpx@? [exact] {"declared":">=0.25","scope":"runtime","version_from":"unresolved"}"#,
+                r#"b -> py/httpx@? [exact] {"declared":">=0.25","scope":"runtime","version_from":"unresolved"}"#,
+            ]
+        );
+        assert_eq!(
+            diagnostics,
+            [
+                "lockfile_unreadable a/poetry.lock",
+                "lockfile_unread b/requirements.txt"
+            ]
+        );
+    }
+
+    /// Contract M6d S6: only registry (or absent) sources pin; git,
+    /// editable, directory and url sources never do.
+    #[test]
+    fn uv_lock_skips_non_registry_sources() {
+        let lock = uv_lock(
+            r#"version = 1
+[[package]]
+name = "reg"
+version = "1.0"
+source = { registry = "https://pypi.org/simple" }
+[[package]]
+name = "bare"
+version = "1.0"
+[[package]]
+name = "gitted"
+version = "1.0"
+source = { git = "https://example.com/g.git" }
+[[package]]
+name = "ed"
+version = "1.0"
+source = { editable = "." }
+[[package]]
+name = "dir"
+version = "1.0"
+source = { directory = "../dir" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lock.into_iter().collect::<Vec<_>>(),
+            [
+                ("bare".to_owned(), "1.0".to_owned()),
+                ("reg".to_owned(), "1.0".to_owned())
+            ]
+        );
+        assert!(uv_lock("version = 1\n").is_err());
+        assert!(poetry_lock("[[package]\n").is_err());
+    }
+
+    /// Contract M6d S6: evidence points at the dependency's own entry.
+    #[test]
+    fn python_dependency_spans_point_at_the_entry() {
+        let text = PEP621_PYPROJECT;
+        let deps = pyproject_deps(text);
+        assert_eq!(deps.len(), 4);
+        let at = |name: &str| {
+            let start = text.find(name).unwrap();
+            span_of(text, start, start + name.len())
+        };
+        assert_eq!(deps[0].span, at("fastapi"));
+        assert_eq!(deps[2].span, at("\"bare\"\n".trim_matches(['"', '\n'])));
+        let poetry = pyproject_deps(POETRY_PYPROJECT);
+        let key = |name: &str| {
+            let line = POETRY_PYPROJECT
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap();
+            let start = POETRY_PYPROJECT.find(line).unwrap();
+            span_of(POETRY_PYPROJECT, start, start + name.len())
+        };
+        assert_eq!(
+            poetry.iter().find(|d| d.name == "requests").unwrap().span,
+            key("requests")
+        );
     }
 }

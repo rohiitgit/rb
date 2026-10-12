@@ -381,6 +381,14 @@ pub enum Init {
         text: String,
         span: Span,
     },
+    /// A member of a destructured object (contract M6b S9): `const { get } =
+    /// axios` holds `axios.get` under the local name. The object as written
+    /// (a name, a member path, or a `require("module")` module); the member is
+    /// the binding's own name. Never folded (a hole, like no initialiser).
+    Member {
+        object: String,
+        span: Span,
+    },
     /// `a ?? 'lit'` or `a || 'lit'`: the name `a` with a default string.
     Fallback {
         primary: String,
@@ -393,6 +401,12 @@ pub enum Init {
     },
 }
 
+/// `true` for `serde(default)` on facts that predated the field, all of
+/// which were `this` writes.
+fn default_true() -> bool {
+    true
+}
+
 /// A member write `this.x = <value>` (TS/JS) or `this.x = <value>` (Java), in source
 /// order (contract M6b S1). The value is summarised as an initialiser when it has a
 /// foldable shape; `None` for anything else (still a write for single-assignment
@@ -403,6 +417,10 @@ pub enum Init {
 pub struct MemberWrite {
     pub member: String,
     pub value: Option<Init>,
+    /// The written object is `this` (contract M6b S6: anything else still
+    /// counts for single-assignment, but never folds).
+    #[serde(default = "default_true")]
+    pub on_this: bool,
     pub enclosing: Option<usize>,
     /// The write sits in a constructor: a TS/JS `method_definition` named `constructor`
     /// or a Java `constructor_declaration` (TypeScript constructors are not definitions:
@@ -734,8 +752,16 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                     point(to.column),
                 ],
                 init: b
-                    .value
-                    .and_then(|v| calls::init(language, v, source, &chain_index)),
+                    .destructured_from
+                    .clone()
+                    .map(|object| Init::Member {
+                        object,
+                        span: span(b.node),
+                    })
+                    .or_else(|| {
+                        b.value
+                            .and_then(|v| calls::init(language, v, source, &chain_index))
+                    }),
                 constant: b.constant,
                 decorations: if language == Language::Java {
                     decorations::decorations(language, b.node, source)
@@ -802,7 +828,10 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             .into_iter()
             .map(|w| MemberWrite {
                 member: w.member,
-                value: calls::init(language, w.value, source, &chain_index),
+                value: w
+                    .value
+                    .and_then(|v| calls::init(language, v, source, &chain_index)),
+                on_this: w.on_this,
                 enclosing: enclosing(w.node.start_byte(), &starts, &ends, &lexical_parent)
                     .map(|i| nearest_kept(i, &kept, &lexical_parent)),
                 ctor: w.ctor,

@@ -1,2 +1,2 @@
-  code: 100.0% of references to own code resolved (1 resolved, 0 ambiguous, 0 unresolved; 0 external); 6 exact calls (scip)
-  scip: . scip-java ok, definitions matched 53/53 (1 by name), definitions without occurrence 0, references matched 6, external 14, undocumented 2, local 0, unanchored 1, unmatched 0, unconverted 0, documents rejected 0, relationships dropped 9 (0 in project, 0 anonymous)
+  code: 100.0% of references to own code resolved (1 resolved, 0 ambiguous, 0 unresolved; 0 external); 7 exact calls (scip)
+  scip: . scip-java ok, definitions matched 75/75 (1 by name), definitions without occurrence 0, references matched 7, external 17, undocumented 2, local 0, unanchored 2, unmatched 0, unconverted 0, documents rejected 0, lombok-generated 12 in 1 documents, relationships dropped 12 (0 in project, 0 anonymous)

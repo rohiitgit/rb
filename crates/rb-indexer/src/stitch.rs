@@ -98,6 +98,12 @@ pub(crate) struct Site {
     pub method: Option<String>,
     /// `None` when the URL is not a string or a name.
     pub url: Option<Folded>,
+    /// A generated-client call (contract M6f S6): stitched by operation/RPC name, never by
+    /// URL. `None` for URL sites.
+    pub generated: Option<GeneratedSite>,
+    /// The request value reaches an in-process sink (contract M6b S4): never
+    /// stitched, whatever the URL folds to.
+    pub in_process: bool,
     /// A Spring property the URL folded is also set by a configuration file M4a does not read
     /// (a profile, YAML or bootstrap file), so the folded value may not be the deployed one
     /// (evaluator pass 1, P7).
@@ -113,12 +119,29 @@ pub(crate) struct Site {
     pub base_verified: Option<bool>,
     /// The repository configures service discovery or a load balancer, which may bind the
     /// service a host names to any instance: a host-by-name match (F1) is never `synthetic`,
-    /// and its edge says `discovery: configured` (contract M4a amendment 17, W4).
+    /// and its edge says `discovery: configured` (contract M4a amendment 17, W4). This is the
+    /// narrowed rule (contract M6b S8): raw-file evidence, parsed-file
+    /// single-literal keys, or import-resolved known types.
     pub discovery: bool,
+    /// The broad rule (contract M5 S19 (a)): parsed-file discovery words and
+    /// unresolved Java imports included. Compared against [`Site::discovery`]
+    /// to count the sites narrowing lifted (`discovery_lifted`, invariant 6);
+    /// never caps.
+    pub discovery_broad: bool,
     /// The values a contested base joined to the URL may take, folded (contract M5 S19 (f)):
     /// one naming an external host makes the site external. Empty when the base is decided or
     /// unknown with no stated value, or does not apply (an absolute URL).
     pub base_candidates: Vec<Folded>,
+}
+
+/// A generated-client call site (contract M6f S6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedSite {
+    pub kind: rb_frameworks::clients::GeneratedKind,
+    /// The operationId or RPC name.
+    pub operation: String,
+    /// The `*Api` receiver, stub class or service, for scoping.
+    pub carrier: String,
 }
 
 /// A service as the host rule (D6) sees it.
@@ -144,8 +167,9 @@ struct Outcome {
     links: Vec<Link>,
     /// Candidates of a `too_ambiguous` site.
     candidates: usize,
-    /// Why an `unmatched` site is unmatched, when a rule removed its only path match
-    /// (`catch_all_only`, contract M4b S20).
+    /// Why an `unmatched` site is unmatched: a rule that removed its only
+    /// path match (`catch_all_only`, contract M4b S20), or an S4 exclusion
+    /// (`in_process`, `empty_url`, contract M6b S4).
     detail: Option<&'static str>,
 }
 
@@ -249,10 +273,10 @@ impl<'a, 'i> Folding<'a, 'i> {
         })
     }
 
-    fn value(&self, file: usize, v: &UrlValue) -> Option<Folded> {
+    fn value(&self, folder: &mut fold::Folder<'_>, file: usize, v: &UrlValue) -> Option<Folded> {
         match v {
-            UrlValue::Template(t) => Some(fold::fold_template(self, file, t)),
-            UrlValue::Name { text, span } => Some(fold::fold_name(self, file, text, *span)),
+            UrlValue::Template(t) => Some(folder.fold_template(file, t)),
+            UrlValue::Name { text, span } => Some(folder.fold_name(file, text, *span)),
             UrlValue::Unknown | UrlValue::Contested(_) => None,
         }
     }
@@ -325,24 +349,25 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
     }
     // A file without facts may hook a kind too, or configure discovery (amendment 17), as may
     // Java code naming Spring Cloud LoadBalancer or Ribbon by an import or a fully qualified
-    // annotation.
+    // annotation. Contract M6b S8 (D7) narrows the parsed-file evidence to positively resolved
+    // forms — a type use resolving through imports to a discovery package
+    // ([`rb_frameworks::clients::discovery_resolved`]) or a fully qualified
+    // use — and single-literal JSON keys
+    // ([`rb_frameworks::clients::single_literal_discovery`]); raw-text hits
+    // stay capped. The broad rule is kept to count the lifted sites.
     hooked.extend(inputs.unparsed.hooks.iter().copied());
-    let discovery_package = rb_frameworks::clients::discovery_package;
-    let discovery = inputs.unparsed.discovery
-        || inputs.files.values().any(|(language, facts)| {
-            *language == Language::Java
-                && (facts.imports.iter().any(|i| discovery_package(&i.module))
-                    || facts
-                        .definitions
-                        .iter()
-                        .flat_map(|d| &d.decorations)
-                        .any(|d| {
-                            d.name
-                                .rsplit_once('.')
-                                .is_some_and(|(q, _)| discovery_package(q))
-                        }))
-        });
+    let (broad, discovery) = rb_frameworks::clients::discovery_flags(
+        inputs.unparsed,
+        inputs
+            .files
+            .values()
+            .map(|(language, facts)| (*language, *facts)),
+    );
     let mut out = Vec::new();
+    // One folder for the run: per-file indexes, member proofs and clean
+    // folds amortize across sites (a fresh step budget per fold, as with a
+    // fresh folder per call).
+    let mut folder = rb_frameworks::fold::Folder::new(&folding);
     for (&path, file_clients) in &clients {
         let file = folding.ids[path];
         let facts = inputs.files[path].1;
@@ -382,18 +407,38 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 },
                 None => stated,
             };
-            let url = folding.value(file, &call.url);
+            let url = folding.value(&mut folder, file, &call.url);
             let base_candidates = match (&base, &url) {
                 (Some((base_file, UrlValue::Contested(values))), Some(url)) if joins_base(url) => {
-                    values
-                        .iter()
-                        .filter_map(|v| folding.value(*base_file, v))
-                        .collect()
+                    let mut candidates: Vec<Folded> = Vec::new();
+                    for v in values {
+                        // A spread the pack could not read (contract M6b S5):
+                        // its object through the unique declaration, if any.
+                        if let UrlValue::Name { text, span } = v {
+                            let mut seen = HashSet::new();
+                            let mut objects = Vec::new();
+                            rb_frameworks::fold::object_values(
+                                &folding,
+                                *base_file,
+                                text,
+                                *span,
+                                &mut seen,
+                                &mut objects,
+                            );
+                            candidates.extend(
+                                objects
+                                    .iter()
+                                    .filter_map(|o| folding.value(&mut folder, *base_file, o)),
+                            );
+                        }
+                        candidates.extend(folding.value(&mut folder, *base_file, v));
+                    }
+                    candidates
                 }
                 _ => Vec::new(),
             };
             let url = url.map(|url| match &base {
-                Some((base_file, b)) => join(folding.value(*base_file, b), url),
+                Some((base_file, b)) => join(folding.value(&mut folder, *base_file, b), url),
                 None => url,
             });
             let src = match call.source {
@@ -410,11 +455,46 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 client: call.kind,
                 method: call.method.clone(),
                 url,
+                // A request that never leaves the process (contract M6b
+                // S4): unmatched, never an edge.
+                in_process: file_clients.in_process.contains(&call.span),
                 config_overridden: folding.take_asked(),
                 base_from_bean: from_bean.is_some(),
                 base_verified,
                 discovery,
+                discovery_broad: broad,
                 base_candidates,
+                generated: None,
+            });
+        }
+        for gencall in &file_clients.generated {
+            // Generated calls stitch by operation/RPC name (below); they fold nothing.
+            let kind = match gencall.kind {
+                rb_frameworks::clients::GeneratedKind::OpenApi => ClientKind::OpenApi,
+                rb_frameworks::clients::GeneratedKind::Grpc => ClientKind::Grpc,
+            };
+            out.push(Site {
+                src: NodeKey::new(NodeKind::File, path),
+                at: Evidence {
+                    path: path.to_owned(),
+                    span: gencall.span,
+                },
+                service: service.clone(),
+                client: kind,
+                method: None,
+                url: None,
+                generated: Some(GeneratedSite {
+                    kind: gencall.kind,
+                    operation: gencall.operation.clone(),
+                    carrier: gencall.carrier.clone(),
+                }),
+                in_process: file_clients.in_process.contains(&gencall.span),
+                config_overridden: false,
+                base_from_bean: false,
+                base_verified: None,
+                discovery: false,
+                discovery_broad: false,
+                base_candidates: Vec::new(),
             });
         }
     }
@@ -595,6 +675,31 @@ impl EndpointIndex {
     }
 }
 
+/// Whether a GRPC endpoint's target names `service` with RPC `rpc` (contract M6f S6): the
+/// carrier's `Grpc` suffix is the stub class, not the service (`GreeterGrpc` serves `Greeter`),
+/// and stub generators re-case the RPC's first letter (Java `sayHello` for `SayHello`), so the
+/// method matches with its first letter folded.
+fn grpc_target_match(e: &EndpointRef, carrier: &str, rpc: &str) -> bool {
+    if e.method != "GRPC" {
+        return false;
+    }
+    let Some((service_part, method)) = e.path.rsplit_once('/') else {
+        return false;
+    };
+    if method.is_empty() || rpc.is_empty() {
+        return false;
+    }
+    if method.len() != rpc.len()
+        || method[1..] != rpc[1..]
+        || !method[..1].eq_ignore_ascii_case(&rpc[..1])
+    {
+        return false;
+    }
+    let service = service_part.rsplit('.').next().unwrap_or(service_part);
+    let carrier = carrier.strip_suffix("Grpc").unwrap_or(carrier);
+    service == carrier
+}
+
 /// How the host restricts candidates (D6).
 enum Scope<'s> {
     /// No host, a host with a hole, or one naming several services: every other service.
@@ -650,9 +755,35 @@ impl<'e> Stitcher<'e> {
 
     /// The bucket and edges of one site (S13, S14).
     fn site(&self, site: &Site) -> Outcome {
+        // An in-process request never leaves the process (contract M6b S4):
+        // never stitched, whatever the URL folds to.
+        if site.in_process {
+            return Outcome {
+                detail: Some("in_process"),
+                ..Outcome::bucket(Bucket::Unmatched)
+            };
+        }
+        // A generated-client call stitches by operation/RPC name (contract M6f S6), never by
+        // URL: it folds nothing.
+        if let Some(generated) = &site.generated {
+            return self.generated(site, generated);
+        }
         let Some(folded) = &site.url else {
             return Outcome::bucket(Bucket::Dynamic);
         };
+        // An empty URL is never path-matched (contract M6b S4): no literal
+        // text and no holes. `""` normalises to `/` below, so this check
+        // comes first.
+        if folded
+            .pieces
+            .iter()
+            .all(|p| matches!(p, Piece::Lit(l) if l.is_empty()))
+        {
+            return Outcome {
+                detail: Some("empty_url"),
+                ..Outcome::bucket(Bucket::Unmatched)
+            };
+        }
         let url = client_url(&folded.pieces);
         // A host hole next to an FQDN fragment names no service (amendment 12, Q2).
         if url.host_external.is_some() {
@@ -777,6 +908,9 @@ impl<'e> Stitcher<'e> {
         }
         // A host naming a service may be bound to other instances by discovery (W4).
         let rebound = site.discovery && !matches!(scope, Scope::Any);
+        // ... unless narrowing lifted the cap (contract M6b S8): broad
+        // evidence with no positively resolved form.
+        let lifted = site.discovery_broad && !site.discovery && !matches!(scope, Scope::Any);
         if rebound {
             attrs.insert("discovery".into(), "configured".into());
         }
@@ -827,6 +961,96 @@ impl<'e> Stitcher<'e> {
             },
             links: vec![Link {
                 endpoint: i,
+                certainty,
+                attrs,
+            }],
+            candidates: 1,
+            detail: lifted.then_some("discovery_lifted"),
+        }
+    }
+
+    /// A generated-client call's matches (contract M6f S6): endpoints stating its operationId,
+    /// or GRPC endpoints whose target names its service and RPC. Sorted by key, so the outcome
+    /// never depends on endpoint order.
+    fn generated_matches(&self, generated: &GeneratedSite) -> Vec<usize> {
+        let mut found: Vec<usize> = match generated.kind {
+            rb_frameworks::clients::GeneratedKind::OpenApi => self
+                .endpoints
+                .iter()
+                .enumerate()
+                .inspect(|_| rb_frameworks::work::tick(1))
+                .filter(|(_, e)| e.operations.iter().any(|o| o == &generated.operation))
+                .map(|(i, _)| i)
+                .collect(),
+            rb_frameworks::clients::GeneratedKind::Grpc => self
+                .endpoints
+                .iter()
+                .enumerate()
+                .inspect(|_| rb_frameworks::work::tick(1))
+                .filter(|(_, e)| grpc_target_match(e, &generated.carrier, &generated.operation))
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        found.sort_by_key(|&i| &self.endpoints[i].key);
+        found
+    }
+
+    /// Stitches a generated-client call (contract M6f S6): the certainty never exceeds
+    /// `synthetic` (closing bar (f)); a name match cannot tell a self call from a foreign one,
+    /// so any own-service match makes the site self (M4a invariant 5 — self is never linked).
+    fn generated(&self, site: &Site, generated: &GeneratedSite) -> Outcome {
+        let found = self.generated_matches(generated);
+        if found.is_empty() {
+            return Outcome::bucket(Bucket::Unmatched);
+        }
+        if found
+            .iter()
+            .any(|&i| self.endpoints[i].service == site.service)
+        {
+            return Outcome::bucket(Bucket::OwnService);
+        }
+        let n = found.len();
+        if n > MAX_CANDIDATES {
+            return Outcome {
+                candidates: n,
+                ..Outcome::bucket(Bucket::TooAmbiguous)
+            };
+        }
+        let mut attrs = Attrs::new();
+        attrs.insert(
+            "match".into(),
+            match generated.kind {
+                rb_frameworks::clients::GeneratedKind::OpenApi => "operation",
+                rb_frameworks::clients::GeneratedKind::Grpc => "rpc",
+            }
+            .into(),
+        );
+        attrs.insert("client".into(), site.client.as_str().into());
+        if n > 1 {
+            attrs.insert("candidates".into(), n.into());
+            return Outcome {
+                bucket: Bucket::Ambiguous,
+                links: found
+                    .iter()
+                    .map(|&i| Link {
+                        endpoint: i,
+                        certainty: Certainty::Ambiguous,
+                        attrs: attrs.clone(),
+                    })
+                    .collect(),
+                candidates: n,
+                detail: None,
+            };
+        }
+        let certainty = Certainty::Synthetic.min(self.endpoints[found[0]].certainty);
+        Outcome {
+            bucket: if certainty == Certainty::Synthetic {
+                Bucket::Synthetic
+            } else {
+                Bucket::Heuristic
+            },
+            links: vec![Link {
+                endpoint: found[0],
                 certainty,
                 attrs,
             }],
@@ -904,11 +1128,33 @@ pub(crate) fn add_consumes(
     let mut merged: BTreeMap<(NodeKey, usize), Merged> = BTreeMap::new();
     let mut diagnostics = Vec::new();
     let mut counts: BTreeMap<Bucket, usize> = Bucket::ALL.iter().map(|&k| (k, 0)).collect();
+    let mut in_process = 0;
+    let mut empty_url = 0;
+    let mut lifted = 0;
     for site in sites {
         let outcome = stitcher.site(site);
         *counts.entry(outcome.bucket).or_default() += 1;
-        if let Some(kind) = outcome.bucket.diagnostic() {
+        match outcome.detail {
+            Some("in_process") => in_process += 1,
+            Some("empty_url") => empty_url += 1,
+            // Contract M6b S8 (invariant 6): a stitched host match the broad
+            // rule would have capped but the narrowed rule lifts.
+            Some("discovery_lifted") => lifted += 1,
+            _ => {}
+        }
+        // Contract M6b S4 (D4): in-process and empty-URL sites are
+        // `unmatched` with their own diagnostic kinds, never silent drops.
+        let kind = match outcome.detail {
+            Some("in_process") => Some("http_in_process"),
+            Some("empty_url") => Some("http_empty_url"),
+            _ => outcome.bucket.diagnostic(),
+        };
+        if let Some(kind) = kind {
             let mut detail = json!({ "client": site.client.as_str() });
+            if let Some(generated) = &site.generated {
+                detail["operation"] = generated.operation.as_str().into();
+                detail["carrier"] = generated.carrier.as_str().into();
+            }
             if let Some(url) = &site.url {
                 detail["url"] = render(url).into();
                 let u = client_url(&url.pieces);
@@ -977,6 +1223,27 @@ pub(crate) fn add_consumes(
             "bases".into(),
             json!({ "verified": bases(true), "unverified": bases(false) }),
         );
+        // Contract M6b S4 (D3, invariant 4): the `unmatched` bucket splits
+        // into plain-unmatched and the exclusions, so the buckets still sum
+        // to the sites. The split counts ride along only when non-zero, so
+        // unrelated dumps stay byte-identical.
+        if in_process > 0 || empty_url > 0 {
+            let plain =
+                detail["unmatched"].as_u64().unwrap_or(0) - in_process as u64 - empty_url as u64;
+            detail.insert("unmatched".into(), plain.into());
+            if in_process > 0 {
+                detail.insert("http_in_process".into(), in_process.into());
+            }
+            if empty_url > 0 {
+                detail.insert("http_empty_url".into(), empty_url.into());
+            }
+        }
+        // Contract M6b S8 (D3, invariant 6): the lifted-site count rides
+        // along only when non-zero. Lifted sites already count in their
+        // buckets, so the buckets still sum to the sites.
+        if lifted > 0 {
+            detail.insert("discovery_lifted".into(), lifted.into());
+        }
         diagnostics.push(Diagnostic {
             kind: "http_coverage".into(),
             path: None,
@@ -989,7 +1256,7 @@ pub(crate) fn add_consumes(
 
 #[cfg(test)]
 mod tests {
-    use rb_frameworks::endpoint::{endpoint_key, norm_path};
+    use rb_frameworks::endpoint::{endpoint_key, grpc_key, norm_path};
     use rb_model::Graph;
 
     use super::*;
@@ -1026,6 +1293,7 @@ mod tests {
             certainty: Certainty::Exact,
             hosts: Vec::new(),
             prefix_maybe_incomplete: false,
+            operations: Vec::new(),
         }
     }
 
@@ -1075,11 +1343,14 @@ mod tests {
             client: ClientKind::Fetch,
             method: method.map(str::to_owned),
             url: url.map(|(t, o)| folded(t, o)),
+            in_process: false,
             config_overridden: false,
             base_from_bean: false,
             base_verified: None,
             discovery: false,
+            discovery_broad: false,
             base_candidates: Vec::new(),
+            generated: None,
         }
     }
 
@@ -1639,6 +1910,224 @@ mod tests {
         let none = call("http://notification/nothing/here");
         assert_eq!(one(&eps, &none).0, Bucket::Unmatched);
         assert_eq!(detail(&eps, &none), None);
+    }
+
+    /// Contract M6b S4: an in-process request is `unmatched` and never
+    /// stitched — even with a foreign absolute URL that is otherwise the
+    /// `synthetic` row. Its diagnostic kind is its own (`http_in_process`,
+    /// D4), not `http_unmatched`.
+    #[test]
+    fn in_process_requests_are_unmatched() {
+        let eps = endpoints();
+        let sunk = Site {
+            in_process: true,
+            ..site(
+                AUTH,
+                Some("POST"),
+                Some(("http://notification:3000/internal/mfa/email", Literal)),
+                1,
+            )
+        };
+        assert_eq!(one(&eps, &sunk), (Bucket::Unmatched, vec![]));
+        assert_eq!(detail(&eps, &sunk), Some("in_process"));
+        let mut b = GraphBuilder::new();
+        let diagnostics =
+            add_consumes(&mut b, std::slice::from_ref(&sunk), &eps, &services()).unwrap();
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_in_process")
+            .unwrap();
+        assert_eq!(diagnostic.detail["detail"], "in_process");
+        assert!(diagnostics.iter().all(|d| d.kind != "http_unmatched"));
+    }
+
+    /// Contract M6b S4: an empty URL is never path-matched — not even to
+    /// `/`, which today is what `""` normalises to. Its diagnostic kind is
+    /// its own (`http_empty_url`, D4).
+    #[test]
+    fn empty_urls_are_never_path_matched() {
+        let mut eps = endpoints();
+        eps.push(ep("GET", "/", NOTIFICATION));
+        let empty = site(WEB, Some("GET"), Some(("", Literal)), 1);
+        assert_eq!(one(&eps, &empty), (Bucket::Unmatched, vec![]));
+        assert_eq!(detail(&eps, &empty), Some("empty_url"));
+        // The control: a literal `/` still matches.
+        let slash = site(WEB, Some("GET"), Some(("/", Literal)), 2);
+        assert_eq!(one(&eps, &slash).0, Bucket::Heuristic);
+        assert_eq!(detail(&eps, &slash), None);
+    }
+
+    /// Contract M6b S4: a site that is both in-process and empty counts as
+    /// in-process — the sink evidence dominates.
+    #[test]
+    fn in_process_beats_empty_url() {
+        let eps = endpoints();
+        let sunk = Site {
+            in_process: true,
+            ..site(WEB, Some("GET"), Some(("", Literal)), 1)
+        };
+        assert_eq!(one(&eps, &sunk), (Bucket::Unmatched, vec![]));
+        assert_eq!(detail(&eps, &sunk), Some("in_process"));
+    }
+
+    /// Contract M6b S4, invariant 4 and D3: every exclusion lands in exactly
+    /// one counted bucket (`unmatched`), the split counts ride along only
+    /// when non-zero, and the buckets still sum to the sites.
+    #[test]
+    fn s4_exclusions_are_counted_but_only_when_non_zero() {
+        let eps = endpoints();
+        let sunk = Site {
+            in_process: true,
+            ..site(
+                AUTH,
+                Some("POST"),
+                Some(("http://notification:3000/internal/mfa/email", Literal)),
+                1,
+            )
+        };
+        let empty = site(WEB, Some("GET"), Some(("", Literal)), 2);
+        let plain = site(WEB, Some("GET"), Some(("/nowhere", Literal)), 3);
+        let sites = vec![sunk, empty, plain];
+        let mut b = GraphBuilder::new();
+        for e in &eps {
+            b.add_node(
+                NodeKey::new(NodeKind::Endpoint, e.key.clone()),
+                &e.key,
+                Attrs::new(),
+            )
+            .unwrap();
+        }
+        for s in &sites {
+            if !b.has_node(&s.src) {
+                b.add_node(s.src.clone(), "f", Attrs::new()).unwrap();
+            }
+        }
+        let diagnostics = add_consumes(&mut b, &sites, &eps, &services()).unwrap();
+        let kinds: Vec<&str> = diagnostics.iter().map(|d| d.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "http_in_process",
+                "http_empty_url",
+                "http_unmatched",
+                "http_coverage"
+            ]
+        );
+        let coverage = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_coverage")
+            .unwrap();
+        assert_eq!(
+            coverage.detail,
+            json!({"sites": 3, "synthetic": 0, "heuristic": 0, "ambiguous": 0, "too_ambiguous": 0,
+                   "unmatched": 1, "self": 0, "external": 0, "dynamic": 0,
+                   "http_in_process": 1, "http_empty_url": 1,
+                   "bases": {"verified": 0, "unverified": 0}})
+        );
+        // Invariant 4, extended: the buckets plus the S4 split sum to the sites.
+        let total: u64 = Bucket::ALL
+            .iter()
+            .map(|b| coverage.detail[b.as_str()].as_u64().unwrap())
+            .sum::<u64>()
+            + coverage.detail["http_in_process"].as_u64().unwrap_or(0)
+            + coverage.detail["http_empty_url"].as_u64().unwrap_or(0);
+        assert_eq!(total, sites.len() as u64);
+        // D3: no S4 site, no S4 counter.
+        let mut b = GraphBuilder::new();
+        let diagnostics = add_consumes(&mut b, &sites[2..], &eps, &services()).unwrap();
+        let coverage = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_coverage")
+            .unwrap();
+        assert!(coverage.detail.get("http_in_process").is_none());
+        assert!(coverage.detail.get("http_empty_url").is_none());
+    }
+
+    /// Contract M6b S8 (D7, invariant 6): narrowing lifts the discovery cap
+    /// only where no positive evidence reaches — a host-by-name match with
+    /// broad evidence but no resolved evidence is `synthetic` again, and each
+    /// such site is counted (`discovery_lifted`, non-zero-only). A site the
+    /// narrowed rule still reaches stays capped; a host-less suffix match was
+    /// never capped, so neither counts.
+    #[test]
+    fn discovery_narrowing_lifts_and_counts() {
+        let eps = endpoints();
+        let lifted = Site {
+            discovery: false,
+            discovery_broad: true,
+            ..site(
+                AUTH,
+                Some("POST"),
+                Some(("http://notification:3000/internal/mfa/email", Literal)),
+                1,
+            )
+        };
+        // The cap lifts: synthetic again, marked for the count.
+        assert_eq!(one(&eps, &lifted).0, Bucket::Synthetic);
+        assert_eq!(detail(&eps, &lifted), Some("discovery_lifted"));
+        // The control: positive evidence still caps.
+        let capped = Site {
+            discovery: true,
+            ..lifted.clone()
+        };
+        let (bucket, links) = one(&eps, &capped);
+        assert_eq!(bucket, Bucket::Heuristic);
+        assert!(
+            links[0].contains("\"discovery\":\"configured\""),
+            "{links:?}"
+        );
+        assert_eq!(detail(&eps, &capped), None);
+        // A host-less suffix match never rebounds: narrowing changes nothing
+        // there and counts nothing.
+        let suffix = Site {
+            discovery: false,
+            discovery_broad: true,
+            ..site(
+                WEB,
+                Some("POST"),
+                Some(("{?}/invoices/{?}/pay", Literal)),
+                2,
+            )
+        };
+        assert_eq!(one(&eps, &suffix).0, Bucket::Heuristic);
+        assert_eq!(detail(&eps, &suffix), None);
+        // The count rides along only when non-zero (D3).
+        let nodes = |b: &mut GraphBuilder, sites: &[Site]| {
+            for e in &eps {
+                if !b.has_node(&NodeKey::new(NodeKind::Endpoint, e.key.clone())) {
+                    b.add_node(
+                        NodeKey::new(NodeKind::Endpoint, e.key.clone()),
+                        &e.key,
+                        Attrs::new(),
+                    )
+                    .unwrap();
+                }
+            }
+            for s in sites {
+                if !b.has_node(&s.src) {
+                    b.add_node(s.src.clone(), "f", Attrs::new()).unwrap();
+                }
+            }
+        };
+        let sites = vec![lifted.clone(), capped.clone(), suffix.clone()];
+        let mut b = GraphBuilder::new();
+        nodes(&mut b, &sites);
+        let diagnostics = add_consumes(&mut b, &sites, &eps, &services()).unwrap();
+        let coverage = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_coverage")
+            .unwrap();
+        assert_eq!(coverage.detail["discovery_lifted"], 1);
+        // No lifted site, no counter.
+        let rest = vec![capped, suffix];
+        let mut b = GraphBuilder::new();
+        nodes(&mut b, &rest);
+        let diagnostics = add_consumes(&mut b, &rest, &eps, &services()).unwrap();
+        let coverage = diagnostics
+            .iter()
+            .find(|d| d.kind == "http_coverage")
+            .unwrap();
+        assert!(coverage.detail.get("discovery_lifted").is_none());
     }
 
     /// Evaluator pass 1, P1 (the evaluator's repros, folded URLs): a hole in the port keeps a
@@ -2363,6 +2852,7 @@ mod tests {
         // the bases of injected clients (contract M4b S21).
         let deployable: BTreeSet<String> = by_path.keys().map(|p| service_of(p)).collect();
         let depends = BTreeMap::new();
+        let empty_manifests: BTreeMap<&str, String> = BTreeMap::new();
         let resolution = crate::di::resolve(&crate::di::Inputs {
             files: &by_path,
             keys: &keys,
@@ -2371,6 +2861,7 @@ mod tests {
             deployable: &deployable,
             depends: &depends,
             unparsed,
+            manifests: &empty_manifests,
         });
         let inputs = Inputs {
             files: &by_path,
@@ -2552,6 +3043,107 @@ mod tests {
             .collect()
     }
 
+    /// Contract M6f S6: operationId calls stitch by operation name (unique → synthetic, own
+    /// service → self, unknown → unmatched, several → ambiguous); RPC calls stitch by
+    /// service+method; an own-service match makes the site self; certainty never exceeds
+    /// synthetic.
+    #[test]
+    fn generated_calls_stitch_by_operation_and_rpc_name() {
+        let caller = "import { UsersApi } from './gen';\nconst usersApi = new UsersApi();\nexport async function f() {\n  await usersApi.listUsers();\n  await usersApi.missing();\n}\n";
+        let selfcaller = "import { UsersApi } from './gen';\nconst usersApi = new UsersApi();\nexport async function g() {\n  await usersApi.listUsers();\n}\n";
+        let mut list = ep("GET", "/users", "orders");
+        list.operations = vec!["listUsers".into()];
+        let eps = vec![list];
+        assert_eq!(
+            stitched(
+                &[
+                    ("web/src/a.ts", Language::TypeScript, caller),
+                    ("orders/src/b.ts", Language::TypeScript, selfcaller)
+                ],
+                &eps,
+                &["web", "orders"],
+            ),
+            [
+                "orders/src/b.ts 3 self",
+                "web/src/a.ts 3 synthetic -> HTTP GET /users @orders [synthetic]",
+                "web/src/a.ts 4 unmatched",
+            ]
+        );
+        // Two foreign services sharing the operation: ambiguous; an own-service match makes
+        // the site self instead of linking.
+        let mut billing = ep("GET", "/users", "billing");
+        billing.operations = vec!["listUsers".into()];
+        let mut mine = ep("GET", "/users", "web");
+        mine.operations = vec!["listUsers".into()];
+        assert_eq!(
+            stitched(
+                &[("web/src/a.ts", Language::TypeScript, caller)],
+                std::slice::from_ref(&mine),
+                &["web", "orders", "billing"],
+            ),
+            ["web/src/a.ts 3 self", "web/src/a.ts 4 unmatched"]
+        );
+        let mut other = ep("GET", "/users", "orders");
+        other.operations = vec!["listUsers".into()];
+        let eps = vec![billing, other];
+        assert_eq!(
+            stitched(
+                &[("web/src/a.ts", Language::TypeScript, caller)],
+                &eps,
+                &["web", "orders", "billing"],
+            ),
+            [
+                "web/src/a.ts 3 ambiguous -> HTTP GET /users @billing [ambiguous] -> HTTP GET /users @orders [ambiguous]",
+                "web/src/a.ts 4 unmatched"
+            ]
+        );
+    }
+
+    /// Contract M6f S6: gRPC stub calls stitch by service and RPC name.
+    #[test]
+    fn grpc_calls_stitch_by_service_and_rpc_name() {
+        let java = "class C {\n  void f(Object ch, Object req) {\n    GreeterGrpc.newBlockingStub(ch).sayHello(req);\n    GreeterGrpc.newBlockingStub(ch).unknown(req);\n  }\n}\n";
+        let greet = EndpointRef {
+            key: grpc_key("acme", "Greeter", "SayHello", "orders"),
+            method: "GRPC".into(),
+            path: "acme.Greeter/SayHello".into(),
+            service: "orders".into(),
+            prefix_unknown: false,
+            certainty: Certainty::Exact,
+            hosts: Vec::new(),
+            prefix_maybe_incomplete: false,
+            operations: Vec::new(),
+        };
+        assert_eq!(
+            stitched(
+                &[("web/src/C.java", Language::Java, java)],
+                std::slice::from_ref(&greet),
+                &["web", "orders"],
+            ),
+            [
+                "web/src/C.java 2 synthetic -> GRPC acme.Greeter/SayHello @orders [synthetic]",
+                "web/src/C.java 3 unmatched",
+            ]
+        );
+    }
+
+    /// Contract M6b S7, from source: `scheme://user…hole…@host` matches
+    /// within the literal host — here a template hole for the password with
+    /// a service host after `@` stitches exactly as the literal URL would.
+    #[test]
+    fn userinfo_holes_match_within_the_literal_host() {
+        let ts = "import axios from \"axios\";\nexport async function f(token: string) {\n  await axios.get(`http://deploy:${token}@orders/orders/1`);\n}\n";
+        let eps = vec![ep("GET", "/orders/{id}", "orders")];
+        assert_eq!(
+            stitched(
+                &[("web/src/a.ts", Language::TypeScript, ts)],
+                &eps,
+                &["web", "orders"],
+            ),
+            ["web/src/a.ts 2 synthetic -> HTTP GET /orders/{} @orders [synthetic]".to_owned(),]
+        );
+    }
+
     /// Contract M4a amendment 12 (evaluator pass 2, Q2) from source: a hole next to a literal
     /// host fragment with a dot, as a template literal, a concatenation, Java `String.format`
     /// and `+`, and Go `fmt.Sprintf` and `+`, is external whatever path follows; a bare host
@@ -2593,7 +3185,8 @@ mod tests {
     /// Contract M4a amendment 12 (evaluator pass 2, Q1) from source: a base stated in the
     /// call's request config, or configured on a Spring client instance, decides the host; an
     /// external one is never path-matched, and a call overriding an instance's base never
-    /// relies on that instance's base (the evaluator's false `synthetic`).
+    /// relies on that instance's base (the evaluator's false `synthetic`). Contract M6b S5: a
+    /// config passed by name that names nothing readable is dynamic instead.
     #[test]
     fn bases_stated_at_the_call_or_on_the_instance_decide_the_host() {
         let calls = "import axios from \"axios\";\nimport { shared } from \"./http\";\nexport const api = axios.create({ baseURL: \"http://orders\" });\nexport async function f(body: unknown, cfg: object) {\n  await api.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await axios.post(\"/charges\", body, { baseURL: \"https://api.stripe.com\" });\n  await api.get(\"/orders/1\");\n  await api.get(\"/orders/1\", cfg);\n  await shared.get(\"/orders/1\", { baseURL: \"https://api.stripe.com\" });\n  await shared.get(\"/orders/1\");\n}\n";
@@ -2622,7 +3215,9 @@ mod tests {
                 // Both instances are exported, so their bases are never verified (Gate A,
                 // amendment 14): `heuristic`.
                 "web/src/calls.ts 7 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
-                "web/src/calls.ts 8 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
+                // A config passed by name that names nothing readable is dynamic
+                // (contract M6b S5), never suffix-matched.
+                "web/src/calls.ts 8 dynamic",
                 "web/src/calls.ts 9 external",
                 "web/src/calls.ts 10 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
             ]
@@ -3320,9 +3915,12 @@ mod tests {
     /// Contract M5 S19 (f) (M4a open item 21, part), from source: a stated base that cannot be
     /// decided but names an external host among its candidates is external, whatever the path
     /// (evaluator pass 3's `t10` with a resolvable spread, a `baseURL` before such a spread, a
-    /// nested spread, and `j07`'s two Spring bases); with only internal candidates, or none
-    /// (`t25`'s unreadable config, a spread of a parameter), the path is matched by suffix as
-    /// before. A URL that is absolute ignores the base and its candidates.
+    /// nested spread, and `j07`'s two Spring bases, now later-wins but still external through
+    /// the decided host); with only internal candidates the path is matched by suffix as
+    /// before. Contract M6b S5: a config passed by name that resolves to nothing readable is
+    /// dynamic (`t25`'s unreadable config), never suffix-matched; a spread it cannot read names
+    /// its value for cross-file resolution. A URL that is absolute ignores the base and its
+    /// candidates.
     #[test]
     fn contested_bases_with_an_external_candidate_are_external() {
         let ts = "import axios from \"axios\";\nconst api10 = axios.create({ baseURL: \"http://orders\" });\nconst stripeOpts = { baseURL: \"https://api.stripe.com\" };\nconst nested = { ...stripeOpts, timeout: 1 };\nconst ordersOpts = { baseURL: \"http://orders\" };\nexport async function f(cfg) {\n  await api10.get(\"/orders/1\", { ...stripeOpts });\n  await api10.get(\"/orders/1\", cfg);\n  await api10.get(\"/orders/1\", { baseURL: \"http://orders\", ...stripeOpts });\n  await api10.get(\"/orders/1\", { ...nested });\n  await api10.get(\"/orders/1\", { ...ordersOpts });\n  await api10.get(\"/orders/1\", { ...cfg });\n  await api10.get(\"http://orders/orders/1\", { ...stripeOpts });\n}\n";
@@ -3351,14 +3949,41 @@ mod tests {
             ),
             [
                 "pay/src/main/java/p/C7.java 7 external".to_owned(),
-                format!("pay/src/main/java/p/C8.java 7 {suffix}"),
+                // Later-wins restricts to the billing host, whose endpoints
+                // hold no such path: the suffix edge is gone.
+                "pay/src/main/java/p/C8.java 7 unmatched".to_owned(),
                 "web/src/t.ts 6 external".to_owned(),
-                format!("web/src/t.ts 7 {suffix}"),
+                "web/src/t.ts 7 dynamic".to_owned(),
                 "web/src/t.ts 8 external".to_owned(),
                 "web/src/t.ts 9 external".to_owned(),
                 format!("web/src/t.ts 10 {suffix}"),
                 format!("web/src/t.ts 11 {suffix}"),
                 "web/src/t.ts 12 heuristic -> HTTP GET /orders/{} @orders [heuristic] base=unverified match=exact".to_owned(),
+            ]
+        );
+    }
+
+    /// Contract M6b S5, from source: a spread from an imported const reads
+    /// its `baseURL` through the unique declaration. With an external base
+    /// among the candidates the site is external (no edge); with a service
+    /// base the relative path stitches as before.
+    #[test]
+    fn contested_cross_file_spreads() {
+        let opts = "export const extOpts = { baseURL: \"https://api.stripe.com\" };\nexport const orderOpts = { baseURL: \"http://orders\" };\n";
+        let use_ = "import axios from \"axios\";\nimport { extOpts, orderOpts } from \"./opts\";\nexport async function f() {\n  await axios.get(\"/a\", { ...extOpts });\n  await axios.get(\"/b\", { ...orderOpts });\n}\n";
+        let eps = vec![ep("GET", "/a", "orders"), ep("GET", "/b", "orders")];
+        assert_eq!(
+            stitched_bases(
+                &[
+                    ("web/opts.ts", Language::TypeScript, opts),
+                    ("web/use.ts", Language::TypeScript, use_),
+                ],
+                &eps,
+                &["web", "orders"],
+            ),
+            [
+                "web/use.ts 3 external".to_owned(),
+                "web/use.ts 4 heuristic -> HTTP GET /b @orders [heuristic] base=unresolved match=suffix".to_owned(),
             ]
         );
     }

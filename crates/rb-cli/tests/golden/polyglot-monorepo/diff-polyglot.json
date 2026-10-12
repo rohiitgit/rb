@@ -3,7 +3,7 @@
   "repo": "<repo>",
   "snapshot": {
     "id": "<live>",
-    "commit_sha": "4aab1ccd468af53db9dd46e5b3a648d82e47f51f"
+    "commit_sha": "9e82497c26318aa924660b08250b439df8cac722"
   },
   "query": {
     "diagnostics": false,
@@ -33,9 +33,17 @@
           "after": 1,
           "before": 1
         },
-        "http_external": {
+        "http_empty_url": {
           "after": 1,
           "before": 1
+        },
+        "http_external": {
+          "after": 2,
+          "before": 2
+        },
+        "http_in_process": {
+          "after": 2,
+          "before": 2
         },
         "http_self": {
           "after": 2,
@@ -54,16 +62,16 @@
           "before": 1
         },
         "scip_status": {
-          "after": 5,
-          "before": 5
+          "after": 6,
+          "before": 6
         },
         "unparsed_sql": {
           "after": 1,
           "before": 1
         },
         "unresolved_references": {
-          "after": 12,
-          "before": 12
+          "after": 14,
+          "before": 14
         }
       }
     },
@@ -538,7 +546,7 @@
       }
     },
     "from": {
-      "commit_sha": "45240eff4a4ed8baece4dcb2f95cf843fc24f223",
+      "commit_sha": "b9b990373146294a722fda273fa36a7bcae61ca2",
       "id": "<from>",
       "repo": "<repo>",
       "status": "retired"
@@ -718,7 +726,7 @@
       }
     },
     "to": {
-      "commit_sha": "4aab1ccd468af53db9dd46e5b3a648d82e47f51f",
+      "commit_sha": "9e82497c26318aa924660b08250b439df8cac722",
       "id": "<live>",
       "repo": "<repo>",
       "status": "live"

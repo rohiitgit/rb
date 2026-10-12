@@ -9,8 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use rb_syntax::{Binding, DefKind, FileFacts, Init, Language, Span, StrTemplate, TemplatePart};
+use rb_syntax::{
+    Arg, Binding, DefKind, FileFacts, Init, Language, ObjectEntry, Span, StrTemplate, TemplatePart,
+};
 
+use crate::clients::{MAX_SPREADS, UrlValue};
 use crate::endpoint::Piece;
 use crate::routes::FileScope;
 
@@ -105,10 +108,16 @@ pub fn is_env(name: &str) -> bool {
     name.starts_with("process.env.") || name.starts_with("import.meta.env.")
 }
 
-struct Folder<'l> {
+/// One fold's working state: per-file lookup indexes, member-write proofs
+/// and memoised bindings. Build one per file and reuse it across that
+/// file's folds (the per-file indexes then cost once, not once per site);
+/// the step budget resets per fold, exactly as with a fresh folder.
+pub struct Folder<'l> {
     lookup: &'l dyn Lookup,
     /// Each file's lookup indexes, built on first use.
     scopes: HashMap<usize, FileScope<'l>>,
+    /// Each file's member-write proofs, built on first member fold.
+    members: HashMap<usize, FileMembers>,
     on_path: HashSet<(usize, Span)>,
     memo: HashMap<(usize, Span), Folded>,
     steps: usize,
@@ -118,14 +127,63 @@ struct Folder<'l> {
 type Out = (Folded, bool);
 
 impl<'l> Folder<'l> {
-    fn new(lookup: &'l dyn Lookup) -> Self {
+    /// A folder for `lookup`, shared across one file's folds (see the struct
+    /// docs).
+    pub fn new(lookup: &'l dyn Lookup) -> Self {
         Folder {
             lookup,
             scopes: HashMap::new(),
+            members: HashMap::new(),
             on_path: HashSet::new(),
             memo: HashMap::new(),
             steps: 0,
         }
+    }
+
+    /// Folds with this folder's caches and a fresh step budget per call.
+    pub fn fold_template(&mut self, file: usize, template: &StrTemplate) -> Folded {
+        self.steps = 0;
+        self.template(file, template, 0).0
+    }
+
+    /// Folds with this folder's caches and a fresh step budget per call.
+    pub fn fold_name(&mut self, file: usize, name: &str, at: Span) -> Folded {
+        self.steps = 0;
+        self.name(file, name, at, 0).0
+    }
+
+    /// What `member` of `class` in `file` folds to (contract M6b S6): its
+    /// single constructor-assigned value folded where written, or `None`.
+    /// TypeScript/JavaScript and Java only (D6).
+    fn member_fold(
+        &mut self,
+        file: usize,
+        member: &str,
+        class: Option<usize>,
+        depth: usize,
+    ) -> Option<Out> {
+        if !matches!(
+            self.lookup.language(file),
+            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Java
+        ) {
+            return None;
+        }
+        let class = class?;
+        let (init, at) = {
+            let facts = self.lookup.facts(file);
+            let proofs = self
+                .members
+                .entry(file)
+                .or_insert_with(|| FileMembers::build(facts, self.lookup.language(file)));
+            proofs.single(facts, class, member)?
+        };
+        let key = (file, at);
+        if !self.on_path.insert(key) {
+            return Some((Folded::hole(), false));
+        }
+        let out = self.fold_init(file, &Some(init), at, depth + 1);
+        self.on_path.remove(&key);
+        Some(out)
     }
 
     fn template(&mut self, file: usize, t: &StrTemplate, depth: usize) -> Out {
@@ -172,6 +230,52 @@ impl<'l> Folder<'l> {
         }
         let lookup = self.lookup;
         let language = lookup.language(file);
+        // A member read folds from its single constructor-assigned value
+        // (contract M6b S6): `this.x` in any of the folded languages, or a
+        // Java name resolving to a member binding (a bare field, `Type.x`).
+        // Anything unproven falls through to the normal path below.
+        if matches!(
+            language,
+            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Java
+        ) {
+            let read: Option<(&str, Option<usize>)> = match name.strip_prefix("this.") {
+                Some(member) if !member.contains('.') => {
+                    let scope = self
+                        .scopes
+                        .entry(file)
+                        .or_insert_with(|| FileScope::new(lookup.facts(file)));
+                    let class = local_binding(scope, language, name, at)
+                        .filter(|&bi| scope.bindings[bi].member)
+                        .and_then(|bi| scope.bindings[bi].scope)
+                        .or_else(|| {
+                            let proofs = self.members.entry(file).or_insert_with(|| {
+                                FileMembers::build(lookup.facts(file), lookup.language(file))
+                            });
+                            proofs.innermost_class(lookup.facts(file), at)
+                        });
+                    Some((member, class))
+                }
+                _ if language == Language::Java => {
+                    let scope = self
+                        .scopes
+                        .entry(file)
+                        .or_insert_with(|| FileScope::new(lookup.facts(file)));
+                    match local_binding(scope, language, name, at) {
+                        Some(bi) if scope.bindings[bi].member => {
+                            let member = name.rsplit('.').next().unwrap_or(name);
+                            Some((member, scope.bindings[bi].scope))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((member, class)) = read
+                && let Some(out) = self.member_fold(file, member, class, depth)
+            {
+                return out;
+            }
+        }
         let scope = self
             .scopes
             .entry(file)
@@ -219,10 +323,29 @@ impl<'l> Folder<'l> {
         {
             return (placeholders(self.lookup, file, &value.value), true);
         }
+        // A member folds from its single constructor-assigned value
+        // (contract M6b S6), whatever its declared constness; anything
+        // unproven falls through below.
+        if b.member
+            && matches!(
+                self.lookup.language(file),
+                Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Java
+            )
+            && let Some(out) = self.member_fold(file, &b.name, b.scope, depth)
+        {
+            return out;
+        }
         if !b.constant {
             return (Folded::hole(), true);
         }
-        match &b.init {
+        self.fold_init(file, &b.init, b.span, depth)
+    }
+
+    /// A constant-like value folded: a literal, a name, or an env-default
+    /// fallback, relabelled `constant` at best. Anything else (a call, an
+    /// object, nothing) is a hole. `at` is where names in it resolve.
+    fn fold_init(&mut self, file: usize, init: &Option<Init>, at: Span, depth: usize) -> Out {
+        match init {
             Some(Init::Template { template }) => {
                 let (f, clean) = self.template(file, template, depth);
                 (relabel(f, Origin::Constant), clean)
@@ -236,12 +359,13 @@ impl<'l> Folder<'l> {
                     let (f, clean) = self.template(file, default, depth);
                     return (relabel(f, Origin::EnvDefault), clean);
                 }
-                let (f, clean) = self.name(file, primary, b.span, depth);
+                let (f, clean) = self.name(file, primary, at, depth);
                 (relabel(f, Origin::Constant), clean)
             }
-            Some(Init::Call { .. } | Init::New { .. } | Init::Object { .. }) | None => {
-                (Folded::hole(), true)
-            }
+            Some(
+                Init::Call { .. } | Init::New { .. } | Init::Object { .. } | Init::Member { .. },
+            )
+            | None => (Folded::hole(), true),
         }
     }
 }
@@ -297,6 +421,244 @@ pub(crate) fn local_binding(
         // The innermost enclosing type wins.
         .max_by_key(|(_, b)| b.scope)
         .map(|(i, _)| i)
+}
+
+/// The `baseURL` values a spread name may leave in effect, read through its
+/// declaration (contract M6b S5): a same-file object binding's entries, or —
+/// through [`Lookup::external`] — a uniquely resolved declaration's object
+/// entries, with spreads followed the same way (visited set, the pack's
+/// [`MAX_SPREADS`](crate::clients::MAX_SPREADS) bound). A name that folds to
+/// a string, resolves ambiguously or not at all, or names no object
+/// contributes nothing here (strings fold through the normal path; anything
+/// else is a hole there too).
+///
+/// Values come back as written: entry values keep their defining spans, so
+/// the caller folds them where it folds everything else (usually the use
+/// site; a literal needs no context, a name resolves where it is visible).
+pub fn object_values(
+    lookup: &dyn Lookup,
+    file: usize,
+    name: &str,
+    at: Span,
+    seen: &mut HashSet<(usize, Span)>,
+    out: &mut Vec<UrlValue>,
+) {
+    crate::work::tick(1);
+    if seen.len() >= MAX_SPREADS {
+        return;
+    }
+    let scope = FileScope::new(lookup.facts(file));
+    if let Some(bi) = scope.binding_index_at(name, at)
+        && let Some(Init::Object { entries }) = &scope.bindings[bi].init
+    {
+        let key = (file, scope.bindings[bi].span);
+        if seen.insert(key) {
+            object_entries(lookup, file, entries, seen, out);
+        }
+        return;
+    }
+    let Some((target, bi)) = lookup.external(file, name, at) else {
+        return;
+    };
+    let facts = lookup.facts(target);
+    let key = (target, facts.bindings[bi].span);
+    if !seen.insert(key) {
+        return;
+    }
+    if let Some(Init::Object { entries }) = &facts.bindings[bi].init {
+        object_entries(lookup, target, entries, seen, out);
+    }
+}
+
+/// The `baseURL` values `entries` may leave in effect: its literals and
+/// names from the last `baseURL` on, and its spreads through
+/// [`object_values`].
+fn object_entries(
+    lookup: &dyn Lookup,
+    file: usize,
+    entries: &[ObjectEntry],
+    seen: &mut HashSet<(usize, Span)>,
+    out: &mut Vec<UrlValue>,
+) {
+    let from = entries
+        .iter()
+        .rposition(|e| e.key == "baseURL")
+        .unwrap_or(0);
+    for e in &entries[from..] {
+        crate::work::tick(1);
+        if e.key == "baseURL" {
+            push_value(out, &UrlValue::of(Some(&e.value)));
+            continue;
+        }
+        if e.key != "..." {
+            continue;
+        }
+        let Arg::Name { text, span } = &e.value else {
+            continue;
+        };
+        object_values(lookup, file, text, *span, seen, out);
+    }
+}
+
+/// A readable value, once, without repeats.
+fn push_value(out: &mut Vec<UrlValue>, value: &UrlValue) {
+    if *value != UrlValue::Unknown && !out.iter().any(|v| crate::clients::same_value(v, value)) {
+        out.push(value.clone());
+    }
+}
+
+/// Proof that members hold single constructor-assigned values (contract
+/// M6b S6), per file: every member write grouped under its class (with
+/// same-file subclasses merged in), the classes an `Object.assign` over
+/// `this` kills every proof in, and the file's classes for read-side lookup.
+#[derive(Debug, Default)]
+struct FileMembers {
+    /// (class, member) → member-write indices: the class's own writes plus
+    /// its same-file subclasses', in source order.
+    writes: HashMap<(usize, String), Vec<usize>>,
+    /// Classes with an `Object.assign/defineProperty(this, …)` chain.
+    assigned: HashSet<usize>,
+    /// Class and interface definition indices, in source order.
+    classes: Vec<usize>,
+}
+
+impl FileMembers {
+    /// Groups one file's member writes for single-assignment proofs. Every
+    /// loop ticks what it examines (contract invariant 9).
+    fn build(facts: &FileFacts, language: Language) -> Self {
+        let mut out = FileMembers::default();
+        // The class each definition sits in, if any.
+        let mut class_of: HashMap<usize, usize> = HashMap::new();
+        for (di, d) in facts.definitions.iter().enumerate() {
+            crate::work::tick(1);
+            if matches!(d.kind, DefKind::Class | DefKind::Interface) {
+                out.classes.push(di);
+            }
+            let mut cur = Some(di);
+            while let Some(c) = cur {
+                if matches!(
+                    facts.definitions[c].kind,
+                    DefKind::Class | DefKind::Interface
+                ) {
+                    class_of.insert(di, c);
+                    break;
+                }
+                cur = facts.definitions[c].parent;
+            }
+        }
+        // Direct superclasses by extended simple name (over-approximate: a
+        // collision only kills more proofs, never folds more).
+        let mut supers: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (di, d) in facts.definitions.iter().enumerate() {
+            crate::work::tick(1);
+            if !matches!(d.kind, DefKind::Class | DefKind::Interface) {
+                continue;
+            }
+            // Interfaces carry no fields of their own; a class implementing
+            // one does not inherit a member implementation from it.
+            for s in d.supertypes.iter().filter(|s| !s.implements) {
+                crate::work::tick(1);
+                let simple = s.name.rsplit('.').next().unwrap_or(&s.name);
+                for (ci, c) in facts.definitions.iter().enumerate() {
+                    crate::work::tick(1);
+                    if ci != di
+                        && matches!(c.kind, DefKind::Class | DefKind::Interface)
+                        && c.name == simple
+                    {
+                        supers.entry(di).or_default().push(ci);
+                    }
+                }
+            }
+        }
+        // A write counts for its class and every superclass: a subclass
+        // write overrides what its instances read.
+        for (wi, w) in facts.member_writes.iter().enumerate() {
+            crate::work::tick(1);
+            let Some(class) = w.enclosing.and_then(|d| class_of.get(&d).copied()) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            let mut stack = vec![class];
+            while let Some(c) = stack.pop() {
+                if !seen.insert(c) {
+                    continue;
+                }
+                out.writes
+                    .entry((c, w.member.clone()))
+                    .or_default()
+                    .push(wi);
+                if let Some(parents) = supers.get(&c) {
+                    stack.extend(parents.iter().copied());
+                }
+            }
+        }
+        // `Object.assign/defineProperty(this, …)` may rewrite any member of
+        // the chain's class. Not import-gated: a local named `Object` with
+        // an `assign` method is absurd; recording the kill unconditionally
+        // can only turn folds into holes.
+        let object_assign = language != Language::Java;
+        if object_assign {
+            for chain in facts.chains.iter() {
+                crate::work::tick(1);
+                if chain.root.as_deref() != Some("Object") {
+                    continue;
+                }
+                let Some(link) = chain.links.first() else {
+                    continue;
+                };
+                if !matches!(
+                    link.name.as_str(),
+                    "assign" | "defineProperty" | "defineProperties"
+                ) {
+                    continue;
+                }
+                if !matches!(link.args.first(), Some(Arg::Name { text, .. }) if text == "this") {
+                    continue;
+                }
+                if let Some(def) = chain.enclosing
+                    && let Some(class) = class_of.get(&def).copied()
+                {
+                    out.assigned.insert(class);
+                }
+            }
+        }
+        out
+    }
+
+    /// The single constructor write of `member` in `class`: exactly one
+    /// write names it there, on `this`, in a constructor — with the write's
+    /// value and span, for folding where written. Foldability itself is
+    /// `fold_init`'s allow-list (a call folds to a hole there, the same as
+    /// here), so this stays permissive on purpose.
+    fn single(&self, facts: &FileFacts, class: usize, member: &str) -> Option<(Init, Span)> {
+        if self.assigned.contains(&class) {
+            return None;
+        }
+        let [wi] = self.writes.get(&(class, member.to_owned()))?.as_slice() else {
+            return None;
+        };
+        let w = &facts.member_writes[*wi];
+        if !w.on_this || !w.ctor {
+            return None;
+        }
+        w.value.clone().map(|init| (init, w.span))
+    }
+
+    /// The innermost class or interface containing `at`, if any.
+    fn innermost_class(&self, facts: &FileFacts, at: Span) -> Option<usize> {
+        let mut best: Option<(usize, i32, i32)> = None;
+        for &ci in &self.classes {
+            crate::work::tick(1);
+            let span = facts.definitions[ci].span;
+            if (span[0], span[1]) <= (at[0], at[1]) && (at[2], at[3]) <= (span[2], span[3]) {
+                let start = (span[0], span[1]);
+                if best.is_none_or(|(_, r, c)| start > (r, c)) {
+                    best = Some((ci, span[0], span[1]));
+                }
+            }
+        }
+        best.map(|(ci, _, _)| ci)
+    }
 }
 
 /// Resolves `${k}` / `${k:default}` placeholders in a Spring string.
@@ -694,20 +1056,33 @@ mod tests {
             let (head, member) = name
                 .rsplit_once('.')
                 .map_or((None, name), |(h, m)| (Some(h), m));
-            let target = match head {
+            let mut targets = Vec::new();
+            match head {
                 // TS: a named import.
                 None => {
-                    let import = facts
+                    for import in facts
                         .imports
                         .iter()
-                        .find(|i| i.names.iter().any(|n| n.local == name))?;
-                    let module = import.module.trim_start_matches("./");
-                    self.files.iter().position(|(_, _, p)| *p == module)?
+                        .filter(|i| i.names.iter().any(|n| n.local == name))
+                    {
+                        let module = import.module.trim_start_matches("./");
+                        if let Some(target) = self.files.iter().position(|(_, _, p)| *p == module) {
+                            targets.push(target);
+                        }
+                    }
                 }
                 // Java `Type.CONST` / Go `pkg.Const`: a file named like the qualifier.
-                Some(h) => self.files.iter().position(|(_, _, p)| *p == h)?,
+                Some(h) => {
+                    if let Some(target) = self.files.iter().position(|(_, _, p)| *p == h) {
+                        targets.push(target);
+                    }
+                }
+            }
+            // Like the real resolution: an ambiguous name resolves nowhere.
+            let [target] = targets.as_slice() else {
+                return None;
             };
-            Some((target, self.top_level(target, member)?))
+            Some((*target, self.top_level(*target, member)?))
         }
         fn property(&self, _file: usize, key: &str) -> Option<String> {
             self.properties.get(key).cloned()
@@ -767,6 +1142,34 @@ mod tests {
             (
                 "const S = \"/outer\";\nfunction f() { let S = x; get(S); }\n",
                 "{?} [unresolved]",
+            ),
+        ];
+        for (src, want) in cases {
+            let files = Files::new(&[(Language::TypeScript, "a", src)]);
+            assert_eq!(fold_last_call(&files), want, "{src}");
+        }
+    }
+
+    /// Contract M6b S9: a destructured member never folds (a hole, like no
+    /// initialiser) — the pack reads it as a member call, the folder does not
+    /// follow it, even when the object would fold.
+    #[test]
+    fn destructured_members_stay_holes() {
+        let cases = [
+            // The object would fold, but the member does not follow it.
+            (
+                "const config = \"http://a\";\nconst { base } = config;\nget(base);\n",
+                "{?} [unresolved]",
+            ),
+            // Through a name indirection, still a hole.
+            (
+                "import axios from \"axios\";\nconst { get } = axios;\nconst u = get;\nget(u);\n",
+                "{?} [unresolved]",
+            ),
+            // An object source folds to a hole either way.
+            (
+                "const config = { base: \"http://a\" };\nconst { base } = config;\nget(base + \"/x\");\n",
+                "{?}/x [literal]",
             ),
         ];
         for (src, want) in cases {
@@ -1079,5 +1482,359 @@ mod tests {
         assert_eq!(p.get("esc").map(String::as_str), Some("tab\there A"));
         assert_eq!(p.get("empty").map(String::as_str), Some(""));
         assert_eq!(p.len(), 6);
+    }
+
+    /// Renders `baseURL` values as written: literals quoted, names bare.
+    fn shown_values(values: &[crate::clients::UrlValue]) -> Vec<String> {
+        values
+            .iter()
+            .map(|v| match v {
+                crate::clients::UrlValue::Template(t) => format!(
+                    "'{}'",
+                    t.parts
+                        .iter()
+                        .map(|p| match p {
+                            TemplatePart::Lit { text } => text.clone(),
+                            TemplatePart::Hole { expr, .. } => format!("{{{expr}}}"),
+                        })
+                        .collect::<String>()
+                ),
+                crate::clients::UrlValue::Name { text, .. } => text.clone(),
+                crate::clients::UrlValue::Unknown => "?".into(),
+                crate::clients::UrlValue::Contested(_) => "contested".into(),
+            })
+            .collect()
+    }
+
+    /// The `baseURL` values the spread `...{name}` in file 0 may leave, read
+    /// through a uniquely resolved declaration (contract M6b S5).
+    fn spread_values(files: &Files, file: usize, name: &str) -> Vec<String> {
+        let facts = files.facts(file);
+        let span = facts
+            .chains
+            .iter()
+            .flat_map(|c| &c.links)
+            .flat_map(|l| &l.args)
+            .find_map(|a| match a {
+                rb_syntax::Arg::Name { text, span } if text == name => Some(*span),
+                _ => None,
+            })
+            .unwrap();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        object_values(files, file, name, span, &mut seen, &mut out);
+        shown_values(&out)
+    }
+
+    /// Contract M6b S5: a spread name resolves through a unique declaration
+    /// to the object it holds, across files. An ambiguous or missing target,
+    /// a cycle, a string (which folds through the normal path) and a
+    /// parameter name contribute nothing here.
+    #[test]
+    fn object_values_resolve_through_unique_declarations() {
+        let files = Files::new(&[
+            (
+                Language::TypeScript,
+                "use",
+                "import { sharedOpts } from \"./opts\";\nimport { multi } from \"./multi\";\nget(sharedOpts, multi);\n",
+            ),
+            (
+                Language::TypeScript,
+                "opts",
+                "export const sharedOpts = { baseURL: \"http://orders\" };\n",
+            ),
+            (
+                Language::TypeScript,
+                "multi",
+                "import { deep } from \"./deep\";\nexport const multi = { ...deep, retries: 1 };\n",
+            ),
+            (
+                Language::TypeScript,
+                "deep",
+                "export const deep = { baseURL: \"https://api.stripe.com\" };\n",
+            ),
+        ]);
+        assert_eq!(spread_values(&files, 0, "sharedOpts"), ["'http://orders'"]);
+        // Through two files of spreads.
+        assert_eq!(
+            spread_values(&files, 0, "multi"),
+            ["'https://api.stripe.com'"]
+        );
+        // A string constant folds normally, so it contributes no object value.
+        let strings = Files::new(&[
+            (
+                Language::TypeScript,
+                "use",
+                "import { API } from \"./consts\";\nget(API);\n",
+            ),
+            (
+                Language::TypeScript,
+                "consts",
+                "export const API = \"http://orders\";\n",
+            ),
+        ]);
+        assert!(spread_values(&strings, 0, "API").is_empty());
+        // Ambiguous (the same local imported twice — the extractor keeps
+        // both, the real resolution resolves neither), missing and cyclic
+        // targets: none.
+        let ambiguous = Files::new(&[
+            (
+                Language::TypeScript,
+                "use",
+                "import { dup } from \"./a\";\nimport { dup } from \"./b\";\nget(dup);\n",
+            ),
+            (
+                Language::TypeScript,
+                "a",
+                "export const dup = { baseURL: \"http://a\" };\n",
+            ),
+            (
+                Language::TypeScript,
+                "b",
+                "export const dup = { baseURL: \"http://b\" };\n",
+            ),
+        ]);
+        assert!(spread_values(&ambiguous, 0, "dup").is_empty());
+        let cyclic = Files::new(&[
+            (
+                Language::TypeScript,
+                "use",
+                "import { ca } from \"./ca\";\nget(ca);\n",
+            ),
+            (
+                Language::TypeScript,
+                "ca",
+                "import { cb } from \"./cb\";\nexport const ca = { ...cb };\n",
+            ),
+            (
+                Language::TypeScript,
+                "cb",
+                "import { ca } from \"./ca\";\nexport const cb = { ...ca };\n",
+            ),
+        ]);
+        assert!(spread_values(&cyclic, 0, "ca").is_empty());
+    }
+
+    /// Contract M6b S5, invariant 9: n distinct spread names cost linear
+    /// work — 4× the names makes at most 5× the counted steps, the same
+    /// pattern the stitcher runs (one expansion per contested name).
+    #[test]
+    fn object_values_grow_linearly() {
+        fn work(n: usize) -> u64 {
+            // Only the mock's paths need `'static`; the sources are borrowed.
+            let mut paths: Vec<&'static str> = Vec::new();
+            let mut sources: Vec<String> = Vec::new();
+            let mut use_src = String::new();
+            for i in 0..n {
+                use_src.push_str(&format!("import {{ o{i} }} from \"./o{i}\";\n"));
+            }
+            use_src.push_str("get(");
+            for i in 0..n {
+                use_src.push_str(&format!("o{i}, "));
+            }
+            use_src.push_str(");\n");
+            sources.push(use_src);
+            paths.push("use");
+            for i in 0..n {
+                paths.push(Box::leak(format!("o{i}").into_boxed_str()));
+                sources.push(format!(
+                    "export const o{i} = {{ baseURL: \"http://o{i}\" }};\n"
+                ));
+            }
+            let refs: Vec<(Language, &'static str, &str)> = paths
+                .iter()
+                .zip(sources.iter())
+                .map(|(p, s)| (Language::TypeScript, *p, s.as_str()))
+                .collect();
+            let files = Files::new(&refs);
+            let facts = files.facts(0);
+            let names: Vec<(String, Span)> = facts
+                .chains
+                .iter()
+                .flat_map(|c| &c.links)
+                .flat_map(|l| &l.args)
+                .filter_map(|a| match a {
+                    rb_syntax::Arg::Name { text, span } => Some((text.clone(), *span)),
+                    _ => None,
+                })
+                .collect();
+            crate::work::take();
+            let mut total = 0;
+            for (name, span) in &names {
+                let mut seen = HashSet::new();
+                let mut out = Vec::new();
+                object_values(&files, 0, name, *span, &mut seen, &mut out);
+                total += out.len();
+            }
+            assert_eq!(total, n);
+            crate::work::take()
+        }
+        let (small, large) = (work(25), work(100));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// Folds the first argument of the last call of one TypeScript file.
+    fn fold_one(src: &str) -> String {
+        let files = Files::new(&[(Language::TypeScript, "a", src)]);
+        fold_last_call(&files)
+    }
+
+    /// Contract M6b S6: `this.x` folds when assigned exactly once, in a
+    /// constructor, to a foldable value — a literal, a name, or an env
+    /// default. The value folds where it is written.
+    #[test]
+    fn members_fold_from_a_single_constructor_write() {
+        // A literal: the value is a constant wherever it is read.
+        assert_eq!(
+            fold_one(
+                "class C {\n  svc: string;\n  constructor() {\n    this.svc = \"http://orders\";\n  }\n  m() {\n    get(`${this.svc}/x`);\n  }\n}\n"
+            ),
+            "http://orders/x [constant]"
+        );
+        // A name: folded where written (here a same-file constant).
+        assert_eq!(
+            fold_one(
+                "const B = \"http://b\";\nclass C {\n  svc: string;\n  constructor() {\n    this.svc = B;\n  }\n  m() {\n    get(`${this.svc}/x`);\n  }\n}\n"
+            ),
+            "http://b/x [constant]"
+        );
+        // The ftgo shape: a constructor parameter inside holes out the host
+        // but keeps the literal tail.
+        assert_eq!(
+            fold_one(
+                "class C {\n  consumerService: string;\n  constructor(options) {\n    this.consumerService = `${options.baseUrl}/consumers`;\n  }\n  m(id) {\n    get(`${this.consumerService}/${id}`);\n  }\n}\n"
+            ),
+            "{?}/consumers/{?} [constant]"
+        );
+        // Java blank finals assign once in a constructor by definition.
+        let java = Files::new(&[(
+            Language::Java,
+            "C",
+            "class C {\n  final String s;\n  C() {\n    this.s = \"http://j\";\n  }\n  String m() {\n    return get(this.s);\n  }\n}\n",
+        )]);
+        assert_eq!(fold_last_call(&java), "http://j [constant]");
+    }
+
+    /// Contract M6b S6: anything else stays a hole — a second write, a write
+    /// outside a constructor, an update, an alias write, a subclass write, an
+    /// `Object.assign` over `this`, an unfoldable value, a field
+    /// initialiser (not a constructor write, by contract).
+    #[test]
+    fn members_without_a_single_constructor_write_stay_holes() {
+        let cls = |body: &str| {
+            format!(
+                "class C {{\n  svc: string;\n  constructor() {{\n{body}  }}\n  m() {{\n    get(`${{this.svc}}/x`);\n  }}\n}}\n"
+            )
+        };
+        // Written twice.
+        assert_eq!(
+            fold_one(&cls(
+                "    this.svc = \"http://a\";\n    this.svc = \"http://b\";\n"
+            )),
+            "{?}/x [literal]"
+        );
+        // Written outside any constructor.
+        assert_eq!(
+            fold_one(
+                "class C {\n  svc: string;\n  m() {\n    this.svc = \"http://a\";\n    get(`${this.svc}/x`);\n  }\n}\n"
+            ),
+            "{?}/x [literal]"
+        );
+        // An update reads and writes.
+        assert_eq!(
+            fold_one(&cls("    this.svc = \"http://a\";\n    this.svc++;\n")),
+            "{?}/x [literal]"
+        );
+        // Written through an alias.
+        assert_eq!(
+            fold_one(
+                "class C {\n  svc: string;\n  constructor(s) {\n    this.svc = \"http://a\";\n    s.svc = \"http://evil\";\n  }\n  m() {\n    get(`${this.svc}/x`);\n  }\n}\n"
+            ),
+            "{?}/x [literal]"
+        );
+        // Only ever written through an alias: still a hole.
+        assert_eq!(
+            fold_one(
+                "class C {\n  svc: string;\n  constructor(s) {\n    s.svc = \"http://a\";\n  }\n  m() {\n    get(`${this.svc}/x`);\n  }\n}\n"
+            ),
+            "{?}/x [literal]"
+        );
+        // Written in a subclass (the subclass sorts first, so the read
+        // stays last for `fold_last_call`).
+        assert_eq!(
+            fold_one(
+                "class D extends C {\n  constructor() {\n    super();\n    this.svc = \"http://evil\";\n  }\n}\nclass C {\n  svc: string;\n  constructor() {\n    this.svc = \"http://a\";\n  }\n  m() {\n    get(`${this.svc}/x`);\n  }\n}\n"
+            ),
+            "{?}/x [literal]"
+        );
+        // `Object.assign` over `this` may rewrite anything.
+        assert_eq!(
+            fold_one(&cls(
+                "    this.svc = \"http://a\";\n    Object.assign(this, opts);\n"
+            )),
+            "{?}/x [literal]"
+        );
+        // An unfoldable value (a call) is no value.
+        assert_eq!(fold_one(&cls("    this.svc = mk();\n")), "{?}/x [literal]");
+        // A field initialiser is not a constructor write.
+        assert_eq!(
+            fold_one(
+                "class C {\n  svc = \"http://i\";\n  m() {\n    get(`${this.svc}/x`);\n  }\n}\n"
+            ),
+            "{?}/x [literal]"
+        );
+        // A cycle folds to holes and terminates.
+        assert_eq!(
+            fold_one(
+                "class C {\n  a: string;\n  b: string;\n  constructor() {\n    this.a = this.b;\n    this.b = this.a;\n  }\n  m() {\n    get(`${this.a}/x`);\n  }\n}\n"
+            ),
+            "{?}/x [literal]"
+        );
+        // Java: a method write kills the constructor one.
+        let java_two = Files::new(&[(
+            Language::Java,
+            "C",
+            "class C {\n  String s;\n  C() {\n    this.s = \"http://a\";\n  }\n  void n() {\n    this.s = \"http://evil\";\n  }\n  String m() {\n    return get(this.s);\n  }\n}\n",
+        )]);
+        assert_eq!(fold_last_call(&java_two), "{?} [unresolved]");
+    }
+
+    /// Contract M6b S6, invariant 9: n singly-written members cost linear
+    /// work — 4× the members makes at most 5× the counted steps, folding
+    /// through one folder per file as production does.
+    #[test]
+    fn member_proofs_grow_linearly() {
+        fn work(n: usize) -> u64 {
+            let mut src = String::new();
+            src.push_str("class C {\n  constructor() {\n");
+            for i in 0..n {
+                src.push_str(&format!("    this.m{i} = \"http://o{i}\";\n"));
+            }
+            src.push_str("  }\n  m() {\n");
+            for i in 0..n {
+                src.push_str(&format!("    get(`${{this.m{i}}}/x`);\n"));
+            }
+            src.push_str("  }\n}\n");
+            let files = Files::new(&[(Language::TypeScript, "a", src.as_str())]);
+            crate::work::take();
+            let facts = files.facts(0);
+            let mut folder = Folder::new(&files);
+            let mut shown = Vec::new();
+            for chain in facts.chains.iter() {
+                if let Some(rb_syntax::Arg::Template { template }) =
+                    chain.links.last().and_then(|l| l.args.first())
+                {
+                    shown.push(show(&folder.fold_template(0, template)));
+                }
+            }
+            // Every member folded to its literal: the proof holds per member.
+            let want: Vec<String> = (0..n)
+                .map(|i| format!("http://o{i}/x [constant]"))
+                .collect();
+            assert_eq!(shown, want);
+            crate::work::take()
+        }
+        let (small, large) = (work(25), work(100));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 }
