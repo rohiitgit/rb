@@ -344,3 +344,15 @@ tolerance), H2 (bind markers), H3 (nested innermost), H4 (file-scoped modules) �
 all found during probing and in-tree; P5–P9 verified no-change (qualifiers, assisted
 risk with no instance, dump-neutral decorations, no panics, determinism). 52/52 unit
 mutants + all guard bites re-verified on the final tree.
+
+11. **(close) `PIPELINE m6j-1` + passes.** Metadata-only bump (no golden pins it);
+close verify re-proves the exact bumped tree per precedent. Pass 1
+(`tasks/eval-m6j-pass1.md`): VERDICT PASS with H1–H4 in-tree. Pass 2
+(`tasks/eval-m6j-pass2.md`): verification-only VERDICT PASS. **M6j closed 2026-10-12.**
+Residue (for their owners): assisted-param hardening, toProvider/toInstance/
+asEagerSingleton, multibindings, custom Nest providers, val-form beans, `bean(::ref)`,
+keyed .NET, factories/instances/`typeof`/top-level hosting, C# property injection,
+lifetimes/scopes, Guice/Dagger in Kotlin, NestJS in plain JS, pure-jakarta consumers,
+`Lazy`/`Provider`, parent-bean merge, nested `<bean>`, `spring.factories`,
+conditional Kotlin DSL, dynamic modules, file-scoped non-nesting, last-wins vs
+ambiguous, overload signatures. Next owner: none — M6j was the last M6 sub-milestone.

@@ -635,3 +635,22 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Evaluator pass 1 (`tasks/eval-m6i-pass1.md`): VERDICT PASS — H1 in-tree, 8 probes, mutant killed.
   - [x] Evaluator pass 2 (`tasks/eval-m6i-pass2.md`): VERDICT PASS — repros re-run, suite stands.
 - **Verification** (`var/m6i/logs/p6-close2-*`): fmt, clippy `-D warnings`, 888 units, `rb-store` 72/72, `rb-server` 12/12, e2e 42/42 (after the reviewed re-bless), api 1/1 (150 sets identical), no `skipping:`, no listener, stub scan clean.
+
+## M6j DI breadth: complete (closed 2026-10-12, contract amendment 11)
+
+- **Contract:** `tasks/contract-m6j.md` (2026-10-12), S1–S11 and invariants 1–7, D1–D4, forks F1–F5 (F5 decided in phase 4: no new nodes).
+- **Soundness claims and closing bar, stated up front:** wrong beans, wrong injection targets, XML misreads, taint loss, decorator misattachment; safe direction everywhere (unread stays taint, unresolvable stays unresolved, old packs frozen, XML parse failure taints, .NET heuristic max).
+- **Decided in the contract (D1–D4, F1–F5):** packs reuse M4b; stock node shapes first; XML reuses `parse_xml`; fixture plan is code (4 new + 2 extensions, Dagger split amended in).
+- **Progress:**
+  - [x] Phase 0, preflight (amendment 1): baseline binary, six pins (guice/dagger/nest/jpetstore/spring-fu/automapper-reuse), grammar shapes, green baseline.
+  - [x] Phase 1, decorations (amendment 2): Kotlin annotations + C# attributes with literal args, string literals with interpolation holes, `class_parameter` bindings, binding decorations for Kotlin/C#/TS; 12/12 mutants.
+  - [x] Phase 2, Guice/Dagger (amendment 3): import-gated packs (`Singleton`/`Injectable`/`Binds`/`Provides`/bind-chains with qualifier joins), `Arg::Type` class literals, engine `Binds` arm; fixtures + 8/5 guards, every guard biting; 12/12 + T1/T2 mutants.
+  - [x] Phase 3, NestJS (amendment 4): decorator packs + `resolve_nest` lane (qualifier-only tokens); `ts-nest` fixture + 3/3 guards; 6/6 mutants + lane bites.
+  - [x] Phase 4, Spring XML (amendment 5): `xml_beans.rs` reader + synthesis (beans target resolved classes, refs become points, scans union roots, findings retire); `Inputs.xml`; `spring-xml` fixture + 4/3 guards; 7/7 + X1–X5 bites.
+  - [x] Phase 5, Kotlin beans (amendment 6): `CallLink.type_args` + `value_argument` decoding; structural `beans`-span packs reusing `Binds`; shared lane; plain `kotlin-beans` fixture + 4/3 guards; 8/8 + K1/K2 bites.
+  - [x] Phase 6, .NET (amendment 7): generic call args + file-scoped modules; `Add/TryAdd` packs with owner-registration rule; lane shared; `csharp/` extended + guards; 5/5 + D6/D7/V1/V2 bites.
+  - [x] Phase 8, public measurement (amendment 8): guice +40, nest +168, jpetstore gate-lift, springfu QUERIES, automapper +693 — every row classified, samples read in source, 0 false.
+  - [x] S10 growth (amendment 9): shared `bean_start`, indexed class resolution, ticks; two lane ratio tests green.
+  - [x] Evaluator pass 1 (amendment 10, `tasks/eval-m6j-pass1.md`): VERDICT PASS — H1–H4 in-tree, 9 probes, 52/52 mutants.
+  - [x] Evaluator pass 2 (`tasks/eval-m6j-pass2.md`): VERDICT PASS — repros re-run, suite stands.
+- **Verification** (`var/m6j/logs/p6-close-*`): fmt, clippy `-D warnings`, 913 units, `rb-store` 72/72, `rb-server` 12/12, e2e 47/47, api 1/1 (150 sets identical), no `skipping:`, no listener, stub scan clean.
