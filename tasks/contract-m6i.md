@@ -188,3 +188,19 @@ languages. Shared-denylist lesson: `BUILTIN_TYPES` must not contain Java referen
 spellings (`String` et al. broke a Java Gate-A verdict — caught by the carriers e2e; kept only
 Int/Char/Unit + decimal/dynamic/nint/nuint/sbyte/uint/ulong/ushort). Tests-first throughout;
 12/12 mutants killed. Framework packs (routes/clients/ORM) stay out of M6i.
+
+3. **(phase 2) Tier B: imports through implements.** Imports (Kotlin Java-shaped + alias/wildcard;
+C# plain/alias/static) + Kotlin `package`; bindings (Kotlin params/properties/locals with
+`val`-constness and member detection; C# params/fields/locals with `var`-construction typing);
+call chains (Kotlin positional + navigation, C# field-based); module resolution (Kotlin reuses
+Java packages; C# namespace→file with rsplit walk); same-package keys (Kotlin Java-like, C#
+top-level module); constructor dispatch stays `None` (calls to classes are References, Go
+precedent); supertypes (Kotlin delegation roles + interface-keyword detection; C# first-extends
+convention); member-call qualifiers (Kotlin positional navigation, C# `expression` field).
+Resolve units prove cross-file calls, typed receivers, statics and implements for both
+languages. Shared-denylist lesson: `BUILTIN_TYPES` must not contain Java reference-type
+spellings (`String` et al. broke a Java Gate-A verdict — caught by the carriers e2e; kept only
+Int/Char/Unit + decimal/dynamic/nint/nuint/sbyte/uint/ulong/ushort). Framework packs
+(routes/clients/ORM) stay out of M6i. Tests-first throughout; 12/12 mutants killed.
+Fixtures `kotlin-gradle` + `csharp` with reviewed dump goldens and 11/4 biting guards (7
+mutant runs, incl. implementation-preferred dispatch both languages).
