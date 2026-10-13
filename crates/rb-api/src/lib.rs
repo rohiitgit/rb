@@ -796,6 +796,24 @@ pub struct Coverage {
     /// The `scip_status` diagnostics, one per project: `{path, detail}`.
     #[serde(serialize_with = "scip_jobs")]
     pub scip: Vec<rb_model::Diagnostic>,
+    /// The `excluded` diagnostics, one per reason (contract M7e): `{reason, files}`. Absent
+    /// when nothing was excluded, so such repositories answer exactly as before.
+    #[serde(
+        serialize_with = "excluded_counts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub excluded: Vec<rb_model::Diagnostic>,
+}
+
+fn excluded_counts<S: Serializer>(
+    counts: &[rb_model::Diagnostic],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    counts
+        .iter()
+        .map(|d| d.detail.clone())
+        .collect::<Vec<_>>()
+        .serialize(s)
 }
 
 fn scip_jobs<S: Serializer>(jobs: &[rb_model::Diagnostic], s: S) -> Result<S::Ok, S::Error> {
@@ -818,18 +836,22 @@ fn status(store: &mut Store, repo: Option<&str>) -> Result<Output, ApiError> {
     for name in names {
         let st = store.status(&name)?;
         let coverage = match &st.live {
-            Some(live) => Some(Coverage {
-                sql: store.sql_coverage(live.id)?,
-                code: store.resolution_coverage(live.id)?,
-                http: store.http_coverage(live.id)?,
-                di: store.di_coverage(live.id)?,
-                rta: store.rta_coverage(live.id)?,
-                scip: store
+            Some(live) => {
+                let (scip, excluded) = store
                     .load_diagnostics(live.id)?
                     .into_iter()
-                    .filter(|d| d.kind == "scip_status")
-                    .collect(),
-            }),
+                    .filter(|d| d.kind == "scip_status" || d.kind == "excluded")
+                    .partition(|d| d.kind == "scip_status");
+                Some(Coverage {
+                    sql: store.sql_coverage(live.id)?,
+                    code: store.resolution_coverage(live.id)?,
+                    http: store.http_coverage(live.id)?,
+                    di: store.di_coverage(live.id)?,
+                    rta: store.rta_coverage(live.id)?,
+                    scip,
+                    excluded,
+                })
+            }
             None => None,
         };
         reports.push(StatusReport {

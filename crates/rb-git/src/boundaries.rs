@@ -73,6 +73,10 @@ struct RbToml {
     /// Patterns (CODEOWNERS dialect) of manifest files to ignore during detection.
     #[serde(default)]
     exclude: Vec<String>,
+    /// Patterns (CODEOWNERS dialect) of files excluded from analysis (contract M7e): read by
+    /// the indexer through [`rb_toml_ignore`].
+    #[serde(default)]
+    ignore: Vec<String>,
     #[serde(default)]
     service: Vec<ServiceOverride>,
     /// Host mappings (contract M6g S4): parsed so detection accepts them; read by the indexer.
@@ -99,6 +103,18 @@ struct Found {
     detected_by: BTreeSet<String>,
     manifests: BTreeSet<String>,
     deployable: bool,
+}
+
+/// The `ignore` patterns of an `rb.toml` text (contract M7e). The whole file is validated as
+/// detection validates it, and a pattern the shared dialect cannot read is an error, never a
+/// silent fallback (design §4.3).
+pub fn rb_toml_ignore(text: &str) -> anyhow::Result<Vec<Pattern>> {
+    let config: RbToml = toml::from_str(crate::strip_bom(text)).context("parsing rb.toml")?;
+    config
+        .ignore
+        .iter()
+        .map(|p| Pattern::parse(p).map_err(|e| anyhow::anyhow!("rb.toml ignore {p:?}: {e}")))
+        .collect()
 }
 
 /// Detects projects among `files`. `read` returns a file's text (used only for manifests).
@@ -547,6 +563,21 @@ mod tests {
             [s("backend", "api", true), s("svc", "svc", false)]
         );
         assert_eq!(b.projects[0].detected_by, ["rb.toml"]);
+    }
+
+    /// Contract M7e S4: `ignore = [globs]` is part of `rb.toml` (detection accepts it) and
+    /// parses with the shared CODEOWNERS dialect; a pattern it cannot read fails loudly.
+    #[test]
+    fn rb_toml_ignore_parses_with_the_shared_dialect() {
+        let toml = "ignore = [\"generated/**\", \"*.pb.go\"]\n";
+        assert!(detect_in(&[("rb.toml", toml)]).is_ok());
+        let ignore = rb_toml_ignore(toml).unwrap();
+        let raw: Vec<&str> = ignore.iter().map(Pattern::as_str).collect();
+        assert_eq!(raw, ["generated/**", "*.pb.go"]);
+        assert!(ignore[1].matches("api/v1/x.pb.go"));
+        assert!(rb_toml_ignore("").unwrap().is_empty());
+        assert!(rb_toml_ignore("ignore = [\"!x\"]\n").is_err());
+        assert!(rb_toml_ignore("bogus = 1\n").is_err());
     }
 
     #[test]

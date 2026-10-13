@@ -720,3 +720,11 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - 18 mutants killed (m40–m57). Real-Docker suites 995/0/0.
   - Invariant 26/31 identical, diffs classified.
   - `PIPELINE` `m7d-1`.
+
+## M7e Input hygiene (stress batch D): implemented 2026-10-13
+
+- **Contract and design:** `tasks/contract-m7e.md` (diagram, estimates, trade-offs, algorithm). Fixes F16, F22, F13, F29.
+- **Mechanism:** `exclude::decide` runs once from the full tree; analysis stages see only non-excluded files; `File` nodes are kept and marked; counts are reported per reason, including in `rb status`.
+- **Verification:**
+  - 15 mutants killed. Real-Docker 1,004/0/0. Invariant 28/31 identical, classified.
+  - go-gin-example: 4× faster, 4× less memory, 8× smaller graph.

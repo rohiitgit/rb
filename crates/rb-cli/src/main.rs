@@ -1870,12 +1870,32 @@ fn status_text(all: bool, reports: &[rb_api::StatusReport]) -> String {
             let _ = writeln!(out, "  {}", http_line(&c.http));
             let _ = writeln!(out, "  {}", di_line(&c.di));
             let _ = writeln!(out, "  {}", rta_line(&c.rta));
+            if let Some(line) = excluded_line(&c.excluded) {
+                let _ = writeln!(out, "  {line}");
+            }
             for d in &c.scip {
                 let _ = writeln!(out, "  {}", scip_status_line(d));
             }
         }
     }
     out
+}
+
+/// `excluded from analysis: <reason> <n> files, …` from the `excluded` diagnostics (contract
+/// M7e S3); `None` when nothing was excluded.
+fn excluded_line(excluded: &[rb_model::Diagnostic]) -> Option<String> {
+    let parts: Vec<String> = excluded
+        .iter()
+        .map(|d| {
+            let files = d.detail["files"].as_u64().unwrap_or(0);
+            let unit = if files == 1 { "file" } else { "files" };
+            format!(
+                "{} {files} {unit}",
+                d.detail["reason"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("excluded from analysis: {}", parts.join(", ")))
 }
 
 /// Text rendering of the Service Card's structure sections (design §9.5).
@@ -3182,6 +3202,23 @@ mod tests {
 
     /// Contract M3b amendment 50: a timeout's detail is printed once; other statuses print
     /// their reason; coverage lists `relationships dropped` (amendment 52).
+    /// Contract M7e S3: the status line names what was not analysed and why, in the stored
+    /// (canonical) order; nothing excluded prints no line.
+    #[test]
+    fn excluded_line_counts_each_reason() {
+        let d = |reason: &str, files: u64| rb_model::Diagnostic {
+            kind: "excluded".into(),
+            path: None,
+            span: None,
+            detail: json!({ "reason": reason, "files": files }),
+        };
+        assert_eq!(
+            excluded_line(&[d("go_vendor", 1020), d("node_modules", 1)]).as_deref(),
+            Some("excluded from analysis: go_vendor 1020 files, node_modules 1 file")
+        );
+        assert_eq!(excluded_line(&[]), None);
+    }
+
     #[test]
     fn scip_status_line_prints_a_timeout_once() {
         let diagnostic = |detail: Value| rb_model::Diagnostic {

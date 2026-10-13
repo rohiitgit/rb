@@ -1,5 +1,37 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M7e: input hygiene (stress batch D)
+- One exclusion decision per commit (`crates/rb-indexer/src/exclude.rs`), from five rules in order: `rb.toml` `ignore` (new key, shared CODEOWNERS dialect), Go `vendor/` beside `vendor/modules.txt`, `node_modules`, `.gitattributes` `linguist-vendored`/`-generated`, and tsconfig `outDir` compiler outputs. Excluded files keep their `File` node (`excluded: <reason>`) and are never parsed, scanned, detected or indexed. Counted per reason (`excluded` diagnostic) and shown by `rb status`.
+- go-gin-example: 2.64 s → 0.64 s, 359 → 87 MiB, 10,077 → 1,259 nodes, 1,059 → 0 ambiguous references. nestjs-realworld: `dist/` duplicates gone.
+- Fixes F16, F22, F13, F29. Tests first, 15 mutants killed (1 equivalent recorded). Real-Docker suites 1,004/0/0. Invariant vs M7d 28/31 identical, diffs classified by identity. `PIPELINE m7e-1`.
+- Files: `crates/rb-indexer/src/{exclude,lib}.rs`, `crates/rb-git/src/boundaries.rs`, `crates/rb-scip/src/jobs.rs`, `crates/rb-api/src/lib.rs`, `crates/rb-cli/src/main.rs`; records `tasks/{contract-m7e,todo,stress-findings}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M7a–M7d: stress-campaign fixes (batches A–C)
+Source: `tasks/stress-findings.md` (31 findings from a usability/robustness/correctness campaign over 18 fixtures and 13 public repos). Each milestone was tests-first with killed mutants, verified with real-Docker suites (0 failed, 0 skipped), and checked by an invariant run over 31 targets with every differing row classified. This entry was backfilled at M7e; M7a–M7d had skipped the changelog.
+- **M7a** (`372963c`, contract `tasks/contract-m7a.md`): `exact`-label correctness.
+  - gRPC endpoints are attributed by server registration (F17).
+  - FastAPI goes through the shared router composer (F18).
+  - Go protobuf getters are no longer RPCs (F19).
+  - `PIPELINE m7a-1`.
+- **M7b** (`a66c460`, `tasks/contract-m7b.md`): regressions and hangs.
+  - `rb status` lists all repos again; two red DB suites are green (F1).
+  - Bounded Docker CLI calls (F2).
+  - O(1) ancestor lookups in rb-syntax: a 4,000-link chain dropped from over 300 s to 3 s (F9/F10).
+  - Pruned mount composition: 44 s → 1 s (F11).
+  - Streamed blob sniffing: a 1 GiB blob drops from 2 GiB to 16 MiB of memory (F15).
+- **M7c** (`8078ac2`, `tasks/contract-m7c.md`): HTTP recall.
+  - Express name-valued paths fold through a shared constant lookup (`rb-indexer/src/constants.rs`) (F20).
+  - Default-imported axios instances resolve (F21).
+  - `require('express')()` is recognised (F12).
+  - TS gRPC stubs need a generated import (F27).
+  - bookcars went from 0 to 107 routes and +175 stitched calls. `PIPELINE m7c-1`.
+- **M7d** (`79216ce`, `tasks/contract-m7d.md`): DI and SQL roles.
+  - .NET implicit and global usings; implementation-registered owners; constructor parameters only (F28; open generics deferred).
+  - Framework-provided Nest points are `external` (F26).
+  - `.sql` files are migrations only by evidence (F23).
+  - `PIPELINE m7d-1`.
+- Files: `crates/rb-{syntax,frameworks,indexer,scip,git,cli,api}/src/*`; records `tasks/{stress-findings,contract-m7a..m7d,lessons,todo}.md`, `IMPLEMENT.md`.
+
 ## [2026-10-13] (wall clock) M6l CLOSED (evaluator passes 1–2)
 - Phase 1: XML `di_unresolved` diagnostics site the document (`owner_path` → `xml_path`) + unit (mutant kills) + spring-xml fixture (`missing` ref, no new nodes/edges, guards hold) + reviewed re-bless (coverage +1/+1, newly-sited diagnostic only).
 - Pass 1: short review — the fix surface, one mutant kill, no other rows shift.

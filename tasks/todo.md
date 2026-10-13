@@ -1033,3 +1033,17 @@ Contract: `tasks/contract-m7d.md`. Branch `m7d-di-and-sql` (stacked on M7c `8078
 
 ## Review (M7d)
 - Batch C is complete (M7c + M7d). S3 (open generics) is deferred. Lesson added on content markers.
+
+---
+
+# M7e: input hygiene (stress batch D), started 2026-10-13
+
+Contract and design: `tasks/contract-m7e.md`. Branch `m7e-input-hygiene` (stacked on M7d `79216ce`). Skills applied: engineer (state/derived/invariants declared), karpathy-loops (read-first, contract-first, TDD, scope lock), system-design (diagram, numbers, trade-offs, LLD).
+
+- [x] Phase 1 (S1, S4): `rb_git::boundaries::rb_toml_ignore` (`RbToml.ignore`, shared dialect, loud errors); `exclude::decide` with 5 rules in order; `rb_scip::jobs::strip_json_comments` made pub (reused, not copied). Mutants m58–m66 killed (m62 needed the file an escaping outDir would reach); m63 (empty outDir guard) is an equivalent mutant (prefix `D//` matches no path) and the guard is kept for intent.
+- [x] Phase 2 (S2): `index_commit` decides once; `analysed` replaces `manifest.files` at the 13 analysis sites (codeowners, `assemble` and `packages` existence keep the full manifest); `Content.excluded` sets the `File` attr; one `excluded {reason, files}` diagnostic per reason. Temp-git-repo test (vendored module with its own go.mod, committed node_modules) failed first. Mutants m67–m70 killed.
+- [x] Phase 3 (S3): `Coverage.excluded` (JSON field skipped when empty, so unaffected repos answer byte-identically), diagnostics loaded once and partitioned; CLI `excluded_line`. Mutants m71/m72 killed.
+- [x] Phase 4: PIPELINE `m7e-1`. Real Docker 1,004/0/0. Invariant 28/31 identical; every row of the 3 diffs classified by identity (laravel was a prediction miss, correct behaviour). go-gin 2.64 s → 0.64 s, 359 → 87 MiB, 10,077 → 1,259 nodes, 1,059 → 0 ambiguous. CHANGELOG backfilled.
+
+## Review (M7e)
+- Batch D is complete. Exclusion is decided once from the full tree and counted per reason. Residue: `rb.toml` `include` opt-back-in, gitattributes macros and negations, `outDir` via `extends`.

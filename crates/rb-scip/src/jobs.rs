@@ -833,7 +833,7 @@ pub struct TsScopes {
 
 /// `text` with its `//` and `/* */` comments removed (string-aware; JSON itself has only
 /// `"` strings, which is all this strips around).
-fn strip_json_comments(text: &str) -> String {
+pub fn strip_json_comments(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
