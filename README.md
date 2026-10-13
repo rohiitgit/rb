@@ -2,20 +2,22 @@
 
 A deterministic, LLM-free code-intelligence graph for Git repositories. It is built with Rust, Postgres and Apache AGE.
 The design is in [docs/repository-brain-design.md](docs/repository-brain-design.md).
+The operator's guide (usage + testing) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 
-**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution), M3b (SCIP), M4a (endpoints and request paths), M4b (DI and dispatch) and M5 (scale and API: `rb serve`, `rb diff`, JSON everywhere, retention and `rb gc`, the fetch-phase egress proxy, the benchmark; contract `tasks/contract-m5.md`) are done; M6 (breadth) is next.** `rb` indexes a commit into a snapshot containing:
+**Status: milestones M0 (Foundations), M1a (Structure), M1b (Syntax), M2a (SQL core), M2b (ORM mappings), M3a (heuristic resolution), M3b (SCIP), M4a (endpoints and request paths), M4b (DI and dispatch), M5 (scale and API), M6a–M6h (SCIP breadth, topology, gateway, YAML, rules engine), M6i (Kotlin and C# syntax), M6j (DI breadth: Guice, Dagger, NestJS, Spring XML, Kotlin beans, .NET), M6k (DI recall: val-form beans, minimal hosting, assisted exclusion, providers, C# properties, keyed services, C# namespaces) and M6l (XML diagnostic siting) are done.** `rb` indexes a commit into a snapshot containing:
 
 - one `File` node per blob, with its blob SHA, size, language and binary/generated flags;
 - one `Service` per detected project (package.json, Maven, Gradle, go.mod / `package main`, Cargo, pyproject, Dockerfile, `rb.toml`), marked deployable or library;
 - `Owner` nodes from CODEOWNERS (GitHub semantics), with `OWNED_BY` edges that cite the deciding CODEOWNERS line;
-- `Symbol` nodes for the definitions Tree-sitter finds in TypeScript/TSX/JavaScript, Java, Python and Go files, with `DEFINED_IN` (pointing at the name) and `CONTAINS` edges. Parse results are cached per blob, so a re-index only parses changed files.
+- `Symbol` nodes for the definitions Tree-sitter finds in TypeScript/TSX/JavaScript, Java, Python, Go, Kotlin and C# files, with `DEFINED_IN` (pointing at the name) and `CONTAINS` edges. Parse results are cached per blob, so a re-index only parses changed files.
 - `Table` nodes from SQL parsed with the real Postgres parser. `MIGRATES` edges come from `.sql` files, `QUERIES` edges from SQL strings in code (exact when passed to a known database call) and from ORM calls, and `MAPS_TO` edges from ORM entity mappings (JPA, Prisma, TypeORM, SQLAlchemy, Django).
-- `CALLS`, `REFERENCES` and `IMPLEMENTS` edges between symbols: exact (provenance `scip`) where a SCIP indexer ran for the project in a container, heuristic otherwise (resolved from imports, packages and typed bindings, never by bare name across the repository).
+- `CALLS`, `REFERENCES` and `IMPLEMENTS` edges between symbols: exact (provenance `scip`) where a SCIP indexer ran for the project in a container, heuristic otherwise (resolved from imports, packages and typed bindings, never by bare name across the repository). C# is Tier B only (no SCIP): namespaces (block, file-scoped, dotted), enclosing-namespace scope and the global namespace all resolve.
 - `Package` nodes and `DEPENDS_ON` edges from the external symbols a SCIP index names (provenance `scip`) and from manifests (provenance `manifest`: `package.json` with `package-lock.json` v2/v3, `go.mod`, `pom.xml` literals and same-pom properties; `@?` when the version cannot be read), plus Service → Service `DEPENDS_ON` (`via: package`) when a manifest names another service of the repository.
-- `INJECTS` edges (provenance `di`, never above `heuristic`) from Spring dependency injection: constructor (Lombok-generated included), field, setter and `@Bean`-parameter points to the stereotype class, `@Bean` method, Spring Data repository or Feign client they resolve to, narrowed by `@Qualifier`, `@Primary` and the parameter name, with `resolution`, `origin`, `via` and `capped_by` attributes; several candidates give `ambiguous` edges.
+- `INJECTS` edges (provenance `di`, never above `heuristic`) from dependency injection: Spring constructor (Lombok-generated included), field, setter and `@Bean`-parameter points; Guice (`@Singleton`, `@Provides`, `bind().to()`/`toProvider()`, `@Assisted` exclusion) and Dagger (`@Module`, `@Binds`, `@Provides`); NestJS injectables and controllers; Spring XML `<bean>` (constructor-arg/property refs, aliases, component scan); Kotlin `beans { }` (function form and top-level `val` form, `ref()` points); .NET `Add/TryAdd/Keyed` registrations (including top-level minimal hosting), constructor and `[Inject]`/`[FromServices]`/`[FromKeyedServices]` property points with key matching. Points resolve to the stereotype class, `@Bean` method, Spring Data repository, Feign client or bound-type definition they reach, narrowed by qualifiers/keys/names, with `resolution`, `origin`, `via` and `capped_by` attributes; several candidates give `ambiguous` edges.
 - `impl_instantiated: false` on `IMPLEMENTS` edges out of a type proven never instantiated (RTA), and the `Symbol` attributes `entry` (`main`, `test`, `scheduled`, `listener`, `lifecycle`) and `orphan_eligible`.
 - `Endpoint` nodes from Spring MVC, Express, gin and Go `net/http` routes, with `EXPOSES` (service → endpoint) and `HANDLED_BY` (endpoint → handler); `CONSUMES` edges (provenance `http_stitch`, never above `synthetic`) from `fetch` (with `node-fetch` and `cross-fetch`), axios, Feign, `RestTemplate`, `WebClient`/`RestClient` and Go `net/http` client calls to other services' endpoints (contract `tasks/contract-m4a.md`). An endpoint key is `HTTP <METHOD> <path> @<service>`; when a route's prefix cannot be composed it is flagged `prefix_unknown` and its key ends in ` ?router=<file>#<binding>`.
-- `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests, syntax errors, oversized files, unresolved references, one `scip_status` per build root, route diagnostics and one bucket per HTTP client call that was not stitched).
+- `IN_SERVICE` edges and diagnostics (skipped files, ignored or invalid CODEOWNERS lines, unreadable manifests, syntax errors, oversized files, unresolved references — sited where the reference is written — one `scip_status` per build root, route diagnostics and one bucket per HTTP client call that was not stitched).
+- Architecture-rule violations via `rb check` (rules `orphan_endpoints`, `unowned_table_writes`, `service_cycles`; exit 0 clean, 1 violations, 2 errors).
 
 Each snapshot is stored relationally and projected into an AGE graph.
 
@@ -35,6 +37,7 @@ target/debug/rb callers AuthService.login --depth 2   # what calls a function or
 target/debug/rb impact "AuthService#login()."         # what breaks if it is removed (Q2): endpoints, orphans, tests; --json
 target/debug/rb path "POST /api/v1/login"             # the request path through an endpoint (Q4); --format json, --pick N
 target/debug/rb cypher "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)" --cols service,files
+target/debug/rb check --repo myrepo                   # architecture rules: exit 0 clean, 1 violations
 target/debug/rb snapshots             # kept snapshots (live, retired, failed), newest first
 target/debug/rb diff                  # the live snapshot against its parent: endpoints, table access, dependencies, nodes, edges
 target/debug/rb serve                 # the REST API on 127.0.0.1:55480 (read-only, loopback only)
@@ -67,9 +70,9 @@ $ target/debug/rb index "$FIXTURE" --repo m5r_polyglot --no-scip --profile
 m5r_polyglot: snapshot 15449 live @ 45240eff4a4e — 105 nodes, 174 edges, 28 diagnostics; AGE graph rb_m5r_polyglot_15449; parsed 0 source files; scanned 21 other files as text
   profile: age Endpoint (Endpoint.csv): 7 rows, 616 bytes, 4.7 ms
   profile: age File (File.csv): 37 rows, 2204 bytes, 1.7 ms
-  profile: age Owner (Owner.csv): 7 rows, 336 bytes, 1.7 ms
+  profile: age Owner (Owner.csv): 7 rows, 601 bytes, 1.7 ms
   profile: age Package (Package.csv): 7 rows, 601 bytes, 1.5 ms
-  profile: age Service (Service.csv): 9 rows, 387 bytes, 2.7 ms
+  profile: age Service (Service.csv): 9 rows, 377 bytes, 2.7 ms
   profile: age Symbol (Symbol.csv): 34 rows, 3535 bytes, 1.6 ms
   profile: age Table (Table.csv): 4 rows, 163 bytes, 1.5 ms
   profile: age CALLS (CALLS.csv): 5 rows, 257 bytes, 1.6 ms
@@ -80,7 +83,7 @@ m5r_polyglot: snapshot 15449 live @ 45240eff4a4e — 105 nodes, 174 edges, 28 di
   profile: age EXPOSES (EXPOSES.csv): 7 rows, 365 bytes, 1.9 ms
   profile: age HANDLED_BY (HANDLED_BY.csv): 7 rows, 354 bytes, 1.6 ms
   profile: age INJECTS (INJECTS.csv): 2 rows, 133 bytes, 1.5 ms
-  profile: age IN_SERVICE (IN_SERVICE.csv): 37 rows, 1403 bytes, 1.9 ms
+  profile: age IN_SERVICE (IN_SERVICE.csv): 37 rows, 1403 bytes, 2.7 ms
   profile: age MIGRATES (MIGRATES.ops.csv): 3 rows, 222 bytes, 1.9 ms
   profile: age OWNED_BY (OWNED_BY.csv): 48 rows, 1829 bytes, 4.1 ms
   profile: age QUERIES (QUERIES.ops.csv): 6 rows, 393 bytes, 1.7 ms
@@ -257,140 +260,23 @@ Error: refusing to bind 0.0.0.0:55480: the server answers on a loopback address 
 
 $ target/debug/rb serve &
 rb serve: listening on http://127.0.0.1:55480
-
-$ curl -s http://127.0.0.1:55480/v1/health
-{
-  "api": 1,
-  "status": "ok"
-}
-
-$ curl -s 'http://127.0.0.1:55480/v1/repos/m5r_polyglot/callers?target=sendCode'
-{
-  "api": 1,
-  "repo": "m5r_polyglot",
-  "snapshot": {
-    "id": 15450,
-    "commit_sha": "6771067e0a71e93f55ab92bf1bb8ff4d11078443"
-  },
-  "query": {
-    "depth": 1,
-    "include_references": false,
-    "min_certainty": "ambiguous",
-    "pick": null,
-    "precision": "cha",
-    "target": "sendCode"
-  },
-  "limits": {
-    "tree": 5000,
-    "work": 20000000
-  },
-  "truncated": [],
-  "certainty": {
-    "heuristic": 1
-  },
-  "result": {
-    "callers": [
-      {
-        "callers": [],
-        "certainty": "heuristic",
-        "dispatch": false,
-        "display": "AuthController#login().",
-        "entry": [
-          "endpoint POST /api/v1/login"
-        ],
-        "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/AuthController.java`/AuthController#login().",
-        "line": 17,
-        "path": "services/auth/src/main/java/com/acme/auth/AuthController.java",
-        "reference": false,
-        "service": "auth-service"
-      }
-    ],
-    "precision": "cha",
-    "pruned_by_rta": 0,
-    "target": {
-      "display": "MfaClient#sendCode().",
-      "key": "rb-heuristic . . . `services/auth/src/main/java/com/acme/auth/MfaClient.java`/MfaClient#sendCode().",
-      "line": 9,
-      "path": "services/auth/src/main/java/com/acme/auth/MfaClient.java",
-      "service": "auth-service"
-    },
-    "truncated": []
-  }
-}
-
-$ curl -s 'http://127.0.0.1:55480/v1/repos/m5r_polyglot/callers?target=sendCode' | cmp - <(target/debug/rb callers sendCode --json) && echo identical
-identical
-
+...
 $ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: attacker.example:55480' http://127.0.0.1:55480/v1/health
 421
-
-$ curl -s 'http://127.0.0.1:55480/v1/repos/m5r_polyglot/callers?target=sendCode&dpeth=2'
-{
-  "api": 1,
-  "error": {
-    "kind": "invalid_param",
-    "message": "dpeth is not a parameter of this request (allowed: target, depth, include_references, min_certainty, precision, pick, snapshot)",
-    "param": "dpeth"
-  }
-}
-
-$ curl -s -H 'Content-Type: application/json' -d '{"query": "MATCH (s:Service) RETURN count(s)", "columns": ["services"]}' http://127.0.0.1:55480/v1/repos/m5r_polyglot/cypher
-{
-  "api": 1,
-  "repo": "m5r_polyglot",
-  "snapshot": {
-    "id": 15450,
-    "commit_sha": "6771067e0a71e93f55ab92bf1bb8ff4d11078443"
-  },
-  "query": {
-    "columns": [
-      "services"
-    ],
-    "query": "MATCH (s:Service) RETURN count(s)",
-    "timeout_ms": 2000
-  },
-  "limits": {
-    "rows": 10000
-  },
-  "truncated": [],
-  "result": {
-    "columns": [
-      "services"
-    ],
-    "rows": [
-      [
-        "9"
-      ]
-    ]
-  }
-}
-
-$ curl -s -D - -o /dev/null 'http://127.0.0.1:55480/v1/repos/m5r_polyglot/find?q=mfa&limit=1'
-HTTP/1.1 200 OK
-content-type: application/json
-server-timing: queue;dur=0.0, run;dur=3.5, total;dur=3.5
-content-length: 478
-date: Wed, 07 Oct 2026 02:19:45 GMT
-
+...
 ```
 
-The server was then stopped with SIGINT.
+The server was then stopped with SIGINT. (The full callers/JSON examples are in git history; the CLI↔HTTP identity is re-proven by the api suite on every run.)
 
 #### Retention, `rb gc` and `rb cache prune`
 
 A publish writes the snapshot row, its rows, the AGE graph and the live flip in one transaction, so a failed or killed run leaves at most a `failed` row (written after the rollback); a run killed after that commit, before its retention, can leave the previous snapshot's AGE graph, which no read uses and the repository's next publish or the next `rb serve` start drops. Each run keeps the live snapshot plus the `--keep` newest retired ones (default 2, at most 20, env `RB_KEEP_RETIRED`) and deletes older and `failed` rows; only the live snapshot keeps an AGE graph (retention drops every other one of the repository), and graphs are created and dropped one per transaction under a database-wide lock. Every read command reads the live pointer and the snapshot in one read-only transaction. `rb gc` (never implicit; `--dry-run` lists, `--prefix` limits it to repositories whose names start with the prefix) removes graphs no live snapshot names and `building` rows left by binaries before M5; `rb cache prune --facts|--scip` removes cache rows no current `rb` can read (an older `rb` sharing the database may, so it is never implicit) and prints rows and bytes.
 
-```
-$ target/debug/rb gc --prefix m5r --egress --dry-run
-gc: nothing to remove
-gc: no egress network or proxy
+`rb gc --egress` also removes the SCIP fetch phase's two Docker networks and any proxy an interrupted run left. `rb cache prune` removes facts rows of other extractor versions and SCIP index rows of other indexer images.
 
-$ target/debug/rb cache prune --facts --scip --dry-run
-facts: would remove 19780 rows, 649322992 bytes
-scip: would remove 0 rows, 0 bytes
-```
+#### `rb check`
 
-`rb gc --egress` also removes the SCIP fetch phase's two Docker networks and any egress proxy an interrupted run left (below). `rb cache prune` removes facts rows of other extractor versions and SCIP index rows of other indexer images; the dry run above counted the facts rows earlier development builds wrote into this shared database.
+`rb check [--repo <name>] [--rule <rule>] [--json]` checks the live snapshot against the built-in architecture rules and prints violations sorted by rule, source and target: exit 0 when clean, 1 on violations, 2 on errors. Rules: `orphan_endpoints` (endpoints with no handler path to code), `unowned_table_writes` (table writes outside owned services), `service_cycles` (dependency cycles between services). It is the CI gate form of the questions above: same graph, same certainty discipline, machine-readable verdict.
 
 ### Endpoints and request paths
 
@@ -427,7 +313,7 @@ The Service Card (`rb service <name>`) gains `APIs` (each endpoint with its hand
 
 ### Dependency injection, dispatch precision, orphans and dependencies
 
-`rb status` prints a `di:` line (every Spring injection point in exactly one bucket: `plain` one bean reached without a capping gate, `capped`, `ambiguous`, `too ambiguous`, `external`, `unresolved`, `optional absent`, `not a bean`, `test`) and an `rta:` line (implementing types proven never instantiated, and the dispatch edges that makes prunable):
+`rb status` prints a `di:` line (every injection point in exactly one bucket: `plain`, `capped`, `ambiguous`, `too ambiguous`, `external`, `unresolved`, `optional absent`, `not a bean`, `test`) and an `rta:` line (implementing types proven never instantiated, and the dispatch edges that makes prunable):
 
 ```
   di: 9 injection points: 5 plain, 2 capped, 1 ambiguous, 1 not a bean
@@ -447,7 +333,7 @@ The Service Card adds `Packages` (version and where it came from: `[lockfile]`, 
 ├─ Depended on by (1)
 │    @acme/web (apps/web)  via http  [heuristic]  POST /api/v1/login
 ├─ Shares tables with (1)
-│    github.com/acme/billing (services/billing)  public.users
+│    github.com/acme/billing (services/billing)  via package  [synthetic]  public.users
 └─ Call graph (edges within the service)
      13 symbols · CALLS 2, IMPLEMENTS 0, INJECTS 2, REFERENCES 0
      certainty: heuristic 100.0%
@@ -456,7 +342,7 @@ The Service Card adds `Packages` (version and where it came from: `[lockfile]`, 
 
 ### SCIP indexers
 
-`rb index` runs a SCIP indexer in a container for every Maven project (`pom.xml`), every npm, yarn or pnpm package with a `tsconfig.json`, every Go module (`go.mod`), and every Python project (`pyproject.toml`/`setup.py`), and replaces that project's heuristic symbol keys and code edges with exact ones (design §5.2–§5.3, contracts `tasks/contract-m3b.md`, `tasks/contract-m6d.md`). It needs Docker and the four images:
+`rb index` runs a SCIP indexer in a container for every Maven or Gradle project (`pom.xml`, `build.gradle*`), every npm, yarn or pnpm package with a `tsconfig.json`, every Go module (`go.mod`), and every Python project (`pyproject.toml`/`setup.py`), and replaces that project's heuristic symbol keys and code edges with exact ones (design §5.2–§5.3, contracts `tasks/contract-m3b.md`, `tasks/contract-m6d.md`). Kotlin exact edges come from scip-java in Gradle builds (Kotlin 2.2.0 toolchain). It needs Docker and the images:
 
 ```sh
 docker build -t rb-scip-java:0.13.1 docker/scip-java      # slim local scip-java image (see docker/scip-java/README.md)
@@ -466,7 +352,7 @@ docker build -t rb-scip-go:0.2.7 docker/scip-go            # local scip-go image
 docker pull --platform linux/amd64 sourcegraph/scip-python@sha256:1847528ce710f58d13200e8c0237f8028342eee3f8a073a9f6109107f930be23
 ```
 
-Each job exports the project's files, runs a fetch phase (`mvn … go-offline` and the build, `npm ci --ignore-scripts --logs-max=0`, `go mod download`, or a lockfile-driven `poetry install --no-root --no-interaction` / `pip install --no-deps`; no credentials, no host toolchains), then indexes with `--network none`. The fetch phase runs behind an egress allow-list: its containers attach only to the `--internal` Docker network `rb-scip-fetch` (no route out, no external DNS), whose one other member is a tinyproxy container started for that run (`rb-egress-<run>`, also on the bridge `rb-scip-egress`), which forwards only `CONNECT <host>:443` to Maven Central (`repo.maven.apache.org`, `repo1.maven.org`), the npm registry and the Yarn registry, the Go module proxy and its zip bucket (`proxy.golang.org`, `storage.googleapis.com`), and PyPI (`pypi.org`, `files.pythonhosted.org`), plus the hosts in `--scip-registries`; plain HTTP, other ports, IP addresses and every other host are refused, and a failed fetch's report names what the proxy refused (`egress proxy refused: repo.example.com:443`). Maven reads the proxy from a generated `settings.xml`, npm/Yarn/pnpm from the proxy variables, Go from `GOPROXY` with `GOSUMDB=off` and `GOTOOLCHAIN=local` (a newer-toolchain repo fails closed rather than dialing out), pip/poetry from the proxy variables with `PIP_TIMEOUT=60` (pip's 15 s default trips on slow wheel reads through the emulated stack) and the version check off. Package caches are per repository (`<scip-work-dir>/cache/<repo>/{m2,npm,gomod,pip,pypoetry}`), so one repository's fetch never writes where another's reads, and both Maven phases turn the Develocity/Gradle Enterprise build caches off (a cache hit would skip `javac`, leaving sources without an index). `rb index` creates the two networks when absent and never removes them; `rb gc --egress` removes them and any proxy an interrupted run left. Without the proxy image every job is `unsupported`: no fetch runs unguarded. Indexes are cached in the database by `(project input hash, image)`; the input hash covers the blobs the job exports, the indexer's fetch recipe (`rb_scip::RECIPE_JAVA`, `RECIPE_TS`, `RECIPE_GO`, `RECIPE_PY`; `+T<n>` for a threaded Maven build) and the allow-list, so an unchanged project runs no container, an index from an older recipe is never served, and a fetch that failed on a host outside the list is retried once the host is added. Without Docker or an image the project stays heuristic and `rb status` says so (`scip: … skipped`/`unsupported`); the images' identities are part of the snapshot's tool configuration, and a snapshot whose jobs did not all finish (`skipped`, `unsupported`, `environment`, `timeout`) is never "up to date" while SCIP is on, so the next `rb index` tries again (`rebuilding: n SCIP jobs did not finish last time`).
+Each job exports the project's files, runs a fetch phase (`mvn … go-offline` and the build, `npm ci --ignore-scripts --logs-max=0`, `go mod download`, or a lockfile-driven `poetry install --no-root --no-interaction` / `pip install --no-deps`; no credentials, no host toolchains), then indexes with `--network none`. The fetch phase runs behind an egress allow-list: its containers attach only to the `--internal` Docker network `rb-scip-fetch` (no route out, no external DNS), whose one other member is a tinyproxy container started for that run (`rb-egress-<run>`, also on the bridge `rb-scip-egress`), which forwards only `CONNECT <host>:443` to Maven Central (`repo.maven.apache.org`, `repo1.maven.org`), the npm registry and the Yarn registry, the Go module proxy and its zip bucket (`proxy.golang.org`, `storage.googleapis.com`), and PyPI (`pypi.org`, `files.pythonhosted.org`), plus the hosts in `--scip-registries`; plain HTTP, other ports, IP addresses and every other host are refused, and a failed fetch's report names what the proxy refused (`egress proxy refused: repo.example.com:443`). Maven reads the proxy from a generated `settings.xml`, npm/Yarn/pnpm from the proxy variables, Go from `GOPROXY` with `GOSUMDB=off` and `GOTOOLCHAIN=local` (a newer-toolchain repo fails closed rather than dialing out), pip/poetry from the proxy variables with `PIP_TIMEOUT=60` (pip's 15 s default trips on slow wheel reads through the emulated stack) and the version check off. Package caches are per repository (`<scip-work-dir>/cache/<repo>/{m2,npm,gomod,pip,pypoetry}`), so one repository's fetch never writes where another's reads, and both Maven phases turn the Develocity/Gradle Enterprise build caches off (a cache hit would skip `javac`, leaving sources without an index). `rb index` creates the two networks when absent and never removes them; `rb gc --egress` removes them and any proxy an interrupted run left. Without the proxy image every job is `unsupported`: no fetch runs unguarded.
 
 | Flag | Meaning |
 |---|---|
@@ -485,11 +371,11 @@ Lombok-generated members (contract `tasks/contract-m6a.md`): a scip-java documen
 
 Go and Python (contract `tasks/contract-m6d.md`): scip-go runs from the locally built image and scip-python from the digest-pinned image (emulated `linux/amd64`; a bare-files project with no manifest plans no job). SCIP and manifest package edges share one `go/<module>@<version>` key (a mismatch keeps both rows); `poetry.lock`/`uv.lock` pin exact `py/<name>@<version>` rows (anything else stays `?`). `requests`/`httpx` call sites (module verbs, sessions, `self.` members, typed locals) enter as fetch-class clients, capped; chi route groups and FastAPI routers/decorators enter as endpoints. A Python fetch that reads slowly through the emulated stack retries under `PIP_TIMEOUT=60`; a cached fetch failure replays until `--no-cache --force` overwrites it.
 
-Known limits measured on two large repositories (contracts `tasks/contract-m5.md` S24, `tasks/contract-m6a.md` S13/S17): a Maven repository whose only build root is the top-level `pom.xml` is one job (apache/shardingsphere: 2,950 s fetch+index at the default budget; `--scip-maven-threads 4` fails its build there, so the default stays 1); a repository whose `engines` exceed the pinned scip-typescript image's toolchain fails its fetch (mattermost's `webapp`). Remaining build shapes are M6e work (pnpm/Yarn ≥ 2, Gradle, tsconfig scoping).
+Kotlin and Gradle (contracts `tasks/contract-m6e.md`, `tasks/contract-m6i.md`): Gradle projects (Groovy or Kotlin DSL, version catalogs included) build in the scip-java container; Kotlin exact edges come from the same index (Kotlin 2.2.0 toolchain measured). Known limits measured on large repositories: a Maven repository whose only build root is the top-level `pom.xml` is one job (apache/shardingsphere: 2,950 s fetch+index at the default budget); a repository whose `engines` exceed the pinned scip-typescript image's toolchain fails its fetch (mattermost's `webapp`).
 
 #### Container runtime
 
-`rb` talks to whatever daemon the Docker CLI's **current context** selects (`docker context show`), and the four images must exist in that daemon. Docker Desktop (`desktop-linux`) is the runtime of record: the e2e tests, the goldens and the public-repo measurements were made on it. If `docker context show` prints something else (another runtime such as colima holds neither image and would let `docker run` pull scip-typescript into its own VM), run `rb` with `DOCKER_CONTEXT=desktop-linux` in the environment, or switch once with `docker context use desktop-linux`. Then, in that context:
+`rb` talks to whatever daemon the Docker CLI's **current context** selects (`docker context show`), and the images must exist in that daemon. Docker Desktop (`desktop-linux`) is the runtime of record: the e2e tests, the goldens and the public-repo measurements were made on it. If `docker context show` prints something else (another runtime such as colima holds neither image and would let `docker run` pull scip-typescript into its own VM), run `rb` with `DOCKER_CONTEXT=desktop-linux` in the environment, or switch once with `docker context use desktop-linux`. Then, in that context:
 
 ```sh
 docker build -t rb-scip-java:0.13.1 docker/scip-java      # slim scip-java image (docker/scip-java/README.md); absent → `unsupported`
@@ -509,17 +395,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55432/rb cargo test --workspace
 ```
 
-Use the port the database runs on: 55432 by default, 55433 on the development machine of record (`RB_DB_PORT=55433`), where the loop is `var/m5/scripts/verify.sh <tag>` (fmt, clippy, the workspace tests, `rb-store` and `rb-server` with the database, the e2e and API identity suites, a check that no `rb serve` is left listening, and the stub scan; logs under `var/m5/logs/`). Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e.rs` and `api.rs` print `skipping:` and pass without running, which is not a pass.
+Use the port the database runs on: 55432 by default, 55433 on the development machine of record (`RB_DB_PORT=55433`), where the loop is `var/m6l/scripts/verify.sh <tag>` (fmt, clippy, the workspace tests — 927 unit tests at M6l close — `rb-store` and `rb-server` with the database, the 47-test e2e and the API identity suites, a check that no `rb serve` is left listening, and the stub scan; logs under `var/m6l/logs/`). Without `RB_TEST_DATABASE_URL`, the end-to-end tests in `crates/rb-cli/tests/e2e.rs` and `api.rs` print `skipping:` and pass without running, which is not a pass. The full operator guide (worked example, fixture catalog, golden workflow, invariant/measurement practice, troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 
 | Path | Contents |
 |---|---|
 | `crates/rb-model` | node/edge kinds, certainty, `GraphBuilder`, canonical dump |
 | `crates/rb-git` | commit → manifest (gitoxide), CODEOWNERS, glob matcher, boundary detection |
-| `crates/rb-syntax` | Tree-sitter extraction (definitions, references, SQL candidates) and heuristic symbol keys |
+| `crates/rb-syntax` | Tree-sitter extraction (definitions, references, SQL candidates) and heuristic symbol keys; TypeScript, JavaScript, Java, Python, Go, Kotlin, C# |
 | `crates/rb-sql` | SQL statements → tables and operations (pg_query parse-tree walk) |
-| `crates/rb-frameworks` | ORM packs (JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django); route and HTTP-client packs, endpoint normalisation, URL constant folding; Spring DI facts (beans, injection points, scan roots) |
+| `crates/rb-frameworks` | ORM packs (JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django); route and HTTP-client packs, endpoint normalisation, URL constant folding; DI facts (Spring, Guice/Dagger, NestJS, Spring XML, Kotlin beans, .NET) |
 | `crates/rb-scip` | SCIP: project detection, container jobs (fetch + offline index), index cache key, `index.scip` decoding, symbol parsing |
-| `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → manifest packages → SCIP jobs (cached) → join → endpoints and HTTP stitching → DI resolution, RTA, entry kinds and orphan eligibility → snapshot graph + diagnostics |
+| `crates/rb-indexer` | pipeline: git → structure → syntax (cached) → manifest packages → SCIP jobs (cached) → join → endpoints and HTTP stitching → DI resolution, RTA, entry kinds and orphan eligibility → snapshot graph + diagnostics; architecture rules (`rb check`) |
 | `crates/rb-store` | migrations, snapshot publish/retention and `gc`, whole-snapshot reads, evidence, AGE projection, read-only Cypher as `rb_reader`, the prebuilt snapshot index and limits, find/service queries and the card's derived sections, `callers`/`impact`/`path` walks with precision and orphans, Q3's roll-up |
 | `crates/rb-api` | the request layer shared by every `--json` output and the server: parameters and limits, target resolution, the envelope, errors with exit codes and statuses, renderers |
 | `crates/rb-server` | `rb serve`: the axum binding, Host check, read-only connection pool, per-snapshot index cache, workers, queue and deadline |
@@ -527,5 +413,5 @@ Use the port the database runs on: 55432 by default, 55433 on the development ma
 | `docker/scip-java/` | the slim scip-java image |
 | `docker/egress-proxy/` | the fetch phase's egress proxy image (tinyproxy on a pinned Alpine base) |
 | `migrations/` | SQL schema, embedded into the binary |
-| `fixtures/` | golden fixture repositories |
+| `fixtures/` | golden fixture repositories (18 fixtures: structure, routes, SQL/ORM, SCIP, DI frameworks, Kotlin/C#/Go/Python breadth) |
 | `crates/rb-cli/tests/golden/` | reviewed golden outputs (`RB_BLESS=1` rewrites them; review before committing) |
