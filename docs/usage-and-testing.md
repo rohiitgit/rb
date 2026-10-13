@@ -112,6 +112,9 @@ Notes that bite newcomers:
   `query`, `limits`, `truncated`, `result`) and `--snapshot <id>` for retired
   snapshots. Limits are maxima, never clamps — over-limit is `invalid_param`.
 - Ambiguous names are never picked silently (`ambiguous` error + candidates).
+`--repo` defaults to the git checkout you run from (sanitised like `index`
+names it, honoured only when indexed); explicit `--repo` wins, and outside
+any indexed repo the old "several repositories" error stands.
 
 ## 5. Testing
 

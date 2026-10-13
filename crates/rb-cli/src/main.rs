@@ -784,6 +784,7 @@ fn asked(command: Command) -> Option<Asked> {
 /// code the server uses, and prints it; a refused request prints its message and exits with
 /// D5's code.
 fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Result<ExitCode> {
+    let repo = repo.or_else(|| inferred_repo(store));
     let settings = settings()?;
     let answered = rb_api::parse(endpoint, repo.as_deref(), &params, &settings)
         .and_then(|req| rb_api::run(store, &mut rb_api::LoadEach, &req, &settings));
@@ -2376,6 +2377,7 @@ fn check_rules(
 }
 
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
+    let repo = repo.or_else(|| inferred_repo(store));
     let repo = match repo {
         Some(r) => r,
         None => {
@@ -2414,6 +2416,34 @@ fn repo_name_from_path(path: &Path) -> String {
     }
     let name: String = name.trim_matches('_').chars().take(40).collect();
     if name.is_empty() { "repo".into() } else { name }
+}
+
+/// The nearest ancestor of `start` (or `start` itself) holding `.git`, as a
+/// directory or a file (worktrees and submodules keep a `.git` file).
+fn git_root(start: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").symlink_metadata().is_ok() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// The repository implied by the working directory: the enclosing git root's
+/// directory name, sanitised exactly like `index` names it — but only when a
+/// repository of that name is indexed, so anything else keeps the old errors
+/// (`--repo` always wins when given).
+fn inferred_repo(store: &mut Store) -> Option<String> {
+    let root = git_root(&std::env::current_dir().ok()?)?;
+    let name = repo_name_from_path(&root);
+    store
+        .repo_names()
+        .ok()?
+        .iter()
+        .any(|r| r == &name)
+        .then_some(name)
 }
 
 fn short(sha: &str) -> &str {
@@ -3370,5 +3400,24 @@ mod tests {
             repo_name_from_path(Path::new(&format!("/x/{}", "a".repeat(50)))).len(),
             40
         );
+    }
+
+    #[test]
+    fn git_root_finds_dir_file_and_nesting() {
+        let base = std::env::temp_dir().join(format!("rb-git-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("proj");
+        let nested = repo.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        assert_eq!(git_root(&nested), Some(repo.clone()));
+        assert_eq!(git_root(&repo), Some(repo.clone()));
+        assert_eq!(git_root(&base), None);
+        // Worktrees and submodules keep a `.git` file instead of a directory.
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: elsewhere").unwrap();
+        assert_eq!(git_root(&wt), Some(wt.clone()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
