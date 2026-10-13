@@ -6,3 +6,7 @@ CALLS * -> * [exact]
 CALLS rb-heuristic . . . `src/Program.cs`/Program#Main(). -> rb-heuristic . . . `src/Util.cs`/Shop/IGreeter#Greet(). [heuristic]
 INJECTS * -> * [exact]
 INJECTS rb-heuristic . . . `src/Unregistered.cs`/Unregistered# -> * [heuristic]
+# Contract M6k S6: the wrong key never matches.
+INJECTS rb-heuristic . . . `src/Keyed.cs`/KeyedConsumer# -> rb-heuristic . . . `src/Keyed.cs`/KeyedStartup#ConfigureKeyed(). [heuristic] {"qualifier":"other"}
+# Contract M6k pass 1: a different namespace with no `using` never resolves.
+IMPLEMENTS rb-heuristic . . . `src/OtherDecoy.cs`/OtherDecoy# -> rb-heuristic . . . `src/Helper.cs`/Helper# [heuristic]

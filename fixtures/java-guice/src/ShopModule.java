@@ -10,6 +10,8 @@ public class ShopModule extends AbstractModule {
     protected void configure() {
         bind(Service.class).to(ServiceImpl.class);
         bind(MainDb.class).annotatedWith(Names.named("main")).to(MainDbImpl.class);
+        // Contract M6k S7: `toProvider` records the implementation like `to`.
+        bind(Cache.class).toProvider(CacheProvider.class);
     }
 
     @Provides

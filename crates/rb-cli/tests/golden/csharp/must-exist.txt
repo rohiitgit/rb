@@ -11,3 +11,13 @@ IMPLEMENTS rb-heuristic . . . `src/Util.cs`/Shop/Greeter#Greet(). -> rb-heuristi
 # M6j S6: the two constructor points resolve through their registrations into one
 # merged edge (two sites); the unregistered consumer stays silent.
 INJECTS rb-heuristic . . . `src/MailerUser.cs`/MailerUser# -> rb-heuristic . . . `src/Startup.cs`/Startup#ConfigureServices(). [heuristic] {"sites":2}
+# Contract M6k S6: the keyed point matches by key literal.
+INJECTS rb-heuristic . . . `src/Keyed.cs`/KeyedConsumer# -> rb-heuristic . . . `src/Keyed.cs`/KeyedStartup#ConfigureKeyed(). [heuristic] {"qualifier":"main"}
+# Contract M6k S5: the marked property points (`via":"field"`); the unmarked one
+# stays silent, pinned by `"sites":1`.
+INJECTS rb-heuristic . . . `src/Keyed.cs`/KeyedConsumer# -> rb-heuristic . . . `src/Startup.cs`/Startup#ConfigureServices(). [heuristic] {"sites":1,"via":"field"}
+# Contract M6k S3: the top-level minimal-hosting registration anchors at its bound
+# type; its constructor wires like any registered consumer.
+INJECTS rb-heuristic . . . `src/Mini.cs`/Mini# -> rb-heuristic . . . `src/Startup.cs`/Startup#ConfigureServices(). [heuristic]
+# Contract M6k pass 1: enclosing namespaces resolve with no `using`.
+IMPLEMENTS rb-heuristic . . . `src/SubHelper.cs`/SubHelper# -> rb-heuristic . . . `src/Helper.cs`/Helper# [heuristic]

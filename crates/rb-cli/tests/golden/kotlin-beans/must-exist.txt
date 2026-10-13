@@ -3,6 +3,9 @@
 # `*` stands for any key; certainty and attributes are optional. Lines starting with # are notes.
 # Kotlin beans: `ref("db")` resolves through the token; the bare `ref()` stays unresolved.
 INJECTS rb-heuristic . . . `src/Beans.kt`/webBeans(). -> rb-heuristic . . . `src/Beans.kt`/dataBeans(). [heuristic] {"qualifier":"db"}
+# Contract M6k S2: the top-level val form anchors at its bound type; its `ref()`
+# wires through the token with evidence in the declaring file.
+INJECTS rb-heuristic . . . `src/ValBeans.kt`/VSvc# -> rb-heuristic . . . `src/ValBeans.kt`/VDb# [heuristic] {"qualifier":"vdb"}
 REFERENCES rb-heuristic . . . `src/Beans.kt`/dataBeans(). -> rb-heuristic . . . `src/Db.kt`/Db# [heuristic]
 REFERENCES rb-heuristic . . . `src/Beans.kt`/webBeans(). -> rb-heuristic . . . `src/Store.kt`/Store# [heuristic]
 IMPLEMENTS rb-heuristic . . . `src/Db.kt`/DbImpl# -> rb-heuristic . . . `src/Db.kt`/Db# [heuristic]

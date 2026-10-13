@@ -337,11 +337,17 @@ fn package_key<'a>(
         Language::Kotlin => Some(("", package)),
         Language::Go => Some((dir(path), package)),
         // C# namespaces: the file's top-level module definition, when it has one.
-        Language::CSharp => facts
-            .definitions
-            .iter()
-            .find(|d| d.kind == DefKind::Module && d.parent.is_none())
-            .map(|d| ("", d.name.as_str())),
+        // Contract M6k S3: files without one share the global namespace key —
+        // global-namespace types are visible across files with no import (minimal
+        // hosting's Program.cs leg). Namespaced files keep their own key.
+        Language::CSharp => Some(
+            facts
+                .definitions
+                .iter()
+                .find(|d| d.kind == DefKind::Module && d.parent.is_none())
+                .map(|d| ("", d.name.as_str()))
+                .unwrap_or(("", "")),
+        ),
         _ => None,
     }
 }
@@ -914,14 +920,42 @@ impl<'a> Index<'a> {
 
     fn same_package(&self, path: &'a str, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
         let (language, facts) = self.files[path];
-        package_key(path, language, facts)
-            .and_then(|key| self.packages.get(&key))
-            .and_then(|table| table.get(name))
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|&(f, i)| f != path && want(self.def((f, i)).kind))
-            .collect()
+        let found = |key: &(&str, &str)| {
+            self.packages
+                .get(key)
+                .and_then(|table| table.get(name))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&(f, i)| f != path && want(self.def((f, i)).kind))
+                .collect::<Vec<_>>()
+        };
+        let Some(key) = package_key(path, language, facts) else {
+            return Vec::new();
+        };
+        let hit = found(&key);
+        if !hit.is_empty() {
+            return hit;
+        }
+        // Contract M6k pass 1: C# enclosing namespaces are in scope without any
+        // `using` (nearest first, hiding like the language). Without this, names
+        // a parent namespace declares silently miss once usings stop accidentally
+        // covering them through the outer-namespace fallback.
+        if language == Language::CSharp {
+            let mut ns = key.1;
+            while let Some((outer, _)) = ns.rsplit_once('.') {
+                ns = outer;
+                let hit = found(&("", ns));
+                if !hit.is_empty() {
+                    return hit;
+                }
+            }
+            // The global namespace is always in scope too.
+            if !key.1.is_empty() {
+                return found(&("", ""));
+            }
+        }
+        Vec::new()
     }
 
     /// Members named `name` of `t`, else of its nearest supertypes that have one (breadth-first,

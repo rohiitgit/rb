@@ -330,6 +330,17 @@ fn summary(language: Language, syn: &Syntax, node: Node<'_>, source: &[u8], dept
             None => break,
         }
     }
+    // Contract M6k S6: C# wraps call arguments in `argument` nodes (with an optional
+    // `name_colon` for named arguments); the pack needs the inner expression.
+    if language == Language::CSharp && node.kind() == "argument" {
+        let mut c = node.walk();
+        if let Some(inner) = node
+            .named_children(&mut c)
+            .find(|n| n.kind() != "name_colon")
+        {
+            node = inner;
+        }
+    }
     if let Some(template) = strings::string_template(language, node, source) {
         return Arg::Template { template };
     }
@@ -626,12 +637,14 @@ mod tests {
     }
 
     /// Contract M6i S2: C# invocations chain, including `this` and chained members.
+    /// Contract M6k S6: `argument` wrappers unwrap, so identifier arguments read as
+    /// names (Kotlin-shaped), not `?`.
     #[test]
     fn csharp_calls_chain() {
         let src = "class K {\nvoid M() {\nFoo(1);\nthis.Bar(x);\na.Baz(1).Qux(2);\n}\n}\n";
         assert_eq!(
             outline(Language::CSharp, src),
-            ["Foo(?)", "this.Bar(?)", "a.Baz(?).Qux(?)"]
+            ["Foo(?)", "this.Bar(x)", "a.Baz(?).Qux(?)"]
         );
     }
 

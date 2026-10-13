@@ -10,5 +10,7 @@
   <alias name="store" alias="shop"/>
   <bean id="audit" class="com.acme.shop.Audit">
     <constructor-arg ref="shop"/>
+    <!-- Contract M6l S1: an unresolvable ref stays a miss, sited in this document. -->
+    <constructor-arg ref="missing"/>
   </bean>
 </beans>

@@ -4,3 +4,6 @@
 INJECTS * -> * [exact]
 INJECTS rb-heuristic . . . `src/Beans.kt`/dataBeans(). -> rb-heuristic . . . `src/Beans.kt`/webBeans(). [heuristic]
 INJECTS rb-heuristic . . . `src/Beans.kt`/webBeans(). -> rb-heuristic . . . `src/Db.kt`/DbImpl# [heuristic]
+# Contract M6k S2: the val-form token never takes the function-form bean of the
+# same bound type.
+INJECTS rb-heuristic . . . `src/ValBeans.kt`/VSvc# -> rb-heuristic . . . `src/Db.kt`/Db# [heuristic]

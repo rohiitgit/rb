@@ -115,7 +115,7 @@ use serde_json::{Value, json};
 /// rides the generated parameter and narrows, counted (M6c S8).
 /// `m6c-5` exact type-arg agreement: the single bean in simple-name agreement
 /// picks at `heuristic`, capped by the generic gate, counted (M6c S9a).
-pub const PIPELINE: &str = "m6j-1";
+pub const PIPELINE: &str = "m6l-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

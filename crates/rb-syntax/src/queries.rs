@@ -62,10 +62,12 @@ const KOTLIN_TAGS: &str = "
 /// C#'s stock tags use `@reference.send` for invocations, which the extractor does not map, so
 /// the supplement restates invocations as `@reference.call` (contract M6i D1). File-scoped
 /// namespaces (`namespace Shop;`) parse as `file_scoped_namespace_declaration`, not
-/// `namespace_declaration`, so both spell module (contract M6j S6).
+/// `namespace_declaration`, so both spell module (contract M6j S6). Either form takes a
+/// bare or a dotted name (contract M6k pass 1: dotted file-scoped namespaces never
+/// matched, so their files silently lost same-namespace resolution).
 const CSHARP_SUPPLEMENT: &str = "
-(namespace_declaration name: (qualified_name) @name) @definition.module
-(file_scoped_namespace_declaration name: (identifier) @name) @definition.module
+(namespace_declaration name: [(identifier) (qualified_name)] @name) @definition.module
+(file_scoped_namespace_declaration name: [(identifier) (qualified_name)] @name) @definition.module
 (invocation_expression function: (identifier) @name) @reference.call
 (invocation_expression function: (member_access_expression name: (identifier) @name)) @reference.call
 ";

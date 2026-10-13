@@ -616,6 +616,178 @@ fn bean_start<'a>(
     }
 }
 
+struct NestBean<'a, 'b> {
+    path: &'a str,
+    bean: &'b Bean,
+    service: String,
+    types: Vec<Sym<'a>>,
+    inferred: bool,
+}
+
+/// One managed-lane point resolved (contract M6k S1): shared by declared points and
+/// synthesized anchor points. `ev_path` evidences the edge (the declaring file);
+/// `owner_path` scopes matching and keys the source (the owning definition's file).
+#[allow(clippy::too_many_arguments)]
+fn resolve_lane_point<'a>(
+    inputs: &Inputs<'a>,
+    beans: &[NestBean<'a, '_>],
+    by_type: &BTreeMap<Sym<'a>, Vec<usize>>,
+    classpaths: &mut BTreeMap<String, BTreeSet<String>>,
+    ev_path: &'a str,
+    owner_path: &'a str,
+    surface: bool,
+    p: &InjectionPoint,
+    out: &mut Resolution,
+) {
+    let service = (inputs.service_of)(owner_path);
+    let classpath = classpaths
+        .entry(service.clone())
+        .or_insert_with(|| {
+            crate::packages::classpath(&service, inputs.depends)
+                .into_iter()
+                .filter(|s| *s == service || !inputs.deployable.contains(s))
+                .collect()
+        })
+        .clone();
+    // Contract M6j S6: class owners resolve only when registered themselves;
+    // function owners (Kotlin DSL) always pass.
+    if inputs.files[owner_path]
+        .1
+        .definitions
+        .get(p.owner)
+        .is_some_and(|d| {
+            d.kind == DefKind::Class && !beans.iter().any(|b| simple(&b.bean.type_name) == d.name)
+        })
+    {
+        return;
+    }
+    out.points
+        .by_owner
+        .entry((owner_path.to_owned(), p.owner))
+        .or_default()
+        .push(PointRef {
+            name: p.name.clone(),
+            element: p.element.clone(),
+            span: p.span,
+        });
+    let mut gates: BTreeSet<&'static str> = BTreeSet::new();
+    if surface {
+        gates.insert("surface");
+    }
+    gates.insert("scan_roots_unknown");
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut resolution = "unique";
+    let types: Vec<Sym> = if p.qualifier.is_none() {
+        inputs
+            .index
+            .type_candidates(owner_path, Some(p.owner), &p.element)
+    } else {
+        Vec::new()
+    };
+    if let Some(q) = &p.qualifier {
+        // A token: beans explicitly carrying it as qualifier. Auto-names do
+        // not count (a class named `DB` does not serve token `'DB'` without
+        // a custom provider, which stays unread).
+        for (i, b) in beans.iter().enumerate() {
+            work::tick(1);
+            if !classpath.contains(&b.service) {
+                continue;
+            }
+            if b.bean.qualifiers.iter().any(|x| x == q) {
+                candidates.push(i);
+            }
+        }
+        resolution = "qualifier";
+    } else {
+        let mut set = BTreeSet::new();
+        for t in &types {
+            for &i in by_type.get(t).into_iter().flatten() {
+                work::tick(1);
+                if classpath.contains(&beans[i].service) {
+                    set.insert(i);
+                }
+            }
+        }
+        candidates = set.into_iter().collect();
+    }
+    if candidates.is_empty() {
+        *out.buckets.get_mut("unresolved").unwrap() += 1;
+        // Contract M6k S1: the diagnostic sites where the point is written (the
+        // record for anchored points), never the owner's path with foreign spans.
+        out.diagnostics.push(site_diagnostic(
+            "di_unresolved",
+            ev_path,
+            p.span,
+            &p.element,
+            "no_bean",
+        ));
+        return;
+    }
+    // Deterministic order: by target key.
+    candidates.sort_by(|a, b| {
+        inputs.keys[beans[*a].path][beans[*a].bean.definition]
+            .cmp(&inputs.keys[beans[*b].path][beans[*b].bean.definition])
+    });
+    candidates.dedup();
+    if !types.is_empty() && candidates.iter().any(|&i| beans[i].inferred) {
+        gates.insert("bean_type_inferred");
+    }
+    let several = candidates.len() > 1;
+    let certainty = if several {
+        Certainty::Ambiguous
+    } else {
+        Certainty::Heuristic
+    };
+    let label = if several {
+        "ambiguous"
+    } else if gates.is_empty() {
+        "plain"
+    } else {
+        "capped"
+    };
+    *out.buckets.get_mut(label).unwrap() += 1;
+    for g in &gates {
+        *out.gates.entry(g).or_default() += 1;
+    }
+    if candidates.len() == 1 {
+        let b = &beans[candidates[0]];
+        out.points.unique.insert(
+            (owner_path.to_owned(), p.span),
+            (b.path.to_owned(), b.bean.definition),
+        );
+    }
+    let src = inputs.keys[owner_path][p.owner].clone();
+    for &i in &candidates {
+        let b = &beans[i];
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("origin".into(), b.bean.origin.as_str().into());
+        attrs.insert("via".into(), p.form.as_str().into());
+        attrs.insert("resolution".into(), resolution.into());
+        if let Some(q) = &p.qualifier {
+            attrs.insert("qualifier".into(), q.as_str().into());
+        }
+        if several {
+            attrs.insert("candidates".into(), candidates.len().into());
+        }
+        if !gates.is_empty() {
+            attrs.insert(
+                "capped_by".into(),
+                Value::Array(gates.iter().map(|g| Value::from(*g)).collect()),
+            );
+        }
+        out.injections.push(Injection {
+            src: src.clone(),
+            dst: inputs.keys[b.path][b.bean.definition].clone(),
+            certainty,
+            attrs,
+            at: Evidence {
+                path: ev_path.to_owned(),
+                span: p.span,
+            },
+        });
+    }
+}
+
 /// NestJS, Kotlin-beans and .NET resolution (contract M6j S3/S5/S6): a compact lane
 /// Java engine. Neither TypeScript nor Kotlin has scan roots, conditionals, Lombok,
 /// registrants or wrappers that matter here;
@@ -714,9 +886,11 @@ fn resolve_xml_points<'a>(
         });
         if candidates.is_empty() {
             *out.buckets.get_mut("unresolved").unwrap() += 1;
+            // Contract M6l S1: the diagnostic sites the XML document (where the
+            // ref is written), never the owner's path with foreign spans.
             out.diagnostics.push(site_diagnostic(
                 "di_unresolved",
-                p.owner_path,
+                p.xml_path,
                 p.span,
                 &p.element,
                 "no_bean",
@@ -817,13 +991,6 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
             (*path, *facts, di)
         })
         .collect();
-    struct NestBean<'a, 'b> {
-        path: &'a str,
-        bean: &'b Bean,
-        service: String,
-        types: Vec<Sym<'a>>,
-        inferred: bool,
-    }
     let mut beans: Vec<NestBean<'_, '_>> = Vec::new();
     for (path, facts, d) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
         let service = (inputs.service_of)(path);
@@ -839,6 +1006,106 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
             });
         }
     }
+    // Contract M6k S1: declaration-less registrations anchor at their bound type's
+    // unique definition (XML-bean precedent). Two phases: resolve into owned Beans
+    // first (borrows below must not race pushes), then link.
+    struct AnchorWork<'a> {
+        record: &'a str,
+        target: (&'a str, usize),
+        bean: Bean,
+        points: Vec<InjectionPoint>,
+    }
+    let mut work: Vec<AnchorWork<'_>> = Vec::new();
+    for (path, _, d) in per_file.iter().filter(|(p, _, _)| !is_test_path(p)) {
+        for u in &d.unanchored {
+            let targets = inputs.index.type_candidates(path, None, &u.type_name);
+            if targets.len() != 1 {
+                continue;
+            }
+            let (tpath, tidx) = targets[0];
+            let mut points = Vec::new();
+            for (k, r) in u.refs.iter().enumerate() {
+                points.push(InjectionPoint {
+                    owner: tidx,
+                    owner_is_bean: true,
+                    form: Form::Constructor,
+                    name: format!("#{k}"),
+                    type_name: String::new(),
+                    element: String::new(),
+                    wrapper: None,
+                    generic: false,
+                    type_args: Vec::new(),
+                    qualifier: if r.qualifier.is_empty() {
+                        None
+                    } else {
+                        Some(r.qualifier.clone())
+                    },
+                    copied_qualifier: false,
+                    by_name: None,
+                    annotations: Vec::new(),
+                    span: r.span,
+                });
+            }
+            work.push(AnchorWork {
+                record: path,
+                target: (tpath, tidx),
+                bean: Bean {
+                    definition: tidx,
+                    origin: Origin::Binds,
+                    type_name: u.type_name.clone(),
+                    generic: false,
+                    names: u.names.clone(),
+                    qualifiers: u.names.clone(),
+                    primary: false,
+                    conditional: false,
+                    annotations: Vec::new(),
+                    created: u.created.clone(),
+                    extends: Vec::new(),
+                },
+                points,
+            });
+        }
+    }
+    struct Linked<'a> {
+        record: &'a str,
+        target: (&'a str, usize),
+        service: String,
+        types: Vec<Sym<'a>>,
+        inferred: bool,
+        points: Vec<InjectionPoint>,
+    }
+    let mut owned: Vec<Bean> = Vec::new();
+    let mut linked: Vec<Linked<'_>> = Vec::new();
+    for w in work {
+        let (tpath, _tidx) = w.target;
+        let service = (inputs.service_of)(tpath);
+        let facts = inputs.files[tpath].1;
+        let (start, inferred) = bean_start(inputs.index, tpath, facts, &w.bean);
+        let types: Vec<Sym<'_>> = assignable(inputs.index, &start).into_iter().collect();
+        linked.push(Linked {
+            record: w.record,
+            target: w.target,
+            service,
+            types,
+            inferred,
+            points: w.points,
+        });
+        owned.push(w.bean);
+    }
+    let mut spoints: Vec<(&str, &str, InjectionPoint)> = Vec::new();
+    for (k, l) in linked.into_iter().enumerate() {
+        let (tpath, _tidx) = l.target;
+        beans.push(NestBean {
+            path: tpath,
+            bean: &owned[k],
+            service: l.service,
+            types: l.types,
+            inferred: l.inferred,
+        });
+        for point in l.points {
+            spoints.push((l.record, tpath, point));
+        }
+    }
     let mut by_type: BTreeMap<Sym<'a>, Vec<usize>> = BTreeMap::new();
     for (i, b) in beans.iter().enumerate() {
         for &t in &b.types {
@@ -848,158 +1115,43 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
     }
     let mut classpaths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (path, _, d) in &per_file {
-        let service = (inputs.service_of)(path);
-        let classpath = classpaths
-            .entry(service.clone())
-            .or_insert_with(|| {
-                crate::packages::classpath(&service, inputs.depends)
-                    .into_iter()
-                    .filter(|s| *s == service || !inputs.deployable.contains(s))
-                    .collect()
-            })
-            .clone();
         for p in &d.points {
             if is_test_path(path) {
                 *out.buckets.get_mut("test").unwrap() += 1;
                 continue;
             }
-            // Contract M6j S6: class owners resolve only when registered themselves;
-            // function owners (Kotlin DSL) always pass.
-            if inputs.files[path]
-                .1
-                .definitions
-                .get(p.owner)
-                .is_some_and(|d| {
-                    d.kind == DefKind::Class
-                        && !beans.iter().any(|b| simple(&b.bean.type_name) == d.name)
-                })
-            {
-                continue;
-            }
-            out.points
-                .by_owner
-                .entry(((*path).to_owned(), p.owner))
-                .or_default()
-                .push(PointRef {
-                    name: p.name.clone(),
-                    element: p.element.clone(),
-                    span: p.span,
-                });
-            let mut gates: BTreeSet<&'static str> = BTreeSet::new();
-            if !d.surface.is_empty() {
-                gates.insert("surface");
-            }
-            gates.insert("scan_roots_unknown");
-            let mut candidates: Vec<usize> = Vec::new();
-            let mut resolution = "unique";
-            let types: Vec<Sym> = if p.qualifier.is_none() {
-                inputs
-                    .index
-                    .type_candidates(path, Some(p.owner), &p.element)
-            } else {
-                Vec::new()
-            };
-            if let Some(q) = &p.qualifier {
-                // A token: beans explicitly carrying it as qualifier. Auto-names do
-                // not count (a class named `DB` does not serve token `'DB'` without
-                // a custom provider, which stays unread).
-                for (i, b) in beans.iter().enumerate() {
-                    work::tick(1);
-                    if !classpath.contains(&b.service) {
-                        continue;
-                    }
-                    if b.bean.qualifiers.iter().any(|x| x == q) {
-                        candidates.push(i);
-                    }
-                }
-                resolution = "qualifier";
-            } else {
-                let mut set = BTreeSet::new();
-                for t in &types {
-                    for &i in by_type.get(t).into_iter().flatten() {
-                        work::tick(1);
-                        if classpath.contains(&beans[i].service) {
-                            set.insert(i);
-                        }
-                    }
-                }
-                candidates = set.into_iter().collect();
-            }
-            if candidates.is_empty() {
-                *out.buckets.get_mut("unresolved").unwrap() += 1;
-                out.diagnostics.push(site_diagnostic(
-                    "di_unresolved",
-                    path,
-                    p.span,
-                    &p.element,
-                    "no_bean",
-                ));
-                continue;
-            }
-            // Deterministic order: by target key.
-            candidates.sort_by(|a, b| {
-                inputs.keys[beans[*a].path][beans[*a].bean.definition]
-                    .cmp(&inputs.keys[beans[*b].path][beans[*b].bean.definition])
-            });
-            candidates.dedup();
-            if !types.is_empty() && candidates.iter().any(|&i| beans[i].inferred) {
-                gates.insert("bean_type_inferred");
-            }
-            let several = candidates.len() > 1;
-            let certainty = if several {
-                Certainty::Ambiguous
-            } else {
-                Certainty::Heuristic
-            };
-            let label = if several {
-                "ambiguous"
-            } else if gates.is_empty() {
-                "plain"
-            } else {
-                "capped"
-            };
-            *out.buckets.get_mut(label).unwrap() += 1;
-            for g in &gates {
-                *out.gates.entry(g).or_default() += 1;
-            }
-            if candidates.len() == 1 {
-                let b = &beans[candidates[0]];
-                out.points.unique.insert(
-                    ((*path).to_owned(), p.span),
-                    (b.path.to_owned(), b.bean.definition),
-                );
-            }
-            let src = inputs.keys[path][p.owner].clone();
-            for &i in &candidates {
-                let b = &beans[i];
-                let mut attrs = serde_json::Map::new();
-                attrs.insert("origin".into(), b.bean.origin.as_str().into());
-                attrs.insert("via".into(), p.form.as_str().into());
-                attrs.insert("resolution".into(), resolution.into());
-                if let Some(q) = &p.qualifier {
-                    attrs.insert("qualifier".into(), q.as_str().into());
-                }
-                if several {
-                    attrs.insert("candidates".into(), candidates.len().into());
-                }
-                if !gates.is_empty() {
-                    attrs.insert(
-                        "capped_by".into(),
-                        Value::Array(gates.iter().map(|g| Value::from(*g)).collect()),
-                    );
-                }
-                out.injections.push(Injection {
-                    src: src.clone(),
-                    dst: inputs.keys[b.path][b.bean.definition].clone(),
-                    certainty,
-                    attrs,
-                    at: Evidence {
-                        path: (*path).to_owned(),
-                        span: p.span,
-                    },
-                });
-            }
+            resolve_lane_point(
+                inputs,
+                &beans,
+                &by_type,
+                &mut classpaths,
+                path,
+                path,
+                !d.surface.is_empty(),
+                p,
+                &mut out,
+            );
         }
+    }
+    // Contract M6k S1: anchored points resolve through the shared helper; evidence
+    // lives in the declaring file, matching in the anchor's.
+    for (record, owner_path, point) in &spoints {
+        let surface = per_file
+            .iter()
+            .find(|(p, _, _)| p == record)
+            .map(|(_, _, d)| !d.surface.is_empty())
+            .unwrap_or(false);
+        resolve_lane_point(
+            inputs,
+            &beans,
+            &by_type,
+            &mut classpaths,
+            record,
+            owner_path,
+            surface,
+            point,
+            &mut out,
+        );
     }
     out
 }
@@ -3471,6 +3623,123 @@ mod tests {
         assert!(large <= small * 5, "{small} -> {large}");
     }
 
+    /// Contract M6k S1: val-form beans anchor at their bound type; their refs wire
+    /// through qualifiers with evidence in the declaring file.
+    #[test]
+    fn unanchored_val_form_beans_resolve() {
+        let kt = "package acme\nval x = beans {\nbean(\"db\") { Db() }\nbean(\"svc\") { Svc(ref(\"db\")) }\n}\n";
+        let db = "package acme\nclass Db {\n}\nclass Svc(db: Db) {\n}\n";
+        let (r, _) = resolve_lang(
+            &[
+                ("src/A.kt", Language::Kotlin, kt),
+                ("src/B.kt", Language::Kotlin, db),
+            ],
+            &[],
+        );
+        assert_eq!(r.injections.len(), 1);
+        let e = &r.injections[0];
+        assert!(e.src.contains("Svc#"), "{}", e.src);
+        assert!(e.dst.contains("Db#"), "{}", e.dst);
+        assert_eq!(
+            e.attrs.get("qualifier").and_then(|v| v.as_str()),
+            Some("db")
+        );
+    }
+
+    /// Contract M6k pass 1: an unresolved anchored point's diagnostic sites the
+    /// record file (where the ref is written), never the anchor's file with
+    /// foreign spans.
+    #[test]
+    fn anchored_unresolved_diagnostic_sites_the_record() {
+        let kt = "package acme\nval x = beans {\nbean(\"s\") { Svc(ref(\"missing\")) }\n}\n";
+        let (r, _) = resolve_lang(
+            &[
+                ("src/A.kt", Language::Kotlin, kt),
+                (
+                    "src/B.kt",
+                    Language::Kotlin,
+                    "package acme\nclass Svc {\n}\n",
+                ),
+            ],
+            &[],
+        );
+        assert!(r.injections.is_empty());
+        let d: Vec<&Diagnostic> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "di_unresolved")
+            .collect();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path.as_deref(), Some("src/A.kt"));
+    }
+
+    /// Contract M6k S1: ambiguous anchors skip (two same-named bound types bind
+    /// nothing, and their refs wire nowhere); missing anchors skip too. The `Db`
+    /// bean anchors (unique) but has no refs, so a correct skip yields no edges;
+    /// binding the ambiguous anchor would wire `Svc(ref("d"))` to it.
+    #[test]
+    fn ambiguous_and_missing_anchors_skip() {
+        let kt = "package acme\nval x = beans {\nbean(\"d\") { Db() }\nbean(\"s\") { Svc(ref(\"d\")) }\nbean(\"n\") { Nope() }\n}\n";
+        let (r, _) = resolve_lang(
+            &[
+                ("src/A.kt", Language::Kotlin, kt),
+                (
+                    "src/B.kt",
+                    Language::Kotlin,
+                    "package acme\nclass Db {\n}\nclass Svc {\n}\n",
+                ),
+                (
+                    "src/C.kt",
+                    Language::Kotlin,
+                    "package acme\nclass Svc {\n}\n",
+                ),
+            ],
+            &[],
+        );
+        assert!(r.injections.is_empty());
+    }
+
+    /// Contract M6k S3: top-level `AddX` anchors at the bound type; a registered
+    /// consumer's constructor wires to it.
+    #[test]
+    fn unanchored_dotnet_registrations_resolve() {
+        let prog = "using Microsoft.Extensions.DependencyInjection;\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddSingleton<IService, ServiceImpl>();\n";
+        let lib = "using Microsoft.Extensions.DependencyInjection;\npublic interface IService {}\npublic class ServiceImpl : IService {}\npublic class Startup {\npublic void ConfigureServices(object s) {\ns.AddSingleton<Consumer>();\n}\npublic class Consumer {\npublic Consumer(IService svc) {}\n}\n}\n";
+        let (r, _) = resolve_lang(
+            &[
+                ("src/Program.cs", Language::CSharp, prog),
+                ("src/Lib.cs", Language::CSharp, lib),
+            ],
+            &[],
+        );
+        assert_eq!(r.injections.len(), 1);
+        let e = &r.injections[0];
+        assert!(e.src.contains("Consumer#"), "{}", e.src);
+        // The anchor binds the bound type's definition (contract M6k S1).
+        assert!(e.dst.contains("IService#"), "{}", e.dst);
+    }
+
+    /// Contract M6k S5+S6: a marked property points, and a keyed point matches the
+    /// keyed registration.
+    #[test]
+    fn dotnet_property_and_keyed_points_resolve() {
+        let src = "using Microsoft.Extensions.DependencyInjection;\npublic interface IService {}\npublic class ServiceImpl : IService {}\npublic class OtherImpl : IService {}\npublic class Startup {\npublic void ConfigureServices(object s) {\ns.AddKeyedSingleton<IService, ServiceImpl>(\"main\");\ns.AddKeyedSingleton<IService, OtherImpl>(\"other\");\ns.AddSingleton<Consumer>();\n}\npublic class Consumer {\n[Inject] public IService Prop { get; set; }\npublic Consumer([FromKeyedServices(\"main\")] IService svc) {}\n}\n}\n";
+        let (r, _) = resolve_lang(&[("src/Lib.cs", Language::CSharp, src)], &[]);
+        let keyed: Vec<&str> = r
+            .injections
+            .iter()
+            .filter(|e| e.attrs.get("qualifier").and_then(|v| v.as_str()) == Some("main"))
+            .map(|e| e.dst.as_str())
+            .collect();
+        // Both keyed registrations anchor at their enclosing method (the M6j .NET
+        // semantic); the key disambiguates to the `main` registration site.
+        assert_eq!(keyed.len(), 1);
+        assert!(keyed[0].contains("ConfigureServices"), "{}", keyed[0]);
+        // The unqualified property sees both keyed beans: one ambiguous pair.
+        assert_eq!(r.injections.len(), 3);
+        assert_eq!(r.buckets.get("ambiguous").copied().unwrap_or(0), 1);
+    }
+
     /// Contract M6j S10: XML bean synthesis grows linearly in beans (counted
     /// operations, at most 5× for 4× the input): classes resolve by index lookup.
     #[test]
@@ -3500,6 +3769,23 @@ mod tests {
         }
         let (small, large) = (work_for(100), work_for(400));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M6l S1: an unresolved XML ref's diagnostic sites the XML document
+    /// (where the ref is written), never the consumer class file.
+    #[test]
+    fn xml_unresolved_diagnostic_sites_the_document() {
+        let java = "package com.acme;\nclass C0 {}\n";
+        let xml = "<beans xmlns=\"http://www.springframework.org/schema/beans\">\n  <bean id=\"b0\" class=\"com.acme.C0\">\n    <constructor-arg ref=\"missing\"/>\n  </bean>\n</beans>\n";
+        let (r, _) = resolve_lang(&[("src/C.java", Language::Java, java)], &[("app.xml", xml)]);
+        assert!(r.injections.is_empty());
+        let d: Vec<&Diagnostic> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "di_unresolved")
+            .collect();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path.as_deref(), Some("app.xml"));
     }
 
     /// Resolves mixed-language files with XML texts (contract M6j S10): returns the
