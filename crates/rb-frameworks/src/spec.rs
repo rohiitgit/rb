@@ -53,18 +53,15 @@ pub fn openapi_json(text: &str) -> Option<Vec<SpecOp>> {
     let json: serde_json::Value = serde_json::from_str(text).ok()?;
     let paths = json.get("paths")?.as_object()?;
     let paths_at = json_key_at(text, 0, "paths").unwrap_or(0);
+    let keys = key_spans(text, paths_at);
     let mut ops = Vec::new();
     for (path, item) in paths {
         tick(1);
         if !path.starts_with('/') {
             continue;
         }
-        let span = json_key_at(text, paths_at, path).map_or([0, 0, 0, 0], |at| {
-            let quoted = serde_json::to_string(path).unwrap_or_default().len();
-            let row = text[..at].matches('\n').count() as i32;
-            let col = (at - text[..at].rfind('\n').map_or(0, |n| n + 1)) as i32;
-            [row, col, row, col + quoted as i32]
-        });
+        let quoted = serde_json::to_string(path).unwrap_or_default();
+        let span = keys.get(quoted.as_str()).copied().unwrap_or([0, 0, 0, 0]);
         let Some(methods) = item.as_object() else {
             continue;
         };
@@ -88,6 +85,41 @@ pub fn openapi_json(text: &str) -> Option<Vec<SpecOp>> {
         }
     }
     Some(sorted(ops))
+}
+
+/// The span of the first occurrence at or after `from` of every JSON object key (a string
+/// followed by `:`), keyed by the key as written with its quotes. One forward pass that counts
+/// lines as it goes (contract M7j E5: a search per path was quadratic in the document).
+fn key_spans(text: &str, from: usize) -> std::collections::HashMap<&str, Span> {
+    let bytes = text.as_bytes();
+    let mut out = std::collections::HashMap::new();
+    let (mut row, mut line_start, mut i) = (0i32, 0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                row += 1;
+                line_start = i + 1;
+                i += 1;
+            }
+            b'"' => {
+                tick(1);
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    j += if bytes[j] == b'\\' { 2 } else { 1 };
+                }
+                let end = (j + 1).min(bytes.len());
+                let is_key = text[end..].trim_start().starts_with(':');
+                if is_key && i >= from {
+                    let col = (i - line_start) as i32;
+                    out.entry(&text[i..end])
+                        .or_insert([row, col, row, col + (end - i) as i32]);
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 /// The byte offset of `key` written as a JSON object key (quoted as `serde_json` writes it,

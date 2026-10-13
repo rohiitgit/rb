@@ -561,3 +561,7 @@
 ## 2026-10-13: a new request parameter goes into every harness that translates parameters
 - **Mistake:** M7i added the boolean `exclude_tests` to the request layer and the CLI, but the CLI↔HTTP parity harness (`tests/api.rs`) maps boolean parameters to bare flags from its own list. It passed `--exclude-tests true`, and the run failed only in the 40-minute suite.
 - **Rule:** When adding a parameter, grep the tests for an existing sibling of the same type (`include_references` for a boolean, `limit` for a number) and add the new one wherever the sibling is listed, before the full run.
+
+## 2026-10-13: mutants of database writes run against a scratch database
+- **Mistake:** M7h mutant m103 removed the `WHERE` from `record_checkout` (`… WHERE name = $1 OR true`) and ran its test against the shared database. The store test's own repositories were fine, but every other repository's checkout became `/y/demo`. The evaluator found it two milestones later as wrong directives.
+- **Rule:** A mutant that can widen a write (`UPDATE`/`DELETE` predicates, `ON CONFLICT` targets) runs only against a test that uses `ScratchDb`, or against a disposable database. After any mutation run on the shared database, compare `SELECT name, checkout FROM rb.repo` (and row counts of the touched tables) before and after.

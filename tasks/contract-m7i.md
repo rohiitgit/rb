@@ -93,3 +93,10 @@ flowchart LR
   - The value of an Express `caseSensitive` option is not read (any mention keeps exact case).
   - A prefix matched by a parent router with another case setting is folded by the route's own router.
   - The fresh-index RSS drift since M5.
+
+## Amendment 2 (2026-10-13, after evaluator pass 1)
+
+- **S2:** the callers header names the target's entry marks, whatever they are (`test`, `main`, `endpoint …`), not only a handled endpoint. Showing them is deliberate, and the M7i contract's narrower wording is corrected here.
+- **Residue:** Cypher refusals are classified partly by the server's English messages (`permission denied for …`, the column-list mismatch). A server with another `lc_messages` turns them back into plain `cypher:` refusals. That is still correct, only less specific.
+- **Fixes after evaluator pass 1** are in M7j (`tasks/contract-m7j.md`): `case: folded` per candidate, the certainty histogram after `--limit`, JSON spans in one pass.
+

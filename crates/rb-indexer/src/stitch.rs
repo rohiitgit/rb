@@ -674,6 +674,16 @@ impl EndpointIndex {
     }
 }
 
+/// A link's attributes: the site's, plus `case: folded` when this candidate's own match folded
+/// case (contract M7j E1: never copied from another candidate).
+fn with_case(attrs: &Attrs, m: PathMatch) -> Attrs {
+    let mut attrs = attrs.clone();
+    if m.case_folded {
+        attrs.insert("case".into(), "folded".into());
+    }
+    attrs
+}
+
 /// The endpoints bucketed under a client literal: exact-case ones by the literal as written,
 /// case-folding ones by its lower case.
 fn by_literal<'a>(
@@ -1039,9 +1049,6 @@ impl<'e> Stitcher<'e> {
             if m.suffix { "suffix" } else { "exact" }.into(),
         );
         attrs.insert("client".into(), site.client.as_str().into());
-        if m.case_folded {
-            attrs.insert("case".into(), "folded".into());
-        }
         let unverified = site.base_verified == Some(false);
         // Matched by suffix because no host resolved: the base is unknown, whatever the label of
         // the parts that did resolve (contract M5 S18, M4a open item 6). A suffix match whose
@@ -1083,10 +1090,10 @@ impl<'e> Stitcher<'e> {
                 bucket: Bucket::Ambiguous,
                 links: best
                     .iter()
-                    .map(|&(i, _)| Link {
+                    .map(|&(i, m)| Link {
                         endpoint: i,
                         certainty: Certainty::Ambiguous,
-                        attrs: attrs.clone(),
+                        attrs: with_case(&attrs, m),
                     })
                     .collect(),
                 candidates: n,
@@ -1126,7 +1133,7 @@ impl<'e> Stitcher<'e> {
             links: vec![Link {
                 endpoint: i,
                 certainty,
-                attrs,
+                attrs: with_case(&attrs, m),
             }],
             candidates: 1,
             detail: lifted.then_some("discovery_lifted"),
@@ -1599,6 +1606,32 @@ mod tests {
             one(&eps, &call("http://auth/api/Users")).0,
             Bucket::Unmatched
         );
+    }
+
+    /// Contract M7j E1 (evaluator pass 1, item 1): among ambiguous candidates, `case: folded`
+    /// is on exactly those whose own match folded, never copied from the first.
+    #[test]
+    fn case_folded_is_decided_per_candidate() {
+        let mut upper = ep("GET", "/api/Users", NOTIFICATION);
+        upper.fold_case = true;
+        let mut lower = ep("GET", "/api/users", NOTIFICATION);
+        lower.fold_case = true;
+        let eps = vec![upper, lower];
+        let (bucket, links) = one(
+            &eps,
+            &site(
+                WEB,
+                Some("GET"),
+                Some(("http://notification/api/users", Literal)),
+                1,
+            ),
+        );
+        assert_eq!(bucket, Bucket::Ambiguous, "{links:?}");
+        let folded: Vec<bool> = links
+            .iter()
+            .map(|l| l.contains("\"case\":\"folded\""))
+            .collect();
+        assert_eq!(folded, [true, false], "{links:?}");
     }
 
     /// Contract M6g S3: a gateway rewrite strips its prefix and scopes to the target,

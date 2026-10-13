@@ -150,19 +150,22 @@ Notes that bite newcomers:
   `… repository "api" was indexed from another checkout ("…"); …` or
   `… no git repository found in "…"; …`. `rb status` is the exception: there
   it lists every repository.
-- `rb callers` and `rb impact` take `--limit N`: N rows shown after a summary
-  of every row found (callers per service and per entry kind; impact headers
-  keep each list's full length), and `truncated: limit`. `rb callers
-  --exclude-tests` leaves out callers in test code and counts them. Callers of
-  an endpoint handler name the endpoint on the first line.
+- `rb callers` and `rb impact` take `--limit N`: N rows shown, and
+  `truncated: limit`. `callers` first summarises every row found (per service
+  and per entry kind); `impact` headers keep each list's full length; the
+  `certainty:` line counts every row found. `rb callers --exclude-tests`
+  leaves out callers in test code and counts them. The target's own entry
+  marks follow it on the first line (an endpoint handler names its endpoint).
+  `--pick N` beyond the only candidate is refused.
 - `rb status`'s `http:` line counts routes only a spec states:
   `18 routes (3 from specs only)`. Express routes match client paths
-  case-insensitively (as Express does by default), and such a link says
-  `case: folded`.
+  case-insensitively (as Express does by default); such a link carries
+  `case: folded` (JSON, dumps) and `rb path` notes `case folded`.
 - Two `rb index` runs of one repository take turns: the second prints
   `waiting: another rb index of <repo> is running`, then usually finds the
   first's snapshot up to date.
-- `rb find --kind endpoint` (no text) lists every node of a kind; a search
+- `rb find --kind endpoint` (no text) lists the nodes of a kind, 20 a page
+  (`--limit`, `--offset`); a search
   that matches nothing says `no matches for "x"` on stderr (stdout stays
   empty, exit 0).
 - Cypher is read-only: a write is refused as `cypher is read-only: …` (exit 5);
@@ -171,7 +174,8 @@ Notes that bite newcomers:
   `serve`; a bad value is reported as the variable, not as the flag.
 - `rb doctor` checks the environment (database, AGE, migrations, the age-load
   mount, Docker, the SCIP images, the work dir, disk) and prints a fix for
-  each row that is not `ok`; it exits 1 when one fails.
+  each `warn` and `fail` row; `skip` rows name the check they need. It exits 1
+  when one fails; a database that never answers fails after 10 s.
 - **Errors have one shape.** Text mode prints one `Error:` line, naming flags and arguments as you typed them (`--cols`, `<TEXT>`). `--json` and HTTP return the envelope `{"api": 1, "error": {"kind", "message", …}}`. Exit code and HTTP status per kind:
 
   | Exit | Kind | HTTP |
@@ -196,7 +200,7 @@ cargo test --workspace
 ```
 
 Per-crate: `cargo test -p rb-syntax --lib`, `-p rb-frameworks`,
-`-p rb-indexer`, etc. (121 + 203 + 354 lib tests at M7i close; 1,041 across the workspace).
+`-p rb-indexer`, etc. (121 + 203 + 355 lib tests at M7j close; 1,047 across the workspace).
 
 ### 5.2 Database-backed suites
 
@@ -207,7 +211,7 @@ is not a pass**. Always set it:
 export RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb
 cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (83 tests)
 cargo test -p rb-server -- --nocapture  # serve binding, limits, parity (12 tests)
-cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (51 tests)
+cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (52 tests)
 cargo test -p rb-cli --test api     # CLI↔HTTP identity over 150 parameter sets (1 test)
 ```
 

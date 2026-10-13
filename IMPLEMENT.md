@@ -761,3 +761,10 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - 21 mutants killed. Real-Docker 1,041/0/0.
   - Invariant 29/31 identical, 2 classified.
   - mattermost cached RSS 2,148 → 1,658 MiB.
+
+## M7j The M7 close fixes (evaluator pass 1): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7j.md` (E1–E8, amendment 1). Input: `tasks/eval-m7-pass1.md` (17 findings, 0 S1).
+- **Verification:**
+  - 7 mutants killed. Real-Docker 1,047/0/0, with the log kept.
+  - Invariant 31/31 identical. E5 10.8 s (M7i 45.4 s).

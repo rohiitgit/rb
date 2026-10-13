@@ -134,7 +134,8 @@ use serde_json::{Value, json};
 /// (`framework_unsupported`).
 /// `m7i-1` Express routes match case-insensitively unless their router opts in
 /// (`CONSUMES` `case: folded`); JSON spec operations carry their path key's span.
-pub const PIPELINE: &str = "m7i-1";
+/// `m7j-1` `case: folded` decided per candidate (it was copied from the first).
+pub const PIPELINE: &str = "m7j-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

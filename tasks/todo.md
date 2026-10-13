@@ -1078,7 +1078,7 @@ Contract: `tasks/contract-m7g.md`. Branch `m7g-honesty` (stacked on M7f `83f720b
 
 Contract: `tasks/contract-m7h.md`. Branch `m7h-ux` (stacked on M7g `52b7b90`). Record set: CHANGELOG, IMPLEMENT, contract, todo, stress-findings, lessons, README, usage guide.
 
-- [x] Phase 1 (S1, F3/U1): migration `0007_repo_checkout`; `Store::{record_checkout, repos_at_checkout, repo_checkout}`; one CLI `infer_repo` used by questions, `check`, `dump`; `rb index` without `--repo` reuses the checkout's repo.
+- [x] Phase 1 (S1, F3/U1): migration `0007_repo_checkout`; `Store::{record_checkout, repo_checkouts}`; one CLI `infer_repo` used by questions, `check`, `dump`; `rb index` without `--repo` reuses the checkout's repo.
 - [x] Phase 2 (S2, S3): `find --kind` without text; `service NAME --limit` wording; `find` no-match note; env-named `RB_CYPHER_TIMEOUT_MS`.
 - [x] Phase 3 (S4): Cypher read-only and `--cols` mismatch errors.
 - [x] Phase 4 (S5): `rb doctor`.
@@ -1106,3 +1106,12 @@ Contract: `tasks/contract-m7i.md`. Branch `m7i-precision-cost` (stacked on M7h `
 - [x] Phase 3 (S3, S5; O3, O4): per-repo index lock; streamed facts.
 - [x] Phase 4 (S4, U5): `--limit` and `--exclude-tests` for callers and impact.
 - [x] Phase 5: real-Docker suites 1,041/0/0 (3 goldens re-blessed after review, the parity harness taught `exclude_tests`); invariant against M7h 29/31, 2 classified (bookcars +4 folded `CONSUMES`, go-gin spec spans); go-gin `3 from specs only`; mattermost cached RSS 2,148 → 1,658 MiB; docs; records. Then the M7 close pass.
+
+# M7j: the M7 close fixes (evaluator pass 1), started 2026-10-13
+
+Contract: `tasks/contract-m7j.md`. Branch `m7j-close` (stacked on M7i `77675c8`). Input: `tasks/eval-m7-pass1.md`.
+
+- [x] E3: shared-DB checkouts repaired (5 repos had the m103 mutant's `/y/demo`); mutant leftover repo `tmpzc8i9d` removed; `rb gc`.
+- [x] Phase 1 (E1, E4, E6, E7): per-candidate `case`; histogram over every row found; `--pick` beyond one; `rb path` case note.
+- [x] Phase 2 (E2, E5): bounded `rb doctor`; linear JSON spans.
+- [x] Phase 3 (E8): records and docs; full real-Docker run with log 1,047/0/0; invariant against M7i 31/31; E5 10.8 s (M7i 45.4 s); evaluator pass 2 next.

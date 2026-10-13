@@ -44,7 +44,8 @@ pub fn pick_target(ix: &SnapshotIndex, input: &str, pick: Option<usize>) -> Resu
             "nothing matches {input:?} (try `rb find {}`)",
             shell_arg(input)
         ))),
-        ([only], _) => Ok(*only),
+        ([only], None | Some(1)) => Ok(*only),
+        ([_], Some(n)) => Err(pick_beyond_one(input, n)),
         (many, Some(n)) if (1..=many.len()).contains(&n) => Ok(many[n - 1]),
         (many, _) => {
             let list: Vec<String> = many
@@ -64,6 +65,15 @@ pub fn pick_target(ix: &SnapshotIndex, input: &str, pick: Option<usize>) -> Resu
             ))
         }
     }
+}
+
+/// `--pick N` beyond the only candidate (contract M7j E6): refused, never ignored. Beyond several
+/// candidates the request lists them instead (M5 amendment 5).
+fn pick_beyond_one(input: &str, n: usize) -> ApiError {
+    ApiError::invalid(
+        "pick",
+        format!("is {n}, but only 1 candidate matches {input:?}"),
+    )
 }
 
 /// Symbols a near-miss key names (contract M7f S4): `rb find`'s rule — a case-insensitive
@@ -429,7 +439,8 @@ pub fn pick_endpoint(
             "no endpoint matches {input:?} (try `rb find {} --kind endpoint`)",
             shell_arg(input)
         ))),
-        ([only], _) => Ok(*only),
+        ([only], None | Some(1)) => Ok(*only),
+        ([_], Some(n)) => Err(pick_beyond_one(input, n)),
         (many, Some(n)) if (1..=many.len()).contains(&n) => Ok(many[n - 1]),
         (many, _) => {
             let list: Vec<String> = many

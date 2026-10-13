@@ -1146,7 +1146,11 @@ fn answer(
             }
             limits = limits_of(&caps_in_force);
             truncated = names(&tree.truncated);
-            certainty = Some(histogram(caller_certainties(&tree.callers)));
+            // Every row found, also when `limit` cut the rows shown (contract M7j E4).
+            certainty = Some(match &tree.summary {
+                Some(s) => histogram(s.certainties.iter().copied()),
+                None => histogram(caller_certainties(&tree.callers)),
+            });
             Answer::Callers { ix, tree }
         }
         Query::Impact {
@@ -1168,13 +1172,17 @@ fn answer(
             }
             limits = limits_of(&caps_in_force);
             truncated = names(&impact.truncated);
-            certainty = Some(histogram(
-                impact
-                    .breaks
-                    .iter()
-                    .chain(&impact.affects)
-                    .map(|x| x.certainty),
-            ));
+            certainty = Some(if impact.certainties_found.is_empty() {
+                histogram(
+                    impact
+                        .breaks
+                        .iter()
+                        .chain(&impact.affects)
+                        .map(|x| x.certainty),
+                )
+            } else {
+                histogram(impact.certainties_found.iter().copied())
+            });
             Answer::Impact {
                 ix,
                 impact: Box::new(impact),

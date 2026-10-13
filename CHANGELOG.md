@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M7j: the M7 close fixes (evaluator pass 1)
+- **Correctness:** `case: folded` is decided per candidate (it was copied from the first). After `--limit`, the certainty histogram counts every row found. `--pick N` beyond the only candidate is refused.
+- **Bounds:** `rb doctor` waits at most 10 s for the database, and every `warn`/`fail` row has a fix. JSON spec spans take one pass (20,000-path spec: 45.4 s in M7i, 10.8 s now; M7h 11.0 s).
+- **`rb path`** notes `case folded`.
+- **Records:** the stress register's counts and statuses, the Observations classified, partial fixes marked ◐; README and usage guide corrected; the shared DB's checkouts repaired after a mutant wrote them.
+- **Verification:** mutants m144–m150. Real-Docker suites 1,047/0/0 (log kept). Invariant vs M7i 31/31. `PIPELINE` `m7j-1`.
+- **Files:** `crates/rb-indexer/src/stitch.rs`, `crates/rb-frameworks/src/spec.rs`, `crates/rb-store/src/code.rs`, `crates/rb-api/src/{lib,render}.rs`, `crates/rb-cli/src/{doctor,code,path}.rs`, `crates/rb-cli/tests/e2e.rs`, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7h,contract-m7i,contract-m7j,eval-m7-pass1,todo,stress-findings,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M7i: precision and cost remainder (stress batch F, part 2)
 - **Express case:** routes match client paths case-insensitively, as Express does, unless their router opts into `caseSensitive`; such links say `case: folded` and are never `synthetic`.
 - **Specs:** `rb status` counts routes only a spec states (`18 routes (3 from specs only)`); JSON specs carry each operation's path-key span.

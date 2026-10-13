@@ -137,7 +137,11 @@ pub(crate) fn render_callers(ix: &SnapshotIndex, tree: &CallerTree) -> String {
         (true, None) => out.push_str("  (no callers found)\n"),
         (false, _) => {}
     }
-    out.push_str(&histogram(all.iter()));
+    // Every row found, also when `--limit` cut the rows shown (contract M7j E4).
+    match &tree.summary {
+        Some(s) => out.push_str(&histogram(s.certainties.iter())),
+        None => out.push_str(&histogram(all.iter())),
+    }
     out.push_str(&truncated_line(&tree.truncated));
     out
 }
@@ -263,13 +267,17 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
             owners.join("; ")
         }
     );
-    out.push_str(&histogram(
-        impact
-            .breaks
-            .iter()
-            .chain(&impact.affects)
-            .map(|x| &x.certainty),
-    ));
+    if impact.certainties_found.is_empty() {
+        out.push_str(&histogram(
+            impact
+                .breaks
+                .iter()
+                .chain(&impact.affects)
+                .map(|x| &x.certainty),
+        ));
+    } else {
+        out.push_str(&histogram(impact.certainties_found.iter()));
+    }
     out.push_str(&truncated_line(&impact.truncated));
     out
 }
@@ -314,6 +322,36 @@ mod tests {
         assert!(precision_lines(Precision::Rta, 3).contains("rta: 3 dispatch steps pruned"));
         assert_eq!(parse_precision("cha"), Ok(Precision::Cha));
         assert!(parse_precision("vta").is_err());
+    }
+
+    /// Contract M7j E6 (stress observation, evaluator item 12): `--pick N` beyond the only
+    /// candidate is refused, never ignored; `--pick 1` on it is fine.
+    #[test]
+    fn a_pick_beyond_the_only_candidate_is_refused() {
+        use rb_model::{Attrs, GraphBuilder, NodeKey, NodeKind};
+        let mut b = GraphBuilder::new();
+        b.add_node(
+            NodeKey::new(NodeKind::Symbol, "Db#load()."),
+            "load",
+            Attrs::new(),
+        )
+        .unwrap();
+        let ep = NodeKey::new(NodeKind::Endpoint, "HTTP GET /x @.");
+        b.add_node(ep, "GET /x", Attrs::new()).unwrap();
+        let ix = rb_store::code::SnapshotIndex::new(b.finish().unwrap());
+        assert!(rb_api::render::pick_target(&ix, "load", Some(1)).is_ok());
+        let err = rb_api::render::pick_target(&ix, "load", Some(3)).unwrap_err();
+        assert_eq!(err.kind, rb_api::ErrorKind::InvalidParam);
+        assert_eq!(
+            err.cli_text(),
+            "--pick is 3, but only 1 candidate matches \"load\""
+        );
+        assert!(rb_api::render::pick_endpoint(&ix, "GET /x", Some(1)).is_ok());
+        let err = rb_api::render::pick_endpoint(&ix, "GET /x", Some(2)).unwrap_err();
+        assert_eq!(
+            err.cli_text(),
+            "--pick is 2, but only 1 candidate matches \"GET /x\""
+        );
     }
 
     /// Contract M7i S4 (stress U5): with `--exclude-tests` the text counts what it left out;
@@ -386,6 +424,7 @@ mod tests {
         rb_store::code::limit_callers(&ix, &mut tree, 1);
         let text = render_callers(&ix, &tree);
         for want in [
+            "certainty: heuristic 2\n",
             "excluded: 1 callers in test code (--exclude-tests)\n",
             "summary: 2 callers found, 1 shown (--limit 1)\n  by service: app 2\n",
             "truncated: limit\n",
@@ -406,6 +445,8 @@ mod tests {
             text.contains("breaks: requiring edges into it (3, 1 shown):\n"),
             "{text}"
         );
+        // Contract M7j E4: the histogram counts every row found, not the rows shown.
+        assert!(text.contains("certainty: heuristic 3\n"), "{text}");
         assert_eq!(
             rb_api::render::impact_json(&ix, &impact)["totals"],
             json!({"breaks": 3})

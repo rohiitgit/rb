@@ -86,18 +86,20 @@ name='demo'"` and `rb gc`. That's the whole loop: **index → ask → diff/serve
 ## Guided tour: what you can ask
 
 **Find things.** `rb find login --kind symbol` searches nodes by key or name
-(exact matches first); `rb find --kind endpoint` lists every endpoint. `rb service` lists services; `rb service <name>` shows
+(exact matches first); `rb find --kind endpoint` lists endpoints (20 a page;
+`--limit`/`--offset` page through them). `rb service` lists services; `rb service <name>` shows
 the card: endpoints it exposes, packages, database tables, dependencies
 (`via http`, `via calls`, `via package`), and a call-graph summary.
 
 **Trace code.** `rb callers <target> [--depth N]` walks up the call graph as a
 tree (entry points marked: `endpoint …`, `main`, `top-level`). `rb impact
 <target>` walks down: what breaks, what becomes dead code (`orphans:`), which
-tests touch it, which endpoints it handles. On a hub, `--limit N` shows N rows
-after a summary of everything found (per service, per entry kind), and
-`rb callers --exclude-tests` leaves out (and counts) callers in test code. A
-handler's own endpoint is named after the target; its callers are HTTP
-clients, which `rb path` follows.
+tests touch it, which endpoints it handles. On a hub, `--limit N` shows N rows:
+`rb callers` first summarises everything found (per service, per entry kind),
+and `rb impact`'s headers keep each list's full length. `rb callers
+--exclude-tests` leaves out (and counts) callers in test code. The target's own
+entry marks follow its name; a handler's callers are HTTP clients, which
+`rb path` follows.
 
 **Follow requests.** `rb path "POST /api/v1/login"` joins the upstream
 (client calls in other services and *their* callers) and the downstream (the
@@ -184,8 +186,9 @@ HTTP stitching → DI resolution → RTA/entry/orphans → snapshot → AGE grap
 
 Each `rb index` publishes one immutable snapshot (live + up to `--keep`
 retired, default 2); only the live snapshot keeps an AGE graph. Two runs on one
-repository at once take turns (the second says `waiting:`), so neither repeats
-the other's work. Reads hit the
+repository at once take turns (the second says `waiting:`); the second then
+usually finds the first's snapshot up to date (with `--force` or another
+`--rev` it indexes again). Reads hit the
 live pointer in one read-only transaction. Nothing is an LLM call anywhere in
 this pipeline — that is why the output is deterministic.
 
@@ -198,7 +201,7 @@ adds compiler-grade `exact` edges where a build can run in a container.
 | Language | Parsed | `exact` via SCIP | HTTP routes | HTTP / RPC clients | Dependency injection | Data access |
 |---|---|---|---|---|---|---|
 | **Java** | yes | scip-java (Maven, Gradle) | Spring MVC (class × method prefixes, context path; OpenAPI interfaces handled by implementors) | RestTemplate, WebClient, RestClient, Feign, gRPC stubs, OpenAPI-generated clients | Spring (stereotypes, `@Bean`, qualifiers, Lombok), Guice, Dagger, Spring XML | JPA + Spring Data (mappings, derived and `@Query` methods, JPQL), MyBatis XML mappers, SQL in strings |
-| **TypeScript / JavaScript** | yes (TS, TSX, JS) | scip-typescript (npm, pnpm, Yarn) | Express (routers, mounts, constant paths, `require('express')()`; paths matched case-insensitively, as Express does, unless a router opts into `caseSensitive`) | fetch, axios (incl. shared default-exported instances), HTTP client wrappers, gRPC stubs, OpenAPI-generated clients | NestJS (providers, constructor points, tokens) | Prisma (models and queries), TypeORM (models only), SQL in strings |
+| **TypeScript / JavaScript** | yes (TS, TSX, JS) | scip-typescript (npm, pnpm, Yarn) | Express (routers, mounts, constant paths, `require('express')()`; paths matched case-insensitively, as Express does, unless the router mentions `caseSensitive` or the app sets `case sensitive routing`: any value counts, since the value is not read) | fetch, axios (incl. shared default-exported instances), HTTP client wrappers, gRPC stubs, OpenAPI-generated clients | NestJS (providers, constructor points, tokens) | Prisma (models and queries), TypeORM (models only), SQL in strings |
 | **Python** | yes | scip-python | FastAPI (decorators, `APIRouter` prefixes, `include_router` across modules) | requests, httpx | none | SQLAlchemy and Django models (mappings, not queries), SQL in strings |
 | **Go** | yes | scip-go | gin (incl. groups passed as parameters), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings |
 | **Kotlin** | yes | scip-java (Gradle) | none | none | `beans { }` DSL (function and top-level `val` forms) | SQL in strings |
@@ -236,7 +239,8 @@ target/debug/rb doctor                         # checks all of the above, with f
 `rb doctor` prints one row per check (database, Postgres and AGE versions,
 migrations, the age-load directory and whether the database sees it, Docker,
 the SCIP images, the SCIP work dir and free disk), each `ok`, `warn` or `fail`
-with its fix, and exits 1 when one fails.
+with its fix (`skip` when it needs a check that failed), and exits 1 when one
+fails. A database that never answers fails after 10 s.
 
 | Variable | Default | Meaning |
 |---|---|---|

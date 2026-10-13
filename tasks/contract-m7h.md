@@ -77,3 +77,10 @@ flowchart LR
   - `rb doctor` on the machine of record: 10 rows ok, about 2 s (NFR: under 15 s).
 - **Docs:** README (checkout default, `find --kind`, Cypher read-only, `rb doctor`, the variable) and the usage guide. A stray code fence after the README's repository map, present on `main` too, rendered the status paragraph as code; it was removed.
 - **Residue:** the Cypher timeout message still names `--timeout-ms` (the same text serves HTTP); `find --kind` lists in `find`'s rank order (shorter keys first), not alphabetically.
+
+## Amendment 2 (2026-10-13, after evaluator pass 1)
+
+- **S5:** a Docker daemon that does not answer is `warn`, not `fail`, because `--no-scip` indexes without it. Rows that need a failed check are `skip`. Every `warn`/`fail` row has a fix, and the database probes are bounded at 10 s (M7j E2).
+- **S1/U1:** checkouts are matched by path only; root-commit matching was not built. A moved clone gets the "indexed from another checkout" directive.
+- **Process:** mutant m103 (`WHERE name = $1 OR true`) ran against the shared database and wrote `/y/demo` as every repository's checkout. Repaired in M7j (E3).
+

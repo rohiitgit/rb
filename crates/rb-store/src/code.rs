@@ -500,6 +500,8 @@ pub struct CallerTree {
 pub struct CallerSummary {
     pub callers: usize,
     pub shown: usize,
+    /// Every row's certainty, so the histogram counts every row found (contract M7j E4).
+    pub certainties: Vec<Certainty>,
     pub by_service: Vec<(String, usize)>,
     pub by_entry: Vec<(String, usize)>,
 }
@@ -672,10 +674,12 @@ pub fn limit_callers(ix: &SnapshotIndex, tree: &mut CallerTree, max: usize) {
         v
     };
     let callers = all.len();
+    let certainties = all.iter().map(|c| c.certainty).collect();
     cut(&mut tree.callers, &mut max.clone());
     tree.summary = Some(CallerSummary {
         callers,
         shown: max,
+        certainties,
         by_service: most_first(by_service),
         by_entry: most_first(by_entry),
     });
@@ -685,6 +689,12 @@ pub fn limit_callers(ix: &SnapshotIndex, tree: &mut CallerTree, max: usize) {
 /// Shows at most `max` rows of each list of `impact` (contract M7i S4), recording each cut
 /// list's full length in `totals`; the service and owner roll-ups still count every row.
 pub fn limit_impact(impact: &mut Impact, max: usize) {
+    let found: Vec<Certainty> = impact
+        .breaks
+        .iter()
+        .chain(&impact.affects)
+        .map(|x| x.certainty)
+        .collect();
     let mut totals = BTreeMap::new();
     for (name, xs) in [
         ("breaks", &mut impact.breaks),
@@ -705,6 +715,7 @@ pub fn limit_impact(impact: &mut Impact, max: usize) {
     }
     if !totals.is_empty() {
         impact.truncated.insert(Limit::Shown);
+        impact.certainties_found = found;
     }
     impact.totals = totals;
 }
@@ -739,6 +750,9 @@ pub struct Impact {
     pub pruned_by_rta: usize,
     /// The full length of each list [`limit_impact`] cut, by list name.
     pub totals: BTreeMap<&'static str, usize>,
+    /// When a list was cut: the certainty of every `breaks` and `affects` row found, so the
+    /// histogram counts them all (contract M7j E4); empty otherwise.
+    pub certainties_found: Vec<Certainty>,
 }
 
 /// The orphans of an impact, or why they were not computed.
@@ -960,6 +974,7 @@ fn impact_walk(
         precision,
         pruned_by_rta: v.pruned(),
         totals: BTreeMap::new(),
+        certainties_found: Vec::new(),
     }
 }
 
@@ -2029,6 +2044,7 @@ mod tests {
             Some(CallerSummary {
                 callers: 5,
                 shown: 2,
+                certainties: vec![Certainty::Heuristic; 5],
                 by_service: vec![("app".into(), 4), ("lib".into(), 1)],
                 by_entry: vec![("test".into(), 1)],
             })

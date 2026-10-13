@@ -4760,6 +4760,11 @@ fn a_checkout_is_its_repository_whatever_its_name() {
         "{text}"
     );
     assert!(text.ends_with("truncated: limit\n"), "{text}");
+    // Contract M7j E4: the envelope's certainty counts every caller found.
+    let (code, json, _) = rb_exit_in(&url, root, &["callers", "b", "--limit", "1", "--json"]);
+    assert_eq!(code, 0);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(json["certainty"]["heuristic"], 3, "{json}");
     let (code, text, stderr) = rb_exit_in(&url, root, &["impact", "b", "--limit", "1"]);
     assert_eq!(code, 0, "{stderr}");
     assert!(text.contains("(3, 1 shown):\n"), "{text}");
@@ -4942,4 +4947,34 @@ fn a_second_index_of_a_repository_waits_for_the_first() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+}
+
+/// Contract M7j E2 (evaluator pass 1, item 2): `rb doctor` against a server that accepts the
+/// connection and never answers finishes within its bound, failing the database row.
+#[test]
+fn doctor_is_bounded_against_a_silent_database() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming().flatten() {
+            held.push(conn);
+        }
+    });
+    let started = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("doctor")
+        .env(
+            "RB_DATABASE_URL",
+            format!("postgresql://rb:rb@127.0.0.1:{port}/rb"),
+        )
+        .env("RB_AGE_LOAD_DIR", workspace_root().join("var/age-load"))
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(elapsed < std::time::Duration::from_secs(25), "{elapsed:?}");
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.starts_with("fail  database"), "{text}");
+    assert!(text.contains("answered nothing within 10 s"), "{text}");
 }

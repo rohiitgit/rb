@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use rb_scip::Runner as _;
 use rb_store::{LoadDir, Store};
@@ -64,54 +65,27 @@ pub(crate) struct Inputs<'a> {
     pub home: Option<PathBuf>,
 }
 
+/// How long the database checks may take together, as the Docker probe (M7b): a server that
+/// accepts a connection and never answers must not hang `rb doctor` (contract M7j E2).
+const DB_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Runs every check, in order.
 pub(crate) fn diagnose(inputs: &Inputs<'_>) -> Vec<Row> {
-    let mut rows = Vec::new();
     let load_dir = LoadDir::new(inputs.age_load_dir);
-    let mut store = match Store::connect(inputs.database_url) {
-        Ok(store) => {
-            rows.push(row(
-                "database",
-                Status::Ok,
-                rb_store::redact(inputs.database_url),
-            ));
-            Some(store)
-        }
-        Err(e) => {
-            rows.push(
-                row("database", Status::Fail, format!("{e:#}"))
-                    .fix("start it: `docker compose up -d --wait` (with RB_DB_PORT matching the URL), or set RB_DATABASE_URL"),
-            );
-            None
-        }
-    };
-    match store.as_mut() {
-        Some(store) => {
-            match store.server_versions() {
-                Ok((postgres, age)) => {
-                    rows.push(row("postgres", Status::Ok, postgres));
-                    rows.push(age_row(age));
-                }
-                Err(e) => rows.push(row("postgres", Status::Fail, format!("{e:#}"))),
-            }
-            rows.push(match store.pending_migrations() {
-                Ok(pending) => migrations_row(&pending),
-                Err(e) => row("migrations", Status::Fail, format!("{e:#}")),
-            });
-        }
-        None => {
-            for name in ["postgres", "age", "migrations"] {
-                rows.push(row(name, Status::Skip, "needs the database"));
-            }
-        }
-    }
     let dir_ok = inputs.age_load_dir.is_dir();
-    rows.push(load_dir_row(inputs.age_load_dir, dir_ok));
-    rows.push(match (store.as_mut(), dir_ok) {
-        (Some(store), true) => mount_row(mount_probe(store, &load_dir)),
-        (None, _) => row("age-load mount", Status::Skip, "needs the database"),
-        (_, false) => row("age-load mount", Status::Skip, "needs the age-load dir"),
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (url, dir) = (inputs.database_url.to_owned(), load_dir.clone());
+    // A probe still blocked at the timeout is left behind; the process exits after the report.
+    std::thread::spawn(move || {
+        let _ = tx.send(database_rows(&url, &dir, dir_ok));
     });
+    let mut rows = rx
+        .recv_timeout(DB_PROBE_TIMEOUT)
+        .unwrap_or_else(|_| silent_database(inputs.database_url));
+    // The database rows end with the mount check, which reads after the load-dir row.
+    let mount = rows.pop().expect("the database rows end with the mount");
+    rows.push(load_dir_row(inputs.age_load_dir, dir_ok));
+    rows.push(mount);
     let docker = rb_scip::docker_available();
     rows.push(docker_row(&docker, std::env::var("DOCKER_CONTEXT").ok()));
     rows.push(match docker {
@@ -129,6 +103,74 @@ pub(crate) fn diagnose(inputs: &Inputs<'_>) -> Vec<Row> {
     let work_dir = absolute(inputs.scip_work_dir);
     rows.push(work_dir_row(&work_dir, inputs.home.as_deref()));
     rows.push(disk_row(&work_dir, free_bytes(&work_dir)));
+    rows
+}
+
+/// The database, Postgres, AGE, migrations and age-load mount rows, in that order.
+fn database_rows(url: &str, load_dir: &LoadDir, dir_ok: bool) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut store = match Store::connect(url) {
+        Ok(store) => {
+            rows.push(row("database", Status::Ok, rb_store::redact(url)));
+            store
+        }
+        Err(e) => {
+            rows.push(
+                row("database", Status::Fail, format!("{e:#}"))
+                    .fix("start it: `docker compose up -d --wait` (with RB_DB_PORT matching the URL), or set RB_DATABASE_URL"),
+            );
+            rows.extend(needs_the_database());
+            return rows;
+        }
+    };
+    match store.server_versions() {
+        Ok((postgres, age)) => {
+            rows.push(row("postgres", Status::Ok, postgres));
+            rows.push(age_row(age));
+        }
+        Err(e) => {
+            rows.push(
+                row("postgres", Status::Fail, format!("{e:#}")).fix(
+                    "point RB_DATABASE_URL at the compose database (Postgres 18 + Apache AGE)",
+                ),
+            );
+            rows.push(row("age", Status::Skip, "needs the server's answer"));
+        }
+    }
+    rows.push(match store.pending_migrations() {
+        Ok(pending) => migrations_row(&pending),
+        Err(e) => row("migrations", Status::Fail, format!("{e:#}")).fix("`rb migrate`"),
+    });
+    rows.push(if dir_ok {
+        mount_row(mount_probe(&mut store, load_dir))
+    } else {
+        row("age-load mount", Status::Skip, "needs the age-load dir")
+    });
+    rows
+}
+
+/// `skip` rows for the checks after an unreachable database.
+fn needs_the_database() -> Vec<Row> {
+    ["postgres", "age", "migrations", "age-load mount"]
+        .into_iter()
+        .map(|name| row(name, Status::Skip, "needs the database"))
+        .collect()
+}
+
+/// The database rows when the server took the connection but answered nothing in time.
+fn silent_database(url: &str) -> Vec<Row> {
+    let mut rows =
+        vec![row(
+        "database",
+        Status::Fail,
+        format!(
+            "{} answered nothing within {} s",
+            rb_store::redact(url),
+            DB_PROBE_TIMEOUT.as_secs()
+        ),
+    )
+    .fix("restart it (`docker compose restart`), and check that RB_DATABASE_URL names Postgres")];
+    rows.extend(needs_the_database());
     rows
 }
 
@@ -205,7 +247,9 @@ fn mount_row(seen: Result<bool, String>) -> Row {
             "the database does not see this directory at /tmp/age/rb-load",
         )
         .fix("point RB_AGE_LOAD_DIR at the directory compose mounts (./var/age-load of the checkout that started it)"),
-        Err(e) => row("age-load mount", Status::Warn, format!("not verified: {e}")),
+        Err(e) => row("age-load mount", Status::Warn, format!("not verified: {e}")).fix(
+            "the check reads the file through `pg_stat_file` (superuser or pg_read_server_files); a first `rb index` also proves the mount",
+        ),
     }
 }
 
@@ -273,7 +317,8 @@ fn disk_row(dir: &Path, free: Option<u64>) -> Row {
             "disk",
             Status::Warn,
             format!("free space under {} unknown", dir.display()),
-        ),
+        )
+        .fix("check it by hand (`df -h`)"),
     }
 }
 
@@ -425,6 +470,59 @@ mod tests {
         assert_eq!(disk_row(dir, Some(DISK_FLOOR)).status, Status::Ok);
         assert_eq!(disk_row(dir, Some(DISK_FLOOR - 1)).status, Status::Warn);
         assert_eq!(disk_row(dir, None).status, Status::Warn);
+    }
+
+    /// Contract M7j E2: a silent server is a failed database row with a fix and the rows that
+    /// need it skipped, in the usual order (the mount last).
+    #[test]
+    fn a_silent_database_fails_with_a_fix() {
+        let rows = silent_database("postgresql://rb:pw@h:1/rb");
+        let names: Vec<&str> = rows.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                "database",
+                "postgres",
+                "age",
+                "migrations",
+                "age-load mount"
+            ]
+        );
+        assert_eq!(rows[0].status, Status::Fail);
+        assert!(
+            rows[0]
+                .detail
+                .starts_with("postgresql://rb:***@h:1/rb answered nothing")
+        );
+        assert!(rows[0].fix.is_some());
+        assert!(rows[1..].iter().all(|r| r.status == Status::Skip));
+    }
+
+    /// Contract M7j E2 (evaluator item 10): every `warn` and `fail` row the builders make has a
+    /// fix; `skip` rows name what they wait for.
+    #[test]
+    fn every_warn_and_fail_row_has_a_fix() {
+        let dir = Path::new("/d");
+        let rows = [
+            migrations_row(&["0007"]),
+            age_row(None),
+            load_dir_row(Path::new("var/x"), true),
+            load_dir_row(dir, false),
+            mount_row(Ok(false)),
+            mount_row(Err("denied".into())),
+            docker_row(&Err("down".into()), None),
+            images_row(&["x"]),
+            work_dir_row(Path::new("/tmp/x"), Some(Path::new("/Users/me"))),
+            disk_row(dir, Some(1)),
+            disk_row(dir, None),
+        ];
+        for r in rows.iter().chain(&silent_database("postgresql://h/rb")) {
+            match r.status {
+                Status::Warn | Status::Fail => assert!(r.fix.is_some(), "{r:?}"),
+                Status::Skip => assert!(r.detail.starts_with("needs "), "{r:?}"),
+                Status::Ok => {}
+            }
+        }
     }
 
     /// `df -Pk`'s available column, in bytes; anything else is unknown.
