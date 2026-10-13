@@ -545,3 +545,7 @@
 ## 2026-10-13: a content marker is a format's exact spelling, checked against other tools that write similar lines
 - **Mistake:** M7d S5 read `-- name:` case-insensitively as an aiosql query marker. pg_dump writes `-- Name: audits; Type: TABLE; Schema: public` above every object, so 87 mattermost schema dumps (55 `CREATE TABLE` each) were reclassified as query files. The unit cases held only aiosql and plain DDL; the invariant run on mattermost caught it.
 - **Rule:** Match a marker in the exact form the format documents (case included), and before shipping, grep the measured repositories for near-variants of the marker written by other tools (dumps, ORMs, linters). Each near-variant found becomes a negative case in the test.
+
+## 2026-10-13: before a new milestone series, list the project's record files and keep every one
+- **Mistake:** M7a–M7d updated `IMPLEMENT.md`, contracts, todo and lessons, but not `CHANGELOG.md`, which every earlier milestone (M0–M6l) kept. The gap was caught only when the karpathy-loops changelog rule was applied at M7e, and it was backfilled there.
+- **Rule:** At the start of a milestone series, read the last close commit's file list (`git show --stat <last close>`) and copy its record set into the plan's final phase as checkboxes: `CHANGELOG.md`, `IMPLEMENT.md`, contract, todo, lessons, design doc rows.
