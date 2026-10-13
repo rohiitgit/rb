@@ -803,6 +803,20 @@ pub struct Coverage {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub excluded: Vec<rb_model::Diagnostic>,
+    /// The `language_unsupported` diagnostics, one per language (contract M7g S1):
+    /// `{language, files}`; absent when every code file has a grammar.
+    #[serde(
+        serialize_with = "excluded_counts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub unsupported_languages: Vec<rb_model::Diagnostic>,
+    /// The `framework_unsupported` diagnostics (contract M7g S2): `{service, framework,
+    /// package}`; absent when every framework found has a pack.
+    #[serde(
+        serialize_with = "excluded_counts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub unsupported_frameworks: Vec<rb_model::Diagnostic>,
 }
 
 fn excluded_counts<S: Serializer>(
@@ -837,19 +851,20 @@ fn status(store: &mut Store, repo: Option<&str>) -> Result<Output, ApiError> {
         let st = store.status(&name)?;
         let coverage = match &st.live {
             Some(live) => {
-                let (scip, excluded) = store
-                    .load_diagnostics(live.id)?
-                    .into_iter()
-                    .filter(|d| d.kind == "scip_status" || d.kind == "excluded")
-                    .partition(|d| d.kind == "scip_status");
+                let notes = store.load_diagnostics(live.id)?;
+                let of = |kind: &str| -> Vec<rb_model::Diagnostic> {
+                    notes.iter().filter(|d| d.kind == kind).cloned().collect()
+                };
                 Some(Coverage {
                     sql: store.sql_coverage(live.id)?,
                     code: store.resolution_coverage(live.id)?,
                     http: store.http_coverage(live.id)?,
                     di: store.di_coverage(live.id)?,
                     rta: store.rta_coverage(live.id)?,
-                    scip,
-                    excluded,
+                    scip: of("scip_status"),
+                    excluded: of("excluded"),
+                    unsupported_languages: of("language_unsupported"),
+                    unsupported_frameworks: of("framework_unsupported"),
                 })
             }
             None => None,

@@ -1062,3 +1062,14 @@ Contract: `tasks/contract-m7f.md`. Branch `m7f-error-contract` (stacked on M7e `
 
 ## Review (M7f)
 - Batch E part 1 is complete. One error contract: typed kinds, envelope everywhere, exit 6 for an unreachable database, and 2 for any `check` error.
+
+---
+
+# M7g: honesty about what was not analysed (stress batch E, part 2), started 2026-10-13
+
+Contract: `tasks/contract-m7g.md`. Branch `m7g-honesty` (stacked on M7f `83f720b`). Record set: CHANGELOG, IMPLEMENT, contract, todo, stress-findings, lessons.
+
+- [x] Phase 1 (S1, F30): php/scala/swift/dart/elixir named; `parse_plan` counts code languages without a grammar (data formats, binary and generated files excluded); one `counts_line` helper behind the `excluded` and `not analysed` lines. Mutants m87–m90 killed (m88 re-applied on fmt text).
+- [x] Phase 2 (S2, F25): `FRAMEWORKS_WITHOUT_A_PACK` (14 entries) matched per manager (Go `/vN`, Maven group); one diagnostic per service and framework; status line. Mutants m91, m92, m94 killed; m93 showed the PyPI case arm was dead (names arrive normalised), so it was deleted.
+- [x] Phase 3 (S3, F24): orphan Cypher (`OPTIONAL MATCH … certainty > 1 … COUNT = 0`) and twin (`certainty > Ambiguous`) changed together, the literal bound to `Certainty::Ambiguous.rank()` by test; `--baseline` reads `rb check`'s own text output; stderr caveat from `http_coverage`. Mutants m95–m98 killed (m98 needed a non-rule arrow line).
+- [x] Phase 4: PIPELINE `m7g-1`; real-Docker suites 1,013/0/0 (the polyglot `check` golden re-blessed: one ambiguous-only endpoint is now an orphan, as S3 states); invariant against M7f 27/31 identical, 4 diffs classified (3 `framework_unsupported`, laravel `php`); `rb check` orphan counts unchanged on 8 real repos, mattermost 0.16 s; README and usage guide updated; records.

@@ -553,3 +553,7 @@
 ## 2026-10-13: changing an error kind means grepping every test for the old kind first
 - **Mistake:** M7f S2 turned "database unreachable" from `internal` (500) into `unavailable` (503). Two `rb-server` tests used a closed port only to keep workers busy, but asserted `(500, "internal")`; they failed in the 40-minute real-Docker run instead of a 3-second unit run.
 - **Rule:** When an error's kind, exit code or status changes, `grep -rn '"<old kind>"\|<old status>'` across `crates/*/src/tests.rs` and `crates/*/tests/` before the full run. Classify each hit as intent (keep and justify) or incidental (update with a note).
+
+## 2026-10-13: every step of a verification script sets the environment it needs
+- **Mistake:** the M7g close script ran the mattermost `rb check` timing without `RB_DATABASE_URL`, so it hit the default port 55432 and exited 2 (`unavailable`). The log line `mattermost check: 2s exit=2` looked like a failed NFR until it was re-run by hand (0.16 s).
+- **Rule:** A verification script exports every variable it relies on once at the top (DB URL, Docker context), and records each command's stderr next to its exit code, so a non-zero exit explains itself in the log.

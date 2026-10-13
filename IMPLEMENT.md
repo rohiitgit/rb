@@ -735,3 +735,11 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Verification:**
   - 14 mutants killed. Real-Docker 1,009/0/0.
   - Invariant 31/31 byte-identical. The exit-code table gains `unavailable` (6 / 503).
+
+## M7g Honesty about what was not analysed (stress batch E, part 2): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7g.md` (design diagram, S1–S3, amendment 1). Addresses F30, F25 and F24, each partly (residue recorded).
+- **Implemented:** `language_unsupported` and `framework_unsupported` diagnostics with `rb status` lines; `orphan_endpoints` requires a non-ambiguous consumer; `rb check --baseline` and the unlinked-client note.
+- **Verification:**
+  - Mutants m87–m98 killed (m93 exposed dead code, now deleted). Real-Docker 1,013/0/0.
+  - Invariant 27/31 byte-identical, 4 classified. `PIPELINE` `m7g-1`.

@@ -129,7 +129,10 @@ use serde_json::{Value, json};
 /// `m7e-1` input hygiene: vendored and built files (rb.toml `ignore`, Go `vendor/`,
 /// `node_modules`, `.gitattributes` linguist marks, tsconfig `outDir` outputs) keep
 /// their `File` node with `excluded` and are not analysed; counted per reason.
-pub const PIPELINE: &str = "m7e-1";
+/// `m7g-1` honesty: php/scala/swift/dart/elixir files named; code without a grammar
+/// counted (`language_unsupported`); frameworks without a pack named
+/// (`framework_unsupported`).
+pub const PIPELINE: &str = "m7g-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -1005,6 +1008,7 @@ pub fn assemble(
     });
     packages::add(&mut b, &manifest_edges)?;
     diagnostics.extend(manifest_diagnostics);
+    diagnostics.extend(packages::unsupported_frameworks(&manifest_edges));
     // ORM mappings from every file first, so accesses can resolve entities across files.
     for (path, (_, facts)) in &content.facts {
         syntax::add_symbols(&mut b, path, facts, &keys[path])?;

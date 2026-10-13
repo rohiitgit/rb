@@ -199,6 +199,12 @@ pub fn language_for_path(path: &str) -> Option<&'static str> {
         "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
         "cs" => "csharp",
         "rb" => "ruby",
+        // No grammar in rb; named so their files are reported as unanalysed code (M7g S1).
+        "php" => "php",
+        "scala" | "sc" => "scala",
+        "swift" => "swift",
+        "dart" => "dart",
+        "ex" | "exs" => "elixir",
         "sql" => "sql",
         "proto" => "protobuf",
         "prisma" => "prisma",
@@ -404,5 +410,17 @@ mod tests {
         assert_eq!(language_for_path("x.tsx"), Some("tsx"));
         assert_eq!(language_for_path("Makefile"), None);
         assert_eq!(language_for_path(".env"), None);
+        // Contract M7g S1: languages rb has no grammar for are still named, so a file of one
+        // is reported as unanalysed code, not as "other".
+        for (path, lang) in [
+            ("app/Http/Kernel.php", "php"),
+            ("src/Main.scala", "scala"),
+            ("Sources/App.swift", "swift"),
+            ("lib/main.dart", "dart"),
+            ("lib/app.ex", "elixir"),
+            ("test/app_test.exs", "elixir"),
+        ] {
+            assert_eq!(language_for_path(path), Some(lang), "{path}");
+        }
     }
 }

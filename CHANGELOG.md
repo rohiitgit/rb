@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M7g: honesty about what was not analysed (stress batch E, part 2)
+- **Languages:** php, scala, swift, dart and elixir files are named (`lang`). Code in a language without a grammar is counted per language (`language_unsupported`), and `rb status` prints `not analysed (no grammar): php 84 files`.
+- **Frameworks:** a service that depends on a known framework rb has no pack for (14 packages: koa, fastify, hapi, routing-controllers, NestJS controllers, echo, fiber, flask, Django views, tornado, Micronaut, Quarkus) gets `framework_unsupported`, and `rb status` names it.
+- **`rb check`:** `orphan_endpoints` needs a non-ambiguous consumer (Cypher rule and relational twin together). `--baseline FILE` accepts the violations listed in a saved `rb check` output. A stderr note counts the client call sites that are linked to no endpoint.
+- **Docs:** README per-language support matrix and known gaps; usage guide brought up to M7g.
+- **Verification:** F30, F25 and F24 partly fixed (residue in the contract). Mutants m87–m98. Real-Docker suites 1,013/0/0 (the polyglot `check` golden re-blessed: +1 ambiguous-only orphan). Invariant vs M7f 27/31 identical, 4 diffs classified. `rb check` 0.16 s on mattermost. `PIPELINE` `m7g-1`.
+- **Files:** `crates/rb-git/src/lib.rs`, `crates/rb-indexer/src/{lib,syntax,packages}.rs`, `crates/rb-store/src/check.rs`, `crates/rb-api/src/lib.rs`, `crates/rb-cli/src/main.rs`, `crates/rb-cli/tests/golden/polyglot-monorepo/check.txt`, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7g,todo,stress-findings,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M7f: the error contract and targets (stress batch E, part 1)
 - **Error wording:** CLI error text names what the user typed: positionals by clap usage name (`<TEXT> is required`), `--cols` (not `--columns`), and the repo directive as a predicate (`--repo is needed: …`, one helper replacing 4 copies).
 - **Unreachable database:** the new `unavailable` kind (exit 6, HTTP 503) gives a one-line cause with a hint, with no anyhow chain, and the envelope under `--json` (`rb_store::Unavailable`).

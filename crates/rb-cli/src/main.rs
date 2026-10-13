@@ -394,6 +394,10 @@ enum Command {
             value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
         )]
         timeout_ms: u64,
+        /// Accept the violations listed in this file (as `rb check` prints them: save today's
+        /// output to adopt the gate, then only new violations fail).
+        #[arg(long)]
+        baseline: Option<PathBuf>,
     },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
@@ -613,8 +617,16 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
             rule,
             json,
             timeout_ms,
+            baseline,
         } => {
-            return check_rules(&mut store, repo, rule, json, timeout_ms);
+            return check_rules(
+                &mut store,
+                repo,
+                rule,
+                json,
+                timeout_ms,
+                baseline.as_deref(),
+            );
         }
         question => {
             let asked = asked(question).expect("every other command is a question");
@@ -1888,6 +1900,12 @@ fn status_text(all: bool, reports: &[rb_api::StatusReport]) -> String {
             if let Some(line) = excluded_line(&c.excluded) {
                 let _ = writeln!(out, "  {line}");
             }
+            if let Some(line) = unsupported_languages_line(&c.unsupported_languages) {
+                let _ = writeln!(out, "  {line}");
+            }
+            if let Some(line) = unsupported_frameworks_line(&c.unsupported_frameworks) {
+                let _ = writeln!(out, "  {line}");
+            }
             for d in &c.scip {
                 let _ = writeln!(out, "  {}", scip_status_line(d));
             }
@@ -1899,18 +1917,48 @@ fn status_text(all: bool, reports: &[rb_api::StatusReport]) -> String {
 /// `excluded from analysis: <reason> <n> files, …` from the `excluded` diagnostics (contract
 /// M7e S3); `None` when nothing was excluded.
 fn excluded_line(excluded: &[rb_model::Diagnostic]) -> Option<String> {
-    let parts: Vec<String> = excluded
+    counts_line("excluded from analysis", "reason", excluded)
+}
+
+/// `not analysed (no grammar): <language> <n> files, …` from the `language_unsupported`
+/// diagnostics (contract M7g S1); `None` when every code file has a grammar.
+fn unsupported_languages_line(languages: &[rb_model::Diagnostic]) -> Option<String> {
+    counts_line("not analysed (no grammar)", "language", languages)
+}
+
+/// `frameworks without a pack (…): <framework> in <service>, …` from the
+/// `framework_unsupported` diagnostics (contract M7g S2); `None` when there are none.
+fn unsupported_frameworks_line(frameworks: &[rb_model::Diagnostic]) -> Option<String> {
+    let parts: Vec<String> = frameworks
+        .iter()
+        .map(|d| {
+            format!(
+                "{} in {}",
+                d.detail["framework"].as_str().unwrap_or("?"),
+                d.detail["service"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    (!parts.is_empty()).then(|| {
+        format!(
+            "frameworks without a pack (routes and clients not read): {}",
+            parts.join(", ")
+        )
+    })
+}
+
+/// `<label>: <detail[key]> <n> files, …` over count diagnostics (`{key, files}`), in the
+/// stored (canonical) order; `None` when there are none.
+fn counts_line(label: &str, key: &str, counts: &[rb_model::Diagnostic]) -> Option<String> {
+    let parts: Vec<String> = counts
         .iter()
         .map(|d| {
             let files = d.detail["files"].as_u64().unwrap_or(0);
             let unit = if files == 1 { "file" } else { "files" };
-            format!(
-                "{} {files} {unit}",
-                d.detail["reason"].as_str().unwrap_or("?")
-            )
+            format!("{} {files} {unit}", d.detail[key].as_str().unwrap_or("?"))
         })
         .collect();
-    (!parts.is_empty()).then(|| format!("excluded from analysis: {}", parts.join(", ")))
+    (!parts.is_empty()).then(|| format!("{label}: {}", parts.join(", ")))
 }
 
 /// Text rendering of the Service Card's structure sections (design §9.5).
@@ -2376,6 +2424,62 @@ fn format_check(violations: &[(String, String, String)], truncated: bool, json: 
 struct CheckOutcome {
     violations: Vec<(String, String, String)>,
     truncated: bool,
+    /// What the orphan rule cannot see, when it ran ([`unlinked_note`]).
+    note: Option<String>,
+    /// Violations the baseline accepted, when one was given.
+    accepted: Option<usize>,
+}
+
+/// The violations a baseline accepts: the `rule src -> dst` lines `rb check` prints
+/// ([`check_line`]); its summary, comments and anything else are ignored (contract M7g S3).
+fn parse_baseline(text: &str) -> BTreeSet<(String, String, String)> {
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let (rule, rest) = l.split_once(' ')?;
+            let (src, dst) = rest.split_once(" -> ")?;
+            rb_store::check::RULES
+                .iter()
+                .any(|r| r.name == rule)
+                .then(|| (rule.to_owned(), src.to_owned(), dst.to_owned()))
+        })
+        .collect()
+}
+
+/// `violations` without the accepted ones, and how many were accepted.
+fn apply_baseline(
+    violations: Vec<(String, String, String)>,
+    accepted: &BTreeSet<(String, String, String)>,
+) -> (Vec<(String, String, String)>, usize) {
+    let total = violations.len();
+    let kept: Vec<_> = violations
+        .into_iter()
+        .filter(|v| !accepted.contains(v))
+        .collect();
+    let n = total - kept.len();
+    (kept, n)
+}
+
+/// The caveat for `orphan_endpoints` from a snapshot's `http_coverage` counts: client sites
+/// linked to no endpoint (dynamic, unmatched, ambiguous or too ambiguous) may call an endpoint
+/// the rule reports; `None` when every site is linked.
+fn unlinked_note(coverage: &serde_json::Value) -> Option<String> {
+    let count = |k: &str| coverage[k].as_u64().unwrap_or(0);
+    let parts: Vec<String> = ["dynamic", "unmatched", "ambiguous", "too_ambiguous"]
+        .iter()
+        .filter(|k| count(k) > 0)
+        .map(|k| format!("{} {}", k.replace('_', " "), count(k)))
+        .collect();
+    let total: u64 = ["dynamic", "unmatched", "ambiguous", "too_ambiguous"]
+        .iter()
+        .map(|k| count(k))
+        .sum();
+    (total > 0).then(|| {
+        format!(
+            "note: {total} client call sites are linked to no endpoint ({}); an endpoint reported orphan may still be called through them",
+            parts.join(", ")
+        )
+    })
 }
 
 /// Runs the built-in architecture rules' Cypher queries against the live snapshot (contract M6h
@@ -2387,9 +2491,17 @@ fn check_rules(
     rule: Option<String>,
     json: bool,
     timeout_ms: u64,
+    baseline: Option<&Path>,
 ) -> anyhow::Result<ExitCode> {
     let outcome = (|| -> anyhow::Result<CheckOutcome> {
         let snap = live_snapshot(store, repo)?;
+        let accepted: BTreeSet<(String, String, String)> = match baseline {
+            Some(path) => parse_baseline(
+                &std::fs::read_to_string(path)
+                    .with_context(|| format!("reading baseline {}", path.display()))?,
+            ),
+            None => BTreeSet::new(),
+        };
         let selected: Vec<&rb_store::check::Rule> = match &rule {
             Some(name) => vec![
                 rb_store::check::RULES
@@ -2399,6 +2511,9 @@ fn check_rules(
             ],
             None => rb_store::check::RULES.iter().collect(),
         };
+        let orphan_rule = selected
+            .iter()
+            .any(|r| r.name == rb_store::check::RULE_ORPHAN_ENDPOINTS);
         let limits = rb_store::CypherLimits {
             timeout_ms,
             rows: rb_store::CYPHER_ROWS_MAX,
@@ -2419,14 +2534,29 @@ fn check_rules(
         }
         violations.sort();
         violations.dedup();
+        // The client sites the orphan rule cannot see (contract M7g S3).
+        let note = if orphan_rule {
+            store
+                .load_diagnostics(snap.id)?
+                .iter()
+                .find(|d| d.kind == "http_coverage")
+                .and_then(|d| unlinked_note(&d.detail))
+        } else {
+            None
+        };
+        let (violations, accepted) = apply_baseline(violations, &accepted);
         Ok(CheckOutcome {
             violations,
             truncated,
+            note,
+            accepted: baseline.map(|_| accepted),
         })
     })();
     let CheckOutcome {
         violations,
         truncated,
+        note,
+        accepted,
     } = match outcome {
         Ok(v) => v,
         // Errors exit 2, never 1 (violations), through the shared rendering (contract M7f S3).
@@ -2437,6 +2567,15 @@ fn check_rules(
         eprintln!(
             "warning: rule rows truncated at {}",
             rb_store::CYPHER_ROWS_MAX
+        );
+    }
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    if let Some(n) = accepted {
+        eprintln!(
+            "baseline: {n} accepted violation{} not reported",
+            if n == 1 { "" } else { "s" }
         );
     }
     print!("{}", format_check(&violations, truncated, json));
@@ -2812,6 +2951,52 @@ mod tests {
         assert!(wants(&["rb", "path", "x", "--format", "json"]));
         assert!(!wants(&["rb", "callers", "x"]));
         assert!(!wants(&["rb", "migrate"]));
+    }
+
+    /// Contract M7g S3 (stress F24): `rb check`'s own text output is its baseline — every
+    /// violation line `check_line` writes reads back (endpoint keys hold spaces), the summary
+    /// and comments do not — and the caveat names the client sites the gate cannot see.
+    #[test]
+    fn check_output_is_its_own_baseline_and_names_unlinked_sites() {
+        let violations = vec![
+            (
+                "orphan_endpoints".to_owned(),
+                ".".to_owned(),
+                "HTTP DELETE /api/v1/articles/{} @.".to_owned(),
+            ),
+            ("service_cycles".to_owned(), "a".to_owned(), "b".to_owned()),
+        ];
+        let text = format!(
+            "# accepted 2026-10-13\nmoved svc -> other (not a rule)\n{}",
+            format_check(&violations, false, false)
+        );
+        let baseline = parse_baseline(&text);
+        assert_eq!(
+            baseline,
+            violations.iter().cloned().collect::<BTreeSet<_>>()
+        );
+        let (kept, accepted) = apply_baseline(
+            vec![
+                violations[0].clone(),
+                (
+                    "orphan_endpoints".to_owned(),
+                    ".".to_owned(),
+                    "HTTP GET /new @.".to_owned(),
+                ),
+            ],
+            &baseline,
+        );
+        assert_eq!(accepted, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].2, "HTTP GET /new @.");
+        let coverage = json!({"sites": 50, "dynamic": 3, "unmatched": 11, "ambiguous": 2, "too_ambiguous": 0, "heuristic": 30});
+        assert_eq!(
+            unlinked_note(&coverage).as_deref(),
+            Some(
+                "note: 16 client call sites are linked to no endpoint (dynamic 3, unmatched 11, ambiguous 2); an endpoint reported orphan may still be called through them"
+            )
+        );
+        assert_eq!(unlinked_note(&json!({"sites": 4, "heuristic": 4})), None);
     }
 
     /// Contract M7f S7: `rb path --json` is `--format json`, as `--json` is on every other
@@ -3298,6 +3483,32 @@ mod tests {
             Some("excluded from analysis: go_vendor 1020 files, node_modules 1 file")
         );
         assert_eq!(excluded_line(&[]), None);
+        // Contract M7g S1: languages without a grammar, counted the same way.
+        let lang = |language: &str, files: u64| rb_model::Diagnostic {
+            kind: "language_unsupported".into(),
+            path: None,
+            span: None,
+            detail: json!({ "language": language, "files": files }),
+        };
+        assert_eq!(
+            unsupported_languages_line(&[lang("php", 84), lang("rust", 1)]).as_deref(),
+            Some("not analysed (no grammar): php 84 files, rust 1 file")
+        );
+        assert_eq!(unsupported_languages_line(&[]), None);
+        // Contract M7g S2: frameworks without a pack, by service.
+        let fw = |service: &str, framework: &str| rb_model::Diagnostic {
+            kind: "framework_unsupported".into(),
+            path: None,
+            span: None,
+            detail: json!({ "service": service, "framework": framework, "package": "p" }),
+        };
+        assert_eq!(
+            unsupported_frameworks_line(&[fw("api", "echo"), fw("py", "flask")]).as_deref(),
+            Some(
+                "frameworks without a pack (routes and clients not read): echo in api, flask in py"
+            )
+        );
+        assert_eq!(unsupported_frameworks_line(&[]), None);
     }
 
     #[test]

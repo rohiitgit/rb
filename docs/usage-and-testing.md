@@ -1,11 +1,11 @@
 # Using and testing Repository Brain
 
 This is the operator's guide: how to run the `rb` tool end to end, and how to
-run every test suite. It reflects the tree as of M6l (M0–M6l closed). Design
-rationale lives in `docs/repository-brain-design.md`; the per-milestone
-contracts, evaluations and measurements in `tasks/`; the older quickstart in
-`README.md` (its status line predates M6 — this document supersedes it for
-usage).
+run every test suite. It reflects the tree as of M7g (M0–M7g). Design rationale
+lives in `docs/repository-brain-design.md`; the per-milestone contracts,
+evaluations and measurements in `tasks/`; the short tour in `README.md`. M7a–M7g
+came out of a stress campaign over 18 fixtures and 13 public repositories; its
+findings, repros and what each milestone fixed are in `tasks/stress-findings.md`.
 
 ## 1. What the system does
 
@@ -22,18 +22,38 @@ Language coverage (all Tier B unless noted):
 
 | Language | Calls/refs | DI |
 |---|---|---|
-| TypeScript/TSX/JavaScript | heuristic; `exact` via scip-typescript | NestJS (`@Injectable`, `@Controller`, constructor points, token qualifiers) |
+| TypeScript/TSX/JavaScript | heuristic; `exact` via scip-typescript | NestJS (`@Injectable`, `@Controller`, constructor points, token qualifiers; `@InjectRepository` points are `external`) |
 | Java | heuristic; `exact` via scip-java (Maven + Gradle) | Spring (stereotypes, `@Bean`, `@Value`-exclusion, qualifiers, Lombok points, Guice/Dagger in `java-guice`/`java-dagger` fixtures), Spring XML (`<bean>`, `<constructor-arg>`, aliases, component scan) |
 | Kotlin | heuristic; `exact` via scip-java in Gradle builds | `beans { }` DSL incl. top-level `val` form, `ref()` points, `@Assisted` exclusion |
-| C# (Tier B only, no SCIP) | heuristic (namespaces incl. file-scoped/dotted, enclosing-namespace scope, global namespace) | `Add/TryAdd/Keyed` registrations incl. top-level minimal hosting, constructor + `[Inject]`/`[FromServices]`/`[FromKeyedServices]` property points, key matching |
+| C# (Tier B only, no SCIP) | heuristic (namespaces incl. file-scoped/dotted, enclosing-namespace scope, global namespace) | `Add/TryAdd/Keyed` registrations incl. top-level minimal hosting, read with an explicit `using`, implicit usings (Web/Worker/BlazorWebAssembly SDK with `ImplicitUsings`) or a project `global using`; a class registered as an implementation (`AddScoped<IX, X>`) is an owner; constructor parameters (not body locals) + `[Inject]`/`[FromServices]`/`[FromKeyedServices]` property points, key matching. Open generics (`typeof(IRepo<>)`) are not read |
 | Python / Go | heuristic + endpoints/clients; `exact` via scip-python / scip-go | — |
-| SQL / ORM | pg_query parse-tree walk; JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django | — |
+| SQL / ORM | pg_query parse-tree walk; JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django; `.sql` files are migrations by path convention (migrations dir, Flyway `V…__`, numbered, `.up.sql`) or DDL, else query files (aiosql `-- name:`, HugSQL `-- :name`) | — |
+
+Routes are read for Spring, Express (literal and constant paths, `require('express')()`),
+FastAPI (prefixes composed across modules; an unresolvable prefix stays
+`prefix_unknown`), gin, chi and net/http, plus gRPC services from `.proto`
+files, attributed to the services that register a server. Clients: fetch,
+axios (including default-exported instances), Spring clients, Go/TS/Java gRPC
+stubs.
+
+**Not analysed, and reported** (see `rb status`):
+- **Excluded files.** These keep their `File` node, are never parsed, and the node carries `excluded: <reason>`:
+  - Go `vendor/` next to `vendor/modules.txt`;
+  - `node_modules/`;
+  - `.gitattributes` `linguist-vendored`/`linguist-generated`;
+  - TypeScript `outDir` compiler output;
+  - `rb.toml` `ignore = [globs]`.
+- **Code without a grammar:** PHP, Ruby, Rust, C/C++, Scala, Swift, Dart and Elixir.
+- **Frameworks without a pack**, named per service: echo, fiber, flask, Django views, koa, fastify, hapi, routing-controllers, NestJS controllers, Micronaut and Quarkus.
 
 Questions answered: `find`, `service` (card), `callers` (Q1), `impact` (Q2),
-`table-deps` (Q3), `path` (Q4), `diff`, `cypher`, JSON API + `serve`, and
-architecture gates via `check` (rules: `orphan_endpoints`,
-`unowned_table_writes`, `service_cycles`; exit 0 clean, 1 violations,
-2 errors).
+`table-deps` (Q3), `path` (Q4), `diff`, `cypher` (scalars as text; nodes,
+edges and paths as agtype text), JSON API + `serve`, and architecture gates
+via `check`:
+- **Rules:** `orphan_endpoints` (an endpoint no *unambiguous* client link consumes), `unowned_table_writes` and `service_cycles`.
+- **Exit codes:** 0 clean, 1 violations, 2 on any error, including an unreachable database.
+- **`--baseline FILE`** accepts the violations listed in a saved `rb check` output.
+- **The orphan rule** notes on stderr how many client call sites it could not link.
 
 ## 2. Prerequisites
 
@@ -78,7 +98,7 @@ rm -rf /tmp/demo-spring && mkdir -p /tmp/demo-spring && cp -r fixtures/spring-xm
 target/debug/rb index /tmp/demo-spring --repo demo_spring --no-scip --no-cache
 # demo_spring: snapshot 31145 live @ a96890ed53e0 — 17 nodes, 27 edges, 4 diagnostics; …; parsed 4 source files
 
-target/debug/rb status --repo demo_spring   # services, endpoints, di:/rta: lines
+target/debug/rb status --repo demo_spring   # sql/code/http/di/rta lines, plus what was not analysed
 target/debug/rb service --repo demo_spring  # service list; `rb service shop` for the card
 
 # Questions (a name matching several symbols needs --pick N, never a silent pick)
@@ -87,13 +107,17 @@ target/debug/rb callers "Db#load()." --repo demo_spring
 # callers of Db#load().  src/Db.java:4  [shop]
 # precision=cha
 #   Store#stock().  src/Store.java:15  [shop]  heuristic
+target/debug/rb callers 'Db#load()' --repo demo_spring   # a near-miss key resolves when one symbol matches
 target/debug/rb impact "Store#" --repo demo_spring --pick 1
 # removing Store# … breaks: … 1  Audit#  src/Audit.java:3  [shop]  heuristic …
 target/debug/rb dump --repo demo_spring > /tmp/demo.jsonl   # canonical dump
 
 # Architecture gates
-target/debug/rb check --repo demo_spring        # exit 0 when clean
+target/debug/rb check --repo demo_spring        # exit 0 clean, 1 violations, 2 errors
+target/debug/rb check --repo demo_spring > .rb-baseline                 # adopt today's state
+target/debug/rb check --repo demo_spring --baseline .rb-baseline        # gate new violations only
 target/debug/rb cypher "MATCH (s:Service) RETURN s.name" --repo demo_spring
+target/debug/rb cypher "MATCH (n) RETURN n LIMIT 1" --repo demo_spring  # {…}::vertex
 
 # Housekeeping when done experimenting
 psql "$RB_DATABASE_URL" -c "DELETE FROM rb.repo WHERE name LIKE 'demo_spring%'"
@@ -112,12 +136,27 @@ Notes that bite newcomers:
   `query`, `limits`, `truncated`, `result`) and `--snapshot <id>` for retired
   snapshots. Limits are maxima, never clamps — over-limit is `invalid_param`.
 - Ambiguous names are never picked silently (`ambiguous` error + candidates).
-`--repo` defaults to the git checkout you run from (sanitised like `index`
-names it, honoured only when indexed); explicit `--repo` wins. Outside any
-indexed checkout the CLI refuses to guess and says so: *no indexed repository
-matches this checkout* (with an `rb index .` hint) or *no git repository
-found* (run from inside one). `rb status` is the exception: outside an indexed
-checkout it lists every repository (an overview, not a guess).
+  A key in symbol syntax that misses (`Db#load()`, `Db#load`) resolves when
+  `rb find`'s rule (case-insensitive substring of key or name) yields exactly
+  one symbol; a miss suggests a quoted, copy-pasteable `rb find` command.
+- `--repo` defaults to the git checkout you run from (sanitised like `index`
+  names it, honoured only when indexed); explicit `--repo` wins. Outside any
+  indexed checkout the CLI refuses to guess and says so:
+  `--repo is needed: no indexed repository matches this checkout ("x"); …` or
+  `--repo is needed: no git repository found in "…"; …`. `rb status` is the
+  exception: outside an indexed checkout it lists every repository.
+- **Errors have one shape.** Text mode prints one `Error:` line, naming flags and arguments as you typed them (`--cols`, `<TEXT>`). `--json` and HTTP return the envelope `{"api": 1, "error": {"kind", "message", …}}`. Exit code and HTTP status per kind:
+
+  | Exit | Kind | HTTP |
+  |---|---|---|
+  | 1 | `internal` | 500 |
+  | 2 | `invalid_param` | 400 |
+  | 3 | `not_found`, `no_live_snapshot`, `snapshot_not_retained` | 404 / 404 / 410 |
+  | 4 | `ambiguous` | 409 |
+  | 5 | `cypher`, `cypher_timeout` | 422 |
+  | 6 | `unavailable` (the database cannot be reached; the message names the redacted URL, the cause, and how to start it) | 503 |
+
+- **Excluded files keep their `File` node,** so `rb find vendor/x.go` still answers; nothing in them is parsed. `rb status` prints `excluded from analysis: <reason> <n> files`.
 
 ## 5. Testing
 
@@ -130,7 +169,7 @@ cargo test --workspace
 ```
 
 Per-crate: `cargo test -p rb-syntax --lib`, `-p rb-frameworks`,
-`-p rb-indexer`, etc. (∼119 + ∼196 + ∼330 lib tests at M6l close).
+`-p rb-indexer`, etc. (121 + 201 + 352 lib tests at M7g close; 1,013 across the workspace).
 
 ### 5.2 Database-backed suites
 
@@ -139,16 +178,25 @@ is not a pass**. Always set it:
 
 ```sh
 export RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb
-cargo test -p rb-store --lib        # migrations, publish/retention/gc (72 tests)
+cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (75 tests)
 cargo test -p rb-server -- --nocapture  # serve binding, limits, parity (12 tests)
 cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (47 tests)
 cargo test -p rb-cli --test api     # CLI↔HTTP identity over 150 parameter sets (1 test)
 ```
 
-The one-command loop is `var/m6l/scripts/verify.sh <tag>` (fmt → clippy →
-workspace units → store → server → e2e → api → listener check → stub scan;
-logs under `var/m6l/logs/`). Earlier milestones keep their own copies
-(`var/m*/scripts/verify.sh`).
+The SCIP e2e tests (`scip_*`) also need a **responsive** Docker daemon with
+the images built, and must not share the machine with other builds (container
+fetches time out under contention and the failed fetch is cached). The full
+run, the bar every M7 milestone closed on (0 failed, 0 `skipping:` lines):
+
+```sh
+export RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb DOCKER_CONTEXT=desktop-linux
+cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1 | tee test.log
+grep -c 'skipping:' test.log    # must be 0
+```
+
+(`var/` holds per-milestone scratch scripts and logs, gitignored; they are not
+part of the tree.)
 
 ### 5.3 Fixtures, goldens, guards
 
@@ -183,10 +231,13 @@ logs under `var/m6l/logs/`). Earlier milestones keep their own copies
 
 ### 5.4 Invariant, measurement, determinism
 
-- **Invariant-1** (`var/m6*/scripts/p9-invariant.sh`): base-vs-head dumps for
-  every fixture (`--no-scip`, plus SCIP legs per precedent); dumps asserted
-  non-empty; every differing row classified. Current standing: all fixtures
-  byte-identical except the ones the milestone intentionally extends.
+- **Invariant-1:** base-vs-head `--no-scip` dumps of every fixture and of the
+  13 pinned stress repositories (pins in `tasks/stress-findings.md`), with
+  every differing row classified. Classify **by row identity** (node kind+key,
+  edge endpoints+kind), not by a line diff: a big removal makes `diff` report
+  unchanged rows as moved. M7 closes recorded e.g. "28/31 byte-identical,
+  every row of the 3 diffs classified" (M7e) and "31/31" for milestones that
+  change no graph (M7f).
 - **Public measurement** (`var/m6*/scripts/p8-measure.sh`): base-vs-head
   `--no-scip` dumps of pinned public repos (guice, spring-fu, AutoMapper,
   …), one at a time with `VACUUM` between (disk policy); added/removed rows
@@ -195,21 +246,27 @@ logs under `var/m6l/logs/`). Earlier milestones keep their own copies
 - **Determinism** is tested, not asserted: same commit into two repos dumps
   byte-identically; forced rebuilds match; AGE parity (`age_parity_failures`)
   runs inside every fixture test.
-- **Mutant batteries** (`var/m6*/scripts/p*-mutants.sh` for M6j and earlier;
-  manual batteries for M6k/M6l, recorded in contracts): each new branch gets a
-  mutant that must fail its test. Beware vacuous mutants (a predicate over an
-  empty set, a qualifier that matches nothing either way) — a surviving
-  mutant is a test bug until proven otherwise. Re-run batteries after any
-  `cargo fmt` (reflows break match patterns).
+- **Mutant batteries:** each new rule or guard gets a mutant (one exact text
+  replacement, run the test, restore byte-identically) that must fail its
+  test; contracts record them (M7: m1–m98). A surviving mutant is a test bug
+  until proven otherwise. Usually the test lacks the input that only that
+  rule explains, sometimes the code is dead (delete it), rarely the mutant is
+  equivalent (record why). Re-check mutation text after any `cargo fmt`
+  (reflows break exact matches).
+- **Stress repros:** `tasks/stress-findings.md` lists each finding with its
+  repro and what fixed it. Re-run the repros of the findings a change touches.
 
 ### 5.5 Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | `skipping:` lines in e2e/api | `RB_TEST_DATABASE_URL` unset — set it; skips are not passes |
-| DB connection refused | compose not up, or wrong port (55432 vs 55433); `pg_isready -h 127.0.0.1 -p <port>` |
+| DB connection refused / exit 6 `unavailable` | compose not up (a Docker Desktop restart stops it: `docker compose up -d --wait`), or wrong port (55432 vs 55433); `pg_isready -h 127.0.0.1 -p <port>` |
+| `scip: docker is not responding` (index continues heuristic after ~10 s) | the Docker daemon is wedged, typically after the disk filled: restart Docker Desktop, then `docker version` must answer |
 | SCIP jobs `unsupported` | missing images or wrong Docker context (`DOCKER_CONTEXT=desktop-linux`); `--no-scip` needs none |
-| `t_*` repos / graphs left behind | killed runs; e2e start-up cleans `t_*` once per run; `rb gc --prefix t_` otherwise (only the 3 `fx_*` repos should persist) |
+| `t_*` repos / graphs left behind | killed runs; e2e start-up cleans `t_*` once per run; otherwise delete the `rb.repo` rows and run `rb gc` |
+| Unexpected `excluded from analysis` counts | `rb.toml` `ignore`, a `.gitattributes` linguist mark, a `vendor/modules.txt`, or a tsconfig `outDir`; the `File` node's `excluded` attribute names the reason |
+| `rb check` fails CI on day one | adopt it with a baseline: `rb check > .rb-baseline`, then `rb check --baseline .rb-baseline` |
 | Disk pressure during SCIP | `docker system df`; per-repo caches under `var/scip/cache`; `rb cache prune --facts --scip --dry-run` first |
 | `rb serve` still listening after tests | kill it; the verify loop asserts no listener (`lsof -iTCP -sTCP:LISTEN`) |
 | Golden mismatch after a change | intended (re-bless + review) or regression (bisect to the hunk with a two-file miniature, as in M6k H2/H3) |
@@ -219,8 +276,8 @@ logs under `var/m6l/logs/`). Earlier milestones keep their own copies
 `crates/rb-{model,git,syntax,sql,frameworks,scip,indexer,store,api,server,cli}`,
 `docker/` (SCIP + egress images), `migrations/` (embedded schema),
 `fixtures/` + `crates/rb-cli/tests/{e2e.rs,api.rs,golden/}`,
-`tasks/` (contracts, evaluations, lessons, todo), `docs/` (design + this
-guide), `var/<milestone>/{scripts,logs,measure,base}` (verify loops, evidence,
+`tasks/` (contracts, evaluations, lessons, todo, `stress-findings.md`),
+`docs/` (design + this guide), `var/<milestone>/{scripts,logs,measure,base}` (verify loops, evidence,
 binaries — gitignored scratch). Milestone discipline, earned the hard way:
 contract up front with the closing bar decided there; test-first with killing
 mutants; reviewed re-blesses; base-vs-head invariant and measurement before
