@@ -139,6 +139,13 @@ impl<'a> Composer<'a> {
             }
         }
         for (parent, prefix, mount_file) in mounts {
+            // Known prefixes at the cap and the prefix already unknown: no further mount can
+            // change the result, so the rest are not explored (contract M7b S4). Like any cap,
+            // the result is then not memoised.
+            if out.known.len() >= MAX_PREFIXES && out.unknown {
+                clean = false;
+                break;
+            }
             let Some(prefix) = prefix else {
                 out.unknown = true;
                 continue;
@@ -1623,6 +1630,80 @@ mod tests {
         };
         let (small, large) = (work(1000), work(4000));
         assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// n routers mounted on an app under 5 prefixes each, and a cycle of `use` mounts between
+    /// them (stress F11's shape: 20 routers took 44 s).
+    fn cyclic_mounts(n: usize) -> String {
+        let mut src = String::from("const express = require('express');\nconst app = express();\n");
+        for i in 0..n {
+            src.push_str(&format!(
+                "const r{i} = express.Router();\nr{i}.get('/x', (q, s) => s.end());\n"
+            ));
+        }
+        for i in 0..n {
+            for j in 0..5 {
+                src.push_str(&format!("app.use('/p{j}', r{i});\n"));
+            }
+        }
+        for i in 0..2 * n {
+            src.push_str(&format!("r{}.use('/n{i}', r{});\n", i % n, (i + 1) % n));
+        }
+        src
+    }
+
+    /// `(endpoints, counted work)` of the endpoint stage over one file.
+    fn stage_work(language: Language, src: &str) -> (usize, u64) {
+        let facts = rb_syntax::extract(language, src.as_bytes()).unwrap();
+        let by_path = BTreeMap::from([("svc/r.js", (language, &facts))]);
+        let keys = BTreeMap::from([("svc/r.js", rb_syntax::symbol_keys("svc/r.js", &facts))]);
+        let go = BTreeMap::new();
+        let index = Index::new(&by_path, &go, &keys);
+        let service_of = |_: &str| "svc".to_owned();
+        let (exact, context, unread) = (BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
+        let mut b = GraphBuilder::new();
+        b.add_node(NodeKey::new(NodeKind::Service, "svc"), "svc", Attrs::new())
+            .unwrap();
+        b.add_node(
+            NodeKey::new(NodeKind::File, "svc/r.js"),
+            "r.js",
+            Attrs::new(),
+        )
+        .unwrap();
+        rb_frameworks::work::take();
+        let routes =
+            BTreeMap::from([("svc/r.js", rb_frameworks::routes::routes(language, &facts))]);
+        let inputs = Inputs {
+            files: &by_path,
+            routes: &routes,
+            keys: &keys,
+            index: &index,
+            exact_handlers: &exact,
+            service_of: &service_of,
+            context_paths: &context,
+            config_unread: &unread,
+            specs: &BTreeMap::new(),
+            has_project: &|_: &str| true,
+        };
+        let (_, endpoints) = add_endpoints(&mut b, &inputs).unwrap();
+        (endpoints.len(), rb_frameworks::work::take())
+    }
+
+    /// Contract M7b S4 (stress F11): cyclic mounts compose in work proportional to the output.
+    /// Once a router's known prefixes are at the cap and its prefix is already unknown, no
+    /// further mount can change it, so the rest are not explored. Doubling the routers at most
+    /// quadruples the work (the output grows with the routers; exploring every simple path of
+    /// the cycle grows exponentially).
+    #[test]
+    fn cyclic_mounts_compose_in_bounded_work() {
+        let (small_endpoints, small) = stage_work(Language::JavaScript, &cyclic_mounts(6));
+        let (large_endpoints, large) = stage_work(Language::JavaScript, &cyclic_mounts(12));
+        // The output is pinned to what the unpruned composer produced (measured before S4).
+        assert_eq!((small_endpoints, large_endpoints), (365, 725));
+        assert!(
+            small > 0 && large <= 4 * small,
+            "{small} → {large} (endpoints {small_endpoints} → {large_endpoints})"
+        );
     }
 
     /// S8: a handler name resolves as a call at its position, never by bare name across the

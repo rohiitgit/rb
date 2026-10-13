@@ -116,7 +116,8 @@ Notes that bite newcomers:
 names it, honoured only when indexed); explicit `--repo` wins. Outside any
 indexed checkout the CLI refuses to guess and says so: *no indexed repository
 matches this checkout* (with an `rb index .` hint) or *no git repository
-found* (run from inside one).
+found* (run from inside one). `rb status` is the exception: outside an indexed
+checkout it lists every repository (an overview, not a guess).
 
 ## 5. Testing
 

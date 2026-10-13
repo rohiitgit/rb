@@ -12,7 +12,7 @@ use std::ops::Range;
 
 use tree_sitter::Node;
 
-use crate::{Language, MentionRole};
+use crate::{Language, MentionRole, Parents};
 
 pub(crate) fn mentions(
     language: Language,
@@ -20,6 +20,7 @@ pub(crate) fn mentions(
     source: &[u8],
     declared: &HashSet<Range<usize>>,
     defined: &HashSet<Range<usize>>,
+    parents: &Parents<'_>,
 ) -> BTreeMap<String, BTreeSet<MentionRole>> {
     let mut out: BTreeMap<String, BTreeSet<MentionRole>> = BTreeMap::new();
     let java = match language {
@@ -40,15 +41,15 @@ pub(crate) fn mentions(
         if TOKENS.contains(&kind) {
             // A class expression's own name is not how its instances are made (`const D =
             // class Named …; new D()`), so it is no declaration (evaluator pass 1, Y2).
-            let expression_name = node.parent().is_some_and(|p| p.kind() == "class");
+            let expression_name = parents.of(node).is_some_and(|p| p.kind() == "class");
             let role = if expression_name {
                 MentionRole::Other
             } else if declared.contains(&node.byte_range()) {
                 MentionRole::Declaration
             } else if java {
-                java_role(node, source, defined)
+                java_role(node, source, defined, parents)
             } else {
-                es_role(node, defined)
+                es_role(node, defined, parents)
             };
             let name = String::from_utf8_lossy(&source[node.byte_range()]).into_owned();
             out.entry(name).or_default().insert(role);
@@ -90,7 +91,11 @@ fn words(bytes: &[u8]) -> Vec<String> {
 /// The role of a supertype head: `supertype` when the type declaring it is a definition of the
 /// facts, else `other` (a local class in a lambda or an anonymous class body, a class
 /// expression: their instances reach no rule that would keep the supertype).
-fn supertype_role(clause: Node<'_>, defined: &HashSet<Range<usize>>) -> MentionRole {
+fn supertype_role<'t>(
+    clause: Node<'t>,
+    defined: &HashSet<Range<usize>>,
+    parents: &Parents<'t>,
+) -> MentionRole {
     const TYPES: &[&str] = &[
         "class_declaration",
         "abstract_class_declaration",
@@ -98,7 +103,7 @@ fn supertype_role(clause: Node<'_>, defined: &HashSet<Range<usize>>) -> MentionR
         "enum_declaration",
         "record_declaration",
     ];
-    let mut cur = clause.parent();
+    let mut cur = parents.of(clause);
     while let Some(n) = cur {
         if TYPES.contains(&n.kind()) {
             return match n.child_by_field_name("name") {
@@ -109,7 +114,7 @@ fn supertype_role(clause: Node<'_>, defined: &HashSet<Range<usize>>) -> MentionR
         if !matches!(n.kind(), "class_heritage" | "extends_clause") {
             break;
         }
-        cur = n.parent();
+        cur = parents.of(n);
     }
     MentionRole::Other
 }
@@ -121,10 +126,15 @@ fn is_field(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
 }
 
 /// The role of a Java token, from the structures it sits in (innermost first).
-fn java_role(node: Node<'_>, source: &[u8], defined: &HashSet<Range<usize>>) -> MentionRole {
+fn java_role<'t>(
+    node: Node<'t>,
+    source: &[u8],
+    defined: &HashSet<Range<usize>>,
+    parents: &Parents<'t>,
+) -> MentionRole {
     let mut child = node;
     let mut member = false;
-    while let Some(parent) = child.parent() {
+    while let Some(parent) = parents.of(child) {
         match parent.kind() {
             "import_declaration" | "package_declaration" => return MentionRole::Import,
             "annotation" | "marker_annotation" => {
@@ -134,7 +144,7 @@ fn java_role(node: Node<'_>, source: &[u8], defined: &HashSet<Range<usize>>) -> 
                 break;
             }
             "class_literal" => {
-                return if is_logger_argument(parent, source) {
+                return if is_logger_argument(parent, source, parents) {
                     MentionRole::Logger
                 } else {
                     MentionRole::ClassLiteral
@@ -154,7 +164,7 @@ fn java_role(node: Node<'_>, source: &[u8], defined: &HashSet<Range<usize>>) -> 
                 break;
             }
             "superclass" | "super_interfaces" | "extends_interfaces" => {
-                return supertype_role(parent, defined);
+                return supertype_role(parent, defined, parents);
             }
             "type_arguments" => return MentionRole::Type,
             "type_list"
@@ -183,8 +193,8 @@ fn java_role(node: Node<'_>, source: &[u8], defined: &HashSet<Range<usize>>) -> 
 }
 
 /// A class literal that is the only argument of a `getLogger(…)` call.
-fn is_logger_argument(literal: Node<'_>, source: &[u8]) -> bool {
-    let Some(arguments) = literal.parent().filter(|a| a.kind() == "argument_list") else {
+fn is_logger_argument<'t>(literal: Node<'t>, source: &[u8], parents: &Parents<'t>) -> bool {
+    let Some(arguments) = parents.of(literal).filter(|a| a.kind() == "argument_list") else {
         return false;
     };
     let mut c = arguments.walk();
@@ -193,18 +203,22 @@ fn is_logger_argument(literal: Node<'_>, source: &[u8]) -> bool {
         .filter(|n| !matches!(n.kind(), "line_comment" | "block_comment"))
         .count()
         == 1;
-    only && arguments
-        .parent()
+    only && parents
+        .of(arguments)
         .filter(|call| call.kind() == "method_invocation")
         .and_then(|call| call.child_by_field_name("name"))
         .is_some_and(|name| &source[name.byte_range()] == b"getLogger")
 }
 
 /// The role of a TS/JS token, from the structures it sits in (innermost first).
-fn es_role(node: Node<'_>, defined: &HashSet<Range<usize>>) -> MentionRole {
+fn es_role<'t>(
+    node: Node<'t>,
+    defined: &HashSet<Range<usize>>,
+    parents: &Parents<'t>,
+) -> MentionRole {
     let mut child = node;
     let mut member = false;
-    while let Some(parent) = child.parent() {
+    while let Some(parent) = parents.of(child) {
         match parent.kind() {
             "decorator" => return MentionRole::Annotation,
             "import_specifier" | "export_specifier" => {
@@ -220,13 +234,13 @@ fn es_role(node: Node<'_>, defined: &HashSet<Range<usize>>) -> MentionRole {
             }
             "extends_clause" => {
                 if is_field(parent, "value", child) {
-                    return supertype_role(parent, defined);
+                    return supertype_role(parent, defined, parents);
                 }
                 break;
             }
             // JavaScript's heritage is `extends <expression>` with no clause node.
             "implements_clause" | "extends_type_clause" | "class_heritage" => {
-                return supertype_role(parent, defined);
+                return supertype_role(parent, defined, parents);
             }
             "type_arguments" => return MentionRole::Type,
             "new_expression" => {

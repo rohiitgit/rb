@@ -785,11 +785,14 @@ fn asked(command: Command) -> Option<Asked> {
 /// D5's code.
 fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Result<ExitCode> {
     // `--repo` wins; else the working directory's checkout when indexed; else a
-    // directive error — never a guess across several repositories.
+    // directive error — never a guess across several repositories. `rb status` is the
+    // exception: outside an indexed checkout it is the overview of every repository, which
+    // guesses nothing (README; contract M7b S1).
     let repo = match repo {
         Some(r) => Some(r),
         None => match cwd_repo_name() {
             Some(name) if is_indexed(store, &name) => Some(name),
+            _ if matches!(endpoint, Endpoint::Status) => None,
             Some(name) => {
                 return answer_err(
                     out,

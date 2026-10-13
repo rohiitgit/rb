@@ -537,3 +537,7 @@
 ## 2026-10-13: a generated-code naming pattern must be tested against SDKs that share the name
 - **Mistake:** M7a S1's first rule read any `….New{X}Client(c).Rpc(…)` chain as a gRPC call. Generated Go stubs do look like that, but so does the Azure SDK's `….NewContainerClient(c).NewBlobClient(p)`. The unit test held only generated-code shapes; the invariant run on mattermost found 2 false gRPC sites.
 - **Rule:** When a rule keys on a naming convention (`New*Client`, `*ImplBase`, `*Api`), pin the exact generated shape (link count, position, what follows), and add negatives from a real SDK that uses the same words. Give each guard its own negative, so every guard has a mutant that bites alone.
+
+## 2026-10-13: a performance change keeps only the edits a mutant proves hot
+- **Mistake:** M7b S3 converted six `Node::parent()` call sites to the ancestor map, on the reasoning that each "could be" quadratic. Mutants showed two (`local_by_ancestry`, `type_qualifier`) were not hot on any pathological input: one stops at the nearest definition, the other never climbs.
+- **Rule:** For a complexity fix, profile first, convert the hot spots, and give each conversion a timing case whose mutant (the old call restored) fails it. Revert any conversion whose mutant survives every pathological case you can construct: it is churn, not a fix.

@@ -689,3 +689,16 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **S2:** FastAPI goes through the shared router composer (`RouterDecl`/`Mount`). `module.router` resolves through Python submodules, and an unknown prefix stays unknown.
 - **S3:** gRPC endpoints come from server registrations in 5 languages, counted with `grpc_implementer_unknown` / `grpc_registration_ambiguous`.
 - **Verification:** 14 mutants killed. DB suites 980/2, with the 2 failures pre-existing (F1). Invariant: 29/31 targets byte-identical (all 18 fixtures), and microservices-demo plus fastapi-realworld diffs classified. `PIPELINE` `m7a-1`.
+
+## M7b Regressions and hangs (stress batch B): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7b.md` (S1–S5, amendment 1). Source: `tasks/stress-findings.md` F1, F2, F9–F11, F15.
+- **S1:** `rb status` lists every repository outside an indexed checkout. The two red DB suites are green again.
+- **S2:** every Docker CLI call is bounded, killed and reaped. A wedged daemon now costs about 10 s, not a hang.
+- **S3:** a `Parents` map replaces `Node::parent()` in the profiled rb-syntax hot spots. Cubic and quadratic pathological inputs now take seconds or less.
+- **S4:** the mount composer is pruned once its result can't change. F11 went from 44 s to 1 s with identical output.
+- **S5:** huge blobs are sniffed by streaming. A 1 GiB blob now peaks at 16 MiB, down from 2 GiB.
+- **Verification:**
+  - 11 mutants killed (m15–m25, 2 reverted conversions recorded).
+  - DB suites 986/0, with no skips.
+  - Invariant against M7a: 31/31 byte-identical.

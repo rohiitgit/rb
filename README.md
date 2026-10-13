@@ -68,7 +68,8 @@ A name matching several symbols asks you to `--pick` one instead of guessing.
 `--repo` defaults to the git checkout you run from (when that repo is
 indexed); an explicit `--repo` always wins. Anywhere else you get a plain
 directive instead of a guess: either *no indexed repository matches this
-checkout* or *no git repository found — run from inside one*.
+checkout* or *no git repository found — run from inside one*. The one
+exception is `rb status`, which there lists every indexed repository.
 Clean up with `psql "$RB_DATABASE_URL" -c "DELETE FROM rb.repo WHERE
 name='demo'"` and `rb gc`. That's the whole loop: **index → ask → diff/serve**.
 

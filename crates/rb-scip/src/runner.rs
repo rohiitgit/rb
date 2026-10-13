@@ -161,6 +161,9 @@ pub struct DockerRunner {
     /// How long a timed-out run's client gets to exit after `docker kill` before it is killed
     /// itself.
     pub kill_grace: Duration,
+    /// The bound on every other CLI call (inspect, kill, logs, network and proxy commands): a
+    /// wedged daemon makes the CLI hang, never fail (contract M7b S2).
+    pub cli_timeout: Duration,
 }
 
 impl Default for DockerRunner {
@@ -168,25 +171,100 @@ impl Default for DockerRunner {
         DockerRunner {
             docker: PathBuf::from("docker"),
             kill_grace: Duration::from_secs(10),
+            cli_timeout: CLI_TIMEOUT,
         }
     }
 }
 
-/// Whether `docker version` succeeds (the CLI is installed and a daemon answers); the error is
-/// the user-facing reason when it does not.
+/// How long `docker version` may take before the daemon counts as not responding.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The default bound on Docker CLI calls other than container runs (see
+/// [`DockerRunner::cli_timeout`]).
+pub const CLI_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Whether `docker version` succeeds (the CLI is installed and a daemon answers) within
+/// [`PROBE_TIMEOUT`]; the error is the user-facing reason when it does not.
 pub fn docker_available() -> Result<(), String> {
-    let out = Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .stdin(std::process::Stdio::null())
-        .output();
+    docker_available_with(Path::new("docker"), PROBE_TIMEOUT)
+}
+
+/// [`docker_available`] for a given CLI program and bound. A CLI that does not answer in time
+/// (a wedged daemon) is killed and reaped, and reported as not responding (contract M7b S2).
+pub fn docker_available_with(docker: &Path, limit: Duration) -> Result<(), String> {
+    let out = bounded_output(
+        Command::new(docker).args(["version", "--format", "{{.Server.Version}}"]),
+        limit,
+    );
     match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!(
+        Ok(Some(o)) if o.status.success() => Ok(()),
+        Ok(Some(o)) => Err(format!(
             "docker is not available: {}",
             tail(&String::from_utf8_lossy(&o.stderr), 1)
         )),
+        Ok(None) => Err(format!(
+            "docker is not responding (`docker version` gave no answer within {} s; restart \
+             the Docker daemon)",
+            limit.as_secs_f64()
+        )),
         Err(e) => Err(format!("docker is not available: {e}")),
     }
+}
+
+/// Runs `cmd` (stdin closed, stdout and stderr captured) for at most `limit`: its output, or
+/// `None` when it overran and was killed and reaped (contract M7b S2).
+fn bounded_output(
+    cmd: &mut Command,
+    limit: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    let started = std::time::Instant::now();
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout, stderr) = (
+        stdout.join().unwrap_or_default(),
+        stderr.join().unwrap_or_default(),
+    );
+    Ok(status.map(|status| std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 impl DockerRunner {
@@ -194,12 +272,10 @@ impl DockerRunner {
     /// killing the client alone leaves the container running (contract M3b amendment 18).
     /// Errors (the container already gone) are ignored.
     fn kill_container(&self, name: &str) {
-        let _ = Command::new(&self.docker)
-            .args(["kill", name])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = bounded_output(
+            Command::new(&self.docker).args(["kill", name]),
+            self.cli_timeout,
+        );
     }
 }
 
@@ -254,11 +330,11 @@ impl Runner for DockerRunner {
     }
 
     fn image_id(&self, image: &str) -> Option<String> {
-        let out = Command::new(&self.docker)
-            .args(["image", "inspect", "--format", "{{.Id}}", image])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()?;
+        let out = bounded_output(
+            Command::new(&self.docker).args(["image", "inspect", "--format", "{{.Id}}", image]),
+            self.cli_timeout,
+        )
+        .ok()??;
         let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         (out.status.success() && id.starts_with("sha256:")).then_some(id)
     }
@@ -318,16 +394,18 @@ impl Runner for DockerRunner {
     }
 
     fn stop_proxy(&self, name: &str) -> String {
-        let log = Command::new(&self.docker)
-            .args(["logs", name])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map(|o| {
-                let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&o.stderr));
-                text
-            })
-            .unwrap_or_default();
+        let log = bounded_output(
+            Command::new(&self.docker).args(["logs", name]),
+            self.cli_timeout,
+        )
+        .ok()
+        .flatten()
+        .map(|o| {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            text
+        })
+        .unwrap_or_default();
         let _ = self.docker_ok(&["rm", "-f", name]);
         log
     }
@@ -336,11 +414,15 @@ impl Runner for DockerRunner {
 impl DockerRunner {
     /// Runs the CLI with `args`; its trimmed stdout, or an error with its stderr.
     fn docker_ok(&self, args: &[&str]) -> anyhow::Result<String> {
-        let out = Command::new(&self.docker)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| anyhow::anyhow!("starting docker: {e}"))?;
+        let out = bounded_output(Command::new(&self.docker).args(args), self.cli_timeout)
+            .map_err(|e| anyhow::anyhow!("starting docker: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "docker {}: no answer within {} s (is the Docker daemon responding?)",
+                    args.first().copied().unwrap_or_default(),
+                    self.cli_timeout.as_secs_f64()
+                )
+            })?;
         anyhow::ensure!(
             out.status.success(),
             "docker {}: {}",
@@ -509,6 +591,7 @@ mod tests {
         let runner = DockerRunner {
             docker,
             kill_grace: Duration::from_millis(500),
+            cli_timeout: CLI_TIMEOUT,
         };
         (runner, log)
     }
@@ -586,6 +669,58 @@ mod tests {
         );
     }
 
+    /// Contract M7b S2 (stress F2): a Docker CLI that never answers (a wedged daemon) is given
+    /// up on within its bound, killed and reaped — no orphan — and the probe says so; the CLI
+    /// calls behind `gc --egress` are bounded the same way.
+    #[test]
+    fn a_hung_docker_cli_is_bounded_killed_and_reaped() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let docker = tmp.path().join("docker");
+        let pids = tmp.path().join("pids");
+        std::fs::write(
+            &docker,
+            format!("#!/bin/sh\necho $$ >> {}\nexec sleep 30\n", pids.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        // Bounds an order of magnitude above a process start (lesson 2026-10-01), far below the
+        // fake's 30 s hang.
+        let err = docker_available_with(&docker, Duration::from_secs(1)).unwrap_err();
+        assert!(err.contains("not responding"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let runner = DockerRunner {
+            docker,
+            kill_grace: Duration::from_secs(1),
+            cli_timeout: Duration::from_secs(1),
+        };
+        let started = std::time::Instant::now();
+        assert!(runner.egress_leftovers(true).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // A fake killed before its shell wrote its pid leaves no line (lesson 2026-10-01: never
+        // assume when a spawned process started); every pid written must be gone.
+        let pids = std::fs::read_to_string(&pids).unwrap_or_default();
+        assert!(pids.lines().count() >= 1, "{pids}");
+        for pid in pids.lines() {
+            let alive = Command::new("kill")
+                .args(["-0", pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(!alive, "docker fake {pid} outlived its call");
+        }
+    }
+
     /// A fake `docker` for the egress commands: logs every call; `network inspect` answers
     /// from `$DIR/net-<name>` (absent: fails, as for a missing network) and `network create`
     /// writes that file (`true` with `--internal`); `inspect` prints an address; `logs` prints
@@ -604,6 +739,7 @@ mod tests {
             DockerRunner {
                 docker,
                 kill_grace: Duration::from_millis(500),
+                cli_timeout: CLI_TIMEOUT,
             },
             log,
         )

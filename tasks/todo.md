@@ -985,3 +985,20 @@ Contract: `tasks/contract-m7a.md`. Findings: `tasks/stress-findings.md` (F17, F1
 - The three S1 `exact`-label errors from the stress campaign are fixed, tests-first, with 14 mutants killed. All 18 fixture dumps are byte-identical.
 - Residue recorded in the contract: inner prefixes are lost under an unknown top prefix; gRPC handler methods aren't linked; helper-registered health isn't read.
 - Not done: commit, and an evaluator pass.
+
+---
+
+# M7b: regressions and hangs (stress batch B), started 2026-10-13
+
+Contract: `tasks/contract-m7b.md`. Branch `m7b-regressions-and-hangs` (stacked on M7a).
+
+- [x] Phase 1 (S1/F1): `rb status` without `--repo` lists all repositories outside an indexed checkout. The two red tests (e2e `json_answers…`, api) now pass. README and testing guide updated.
+- [x] Phase 2 (S2/F2): `bounded_output` for every Docker CLI call (probe 10 s, others 60 s), killed and reaped. Test with a hanging fake (bounds 1 s, an order of magnitude above process start, after a flake at 300 ms). Mutants m15/m16 killed. Against the real wedged Docker Desktop, `rb index` finishes in 12 s (was an indefinite hang).
+- [x] Phase 3 (S3/F9/F10): a `Parents` map (one walk) replaces `Node::parent()` in the profiled hot spots only: `mentions` (es/java role), `call_qualifier`, `is_inner_link`, `assignment_target`. Each has a killing mutant (m17–m20, m23). `local_by_ancestry` and `type_qualifier` were converted, then reverted when their mutants (m21, m22) showed they are not hot. The timing test (7 pathological cases) runs in about 4.7 s in a debug build. The 1,500-link JS chain took 365 s in debug before. A probe also found a 3,000-segment member path at 85 s (release), now under 1 s.
+- [x] Phase 4 (S4/F11): `Composer::prefixes` explored every simple path of a mount cycle (unclean results are never memoised). It now stops once the known prefixes are capped and the result is unknown. Counted work at 6→12 routers went from 123× growth to within 4×, with endpoints pinned (365/725). On the F11 file: 44 s → 1 s, dumps byte-identical. Mutant m24 killed.
+- [x] Phase 5 (S5/F15): `find_header` for the size, and the head is streamed through `git cat-file` for blobs over 64 MiB (full load as fallback). The manifest is identical with streaming forced on and off (sniff-edge fixture). Mutant m25 killed. 1 GiB blob: 2,063 MiB → 16 MiB peak RSS, 2.66 s → 1.30 s.
+- [x] Phase 6: fmt and clippy clean. DB suites 986/0, no skips. Invariant against M7a 31/31 identical. Repros: F1 lists all repos; F2 12 s on real wedged Docker; F9 chain 4k 3 s (was >300 s); F10 nested 20k under 1 s; F11 1 s (was 44 s); F15 16 MiB (was 2 GiB). DB cleaned.
+
+## Review (M7b)
+- Batch B is complete. Both suites are green with the DB and without skips. Every hang and blow-up found by the stress campaign is now bounded.
+- Residue: role walks are O(n·depth) on one long chain (3 s at 4k links); blobs of 64 MiB and under are still loaded to sniff.
