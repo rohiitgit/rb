@@ -68,6 +68,11 @@ A name matching several symbols asks you to `--pick` one instead of guessing.
 Clean up with `psql "$RB_DATABASE_URL" -c "DELETE FROM rb.repo WHERE
 name='demo'"` and `rb gc`. That's the whole loop: **index → ask → diff/serve**.
 
+> **Want bare `rb` instead of `./target/debug/rb`?** Add this alias (DB and
+> age-load dir baked in — both must match the running stack):
+> `alias rb='RB_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb RB_AGE_LOAD_DIR=/Users/rohit/conductor/workspaces/newide/spokane/var/age-load /Users/rohit/conductor/workspaces/newide/spokane/target/debug/rb'`
+> Then open a new shell (or `source ~/.zshrc`) and `rb status` works from anywhere.
+
 ## Guided tour: what you can ask
 
 **Find things.** `rb find login --kind symbol` searches nodes by key or name
