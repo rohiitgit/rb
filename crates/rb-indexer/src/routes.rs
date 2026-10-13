@@ -19,7 +19,9 @@ use rb_model::{
 use rb_syntax::{Arg, FileFacts, Init, Language};
 use serde_json::json;
 
+use crate::constants::Constants;
 use crate::resolve::Index;
+use rb_frameworks::fold::Origin;
 
 /// Mounts followed at most from a router to its root (contract M4a S5).
 pub(crate) const MAX_MOUNT_DEPTH: usize = 32;
@@ -472,6 +474,9 @@ pub(crate) fn add_endpoints(
         span: Some(span),
         detail,
     };
+    // Paths written as names fold across files, as client URLs do (contract M7c S1).
+    let consts = Constants::new(inputs.files, inputs.index);
+    let mut folder = rb_frameworks::fold::Folder::new(&consts);
     for (&path, file) in inputs.routes {
         for d in &file.diagnostics {
             diagnostics.push(diag(d.kind, path, d.span, json!({ "detail": d.detail })));
@@ -485,6 +490,32 @@ pub(crate) fn add_endpoints(
         };
         for r in &file.routes {
             rb_frameworks::work::tick(1);
+            // A name folds to a constant's value, or the route is counted dynamic.
+            let folded: String;
+            let route_path: &str = match &r.path_name {
+                None => &r.path,
+                Some(name) => {
+                    let value = folder.fold_name(consts.ids[path], &name.text, name.span);
+                    match value
+                        .literal()
+                        .filter(|_| matches!(value.origin, Origin::Constant | Origin::Literal))
+                    {
+                        Some(p) => {
+                            folded = p;
+                            &folded
+                        }
+                        None => {
+                            diagnostics.push(diag(
+                                "route_path_dynamic",
+                                path,
+                                r.span,
+                                json!({ "detail": name.text }),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            };
             // Full paths with their certainty, the router when the prefix is unknown
             // (the path is then the tail below that router), and the call sites a
             // composed prefix comes from.
@@ -493,13 +524,13 @@ pub(crate) fn add_endpoints(
                 RouteBase::Root => match inputs.context_paths.get(&service) {
                     Some(ctx) if r.framework == rb_frameworks::routes::Framework::Spring => {
                         paths.push((
-                            format!("{ctx}/{}", r.path),
+                            format!("{ctx}/{route_path}"),
                             Certainty::Synthetic,
                             None,
                             Vec::new(),
                         ));
                     }
-                    _ => paths.push((r.path.clone(), Certainty::Exact, None, Vec::new())),
+                    _ => paths.push((route_path.to_owned(), Certainty::Exact, None, Vec::new())),
                 },
                 RouteBase::Unknown(receiver) => {
                     let mut unknown = true;
@@ -510,7 +541,7 @@ pub(crate) fn add_endpoints(
                     {
                         for (prefix, sites) in &comp.composed {
                             paths.push((
-                                join_prefix(prefix, &r.path),
+                                join_prefix(prefix, route_path),
                                 Certainty::Heuristic,
                                 None,
                                 sites.clone(),
@@ -520,7 +551,7 @@ pub(crate) fn add_endpoints(
                     }
                     if unknown {
                         paths.push((
-                            r.path.clone(),
+                            route_path.to_owned(),
                             Certainty::Heuristic,
                             Some(router_id(receiver)),
                             Vec::new(),
@@ -535,7 +566,7 @@ pub(crate) fn add_endpoints(
                         } else {
                             Certainty::Exact
                         };
-                        paths.push((format!("{p}/{}", r.path), certainty, None, Vec::new()));
+                        paths.push((format!("{p}/{route_path}"), certainty, None, Vec::new()));
                     }
                     if prefixes.unknown {
                         // An anonymous default-exported router is identified by the
@@ -545,12 +576,18 @@ pub(crate) fn add_endpoints(
                             None => format!("{path}#default"),
                         };
                         paths.push((
-                            r.path.clone(),
+                            route_path.to_owned(),
                             Certainty::Heuristic,
                             Some(router),
                             Vec::new(),
                         ));
                     }
+                }
+            }
+            // A constant's value, not a path written at the registration (contract M7c S1).
+            if r.path_name.is_some() {
+                for p in &mut paths {
+                    p.1 = p.1.min(Certainty::Heuristic);
                 }
             }
             let method = r.method.clone();
@@ -562,7 +599,7 @@ pub(crate) fn add_endpoints(
                     json!({
                         "framework": r.framework.as_str(),
                         "method": method,
-                        "path": norm_path(&r.path),
+                        "path": norm_path(route_path),
                     }),
                 ));
             }
@@ -1419,6 +1456,48 @@ mod tests {
                 "EXPOSES svc -> HTTP POST /v2/api/login @svc [exact]",
             ]
         );
+    }
+
+    /// Contract M7c S1 (stress F20, bookcars): an Express path written as a name folds through
+    /// the cross-file constant lookup — a member of a default-imported config object, an
+    /// in-file constant — and is `heuristic` (a constant's value, not a written path); a name
+    /// that does not fold is counted as `route_path_dynamic`, never dropped silently.
+    #[test]
+    fn express_paths_written_as_names_fold_or_are_counted() {
+        let app = "import express from \"express\";\nimport carRoutes from \"./routes/carRoutes\";\nconst app = express();\nconst HEALTH = \"/health\";\napp.get(HEALTH, (q, s) => s.end());\napp.use(\"/\", carRoutes);\n";
+        let car = "import express from \"express\";\nimport routeNames from \"../config/carRoutes.config\";\nconst routes = express.Router();\nroutes.route(routeNames.create).post(create);\nroutes.get(routeNames.byId, byId);\nroutes.get(process.env.ROUTE, dyn);\nexport default routes;\nfunction create() {}\nfunction byId() {}\nfunction dyn() {}\n";
+        let config = "const routes = {\n  create: \"/api/create-car\",\n  byId: \"/api/car/:id\",\n};\nexport default routes;\n";
+        let built = build(
+            &[
+                ("svc/src/app.ts", Language::TypeScript, app),
+                ("svc/src/routes/carRoutes.ts", Language::TypeScript, car),
+                (
+                    "svc/src/config/carRoutes.config.ts",
+                    Language::TypeScript,
+                    config,
+                ),
+            ],
+            &[],
+        );
+        let mut exposes: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("EXPOSES"))
+            .collect();
+        exposes.sort();
+        assert_eq!(
+            exposes,
+            [
+                "EXPOSES svc -> HTTP GET /api/car/{} @svc [heuristic]",
+                "EXPOSES svc -> HTTP GET /health @svc [heuristic]",
+                "EXPOSES svc -> HTTP POST /api/create-car @svc [heuristic]",
+            ]
+        );
+        let dynamic: Vec<String> = diagnostics(&built)
+            .into_iter()
+            .filter(|d| d.starts_with("route_path_dynamic"))
+            .collect();
+        assert_eq!(dynamic.len(), 1, "{dynamic:?}");
+        assert!(dynamic[0].contains("process.env.ROUTE"), "{dynamic:?}");
     }
 
     #[test]

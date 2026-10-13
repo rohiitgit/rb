@@ -84,6 +84,16 @@ pub struct RouteFact {
     /// A Go `ServeMux` host pattern's host (`example.com/x`), lower-cased without the port; the
     /// route serves only requests for that host (evaluator pass 1, P8).
     pub host: Option<String>,
+    /// The path as written when it is a name (`routeNames.create`, contract M7c S1): `path` is
+    /// empty and the endpoint stage folds the name across files.
+    pub path_name: Option<PathName>,
+}
+
+/// A route path written as a name, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathName {
+    pub text: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +654,7 @@ fn spring(facts: &FileScope<'_>, out: &mut FileRoutes) {
                                         span: d.span,
                                         enclosing: Some(m),
                                         host: None,
+                                        path_name: None,
                                     });
                                 }
                             }
@@ -676,12 +687,15 @@ const EXPRESS_VERBS: &[&str] = &[
 struct ExpressNames {
     module: HashSet<String>,
     router: HashSet<String>,
+    /// Some chain constructs straight from `require("express")` (contract M7c S3).
+    inline: bool,
 }
 
 fn express_names(facts: &FileFacts) -> ExpressNames {
     let mut names = ExpressNames {
         module: HashSet::new(),
         router: HashSet::new(),
+        inline: facts.chains.iter().any(|c| inline_express(c).is_some()),
     };
     for i in facts.imports.iter().filter(|i| i.module == "express") {
         names.module.extend(i.alias.clone());
@@ -715,8 +729,30 @@ fn express_names(facts: &FileFacts) -> ExpressNames {
     names
 }
 
+/// `require("express")()` (an app) and `require("express").Router()` (a router), constructed
+/// inline with no binding of the module (contract M7c S3).
+fn inline_express(chain: &CallChain) -> Option<RouterKind> {
+    let [require, ctor, ..] = chain.links.as_slice() else {
+        return None;
+    };
+    if chain.root.is_some()
+        || require.name != "require"
+        || require.args.first().and_then(literal).as_deref() != Some("express")
+    {
+        return None;
+    }
+    match ctor.name.as_str() {
+        "" => Some(RouterKind::App),
+        "Router" => Some(RouterKind::Router),
+        _ => None,
+    }
+}
+
 /// The router kind a binding's initialiser creates, if any.
 fn router_kind(names: &ExpressNames, chain: &CallChain) -> Option<RouterKind> {
+    if let Some(kind) = inline_express(chain) {
+        return Some(kind);
+    }
     // Only the first link decides: a construction followed by any links (`Router()`,
     // `Router().use(…)`, `express()`) binds; the rest are mounts and routes on it.
     let first = chain.links.first()?;
@@ -730,7 +766,7 @@ fn router_kind(names: &ExpressNames, chain: &CallChain) -> Option<RouterKind> {
 
 fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
     let names = express_names(facts);
-    if names.module.is_empty() && names.router.is_empty() {
+    if names.module.is_empty() && names.router.is_empty() && !names.inline {
         return;
     }
     let mut binding_router: HashMap<usize, usize> = HashMap::new(); // binding → router
@@ -832,12 +868,27 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 None => continue,
             };
             let Some(path_arg) = path_arg else { continue };
-            if !matches!(path_arg, Arg::Template { .. }) {
-                continue;
-            }
-            let Some(path) = literal(path_arg) else {
-                dynamic(out, chain.span, format!("{path_arg:?}"));
-                continue;
+            // A string folds here; a name folds across files in the endpoint stage (contract
+            // M7c S1); anything else is counted, never dropped silently.
+            let (path, path_name) = match path_arg {
+                Arg::Template { .. } => match literal(path_arg) {
+                    Some(path) => (path, None),
+                    None => {
+                        dynamic(out, chain.span, format!("{path_arg:?}"));
+                        continue;
+                    }
+                },
+                Arg::Name { text, span } => (
+                    String::new(),
+                    Some(PathName {
+                        text: text.clone(),
+                        span: *span,
+                    }),
+                ),
+                _ => {
+                    dynamic(out, chain.span, format!("{path_arg:?}"));
+                    continue;
+                }
             };
             out.routes.push(RouteFact {
                 framework: Framework::Express,
@@ -848,6 +899,7 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 span: chain.span,
                 enclosing: chain.enclosing,
                 host: None,
+                path_name,
             });
         }
     }
@@ -998,6 +1050,7 @@ fn gin(facts: &FileScope<'_>, out: &mut FileRoutes) {
             span: chain.span,
             enclosing: chain.enclosing,
             host: None,
+            path_name: None,
         });
     }
 }
@@ -1306,6 +1359,7 @@ fn chi(facts: &FileScope<'_>, out: &mut FileRoutes) {
             span: chain.span,
             enclosing: chain.enclosing,
             host: None,
+            path_name: None,
         });
     }
 }
@@ -1474,6 +1528,7 @@ fn fastapi(facts: &FileScope<'_>, out: &mut FileRoutes) {
                     span: deco.span,
                     enclosing: Some(di),
                     host: None,
+                    path_name: None,
                 });
             }
         }
@@ -1581,6 +1636,7 @@ fn net_http(facts: &FileScope<'_>, out: &mut FileRoutes) {
             span: chain.span,
             enclosing: chain.enclosing,
             host,
+            path_name: None,
         });
     }
 }
@@ -1909,6 +1965,19 @@ public class AuthController {
         // A parameter named like an app is not one.
         let param = "import express from \"express\";\nexport function routes(app) { app.get(\"/p\", h); }\n";
         assert!(summary(Language::JavaScript, param).is_empty());
+        // Contract M7c S3 (stress F12): the inline factory forms, with no `express` binding.
+        let inline = "const app = require(\"express\")();\napp.get(\"/a\", h);\nconst r = require(\"express\").Router();\nr.get(\"/b\", h);\nconst other = require(\"koa\")();\nother.get(\"/c\", h);\n";
+        assert_eq!(
+            summary(Language::JavaScript, inline),
+            ["GET /a router app name h", "GET /b router r name h"]
+        );
+        let facts = extract(Language::JavaScript, inline.as_bytes()).unwrap();
+        let kinds: Vec<RouterKind> = routes(Language::JavaScript, &facts)
+            .routers
+            .iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(kinds, [RouterKind::App, RouterKind::Router]);
     }
 
     const GIN: &str = "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\nfunc main() {\n\tr := gin.Default()\n\tapi := r.Group(\"/billing\")\n\tapi.POST(\"/invoices/:id/pay\", payInvoice)\n\tr.POST(\"/internal/mfa/email\", mfaEcho)\n\tv := api.Group(\"/v\")\n\tv.GET(\"/x\", func(c *gin.Context) {})\n\tr.Group(\"/inline\").Handle(\"PATCH\", \"/y\", auth, h.Y)\n\tr.Handle(http.MethodDelete, \"/z\", h.Z)\n\tr.Any(\"/all\", h.All)\n}\n\nfunc register(g *gin.RouterGroup, e *gin.Engine) {\n\tg.GET(\"/param\", h.P)\n\te.GET(\"/engine\", h.E)\n}\n";

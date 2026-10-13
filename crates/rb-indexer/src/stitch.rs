@@ -24,6 +24,7 @@ use rb_model::{
 use rb_syntax::{FileFacts, Language};
 use serde_json::{Value, json};
 
+use crate::constants::Constants;
 use crate::resolve::Index;
 use crate::routes::EndpointRef;
 
@@ -231,43 +232,20 @@ pub(crate) struct Inputs<'a, 'i> {
     pub points: &'i crate::di::Points,
 }
 
-/// One file's top-level non-member bindings (`None`) and type members (`Some(type)`) by name.
-type Declared<'a> = HashMap<(Option<usize>, &'a str), Vec<usize>>;
-
-/// The indexer's [`Lookup`]: files by number, constants across files through M3a resolution
-/// (only a unique declaration folds), properties of the owning service.
+/// The indexer's [`Lookup`] for stitching: the shared cross-file [`Constants`], plus properties
+/// of the owning service.
 struct Folding<'a, 'i> {
     inputs: &'i Inputs<'a, 'i>,
-    paths: Vec<&'a str>,
-    ids: HashMap<&'a str, usize>,
-    /// Per file.
-    declared: Vec<Declared<'a>>,
+    consts: Constants<'a, 'i>,
     /// The `(service, key)` of every property asked for since the last [`Folding::take_asked`].
     asked: RefCell<Vec<(String, String)>>,
 }
 
 impl<'a, 'i> Folding<'a, 'i> {
     fn new(inputs: &'i Inputs<'a, 'i>) -> Self {
-        let paths: Vec<&'a str> = inputs.files.keys().copied().collect();
-        let ids = paths.iter().enumerate().map(|(i, p)| (*p, i)).collect();
-        let declared = inputs
-            .files
-            .values()
-            .map(|(_, facts)| {
-                let mut table: Declared<'a> = HashMap::new();
-                for (i, b) in facts.bindings.iter().enumerate() {
-                    if b.member == b.scope.is_some() {
-                        table.entry((b.scope, b.name.as_str())).or_default().push(i);
-                    }
-                }
-                table
-            })
-            .collect();
         Folding {
             inputs,
-            paths,
-            ids,
-            declared,
+            consts: Constants::new(inputs.files, inputs.index),
             asked: RefCell::new(Vec::new()),
         }
     }
@@ -293,38 +271,19 @@ impl<'a, 'i> Folding<'a, 'i> {
 
 impl Lookup for Folding<'_, '_> {
     fn facts(&self, file: usize) -> &FileFacts {
-        self.inputs.files[self.paths[file]].1
+        self.consts.facts(file)
     }
 
     fn language(&self, file: usize) -> Language {
-        self.inputs.files[self.paths[file]].0
+        self.consts.language(file)
     }
 
     fn external(&self, file: usize, name: &str, at: Span) -> Option<(usize, usize)> {
-        let found: BTreeSet<(usize, usize)> = self
-            .inputs
-            .index
-            .constant_declarations(self.paths[file], name, at)
-            .into_iter()
-            .flat_map(|(path, owner, declared)| {
-                let id = self.ids[path];
-                self.declared[id]
-                    .get(&(owner, declared.as_str()))
-                    .into_iter()
-                    .flatten()
-                    .map(move |&b| (id, b))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        // Several declarations: the constant is not known, so nothing folds.
-        match found.len() {
-            1 => found.into_iter().next(),
-            _ => None,
-        }
+        self.consts.external(file, name, at)
     }
 
     fn property(&self, file: usize, key: &str) -> Option<String> {
-        let service = (self.inputs.service_of)(self.paths[file]);
+        let service = (self.inputs.service_of)(self.consts.paths[file]);
         let value = self
             .inputs
             .properties
@@ -378,7 +337,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
     // fresh folder per call).
     let mut folder = rb_frameworks::fold::Folder::new(&folding);
     for (&path, file_clients) in &clients {
-        let file = folding.ids[path];
+        let file = folding.consts.ids[path];
         let facts = inputs.files[path].1;
         let service = (inputs.service_of)(path);
         for call in &file_clients.calls {
@@ -410,7 +369,12 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                                 Some(false)
                             };
                         }
-                        stated.or_else(|| instance.base.clone().map(|b| (folding.ids[target], b)))
+                        stated.or_else(|| {
+                            instance
+                                .base
+                                .clone()
+                                .map(|b| (folding.consts.ids[target], b))
+                        })
                     }
                     None => continue,
                 },
@@ -539,11 +503,12 @@ fn injected_base(
     let (bean_path, method) = inputs.points.unique.get(&(path.to_owned(), point.span))?;
     let (_, bean_facts) = inputs.files.get(bean_path.as_str())?;
     let value = rb_frameworks::clients::bean_base(bean_facts, *method, kind)?;
-    Some((*folding.ids.get(bean_path.as_str())?, value))
+    Some((*folding.consts.ids.get(bean_path.as_str())?, value))
 }
 
 /// The axios instance an imported name is, with its file: the first resolved target (in path
-/// order) binding an instance of the exported name at top level.
+/// order) binding an instance of the exported name at top level. A default import names the
+/// target's default export (`export default api`; contract M7c S2), one level, as for routers.
 fn imported_instance<'a, 'c>(
     inputs: &Inputs<'a, '_>,
     clients: &'c BTreeMap<&'a str, FileClients>,
@@ -560,8 +525,16 @@ fn imported_instance<'a, 'c>(
             import
                 .names
                 .iter()
-                .filter(|n| n.local == local && n.name != "default")
+                .filter(|n| n.local == local)
                 .flat_map(move |n| files.iter().map(move |f| (*f, n.name.as_str())))
+        })
+        .filter_map(|(target, exported)| {
+            let exported = if exported == "default" {
+                inputs.files.get(target)?.1.default_export.as_deref()?
+            } else {
+                exported
+            };
+            Some((target, exported))
         })
         .find_map(|(target, exported)| {
             clients
@@ -3644,6 +3617,70 @@ mod tests {
                 "web/src/calls.ts 10 heuristic -> HTTP GET /orders/{} @orders [heuristic]",
             ]
         );
+    }
+
+    /// Contract M7c S2 (stress F21, bookcars): a default-imported axios instance is its module's
+    /// default export (`const i = axios.create(…); export default i`), so calls through it are
+    /// sites with that instance's base; a default import of a module whose default export is no
+    /// instance stays out, as before.
+    #[test]
+    fn default_imported_axios_instances_are_their_modules_default_export() {
+        let calls = "import api from \"./axiosInstance\";\nimport other from \"./notAnInstance\";\nexport async function f(id: string) {\n  await api.get(`/orders/${id}`);\n  await other.get(\"/orders/1\");\n}\n";
+        let instance = "import axios from \"axios\";\nconst axiosInstance = axios.create({ baseURL: \"http://orders\" });\nexport default axiosInstance;\n";
+        let not_instance = "export default { get(x: string) { return x; } };\n";
+        let eps = vec![ep("GET", "/orders/{id}", "orders")];
+        assert_eq!(
+            stitched(
+                &[
+                    ("web/src/calls.ts", Language::TypeScript, calls),
+                    ("web/src/axiosInstance.ts", Language::TypeScript, instance),
+                    (
+                        "web/src/notAnInstance.ts",
+                        Language::TypeScript,
+                        not_instance
+                    ),
+                ],
+                &eps,
+                &["web", "orders"],
+            ),
+            // 0-based row 3: the `api.get` call; `other.get` is no instance call.
+            ["web/src/calls.ts 3 heuristic -> HTTP GET /orders/{} @orders [heuristic]"]
+        );
+    }
+
+    /// Contract M7c S1 groundwork: a URL written as a member of an object-literal binding folds
+    /// to that entry — in the file (`P.one`), or through a default import of a module whose
+    /// default export is the object (`cfg.ordersUrl`); a missing entry stays a hole.
+    #[test]
+    fn object_members_fold_locally_and_through_default_imports() {
+        let calls = "import cfg from \"./config\";\nconst P = { one: \"http://orders/orders/1\" };\nlet M = { one: \"http://orders/orders/3\" };\nconst S = { one: \"http://orders/orders/4\", ...extra };\nexport async function f() {\n  await fetch(P.one);\n  await fetch(cfg.ordersUrl);\n  await fetch(cfg.missing);\n  await fetch(M.one);\n  await fetch(S.one);\n}\n";
+        let config =
+            "const c = {\n  ordersUrl: \"http://orders/orders/2\",\n};\nexport default c;\n";
+        let eps = vec![ep("GET", "/orders/{id}", "orders")];
+        let found = stitched(
+            &[
+                ("web/src/calls.ts", Language::TypeScript, calls),
+                ("web/src/config.ts", Language::TypeScript, config),
+            ],
+            &eps,
+            &["web", "orders"],
+        );
+        // Rows 5 and 6 (0-based) link to the orders endpoint.
+        let linked: Vec<&String> = found.iter().filter(|s| s.contains("->")).collect();
+        assert_eq!(linked.len(), 2, "{found:?}");
+        assert!(linked[0].starts_with("web/src/calls.ts 5 "), "{found:?}");
+        assert!(linked[1].starts_with("web/src/calls.ts 6 "), "{found:?}");
+        // Row 7: a missing entry; row 8: a mutable (`let`) object; row 9: a spread after the
+        // entry may override it. None folds.
+        for row in [7, 8, 9] {
+            let prefix = format!("web/src/calls.ts {row} ");
+            assert!(
+                found
+                    .iter()
+                    .any(|s| s.starts_with(&prefix) && !s.contains("->")),
+                "{row}: {found:?}"
+            );
+        }
     }
 
     /// `path line bucket [-> key [certainty] base=<base attr>]` per site.

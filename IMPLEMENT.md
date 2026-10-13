@@ -702,3 +702,12 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - 11 mutants killed (m15–m25, 2 reverted conversions recorded).
   - DB suites 986/0, with no skips.
   - Invariant against M7a: 31/31 byte-identical.
+
+## M7c HTTP recall on supported stacks (stress batch C, part 1): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7c.md` (S1–S4, amendment 1). Fixes F20, F21, F12, F27.
+- **Changes:** Express paths written as names fold across files through a shared constant lookup (`rb-indexer/src/constants.rs`), with object-member and default-import folding. Default-imported axios instances resolve. Inline `require('express')()` is recognised. TS gRPC stubs need a generated-code import.
+- **Verification:**
+  - 14 mutants killed. Real-Docker suites 990/0/0.
+  - Invariant 29/31 identical. bookcars: +107 endpoints and +175 stitched calls. mattermost: −29 false gRPC sites.
+  - `PIPELINE` `m7c-1`.

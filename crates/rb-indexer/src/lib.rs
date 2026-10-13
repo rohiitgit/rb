@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
+mod constants;
 mod di;
 mod liveness;
 mod modules;
@@ -118,7 +119,10 @@ use serde_json::{Value, json};
 /// `m7a-1` `exact`-label correctness: Go/TS gRPC clients typed by the constructor
 /// link (S1), FastAPI through the shared router composer (S2), gRPC endpoints by
 /// server registration with `grpc_implementer_unknown` counted (S3).
-pub const PIPELINE: &str = "m7a-1";
+/// `m7c-1` HTTP recall: Express paths written as names fold across files (object
+/// members, default imports) or are counted dynamic (S1); default-imported axios
+/// instances (S2); `require('express')()` (S3); TS gRPC stubs need a generated import (S4).
+pub const PIPELINE: &str = "m7c-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

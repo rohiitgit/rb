@@ -1002,3 +1002,20 @@ Contract: `tasks/contract-m7b.md`. Branch `m7b-regressions-and-hangs` (stacked o
 ## Review (M7b)
 - Batch B is complete. Both suites are green with the DB and without skips. Every hang and blow-up found by the stress campaign is now bounded.
 - Residue: role walks are O(n·depth) on one long chain (3 s at 4k links); blobs of 64 MiB and under are still loaded to sniff.
+
+---
+
+# M7c: HTTP recall on supported stacks (stress batch C, part 1), started 2026-10-13
+
+Contract: `tasks/contract-m7c.md`. Branch `m7c-http-recall` (stacked on M7b). Docker Desktop was restarted and is responsive. Phase 0 ran the full suite against real Docker.
+
+- [x] Phase 0: full workspace with DB and real Docker: 986 passed, 0 failed, 0 skipped. All SCIP e2e green (contract-packs, go-chi, gradle, lombok and others). No leftover containers or networks.
+- [x] Phase 1 (S3/F12, S4/F27): `require('express')()` / `.Router()` inline factories; TS `*Client` gRPC stub only when imported from a generated module (grpc/_pb/proto, or a `gen`/`generated` segment; the gen segment keeps the M6f pin). Tests failed first. Mutants m26–m30 killed.
+- [x] Phase 2 (S2/F21): `imported_instance` resolves `default` through the target's `default_export`. The test failed first (both calls dropped). Mutant m31 killed.
+- [x] Phase 3a (S1 groundwork): `constants.rs` (shared `Constants`, implements `Lookup`, no properties) extracted from stitch `Folding`, which now wraps it and adds service properties. `external` also resolves default imports through `default_export`. `Folder::object_member` folds `obj.key` on a const TS/JS object-literal binding, local or imported (last entry; nothing if a spread follows). The stitch test failed first (all `dynamic`). Mutants m32–m35 killed; m34/m35 first survived on a test-ordering mistake (bindings declared after use), and the test was fixed.
+- [x] Phase 3b (S1/F20): `RouteFact.path_name` (Express keeps `Arg::Name`; other non-literal paths are now counted as `route_path_dynamic` instead of a silent `continue`). `add_endpoints` folds the name (`Constant`/`Literal` origin only), caps it at `heuristic`, or counts it dynamic. The bookcars-shaped test failed first. Mutants m36–m39 killed.
+- [x] Phase 4: PIPELINE `m7c-1`. Real Docker: 990/0/0. Invariant: 29/31 identical; bookcars +107 endpoints / +175 CONSUMES (6/6 sampled correct), all 16 new unmatched classified; mattermost −29 false gRPC sites.
+
+## Review (M7c)
+- Batch C part 1 is complete. Express and axios recall on bookcars went from 0 routes and 0 matched calls to 107 routes and 175 stitched calls.
+- New finding F32 (Express case-insensitive matching). Residue: anonymous default-exported objects.

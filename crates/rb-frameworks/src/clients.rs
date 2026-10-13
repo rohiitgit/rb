@@ -4030,6 +4030,23 @@ fn is_framework_client(type_name: &str) -> bool {
     matches!(simple, "HttpClient" | "WebClient" | "RestClient")
 }
 
+/// Whether the type `name` is imported from a module whose specifier names generated code
+/// (contract M7c S4): a specifier containing `grpc`, `_pb` or `proto`, or a whole path segment
+/// `gen`/`generated` (`./proto/greeter_grpc_pb`, `../gen/cart_pb`, `@acme/protos`, `./gen`).
+/// `google-auth-library`, or a class declared in the file, is not.
+fn generated_stub_import(facts: &FileFacts, name: &str) -> bool {
+    facts.imports.iter().any(|i| {
+        let module = i.module.to_ascii_lowercase();
+        let generated = module.contains("grpc")
+            || module.contains("_pb")
+            || module.contains("proto")
+            || module
+                .split('/')
+                .any(|seg| seg == "gen" || seg == "generated");
+        generated && i.names.iter().any(|n| n.local == name)
+    })
+}
+
 /// The binding `root` names and its type, when it resolves to one binding.
 fn binding_type<'f>(
     facts: &'f FileScope<'_>,
@@ -4171,10 +4188,16 @@ fn generated_calls(
         ) && let Some(bi) = local_binding(facts, language, root, chain.span)
         {
             let binding = &facts.bindings[bi];
-            let mut service = (!is_framework_client(&binding.type_name))
-                .then(|| client_type(last_segment(&binding.type_name)))
-                .flatten()
-                .map(str::to_owned);
+            // TS/JS: a `*Client` type is a stub only when imported from a generated-code
+            // module (contract M7c S4); Go stubs are recognised by their constructor.
+            let stub_type = |type_name: &str| {
+                language == Language::Go || generated_stub_import(facts, last_segment(type_name))
+            };
+            let mut service = (!is_framework_client(&binding.type_name)
+                && stub_type(&binding.type_name))
+            .then(|| client_type(last_segment(&binding.type_name)))
+            .flatten()
+            .map(str::to_owned);
             if service.is_none() {
                 match &binding.init {
                     Some(Init::Call { chain: ci }) => {
@@ -4187,7 +4210,9 @@ fn generated_calls(
                                 .map(str::to_owned);
                         }
                     }
-                    Some(Init::New { type_name, .. }) if !is_framework_client(type_name) => {
+                    Some(Init::New { type_name, .. })
+                        if !is_framework_client(type_name) && stub_type(type_name) =>
+                    {
                         service = client_type(last_segment(type_name)).map(str::to_owned);
                     }
                     None => {
@@ -6474,6 +6499,22 @@ mod tests {
                 "grpc GetAds @AdService",
                 "grpc GetCart @CartService",
                 "grpc GetQuote @ShippingService",
+            ]
+        );
+    }
+
+    /// Contract M7c S4 (stress F27, bookcars): a TS/JS `*Client` is a gRPC stub only when it
+    /// is imported from a generated-code module; a third-party SDK client
+    /// (google-auth-library's `OAuth2Client`) or a locally declared class is not.
+    #[test]
+    fn ts_grpc_stubs_come_from_generated_modules() {
+        let ts = "import { OAuth2Client } from 'google-auth-library';\nimport { GreeterClient } from './proto/greeter_grpc_pb';\nimport { CartClient } from '../gen/cart_pb';\nimport { ShopClient } from '@acme/protos';\nimport { AgentClient } from './agent';\nclass LocalClient {}\nexport function f(x) {\n  const auth = new OAuth2Client();\n  auth.verifyIdToken(x);\n  const g = new GreeterClient('addr');\n  g.sayHello(x);\n  const c = new CartClient('addr');\n  c.getCart(x);\n  const s = new ShopClient('addr');\n  s.list(x);\n  const l = new LocalClient();\n  l.send(x);\n  const a = new AgentClient();\n  a.run(x);\n}\n";
+        assert_eq!(
+            generated(Language::TypeScript, ts),
+            [
+                "grpc sayHello @Greeter",
+                "grpc getCart @Cart",
+                "grpc list @Shop",
             ]
         );
     }
