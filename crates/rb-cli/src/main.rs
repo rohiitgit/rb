@@ -13,7 +13,7 @@ use anyhow::{Context, bail, ensure};
 mod code;
 mod path;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rb_api::{Answer, Endpoint, Params};
+use rb_api::{Answer, ApiError, Endpoint, Params};
 use rb_model::{ServiceRole, canonical_dump};
 use rb_store::{LoadDir, ServiceCard, SnapshotInfo, Store, TableAccess, TableDeps};
 use serde_json::{Value, json};
@@ -784,6 +784,39 @@ fn asked(command: Command) -> Option<Asked> {
 /// code the server uses, and prints it; a refused request prints its message and exits with
 /// D5's code.
 fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Result<ExitCode> {
+    // `--repo` wins; else the working directory's checkout when indexed; else a
+    // directive error — never a guess across several repositories.
+    let repo = match repo {
+        Some(r) => Some(r),
+        None => match cwd_repo_name() {
+            Some(name) if is_indexed(store, &name) => Some(name),
+            Some(name) => {
+                return answer_err(
+                    out,
+                    ApiError::invalid(
+                        "repo",
+                        format!(
+                            "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
+                        ),
+                    ),
+                );
+            }
+            None => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".into());
+                return answer_err(
+                    out,
+                    ApiError::invalid(
+                        "repo",
+                        format!(
+                            "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
+                        ),
+                    ),
+                );
+            }
+        },
+    };
     let settings = settings()?;
     let answered = rb_api::parse(endpoint, repo.as_deref(), &params, &settings)
         .and_then(|req| rb_api::run(store, &mut rb_api::LoadEach, &req, &settings));
@@ -801,15 +834,18 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
             }
             Ok(ExitCode::SUCCESS)
         }
-        Err(e) => {
-            match out {
-                // The error body the server sends for the same request (contract M5 S14).
-                Out::Json => print!("{}", e.body()),
-                Out::Text { .. } => eprintln!("Error: {}", e.cli_text()),
-            }
-            Ok(ExitCode::from(e.kind.exit_code()))
-        }
+        Err(e) => answer_err(out, e),
     }
+}
+
+/// Prints a refused request exactly like `answer` does and exits with its code.
+fn answer_err(out: Out, e: ApiError) -> anyhow::Result<ExitCode> {
+    match out {
+        // The error body the server sends for the same request (contract M5 S14).
+        Out::Json => print!("{}", e.body()),
+        Out::Text { .. } => eprintln!("Error: {}", e.cli_text()),
+    }
+    Ok(ExitCode::from(e.kind.exit_code()))
 }
 
 /// The SCIP budget `rb index`'s flags set (contract M6a D9); every unset flag keeps
@@ -2377,6 +2413,25 @@ fn check_rules(
 
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
     let repo = match repo {
+        Some(r) => Some(r),
+        None => match cwd_repo_name() {
+            Some(name) if is_indexed(store, &name) => Some(name),
+            Some(name) => {
+                bail!(
+                    "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
+                )
+            }
+            None => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".into());
+                bail!(
+                    "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
+                )
+            }
+        },
+    };
+    let repo = match repo {
         Some(r) => r,
         None => {
             let names = store.repo_names()?;
@@ -2414,6 +2469,35 @@ fn repo_name_from_path(path: &Path) -> String {
     }
     let name: String = name.trim_matches('_').chars().take(40).collect();
     if name.is_empty() { "repo".into() } else { name }
+}
+
+/// The nearest ancestor of `start` (or `start` itself) holding `.git`, as a
+/// directory or a file (worktrees and submodules keep a `.git` file).
+fn git_root(start: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").symlink_metadata().is_ok() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// The repository implied by the working directory: the enclosing git root's
+/// directory name, sanitised exactly like `index` names it. No existence
+/// check: callers decide between using it and reporting it.
+fn cwd_repo_name() -> Option<String> {
+    let root = git_root(&std::env::current_dir().ok()?)?;
+    Some(repo_name_from_path(&root))
+}
+
+/// Whether a repository of this name is indexed (store errors count as no).
+fn is_indexed(store: &mut Store, name: &str) -> bool {
+    store
+        .repo_names()
+        .map(|names| names.iter().any(|r| r == name))
+        .unwrap_or(false)
 }
 
 fn short(sha: &str) -> &str {
@@ -3370,5 +3454,24 @@ mod tests {
             repo_name_from_path(Path::new(&format!("/x/{}", "a".repeat(50)))).len(),
             40
         );
+    }
+
+    #[test]
+    fn git_root_finds_dir_file_and_nesting() {
+        let base = std::env::temp_dir().join(format!("rb-git-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("proj");
+        let nested = repo.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        assert_eq!(git_root(&nested), Some(repo.clone()));
+        assert_eq!(git_root(&repo), Some(repo.clone()));
+        assert_eq!(git_root(&base), None);
+        // Worktrees and submodules keep a `.git` file instead of a directory.
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: elsewhere").unwrap();
+        assert_eq!(git_root(&wt), Some(wt.clone()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
