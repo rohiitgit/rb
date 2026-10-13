@@ -181,8 +181,15 @@ fn mount_targets<'a>(
         return Vec::new();
     };
     let targets = inputs.index.import_targets(path);
+    let python = inputs
+        .files
+        .get(path)
+        .is_some_and(|(language, _)| *language == Language::Python);
     let mut out = Vec::new();
     for (import, files) in facts.imports.iter().zip(targets) {
+        // Python `from pkg import module` then `module.router`: only the submodule's own file
+        // (`module.py`, `module/__init__.py`) declares the name (contract M7a S2).
+        let mut submodule: Option<&str> = None;
         let exported: Option<&str> = match m.child.split_once('.') {
             None => import
                 .names
@@ -192,10 +199,26 @@ fn mount_targets<'a>(
             Some((head, tail)) if import.alias.as_deref() == Some(head) && !tail.contains('.') => {
                 Some(tail)
             }
+            Some((head, tail)) if python && !tail.contains('.') => {
+                submodule = import
+                    .names
+                    .iter()
+                    .find(|n| n.local == head)
+                    .map(|n| n.name.as_str());
+                submodule.map(|_| tail)
+            }
             Some(_) => None,
         };
         let Some(exported) = exported else { continue };
         for &target in files {
+            if let Some(module) = submodule
+                && !(target.ends_with(&format!("/{module}.py"))
+                    || target == format!("{module}.py")
+                    || target.ends_with(&format!("/{module}/__init__.py"))
+                    || target == format!("{module}/__init__.py"))
+            {
+                continue;
+            }
             // A default import names the target's default export; an anonymous
             // default-exported construction is named `default` (contract M6b S3).
             let exported = if exported == "default" {
@@ -595,6 +618,14 @@ pub(crate) fn add_endpoints(
     Ok((diagnostics, added))
 }
 
+/// One declaration of a proto service: its spec file, the project holding it (`None` outside
+/// every project) and the service as read (contract M7a S3).
+struct Declared<'s> {
+    spec: &'s str,
+    holder: Option<String>,
+    svc: rb_frameworks::spec::ProtoService,
+}
+
 /// Spec operations and proto RPCs as endpoint registrations under the shared key space, so a
 /// code route for the same method+path joins its handler for free (contract M6f S3/S4).
 /// Unreadable specs are counted (`openapi_unread`); specs outside any project stay
@@ -631,6 +662,56 @@ fn add_spec_endpoints(
                 .push((path, route));
         }
     }
+    // gRPC attribution (contract M7a S3): every proto service declared anywhere (inside a
+    // project or not), by `(package, name)`, and the projects registering a server for it.
+    let mut declared: BTreeMap<(String, String), Vec<Declared<'_>>> = BTreeMap::new();
+    for (spec_path, text) in &specs {
+        if !spec_path.ends_with(".proto") {
+            continue;
+        }
+        let holder = (inputs.has_project)(spec_path).then(|| (inputs.service_of)(spec_path));
+        for svc in rb_frameworks::spec::proto_services(text) {
+            rb_frameworks::work::tick(1);
+            declared
+                .entry((svc.package.clone(), svc.name.clone()))
+                .or_default()
+                .push(Declared {
+                    spec: spec_path,
+                    holder: holder.clone(),
+                    svc,
+                });
+        }
+    }
+    let mut packages_of: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (package, name) in declared.keys() {
+        packages_of.entry(name).or_default().push(package);
+    }
+    let mut registered: BTreeMap<(String, String), BTreeMap<String, Vec<Evidence>>> =
+        BTreeMap::new();
+    for (path, file) in inputs.routes {
+        for server in &file.grpc_servers {
+            rb_frameworks::work::tick(1);
+            match packages_of.get(server.service.as_str()).map(Vec::as_slice) {
+                // No committed proto declares it: nothing to attribute.
+                None | Some([]) => {}
+                Some([package]) => registered
+                    .entry(((*package).to_owned(), server.service.clone()))
+                    .or_default()
+                    .entry((inputs.service_of)(path))
+                    .or_default()
+                    .push(Evidence {
+                        path: (*path).to_owned(),
+                        span: server.span,
+                    }),
+                Some(several) => diagnostics.push(diag(
+                    "grpc_registration_ambiguous",
+                    path,
+                    server.span,
+                    json!({ "service": server.service, "packages": several }),
+                )),
+            }
+        }
+    }
     for (spec_path, text) in specs {
         rb_frameworks::work::tick(1);
         if !(inputs.has_project)(spec_path) {
@@ -645,6 +726,16 @@ fn add_spec_endpoints(
         let service = (inputs.service_of)(spec_path);
         if spec_path.ends_with(".proto") {
             for svc in rb_frameworks::spec::proto_services(text) {
+                // Registered services are attributed to their servers below; a service several
+                // projects declare and nobody registers is counted below (contract M7a S3).
+                let id = (svc.package.clone(), svc.name.clone());
+                let holders: BTreeSet<&str> = declared[&id]
+                    .iter()
+                    .filter_map(|d| d.holder.as_deref())
+                    .collect();
+                if registered.contains_key(&id) || holders.len() > 1 {
+                    continue;
+                }
                 for rpc in svc.rpcs {
                     let target = if svc.package.is_empty() {
                         format!("{}/{}", svc.name, rpc.name)
@@ -743,6 +834,64 @@ fn add_spec_endpoints(
                         from_spec: true,
                     });
                 }
+            }
+        }
+    }
+    for ((package, name), decls) in &declared {
+        let qualified = if package.is_empty() {
+            name.clone()
+        } else {
+            format!("{package}.{name}")
+        };
+        let Some(projects) = registered.get(&(package.clone(), name.clone())) else {
+            let mut holders: Vec<&str> = decls.iter().filter_map(|d| d.holder.as_deref()).collect();
+            holders.sort_unstable();
+            holders.dedup();
+            if holders.len() > 1 {
+                let mut declared_in: Vec<&str> = decls.iter().map(|d| d.spec).collect();
+                declared_in.dedup();
+                diagnostics.push(diag(
+                    "grpc_implementer_unknown",
+                    decls[0].spec,
+                    decls[0].svc.span,
+                    json!({ "service": qualified, "declared_in": declared_in }),
+                ));
+            }
+            continue;
+        };
+        for (project, sites) in projects {
+            // The project's own declaring copy is the evidence (`exact`); else the first
+            // declaration, the attribution resting on the registration's name (`heuristic`).
+            let own = decls
+                .iter()
+                .find(|d| d.holder.as_deref() == Some(project.as_str()));
+            let (decl, certainty) = match own {
+                Some(d) => (d, Certainty::Exact),
+                None => (&decls[0], Certainty::Heuristic),
+            };
+            for rpc in &decl.svc.rpcs {
+                rb_frameworks::work::tick(1);
+                let key = grpc_key(package, name, &rpc.name, project);
+                let e = endpoints.entry(key).or_insert_with(|| Endpoint {
+                    method: "GRPC".into(),
+                    path: format!("{qualified}/{}", rpc.name),
+                    service: project.clone(),
+                    router: None,
+                    ..Endpoint::default()
+                });
+                e.frameworks.insert("grpc");
+                e.any_host = true;
+                e.registrations.push(Registration {
+                    path_certainty: certainty,
+                    handler: Vec::new(),
+                    candidates: 0,
+                    at: Evidence {
+                        path: decl.spec.to_owned(),
+                        span: rpc.span,
+                    },
+                    composed_from: sites.clone(),
+                    from_spec: true,
+                });
             }
         }
     }
@@ -1183,6 +1332,84 @@ mod tests {
                 "EXPOSES api -> HTTP GET /n/x @api [heuristic]",
                 "EXPOSES api -> HTTP GET /ops/health @api [heuristic]",
                 "EXPOSES api -> HTTP GET /y @api ?router=api/src/routes/other.ts#r [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M7a S2 (stress F18, fastapi-realworld): FastAPI composes through the shared
+    /// router composer. `include_router(module.router, prefix=…)` through a from-imported
+    /// submodule and an aliased router import compose across files (`heuristic`, as Express
+    /// cross-file mounts); in-file composition stays `exact`; a router never included and a
+    /// non-literal prefix leave the prefix unknown, so unrelated routers never merge under a
+    /// root path.
+    #[test]
+    fn fastapi_includes_compose_across_modules_and_unknown_prefixes_stay_unknown() {
+        let main = "from fastapi import FastAPI\nfrom app.api import api\n\napp = FastAPI()\n\n@app.get(\"/health\")\ndef health():\n    pass\n\napp.include_router(api.router, prefix=\"/api\")\n";
+        let api = "from fastapi import APIRouter\nfrom app.api.routes import articles, comments\nfrom app.api.routes.users import router as users_router\n\nrouter = APIRouter()\nrouter.include_router(articles.router, prefix=\"/articles\")\nrouter.include_router(comments.router, prefix=\"/articles/{slug}/comments\")\nrouter.include_router(users_router, prefix=\"/users\")\n";
+        let articles = "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n@router.delete(\"/{slug}\")\ndef delete_article(slug: str):\n    pass\n";
+        let comments = "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n@router.delete(\"/{comment_id}\")\ndef delete_comment(comment_id: int):\n    pass\n";
+        let users = "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/me\")\n\n@router.get(\"\")\ndef me():\n    pass\n";
+        let lone = "from fastapi import APIRouter\n\nlone = APIRouter()\n\n@lone.get(\"/l\")\ndef l():\n    pass\n";
+        let dynamic = "from fastapi import FastAPI, APIRouter\nfrom app.core import settings\n\nsite = FastAPI()\nr = APIRouter()\n\n@r.get(\"/d\")\ndef d():\n    pass\n\nsite.include_router(r, prefix=settings.API_PREFIX)\n";
+        let built = build(
+            &[
+                ("svc/app/main.py", Language::Python, main),
+                ("svc/app/api/api.py", Language::Python, api),
+                ("svc/app/api/routes/articles.py", Language::Python, articles),
+                ("svc/app/api/routes/comments.py", Language::Python, comments),
+                ("svc/app/api/routes/users.py", Language::Python, users),
+                ("svc/app/lone.py", Language::Python, lone),
+                ("svc/app/dynamic.py", Language::Python, dynamic),
+                ("svc/app/__init__.py", Language::Python, ""),
+                ("svc/app/api/__init__.py", Language::Python, ""),
+                // A package router of the same name: `articles.router` names the submodule's.
+                (
+                    "svc/app/api/routes/__init__.py",
+                    Language::Python,
+                    "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n@router.get(\"/pkg\")\ndef pkg():\n    pass\n",
+                ),
+            ],
+            &[],
+        );
+        let mut exposes: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("EXPOSES"))
+            .collect();
+        exposes.sort();
+        assert_eq!(
+            exposes,
+            [
+                "EXPOSES svc -> HTTP DELETE /api/articles/{} @svc [heuristic]",
+                "EXPOSES svc -> HTTP DELETE /api/articles/{}/comments/{} @svc [heuristic]",
+                "EXPOSES svc -> HTTP GET /api/users/me @svc [heuristic]",
+                "EXPOSES svc -> HTTP GET /d @svc ?router=svc/app/dynamic.py#r.r [heuristic]",
+                "EXPOSES svc -> HTTP GET /health @svc [exact]",
+                "EXPOSES svc -> HTTP GET /l @svc ?router=svc/app/lone.py#lone.lone [heuristic]",
+                "EXPOSES svc -> HTTP GET /pkg @svc ?router=svc/app/api/routes/__init__.py#router.router [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M6d S9 through M7a S2: in-file FastAPI composition stays `exact` through the
+    /// shared composer: an `APIRouter`'s own prefix, `include_router` prefixes, and a router
+    /// included twice serving both prefixes.
+    #[test]
+    fn fastapi_in_file_includes_stay_exact() {
+        let src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\nrouter = APIRouter(prefix=\"/api\")\nv1 = APIRouter()\n\n@app.get(\"/health\")\ndef health():\n    pass\n\n@router.post(\"/login\")\ndef login():\n    pass\n\n@v1.get(\"/users\")\ndef users():\n    pass\n\n@v1.delete(\"/users/{id}\")\ndef drop_user():\n    pass\n\napp.include_router(router)\napp.include_router(v1, prefix=\"/v1\")\napp.include_router(router, prefix=\"/v2\")\n";
+        let built = build(&[("svc/main.py", Language::Python, src)], &[]);
+        let mut exposes: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("EXPOSES"))
+            .collect();
+        exposes.sort();
+        assert_eq!(
+            exposes,
+            [
+                "EXPOSES svc -> HTTP DELETE /v1/users/{} @svc [exact]",
+                "EXPOSES svc -> HTTP GET /health @svc [exact]",
+                "EXPOSES svc -> HTTP GET /v1/users @svc [exact]",
+                "EXPOSES svc -> HTTP POST /api/login @svc [exact]",
+                "EXPOSES svc -> HTTP POST /v2/api/login @svc [exact]",
             ]
         );
     }
@@ -1682,6 +1909,123 @@ mod tests {
         ] {
             assert!(diag.iter().any(|d| d.starts_with(kind)), "{kind}: {diag:?}");
         }
+    }
+
+    /// Contract M7a S3 (stress F17, microservices-demo): a gRPC service's endpoints belong to
+    /// the projects that register a server for it — `exact` where that project holds a
+    /// declaring proto, `heuristic` where the proto lives elsewhere (here: outside every
+    /// project). Copies in non-implementing projects expose nothing; a service declared in
+    /// several projects that nobody registers gets no endpoint and one counted
+    /// `grpc_implementer_unknown`; a single-copy proto with no registration keeps M6f's
+    /// behaviour.
+    #[test]
+    fn grpc_endpoints_belong_to_registering_projects() {
+        let demo = "syntax = \"proto3\";\npackage hipstershop;\nservice CartService {\n  rpc GetCart (A) returns (B) {}\n}\nservice ProductCatalogService {\n  rpc GetProduct (A) returns (B) {}\n}\nservice CurrencyService {\n  rpc Convert (A) returns (B) {}\n}\nservice AdService {\n  rpc GetAds (A) returns (B) {}\n}\n";
+        let lonely = "syntax = \"proto3\";\npackage solo;\nservice Lonely {\n  rpc Ping (A) returns (B);\n}\n";
+        let built = build_with_specs(
+            &[
+                (
+                    "ads/src/AdService.java",
+                    Language::Java,
+                    "package hipstershop;\nclass AdService {\n  static class AdServiceImpl extends hipstershop.AdServiceGrpc.AdServiceImplBase {}\n}\n",
+                ),
+                (
+                    "currency/server.js",
+                    Language::JavaScript,
+                    "function main() {\n  server.addService(shopProto.CurrencyService.service, {convert});\n}\n",
+                ),
+                (
+                    "catalog/server.go",
+                    Language::Go,
+                    "package main\nfunc main() {\n\tpb.RegisterProductCatalogServiceServer(srv, svc)\n\tnotifypb.RegisterNotifyServer(srv, n)\n}\n",
+                ),
+                (
+                    "solo/main.go",
+                    Language::Go,
+                    "package main\nfunc main() {}\n",
+                ),
+                // A one-copy proto library implemented elsewhere: its holder exposes nothing.
+                ("shared/doc.go", Language::Go, "package shared\n"),
+            ],
+            &[
+                ("ads/src/demo.proto", demo),
+                ("currency/proto/demo.proto", demo),
+                ("protos/demo.proto", demo),
+                ("solo/svc.proto", lonely),
+                (
+                    "shared/notify.proto",
+                    "syntax = \"proto3\";\npackage notify;\nservice Notify {\n  rpc Send (A) returns (B);\n}\n",
+                ),
+            ],
+            &[],
+        );
+        let mut exposes: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("EXPOSES"))
+            .collect();
+        exposes.sort();
+        assert_eq!(
+            exposes,
+            [
+                "EXPOSES ads -> GRPC hipstershop.AdService/GetAds @ads [exact]",
+                "EXPOSES catalog -> GRPC hipstershop.ProductCatalogService/GetProduct @catalog [heuristic]",
+                "EXPOSES catalog -> GRPC notify.Notify/Send @catalog [heuristic]",
+                "EXPOSES currency -> GRPC hipstershop.CurrencyService/Convert @currency [exact]",
+                "EXPOSES solo -> GRPC solo.Lonely/Ping @solo [exact]",
+            ]
+        );
+        let unknown: Vec<String> = diagnostics(&built)
+            .into_iter()
+            .filter(|d| d.starts_with("grpc_implementer_unknown"))
+            .collect();
+        assert_eq!(
+            unknown,
+            [
+                "grpc_implementer_unknown {\"declared_in\":[\"ads/src/demo.proto\",\"currency/proto/demo.proto\",\"protos/demo.proto\"],\"service\":\"hipstershop.CartService\"}"
+            ]
+        );
+    }
+
+    /// Contract M7a S3: a registration whose name matches services of several proto packages
+    /// attributes nothing (counted); those services fall back as if unregistered.
+    #[test]
+    fn grpc_registrations_naming_several_packages_are_counted() {
+        let a =
+            "syntax = \"proto3\";\npackage a;\nservice Users {\n  rpc Get (X) returns (Y);\n}\n";
+        let b =
+            "syntax = \"proto3\";\npackage b;\nservice Users {\n  rpc List (X) returns (Y);\n}\n";
+        let built = build_with_specs(
+            &[
+                (
+                    "svc/main.go",
+                    Language::Go,
+                    "package main\nfunc main() {\n\tpb.RegisterUsersServer(srv, svc)\n}\n",
+                ),
+                ("pa/x.go", Language::Go, "package x\n"),
+                ("pb/x.go", Language::Go, "package x\n"),
+            ],
+            &[("pa/a.proto", a), ("pb/b.proto", b)],
+            &[],
+        );
+        let mut exposes: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("EXPOSES"))
+            .collect();
+        exposes.sort();
+        assert_eq!(
+            exposes,
+            [
+                "EXPOSES pa -> GRPC a.Users/Get @pa [exact]",
+                "EXPOSES pb -> GRPC b.Users/List @pb [exact]",
+            ]
+        );
+        assert!(
+            diagnostics(&built)
+                .iter()
+                .any(|d| d.starts_with("grpc_registration_ambiguous")),
+            "{:?}",
+            diagnostics(&built)
+        );
     }
 
     /// S2 fallback: a dynamic group argument folds to nothing, so the unknown node

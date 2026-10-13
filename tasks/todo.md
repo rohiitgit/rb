@@ -969,3 +969,19 @@ Same rules as M6d:
 - [x] M6k DI recall (closed 2026-10-12, amendments 1–10; passes 1–2 PASS).
 - [x] M6l XML diagnostic siting (closed 2026-10-13, amendments 1–3; passes 1–2 PASS).
 - Deferred beyond M6: scip-clang, `rust-analyzer scip`, scip-dotnet, the SCIP incremental below a single-root reactor, authentication/remote binding/`POST …/index` and move detection (only if asked for). Dropped: Groovy registrants.
+
+---
+
+# M7a: `exact`-label correctness (stress batch A), started 2026-10-13
+
+Contract: `tasks/contract-m7a.md`. Findings: `tasks/stress-findings.md` (F17, F18, F19).
+
+- [x] Phase 1 (S1/F19): Go/TS gRPC client typing. Constructor must be the last link; the `New*Client(c).Rpc` chain read as an RPC. The test failed first (getters reported, real calls missed). Mutants m1–m3 killed.
+- [x] Phase 2 (S2/F18): FastAPI through the shared router composer (`RouterDecl`/`Mount`), plus Python submodule mount targets and Python top-level `Constant` routers. The indexer test failed first (`DELETE /{}` merged, all exact). The 3 pack tests now pin per-file facts, and in-file composition is pinned at indexer level. Mutants m4–m7 killed.
+- [x] Phase 3 (S3/F17): gRPC server registrations (5 languages), registration-based attribution, `grpc_implementer_unknown` and `grpc_registration_ambiguous`. Tests failed first (copies exposed everything). Mutants m8–m12 killed; m9 first survived, and the test gained a one-copy-implemented-elsewhere case.
+- [x] Phase 4: PIPELINE `m7a-1`; fmt and clippy clean. DB suites: 980 pass, 2 fail (pre-existing F1). Invariant: 29/31 identical, with 2 classified (microservices-demo, fastapi-realworld). The mattermost false positives were caught and fixed by tightening to the two-link shape. Repros re-run; DB cleaned.
+
+## Review (M7a)
+- The three S1 `exact`-label errors from the stress campaign are fixed, tests-first, with 14 mutants killed. All 18 fixture dumps are byte-identical.
+- Residue recorded in the contract: inner prefixes are lost under an unknown top prefix; gRPC handler methods aren't linked; helper-registered health isn't read.
+- Not done: commit, and an evaluator pass.

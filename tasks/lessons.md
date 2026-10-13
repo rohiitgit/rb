@@ -533,3 +533,7 @@
 ## 2026-10-13: check the whole check output, not its head
 - **Mistake (caught by the close loop failing):** `cargo fmt --check | head -2` showed nothing while a violation sat below the cut — the loop's fmt step failed on a tree declared clean.
 - **Rule:** never truncate check output; assert on exit codes (`check ... && echo CLEAN`), not on the visible head. Same for clippy and test summaries: grep the counts, show the whole line.
+
+## 2026-10-13: a generated-code naming pattern must be tested against SDKs that share the name
+- **Mistake:** M7a S1's first rule read any `….New{X}Client(c).Rpc(…)` chain as a gRPC call. Generated Go stubs do look like that, but so does the Azure SDK's `….NewContainerClient(c).NewBlobClient(p)`. The unit test held only generated-code shapes; the invariant run on mattermost found 2 false gRPC sites.
+- **Rule:** When a rule keys on a naming convention (`New*Client`, `*ImplBase`, `*Api`), pin the exact generated shape (link count, position, what follows), and add negatives from a real SDK that uses the same words. Give each guard its own negative, so every guard has a mutant that bites alone.

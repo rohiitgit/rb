@@ -4069,6 +4069,25 @@ fn generated_calls(
             continue;
         };
         let [only] = links else {
+            // Go/TypeScript `pb.NewXClient(conn).Rpc(ctx, req)`: exactly a constructor then the
+            // RPC (contract M7a S1). Longer chains and constructor-after-constructor are SDK
+            // navigation (`….NewContainerClient(c).NewBlobClient(p)`), never an RPC.
+            if matches!(
+                language,
+                Language::Go | Language::TypeScript | Language::Tsx | Language::JavaScript
+            ) && let [ctor, rpc] = links
+                && let Some(service) = client_service(&ctor.name)
+                && !rpc.name.is_empty()
+                && client_service(&rpc.name).is_none()
+            {
+                out.generated.push(GeneratedCall {
+                    kind: GeneratedKind::Grpc,
+                    operation: rpc.name.clone(),
+                    carrier: service.to_owned(),
+                    span: rpc.span,
+                });
+                continue;
+            }
             // A stub chain's last link is its RPC; anything else multi-link is navigation.
             if matches!(
                 language,
@@ -4141,9 +4160,11 @@ fn generated_calls(
             }
         }
         // gRPC Go/TypeScript: bindings whose type is a `*Client` (TypeScript `new`), whose
-        // initialiser calls a `New*Client` constructor, or whose own statement holds exactly
-        // one such constructor (Go `client, _ := pb.NewGreeterClient(conn)`, whose binding
-        // carries no initialiser: the M6b-S4 statement-span association).
+        // initialiser ends in a `New*Client` constructor, or whose own statement holds exactly
+        // one chain ending in one (Go `client, _ := pb.NewGreeterClient(conn)`, whose binding
+        // carries no initialiser: the M6b-S4 statement-span association). The constructor must
+        // be the chain's last link: `resp, _ := pb.NewXClient(c).GetX(…)` binds the response,
+        // not the client (contract M7a S1).
         if matches!(
             language,
             Language::Go | Language::TypeScript | Language::Tsx | Language::JavaScript
@@ -4158,13 +4179,12 @@ fn generated_calls(
                 match &binding.init {
                     Some(Init::Call { chain: ci }) => {
                         if let Some(init_chain) = facts.chains.get(*ci) {
-                            crate::work::tick(init_chain.links.len());
-                            for link in init_chain.links.iter().rev() {
-                                if let Some(svc) = client_service(&link.name) {
-                                    service = Some(svc.to_owned());
-                                    break;
-                                }
-                            }
+                            crate::work::tick(1);
+                            service = init_chain
+                                .links
+                                .last()
+                                .and_then(|link| client_service(&link.name))
+                                .map(str::to_owned);
                         }
                     }
                     Some(Init::New { type_name, .. }) if !is_framework_client(type_name) => {
@@ -4177,11 +4197,10 @@ fn generated_calls(
                             if !within(candidate.span, binding.span) {
                                 continue;
                             }
-                            for link in candidate.links.iter().rev() {
-                                if let Some(svc) = client_service(&link.name) {
-                                    found.push(svc.to_owned());
-                                    break;
-                                }
+                            if let Some(svc) =
+                                candidate.links.last().and_then(|l| client_service(&l.name))
+                            {
+                                found.push(svc.to_owned());
                             }
                         }
                         found.sort();
@@ -6435,6 +6454,27 @@ mod tests {
         assert_eq!(
             generated(Language::TypeScript, ts),
             ["grpc sayHello @Greeter"]
+        );
+    }
+
+    /// Contract M7a S1 (stress F19, microservices-demo): a binding is a gRPC client only when a
+    /// `New*Client` constructor is the last link of what it holds, so a response
+    /// (`resp, _ := pb.NewXClient(c).GetX(…)`) is no client and its getters are no RPCs; the
+    /// inline `pb.NewXClient(c).Rpc(…)` chain itself is the RPC call — exactly that two-link
+    /// shape, so an SDK's chained constructors (Azure's `….NewContainerClient(c).NewBlobClient(p)`,
+    /// found on mattermost) are no RPC.
+    #[test]
+    fn grpc_go_responses_are_not_clients_and_inline_constructors_are() {
+        let go = "package main\nimport pb \"example.com/demo\"\nfunc f(conn Conn, ctx Ctx, req Req) {\n  resp, err := pb.NewCartServiceClient(conn).GetCart(ctx, req)\n  _ = resp.GetItems()\n  var quote = pb.NewShippingServiceClient(conn).GetQuote(ctx, req)\n  _ = quote.GetCostUsd()\n  c, _ := pb.NewAdServiceClient(conn)\n  c.GetAds(ctx, req)\n  _ = err\n  _ = b.client.ServiceClient().NewContainerClient(b.container).Download(ctx)\n  _ = sdk.NewFooClient(c).NewBarClient(d)\n  return b.client.ServiceClient().NewContainerClient(b.container).NewBlobClient(p)\n}\n";
+        let mut found = generated(Language::Go, go);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "grpc GetAds @AdService",
+                "grpc GetCart @CartService",
+                "grpc GetQuote @ShippingService",
+            ]
         );
     }
 

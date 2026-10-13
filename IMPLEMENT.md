@@ -681,3 +681,11 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Evaluator pass 2 (`tasks/eval-m6l-pass2.md`): VERDICT PASS — repros re-run, suite stands.
   - [x] `PIPELINE m6l-1`: metadata-only, no golden pins it.
 - **Verification** (`var/m6l/logs/p6-pipe-*`): fmt, clippy `-D warnings`, 927 units, `rb-store` 72/72, `rb-server` 12/12, e2e 47/47, api 1/1, no `skipping:`, no listener, stub scan clean.
+
+## M7a `exact`-label correctness (stress batch A): implemented 2026-10-13, uncommitted
+
+- **Contract:** `tasks/contract-m7a.md` (S1–S3, amendment 1). Source: `tasks/stress-findings.md` F17–F19.
+- **S1:** Go/TS gRPC clients are typed only by a trailing `New*Client` constructor. `pb.NewXClient(c).Rpc(…)` (exactly two links) is the RPC.
+- **S2:** FastAPI goes through the shared router composer (`RouterDecl`/`Mount`). `module.router` resolves through Python submodules, and an unknown prefix stays unknown.
+- **S3:** gRPC endpoints come from server registrations in 5 languages, counted with `grpc_implementer_unknown` / `grpc_registration_ambiguous`.
+- **Verification:** 14 mutants killed. DB suites 980/2, with the 2 failures pre-existing (F1). Invariant: 29/31 targets byte-identical (all 18 fixtures), and microservices-demo plus fastapi-realworld diffs classified. `PIPELINE` `m7a-1`.
