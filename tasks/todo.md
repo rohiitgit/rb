@@ -1086,17 +1086,6 @@ Contract: `tasks/contract-m7h.md`. Branch `m7h-ux` (stacked on M7g `52b7b90`). R
 
 ---
 
-# M8a: accuracy benchmark with answer keys, part 1 (contract written 2026-10-13; starts after M7i and the M7 close)
-
-Contract: `tasks/contract-m8a.md`. Branch `m8a-bench` (stacked on the M7 close). Record set: CHANGELOG, IMPLEMENT, contract, todo, bench-findings (new), lessons, README, usage guide. Part 2 (M8b): microSecEnD, blind hand keys, `exact` sample.
-
-- [ ] Phase 1 (S1–S3): `crates/rb-bench` core: dump v2 reader, `locate` (symbol and file identity), `EdgeId` merge, `score` with exhaustive buckets, ambiguous site hits. Tests first; mutants from the next free number.
-- [ ] Phase 2 (S6, S8, S9): scoreboard v1 writer (sorted, no timestamps), `render`, `render --certainty`, `compare` (per-cell gate, pins/keys exit 2, accept file with milestone tag, exact-`fp` never acceptable, perf warn-only).
-- [ ] Phase 3 (S7): `bench/{manifest.tsv, fetch.sh, run.sh}`; ports `bench_index.sh` timing and `real_one.sh` pin check; 13 stress pins.
-- [ ] Phase 4 (S4): SCIP agreement adapter (`calls`, `calls_file_scope`, `covered_share`); real run on ≥ 1 Java, TS, Go, Python repo.
-- [ ] Phase 5 (S5): PyCG adapter (name mapping, scope rules, case count asserted); real run on every case.
-- [ ] Phase 6 (S8, S10, S11): double run + `cmp`; first scoreboard `bench/scoreboard/m8a.json`; `bench-findings.md`; docs; fmt/clippy; real-Docker suites; invariant against the M7 close (31/31 expected); records; M8b contract.
-
 # M7i: precision and cost remainder (stress batch F, part 2), started 2026-10-13
 
 Contract: `tasks/contract-m7i.md`. Branch `m7i-precision-cost` (stacked on M7h `735d3ae`). Record set: CHANGELOG, IMPLEMENT, contract, todo, stress-findings, lessons, README, usage guide.
@@ -1116,3 +1105,25 @@ Contract: `tasks/contract-m7j.md`. Branch `m7j-close` (stacked on M7i `77675c8`)
 - [x] Phase 2 (E2, E5): bounded `rb doctor`; linear JSON spans.
 - [x] Phase 3 (E8): records and docs; full real-Docker run with log 1,047/0/0; invariant against M7i 31/31; E5 10.8 s (M7i 45.4 s); evaluator pass 2 next.
 - [x] Evaluator pass 2 (`tasks/eval-m7-pass2.md`): FAIL, 1 blocking item (U2 marked done; a records error). E1–E7 reproduced. Fixed: U2 ◐; E6 wording; binary of record rebuilt from the closing tree (`m7j-1` checked); N2 and N4 recorded as residue. **M7 closed.**
+
+---
+
+# M8a: accuracy benchmark with answer keys, part 1, started 2026-10-13
+
+Contract: `tasks/contract-m8a.md`. Branch `m8`, from `main` at `eabfc80` (the merged M7 close); every M8 step commits there. Record set: CHANGELOG, IMPLEMENT, contract, todo, bench-findings (new), lessons, README, usage guide. Part 2 (M8b): microSecEnD, blind hand keys, `exact` sample.
+
+- [x] Phase 1 (S1–S3): `crates/rb-bench` core: dump v2 reader (round-trips rb-model's own `line()` rendering and a real golden), `Locator` (lowest `DEFINED_IN` span; `no_defined_in`, `location_collision`, `unknown_node`, `not_locatable`), `found` (rows of one `EdgeId` merge to max certainty, every provenance and site; `calls` vs `calls_file_scope` by source kind), `score` (exhaustive buckets asserted; `vacuous`/`flagged`; ambiguous sites per source and span), splitmix property test over 300 seeds. Mutants m151–m162 killed (m152, m161, m162 survived first: three missing cases added).
+- [x] Evaluator pass 1 (`tasks/eval-m8a-pass1.md`): FAIL, 2 blocking (ambiguous candidates resolved elsewhere missed; S1 aliases absent) + 4 should-fix. All fixed (amendment 1): two-pass ambiguous sites; `Locator::canonical` and collisions over every site; `negative_span`; non-file `CALLS` sources counted; every golden dump's N and E rows round-trip. Tier B does emit file-sourced `CALLS`, so PyCG module-scope gold is scored in `calls_file_scope`.
+- [x] Phase 2 (S6, S8, S9), as 2a + 2b: `Scoreboard` v1 (`Cell` serde: certainty names, `fn`, owned reasons; duplicate cells and other schemas refused; `check_non_vacuous`), `Perf`; `compare` (per-cell gate on every bad movement, pins/keys exit 2, accept lines per milestone with stale ones listed, exact-`fp` never acceptable, aggregates for reading, perf warn-only on one hardware); `render` and `render --certainty` (goldens); `rb-bench render|compare`. 32 tests. Mutants m163–m184 killed (m163–m167 on the pass-1 fixes).
+- [x] Phase 3 (S7): `bench/{manifest.tsv, fetch.sh, run.sh, cleanup.sh}`. `fetch.sh` pins and verifies each clone, reusing the stress clones. `run.sh` times fresh and cached `noscip` runs with `/usr/bin/time -l`, records the binary sha256, load and disk per `.meta`, checks the 6 GiB floor before every run and runs from a copy of itself. `cleanup.sh` exists because rb cannot delete a repository. Three full runs left 0 `bench_*` repositories.
+- [x] Phase 4 (S4): `scip_ref.rs`: the reference is the `scip`-provenance rows; covered files are read from SCIP keys; source and target must both be covered; each SCIP job's outcome goes in the notes. The real run covered 11 targets, but only Go and TS have coverage: the Java (scip-java), Kotlin and Python jobs all failed or are absent (B4). `run.rs` builds the scoreboard and perf from a run's output, scoped to the manifest. Mutants m185–m187.
+- [x] Phase 5 (S5): `pycg.rs`:
+  - **Names:** PyCG names come from rb keys; `__init__` is the package; a caller is the innermost callable, or the module's file scope for module-level terms (from a probe of three real cases); overloads collapse.
+  - **Scope:** builtins, external code, lambdas (either end) and module callees are out of scope.
+  - **Run:** `run.sh` makes each case a git work tree; all 119 cases are asserted present and scored; the key hash covers every `callgraph.json`.
+  - **Mutants:** m188–m198 (m193 found dead code, deleted).
+- [x] Phase 6 (S8, S10, S11): four full runs (cold SCIP 3,199 s; warm 2 min 42 s); scoreboard determinism (`cmp`); `bench/scoreboard/m8a.json` and `-perf.json`; `bench-findings.md` B1–B6 (B1: SCIP drops cross-Go-module calls, 6,108 of mattermost's 6,147 disagreements); docs; fmt/clippy; real-Docker 1,094/0/0. The invariant was vacuous by construction: the rb binary is byte-identical to M7's (L489). The M8b contract is written.
+- [x] Evaluator pass 2 (`tasks/eval-m8a-pass2.md`): FAIL, 2 blocking + 6 should-fix. Answered in amendment 4: aliases in SCIP scoring (express's 2 false disagreements gone); S4 narrowed to Go/TS; gate on certainty downgrades; `run.sh` hardened (stale outputs, exit status, trap clean-up, process-group timeout, `rb doctor`); more real PyCG tests; mutant specs refreshed (49 live killed, m199–m200 new); records corrected; re-scored from run 4.
+
+## Review (M8a)
+- The accuracy benchmark exists and is re-runnable from a clean checkout. PyCG gives Tier B precision 92–99 % and recall 25–50 % on Python calls. SCIP agreement shows Go and TS gaps (B2, B3) and an rb SCIP-mode recall bug across Go modules (B1). Java, Kotlin and Python SCIP coverage is zero (B4); M8b brings independent keys for the remaining classes and `exact`.

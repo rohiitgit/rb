@@ -775,3 +775,18 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Pass 1:** 17 findings, answered by M7j.
 - **Pass 2:** 1 blocking records error (U2), corrected at the close, plus 4 S4 items (fixed or recorded as residue).
 - **Next:** M8a (accuracy benchmark), whose contract is drafted separately.
+
+## M8a An accuracy benchmark with answer keys, part 1: implemented 2026-10-13
+
+- **Discussed and decided:** the benchmark contract was written in plan mode, its draft reviewed adversarially (4 blockers), and the work split into M8a (harness, gate, SCIP agreement, PyCG) and M8b (microSecEnD, blind hand keys, `exact` sample). Contract: `tasks/contract-m8a.md`, S1–S11 with amendments 1–3.
+- **Built:**
+  - `crates/rb-bench` (dump reader, location identity, scoring, scoreboard, gate, render, SCIP and PyCG adapters, `score|render|compare` CLI).
+  - `bench/` (manifest, fetch, run, cleanup, mutant battery).
+  - The first scoreboard `bench/scoreboard/m8a.json`, and the findings `tasks/bench-findings.md` (B1–B6).
+- **Verification:**
+  - Evaluator passes 1 and 2, both FAIL with 2 blocking items each, all answered (amendments 1 and 4).
+  - Mutants m151–m200 (49 live, all killed).
+  - Scoreboard determinism across runs and scorings.
+  - Real-Docker 1,094/0/0.
+- **Status:** complete. The M8b contract is written (`tasks/contract-m8b.md`).
+

@@ -15,8 +15,14 @@ rb check                           # do the architecture rules pass? (CI gate)
 ```
 
 Every answer cites **file:line evidence** and a **certainty** (`exact` only
-when proven by a compiler-grade index, otherwise `heuristic`/`ambiguous` —
-the tool never guesses silently). No LLM, no embeddings: deterministic Rust +
+when proven: by a compiler-grade index (SCIP) for calls, references and
+implementations; by structure read directly (definitions and containment,
+a file's service, CODEOWNERS); or by what the code states literally (SQL at a
+known sink or in a `.sql` file, an ORM mapping by stated name, a route with a
+literal path, a manifest version); otherwise `heuristic`/`ambiguous` —
+the tool never guesses silently). The accuracy benchmark (`bench/`, usage
+guide §5.5) measures how often `heuristic` and `ambiguous` call edges are
+right; keys for `exact` and `synthetic` come in M8b. No LLM, no embeddings: deterministic Rust +
 Postgres + Apache AGE, byte-identical results on every run.
 
 - New here? Start at [5-minute quickstart](#5-minute-quickstart), then the

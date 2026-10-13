@@ -1,0 +1,20 @@
+# The accuracy benchmark's pinned inputs (contract M8a, S7). One row per target; tab-separated.
+# name: [a-z0-9_]; the DB repository is bench_<name>_<mode>.
+# kind: stress (a real repo, scored by SCIP agreement and timed) or pycg (the PyCG micro-benchmark).
+# modes: comma-separated, from noscip and scip.
+# Stress pins are the stress campaign's (tasks/stress-findings.md; var/stress/repos.tsv), mattermost M5's.
+name	kind	url	sha	modes
+microservices_demo	stress	https://github.com/GoogleCloudPlatform/microservices-demo.git	38e7348eb289eb5b87c0c6e8cb19ced0449dc389	noscip,scip
+spring_boot_microservices	stress	https://github.com/sivaprasadreddy/spring-boot-microservices-course.git	5899a53015228692410b8120df82924e665a5d70	noscip,scip
+express_ts_boilerplate	stress	https://github.com/w3tecch/express-typescript-boilerplate.git	17727010f7f098d8ca8b78da0a5b3c7297659381	noscip,scip
+bookcars	stress	https://github.com/aelassas/bookcars.git	4ea6c110eac5c835323102dc4f654263dea98c2c	noscip,scip
+go_gin_example	stress	https://github.com/eddycjy/go-gin-example.git	4f5174ca325b37f23edadad7c88d49586816a69c	noscip,scip
+go_clean_arch	stress	https://github.com/bxcodec/go-clean-arch.git	e06c6d0cb37069b0ef56e3df67f80ca130a1ab82	noscip,scip
+fastapi_realworld	stress	https://github.com/nsidnev/fastapi-realworld-example-app.git	029eb7781c60d5f563ee8990a0cbfb79b244538c	noscip,scip
+microblog	stress	https://github.com/miguelgrinberg/microblog.git	a975ef64864354867c88e0ed3a17ba7d17dca752	noscip,scip
+nestjs_realworld	stress	https://github.com/lujakob/nestjs-realworld-example-app.git	c1c2cc4e448b279ff083272df1ac50d20c3304fa	noscip,scip
+eshop_on_web	stress	https://github.com/dotnet-architecture/eShopOnWeb.git	4da8212117e87d808d4bbc7da6286fd2147ce606	noscip
+kotlin_spring_realworld	stress	https://github.com/gothinkster/kotlin-spring-realworld-example-app.git	848c29e3abfe1bd72001cc7d7a3227aebec96e9b	noscip,scip
+laravel_realworld	stress	https://github.com/alexeymezenin/laravel-realworld-example-app.git	1f482bfe92e0419ab5b9bb7c4c01b9e776c020b1	noscip
+mattermost	stress	https://github.com/mattermost/mattermost.git	b2ce71db9c18e547ab0c8b042361798201c0f735	noscip,scip
+pycg	pycg	https://github.com/vitsalis/PyCG.git	8d5dc40837803beef1d8d379fbf2cdad6cd94641	noscip

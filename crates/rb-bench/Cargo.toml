@@ -1,0 +1,21 @@
+[package]
+name = "rb-bench"
+description = "Repository Brain accuracy benchmark (contract M8a): reads `rb dump` output, reduces edges to location identity and scores them against answer keys."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rb-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

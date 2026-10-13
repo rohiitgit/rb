@@ -1,5 +1,25 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M8a: an accuracy benchmark with answer keys, part 1
+- **What:** rb's first measurement against answer keys. The new `rb-bench` crate reads `rb dump` and matches edges by location (a symbol is the path and line of its name token, a file its path), so SCIP keys, heuristic keys and external keys compare. It scores every gold item and found edge into exactly one bucket, stores counts only, renders tables and gates a milestone per cell (`compare`: 0 pass, 1 regression, 2 not comparable; a new wrong `exact` edge is never excusable).
+- **Keys:** SCIP agreement (Tier B against the same commit's `scip` `CALLS`, labelled agreement, not accuracy), and PyCG's 119 micro-benchmark cases (independent).
+- **Committed tooling:** `bench/` (manifest of 14 pinned targets, `fetch.sh`, `run.sh` with per-run timing, disk floor and self-copy, `cleanup.sh`, mutant specs). These replace the gitignored `var/` scripts as the source of truth.
+- **First scoreboard** (`bench/scoreboard/m8a.json`, M7 close binary):
+  - PyCG `calls` P 92.3 % R 25.0 %, module-level P 98.9 % R 50.5 %.
+  - SCIP `calls` agreement P 74.3 % R 49.7 %, dominated by mattermost.
+  - Findings B1–B6 in `tasks/bench-findings.md`. The biggest: SCIP mode drops about 7,700 calls across Go modules on mattermost (6,108 of its 6,147 disagreements).
+- **Docs:** the README and usage guide no longer say "`exact` only from SCIP" and name every producer of `exact`; usage guide §5.5 covers the benchmark.
+- **Evaluator passes:**
+  - **Pass 1:** FAIL, 2 blocking (ambiguous sites, aliases); fixed.
+  - **Pass 2:** FAIL, 2 blocking (aliases unused by scoring, S4 overclaimed) and 6 should-fix; answered in amendment 4. That covers aliases in SCIP agreement, a gate rule for certainty downgrades, hardened `run.sh` (stale outputs removed, exit 1 on failure, clean-up on every exit, process-group timeout, `rb doctor` first), more real PyCG cases, and records corrected.
+- **Verification:**
+  - Mutants m151–m200: 49 live specs killed against the final code, m193 retired.
+  - Determinism: final scoring of run 4 `cmp`-identical twice; runs 2 and 3 identical earlier.
+  - Gate self-tests on the real scoreboard.
+  - Real-Docker 1,094/0/0 (rb-bench's 51 tests after amendment 4).
+  - The `rb` binary is byte-identical to M7's (invariant vacuous, L489).
+- **Files:** `crates/rb-bench/{Cargo.toml,src/{lib,dump,identity,score,scoreboard,compare,render,run,scip_ref,pycg,main}.rs}`, `Cargo.lock`, `bench/{manifest.tsv,fetch.sh,run.sh,cleanup.sh,mutants/{run.py,m8a.json},scoreboard/{m8a,m8a-perf}.json}`, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m8a,contract-m8b,eval-m8a-pass1,eval-m8a-pass2,bench-findings,todo,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M7 CLOSED (evaluator passes 1–2)
 - **Pass 1** (`tasks/eval-m7-pass1.md`): FAIL, 17 findings (0 S1). Answered by M7j.
 - **Pass 2** (`tasks/eval-m7-pass2.md`): FAIL with 1 blocking item, a records error (U2 marked done), now marked ◐. Every code fix of M7j was reproduced against the release binary. 14 items resolved, 2 accepted as recorded residue. 4 new S4 items: the binary of record rebuilt after the `PIPELINE` bump (lesson added), E6's wording corrected, two residues recorded.
