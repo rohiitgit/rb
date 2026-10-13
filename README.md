@@ -93,7 +93,11 @@ the card: endpoints it exposes, packages, database tables, dependencies
 **Trace code.** `rb callers <target> [--depth N]` walks up the call graph as a
 tree (entry points marked: `endpoint …`, `main`, `top-level`). `rb impact
 <target>` walks down: what breaks, what becomes dead code (`orphans:`), which
-tests touch it, which endpoints it handles.
+tests touch it, which endpoints it handles. On a hub, `--limit N` shows N rows
+after a summary of everything found (per service, per entry kind), and
+`rb callers --exclude-tests` leaves out (and counts) callers in test code. A
+handler's own endpoint is named after the target; its callers are HTTP
+clients, which `rb path` follows.
 
 **Follow requests.** `rb path "POST /api/v1/login"` joins the upstream
 (client calls in other services and *their* callers) and the downstream (the
@@ -179,7 +183,9 @@ HTTP stitching → DI resolution → RTA/entry/orphans → snapshot → AGE grap
 ```
 
 Each `rb index` publishes one immutable snapshot (live + up to `--keep`
-retired, default 2); only the live snapshot keeps an AGE graph. Reads hit the
+retired, default 2); only the live snapshot keeps an AGE graph. Two runs on one
+repository at once take turns (the second says `waiting:`), so neither repeats
+the other's work. Reads hit the
 live pointer in one read-only transaction. Nothing is an LLM call anywhere in
 this pipeline — that is why the output is deterministic.
 
@@ -192,7 +198,7 @@ adds compiler-grade `exact` edges where a build can run in a container.
 | Language | Parsed | `exact` via SCIP | HTTP routes | HTTP / RPC clients | Dependency injection | Data access |
 |---|---|---|---|---|---|---|
 | **Java** | yes | scip-java (Maven, Gradle) | Spring MVC (class × method prefixes, context path; OpenAPI interfaces handled by implementors) | RestTemplate, WebClient, RestClient, Feign, gRPC stubs, OpenAPI-generated clients | Spring (stereotypes, `@Bean`, qualifiers, Lombok), Guice, Dagger, Spring XML | JPA + Spring Data (mappings, derived and `@Query` methods, JPQL), MyBatis XML mappers, SQL in strings |
-| **TypeScript / JavaScript** | yes (TS, TSX, JS) | scip-typescript (npm, pnpm, Yarn) | Express (routers, mounts, constant paths, `require('express')()`) | fetch, axios (incl. shared default-exported instances), HTTP client wrappers, gRPC stubs, OpenAPI-generated clients | NestJS (providers, constructor points, tokens) | Prisma (models and queries), TypeORM (models only), SQL in strings |
+| **TypeScript / JavaScript** | yes (TS, TSX, JS) | scip-typescript (npm, pnpm, Yarn) | Express (routers, mounts, constant paths, `require('express')()`; paths matched case-insensitively, as Express does, unless a router opts into `caseSensitive`) | fetch, axios (incl. shared default-exported instances), HTTP client wrappers, gRPC stubs, OpenAPI-generated clients | NestJS (providers, constructor points, tokens) | Prisma (models and queries), TypeORM (models only), SQL in strings |
 | **Python** | yes | scip-python | FastAPI (decorators, `APIRouter` prefixes, `include_router` across modules) | requests, httpx | none | SQLAlchemy and Django models (mappings, not queries), SQL in strings |
 | **Go** | yes | scip-go | gin (incl. groups passed as parameters), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings |
 | **Kotlin** | yes | scip-java (Gradle) | none | none | `beans { }` DSL (function and top-level `val` forms) | SQL in strings |
@@ -289,12 +295,14 @@ troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 | `fixtures/` | 18 golden fixture repos (see the testing guide for the catalog) |
 | `tasks/`, `docs/`, `var/` | contracts, evaluations, lessons; design doc; per-milestone scripts/logs/evidence (gitignored scratch) |
 
-**Status: M0–M7h.** M0–M6l built the tool (foundations → structure → syntax →
+**Status: M0–M7i.** M0–M6l built the tool (foundations → structure → syntax →
 SQL/ORM → resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules
-breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7h fixed
+breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7i fixed
 what a stress campaign over 18 fixtures and 13 public repositories found
 (`tasks/stress-findings.md`): wrong `exact` answers, hangs and blow-ups,
 silent recall losses, vendored and built code, the error contract,
-honesty about what was not analysed, and the CLI's rough edges (checkouts
-known by path, `rb doctor`). Detail per milestone: `CHANGELOG.md`,
+honesty about what was not analysed, the CLI's rough edges (checkouts
+known by path, `rb doctor`), and the last precision and cost items (Express
+case, spec-only routes, bounded hub answers, one index per repository,
+streamed caches). Detail per milestone: `CHANGELOG.md`,
 `IMPLEMENT.md`, contracts in `tasks/`.

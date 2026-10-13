@@ -291,6 +291,9 @@ pub(crate) struct EndpointRef {
     pub prefix_maybe_incomplete: bool,
     /// Operation IDs its spec registrations state (contract M6f S6).
     pub operations: Vec<String>,
+    /// Matched with literal case folded: every code registration is on an Express router
+    /// without a case-sensitive opt-in (contract M7i S1).
+    pub fold_case: bool,
 }
 
 #[derive(Default)]
@@ -308,6 +311,10 @@ struct Endpoint {
     hosts: BTreeSet<String>,
     /// A registration with no host pattern: the endpoint serves every host.
     any_host: bool,
+    /// Some code registration is on an Express router that folds case, and some needs exact
+    /// case (contract M7i S1); spec registrations say neither.
+    case_folds: bool,
+    case_exact: bool,
     registrations: Vec<Registration>,
 }
 
@@ -631,6 +638,13 @@ pub(crate) fn add_endpoints(
                     ..Endpoint::default()
                 });
                 e.frameworks.insert(r.framework.as_str());
+                let folds = r.framework == rb_frameworks::routes::Framework::Express
+                    && matches!(r.base, RouteBase::Router(i) if !file.routers[i].case_sensitive);
+                if folds {
+                    e.case_folds = true;
+                } else {
+                    e.case_exact = true;
+                }
                 match &r.host {
                     Some(host) => {
                         e.hosts.insert(host.clone());
@@ -1133,6 +1147,7 @@ fn add_endpoint(
         hosts,
         prefix_maybe_incomplete: unread,
         operations: e.operations.into_iter().collect(),
+        fold_case: e.case_folds && !e.case_exact,
     })
 }
 
@@ -1141,6 +1156,38 @@ mod tests {
     use rb_model::Graph;
 
     use super::*;
+
+    /// Contract M7i S1 (stress F32): an endpoint folds case when every code registration is on
+    /// an Express router without a case-sensitive opt-in; a router that opts in, or a
+    /// non-Express framework, keeps exact case.
+    #[test]
+    fn express_endpoints_fold_case_unless_their_router_opts_in() {
+        let app = "import express, { Router } from \"express\";\n\
+                   const app = express();\nconst strict = Router({ caseSensitive: true });\n\
+                   app.use(\"/strict\", strict);\n\
+                   app.get(\"/api/notifications/:id\", h);\nstrict.get(\"/x\", h);\n";
+        let fastapi = "from fastapi import FastAPI\napp = FastAPI()\n\n@app.get(\"/items\")\ndef items():\n    return []\n";
+        let built = build(
+            &[
+                ("web/src/app.ts", Language::TypeScript, app),
+                ("api/main.py", Language::Python, fastapi),
+            ],
+            &[],
+        );
+        let folds: Vec<(String, bool)> = built
+            .endpoints
+            .iter()
+            .map(|e| (e.key.clone(), e.fold_case))
+            .collect();
+        assert_eq!(
+            folds,
+            [
+                ("HTTP GET /api/notifications/{} @web".to_owned(), true),
+                ("HTTP GET /items @api".to_owned(), false),
+                ("HTTP GET /strict/x @web".to_owned(), false),
+            ]
+        );
+    }
 
     struct Built {
         graph: Graph,

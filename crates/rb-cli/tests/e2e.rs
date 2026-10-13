@@ -1776,6 +1776,7 @@ fn work_cap_is_far_above_every_fixture_question() {
                     min_certainty: Certainty::Ambiguous,
                     precision: Precision::Cha,
                     caps: Caps::default(),
+                    exclude_tests: false,
                 },
             );
             let q2 = impact(&ix, t, Certainty::Ambiguous, Precision::Cha);
@@ -4714,6 +4715,10 @@ fn a_checkout_is_its_repository_whatever_its_name() {
             "export function b(): number { return 1; }\nexport function a(): number { return b(); }\n",
         ),
         ("src/sub/keep.txt", "x\n"),
+        (
+            "src/c.ts",
+            "import { b } from \"./a\";\nexport function c(): number { return b(); }\nexport function d(): number { return b(); }\n",
+        ),
     ]);
     let root = repo.path();
     let path = root.to_str().unwrap();
@@ -4747,10 +4752,21 @@ fn a_checkout_is_its_repository_whatever_its_name() {
         assert_eq!(code, 0, "{stderr}");
         assert_eq!(dump, rb(&url, &["dump", "--repo", &a]));
     }
+    // Contract M7i S4: `--limit` shows that many rows after a summary of every row found.
+    let (code, text, stderr) = rb_exit_in(&url, root, &["callers", "b", "--limit", "1"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        text.contains("summary: 3 callers found, 1 shown (--limit 1)\n"),
+        "{text}"
+    );
+    assert!(text.ends_with("truncated: limit\n"), "{text}");
+    let (code, text, stderr) = rb_exit_in(&url, root, &["impact", "b", "--limit", "1"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(text.contains("(3, 1 shown):\n"), "{text}");
     // Contract M7h S2/S3: `find --kind` alone lists that kind; an empty `find` says so.
     let (code, files, _) = rb_exit_in(&url, root, &["find", "--kind", "file"]);
     assert_eq!(code, 0);
-    assert_eq!(files.lines().count(), 2, "{files}");
+    assert_eq!(files.lines().count(), 3, "{files}");
     let (code, stdout, stderr) = rb_exit_in(&url, root, &["find", "zzz_nothing"]);
     assert_eq!((code, stdout.as_str()), (0, ""));
     assert_eq!(stderr, "no matches for \"zzz_nothing\"\n");
@@ -4868,4 +4884,62 @@ fn doctor_reports_each_check() {
             "{name}:\n{text}"
         );
     }
+}
+
+/// Contract M7i S3 (stress O3): `rb index` of a repository another run is indexing waits for
+/// it, says so on stderr, and proceeds once the lock is free.
+#[test]
+fn a_second_index_of_a_repository_waits_for_the_first() {
+    let Some(url) = db_url() else { return };
+    let repo = repo_from(&[("src/a.ts", "export const a = 1;\n")]);
+    let name = format!("t_indexlock_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let mut holder = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    holder
+        .execute(
+            "SELECT pg_advisory_lock($1, hashtext($2))",
+            &[&rb_store::INDEX_LOCK_CLASS, &name],
+        )
+        .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .args([
+            "index",
+            repo.path().to_str().unwrap(),
+            "--repo",
+            &name,
+            "--no-scip",
+        ])
+        .env("RB_DATABASE_URL", &url)
+        .env("RB_AGE_LOAD_DIR", workspace_root().join("var/age-load"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut stderr, &mut first).unwrap();
+    assert_eq!(
+        first,
+        format!("waiting: another rb index of {name} is running\n")
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "it waits while the lock is held"
+    );
+    holder
+        .execute(
+            "SELECT pg_advisory_unlock($1, hashtext($2))",
+            &[&rb_store::INDEX_LOCK_CLASS, &name],
+        )
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with(&format!("{name}: snapshot ")),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }

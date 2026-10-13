@@ -478,6 +478,8 @@ pub fn resolve_target(ix: &SnapshotIndex, input: &str) -> Vec<i64> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallerTree {
     pub target: i64,
+    /// The target's own entry marks (contract M7i S2): an endpoint handler names its endpoint.
+    pub target_entry: Vec<String>,
     pub callers: Vec<Caller>,
     pub precision: Precision,
     /// Dispatch steps skipped because their implementing type is never instantiated (S10).
@@ -486,6 +488,20 @@ pub struct CallerTree {
     pub truncated: BTreeSet<Limit>,
     /// Counted operations the question spent (D6).
     pub work: u64,
+    /// Callers in test code left out (`exclude_tests`; `None` when not asked).
+    pub excluded_tests: Option<usize>,
+    /// Every row found, when [`limit_callers`] cut the rows shown.
+    pub summary: Option<CallerSummary>,
+}
+
+/// Every caller row of a tree whose shown rows were cut (contract M7i S4): how many, and how
+/// many per service and per entry mark kind (`endpoint`, `test`, `main`, …), most first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallerSummary {
+    pub callers: usize,
+    pub shown: usize,
+    pub by_service: Vec<(String, usize)>,
+    pub by_entry: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -510,6 +526,8 @@ pub struct CallerOptions {
     pub precision: Precision,
     /// `tree` (caller entries) and `work` apply (contract M5 D6).
     pub caps: Caps,
+    /// Callers in test code are left out and counted (contract M7i S4).
+    pub exclude_tests: bool,
 }
 
 /// Callers of `target` up to `depth` levels (§9.2): breadth-first, so each caller appears once,
@@ -530,6 +548,7 @@ fn callers_walk(ix: &SnapshotIndex, target: i64, opts: CallerOptions) -> CallerT
     let depth = opts.depth.clamp(1, MAX_CALLER_DEPTH);
     let mut truncated = BTreeSet::new();
     let mut entries = 0usize;
+    let mut excluded = 0usize;
     let mut seen = HashSet::from([target]);
     // node → its callers (without their own callers yet), in discovery order.
     let mut children: HashMap<i64, Vec<Caller>> = HashMap::new();
@@ -543,6 +562,11 @@ fn callers_walk(ix: &SnapshotIndex, target: i64, opts: CallerOptions) -> CallerT
                 // A recursive target is its own direct caller (listed once, without children).
                 let recursive = src == target && n == target;
                 if !recursive && seen.contains(&src) {
+                    continue;
+                }
+                if opts.exclude_tests && !recursive && in_tests(&v, src) {
+                    seen.insert(src);
+                    excluded += 1;
                     continue;
                 }
                 if entries == opts.caps.tree {
@@ -587,12 +611,102 @@ fn callers_walk(ix: &SnapshotIndex, target: i64, opts: CallerOptions) -> CallerT
     }
     CallerTree {
         target,
+        target_entry: v.entry_marks(target, &[]),
         callers: build(target, &children),
         precision: v.precision(),
         pruned_by_rta: v.pruned(),
         truncated,
         work: 0,
+        excluded_tests: opts.exclude_tests.then_some(excluded),
+        summary: None,
     }
+}
+
+/// Test code: a test node ([`is_test`]) or anything declared in a test path.
+fn in_tests(v: &View<'_>, n: i64) -> bool {
+    is_test(v, n)
+        || v.file_of(n)
+            .is_some_and(|f| rb_model::is_test_path(&v.node(f).key))
+}
+
+/// Shows at most `max` rows of `tree`, in display order, and summarises every row found
+/// (contract M7i S4). A tree within `max` is left as it is.
+pub fn limit_callers(ix: &SnapshotIndex, tree: &mut CallerTree, max: usize) {
+    fn rows<'c>(cs: &'c [Caller], out: &mut Vec<&'c Caller>) {
+        for c in cs {
+            out.push(c);
+            rows(&c.callers, out);
+        }
+    }
+    fn cut(cs: &mut Vec<Caller>, left: &mut usize) {
+        let mut kept = 0;
+        for c in cs.iter_mut() {
+            if *left == 0 {
+                break;
+            }
+            *left -= 1;
+            kept += 1;
+            cut(&mut c.callers, left);
+        }
+        cs.truncate(kept);
+    }
+    let mut all = Vec::new();
+    rows(&tree.callers, &mut all);
+    if all.len() <= max {
+        return;
+    }
+    let d = Describer::new(ix);
+    let mut by_service: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_entry: BTreeMap<String, usize> = BTreeMap::new();
+    for c in &all {
+        let service = d.describe(c.node).service.unwrap_or_else(|| "-".into());
+        *by_service.entry(service).or_default() += 1;
+        for mark in &c.entry {
+            let kind = mark.split(' ').next().unwrap_or(mark);
+            *by_entry.entry(kind.to_owned()).or_default() += 1;
+        }
+    }
+    let most_first = |m: BTreeMap<String, usize>| {
+        let mut v: Vec<(String, usize)> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    };
+    let callers = all.len();
+    cut(&mut tree.callers, &mut max.clone());
+    tree.summary = Some(CallerSummary {
+        callers,
+        shown: max,
+        by_service: most_first(by_service),
+        by_entry: most_first(by_entry),
+    });
+    tree.truncated.insert(Limit::Shown);
+}
+
+/// Shows at most `max` rows of each list of `impact` (contract M7i S4), recording each cut
+/// list's full length in `totals`; the service and owner roll-ups still count every row.
+pub fn limit_impact(impact: &mut Impact, max: usize) {
+    let mut totals = BTreeMap::new();
+    for (name, xs) in [
+        ("breaks", &mut impact.breaks),
+        ("affects", &mut impact.affects),
+        ("endpoints", &mut impact.endpoints),
+        ("tests", &mut impact.tests),
+    ] {
+        if xs.len() > max {
+            totals.insert(name, xs.len());
+            xs.truncate(max);
+        }
+    }
+    if let Orphans::Computed(xs) = &mut impact.orphans
+        && xs.len() > max
+    {
+        totals.insert("orphans", xs.len());
+        xs.truncate(max);
+    }
+    if !totals.is_empty() {
+        impact.truncated.insert(Limit::Shown);
+    }
+    impact.totals = totals;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -623,6 +737,8 @@ pub struct Impact {
     pub precision: Precision,
     /// Dispatch steps skipped because their implementing type is never instantiated (S10).
     pub pruned_by_rta: usize,
+    /// The full length of each list [`limit_impact`] cut, by list name.
+    pub totals: BTreeMap<&'static str, usize>,
 }
 
 /// The orphans of an impact, or why they were not computed.
@@ -843,6 +959,7 @@ fn impact_walk(
         work: 0,
         precision,
         pruned_by_rta: v.pruned(),
+        totals: BTreeMap::new(),
     }
 }
 
@@ -1290,6 +1407,7 @@ mod tests {
             min_certainty: Certainty::Ambiguous,
             precision: Precision::Rta,
             caps: Caps::default(),
+            exclude_tests: false,
         }
     }
 
@@ -1847,6 +1965,106 @@ mod tests {
 
     fn sym_id(g: &Graph, key: &NodeKey) -> i64 {
         g.nodes().iter().find(|n| n.key == key.key).unwrap().id
+    }
+
+    /// Contract M7i S4 (stress U5): `exclude_tests` leaves out (and counts) callers in test
+    /// code, a test entry or anything declared in a test path, and does not walk past them;
+    /// `limit_callers` cuts the rows shown in display order and summarises every row found.
+    #[test]
+    fn callers_exclude_tests_and_limit_with_a_summary() {
+        let mut b = B::new();
+        let t = b.sym("app/src/main/A.java", "T");
+        let mut test = Attrs::new();
+        test.insert("entry".into(), serde_json::json!(["test"]));
+        let unit = b.sym_with("app/src/main/AUnit.java", "u", false, test);
+        let helper = b.sym("app/src/test/Helper.java", "h");
+        let behind = b.sym("app/src/main/C.java", "behind");
+        let a = b.sym("app/src/main/B.java", "a");
+        let a2 = b.sym("lib/src/L.java", "l");
+        b.edge(&unit, EdgeKind::Calls, &t);
+        b.edge(&helper, EdgeKind::Calls, &t);
+        b.edge(&behind, EdgeKind::Calls, &helper);
+        b.edge(&a, EdgeKind::Calls, &t);
+        b.edge(&a2, EdgeKind::Calls, &a);
+        let g = b.b.finish().unwrap();
+        let ix = ix(&g);
+        let names = |cs: &[Caller]| -> Vec<String> {
+            fn walk(g: &Graph, cs: &[Caller], out: &mut Vec<String>) {
+                for c in cs {
+                    out.push(
+                        g.nodes()
+                            .iter()
+                            .find(|n| n.id == c.node)
+                            .unwrap()
+                            .name
+                            .clone(),
+                    );
+                    walk(g, &c.callers, out);
+                }
+            }
+            let mut out = Vec::new();
+            walk(&g, cs, &mut out);
+            out
+        };
+        let all = callers(&ix, sym_id(&g, &t), opts(3));
+        assert_eq!(names(&all.callers), ["u", "a", "l", "h", "behind"]);
+        assert_eq!(all.excluded_tests, None);
+        let kept = callers(
+            &ix,
+            sym_id(&g, &t),
+            CallerOptions {
+                exclude_tests: true,
+                ..opts(3)
+            },
+        );
+        assert_eq!(names(&kept.callers), ["a", "l"]);
+        assert_eq!(kept.excluded_tests, Some(2));
+
+        let mut cut = all.clone();
+        limit_callers(&ix, &mut cut, 2);
+        assert_eq!(names(&cut.callers), ["u", "a"]);
+        assert!(cut.truncated.contains(&Limit::Shown));
+        assert_eq!(
+            cut.summary,
+            Some(CallerSummary {
+                callers: 5,
+                shown: 2,
+                by_service: vec![("app".into(), 4), ("lib".into(), 1)],
+                by_entry: vec![("test".into(), 1)],
+            })
+        );
+        let mut within = all.clone();
+        limit_callers(&ix, &mut within, 5);
+        assert_eq!(within, all, "a tree within the limit is left as it is");
+    }
+
+    /// Contract M7i S4: `limit_impact` cuts each list past the limit and records its length;
+    /// a list within it, and the roll-ups, are untouched.
+    #[test]
+    fn impact_limit_cuts_each_list_and_keeps_totals() {
+        let mut b = B::new();
+        let t = b.sym("app/src/main/A.java", "T");
+        for i in 0..3 {
+            let c = b.sym("app/src/main/B.java", &format!("c{i}"));
+            b.edge(&c, EdgeKind::Calls, &t);
+        }
+        let g = b.b.finish().unwrap();
+        let full = impact(
+            &ix(&g),
+            sym_id(&g, &t),
+            Certainty::Ambiguous,
+            Precision::Cha,
+        );
+        assert_eq!(full.breaks.len(), 3);
+        let mut cut = full.clone();
+        limit_impact(&mut cut, 2);
+        assert_eq!(cut.breaks.len(), 2);
+        assert_eq!(cut.totals.get("breaks"), Some(&3));
+        assert!(cut.truncated.contains(&Limit::Shown));
+        assert_eq!(cut.services, full.services);
+        let mut within = full.clone();
+        limit_impact(&mut within, 3);
+        assert_eq!(within, full);
     }
 
     /// Contract M4b S13, D11: orphans are the candidates no live node reaches. A dead cycle is
@@ -2410,6 +2628,7 @@ mod tests {
                             depth: 4,
                             include_references: true,
                             caps,
+                            exclude_tests: false,
                             ..opts(1)
                         },
                     )
@@ -2633,6 +2852,7 @@ mod tests {
                 CallerOptions {
                     depth: 5,
                     caps,
+                    exclude_tests: false,
                     ..opts(1)
                 },
             )

@@ -34,6 +34,8 @@ pub const FIND_LIMIT_DEFAULT: u64 = 20;
 pub const FIND_LIMIT_MAX: u64 = 1_000;
 /// The page size of the other flat lists (`services`, `snapshots`): default and maximum.
 pub const LIST_LIMIT_MAX: u64 = 1_000;
+/// `callers`/`impact` `limit`: the rows shown (contract M7i S4), at most the `tree` cap.
+pub const SHOWN_LIMIT_MAX: u64 = limits::TREE as u64;
 /// The largest `offset` (Postgres' `OFFSET` is a `bigint`).
 pub const OFFSET_MAX: u64 = i64::MAX as u64;
 
@@ -164,9 +166,18 @@ impl Endpoint {
                 "min_certainty",
                 "precision",
                 "pick",
+                "limit",
+                "exclude_tests",
                 "snapshot",
             ],
-            Endpoint::Impact => &["target", "min_certainty", "precision", "pick", "snapshot"],
+            Endpoint::Impact => &[
+                "target",
+                "min_certainty",
+                "precision",
+                "pick",
+                "limit",
+                "snapshot",
+            ],
             Endpoint::TableDeps => &["table", "precision", "hops", "snapshot"],
             Endpoint::Path => &[
                 "endpoint",
@@ -269,12 +280,16 @@ pub enum Query {
         min_certainty: Certainty,
         precision: Precision,
         pick: Option<usize>,
+        /// Rows shown; every row found is summarised when it cuts (contract M7i S4).
+        limit: Option<usize>,
+        exclude_tests: bool,
     },
     Impact {
         target: String,
         min_certainty: Certainty,
         precision: Precision,
         pick: Option<usize>,
+        limit: Option<usize>,
     },
     TableDeps {
         table: String,
@@ -359,12 +374,15 @@ pub fn parse(
             min_certainty: p.certainty("min_certainty", Certainty::Ambiguous)?,
             precision: p.precision("precision", Precision::Cha)?,
             pick: pick()?,
+            limit: p.int_opt("limit", 1, SHOWN_LIMIT_MAX)?.map(usize_of),
+            exclude_tests: p.boolean("exclude_tests")?,
         },
         Endpoint::Impact => Query::Impact {
             target: p.text("target")?,
             min_certainty: p.certainty("min_certainty", Certainty::Ambiguous)?,
             precision: p.precision("precision", Precision::Cha)?,
             pick: pick()?,
+            limit: p.int_opt("limit", 1, SHOWN_LIMIT_MAX)?.map(usize_of),
         },
         Endpoint::TableDeps => Query::TableDeps {
             table: p.text("table")?,
@@ -481,6 +499,8 @@ impl Query {
                 min_certainty,
                 precision,
                 pick,
+                limit,
+                exclude_tests,
             } => json!({
                 "target": target,
                 "depth": depth,
@@ -488,17 +508,21 @@ impl Query {
                 "min_certainty": min_certainty.as_str(),
                 "precision": precision.as_str(),
                 "pick": pick,
+                "limit": limit,
+                "exclude_tests": exclude_tests,
             }),
             Query::Impact {
                 target,
                 min_certainty,
                 precision,
                 pick,
+                limit,
             } => json!({
                 "target": target,
                 "min_certainty": min_certainty.as_str(),
                 "precision": precision.as_str(),
                 "pick": pick,
+                "limit": limit,
             }),
             Query::TableDeps {
                 table,
@@ -1098,10 +1122,12 @@ fn answer(
             min_certainty,
             precision,
             pick,
+            limit,
+            exclude_tests,
         } => {
             let ix = indexes.index(store, snap, live)?;
             let t = render::pick_target(&ix, target, *pick)?;
-            let tree = rb_store::code::callers(
+            let mut tree = rb_store::code::callers(
                 &ix,
                 t,
                 rb_store::code::CallerOptions {
@@ -1110,9 +1136,15 @@ fn answer(
                     min_certainty: *min_certainty,
                     precision: *precision,
                     caps,
+                    exclude_tests: *exclude_tests,
                 },
             );
-            limits = limits_of(&[(Limit::Tree, caps.tree as u64), (Limit::Work, caps.work)]);
+            let mut caps_in_force = vec![(Limit::Tree, caps.tree as u64), (Limit::Work, caps.work)];
+            if let Some(n) = *limit {
+                rb_store::code::limit_callers(&ix, &mut tree, n);
+                caps_in_force.push((Limit::Shown, n as u64));
+            }
+            limits = limits_of(&caps_in_force);
             truncated = names(&tree.truncated);
             certainty = Some(histogram(caller_certainties(&tree.callers)));
             Answer::Callers { ix, tree }
@@ -1122,11 +1154,19 @@ fn answer(
             min_certainty,
             precision,
             pick,
+            limit,
         } => {
             let ix = indexes.index(store, snap, live)?;
             let t = render::pick_target(&ix, target, *pick)?;
-            let impact = rb_store::code::impact_capped(&ix, t, *min_certainty, *precision, caps);
-            limits = limits_of(&[(Limit::Nodes, caps.nodes as u64), (Limit::Work, caps.work)]);
+            let mut impact =
+                rb_store::code::impact_capped(&ix, t, *min_certainty, *precision, caps);
+            let mut caps_in_force =
+                vec![(Limit::Nodes, caps.nodes as u64), (Limit::Work, caps.work)];
+            if let Some(n) = *limit {
+                rb_store::code::limit_impact(&mut impact, n);
+                caps_in_force.push((Limit::Shown, n as u64));
+            }
+            limits = limits_of(&caps_in_force);
             truncated = names(&impact.truncated);
             certainty = Some(histogram(
                 impact
@@ -1264,6 +1304,43 @@ mod tests {
             &Params::from_pairs(pairs.iter().copied()).unwrap(),
             &Settings::default(),
         )
+    }
+
+    /// Contract M7i S4 (stress U5): `callers` takes `limit` (1 to the tree cap) and
+    /// `exclude_tests`; `impact` takes `limit`; both are echoed in the normalised query.
+    #[test]
+    fn callers_and_impact_take_limit_and_exclude_tests() {
+        let r = parse_pairs(
+            Endpoint::Callers,
+            &[
+                ("target", "x"),
+                ("limit", "5000"),
+                ("exclude_tests", "true"),
+            ],
+        )
+        .unwrap();
+        let q = r.query.normalised();
+        assert_eq!(
+            (q["limit"].clone(), q["exclude_tests"].clone()),
+            (json!(5000), json!(true))
+        );
+        for bad in ["0", "5001"] {
+            let err =
+                parse_pairs(Endpoint::Callers, &[("target", "x"), ("limit", bad)]).unwrap_err();
+            assert_eq!(err.param.as_deref(), Some("limit"), "{bad}");
+        }
+        let i = parse_pairs(Endpoint::Impact, &[("target", "x"), ("limit", "3")]).unwrap();
+        assert_eq!(i.query.normalised()["limit"], json!(3));
+        assert_eq!(
+            parse_pairs(
+                Endpoint::Impact,
+                &[("target", "x"), ("exclude_tests", "true")]
+            )
+            .unwrap_err()
+            .param
+            .as_deref(),
+            Some("exclude_tests")
+        );
     }
 
     /// Contract M7h S2 (stress U4): `find` with a kind and no text lists that kind; with
@@ -1502,7 +1579,8 @@ mod tests {
         assert_eq!(
             r.query.normalised(),
             json!({"target": "x", "depth": 1, "include_references": false,
-                   "min_certainty": "ambiguous", "precision": "cha", "pick": null})
+                   "min_certainty": "ambiguous", "precision": "cha", "pick": null,
+                   "limit": null, "exclude_tests": false})
         );
         let explicit = parse_pairs(
             Endpoint::Callers,

@@ -117,6 +117,9 @@ pub struct RouterDecl {
     pub binding: Option<usize>,
     /// Bound at the top level of the file, so other modules may import it.
     pub top_level: bool,
+    /// Opted into case-sensitive path matching (Express: `Router({ caseSensitive })`, the app's
+    /// `case sensitive routing` setting). Without it Express folds case (contract M7i S1).
+    pub case_sensitive: bool,
 }
 
 /// `parent.use(prefix, child)`.
@@ -748,6 +751,21 @@ fn inline_express(chain: &CallChain) -> Option<RouterKind> {
     }
 }
 
+/// Whether a router construction passes a `caseSensitive` option (`Router({ caseSensitive })`).
+/// Its value is not read (a boolean literal reaches the facts without its text), so any
+/// mention keeps exact-case matching, as before M7i.
+fn case_sensitive_option(chain: &CallChain) -> bool {
+    let ctor = if inline_express(chain).is_some() {
+        chain.links.get(1)
+    } else {
+        chain.links.first()
+    };
+    matches!(
+        ctor.and_then(|l| l.args.first()),
+        Some(Arg::Object { entries, .. }) if entries.iter().any(|e| e.key == "caseSensitive")
+    )
+}
+
 /// The router kind a binding's initialiser creates, if any.
 fn router_kind(names: &ExpressNames, chain: &CallChain) -> Option<RouterKind> {
     if let Some(kind) = inline_express(chain) {
@@ -788,6 +806,7 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 span: b.span,
                 binding: Some(bi),
                 top_level: b.scope.is_none(),
+                case_sensitive: case_sensitive_option(chain),
             });
         }
     }
@@ -807,6 +826,7 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                     span: c.span,
                     binding: None,
                     top_level: true,
+                    case_sensitive: case_sensitive_option(c),
                 });
                 out.routers.len() - 1
             })
@@ -841,6 +861,13 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
             _ => (None, &links[..]),
         };
         for link in verbs {
+            // `app.set("case sensitive routing", …)` / `app.enable(…)`: any value counts.
+            if matches!(link.name.as_str(), "set" | "enable")
+                && link.args.first().and_then(literal).as_deref() == Some("case sensitive routing")
+            {
+                out.routers[router].case_sensitive = true;
+                continue;
+            }
             if link.name == "use" {
                 let (prefix, children) = match link.args.first() {
                     Some(a @ Arg::Template { .. }) => (literal(a), &link.args[1..]),
@@ -1463,6 +1490,8 @@ fn fastapi(facts: &FileScope<'_>, out: &mut FileRoutes) {
                     d.parent.is_none() && d.kind == DefKind::Constant && d.name == b.name
                 })
             }),
+            // FastAPI (Starlette) matches paths case-sensitively.
+            case_sensitive: true,
         });
     }
     // Routes per decorator on the app or router they hang off, the router's own literal
@@ -1809,6 +1838,35 @@ public class AuthController {
 
     const EXPRESS_APP: &str = "import express from \"express\";\nimport { authRouter } from \"./routes/auth\";\n\nexport const app = express();\napp.use(express.json());\napp.use(\"/api/v1\", authRouter);\napp.get(\"/health\", health);\n// app.post(\"/commented\", h);\n";
 
+    /// Contract M7i S1 (stress F32): Express routers match paths case-insensitively unless they
+    /// opt in: `Router({ caseSensitive })` or the app's `set`/`enable("case sensitive
+    /// routing")`. Any opt-in counts (its value is not read), so matching stays exact as before.
+    #[test]
+    fn express_routers_record_a_case_sensitive_opt_in() {
+        let src = "import express, { Router } from \"express\";\n\
+                   const app = express();\nconst strict = express();\nstrict.enable(\"case sensitive routing\");\n\
+                   const set = express();\nset.set(\"case sensitive routing\", true);\n\
+                   const r = Router();\nconst cs = Router({ caseSensitive: true });\nconst other = Router({ mergeParams: true });\n";
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let sensitive: Vec<(String, bool)> = routes(Language::TypeScript, &facts)
+            .routers
+            .iter()
+            .map(|r| (r.name.clone(), r.case_sensitive))
+            .collect();
+        let want = |n: &str, cs: bool| (n.to_owned(), cs);
+        assert_eq!(
+            sensitive,
+            [
+                want("app", false),
+                want("strict", true),
+                want("set", true),
+                want("r", false),
+                want("cs", true),
+                want("other", false),
+            ]
+        );
+    }
+
     #[test]
     fn express_apps_routes_and_mounts() {
         assert_eq!(
@@ -1830,6 +1888,7 @@ public class AuthController {
                     .span,
                 binding: Some(facts.bindings.iter().position(|b| b.name == "app").unwrap()),
                 top_level: true,
+                case_sensitive: false,
             }]
         );
         assert_eq!(r.mounts.len(), 1, "{:?}", r.mounts);

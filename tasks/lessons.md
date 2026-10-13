@@ -557,3 +557,7 @@
 ## 2026-10-13: every step of a verification script sets the environment it needs
 - **Mistake:** the M7g close script ran the mattermost `rb check` timing without `RB_DATABASE_URL`, so it hit the default port 55432 and exited 2 (`unavailable`). The log line `mattermost check: 2s exit=2` looked like a failed NFR until it was re-run by hand (0.16 s).
 - **Rule:** A verification script exports every variable it relies on once at the top (DB URL, Docker context), and records each command's stderr next to its exit code, so a non-zero exit explains itself in the log.
+
+## 2026-10-13: a new request parameter goes into every harness that translates parameters
+- **Mistake:** M7i added the boolean `exclude_tests` to the request layer and the CLI, but the CLI↔HTTP parity harness (`tests/api.rs`) maps boolean parameters to bare flags from its own list. It passed `--exclude-tests true`, and the run failed only in the 40-minute suite.
+- **Rule:** When adding a parameter, grep the tests for an existing sibling of the same type (`include_references` for a boolean, `limit` for a number) and add the new one wherever the sibling is listed, before the full run.

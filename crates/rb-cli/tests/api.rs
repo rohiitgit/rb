@@ -63,7 +63,7 @@ fn cli_args(segment: &str, repo: &str, params: &[(&'static str, String)]) -> Vec
         match *k {
             k if Some(k) == positional => {}
             "from" | "to" if segment == "diff" => {}
-            "include_references" | "full" | "diagnostics" => {
+            "include_references" | "full" | "diagnostics" | "exclude_tests" => {
                 assert_eq!(v, "true");
                 args.push(format!("--{}", k.replace('_', "-")));
             }
@@ -252,6 +252,18 @@ fn table(url: &str, repo: &str, target: &str) -> (Vec<Set>, bool) {
         ),
         ("impact", vec![p("target", target)]),
         ("impact", vec![p("target", target), p("precision", "rta")]),
+        // Contract M7i S4: the rows shown, and test callers left out.
+        ("callers", vec![p("target", target), p("limit", "1")]),
+        (
+            "callers",
+            vec![
+                p("target", target),
+                p("exclude_tests", "true"),
+                p("depth", "3"),
+            ],
+        ),
+        ("callers", vec![p("target", target), p("limit", "5001")]),
+        ("impact", vec![p("target", target), p("limit", "1")]),
         ("impact", vec![p("target", &table)]),
         ("table-deps", vec![p("table", &table)]),
         ("table-deps", vec![p("table", &table), p("hops", "8")]),

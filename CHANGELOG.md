@@ -1,5 +1,14 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M7i: precision and cost remainder (stress batch F, part 2)
+- **Express case:** routes match client paths case-insensitively, as Express does, unless their router opts into `caseSensitive`; such links say `case: folded` and are never `synthetic`.
+- **Specs:** `rb status` counts routes only a spec states (`18 routes (3 from specs only)`); JSON specs carry each operation's path-key span.
+- **Callers of a handler:** the endpoint it handles is named after the target; an empty tree points to `rb path`.
+- **Hub answers:** `callers`/`impact --limit N` (a summary first, `truncated: limit`); `callers --exclude-tests`.
+- **Indexing:** one `rb index` per repository at a time (the second waits, then is usually up to date). Cached facts stream: mattermost's cached peak 2,148 → 1,658 MiB.
+- **Verification:** fixes F31, F32, U5, O3, O4; O7 declined with measurements. Mutants m123–m143. Real-Docker suites 1,041/0/0. Invariant vs M7h 29/31, 2 classified. `PIPELINE` `m7i-1`.
+- **Files:** `crates/rb-frameworks/src/{endpoint,routes,spec}.rs`, `crates/rb-indexer/src/{routes,stitch}.rs`, `crates/rb-store/src/{lib,code,query,db_tests}.rs`, `crates/rb-api/src/{lib,render}.rs`, `crates/rb-cli/src/{main,code}.rs`, `crates/rb-cli/tests/{e2e,api}.rs`, three goldens, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7i,todo,stress-findings,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M7h: the CLI remainder (stress batch F, part 1)
 - **Checkouts:** `rb index` records each repository's checkout (migration `0007_repo_checkout`). Without `--repo`, a question, `check` or `dump` inside that checkout answers from it whatever it was named, and `rb index .` re-indexes it. Several repositories at one checkout, or a directory name already recorded at another checkout, give a directive, never a guess.
 - **`find`:** `--kind` alone lists that kind; a search that matches nothing says `no matches for "x"` on stderr.

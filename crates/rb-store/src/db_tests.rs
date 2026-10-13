@@ -1472,3 +1472,123 @@ fn doctor_probes_read_the_server() {
             .unwrap()
     );
 }
+
+/// Contract M7i S2 (stress F31): HTTP coverage counts the endpoints that only a spec states
+/// (frameworks `openapi`, nothing handling them); a spec endpoint a code handler implements,
+/// or a code route, is not one.
+#[test]
+fn http_coverage_counts_spec_only_endpoints() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("speconly");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut b = GraphBuilder::new();
+    let endpoint = |key: &str| NodeKey::new(NodeKind::Endpoint, key.to_owned());
+    let attrs = |frameworks: &[&str]| -> rb_model::Attrs {
+        let mut a = rb_model::Attrs::new();
+        a.insert("frameworks".into(), json!(frameworks));
+        a
+    };
+    b.add_node(
+        endpoint("HTTP GET /stale @."),
+        "GET /stale",
+        attrs(&["openapi"]),
+    )
+    .unwrap();
+    b.add_node(
+        endpoint("HTTP GET /old @."),
+        "GET /old",
+        attrs(&["openapi"]),
+    )
+    .unwrap();
+    b.add_node(
+        endpoint("HTTP GET /impl @."),
+        "GET /impl",
+        attrs(&["openapi"]),
+    )
+    .unwrap();
+    b.add_node(
+        endpoint("HTTP GET /code @."),
+        "GET /code",
+        attrs(&["express"]),
+    )
+    .unwrap();
+    let handler = NodeKey::new(NodeKind::Symbol, "h".to_owned());
+    b.add_node(handler.clone(), "h", Default::default())
+        .unwrap();
+    b.add_edge(NewEdge::new(
+        endpoint("HTTP GET /impl @."),
+        EdgeKind::HandledBy,
+        handler,
+        Provenance::Treesitter,
+        Certainty::Heuristic,
+    ))
+    .unwrap();
+    let mut store = Store::connect(&db.url).unwrap();
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"d".repeat(40),
+            &json!({}),
+            &b.finish().unwrap(),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let coverage = store.http_coverage(live.id).unwrap();
+    assert_eq!((coverage.routes, coverage.spec_only), (4, 2));
+}
+
+/// Contract M7i S3 (stress O3): one `rb index` per repository at a time: a session holding a
+/// repository's index lock keeps another session from taking it (other repositories are
+/// free), until it lets go.
+#[test]
+fn index_locks_are_per_repository_and_per_session() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("indexlock");
+    let mut a = Store::connect(&db.url).unwrap();
+    let mut b = Store::connect(&db.url).unwrap();
+    assert!(a.try_lock_index(&repo).unwrap());
+    assert!(!b.try_lock_index(&repo).unwrap());
+    assert!(b.try_lock_index(&format!("{repo}_other")).unwrap());
+    drop(a);
+    b.lock_index(&repo).unwrap();
+}
+
+/// Contract M7i S5 (stress O4): cached facts stream a row at a time and yield exactly the rows
+/// `load_facts` returns (requested keys only, each once).
+#[test]
+fn cached_facts_stream_the_rows_load_returns() {
+    let Some(db) = db() else { return };
+    let scratch = ScratchDb::create(&db.url, "stream");
+    let mut store = Store::connect(&scratch.url).unwrap();
+    let blob = |n: u8| format!("{n:040}");
+    store
+        .save_facts(&[
+            (blob(1), "x;go".into(), b"{\"a\":1}".to_vec()),
+            (blob(2), "x;go".into(), b"{\"b\":2}".to_vec()),
+            (blob(3), "x;go".into(), b"{\"c\":3}".to_vec()),
+        ])
+        .unwrap();
+    let keys = [
+        (blob(1), "x;go".to_owned()),
+        (blob(3), "x;go".to_owned()),
+        (blob(9), "x;go".to_owned()),
+    ];
+    let mut streamed = std::collections::HashMap::new();
+    store
+        .for_each_facts(&keys, |key, bytes| {
+            assert!(streamed.insert(key, bytes.to_vec()).is_none());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(streamed, store.load_facts(&keys).unwrap());
+    assert_eq!(streamed.len(), 2);
+    let err = store
+        .for_each_facts(&keys, |_, _| anyhow::bail!("stop"))
+        .unwrap_err();
+    assert_eq!(err.to_string(), "stop");
+}

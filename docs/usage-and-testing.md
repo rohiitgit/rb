@@ -1,9 +1,9 @@
 # Using and testing Repository Brain
 
 This is the operator's guide: how to run the `rb` tool end to end, and how to
-run every test suite. It reflects the tree as of M7h (M0–M7h). Design rationale
+run every test suite. It reflects the tree as of M7i (M0–M7i). Design rationale
 lives in `docs/repository-brain-design.md`; the per-milestone contracts,
-evaluations and measurements in `tasks/`; the short tour in `README.md`. M7a–M7h
+evaluations and measurements in `tasks/`; the short tour in `README.md`. M7a–M7i
 came out of a stress campaign over 18 fixtures and 13 public repositories; its
 findings, repros and what each milestone fixed are in `tasks/stress-findings.md`.
 
@@ -150,6 +150,18 @@ Notes that bite newcomers:
   `… repository "api" was indexed from another checkout ("…"); …` or
   `… no git repository found in "…"; …`. `rb status` is the exception: there
   it lists every repository.
+- `rb callers` and `rb impact` take `--limit N`: N rows shown after a summary
+  of every row found (callers per service and per entry kind; impact headers
+  keep each list's full length), and `truncated: limit`. `rb callers
+  --exclude-tests` leaves out callers in test code and counts them. Callers of
+  an endpoint handler name the endpoint on the first line.
+- `rb status`'s `http:` line counts routes only a spec states:
+  `18 routes (3 from specs only)`. Express routes match client paths
+  case-insensitively (as Express does by default), and such a link says
+  `case: folded`.
+- Two `rb index` runs of one repository take turns: the second prints
+  `waiting: another rb index of <repo> is running`, then usually finds the
+  first's snapshot up to date.
 - `rb find --kind endpoint` (no text) lists every node of a kind; a search
   that matches nothing says `no matches for "x"` on stderr (stdout stays
   empty, exit 0).
@@ -184,7 +196,7 @@ cargo test --workspace
 ```
 
 Per-crate: `cargo test -p rb-syntax --lib`, `-p rb-frameworks`,
-`-p rb-indexer`, etc. (121 + 201 + 352 lib tests at M7h close; 1,028 across the workspace).
+`-p rb-indexer`, etc. (121 + 203 + 354 lib tests at M7i close; 1,041 across the workspace).
 
 ### 5.2 Database-backed suites
 
@@ -193,9 +205,9 @@ is not a pass**. Always set it:
 
 ```sh
 export RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb
-cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (78 tests)
+cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (83 tests)
 cargo test -p rb-server -- --nocapture  # serve binding, limits, parity (12 tests)
-cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (50 tests)
+cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (51 tests)
 cargo test -p rb-cli --test api     # CLI↔HTTP identity over 150 parameter sets (1 test)
 ```
 

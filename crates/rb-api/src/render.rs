@@ -91,7 +91,7 @@ fn near_miss_symbols(ix: &SnapshotIndex, input: &str) -> Vec<i64> {
 
 /// `arg` as a shell word (contract M7f S5): as written when it holds only characters no shell
 /// splits or expands, else single-quoted.
-pub(crate) fn shell_arg(arg: &str) -> String {
+pub fn shell_arg(arg: &str) -> String {
     let plain = !arg.is_empty()
         && arg
             .chars()
@@ -158,13 +158,35 @@ pub fn callers_json(ix: &SnapshotIndex, tree: &CallerTree) -> Value {
     }
     let graph = ix.graph();
     let d = Describer::new(ix);
-    json!({
+    let mut out = json!({
         "target": node_json(graph, &d, tree.target),
         "precision": tree.precision.as_str(),
         "pruned_by_rta": tree.pruned_by_rta,
         "callers": walk(graph, &d, &tree.callers),
         "truncated": tree.truncated.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-    })
+    });
+    // Only when the target has marks, so other answers keep their bytes (contract M7i S2).
+    if !tree.target_entry.is_empty() {
+        out["target_entry"] = tree.target_entry.clone().into();
+    }
+    // Only when asked (`exclude_tests`) or when `limit` cut the rows (contract M7i S4).
+    if let Some(n) = tree.excluded_tests {
+        out["excluded_tests"] = n.into();
+    }
+    if let Some(s) = &tree.summary {
+        let counts = |xs: &[(String, usize)], name: &str| -> Vec<Value> {
+            xs.iter()
+                .map(|(k, n)| json!({ name: k, "callers": n }))
+                .collect()
+        };
+        out["summary"] = json!({
+            "callers": s.callers,
+            "shown": s.shown,
+            "by_service": counts(&s.by_service, "service"),
+            "by_entry": counts(&s.by_entry, "entry"),
+        });
+    }
+    out
 }
 
 /// `rb impact --json` (contract M4b S13): every section of the text answer, with keys.
@@ -215,7 +237,7 @@ pub fn impact_json(ix: &SnapshotIndex, impact: &Impact) -> Value {
                 .collect::<Vec<_>>(),
         }),
     };
-    json!({
+    let mut out = json!({
         "removed": impact
             .removed
             .iter()
@@ -239,7 +261,12 @@ pub fn impact_json(ix: &SnapshotIndex, impact: &Impact) -> Value {
             .map(|(o, n)| json!({"owner": o, "impacted": n}))
             .collect::<Vec<_>>(),
         "truncated": impact.truncated.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-    })
+    });
+    // The full length of each list `limit` cut, only when one was (contract M7i S4).
+    if !impact.totals.is_empty() {
+        out["totals"] = json!(impact.totals);
+    }
+    out
 }
 
 /// `<METHOD> <path>` normalised as routes are (contract M4a S3), when the input has that form.

@@ -1096,3 +1096,13 @@ Contract: `tasks/contract-m8a.md`. Branch `m8a-bench` (stacked on the M7 close).
 - [ ] Phase 4 (S4): SCIP agreement adapter (`calls`, `calls_file_scope`, `covered_share`); real run on ≥ 1 Java, TS, Go, Python repo.
 - [ ] Phase 5 (S5): PyCG adapter (name mapping, scope rules, case count asserted); real run on every case.
 - [ ] Phase 6 (S8, S10, S11): double run + `cmp`; first scoreboard `bench/scoreboard/m8a.json`; `bench-findings.md`; docs; fmt/clippy; real-Docker suites; invariant against the M7 close (31/31 expected); records; M8b contract.
+
+# M7i: precision and cost remainder (stress batch F, part 2), started 2026-10-13
+
+Contract: `tasks/contract-m7i.md`. Branch `m7i-precision-cost` (stacked on M7h `735d3ae`). Record set: CHANGELOG, IMPLEMENT, contract, todo, stress-findings, lessons, README, usage guide.
+
+- [x] Phase 1 (S1, F32): Express case-sensitive opt-in per router; `fold_case` endpoints; folded index buckets; `case: folded`, never synthetic. Mutants m123–m130 killed. (Implemented before this contract was written; the contract records it.)
+- [x] Phase 2 (S2, F31): spec-only route count; JSON spec spans; callers of a handler.
+- [x] Phase 3 (S3, S5; O3, O4): per-repo index lock; streamed facts.
+- [x] Phase 4 (S4, U5): `--limit` and `--exclude-tests` for callers and impact.
+- [x] Phase 5: real-Docker suites 1,041/0/0 (3 goldens re-blessed after review, the parity harness taught `exclude_tests`); invariant against M7h 29/31, 2 classified (bookcars +4 folded `CONSUMES`, go-gin spec spans); go-gin `3 from specs only`; mattermost cached RSS 2,148 → 1,658 MiB; docs; records. Then the M7 close pass.

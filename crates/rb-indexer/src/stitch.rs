@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use rb_frameworks::clients::{AxiosInstance, ClientKind, FileClients, RawScan, UrlValue};
 use rb_frameworks::endpoint::{
-    ANY, PathMatch, Piece, Segment, client_url, literal_segments, match_path, methods_match,
-    segments,
+    ANY, PathMatch, Piece, Segment, client_url, literal_segments, match_path_folding,
+    methods_match, segments,
 };
 use rb_frameworks::fold::{self, Folded, Lookup, Origin};
 use rb_frameworks::work::Counted;
@@ -585,15 +585,19 @@ fn join(base: Option<Folded>, url: Folded) -> Folded {
 
 /// Endpoints bucketed by first segment (exact matches) and last segment (suffix matches). A
 /// client's candidates are the union of the buckets that can match it, each confirmed by
-/// [`match_path`].
+/// [`match_path_folding`]. An endpoint that folds case (contract M7i S1) is bucketed by its
+/// lower-cased literal instead.
 struct EndpointIndex {
     segments: Vec<Vec<Segment>>,
+    fold_case: Vec<bool>,
     /// No segment (`/`).
     root: Vec<usize>,
     first: HashMap<String, Vec<usize>>,
+    first_folded: HashMap<String, Vec<usize>>,
     first_param: Vec<usize>,
     first_wild: Vec<usize>,
     last: HashMap<String, Vec<usize>>,
+    last_folded: HashMap<String, Vec<usize>>,
     last_param: Vec<usize>,
     last_wild: Vec<usize>,
 }
@@ -602,24 +606,37 @@ impl EndpointIndex {
     fn new(endpoints: &[EndpointRef]) -> Self {
         let mut ix = EndpointIndex {
             segments: endpoints.iter().map(|e| segments(&e.path)).collect(),
+            fold_case: endpoints.iter().map(|e| e.fold_case).collect(),
             root: Vec::new(),
             first: HashMap::new(),
+            first_folded: HashMap::new(),
             first_param: Vec::new(),
             first_wild: Vec::new(),
             last: HashMap::new(),
+            last_folded: HashMap::new(),
             last_param: Vec::new(),
             last_wild: Vec::new(),
         };
         for (i, segs) in ix.segments.iter().enumerate() {
+            let fold = ix.fold_case[i];
+            let bucket = |exact: &mut HashMap<String, Vec<usize>>,
+                          folded: &mut HashMap<String, Vec<usize>>,
+                          l: &str| {
+                if fold {
+                    folded.entry(l.to_ascii_lowercase()).or_default().push(i);
+                } else {
+                    exact.entry(l.to_owned()).or_default().push(i);
+                }
+            };
             match segs.first() {
                 None => ix.root.push(i),
-                Some(Segment::Lit(l)) => ix.first.entry(l.clone()).or_default().push(i),
+                Some(Segment::Lit(l)) => bucket(&mut ix.first, &mut ix.first_folded, l),
                 Some(Segment::Param) => ix.first_param.push(i),
                 Some(Segment::Wild) => ix.first_wild.push(i),
             }
             match segs.last() {
                 None => {}
-                Some(Segment::Lit(l)) => ix.last.entry(l.clone()).or_default().push(i),
+                Some(Segment::Lit(l)) => bucket(&mut ix.last, &mut ix.last_folded, l),
                 Some(Segment::Param) => ix.last_param.push(i),
                 Some(Segment::Wild) => ix.last_wild.push(i),
             }
@@ -629,31 +646,49 @@ impl EndpointIndex {
 
     /// The endpoints `client` matches, with how, in endpoint order.
     fn candidates(&self, client: &[Segment], suffix: bool) -> Vec<(usize, PathMatch)> {
-        let lists: [&[usize]; 3] = if suffix {
-            let by_last = match client.last() {
-                Some(Segment::Lit(l)) => self.last.get(l).map_or(&[][..], Vec::as_slice),
-                _ => &[],
-            };
-            [by_last, &self.last_param, &self.last_wild]
+        let lists: [&[usize]; 4] = if suffix {
+            let [exact, folded] = by_literal(&self.last, &self.last_folded, client.last());
+            [exact, folded, &self.last_param, &self.last_wild]
         } else {
             match client.first() {
-                None => [&self.root, &self.first_wild, &[]],
-                Some(Segment::Lit(l)) => [
-                    self.first.get(l).map_or(&[][..], Vec::as_slice),
-                    &self.first_param,
-                    &self.first_wild,
-                ],
-                Some(_) => [&self.first_param, &self.first_wild, &[]],
+                None => [&self.root, &self.first_wild, &[], &[]],
+                Some(Segment::Lit(_)) => {
+                    let [exact, folded] =
+                        by_literal(&self.first, &self.first_folded, client.first());
+                    [exact, folded, &self.first_param, &self.first_wild]
+                }
+                Some(_) => [&self.first_param, &self.first_wild, &[], &[]],
             }
         };
         let mut out: Vec<(usize, PathMatch)> = lists
             .into_iter()
             .flatten()
             .inspect(|_| rb_frameworks::work::tick(1))
-            .filter_map(|&i| match_path(client, suffix, &self.segments[i]).map(|m| (i, m)))
+            .filter_map(|&i| {
+                match_path_folding(client, suffix, &self.segments[i], self.fold_case[i])
+                    .map(|m| (i, m))
+            })
             .collect();
         out.sort_unstable_by_key(|(i, _)| *i);
         out
+    }
+}
+
+/// The endpoints bucketed under a client literal: exact-case ones by the literal as written,
+/// case-folding ones by its lower case.
+fn by_literal<'a>(
+    exact: &'a HashMap<String, Vec<usize>>,
+    folded: &'a HashMap<String, Vec<usize>>,
+    seg: Option<&Segment>,
+) -> [&'a [usize]; 2] {
+    match seg {
+        Some(Segment::Lit(l)) => [
+            exact.get(l).map_or(&[][..], Vec::as_slice),
+            folded
+                .get(&l.to_ascii_lowercase())
+                .map_or(&[][..], Vec::as_slice),
+        ],
+        _ => [&[], &[]],
     }
 }
 
@@ -1004,6 +1039,9 @@ impl<'e> Stitcher<'e> {
             if m.suffix { "suffix" } else { "exact" }.into(),
         );
         attrs.insert("client".into(), site.client.as_str().into());
+        if m.case_folded {
+            attrs.insert("case".into(), "folded".into());
+        }
         let unverified = site.base_verified == Some(false);
         // Matched by suffix because no host resolved: the base is unknown, whatever the label of
         // the parts that did resolve (contract M5 S18, M4a open item 6). A suffix match whose
@@ -1060,6 +1098,7 @@ impl<'e> Stitcher<'e> {
         // certainty caps both (invariant 4).
         let synthetic = !m.suffix
             && !m.wildcard
+            && !m.case_folded
             && site.method.is_some()
             && matches!(scope, Scope::Only(_))
             && folded.origin >= Origin::Config
@@ -1433,6 +1472,7 @@ mod tests {
             hosts: Vec::new(),
             prefix_maybe_incomplete: false,
             operations: Vec::new(),
+            fold_case: false,
         }
     }
 
@@ -1535,6 +1575,30 @@ mod tests {
             })
             .collect();
         (o.bucket, links)
+    }
+
+    /// Contract M7i S1 (stress F32): an Express endpoint (`fold_case`) matches a client path
+    /// whatever the case of its literals; such a link says `case: folded` and is never
+    /// `synthetic`. A same-case call keeps its usual label; other endpoints stay exact-case.
+    #[test]
+    fn express_endpoints_match_with_case_folded() {
+        let mut notifications = ep("GET", "/api/notifications/{id}", NOTIFICATION);
+        notifications.fold_case = true;
+        let eps = vec![notifications, ep("GET", "/api/users", AUTH)];
+        let call = |url: &str| site(WEB, Some("GET"), Some((url, Literal)), 1);
+        let (bucket, links) = one(&eps, &call("http://notification/api/Notifications/7"));
+        assert_eq!(bucket, Bucket::Heuristic, "{links:?}");
+        assert!(links[0].contains("\"case\":\"folded\""), "{links:?}");
+        let (bucket, links) = one(&eps, &call("/api/Notifications/{?}"));
+        assert_eq!(bucket, Bucket::Heuristic, "{links:?}");
+        assert!(links[0].contains("\"case\":\"folded\""), "{links:?}");
+        let (bucket, links) = one(&eps, &call("http://notification/api/notifications/7"));
+        assert_eq!(bucket, Bucket::Synthetic, "{links:?}");
+        assert!(!links[0].contains("\"case\""), "{links:?}");
+        assert_eq!(
+            one(&eps, &call("http://auth/api/Users")).0,
+            Bucket::Unmatched
+        );
     }
 
     /// Contract M6g S3: a gateway rewrite strips its prefix and scopes to the target,
@@ -3021,11 +3085,12 @@ mod tests {
         );
     }
 
-    /// The index is a filter in front of [`match_path`]: over generated endpoints and clients it
-    /// returns exactly what a scan of every endpoint with `match_path` returns.
+    /// The index is a filter in front of [`match_path_folding`]: over generated endpoints (a
+    /// third folding case, contract M7i S1) and clients with mixed-case literals it returns
+    /// exactly what a scan of every endpoint with the matcher returns.
     #[test]
     fn the_candidate_index_agrees_with_the_reference_matcher() {
-        const SEGS: &[&str] = &["a", "b", "c", "{}", "{*}"];
+        const SEGS: &[&str] = &["a", "B", "b", "c", "{}", "{*}"];
         let mut state: u64 = 0x2545_f491_4f6c_dd1d;
         let mut next = || {
             state ^= state << 13;
@@ -3047,14 +3112,20 @@ mod tests {
             p
         };
         let eps: Vec<EndpointRef> = (0..300)
-            .map(|i| ep("GET", &path(i % 5, true), &format!("s{i}")))
+            .map(|i| EndpointRef {
+                fold_case: i % 3 == 0,
+                ..ep("GET", &path(i % 5, true), &format!("s{i}"))
+            })
             .collect();
         let index = EndpointIndex::new(&eps);
         for i in 0..2000 {
             let client = segments(&norm_path(&path(i % 5, false)));
             for suffix in [false, true] {
                 let want: Vec<usize> = (0..eps.len())
-                    .filter(|&e| match_path(&client, suffix, &index.segments[e]).is_some())
+                    .filter(|&e| {
+                        match_path_folding(&client, suffix, &index.segments[e], eps[e].fold_case)
+                            .is_some()
+                    })
                     .collect();
                 let got: Vec<usize> = index
                     .candidates(&client, suffix)
@@ -3508,6 +3579,7 @@ mod tests {
             hosts: Vec::new(),
             prefix_maybe_incomplete: false,
             operations: Vec::new(),
+            fold_case: false,
         };
         assert_eq!(
             stitched(

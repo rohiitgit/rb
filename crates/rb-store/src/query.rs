@@ -188,6 +188,10 @@ pub struct SqlCoverage {
     pub tables: i64,
 }
 
+fn is_zero(n: &i64) -> bool {
+    *n == 0
+}
+
 /// HTTP coverage of a snapshot (contract M4a S14): its endpoints, the services exposing them,
 /// and its client call sites per bucket, as the indexer counted them (`http_coverage`). A site's
 /// bucket cannot be read back from the edges: a `CONSUMES` edge carries its best site's
@@ -195,6 +199,10 @@ pub struct SqlCoverage {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct HttpCoverage {
     pub routes: i64,
+    /// Endpoints only a spec states: frameworks `openapi` and nothing handling them (contract
+    /// M7i S2); left out of the JSON when none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spec_only: i64,
     pub services: i64,
     pub sites: i64,
     /// Bucket → sites; empty for a snapshot without client calls.
@@ -493,7 +501,13 @@ impl Store {
                     (SELECT count(DISTINCT src) FROM rb.edge
                      WHERE snapshot_id = $1 AND kind = 'EXPOSES'),
                     (SELECT detail FROM rb.diagnostic
-                     WHERE snapshot_id = $1 AND kind = 'http_coverage')",
+                     WHERE snapshot_id = $1 AND kind = 'http_coverage'),
+                    (SELECT count(*) FROM rb.node n
+                     WHERE n.snapshot_id = $1 AND n.kind = 'endpoint'
+                       AND n.attrs -> 'frameworks' = '[\"openapi\"]'::jsonb
+                       AND NOT EXISTS (SELECT 1 FROM rb.edge h
+                                       WHERE h.snapshot_id = $1 AND h.src = n.id
+                                         AND h.kind = 'HANDLED_BY'))",
             &[&snapshot_id],
         )?;
         let detail: Option<Value> = r.get(2);
@@ -518,6 +532,7 @@ impl Store {
         }
         Ok(HttpCoverage {
             routes: r.get(0),
+            spec_only: r.get(3),
             services: r.get(1),
             sites,
             buckets,

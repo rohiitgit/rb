@@ -753,3 +753,11 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - Cypher read-only and `--cols` errors; the environment-named timeout.
   - `rb doctor`.
 - **Verification:** 24 mutants killed. Real-Docker 1,028/0/0. Invariant 31/31 identical.
+
+## M7i Precision and cost remainder (stress batch F, part 2): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7i.md` (diagram, S1–S6, amendment 1). Fixes F31, F32, U5, O3, O4; O7 declined.
+- **Verification:**
+  - 21 mutants killed. Real-Docker 1,041/0/0.
+  - Invariant 29/31 identical, 2 classified.
+  - mattermost cached RSS 2,148 → 1,658 MiB.

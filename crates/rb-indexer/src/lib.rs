@@ -132,7 +132,9 @@ use serde_json::{Value, json};
 /// `m7g-1` honesty: php/scala/swift/dart/elixir files named; code without a grammar
 /// counted (`language_unsupported`); frameworks without a pack named
 /// (`framework_unsupported`).
-pub const PIPELINE: &str = "m7g-1";
+/// `m7i-1` Express routes match case-insensitively unless their router opts in
+/// (`CONSUMES` `case: folded`); JSON spec operations carry their path key's span.
+pub const PIPELINE: &str = "m7i-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

@@ -248,6 +248,12 @@ enum Command {
         /// callers reached through forms the scan cannot see.
         #[arg(long)]
         precision: Option<String>,
+        /// Show at most this many callers (1-5000), after a summary of every caller found.
+        #[arg(long)]
+        limit: Option<String>,
+        /// Leave out callers in test code, and count them.
+        #[arg(long)]
+        exclude_tests: bool,
     },
     /// Show what breaks if a symbol or table is removed (Q2).
     Impact {
@@ -267,6 +273,9 @@ enum Command {
         /// the dangerous failure here.
         #[arg(long)]
         precision: Option<String>,
+        /// Show at most this many rows of each list (1-5000); headers keep the full counts.
+        #[arg(long)]
+        limit: Option<String>,
         /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
         json: bool,
@@ -763,6 +772,8 @@ fn asked(command: Command) -> Option<Asked> {
             min_certainty,
             pick,
             precision,
+            limit,
+            exclude_tests,
         } => {
             p.set("target", target)
                 .set_opt("snapshot", snapshot)
@@ -770,7 +781,9 @@ fn asked(command: Command) -> Option<Asked> {
                 .set_flag("include_references", include_references)
                 .set_opt("min_certainty", min_certainty)
                 .set_opt("pick", pick)
-                .set_opt("precision", precision);
+                .set_opt("precision", precision)
+                .set_opt("limit", limit)
+                .set_flag("exclude_tests", exclude_tests);
             (Endpoint::Callers, repo, p, Out::json_if(json))
         }
         Command::Impact {
@@ -780,13 +793,15 @@ fn asked(command: Command) -> Option<Asked> {
             min_certainty,
             pick,
             precision,
+            limit,
             json,
         } => {
             p.set("target", target)
                 .set_opt("snapshot", snapshot)
                 .set_opt("min_certainty", min_certainty)
                 .set_opt("pick", pick)
-                .set_opt("precision", precision);
+                .set_opt("precision", precision)
+                .set_opt("limit", limit);
             (Endpoint::Impact, repo, p, Out::json_if(json))
         }
         Command::Path {
@@ -1166,6 +1181,12 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         load_dir.display()
     );
 
+    // One run per repository (contract M7i S3): a second waits, then usually finds the
+    // first's snapshot up to date instead of extracting everything again.
+    if !store.try_lock_index(&repo)? {
+        eprintln!("waiting: another rb index of {repo} is running");
+        store.lock_index(&repo)?;
+    }
     let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(&rev)?;
     // Decided here, before the "up to date" check: a snapshot indexed without Docker, or
     // without an indexer image, is heuristic and must be rebuilt once they answer (contract M3b
@@ -1416,8 +1437,13 @@ fn http_line(c: &rb_store::HttpCoverage) -> String {
         ("dynamic", "dynamic"),
         ("self", "self"),
     ];
+    let spec_only = if c.spec_only > 0 {
+        format!(" ({} from specs only)", c.spec_only)
+    } else {
+        String::new()
+    };
     let mut line = format!(
-        "http: {} routes in {} services; {} client calls",
+        "http: {} routes{spec_only} in {} services; {} client calls",
         c.routes, c.services, c.sites
     );
     let parts: Vec<String> = ORDER
@@ -1668,16 +1694,15 @@ impl rb_indexer::FactsCache for StoreCache<'_, '_> {
             .map(|k| ((k.blob.clone(), k.extractor()), k))
             .collect();
         let rows: Vec<(String, String)> = by_row.keys().cloned().collect();
-        self.0
-            .borrow_mut()
-            .load_facts(&rows)?
-            .into_iter()
-            .map(|(row, bytes)| {
-                let facts = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("decoding cached facts for blob {}", row.0))?;
-                Ok((by_row[&row].clone(), facts))
-            })
-            .collect()
+        // Decoded as each row arrives (contract M7i S5): the bytes are never all held at once.
+        let mut out = HashMap::with_capacity(rows.len());
+        self.0.borrow_mut().for_each_facts(&rows, |row, bytes| {
+            let facts = serde_json::from_slice(bytes)
+                .with_context(|| format!("decoding cached facts for blob {}", row.0))?;
+            out.insert(by_row[&row].clone(), facts);
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     fn save(
@@ -3232,6 +3257,7 @@ mod tests {
     fn http_line_orders_buckets_and_omits_zeros() {
         let mut c = rb_store::HttpCoverage {
             routes: 3,
+            spec_only: 0,
             services: 2,
             sites: 0,
             buckets: Default::default(),
@@ -3256,6 +3282,13 @@ mod tests {
         assert_eq!(
             http_line(&c),
             "http: 3 routes in 2 services; 10 client calls: 2 synthetic, 1 heuristic, 2 ambiguous, 1 too ambiguous, 1 external, 2 dynamic, 1 self"
+        );
+        // Contract M7i S2 (stress F31): routes only a spec states are counted apart.
+        c.spec_only = 1;
+        assert!(
+            http_line(&c).starts_with("http: 3 routes (1 from specs only) in 2 services; "),
+            "{}",
+            http_line(&c)
         );
     }
 

@@ -52,6 +52,8 @@ pub mod limits {
         Tree,
         Work,
         Rows,
+        /// The rows a question shows (`--limit`, contract M7i S4).
+        Shown,
     }
 
     impl Limit {
@@ -63,6 +65,7 @@ pub mod limits {
                 Limit::Tree => "tree",
                 Limit::Work => "work",
                 Limit::Rows => "rows",
+                Limit::Shown => "limit",
             }
         }
     }
@@ -368,6 +371,10 @@ const MIGRATION_LOCK: i64 = 0x7262_6d69_6772;
 /// several processes has killed backends with `failed to re-find shared lock object`). Taken
 /// after any repository row lock, never before.
 pub const RB_AGE_DDL_LOCK: i64 = 0x7262_6167_6464;
+
+/// The class of the per-repository `rb index` lock (contract M7i S3); the object is
+/// `hashtext(repo)`. Session-level: held until released or the connection closes.
+pub const INDEX_LOCK_CLASS: i32 = 0x7262_6978;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotInfo {
@@ -714,6 +721,24 @@ impl Store {
             .client
             .query_one("SELECT (pg_stat_file($1, true)).size IS NOT NULL", &[&path])?;
         Ok(row.get(0))
+    }
+
+    /// Takes `repo`'s index lock if no other session holds it (contract M7i S3).
+    pub fn try_lock_index(&mut self, repo: &str) -> anyhow::Result<bool> {
+        let row = self.client.query_one(
+            "SELECT pg_try_advisory_lock($1, hashtext($2))",
+            &[&INDEX_LOCK_CLASS, &repo],
+        )?;
+        Ok(row.get(0))
+    }
+
+    /// Waits for `repo`'s index lock and takes it.
+    pub fn lock_index(&mut self, repo: &str) -> anyhow::Result<()> {
+        self.client.execute(
+            "SELECT pg_advisory_lock($1, hashtext($2))",
+            &[&INDEX_LOCK_CLASS, &repo],
+        )?;
+        Ok(())
     }
 
     /// Records the checkout `repo` was indexed from (contract M7h S1); a repository that does
@@ -1364,20 +1389,38 @@ impl Store {
         &mut self,
         rows: &[(String, String)],
     ) -> anyhow::Result<HashMap<(String, String), Vec<u8>>> {
+        let mut out = HashMap::new();
+        self.for_each_facts(rows, |key, bytes| {
+            out.insert(key, bytes.to_vec());
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Streams the cached facts of `rows` (blob, extractor) to `f`, one row at a time, so a
+    /// caller decoding them never holds every row's bytes at once (contract M7i S5: a cached
+    /// index of mattermost held about 300 MB of them twice). Missing rows are skipped; the
+    /// first error from `f` stops the stream.
+    pub fn for_each_facts(
+        &mut self,
+        rows: &[(String, String)],
+        mut f: impl FnMut((String, String), &[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use postgres::fallible_iterator::FallibleIterator;
         let (blobs, extractors): (Vec<&str>, Vec<&str>) =
             rows.iter().map(|(b, e)| (b.as_str(), e.as_str())).unzip();
-        Ok(self
-            .client
-            .query(
-                "SELECT c.blob_sha, c.extractor, c.facts
-                 FROM rb.file_facts_cache c
-                 JOIN unnest($1::text[], $2::text[]) AS k(blob_sha, extractor)
-                   USING (blob_sha, extractor)",
-                &[&blobs, &extractors],
-            )?
-            .iter()
-            .map(|r| ((r.get(0), r.get(1)), r.get(2)))
-            .collect())
+        let params: [&(dyn postgres::types::ToSql + Sync); 2] = [&blobs, &extractors];
+        let mut it = self.client.query_raw(
+            "SELECT c.blob_sha, c.extractor, c.facts
+             FROM rb.file_facts_cache c
+             JOIN unnest($1::text[], $2::text[]) AS k(blob_sha, extractor)
+               USING (blob_sha, extractor)",
+            params,
+        )?;
+        while let Some(row) = it.next()? {
+            f((row.get(0), row.get(1)), row.get::<_, &[u8]>(2))?;
+        }
+        Ok(())
     }
 
     /// Stores syntax facts. Rows are content-addressed, so an existing row is already correct.

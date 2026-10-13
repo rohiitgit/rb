@@ -7,7 +7,9 @@
   },
   "query": {
     "depth": 2,
+    "exclude_tests": false,
     "include_references": false,
+    "limit": null,
     "min_certainty": "ambiguous",
     "pick": null,
     "precision": "cha",
