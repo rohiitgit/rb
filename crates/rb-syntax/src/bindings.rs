@@ -748,6 +748,8 @@ fn csharp<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 node,
                 source,
             );
+            // Its position, as for the other languages: a parameter, not a local (contract M7d).
+            positioned(out, pushed, index_among(node, &["parameter"]));
             initialised(out, pushed, None, false);
         }
         "variable_declarator" => {

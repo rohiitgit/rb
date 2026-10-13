@@ -10,8 +10,8 @@ use crate::work::tick;
 use rb_syntax::Span;
 
 /// One spec operation: its raw in-spec path, upper-cased method, operation ID (empty when
-/// the operation states none) and evidence span — the path line for YAML, file start for
-/// JSON (serde reports no positions).
+/// the operation states none) and evidence span: the path line for YAML, the path key for
+/// JSON (contract M7i S2; file start when the key is spelt with escapes).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SpecOp {
     pub path: String,
@@ -52,12 +52,16 @@ fn sorted(mut ops: Vec<SpecOp>) -> Vec<SpecOp> {
 pub fn openapi_json(text: &str) -> Option<Vec<SpecOp>> {
     let json: serde_json::Value = serde_json::from_str(text).ok()?;
     let paths = json.get("paths")?.as_object()?;
+    let paths_at = json_key_at(text, 0, "paths").unwrap_or(0);
+    let keys = key_spans(text, paths_at);
     let mut ops = Vec::new();
     for (path, item) in paths {
         tick(1);
         if !path.starts_with('/') {
             continue;
         }
+        let quoted = serde_json::to_string(path).unwrap_or_default();
+        let span = keys.get(quoted.as_str()).copied().unwrap_or([0, 0, 0, 0]);
         let Some(methods) = item.as_object() else {
             continue;
         };
@@ -76,11 +80,62 @@ pub fn openapi_json(text: &str) -> Option<Vec<SpecOp>> {
                 path: path.clone(),
                 method: method.to_uppercase(),
                 operation,
-                span: [0, 0, 0, 0],
+                span,
             });
         }
     }
     Some(sorted(ops))
+}
+
+/// The span of the first occurrence at or after `from` of every JSON object key (a string
+/// followed by `:`), keyed by the key as written with its quotes. One forward pass that counts
+/// lines as it goes (contract M7j E5: a search per path was quadratic in the document).
+fn key_spans(text: &str, from: usize) -> std::collections::HashMap<&str, Span> {
+    let bytes = text.as_bytes();
+    let mut out = std::collections::HashMap::new();
+    let (mut row, mut line_start, mut i) = (0i32, 0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                row += 1;
+                line_start = i + 1;
+                i += 1;
+            }
+            b'"' => {
+                tick(1);
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    j += if bytes[j] == b'\\' { 2 } else { 1 };
+                }
+                let end = (j + 1).min(bytes.len());
+                let is_key = text[end..].trim_start().starts_with(':');
+                if is_key && i >= from {
+                    let col = (i - line_start) as i32;
+                    out.entry(&text[i..end])
+                        .or_insert([row, col, row, col + (end - i) as i32]);
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The byte offset of `key` written as a JSON object key (quoted as `serde_json` writes it,
+/// then `:`) at or after `from`.
+fn json_key_at(text: &str, from: usize, key: &str) -> Option<usize> {
+    let quoted = serde_json::to_string(key).ok()?;
+    let mut at = from;
+    while let Some(i) = text.get(at..)?.find(&quoted) {
+        let start = at + i;
+        let after = &text[start + quoted.len()..];
+        if after.trim_start().starts_with(':') {
+            return Some(start);
+        }
+        at = start + quoted.len();
+    }
+    None
 }
 
 /// Reads an OpenAPI/Swagger YAML document with the 0/2/4/6-space shapes: `None` when a line
@@ -328,8 +383,10 @@ mod tests {
     fn openapi_json_reads_paths_methods_and_operation_ids() {
         let doc = r##"{
             "openapi": "3.1.0",
-            "servers": [{"url": "https://x.example"}],
+            "servers": [{"url": "https://x.example", "description": "/users"}],
+            "x-index": {"/users": 1},
             "paths": {
+                "/a": {"parameters": [{"description": "/users"}]},
                 "/users": {
                     "get": {"operationId": "listUsers"},
                     "post": {},
@@ -342,6 +399,14 @@ mod tests {
             "webhooks": {"/hook": {"post": {}}},
             "components": {}
         }"##;
+        // Contract M7i S2 (stress F31): each operation's span is its path key's, as written
+        // inside `paths` (the earlier `"/users"`-like text in `servers` is not taken).
+        let key_span = |key: &str| {
+            let pos = doc.find(&format!("{key}: {{")).unwrap();
+            let row = doc[..pos].matches('\n').count() as i32;
+            let col = (pos - doc[..pos].rfind('\n').map_or(0, |n| n + 1)) as i32;
+            [row, col, row, col + key.len() as i32]
+        };
         assert_eq!(
             openapi_json(doc).unwrap(),
             [
@@ -349,19 +414,19 @@ mod tests {
                     path: "/users".into(),
                     method: "GET".into(),
                     operation: "listUsers".into(),
-                    span: [0, 0, 0, 0],
+                    span: key_span("\"/users\""),
                 },
                 SpecOp {
                     path: "/users".into(),
                     method: "POST".into(),
                     operation: "".into(),
-                    span: [0, 0, 0, 0],
+                    span: key_span("\"/users\""),
                 },
                 SpecOp {
                     path: "/users/{id}".into(),
                     method: "GET".into(),
                     operation: "getUser".into(),
-                    span: [0, 0, 0, 0],
+                    span: key_span("\"/users/{id}\""),
                 },
             ]
         );
@@ -533,7 +598,7 @@ mod tests {
                 path: "/x".into(),
                 method: "GET".into(),
                 operation: "".into(),
-                span: [0, 0, 0, 0],
+                span: [0, 31, 0, 35],
             }]
         );
         let doubled = "syntax = \"proto3\";\nservice A {\n  rpc M (X) returns (Y);\n}\nservice A {\n  rpc N (X) returns (Y);\n}\n";

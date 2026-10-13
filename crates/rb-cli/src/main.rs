@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 
 mod code;
+mod doctor;
 mod path;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rb_api::{Answer, ApiError, Endpoint, Params};
@@ -157,7 +158,8 @@ enum Command {
     },
     /// Search nodes by key or name (exact matches first, then ranked substring matches).
     Find {
-        text: String,
+        /// Text to search for; optional with `--kind`, which then lists that kind.
+        text: Option<String>,
         /// Restrict to one node kind (symbol, file, service, table, owner, endpoint, package).
         #[arg(long)]
         kind: Option<String>,
@@ -246,6 +248,12 @@ enum Command {
         /// callers reached through forms the scan cannot see.
         #[arg(long)]
         precision: Option<String>,
+        /// Show at most this many callers (1-5000), after a summary of every caller found.
+        #[arg(long)]
+        limit: Option<String>,
+        /// Leave out callers in test code, and count them.
+        #[arg(long)]
+        exclude_tests: bool,
     },
     /// Show what breaks if a symbol or table is removed (Q2).
     Impact {
@@ -265,6 +273,9 @@ enum Command {
         /// the dangerous failure here.
         #[arg(long)]
         precision: Option<String>,
+        /// Show at most this many rows of each list (1-5000); headers keep the full counts.
+        #[arg(long)]
+        limit: Option<String>,
         /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
         json: bool,
@@ -291,6 +302,9 @@ enum Command {
         full: bool,
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        /// The same as `--format json`, as on every other question (contract M7f S7).
+        #[arg(long)]
+        json: bool,
         /// Choose among several matching endpoints (1-based, as listed).
         #[arg(long)]
         pick: Option<String>,
@@ -344,14 +358,12 @@ enum Command {
         #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..=3_600_000))]
         deadline_ms: u64,
         /// The default Cypher statement timeout in milliseconds (a request may set its own,
-        /// 1-30000).
+        /// 1-30000; default: `RB_CYPHER_TIMEOUT_MS`, else 2000).
         #[arg(
             long,
-            env = "RB_CYPHER_TIMEOUT_MS",
-            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
             value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
         )]
-        cypher_timeout_ms: u64,
+        cypher_timeout_ms: Option<u64>,
     },
     /// Remove what interrupted or older runs left behind: AGE graphs named `rb_*` that are not a
     /// live snapshot's, and `building` snapshot rows. Never runs implicitly.
@@ -366,6 +378,13 @@ enum Command {
         /// `rb-scip-egress`) and any egress proxy container left by an interrupted run.
         #[arg(long)]
         egress: bool,
+    },
+    /// Check the environment: the database, AGE, migrations, the age-load mount, Docker, the
+    /// SCIP images and disk. Prints one row per check with its fix; exits 1 when one fails.
+    Doctor {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Manage the caches stored in the database.
     Cache {
@@ -383,14 +402,17 @@ enum Command {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
-        /// The Cypher statement timeout in milliseconds for each rule (1-30000).
+        /// The Cypher statement timeout in milliseconds for each rule (1-30000; default:
+        /// `RB_CYPHER_TIMEOUT_MS`, else 2000).
         #[arg(
             long,
-            env = "RB_CYPHER_TIMEOUT_MS",
-            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
             value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
         )]
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
+        /// Accept the violations listed in this file (as `rb check` prints them: save today's
+        /// output to adopt the gate, then only new violations fail).
+        #[arg(long)]
+        baseline: Option<PathBuf>,
     },
     /// Run a read-only Cypher query against the live snapshot's AGE graph.
     Cypher {
@@ -407,10 +429,10 @@ enum Command {
         /// Comma-separated names for the RETURN columns, in order (default `result`).
         #[arg(long)]
         cols: Option<String>,
-        /// Statement timeout in milliseconds (1-30000; default 2000); a query over it is
-        /// cancelled with an error, never cut short. At most 10,000 rows are printed, then
-        /// `truncated: rows`.
-        #[arg(long, env = "RB_CYPHER_TIMEOUT_MS")]
+        /// Statement timeout in milliseconds (1-30000; default: `RB_CYPHER_TIMEOUT_MS`, else
+        /// 2000); a query over it is cancelled with an error, never cut short. At most 10,000
+        /// rows are printed, then `truncated: rows`.
+        #[arg(long)]
         timeout_ms: Option<String>,
     },
 }
@@ -438,16 +460,71 @@ enum Format {
 }
 
 fn main() -> ExitCode {
-    match run_cli(Cli::parse()) {
+    let cli = Cli::parse();
+    let json = wants_json(&cli.command);
+    let check = matches!(cli.command, Command::Check { .. });
+    match run_cli(cli) {
         Ok(code) => code,
-        Err(e) => {
-            eprintln!("Error: {e:?}");
-            ExitCode::FAILURE
-        }
+        Err(e) => report_failure(e, json, check),
     }
 }
 
+/// Whether the command asked for JSON output, known before it runs (contract M7f S2).
+fn wants_json(command: &Command) -> bool {
+    match command {
+        Command::Status { json, .. }
+        | Command::Snapshots { json, .. }
+        | Command::Find { json, .. }
+        | Command::Service { json, .. }
+        | Command::TableDeps { json, .. }
+        | Command::Callers { json, .. }
+        | Command::Impact { json, .. }
+        | Command::Diff { json, .. }
+        | Command::Cypher { json, .. }
+        | Command::Check { json, .. } => *json,
+        Command::Path { json, format, .. } => *json || *format == Format::Json,
+        _ => false,
+    }
+}
+
+/// A failed command (contract M7f S2/S3): a refused request or an unreachable database prints as
+/// every question's error does — the envelope under `--json`, else one `Error:` line — and exits
+/// by its kind; anything else keeps its full chain and exit 1. `rb check` exits 2 on any error,
+/// so a failure is never read as violations (1).
+fn report_failure(e: anyhow::Error, json: bool, check: bool) -> ExitCode {
+    let code = if e.is::<ApiError>() || e.is::<rb_store::Unavailable>() {
+        let api = ApiError::from(e);
+        let code = api.kind.exit_code();
+        let _ = answer_err(Out::json_if(json), api);
+        ExitCode::from(code)
+    } else {
+        eprintln!("Error: {e:?}");
+        ExitCode::FAILURE
+    };
+    if check { ExitCode::from(2) } else { code }
+}
+
 fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
+    // Before connecting: the database is one of the things it checks.
+    if let Command::Doctor { json } = cli.command {
+        let scip_work_dir = std::env::var_os("RB_SCIP_WORK_DIR")
+            .map_or_else(|| PathBuf::from("var/scip"), PathBuf::from);
+        let rows = doctor::diagnose(&doctor::Inputs {
+            database_url: &cli.database_url,
+            age_load_dir: &cli.age_load_dir,
+            scip_work_dir: &scip_work_dir,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        });
+        print!(
+            "{}",
+            if json {
+                doctor::render_json(&rows)
+            } else {
+                doctor::render_text(&rows)
+            }
+        );
+        return Ok(doctor::exit_code(&rows));
+    }
     if let Command::Serve {
         bind,
         workers,
@@ -463,7 +540,10 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
             queue: usize::from(queue),
             deadline: Duration::from_millis(deadline_ms),
             settings: rb_api::Settings {
-                cypher_timeout_ms,
+                cypher_timeout_ms: cypher_timeout(
+                    cypher_timeout_ms,
+                    env_text(CYPHER_TIMEOUT_VAR).as_deref(),
+                )?,
                 ..settings()?
             },
             hold: match std::env::var("RB_TEST_HOLD_MS") {
@@ -575,8 +655,17 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
             rule,
             json,
             timeout_ms,
+            baseline,
         } => {
-            return check_rules(&mut store, repo, rule, json, timeout_ms);
+            let timeout_ms = cypher_timeout(timeout_ms, env_text(CYPHER_TIMEOUT_VAR).as_deref())?;
+            return check_rules(
+                &mut store,
+                repo,
+                rule,
+                json,
+                timeout_ms,
+                baseline.as_deref(),
+            );
         }
         question => {
             let asked = asked(question).expect("every other command is a question");
@@ -632,7 +721,7 @@ fn asked(command: Command) -> Option<Asked> {
             snapshot,
             json,
         } => {
-            p.set("q", text)
+            p.set_opt("q", text)
                 .set_opt("kind", kind)
                 .set_opt("limit", limit)
                 .set_opt("offset", offset)
@@ -683,6 +772,8 @@ fn asked(command: Command) -> Option<Asked> {
             min_certainty,
             pick,
             precision,
+            limit,
+            exclude_tests,
         } => {
             p.set("target", target)
                 .set_opt("snapshot", snapshot)
@@ -690,7 +781,9 @@ fn asked(command: Command) -> Option<Asked> {
                 .set_flag("include_references", include_references)
                 .set_opt("min_certainty", min_certainty)
                 .set_opt("pick", pick)
-                .set_opt("precision", precision);
+                .set_opt("precision", precision)
+                .set_opt("limit", limit)
+                .set_flag("exclude_tests", exclude_tests);
             (Endpoint::Callers, repo, p, Out::json_if(json))
         }
         Command::Impact {
@@ -700,13 +793,15 @@ fn asked(command: Command) -> Option<Asked> {
             min_certainty,
             pick,
             precision,
+            limit,
             json,
         } => {
             p.set("target", target)
                 .set_opt("snapshot", snapshot)
                 .set_opt("min_certainty", min_certainty)
                 .set_opt("pick", pick)
-                .set_opt("precision", precision);
+                .set_opt("precision", precision)
+                .set_opt("limit", limit);
             (Endpoint::Impact, repo, p, Out::json_if(json))
         }
         Command::Path {
@@ -717,6 +812,7 @@ fn asked(command: Command) -> Option<Asked> {
             hops,
             full,
             format,
+            json,
             pick,
             precision,
         } => {
@@ -731,7 +827,7 @@ fn asked(command: Command) -> Option<Asked> {
                 Endpoint::Path,
                 repo,
                 p,
-                Out::json_if(format == Format::Json),
+                Out::json_if(json || format == Format::Json),
             )
         }
         Command::Cypher {
@@ -776,6 +872,7 @@ fn asked(command: Command) -> Option<Asked> {
         | Command::Serve { .. }
         | Command::Dump { .. }
         | Command::Gc { .. }
+        | Command::Doctor { .. }
         | Command::Cache { .. } => return None,
     })
 }
@@ -785,39 +882,25 @@ fn asked(command: Command) -> Option<Asked> {
 /// D5's code.
 fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Result<ExitCode> {
     // `--repo` wins; else the working directory's checkout when indexed; else a
-    // directive error — never a guess across several repositories.
+    // directive error — never a guess across several repositories. `rb status` is the
+    // exception: outside an indexed checkout it is the overview of every repository, which
+    // guesses nothing (README; contract M7b S1).
     let repo = match repo {
         Some(r) => Some(r),
-        None => match cwd_repo_name() {
-            Some(name) if is_indexed(store, &name) => Some(name),
-            Some(name) => {
-                return answer_err(
-                    out,
-                    ApiError::invalid(
-                        "repo",
-                        format!(
-                            "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
-                        ),
-                    ),
-                );
-            }
-            None => {
-                let cwd = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "?".into());
-                return answer_err(
-                    out,
-                    ApiError::invalid(
-                        "repo",
-                        format!(
-                            "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
-                        ),
-                    ),
-                );
-            }
+        None => match cwd_repo(store) {
+            Ok(name) => Some(name),
+            Err(_) if matches!(endpoint, Endpoint::Status) => None,
+            Err(directive) => return answer_err(out, directive),
         },
     };
-    let settings = settings()?;
+    let mut settings = settings()?;
+    // Cypher without `--timeout-ms` takes its default from the environment (contract M7h S3).
+    if matches!(endpoint, Endpoint::Cypher) && params.get("timeout_ms").is_none() {
+        match cypher_timeout(None, env_text(CYPHER_TIMEOUT_VAR).as_deref()) {
+            Ok(ms) => settings.cypher_timeout_ms = ms,
+            Err(e) => return answer_err(out, e),
+        }
+    }
     let answered = rb_api::parse(endpoint, repo.as_deref(), &params, &settings)
         .and_then(|req| rb_api::run(store, &mut rb_api::LoadEach, &req, &settings));
     match answered {
@@ -828,6 +911,9 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
                     print!("{}", render_text(&output, evidence));
                     // A page that is not the last says so on stderr: stdout stays rows only.
                     if let Some(line) = more_line(&output.answer) {
+                        eprintln!("{line}");
+                    }
+                    if let Some(line) = no_match_line(&output.answer, &output.query) {
                         eprintln!("{line}");
                     }
                 }
@@ -919,6 +1005,35 @@ fn sweep_leftover_graphs(database_url: &str) {
 }
 
 /// The request layer's settings: D6's caps, lowered by `RB_TEST_CAPS` in tests (contract M5 S14).
+/// The Cypher timeout's environment variable, read by `cypher`, `check` and `serve` when their
+/// flag is absent.
+const CYPHER_TIMEOUT_VAR: &str = "RB_CYPHER_TIMEOUT_MS";
+
+/// An environment variable's text, `None` when unset (or not Unicode).
+fn env_text(var: &str) -> Option<String> {
+    std::env::var(var).ok()
+}
+
+/// The flag's timeout, else the environment's (`env`), else the default. A bad environment
+/// value is named as the variable, never as the flag (contract M7h S3); decimal digits only,
+/// as the request layer reads numbers.
+fn cypher_timeout(flag: Option<u64>, env: Option<&str>) -> Result<u64, ApiError> {
+    if let Some(ms) = flag {
+        return Ok(ms);
+    }
+    let Some(text) = env else {
+        return Ok(rb_store::CYPHER_TIMEOUT_MS_DEFAULT);
+    };
+    let max = rb_store::CYPHER_TIMEOUT_MS_MAX;
+    match text.parse::<u64>() {
+        Ok(ms) if text.bytes().all(|b| b.is_ascii_digit()) && (1..=max).contains(&ms) => Ok(ms),
+        _ => Err(ApiError::new(
+            rb_api::ErrorKind::InvalidParam,
+            format!("{CYPHER_TIMEOUT_VAR} must be between 1 and {max} (got {text})"),
+        )),
+    }
+}
+
 fn settings() -> anyhow::Result<rb_api::Settings> {
     match std::env::var(rb_api::Settings::TEST_CAPS_VAR) {
         Ok(spec) => rb_api::Settings::default()
@@ -941,6 +1056,23 @@ fn more_line(answer: &Answer) -> Option<String> {
         offset + 1,
         offset + shown as u64
     ))
+}
+
+/// `no matches for "x"` (with the kind, when given) when `find` lists nothing at all (contract
+/// M7h S3): an empty stdout alone reads like a broken pipe.
+fn no_match_line(answer: &Answer, query: &Value) -> Option<String> {
+    let Answer::Find(page) = answer else {
+        return None;
+    };
+    if page.total != 0 {
+        return None;
+    }
+    let q = query["q"].as_str().unwrap_or_default();
+    Some(match (q, query["kind"].as_str()) {
+        ("", Some(kind)) => format!("no {kind} nodes"),
+        (q, Some(kind)) => format!("no matches for {q:?} (kind {kind})"),
+        (q, None) => format!("no matches for {q:?}"),
+    })
 }
 
 /// The text rendering of an answer (the CLI's own; JSON is `rb-api`'s).
@@ -1019,9 +1151,21 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
     let path = path
         .canonicalize()
         .with_context(|| format!("repository path {}", path.display()))?;
+    let checkout = git_root(&path).unwrap_or_else(|| path.clone());
+    let checkout_text = checkout.to_string_lossy().into_owned();
+    store.migrate()?;
+    // Without `--repo`, a checkout indexed before keeps its repository whatever it was named
+    // (contract M7h S1); a directory name never silently takes over another checkout's.
     let repo = match repo {
         Some(r) => r,
-        None => repo_name_from_path(&path),
+        None => match infer_repo(
+            &checkout_text,
+            &repo_name_from_path(&path),
+            &repo_checkouts(store),
+        ) {
+            Inferred::One(name) | Inferred::Unindexed(name) => name,
+            other => return Err(repo_needed(Some(&other), &checkout_text).into()),
+        },
     };
     ensure!(
         !repo.is_empty()
@@ -1037,8 +1181,13 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         load_dir.display()
     );
 
+    // One run per repository (contract M7i S3): a second waits, then usually finds the
+    // first's snapshot up to date instead of extracting everything again.
+    if !store.try_lock_index(&repo)? {
+        eprintln!("waiting: another rb index of {repo} is running");
+        store.lock_index(&repo)?;
+    }
     let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(&rev)?;
-    store.migrate()?;
     // Decided here, before the "up to date" check: a snapshot indexed without Docker, or
     // without an indexer image, is heuristic and must be rebuilt once they answer (contract M3b
     // amendments 17 and 29). The images are looked up once; the jobs run in and cache under
@@ -1068,6 +1217,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         let mut unfinished = |id: i64| store.unfinished_scip_jobs(id);
         match rebuild_reason(&live, &commit_sha, &tools, scip_on, &mut unfinished)? {
             None => {
+                store.record_checkout(&repo, &checkout_text)?;
                 println!(
                     "{repo}: up to date — live snapshot {} already covers {} (use --force to rebuild)",
                     live.id,
@@ -1132,6 +1282,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         &diagnostics,
         &LoadDir::new(load_dir),
     )?;
+    store.record_checkout(&repo, &checkout_text)?;
     if let Some(id) = retention.live_marked_retired {
         eprintln!(
             "warning: {repo}'s live pointer names snapshot {id}, whose status is not `live`; retention kept it"
@@ -1286,8 +1437,13 @@ fn http_line(c: &rb_store::HttpCoverage) -> String {
         ("dynamic", "dynamic"),
         ("self", "self"),
     ];
+    let spec_only = if c.spec_only > 0 {
+        format!(" ({} from specs only)", c.spec_only)
+    } else {
+        String::new()
+    };
     let mut line = format!(
-        "http: {} routes in {} services; {} client calls",
+        "http: {} routes{spec_only} in {} services; {} client calls",
         c.routes, c.services, c.sites
     );
     let parts: Vec<String> = ORDER
@@ -1538,16 +1694,15 @@ impl rb_indexer::FactsCache for StoreCache<'_, '_> {
             .map(|k| ((k.blob.clone(), k.extractor()), k))
             .collect();
         let rows: Vec<(String, String)> = by_row.keys().cloned().collect();
-        self.0
-            .borrow_mut()
-            .load_facts(&rows)?
-            .into_iter()
-            .map(|(row, bytes)| {
-                let facts = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("decoding cached facts for blob {}", row.0))?;
-                Ok((by_row[&row].clone(), facts))
-            })
-            .collect()
+        // Decoded as each row arrives (contract M7i S5): the bytes are never all held at once.
+        let mut out = HashMap::with_capacity(rows.len());
+        self.0.borrow_mut().for_each_facts(&rows, |row, bytes| {
+            let facts = serde_json::from_slice(bytes)
+                .with_context(|| format!("decoding cached facts for blob {}", row.0))?;
+            out.insert(by_row[&row].clone(), facts);
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     fn save(
@@ -1867,12 +2022,68 @@ fn status_text(all: bool, reports: &[rb_api::StatusReport]) -> String {
             let _ = writeln!(out, "  {}", http_line(&c.http));
             let _ = writeln!(out, "  {}", di_line(&c.di));
             let _ = writeln!(out, "  {}", rta_line(&c.rta));
+            if let Some(line) = excluded_line(&c.excluded) {
+                let _ = writeln!(out, "  {line}");
+            }
+            if let Some(line) = unsupported_languages_line(&c.unsupported_languages) {
+                let _ = writeln!(out, "  {line}");
+            }
+            if let Some(line) = unsupported_frameworks_line(&c.unsupported_frameworks) {
+                let _ = writeln!(out, "  {line}");
+            }
             for d in &c.scip {
                 let _ = writeln!(out, "  {}", scip_status_line(d));
             }
         }
     }
     out
+}
+
+/// `excluded from analysis: <reason> <n> files, …` from the `excluded` diagnostics (contract
+/// M7e S3); `None` when nothing was excluded.
+fn excluded_line(excluded: &[rb_model::Diagnostic]) -> Option<String> {
+    counts_line("excluded from analysis", "reason", excluded)
+}
+
+/// `not analysed (no grammar): <language> <n> files, …` from the `language_unsupported`
+/// diagnostics (contract M7g S1); `None` when every code file has a grammar.
+fn unsupported_languages_line(languages: &[rb_model::Diagnostic]) -> Option<String> {
+    counts_line("not analysed (no grammar)", "language", languages)
+}
+
+/// `frameworks without a pack (…): <framework> in <service>, …` from the
+/// `framework_unsupported` diagnostics (contract M7g S2); `None` when there are none.
+fn unsupported_frameworks_line(frameworks: &[rb_model::Diagnostic]) -> Option<String> {
+    let parts: Vec<String> = frameworks
+        .iter()
+        .map(|d| {
+            format!(
+                "{} in {}",
+                d.detail["framework"].as_str().unwrap_or("?"),
+                d.detail["service"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    (!parts.is_empty()).then(|| {
+        format!(
+            "frameworks without a pack (routes and clients not read): {}",
+            parts.join(", ")
+        )
+    })
+}
+
+/// `<label>: <detail[key]> <n> files, …` over count diagnostics (`{key, files}`), in the
+/// stored (canonical) order; `None` when there are none.
+fn counts_line(label: &str, key: &str, counts: &[rb_model::Diagnostic]) -> Option<String> {
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|d| {
+            let files = d.detail["files"].as_u64().unwrap_or(0);
+            let unit = if files == 1 { "file" } else { "files" };
+            format!("{} {files} {unit}", d.detail[key].as_str().unwrap_or("?"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("{label}: {}", parts.join(", ")))
 }
 
 /// Text rendering of the Service Card's structure sections (design §9.5).
@@ -2338,6 +2549,62 @@ fn format_check(violations: &[(String, String, String)], truncated: bool, json: 
 struct CheckOutcome {
     violations: Vec<(String, String, String)>,
     truncated: bool,
+    /// What the orphan rule cannot see, when it ran ([`unlinked_note`]).
+    note: Option<String>,
+    /// Violations the baseline accepted, when one was given.
+    accepted: Option<usize>,
+}
+
+/// The violations a baseline accepts: the `rule src -> dst` lines `rb check` prints
+/// ([`check_line`]); its summary, comments and anything else are ignored (contract M7g S3).
+fn parse_baseline(text: &str) -> BTreeSet<(String, String, String)> {
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let (rule, rest) = l.split_once(' ')?;
+            let (src, dst) = rest.split_once(" -> ")?;
+            rb_store::check::RULES
+                .iter()
+                .any(|r| r.name == rule)
+                .then(|| (rule.to_owned(), src.to_owned(), dst.to_owned()))
+        })
+        .collect()
+}
+
+/// `violations` without the accepted ones, and how many were accepted.
+fn apply_baseline(
+    violations: Vec<(String, String, String)>,
+    accepted: &BTreeSet<(String, String, String)>,
+) -> (Vec<(String, String, String)>, usize) {
+    let total = violations.len();
+    let kept: Vec<_> = violations
+        .into_iter()
+        .filter(|v| !accepted.contains(v))
+        .collect();
+    let n = total - kept.len();
+    (kept, n)
+}
+
+/// The caveat for `orphan_endpoints` from a snapshot's `http_coverage` counts: client sites
+/// linked to no endpoint (dynamic, unmatched, ambiguous or too ambiguous) may call an endpoint
+/// the rule reports; `None` when every site is linked.
+fn unlinked_note(coverage: &serde_json::Value) -> Option<String> {
+    let count = |k: &str| coverage[k].as_u64().unwrap_or(0);
+    let parts: Vec<String> = ["dynamic", "unmatched", "ambiguous", "too_ambiguous"]
+        .iter()
+        .filter(|k| count(k) > 0)
+        .map(|k| format!("{} {}", k.replace('_', " "), count(k)))
+        .collect();
+    let total: u64 = ["dynamic", "unmatched", "ambiguous", "too_ambiguous"]
+        .iter()
+        .map(|k| count(k))
+        .sum();
+    (total > 0).then(|| {
+        format!(
+            "note: {total} client call sites are linked to no endpoint ({}); an endpoint reported orphan may still be called through them",
+            parts.join(", ")
+        )
+    })
 }
 
 /// Runs the built-in architecture rules' Cypher queries against the live snapshot (contract M6h
@@ -2349,9 +2616,17 @@ fn check_rules(
     rule: Option<String>,
     json: bool,
     timeout_ms: u64,
+    baseline: Option<&Path>,
 ) -> anyhow::Result<ExitCode> {
     let outcome = (|| -> anyhow::Result<CheckOutcome> {
         let snap = live_snapshot(store, repo)?;
+        let accepted: BTreeSet<(String, String, String)> = match baseline {
+            Some(path) => parse_baseline(
+                &std::fs::read_to_string(path)
+                    .with_context(|| format!("reading baseline {}", path.display()))?,
+            ),
+            None => BTreeSet::new(),
+        };
         let selected: Vec<&rb_store::check::Rule> = match &rule {
             Some(name) => vec![
                 rb_store::check::RULES
@@ -2361,6 +2636,9 @@ fn check_rules(
             ],
             None => rb_store::check::RULES.iter().collect(),
         };
+        let orphan_rule = selected
+            .iter()
+            .any(|r| r.name == rb_store::check::RULE_ORPHAN_ENDPOINTS);
         let limits = rb_store::CypherLimits {
             timeout_ms,
             rows: rb_store::CYPHER_ROWS_MAX,
@@ -2381,26 +2659,48 @@ fn check_rules(
         }
         violations.sort();
         violations.dedup();
+        // The client sites the orphan rule cannot see (contract M7g S3).
+        let note = if orphan_rule {
+            store
+                .load_diagnostics(snap.id)?
+                .iter()
+                .find(|d| d.kind == "http_coverage")
+                .and_then(|d| unlinked_note(&d.detail))
+        } else {
+            None
+        };
+        let (violations, accepted) = apply_baseline(violations, &accepted);
         Ok(CheckOutcome {
             violations,
             truncated,
+            note,
+            accepted: baseline.map(|_| accepted),
         })
     })();
     let CheckOutcome {
         violations,
         truncated,
+        note,
+        accepted,
     } = match outcome {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: {e:?}");
-            return Ok(ExitCode::from(2));
-        }
+        // Errors exit 2, never 1 (violations), through the shared rendering (contract M7f S3).
+        Err(e) => return Ok(report_failure(e, json, true)),
     };
     // A cut row list would silently pass a violating snapshot: say so loudly (contract M6h S4).
     if truncated {
         eprintln!(
             "warning: rule rows truncated at {}",
             rb_store::CYPHER_ROWS_MAX
+        );
+    }
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
+    if let Some(n) = accepted {
+        eprintln!(
+            "baseline: {n} accepted violation{} not reported",
+            if n == 1 { "" } else { "s" }
         );
     }
     print!("{}", format_check(&violations, truncated, json));
@@ -2413,41 +2713,21 @@ fn check_rules(
 
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
     let repo = match repo {
-        Some(r) => Some(r),
-        None => match cwd_repo_name() {
-            Some(name) if is_indexed(store, &name) => Some(name),
-            Some(name) => {
-                bail!(
-                    "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
-                )
-            }
-            None => {
-                let cwd = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "?".into());
-                bail!(
-                    "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
-                )
-            }
-        },
-    };
-    let repo = match repo {
         Some(r) => r,
-        None => {
-            let names = store.repo_names()?;
-            match names.as_slice() {
-                [only] => only.clone(),
-                [] => bail!("no repositories indexed yet"),
-                many => bail!(
-                    "several repositories indexed; pass --repo (one of: {})",
-                    many.join(", ")
-                ),
-            }
-        }
+        None => cwd_repo(store)?,
     };
-    store
-        .live_snapshot(&repo)?
-        .with_context(|| format!("repository {repo:?} has no live snapshot"))
+    // Typed like every question's errors (contract M7f S3): `not_found` and `no_live_snapshot`.
+    if !store.repo_names()?.contains(&repo) {
+        return Err(ApiError::not_found(format!("repository {repo:?} is not indexed")).into());
+    }
+    match store.live_snapshot(&repo)? {
+        Some(snap) => Ok(snap),
+        None => Err(ApiError::new(
+            rb_api::ErrorKind::NoLiveSnapshot,
+            format!("repository {repo:?} has no live snapshot"),
+        )
+        .into()),
+    }
 }
 
 /// Derives a valid repo name from a directory name: lowercase, `[a-z0-9_]`, max 40 characters.
@@ -2484,20 +2764,106 @@ fn git_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The repository implied by the working directory: the enclosing git root's
-/// directory name, sanitised exactly like `index` names it. No existence
-/// check: callers decide between using it and reporting it.
-fn cwd_repo_name() -> Option<String> {
-    let root = git_root(&std::env::current_dir().ok()?)?;
-    Some(repo_name_from_path(&root))
+/// The `--repo` directive when no repository can be inferred (contracts M7f S1, M7h S1):
+/// `checkout` is what the checkout at `cwd` means, `None` outside any git checkout.
+fn repo_needed(checkout: Option<&Inferred>, cwd: &str) -> ApiError {
+    let why = match checkout {
+        Some(Inferred::Several(names)) => format!(
+            "this checkout ({cwd:?}) is indexed as several repositories ({}); pass --repo",
+            names.join(", ")
+        ),
+        Some(Inferred::Elsewhere { name, checkout }) => format!(
+            "repository {name:?} was indexed from another checkout ({checkout:?}); pass --repo {name} to use it, or index this checkout under another name (`rb index . --repo NAME`)"
+        ),
+        Some(Inferred::Unindexed(name) | Inferred::One(name)) => format!(
+            "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
+        ),
+        None => format!(
+            "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
+        ),
+    };
+    ApiError::invalid("repo", format!("is needed: {why}"))
 }
 
-/// Whether a repository of this name is indexed (store errors count as no).
-fn is_indexed(store: &mut Store, name: &str) -> bool {
+/// The working directory as the directive names it.
+fn cwd_display() -> String {
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into())
+}
+
+/// What a checkout means among the indexed repositories (contract M7h S1).
+#[derive(Debug, PartialEq)]
+enum Inferred {
+    One(String),
+    /// Several repositories were indexed from this checkout.
+    Several(Vec<String>),
+    /// The repository named like the checkout's directory was indexed from another checkout.
+    Elsewhere {
+        name: String,
+        checkout: String,
+    },
+    /// Nothing indexed matches; `rb index .` would name it this.
+    Unindexed(String),
+}
+
+/// The repository the checkout at `root` (canonical) means, among `repos` (name, recorded
+/// checkout): the one recorded there; else the one named `dir_name`, unless it was recorded
+/// at another checkout.
+fn infer_repo(root: &str, dir_name: &str, repos: &[(String, Option<String>)]) -> Inferred {
+    let mut at: Vec<String> = repos
+        .iter()
+        .filter(|(_, checkout)| checkout.as_deref() == Some(root))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if at.len() > 1 {
+        return Inferred::Several(at);
+    }
+    if let Some(name) = at.pop() {
+        return Inferred::One(name);
+    }
+    match repos.iter().find(|(name, _)| name == dir_name) {
+        Some((name, None)) => Inferred::One(name.clone()),
+        Some((name, Some(checkout))) => Inferred::Elsewhere {
+            name: name.clone(),
+            checkout: checkout.clone(),
+        },
+        None => Inferred::Unindexed(dir_name.to_owned()),
+    }
+}
+
+/// Every repository with its recorded checkout. A database without migration 0007 records
+/// none, so every repository keeps the directory-name rule; store errors count as no
+/// repositories.
+fn repo_checkouts(store: &mut Store) -> Vec<(String, Option<String>)> {
     store
-        .repo_names()
-        .map(|names| names.iter().any(|r| r == name))
-        .unwrap_or(false)
+        .repo_checkouts()
+        .or_else(|_| {
+            store
+                .repo_names()
+                .map(|names| names.into_iter().map(|n| (n, None)).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// The repository the working directory's checkout means, or the `--repo` directive.
+fn cwd_repo(store: &mut Store) -> Result<String, ApiError> {
+    let root = std::env::current_dir()
+        .and_then(|cwd| cwd.canonicalize())
+        .ok()
+        .and_then(|cwd| git_root(&cwd));
+    let Some(root) = root else {
+        return Err(repo_needed(None, &cwd_display()));
+    };
+    let root_text = root.to_string_lossy();
+    match infer_repo(
+        &root_text,
+        &repo_name_from_path(&root),
+        &repo_checkouts(store),
+    ) {
+        Inferred::One(name) => Ok(name),
+        other => Err(repo_needed(Some(&other), &root_text)),
+    }
 }
 
 fn short(sha: &str) -> &str {
@@ -2740,6 +3106,99 @@ mod tests {
         assert!(asked(Cli::try_parse_from(["rb", "migrate"]).unwrap().command).is_none());
     }
 
+    /// Contract M7f S2+S3 (stress F5/F6): a refused request or an unreachable database exits by
+    /// its kind (`unavailable` 6, `not_found` 3); `rb check` exits 2 on any error, so an outage
+    /// is never read as violations (1); other failures keep exit 1.
+    #[test]
+    fn failures_exit_by_kind_and_check_errors_exit_2() {
+        let down = || {
+            anyhow::Error::from(rb_store::Unavailable {
+                url: "postgresql://rb:***@127.0.0.1:1/rb".into(),
+                cause: "Connection refused".into(),
+            })
+        };
+        assert_eq!(report_failure(down(), false, false), ExitCode::from(6));
+        assert_eq!(report_failure(down(), true, true), ExitCode::from(2));
+        let missing =
+            || anyhow::Error::from(ApiError::not_found("repository \"x\" is not indexed"));
+        assert_eq!(report_failure(missing(), false, false), ExitCode::from(3));
+        assert_eq!(report_failure(missing(), false, true), ExitCode::from(2));
+        assert_eq!(
+            report_failure(anyhow::anyhow!("disk full"), false, false),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            report_failure(anyhow::anyhow!("disk full"), false, true),
+            ExitCode::from(2)
+        );
+        // Which commands asked for JSON, known before the command runs.
+        let wants = |args: &[&str]| wants_json(&Cli::try_parse_from(args).unwrap().command);
+        assert!(wants(&["rb", "check", "--json"]));
+        assert!(wants(&["rb", "status", "--json"]));
+        assert!(wants(&["rb", "path", "x", "--format", "json"]));
+        assert!(!wants(&["rb", "callers", "x"]));
+        assert!(!wants(&["rb", "migrate"]));
+    }
+
+    /// Contract M7g S3 (stress F24): `rb check`'s own text output is its baseline — every
+    /// violation line `check_line` writes reads back (endpoint keys hold spaces), the summary
+    /// and comments do not — and the caveat names the client sites the gate cannot see.
+    #[test]
+    fn check_output_is_its_own_baseline_and_names_unlinked_sites() {
+        let violations = vec![
+            (
+                "orphan_endpoints".to_owned(),
+                ".".to_owned(),
+                "HTTP DELETE /api/v1/articles/{} @.".to_owned(),
+            ),
+            ("service_cycles".to_owned(), "a".to_owned(), "b".to_owned()),
+        ];
+        let text = format!(
+            "# accepted 2026-10-13\nmoved svc -> other (not a rule)\n{}",
+            format_check(&violations, false, false)
+        );
+        let baseline = parse_baseline(&text);
+        assert_eq!(
+            baseline,
+            violations.iter().cloned().collect::<BTreeSet<_>>()
+        );
+        let (kept, accepted) = apply_baseline(
+            vec![
+                violations[0].clone(),
+                (
+                    "orphan_endpoints".to_owned(),
+                    ".".to_owned(),
+                    "HTTP GET /new @.".to_owned(),
+                ),
+            ],
+            &baseline,
+        );
+        assert_eq!(accepted, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].2, "HTTP GET /new @.");
+        let coverage = json!({"sites": 50, "dynamic": 3, "unmatched": 11, "ambiguous": 2, "too_ambiguous": 0, "heuristic": 30});
+        assert_eq!(
+            unlinked_note(&coverage).as_deref(),
+            Some(
+                "note: 16 client call sites are linked to no endpoint (dynamic 3, unmatched 11, ambiguous 2); an endpoint reported orphan may still be called through them"
+            )
+        );
+        assert_eq!(unlinked_note(&json!({"sites": 4, "heuristic": 4})), None);
+    }
+
+    /// Contract M7f S7: `rb path --json` is `--format json`, as `--json` is on every other
+    /// question; without either it is text.
+    #[test]
+    fn path_takes_json_like_every_other_question() {
+        let out = |args: &[&str]| {
+            let (_, _, _, out) = asked(Cli::try_parse_from(args).unwrap().command).unwrap();
+            matches!(out, Out::Json)
+        };
+        assert!(out(&["rb", "path", "GET /x", "--json"]));
+        assert!(out(&["rb", "path", "GET /x", "--format", "json"]));
+        assert!(!out(&["rb", "path", "GET /x"]));
+    }
+
     /// Contract M5 D18: a page that is not the last names the rows shown and the next offset.
     #[test]
     fn more_line_names_the_next_offset() {
@@ -2798,6 +3257,7 @@ mod tests {
     fn http_line_orders_buckets_and_omits_zeros() {
         let mut c = rb_store::HttpCoverage {
             routes: 3,
+            spec_only: 0,
             services: 2,
             sites: 0,
             buckets: Default::default(),
@@ -2822,6 +3282,13 @@ mod tests {
         assert_eq!(
             http_line(&c),
             "http: 3 routes in 2 services; 10 client calls: 2 synthetic, 1 heuristic, 2 ambiguous, 1 too ambiguous, 1 external, 2 dynamic, 1 self"
+        );
+        // Contract M7i S2 (stress F31): routes only a spec states are counted apart.
+        c.spec_only = 1;
+        assert!(
+            http_line(&c).starts_with("http: 3 routes (1 from specs only) in 2 services; "),
+            "{}",
+            http_line(&c)
         );
     }
 
@@ -3179,6 +3646,182 @@ mod tests {
 
     /// Contract M3b amendment 50: a timeout's detail is printed once; other statuses print
     /// their reason; coverage lists `relationships dropped` (amendment 52).
+    /// Contract M7f S1 (stress F4): the repo directive is a predicate on `--repo`, the same
+    /// for questions and for `check`/`dump`, naming the checkout or the directory.
+    #[test]
+    fn repo_directive_reads_as_a_predicate_on_repo() {
+        let unindexed = repo_needed(Some(&Inferred::Unindexed("demo_spring".into())), "/w");
+        assert_eq!(
+            unindexed.cli_text(),
+            "--repo is needed: no indexed repository matches this checkout (\"demo_spring\"); index it (`rb index .`) or pass --repo"
+        );
+        assert_eq!(unindexed.param.as_deref(), Some("repo"));
+        assert!(unindexed.message.starts_with("repo is needed: "));
+        assert_eq!(
+            repo_needed(None, "/tmp").cli_text(),
+            "--repo is needed: no git repository found in \"/tmp\"; run rb from inside an indexed git checkout (or pass --repo)"
+        );
+    }
+
+    /// Contract M7h S1 (stress F3): a checkout means the one repository recorded at it; else a
+    /// repository named like its directory that has no checkout recorded (indexed before M7h);
+    /// several at one checkout, or a name match recorded elsewhere, is a directive, never a guess.
+    #[test]
+    fn a_checkout_means_the_repository_recorded_at_it() {
+        let rows = |r: &[(&str, Option<&str>)]| -> Vec<(String, Option<String>)> {
+            r.iter()
+                .map(|(n, c)| (n.to_string(), c.map(str::to_owned)))
+                .collect()
+        };
+        let one = |n: &str| Inferred::One(n.into());
+        // Recorded under another name than the directory's.
+        let repos = rows(&[("st_demo", Some("/w/demo_spring")), ("other", Some("/w/x"))]);
+        assert_eq!(
+            infer_repo("/w/demo_spring", "demo_spring", &repos),
+            one("st_demo")
+        );
+        // A recorded checkout wins over a same-named repository without one.
+        let repos = rows(&[("demo_spring", None), ("st_demo", Some("/w/demo_spring"))]);
+        assert_eq!(
+            infer_repo("/w/demo_spring", "demo_spring", &repos),
+            one("st_demo")
+        );
+        // Several repositories at one checkout.
+        let repos = rows(&[("a", Some("/w/r")), ("b", Some("/w/r"))]);
+        assert_eq!(
+            infer_repo("/w/r", "r", &repos),
+            Inferred::Several(vec!["a".into(), "b".into()])
+        );
+        // The directory-name rule, only for a repository with no checkout recorded.
+        assert_eq!(infer_repo("/w/r", "r", &rows(&[("r", None)])), one("r"));
+        assert_eq!(
+            infer_repo("/b/api", "api", &rows(&[("api", Some("/a/api"))])),
+            Inferred::Elsewhere {
+                name: "api".into(),
+                checkout: "/a/api".into()
+            }
+        );
+        assert_eq!(
+            infer_repo("/w/r", "r", &rows(&[("q", None)])),
+            Inferred::Unindexed("r".into())
+        );
+    }
+
+    /// Contract M7h S1: each case that is not one repository reads as a `--repo` directive.
+    #[test]
+    fn checkout_directives_name_the_candidates() {
+        let several = repo_needed(
+            Some(&Inferred::Several(vec!["a".into(), "b".into()])),
+            "/w/r",
+        );
+        assert_eq!(
+            several.cli_text(),
+            "--repo is needed: this checkout (\"/w/r\") is indexed as several repositories (a, b); pass --repo"
+        );
+        let elsewhere = repo_needed(
+            Some(&Inferred::Elsewhere {
+                name: "api".into(),
+                checkout: "/a/api".into(),
+            }),
+            "/b/api",
+        );
+        assert_eq!(
+            elsewhere.cli_text(),
+            "--repo is needed: repository \"api\" was indexed from another checkout (\"/a/api\"); pass --repo api to use it, or index this checkout under another name (`rb index . --repo NAME`)"
+        );
+    }
+
+    /// Contract M7h S3: the Cypher timeout is the flag's, else `RB_CYPHER_TIMEOUT_MS`'s, else
+    /// the default; a bad environment value is named as the variable, never as the flag.
+    #[test]
+    fn a_bad_timeout_from_the_environment_names_the_variable() {
+        let default = rb_store::CYPHER_TIMEOUT_MS_DEFAULT;
+        assert_eq!(cypher_timeout(Some(7), Some("0")).unwrap(), 7);
+        assert_eq!(cypher_timeout(None, Some("250")).unwrap(), 250);
+        assert_eq!(cypher_timeout(None, None).unwrap(), default);
+        for bad in ["0", "30001", "+5", "x", ""] {
+            let err = cypher_timeout(None, Some(bad)).unwrap_err();
+            assert_eq!(err.kind, rb_api::ErrorKind::InvalidParam);
+            assert_eq!(
+                err.cli_text(),
+                format!("RB_CYPHER_TIMEOUT_MS must be between 1 and 30000 (got {bad})")
+            );
+        }
+    }
+
+    /// Contract M7h S3: `find` that lists nothing says so on stderr (stdout stays rows only);
+    /// a page past the end, or any match, says nothing.
+    #[test]
+    fn an_empty_find_says_so() {
+        let found = |total: u64| {
+            Answer::Find(rb_api::Paged::from_rows(
+                total,
+                rb_api::Page {
+                    limit: 20,
+                    offset: 0,
+                },
+                vec![],
+            ))
+        };
+        let query = |q: &str, kind: Option<&str>| serde_json::json!({"q": q, "kind": kind});
+        assert_eq!(
+            no_match_line(&found(0), &query("zzz", None)).as_deref(),
+            Some("no matches for \"zzz\"")
+        );
+        assert_eq!(
+            no_match_line(&found(0), &query("zzz", Some("endpoint"))).as_deref(),
+            Some("no matches for \"zzz\" (kind endpoint)")
+        );
+        assert_eq!(
+            no_match_line(&found(0), &query("", Some("table"))).as_deref(),
+            Some("no table nodes")
+        );
+        assert_eq!(no_match_line(&found(3), &query("zzz", None)), None);
+    }
+
+    /// Contract M7e S3: the status line names what was not analysed and why, in the stored
+    /// (canonical) order; nothing excluded prints no line.
+    #[test]
+    fn excluded_line_counts_each_reason() {
+        let d = |reason: &str, files: u64| rb_model::Diagnostic {
+            kind: "excluded".into(),
+            path: None,
+            span: None,
+            detail: json!({ "reason": reason, "files": files }),
+        };
+        assert_eq!(
+            excluded_line(&[d("go_vendor", 1020), d("node_modules", 1)]).as_deref(),
+            Some("excluded from analysis: go_vendor 1020 files, node_modules 1 file")
+        );
+        assert_eq!(excluded_line(&[]), None);
+        // Contract M7g S1: languages without a grammar, counted the same way.
+        let lang = |language: &str, files: u64| rb_model::Diagnostic {
+            kind: "language_unsupported".into(),
+            path: None,
+            span: None,
+            detail: json!({ "language": language, "files": files }),
+        };
+        assert_eq!(
+            unsupported_languages_line(&[lang("php", 84), lang("rust", 1)]).as_deref(),
+            Some("not analysed (no grammar): php 84 files, rust 1 file")
+        );
+        assert_eq!(unsupported_languages_line(&[]), None);
+        // Contract M7g S2: frameworks without a pack, by service.
+        let fw = |service: &str, framework: &str| rb_model::Diagnostic {
+            kind: "framework_unsupported".into(),
+            path: None,
+            span: None,
+            detail: json!({ "service": service, "framework": framework, "package": "p" }),
+        };
+        assert_eq!(
+            unsupported_frameworks_line(&[fw("api", "echo"), fw("py", "flask")]).as_deref(),
+            Some(
+                "frameworks without a pack (routes and clients not read): echo in api, flask in py"
+            )
+        );
+        assert_eq!(unsupported_frameworks_line(&[]), None);
+    }
+
     #[test]
     fn scip_status_line_prints_a_timeout_once() {
         let diagnostic = |detail: Value| rb_model::Diagnostic {

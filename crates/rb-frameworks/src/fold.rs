@@ -285,8 +285,53 @@ impl<'l> Folder<'l> {
             .or_else(|| lookup.external(file, name, at));
         match local {
             Some((f, b)) => self.binding(f, b, depth + 1),
-            None => (Folded::hole(), true),
+            None => self
+                .object_member(file, name, at, depth)
+                .unwrap_or((Folded::hole(), true)),
         }
+    }
+
+    /// `obj.key` where `obj` is a constant TS/JS binding initialised with an object literal,
+    /// in the file or reached through [`Lookup::external`] (a named or default import): the
+    /// value of its last `key` entry, folded where it is written, labelled a constant at best
+    /// (contract M7c S1). A spread after that entry may override it, so nothing folds then.
+    fn object_member(&mut self, file: usize, name: &str, at: Span, depth: usize) -> Option<Out> {
+        let lookup = self.lookup;
+        if !matches!(
+            lookup.language(file),
+            Language::TypeScript | Language::Tsx | Language::JavaScript
+        ) {
+            return None;
+        }
+        let (head, key) = name.split_once('.')?;
+        if key.contains('.') || head == "this" {
+            return None;
+        }
+        let scope = self
+            .scopes
+            .entry(file)
+            .or_insert_with(|| FileScope::new(lookup.facts(file)));
+        let (f, bi) = scope
+            .binding_index_at(head, at)
+            .map(|bi| (file, bi))
+            .or_else(|| lookup.external(file, head, at))?;
+        let binding = lookup.facts(f).bindings.get(bi)?;
+        let Some(Init::Object { entries }) = &binding.init else {
+            return None;
+        };
+        if !binding.constant {
+            return None;
+        }
+        let last = entries.iter().rposition(|e| e.key == key)?;
+        if entries[last + 1..].iter().any(|e| e.key == "...") {
+            return None;
+        }
+        let out = match &entries[last].value {
+            Arg::Template { template } => self.template(f, template, depth + 1),
+            Arg::Name { text, span } => self.name(f, text, *span, depth + 1),
+            _ => return None,
+        };
+        Some((relabel(out.0, Origin::Constant), out.1))
     }
 
     fn binding(&mut self, file: usize, index: usize, depth: usize) -> Out {

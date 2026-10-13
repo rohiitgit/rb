@@ -26,6 +26,10 @@ fn stitch_note(attrs: Option<&Attrs>) -> String {
     if text("match") == Some("suffix") {
         parts.push("suffix match".to_owned());
     }
+    // An Express route matched with its case folded (contract M7j E7).
+    if text("case") == Some("folded") {
+        parts.push("case folded".to_owned());
+    }
     if let Some(n) = attrs.get("candidates").and_then(Value::as_u64) {
         parts.push(format!("{n} candidates"));
     }
@@ -140,6 +144,17 @@ mod tests {
     use rb_api::render::{path_json as render_json, pick_endpoint};
     use rb_model::{EdgeKind, NodeKind};
     use serde_json::json;
+
+    /// Contract M7j E7: a hop matched with case folded says so in the text, as in the JSON.
+    #[test]
+    fn stitch_note_names_a_folded_case() {
+        let attrs = |v: serde_json::Value| v.as_object().cloned().unwrap();
+        assert_eq!(
+            stitch_note(Some(&attrs(json!({"match": "suffix", "case": "folded"})))),
+            "  (suffix match, case folded)"
+        );
+        assert_eq!(stitch_note(Some(&attrs(json!({"match": "exact"})))), "");
+    }
 
     /// Amendment 10: endpoints that share a name on different routers (prefix unknown) are
     /// listed with their router, and each is reachable by `--pick` or by its full key.

@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rb_model::{EdgeKind, Graph, NodeKind};
+use rb_model::{Certainty, EdgeKind, Graph, NodeKind};
 
 /// Endpoints no client consumes.
 pub const RULE_ORPHAN_ENDPOINTS: &str = "orphan_endpoints";
@@ -29,8 +29,8 @@ pub struct Rule {
 pub const RULES: &[Rule] = &[
     Rule {
         name: RULE_ORPHAN_ENDPOINTS,
-        description: "an endpoint no client site consumes",
-        cypher: "MATCH (s:Service)-[:EXPOSES]->(e:Endpoint) WHERE NOT ()-[:CONSUMES]->(e) RETURN s.key, e.key ORDER BY s.key, e.key",
+        description: "an endpoint no client site consumes (an ambiguous link does not count)",
+        cypher: "MATCH (s:Service)-[:EXPOSES]->(e:Endpoint) OPTIONAL MATCH ()-[c:CONSUMES]->(e) WHERE c.certainty > 1 WITH s, e, COUNT(c) AS linked WHERE linked = 0 RETURN s.key, e.key ORDER BY s.key, e.key",
     },
     Rule {
         name: RULE_UNOWNED_TABLE_WRITES,
@@ -96,10 +96,12 @@ fn service_of(graph: &Graph, by_id: &BTreeMap<i64, usize>, id: i64) -> Option<St
 /// Endpoints with no inbound `CONSUMES`: `(exposing service, endpoint)`.
 fn orphan_endpoints(graph: &Graph) -> Vec<Violation> {
     crate::work::tick(graph.edges().len() + 1);
+    // An ambiguous link guesses at several endpoints; it is no evidence this one is called
+    // (contract M7g S3).
     let consumed: BTreeSet<i64> = graph
         .edges()
         .iter()
-        .filter(|e| e.kind == EdgeKind::Consumes)
+        .filter(|e| e.kind == EdgeKind::Consumes && e.certainty > Certainty::Ambiguous)
         .map(|e| e.dst)
         .collect();
     let by_id: BTreeMap<i64, usize> = graph
@@ -372,6 +374,54 @@ mod tests {
             .collect();
         b.add_edge(writes).unwrap();
         b.finish().unwrap()
+    }
+
+    /// Contract M7g S3 (stress F24): only a non-ambiguous `CONSUMES` clears an endpoint — an
+    /// ambiguous link is a guess at several endpoints, not evidence that this one is called —
+    /// in the relational twin and in the rule's Cypher (bound to the same rank).
+    #[test]
+    fn ambiguous_consumers_do_not_clear_an_orphan() {
+        let mut b = GraphBuilder::new();
+        for (key, name, attrs) in [
+            svc("a"),
+            (
+                NodeKey::new(NodeKind::Endpoint, "HTTP GET /z @a"),
+                "GET /z",
+                [("service".to_owned(), json!("a"))].into_iter().collect(),
+            ),
+            (NodeKey::new(NodeKind::Symbol, "c#g"), "g", Attrs::new()),
+        ] {
+            b.add_node(key, name, attrs).unwrap();
+        }
+        let z = NodeKey::new(NodeKind::Endpoint, "HTTP GET /z @a");
+        b.add_edge(NewEdge::new(
+            NodeKey::new(NodeKind::Service, "a"),
+            EdgeKind::Exposes,
+            z.clone(),
+            Provenance::Treesitter,
+            Certainty::Exact,
+        ))
+        .unwrap();
+        b.add_edge(NewEdge::new(
+            NodeKey::new(NodeKind::Symbol, "c#g"),
+            EdgeKind::Consumes,
+            z,
+            Provenance::HttpStitch,
+            Certainty::Ambiguous,
+        ))
+        .unwrap();
+        let found = orphan_endpoints(&b.finish().unwrap());
+        assert_eq!(found.len(), 1, "{found:?}");
+        let rule = RULES
+            .iter()
+            .find(|r| r.name == RULE_ORPHAN_ENDPOINTS)
+            .unwrap();
+        assert!(
+            rule.cypher
+                .contains(&format!("c.certainty > {}", Certainty::Ambiguous.rank())),
+            "{}",
+            rule.cypher
+        );
     }
 
     /// Contract M6h S1: orphan endpoints report their service and key; consumed ones stay silent.

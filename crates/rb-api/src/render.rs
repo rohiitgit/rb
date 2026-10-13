@@ -34,13 +34,18 @@ pub fn describe_line(d: &Describer<'_>, id: i64) -> String {
 /// The node `input` names (Q1, Q2). Several candidates are listed, never picked silently, unless
 /// `pick` (1-based, in the listed order) chooses one.
 pub fn pick_target(ix: &SnapshotIndex, input: &str, pick: Option<usize>) -> Result<i64, ApiError> {
-    let candidates = rb_store::code::resolve_target(ix, input);
+    let mut candidates = rb_store::code::resolve_target(ix, input);
+    if candidates.is_empty() {
+        candidates = near_miss_symbols(ix, input);
+    }
     let d = Describer::new(ix);
     match (candidates.as_slice(), pick) {
         ([], _) => Err(ApiError::not_found(format!(
-            "nothing matches {input:?} (try `rb find {input}`)"
+            "nothing matches {input:?} (try `rb find {}`)",
+            shell_arg(input)
         ))),
-        ([only], _) => Ok(*only),
+        ([only], None | Some(1)) => Ok(*only),
+        ([_], Some(n)) => Err(pick_beyond_one(input, n)),
         (many, Some(n)) if (1..=many.len()).contains(&n) => Ok(many[n - 1]),
         (many, _) => {
             let list: Vec<String> = many
@@ -59,6 +64,52 @@ pub fn pick_target(ix: &SnapshotIndex, input: &str, pick: Option<usize>) -> Resu
                     .collect(),
             ))
         }
+    }
+}
+
+/// `--pick N` beyond the only candidate (contract M7j E6): refused, never ignored. Beyond several
+/// candidates the request lists them instead (M5 amendment 5).
+fn pick_beyond_one(input: &str, n: usize) -> ApiError {
+    ApiError::invalid(
+        "pick",
+        format!("is {n}, but only 1 candidate matches {input:?}"),
+    )
+}
+
+/// Symbols a near-miss key names (contract M7f S4): `rb find`'s rule — a case-insensitive
+/// substring of a symbol's key or name — for an input written in symbol-key syntax (`#` or `(`),
+/// in key order. Plain words already resolve by name, and stay out so a short word never lists
+/// half the graph.
+fn near_miss_symbols(ix: &SnapshotIndex, input: &str) -> Vec<i64> {
+    if !input.contains(['#', '(']) {
+        return Vec::new();
+    }
+    let needle = input.trim().to_lowercase();
+    let mut hits: Vec<(&str, i64)> = ix
+        .graph()
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::Symbol)
+        .filter(|n| {
+            n.key.to_lowercase().contains(&needle) || n.name.to_lowercase().contains(&needle)
+        })
+        .map(|n| (n.key.as_str(), n.id))
+        .collect();
+    hits.sort_unstable();
+    hits.into_iter().map(|(_, id)| id).collect()
+}
+
+/// `arg` as a shell word (contract M7f S5): as written when it holds only characters no shell
+/// splits or expands, else single-quoted.
+pub fn shell_arg(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c));
+    if plain {
+        arg.to_owned()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
     }
 }
 
@@ -117,13 +168,35 @@ pub fn callers_json(ix: &SnapshotIndex, tree: &CallerTree) -> Value {
     }
     let graph = ix.graph();
     let d = Describer::new(ix);
-    json!({
+    let mut out = json!({
         "target": node_json(graph, &d, tree.target),
         "precision": tree.precision.as_str(),
         "pruned_by_rta": tree.pruned_by_rta,
         "callers": walk(graph, &d, &tree.callers),
         "truncated": tree.truncated.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-    })
+    });
+    // Only when the target has marks, so other answers keep their bytes (contract M7i S2).
+    if !tree.target_entry.is_empty() {
+        out["target_entry"] = tree.target_entry.clone().into();
+    }
+    // Only when asked (`exclude_tests`) or when `limit` cut the rows (contract M7i S4).
+    if let Some(n) = tree.excluded_tests {
+        out["excluded_tests"] = n.into();
+    }
+    if let Some(s) = &tree.summary {
+        let counts = |xs: &[(String, usize)], name: &str| -> Vec<Value> {
+            xs.iter()
+                .map(|(k, n)| json!({ name: k, "callers": n }))
+                .collect()
+        };
+        out["summary"] = json!({
+            "callers": s.callers,
+            "shown": s.shown,
+            "by_service": counts(&s.by_service, "service"),
+            "by_entry": counts(&s.by_entry, "entry"),
+        });
+    }
+    out
 }
 
 /// `rb impact --json` (contract M4b S13): every section of the text answer, with keys.
@@ -174,7 +247,7 @@ pub fn impact_json(ix: &SnapshotIndex, impact: &Impact) -> Value {
                 .collect::<Vec<_>>(),
         }),
     };
-    json!({
+    let mut out = json!({
         "removed": impact
             .removed
             .iter()
@@ -198,7 +271,12 @@ pub fn impact_json(ix: &SnapshotIndex, impact: &Impact) -> Value {
             .map(|(o, n)| json!({"owner": o, "impacted": n}))
             .collect::<Vec<_>>(),
         "truncated": impact.truncated.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
-    })
+    });
+    // The full length of each list `limit` cut, only when one was (contract M7i S4).
+    if !impact.totals.is_empty() {
+        out["totals"] = json!(impact.totals);
+    }
+    out
 }
 
 /// `<METHOD> <path>` normalised as routes are (contract M4a S3), when the input has that form.
@@ -358,9 +436,11 @@ pub fn pick_endpoint(
     let view = PathView::new(ix);
     match (candidates.as_slice(), pick) {
         ([], _) => Err(ApiError::not_found(format!(
-            "no endpoint matches {input:?} (try `rb find {input} --kind endpoint`)"
+            "no endpoint matches {input:?} (try `rb find {} --kind endpoint`)",
+            shell_arg(input)
         ))),
-        ([only], _) => Ok(*only),
+        ([only], None | Some(1)) => Ok(*only),
+        ([_], Some(n)) => Err(pick_beyond_one(input, n)),
         (many, Some(n)) if (1..=many.len()).contains(&n) => Ok(many[n - 1]),
         (many, _) => {
             let list: Vec<String> = many
@@ -535,6 +615,27 @@ mod tests {
                 ErrorKind::NotFound,
                 "nothing matches \"walk\" (try `rb find walk`)"
             )
+        );
+        // Contract M7f S4 (stress F7): a near-miss key (`A#run()` without the trailing `.`)
+        // resolves when `find`'s rule — a case-insensitive substring of a symbol's key or name —
+        // yields exactly one symbol; several are ambiguous, as everywhere.
+        let near = pick_target(&ix, "A#run()", None).unwrap();
+        assert_eq!(ix.node(near).key, "a/A.java/A#run().");
+        assert_eq!(pick_target(&ix, "a#RUN()", None).unwrap(), near);
+        assert_eq!(
+            pick_target(&ix, "#run(", None).unwrap_err().kind,
+            ErrorKind::Ambiguous
+        );
+        // A plain fragment is no key syntax: it stays not found, never a substring sweep.
+        assert_eq!(
+            pick_target(&ix, "un", None).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+        // Contract M7f S5 (stress F8): the suggested command quotes what a shell would split.
+        let miss = pick_target(&ix, "Z#run()", None).unwrap_err();
+        assert_eq!(
+            miss.message,
+            "nothing matches \"Z#run()\" (try `rb find 'Z#run()'`)"
         );
     }
 }

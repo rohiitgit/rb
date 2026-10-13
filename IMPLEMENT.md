@@ -681,3 +681,97 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - [x] Evaluator pass 2 (`tasks/eval-m6l-pass2.md`): VERDICT PASS — repros re-run, suite stands.
   - [x] `PIPELINE m6l-1`: metadata-only, no golden pins it.
 - **Verification** (`var/m6l/logs/p6-pipe-*`): fmt, clippy `-D warnings`, 927 units, `rb-store` 72/72, `rb-server` 12/12, e2e 47/47, api 1/1, no `skipping:`, no listener, stub scan clean.
+
+## M7a `exact`-label correctness (stress batch A): implemented 2026-10-13, uncommitted
+
+- **Contract:** `tasks/contract-m7a.md` (S1–S3, amendment 1). Source: `tasks/stress-findings.md` F17–F19.
+- **S1:** Go/TS gRPC clients are typed only by a trailing `New*Client` constructor. `pb.NewXClient(c).Rpc(…)` (exactly two links) is the RPC.
+- **S2:** FastAPI goes through the shared router composer (`RouterDecl`/`Mount`). `module.router` resolves through Python submodules, and an unknown prefix stays unknown.
+- **S3:** gRPC endpoints come from server registrations in 5 languages, counted with `grpc_implementer_unknown` / `grpc_registration_ambiguous`.
+- **Verification:** 14 mutants killed. DB suites 980/2, with the 2 failures pre-existing (F1). Invariant: 29/31 targets byte-identical (all 18 fixtures), and microservices-demo plus fastapi-realworld diffs classified. `PIPELINE` `m7a-1`.
+
+## M7b Regressions and hangs (stress batch B): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7b.md` (S1–S5, amendment 1). Source: `tasks/stress-findings.md` F1, F2, F9–F11, F15.
+- **S1:** `rb status` lists every repository outside an indexed checkout. The two red DB suites are green again.
+- **S2:** every Docker CLI call is bounded, killed and reaped. A wedged daemon now costs about 10 s, not a hang.
+- **S3:** a `Parents` map replaces `Node::parent()` in the profiled rb-syntax hot spots. Cubic and quadratic pathological inputs now take seconds or less.
+- **S4:** the mount composer is pruned once its result can't change. F11 went from 44 s to 1 s with identical output.
+- **S5:** huge blobs are sniffed by streaming. A 1 GiB blob now peaks at 16 MiB, down from 2 GiB.
+- **Verification:**
+  - 11 mutants killed (m15–m25, 2 reverted conversions recorded).
+  - DB suites 986/0, with no skips.
+  - Invariant against M7a: 31/31 byte-identical.
+
+## M7c HTTP recall on supported stacks (stress batch C, part 1): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7c.md` (S1–S4, amendment 1). Fixes F20, F21, F12, F27.
+- **Changes:** Express paths written as names fold across files through a shared constant lookup (`rb-indexer/src/constants.rs`), with object-member and default-import folding. Default-imported axios instances resolve. Inline `require('express')()` is recognised. TS gRPC stubs need a generated-code import.
+- **Verification:**
+  - 14 mutants killed. Real-Docker suites 990/0/0.
+  - Invariant 29/31 identical. bookcars: +107 endpoints and +175 stitched calls. mattermost: −29 false gRPC sites.
+  - `PIPELINE` `m7c-1`.
+
+## M7d DI and SQL roles (stress batch C, part 2): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7d.md` (amendment 1). Fixes F28 (except open generics), F26, F23.
+- **Changes:** .NET implicit and global usings import DI; implementation-registered owners; constructor parameters only. Framework-provided lane points are `external`. `.sql` files are migrations only by evidence.
+- **Verification:**
+  - 18 mutants killed (m40–m57). Real-Docker suites 995/0/0.
+  - Invariant 26/31 identical, diffs classified.
+  - `PIPELINE` `m7d-1`.
+
+## M7e Input hygiene (stress batch D): implemented 2026-10-13
+
+- **Contract and design:** `tasks/contract-m7e.md` (diagram, estimates, trade-offs, algorithm). Fixes F16, F22, F13, F29.
+- **Mechanism:** `exclude::decide` runs once from the full tree; analysis stages see only non-excluded files; `File` nodes are kept and marked; counts are reported per reason, including in `rb status`.
+- **Verification:**
+  - 15 mutants killed. Real-Docker 1,004/0/0. Invariant 28/31 identical, classified.
+  - go-gin-example: 4× faster, 4× less memory, 8× smaller graph.
+
+## M7f The error contract and targets (stress batch E, part 1): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7f.md` (error contract table and diagram, S1–S7, amendment 1). Fixes F4–F8, F14.
+- **Verification:**
+  - 14 mutants killed. Real-Docker 1,009/0/0.
+  - Invariant 31/31 byte-identical. The exit-code table gains `unavailable` (6 / 503).
+
+## M7g Honesty about what was not analysed (stress batch E, part 2): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7g.md` (design diagram, S1–S3, amendment 1). Addresses F30, F25 and F24, each partly (residue recorded).
+- **Implemented:** `language_unsupported` and `framework_unsupported` diagnostics with `rb status` lines; `orphan_endpoints` requires a non-ambiguous consumer; `rb check --baseline` and the unlinked-client note.
+- **Verification:**
+  - Mutants m87–m98 killed (m93 exposed dead code, now deleted). Real-Docker 1,013/0/0.
+  - Invariant 27/31 byte-identical, 4 classified. `PIPELINE` `m7g-1`.
+
+## M7h The CLI remainder (stress batch F, part 1): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7h.md` (decision diagram, S1–S5, amendment 1). Fixes F3, U1, U4, U7, U9 and the M7f residue.
+- **Implemented:**
+  - Checkouts recorded per repository, used for `--repo` inference and by `rb index .`.
+  - `find --kind` alone, the `find` no-match note, the card page wording.
+  - Cypher read-only and `--cols` errors; the environment-named timeout.
+  - `rb doctor`.
+- **Verification:** 24 mutants killed. Real-Docker 1,028/0/0. Invariant 31/31 identical.
+
+## M7i Precision and cost remainder (stress batch F, part 2): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7i.md` (diagram, S1–S6, amendment 1). Fixes F31, F32, U5, O3, O4; O7 declined.
+- **Verification:**
+  - 21 mutants killed. Real-Docker 1,041/0/0.
+  - Invariant 29/31 identical, 2 classified.
+  - mattermost cached RSS 2,148 → 1,658 MiB.
+
+## M7j The M7 close fixes (evaluator pass 1): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7j.md` (E1–E8, amendment 1). Input: `tasks/eval-m7-pass1.md` (17 findings, 0 S1).
+- **Verification:**
+  - 7 mutants killed. Real-Docker 1,047/0/0, with the log kept.
+  - Invariant 31/31 identical. E5 10.8 s (M7i 45.4 s).
+
+## M7 closed (evaluator passes 1–2): 2026-10-13
+
+- **The series:** M7a–M7j fixed the stress campaign's findings (`tasks/stress-findings.md`).
+- **Pass 1:** 17 findings, answered by M7j.
+- **Pass 2:** 1 blocking records error (U2), corrected at the close, plus 4 S4 items (fixed or recorded as residue).
+- **Next:** M8a (accuracy benchmark), whose contract is drafted separately.

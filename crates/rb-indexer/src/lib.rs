@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
+mod constants;
 mod di;
+mod exclude;
 mod liveness;
 mod modules;
 mod orm;
@@ -115,7 +117,25 @@ use serde_json::{Value, json};
 /// rides the generated parameter and narrows, counted (M6c S8).
 /// `m6c-5` exact type-arg agreement: the single bean in simple-name agreement
 /// picks at `heuristic`, capped by the generic gate, counted (M6c S9a).
-pub const PIPELINE: &str = "m6l-1";
+/// `m7a-1` `exact`-label correctness: Go/TS gRPC clients typed by the constructor
+/// link (S1), FastAPI through the shared router composer (S2), gRPC endpoints by
+/// server registration with `grpc_implementer_unknown` counted (S3).
+/// `m7c-1` HTTP recall: Express paths written as names fold across files (object
+/// members, default imports) or are counted dynamic (S1); default-imported axios
+/// instances (S2); `require('express')()` (S3); TS gRPC stubs need a generated import (S4).
+/// `m7d-1` DI and SQL roles: .NET implicit/global usings import DI (S1), implementation-
+/// registered owners (S2), framework-provided points are `external` (S4), `.sql` files are
+/// migrations only by evidence, else `QUERIES` (S5).
+/// `m7e-1` input hygiene: vendored and built files (rb.toml `ignore`, Go `vendor/`,
+/// `node_modules`, `.gitattributes` linguist marks, tsconfig `outDir` outputs) keep
+/// their `File` node with `excluded` and are not analysed; counted per reason.
+/// `m7g-1` honesty: php/scala/swift/dart/elixir files named; code without a grammar
+/// counted (`language_unsupported`); frameworks without a pack named
+/// (`framework_unsupported`).
+/// `m7i-1` Express routes match case-insensitively unless their router opts in
+/// (`CONSUMES` `case: folded`); JSON spec operations carry their path key's span.
+/// `m7j-1` `case: folded` decided per candidate (it was copied from the first).
+pub const PIPELINE: &str = "m7j-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -164,15 +184,35 @@ pub fn index_commit(
         })
         .collect();
 
+    // Contract M7e: one exclusion decision, from the full tree. Every analysis stage below sees
+    // only `analysed`; `File` nodes and ownership keep the whole manifest.
+    let excluded = exclude::decide(&manifest.files, &read)?;
+    let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
+    for reason in excluded.values() {
+        *by_reason.entry(reason).or_default() += 1;
+    }
+    diagnostics.extend(by_reason.into_iter().map(|(reason, files)| Diagnostic {
+        kind: "excluded".into(),
+        path: None,
+        span: None,
+        detail: json!({ "reason": reason, "files": files }),
+    }));
+    let analysed: Vec<FileEntry> = manifest
+        .files
+        .iter()
+        .filter(|f| !excluded.contains_key(&f.path))
+        .cloned()
+        .collect();
+
     let codeowners = load_codeowners(&manifest, &read, &mut diagnostics)?;
-    let boundaries = boundaries::detect(&manifest.files, &read)?;
+    let boundaries = boundaries::detect(&analysed, &read)?;
     diagnostics.extend(boundaries.diagnostics.iter().cloned());
 
-    let (plan, skipped) = syntax::parse_plan(&manifest.files);
+    let (plan, skipped) = syntax::parse_plan(&analysed);
     diagnostics.extend(skipped);
     // Files with no facts are scanned as text for hooks and discovery (amendment 17).
     let (unparsed, scanned) =
-        syntax::scan_unparsed(&manifest.files, &plan, &|blob: &str| repo.blob(blob))?;
+        syntax::scan_unparsed(&analysed, &plan, &|blob: &str| repo.blob(blob))?;
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let (facts, parsed) =
         syntax::load_or_parse(&|blob: &str| repo.blob(blob), &plan, cache, threads)?;
@@ -194,7 +234,7 @@ pub fn index_commit(
         .flat_map(|(_, f)| f.definitions.iter().map(|d| d.name.as_str()))
         .collect();
     let mut words = liveness::Words::scanned();
-    for f in manifest.files.iter().filter(|f| !f.binary) {
+    for f in analysed.iter().filter(|f| !f.binary) {
         let bytes = (f.size <= liveness::WORD_SCAN_BYTES)
             .then(|| repo.blob(&f.blob_sha))
             .transpose()?;
@@ -202,15 +242,14 @@ pub fn index_commit(
     }
 
     let mut texts = |lang: &str| -> anyhow::Result<BTreeMap<&str, String>> {
-        let (files, skipped) = sql::text_plan(&manifest.files, lang);
+        let (files, skipped) = sql::text_plan(&analysed, lang);
         diagnostics.extend(skipped);
         files
             .into_iter()
             .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
             .collect()
     };
-    let go_modules = manifest
-        .files
+    let go_modules = analysed
         .iter()
         .filter(|f| f.path == "go.mod" || f.path.ends_with("/go.mod"))
         .map(|f| {
@@ -229,26 +268,23 @@ pub fn index_commit(
         std::fs::create_dir_all(&scip.work_dir)?;
     }
     let (scip_projects, scip_ungrouped) = projects::run_projects(
-        &manifest.files,
+        &analysed,
         &|blob: &str| repo.blob(blob),
         &mode,
         scip,
         scip_cache,
     )?;
-    let config = manifest
-        .files
+    let config = analysed
         .iter()
         .filter(|f| is_config_input(&f.path))
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
-    let manifests = manifest
-        .files
+    let manifests = analysed
         .iter()
         .filter(|f| packages::is_input(&f.path) && !f.binary)
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
-    let specs = manifest
-        .files
+    let specs = analysed
         .iter()
         .filter(|f| {
             (rb_frameworks::spec::is_spec_input(&f.path)
@@ -257,26 +293,22 @@ pub fn index_commit(
         })
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
-    let mappers = manifest
-        .files
+    let mappers = analysed
         .iter()
         .filter(|f| f.path.ends_with(".xml") && !f.binary)
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
-    let gateways = manifest
-        .files
+    let gateways = analysed
         .iter()
         .filter(|f| rb_frameworks::gateway::is_gateway_input(&f.path) && !f.binary)
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<_>>()?;
-    let host_files = manifest
-        .files
+    let host_files = analysed
         .iter()
         .filter(|f| rb_frameworks::hosts::is_hosts_input(&f.path) && !f.binary)
         .map(|f| Ok((f.path.as_str(), repo.blob_text(&f.blob_sha)?)))
         .collect::<anyhow::Result<BTreeMap<&str, String>>>()?;
-    let rb_hosts = manifest
-        .files
+    let rb_hosts = analysed
         .iter()
         .find(|f| f.path == "rb.toml" && !f.binary)
         .map(|f| {
@@ -286,6 +318,7 @@ pub fn index_commit(
         .transpose()?
         .unwrap_or_default();
     let content = Content {
+        excluded,
         facts: facts_by_path,
         sql: texts("sql")?,
         prisma: texts("prisma")?,
@@ -357,6 +390,8 @@ fn load_codeowners(
 /// Everything read from a commit besides its structure, by path.
 #[derive(Default)]
 pub struct Content<'a> {
+    /// Files excluded from analysis, with their reason (contract M7e): `File` nodes only.
+    pub excluded: BTreeMap<String, &'static str>,
     /// Parsed source files.
     pub facts: BTreeMap<&'a str, (rb_syntax::Language, &'a rb_syntax::FileFacts)>,
     /// `.sql` files.
@@ -799,7 +834,11 @@ pub fn assemble(
     for f in &manifest.files {
         let file = NodeKey::new(NodeKind::File, f.path.clone());
         let name = f.path.rsplit('/').next().unwrap_or(&f.path);
-        b.add_node(file.clone(), name, file_attrs(f))?;
+        let mut attrs = file_attrs(f);
+        if let Some(reason) = content.excluded.get(&f.path) {
+            attrs.insert("excluded".into(), (*reason).into());
+        }
+        b.add_node(file.clone(), name, attrs)?;
 
         let service = match boundaries.project_for(&f.path) {
             Some(p) => {
@@ -972,6 +1011,7 @@ pub fn assemble(
     });
     packages::add(&mut b, &manifest_edges)?;
     diagnostics.extend(manifest_diagnostics);
+    diagnostics.extend(packages::unsupported_frameworks(&manifest_edges));
     // ORM mappings from every file first, so accesses can resolve entities across files.
     for (path, (_, facts)) in &content.facts {
         syntax::add_symbols(&mut b, path, facts, &keys[path])?;
@@ -1225,7 +1265,7 @@ pub fn assemble(
         )?);
     }
     for (path, text) in &content.sql {
-        diagnostics.extend(sql::add_migrations(&mut b, path, text)?);
+        diagnostics.extend(sql::add_sql_file(&mut b, path, text)?);
     }
     for (path, text) in &content.mappers {
         diagnostics.extend(sql::add_mapper_queries(&mut b, path, text)?);
@@ -1508,6 +1548,135 @@ mod tests {
             binary: false,
             generated: false,
         }
+    }
+
+    /// Contract M7e S2: excluded files keep their `File` node (marked with the reason) and
+    /// nothing else — no symbols, no project, no parse — and each reason is counted once.
+    #[test]
+    fn excluded_files_keep_file_nodes_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let files = [
+            ("go.mod", "module example.com/app\n\ngo 1.21\n"),
+            (
+                "main.go",
+                "package main\n\nfunc main() { helper() }\n\nfunc helper() {}\n",
+            ),
+            ("vendor/modules.txt", "# github.com/x/lib v1.0.0\n"),
+            (
+                "vendor/github.com/x/lib/go.mod",
+                "module github.com/x/lib\n",
+            ),
+            (
+                "vendor/github.com/x/lib/lib.go",
+                "package lib\n\nfunc Vendored() {}\n",
+            ),
+            (
+                "web/node_modules/pkg/index.js",
+                "function nm() {}\nmodule.exports = nm;\n",
+            ),
+        ];
+        for (path, text) in files {
+            let p = dir.join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "rb")
+                .env("GIT_AUTHOR_EMAIL", "rb@example.invalid")
+                .env("GIT_COMMITTER_NAME", "rb")
+                .env("GIT_COMMITTER_EMAIL", "rb@example.invalid")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let indexed = index_commit(
+            dir,
+            "HEAD",
+            &mut NoCache,
+            &ScipOptions::disabled(),
+            &mut NoScipCache,
+        )
+        .unwrap();
+        let g = &indexed.graph;
+        let excluded: Vec<(String, String)> = g
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::File)
+            .filter_map(|n| {
+                n.attrs
+                    .get("excluded")
+                    .map(|r| (n.key.clone(), r.as_str().unwrap().to_owned()))
+            })
+            .collect();
+        assert_eq!(
+            excluded,
+            [
+                (
+                    "vendor/github.com/x/lib/go.mod".to_owned(),
+                    "go_vendor".to_owned()
+                ),
+                (
+                    "vendor/github.com/x/lib/lib.go".to_owned(),
+                    "go_vendor".to_owned()
+                ),
+                ("vendor/modules.txt".to_owned(), "go_vendor".to_owned()),
+                (
+                    "web/node_modules/pkg/index.js".to_owned(),
+                    "node_modules".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(
+            g.nodes()
+                .iter()
+                .filter(|n| n.kind == NodeKind::File)
+                .count(),
+            6
+        );
+        let symbols: Vec<&str> = g
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Symbol)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(symbols.contains(&"helper"), "{symbols:?}");
+        assert!(
+            !symbols.contains(&"Vendored") && !symbols.contains(&"nm"),
+            "{symbols:?}"
+        );
+        let services: Vec<&str> = g
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Service)
+            .map(|n| n.key.as_str())
+            .collect();
+        assert_eq!(services, ["."], "{services:?}");
+        // One per reason; their order is `sort_diagnostics`' canonical one.
+        let counted: BTreeSet<String> = indexed
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "excluded")
+            .map(|d| d.detail.to_string())
+            .collect();
+        assert_eq!(
+            counted,
+            BTreeSet::from([
+                r#"{"files":3,"reason":"go_vendor"}"#.to_owned(),
+                r#"{"files":1,"reason":"node_modules"}"#.to_owned(),
+            ])
+        );
     }
 
     fn project(dir: &str, manifest: &str) -> Project {

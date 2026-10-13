@@ -6,6 +6,7 @@
     "commit_sha": "0a53d7f5c2b84562f0dce79fed5b032313e7137a"
   },
   "query": {
+    "limit": null,
     "min_certainty": "ambiguous",
     "pick": null,
     "precision": "cha",

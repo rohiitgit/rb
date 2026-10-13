@@ -533,3 +533,39 @@
 ## 2026-10-13: check the whole check output, not its head
 - **Mistake (caught by the close loop failing):** `cargo fmt --check | head -2` showed nothing while a violation sat below the cut — the loop's fmt step failed on a tree declared clean.
 - **Rule:** never truncate check output; assert on exit codes (`check ... && echo CLEAN`), not on the visible head. Same for clippy and test summaries: grep the counts, show the whole line.
+
+## 2026-10-13: a generated-code naming pattern must be tested against SDKs that share the name
+- **Mistake:** M7a S1's first rule read any `….New{X}Client(c).Rpc(…)` chain as a gRPC call. Generated Go stubs do look like that, but so does the Azure SDK's `….NewContainerClient(c).NewBlobClient(p)`. The unit test held only generated-code shapes; the invariant run on mattermost found 2 false gRPC sites.
+- **Rule:** When a rule keys on a naming convention (`New*Client`, `*ImplBase`, `*Api`), pin the exact generated shape (link count, position, what follows), and add negatives from a real SDK that uses the same words. Give each guard its own negative, so every guard has a mutant that bites alone.
+
+## 2026-10-13: a performance change keeps only the edits a mutant proves hot
+- **Mistake:** M7b S3 converted six `Node::parent()` call sites to the ancestor map, on the reasoning that each "could be" quadratic. Mutants showed two (`local_by_ancestry`, `type_qualifier`) were not hot on any pathological input: one stops at the nearest definition, the other never climbs.
+- **Rule:** For a complexity fix, profile first, convert the hot spots, and give each conversion a timing case whose mutant (the old call restored) fails it. Revert any conversion whose mutant survives every pathological case you can construct: it is churn, not a fix.
+
+## 2026-10-13: a content marker is a format's exact spelling, checked against other tools that write similar lines
+- **Mistake:** M7d S5 read `-- name:` case-insensitively as an aiosql query marker. pg_dump writes `-- Name: audits; Type: TABLE; Schema: public` above every object, so 87 mattermost schema dumps (55 `CREATE TABLE` each) were reclassified as query files. The unit cases held only aiosql and plain DDL; the invariant run on mattermost caught it.
+- **Rule:** Match a marker in the exact form the format documents (case included), and before shipping, grep the measured repositories for near-variants of the marker written by other tools (dumps, ORMs, linters). Each near-variant found becomes a negative case in the test.
+
+## 2026-10-13: before a new milestone series, list the project's record files and keep every one
+- **Mistake:** M7a–M7d updated `IMPLEMENT.md`, contracts, todo and lessons, but not `CHANGELOG.md`, which every earlier milestone (M0–M6l) kept. The gap was caught only when the karpathy-loops changelog rule was applied at M7e, and it was backfilled there.
+- **Rule:** At the start of a milestone series, read the last close commit's file list (`git show --stat <last close>`) and copy its record set into the plan's final phase as checkboxes: `CHANGELOG.md`, `IMPLEMENT.md`, contract, todo, lessons, design doc rows.
+
+## 2026-10-13: changing an error kind means grepping every test for the old kind first
+- **Mistake:** M7f S2 turned "database unreachable" from `internal` (500) into `unavailable` (503). Two `rb-server` tests used a closed port only to keep workers busy, but asserted `(500, "internal")`; they failed in the 40-minute real-Docker run instead of a 3-second unit run.
+- **Rule:** When an error's kind, exit code or status changes, `grep -rn '"<old kind>"\|<old status>'` across `crates/*/src/tests.rs` and `crates/*/tests/` before the full run. Classify each hit as intent (keep and justify) or incidental (update with a note).
+
+## 2026-10-13: every step of a verification script sets the environment it needs
+- **Mistake:** the M7g close script ran the mattermost `rb check` timing without `RB_DATABASE_URL`, so it hit the default port 55432 and exited 2 (`unavailable`). The log line `mattermost check: 2s exit=2` looked like a failed NFR until it was re-run by hand (0.16 s).
+- **Rule:** A verification script exports every variable it relies on once at the top (DB URL, Docker context), and records each command's stderr next to its exit code, so a non-zero exit explains itself in the log.
+
+## 2026-10-13: a new request parameter goes into every harness that translates parameters
+- **Mistake:** M7i added the boolean `exclude_tests` to the request layer and the CLI, but the CLI↔HTTP parity harness (`tests/api.rs`) maps boolean parameters to bare flags from its own list. It passed `--exclude-tests true`, and the run failed only in the 40-minute suite.
+- **Rule:** When adding a parameter, grep the tests for an existing sibling of the same type (`include_references` for a boolean, `limit` for a number) and add the new one wherever the sibling is listed, before the full run.
+
+## 2026-10-13: mutants of database writes run against a scratch database
+- **Mistake:** M7h mutant m103 removed the `WHERE` from `record_checkout` (`… WHERE name = $1 OR true`) and ran its test against the shared database. The store test's own repositories were fine, but every other repository's checkout became `/y/demo`. The evaluator found it two milestones later as wrong directives.
+- **Rule:** A mutant that can widen a write (`UPDATE`/`DELETE` predicates, `ON CONFLICT` targets) runs only against a test that uses `ScratchDb`, or against a disposable database. After any mutation run on the shared database, compare `SELECT name, checkout FROM rb.repo` (and row counts of the touched tables) before and after.
+
+## 2026-10-13: the binary of record is built from the last code change
+- **Mistake:** M7j's verify script built `var/m7j/bin/rb` and ran the suites. `PIPELINE` was bumped afterwards, so the binary of record wrote `m7i-1` snapshots. It would have taken M7i snapshots as up to date. M7i's binary had the same gap. Evaluator pass 2 found it from timestamps.
+- **Rule:** Bump `PIPELINE` (and every other code change) before the verify run. The verify script refuses a dirty `crates/` (`git diff --quiet HEAD -- crates migrations`) and prints `git rev-parse HEAD` next to the binary's sha256.

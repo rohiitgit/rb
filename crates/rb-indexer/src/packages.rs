@@ -46,7 +46,7 @@ pub(crate) fn is_input(path: &str) -> bool {
             // `tsconfig.json` texts feed exact alias resolution (contract M6c
             // S4); the packages stage ignores unknown basenames.
             | "tsconfig.json"
-    )
+    ) || name.ends_with(".csproj") // .NET SDK and implicit usings (contract M7d S1)
 }
 
 /// What this stage reads: the projects, the texts of [`is_input`] files, and every path of the
@@ -2657,6 +2657,68 @@ pub(crate) fn classpath(
     seen
 }
 
+/// Frameworks rb reads no routes or clients for (contract M7g S2): `(manager, package, name)`.
+/// npm and PyPI names match exactly (PyPI's normalised), Go module paths ignoring a
+/// `/vN` suffix, Maven by group (`io.micronaut/…`).
+const FRAMEWORKS_WITHOUT_A_PACK: &[(&str, &str, &str)] = &[
+    ("npm", "koa", "koa"),
+    ("npm", "@koa/router", "koa"),
+    ("npm", "koa-router", "koa"),
+    ("npm", "fastify", "fastify"),
+    ("npm", "@hapi/hapi", "hapi"),
+    ("npm", "routing-controllers", "routing-controllers"),
+    ("npm", "@nestjs/core", "nestjs (controllers)"),
+    ("go", "github.com/labstack/echo", "echo"),
+    ("go", "github.com/gofiber/fiber", "fiber"),
+    ("py", "flask", "flask"),
+    ("py", "django", "django (views)"),
+    ("py", "tornado", "tornado"),
+    ("maven", "io.micronaut", "micronaut"),
+    ("maven", "io.quarkus", "quarkus"),
+];
+
+/// One `framework_unsupported {service, framework, package}` per service and framework it depends
+/// on that rb has no pack for (contract M7g S2), so "no routes found" is never read as "none".
+pub(crate) fn unsupported_frameworks(edges: &[ManifestEdge]) -> Vec<Diagnostic> {
+    let mut found: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    for e in edges {
+        let Target::Package(p) = &e.target else {
+            continue;
+        };
+        let matched = FRAMEWORKS_WITHOUT_A_PACK
+            .iter()
+            .find(|(manager, package, _)| {
+                *manager == p.manager
+                    && match p.manager {
+                        "go" => {
+                            p.name == *package
+                                || p.name.strip_prefix(package).is_some_and(|rest| {
+                                    rest.strip_prefix("/v")
+                                        .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit()))
+                                })
+                        }
+                        "maven" => p.name.split('/').next() == Some(*package),
+                        // PyPI names arrive normalised (lower case) from the manifest readers.
+                        _ => p.name == *package,
+                    }
+            });
+        if let Some((_, _, framework)) = matched {
+            found
+                .entry((e.service.as_str(), framework))
+                .or_insert(p.name.as_str());
+        }
+    }
+    found
+        .into_iter()
+        .map(|((service, framework), package)| Diagnostic {
+            kind: "framework_unsupported".into(),
+            path: None,
+            span: None,
+            detail: json!({ "service": service, "framework": framework, "package": package }),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2704,6 +2766,59 @@ mod tests {
             .map(|d| format!("{} {}", d.kind, d.path.as_deref().unwrap_or("-")))
             .collect();
         (edges, diagnostics)
+    }
+
+    /// Contract M7g S2 (stress F25): a service depending on a framework rb has no route or client
+    /// pack for says so, one `framework_unsupported` per service and framework; supported ones
+    /// (express, gin, fastapi, Spring) say nothing.
+    #[test]
+    fn frameworks_without_a_pack_are_named() {
+        let projects = [
+            project("web", &["web/package.json"]),
+            project("api", &["api/go.mod"]),
+            project("py", &["py/pyproject.toml"]),
+            project("jvm", &["jvm/pom.xml"]),
+        ];
+        let files = [
+            (
+                "web/package.json",
+                r#"{"name":"web","dependencies":{"koa":"2.15.0","routing-controllers":"0.10.4","express":"4.18.2"}}"#,
+            ),
+            (
+                "api/go.mod",
+                "module example.com/api\n\ngo 1.21\n\nrequire (\n\tgithub.com/labstack/echo/v4 v4.11.4\n\tgithub.com/gin-gonic/gin v1.9.1\n)\n",
+            ),
+            (
+                "py/pyproject.toml",
+                "[project]\nname = \"py\"\ndependencies = [\"Flask>=3.0\", \"fastapi==0.110.0\"]\n",
+            ),
+            (
+                "jvm/pom.xml",
+                "<project><groupId>x</groupId><artifactId>jvm</artifactId><version>1</version><dependencies><dependency><groupId>io.micronaut</groupId><artifactId>micronaut-http</artifactId><version>4.0.0</version></dependency><dependency><groupId>org.springframework</groupId><artifactId>spring-web</artifactId><version>6.1.0</version></dependency></dependencies></project>",
+            ),
+        ];
+        let texts: BTreeMap<&str, String> =
+            files.iter().map(|(p, t)| (*p, (*t).to_owned())).collect();
+        let paths: BTreeSet<&str> = files.iter().map(|(p, _)| *p).collect();
+        let (edges, _) = dependencies(&Inputs {
+            projects: &projects,
+            texts: &texts,
+            paths: &paths,
+        });
+        let named: Vec<String> = unsupported_frameworks(&edges)
+            .iter()
+            .map(|d| d.detail.to_string())
+            .collect();
+        assert_eq!(
+            named,
+            [
+                r#"{"framework":"echo","package":"github.com/labstack/echo/v4","service":"api"}"#,
+                r#"{"framework":"micronaut","package":"io.micronaut/micronaut-http","service":"jvm"}"#,
+                r#"{"framework":"flask","package":"flask","service":"py"}"#,
+                r#"{"framework":"koa","package":"koa","service":"web"}"#,
+                r#"{"framework":"routing-controllers","package":"routing-controllers","service":"web"}"#,
+            ]
+        );
     }
 
     /// Contract M6c S4: `tsconfig.json` texts reach the manifest readers that

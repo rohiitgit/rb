@@ -1306,3 +1306,289 @@ fn a_publish_leaves_statistics_that_cover_the_new_snapshot() {
         );
     }
 }
+
+/// Contract M7f S6 (stress F14): vertices, edges and paths come back as their agtype text
+/// (`{…}::vertex`) instead of an internal cast error, while scalars stay raw as before (a
+/// string is not re-quoted).
+#[test]
+fn cypher_renders_graph_values_and_keeps_scalars_raw() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("cyvalues");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"c".repeat(40),
+            &json!({}),
+            &sample_graph(3, 1),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let limits = crate::CypherLimits::default();
+    let one = |store: &mut Store, q: &str| -> String {
+        let out = store.cypher(live.id, q, &["c".into()], limits).unwrap();
+        out.rows[0][0].clone()
+    };
+    let vertex = one(&mut store, "MATCH (n) RETURN n LIMIT 1");
+    assert!(vertex.ends_with("::vertex"), "{vertex}");
+    let edge = one(&mut store, "MATCH ()-[e]->() RETURN e LIMIT 1");
+    assert!(edge.ends_with("::edge"), "{edge}");
+    let path = one(&mut store, "MATCH p=()-[]->() RETURN p LIMIT 1");
+    assert!(path.ends_with("::path"), "{path}");
+    assert_eq!(one(&mut store, "RETURN 'x::vertex'"), "x::vertex");
+    assert_eq!(one(&mut store, "RETURN 1.5"), "1.5");
+    // Where `agtype_out` writes a scalar differently, the old rendering stands.
+    assert_eq!(one(&mut store, "RETURN 1.0"), "1");
+}
+
+/// Contract M7h S1: a repository remembers the checkout it was indexed from; recording one for
+/// a repository that does not exist creates nothing (a failed first index leaves no row).
+#[test]
+fn repos_remember_their_checkout() {
+    let Some(db) = db() else { return };
+    let (a, b) = (repo_name("checkout_a"), repo_name("checkout_b"));
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![a.clone(), b.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    store.ensure_repo(&a, None).unwrap();
+    store.ensure_repo(&b, None).unwrap();
+    let mine = |store: &mut Store| -> Vec<(String, Option<String>)> {
+        let mut rows = store.repo_checkouts().unwrap();
+        rows.retain(|(name, _)| name == &a || name == &b);
+        rows
+    };
+    assert_eq!(mine(&mut store), vec![(a.clone(), None), (b.clone(), None)]);
+
+    store.record_checkout(&a, "/x/demo").unwrap();
+    store.record_checkout(&b, "/x/demo").unwrap();
+    store.record_checkout(&a, "/y/demo").unwrap();
+    assert_eq!(
+        mine(&mut store),
+        vec![
+            (a.clone(), Some("/y/demo".into())),
+            (b.clone(), Some("/x/demo".into()))
+        ]
+    );
+
+    let ghost = repo_name("checkout_ghost");
+    store.record_checkout(&ghost, "/z").unwrap();
+    assert!(store.repo_names().unwrap().iter().all(|r| r != &ghost));
+}
+
+/// Contract M7h S4 (stress U9): every Cypher write is refused as read-only, whichever check
+/// stops it (a missing privilege or the read-only transaction); a denied function stays a plain
+/// refusal; a RETURN whose item count differs from the columns asked for names the columns.
+#[test]
+fn cypher_writes_read_as_read_only_and_columns_as_columns() {
+    use crate::CypherError;
+    let Some(db) = db() else { return };
+    let repo = repo_name("cywrites");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"c".repeat(40),
+            &json!({}),
+            &sample_graph(3, 1),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let limits = crate::CypherLimits::default();
+    let refusal = |store: &mut Store, q: &str, cols: &[&str]| -> CypherError {
+        let cols: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+        let err = store.cypher(live.id, q, &cols, limits).unwrap_err();
+        err.downcast::<CypherError>().unwrap()
+    };
+    for write in [
+        "CREATE (n:Novel {key: 'x'}) RETURN n",
+        "MATCH (n) SET n.key = 'x' RETURN n",
+        "MATCH (n) DETACH DELETE n RETURN 1",
+        "MERGE (n:Novel {key: 'x'}) RETURN n",
+    ] {
+        match refusal(&mut store, write, &["c"]) {
+            CypherError::ReadOnly(_) => {}
+            other => panic!("{write}: {other:?}"),
+        }
+    }
+    let denied = refusal(&mut store, "RETURN pg_catalog.pg_current_logfile()", &["c"]);
+    assert!(
+        matches!(&denied, CypherError::Refused(m) if m.contains("permission denied for function")),
+        "{denied:?}"
+    );
+    assert_eq!(
+        refusal(&mut store, "RETURN 1, 2", &["c"]),
+        CypherError::Columns { given: 1 }
+    );
+    assert_eq!(
+        refusal(&mut store, "RETURN 1", &["a", "b"]),
+        CypherError::Columns { given: 2 }
+    );
+    let read_only = refusal(&mut store, "CREATE (n:Novel) RETURN n", &["c"]);
+    assert!(
+        read_only
+            .to_string()
+            .starts_with("cypher is read-only: the query was refused ("),
+        "{read_only}"
+    );
+}
+
+/// Contract M7h S5: what `rb doctor` asks the database: its and AGE's versions, the embedded
+/// migrations not applied (none after `migrate`), and whether the server sees a file the host
+/// writes into the load directory (and not one it never wrote).
+#[test]
+fn doctor_probes_read_the_server() {
+    let Some(db) = db() else { return };
+    let mut store = Store::connect(&db.url).unwrap();
+    let (postgres, age) = store.server_versions().unwrap();
+    assert!(
+        postgres.chars().next().is_some_and(|c| c.is_ascii_digit()),
+        "{postgres}"
+    );
+    assert!(age.is_some_and(|v| !v.is_empty()));
+    assert_eq!(store.pending_migrations().unwrap(), Vec::<&str>::new());
+    let dir = load_dir();
+    let name = format!("rb-doctor-test-{}.probe", std::process::id());
+    std::fs::write(dir.host.join(&name), b"probe").unwrap();
+    let seen = store.server_sees_load_file(&dir, &name);
+    std::fs::remove_file(dir.host.join(&name)).unwrap();
+    assert!(seen.unwrap());
+    assert!(
+        !store
+            .server_sees_load_file(&dir, "rb-doctor-never-written")
+            .unwrap()
+    );
+}
+
+/// Contract M7i S2 (stress F31): HTTP coverage counts the endpoints that only a spec states
+/// (frameworks `openapi`, nothing handling them); a spec endpoint a code handler implements,
+/// or a code route, is not one.
+#[test]
+fn http_coverage_counts_spec_only_endpoints() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("speconly");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut b = GraphBuilder::new();
+    let endpoint = |key: &str| NodeKey::new(NodeKind::Endpoint, key.to_owned());
+    let attrs = |frameworks: &[&str]| -> rb_model::Attrs {
+        let mut a = rb_model::Attrs::new();
+        a.insert("frameworks".into(), json!(frameworks));
+        a
+    };
+    b.add_node(
+        endpoint("HTTP GET /stale @."),
+        "GET /stale",
+        attrs(&["openapi"]),
+    )
+    .unwrap();
+    b.add_node(
+        endpoint("HTTP GET /old @."),
+        "GET /old",
+        attrs(&["openapi"]),
+    )
+    .unwrap();
+    b.add_node(
+        endpoint("HTTP GET /impl @."),
+        "GET /impl",
+        attrs(&["openapi"]),
+    )
+    .unwrap();
+    b.add_node(
+        endpoint("HTTP GET /code @."),
+        "GET /code",
+        attrs(&["express"]),
+    )
+    .unwrap();
+    let handler = NodeKey::new(NodeKind::Symbol, "h".to_owned());
+    b.add_node(handler.clone(), "h", Default::default())
+        .unwrap();
+    b.add_edge(NewEdge::new(
+        endpoint("HTTP GET /impl @."),
+        EdgeKind::HandledBy,
+        handler,
+        Provenance::Treesitter,
+        Certainty::Heuristic,
+    ))
+    .unwrap();
+    let mut store = Store::connect(&db.url).unwrap();
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"d".repeat(40),
+            &json!({}),
+            &b.finish().unwrap(),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let coverage = store.http_coverage(live.id).unwrap();
+    assert_eq!((coverage.routes, coverage.spec_only), (4, 2));
+}
+
+/// Contract M7i S3 (stress O3): one `rb index` per repository at a time: a session holding a
+/// repository's index lock keeps another session from taking it (other repositories are
+/// free), until it lets go.
+#[test]
+fn index_locks_are_per_repository_and_per_session() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("indexlock");
+    let mut a = Store::connect(&db.url).unwrap();
+    let mut b = Store::connect(&db.url).unwrap();
+    assert!(a.try_lock_index(&repo).unwrap());
+    assert!(!b.try_lock_index(&repo).unwrap());
+    assert!(b.try_lock_index(&format!("{repo}_other")).unwrap());
+    drop(a);
+    b.lock_index(&repo).unwrap();
+}
+
+/// Contract M7i S5 (stress O4): cached facts stream a row at a time and yield exactly the rows
+/// `load_facts` returns (requested keys only, each once).
+#[test]
+fn cached_facts_stream_the_rows_load_returns() {
+    let Some(db) = db() else { return };
+    let scratch = ScratchDb::create(&db.url, "stream");
+    let mut store = Store::connect(&scratch.url).unwrap();
+    let blob = |n: u8| format!("{n:040}");
+    store
+        .save_facts(&[
+            (blob(1), "x;go".into(), b"{\"a\":1}".to_vec()),
+            (blob(2), "x;go".into(), b"{\"b\":2}".to_vec()),
+            (blob(3), "x;go".into(), b"{\"c\":3}".to_vec()),
+        ])
+        .unwrap();
+    let keys = [
+        (blob(1), "x;go".to_owned()),
+        (blob(3), "x;go".to_owned()),
+        (blob(9), "x;go".to_owned()),
+    ];
+    let mut streamed = std::collections::HashMap::new();
+    store
+        .for_each_facts(&keys, |key, bytes| {
+            assert!(streamed.insert(key, bytes.to_vec()).is_none());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(streamed, store.load_facts(&keys).unwrap());
+    assert_eq!(streamed.len(), 2);
+    let err = store
+        .for_each_facts(&keys, |_, _| anyhow::bail!("stop"))
+        .unwrap_err();
+    assert_eq!(err.to_string(), "stop");
+}

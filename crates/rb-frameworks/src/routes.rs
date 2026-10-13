@@ -84,6 +84,16 @@ pub struct RouteFact {
     /// A Go `ServeMux` host pattern's host (`example.com/x`), lower-cased without the port; the
     /// route serves only requests for that host (evaluator pass 1, P8).
     pub host: Option<String>,
+    /// The path as written when it is a name (`routeNames.create`, contract M7c S1): `path` is
+    /// empty and the endpoint stage folds the name across files.
+    pub path_name: Option<PathName>,
+}
+
+/// A route path written as a name, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathName {
+    pub text: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +117,9 @@ pub struct RouterDecl {
     pub binding: Option<usize>,
     /// Bound at the top level of the file, so other modules may import it.
     pub top_level: bool,
+    /// Opted into case-sensitive path matching (Express: `Router({ caseSensitive })`, the app's
+    /// `case sensitive routing` setting). Without it Express folds case (contract M7i S1).
+    pub case_sensitive: bool,
 }
 
 /// `parent.use(prefix, child)`.
@@ -141,6 +154,17 @@ pub struct FileRoutes {
     /// endpoints from interfaces alone). A spec operation matching one is handled by the
     /// method's implementors.
     pub interface_routes: Vec<InterfaceRoute>,
+    /// gRPC server registrations (contract M7a S3): the proto services this file serves.
+    pub grpc_servers: Vec<GrpcServer>,
+}
+
+/// One gRPC server registration: the simple name of the proto service it serves, as the
+/// generated code spells it (`RegisterXServer`, `add_XServicer_to_server`,
+/// `addService(….X.service, …)`, `extends XGrpc.XImplBase`, `: X.XBase`), and its span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcServer {
+    pub service: String,
+    pub span: Span,
 }
 
 /// One mapping on an interface method: the composed raw path, methods, the method's
@@ -169,7 +193,77 @@ pub fn routes(language: Language, facts: &FileFacts) -> FileRoutes {
         // Contract M6i S2: route packs land with Tier B.
         Language::Kotlin | Language::CSharp => {}
     }
+    grpc_servers(language, facts, &mut out);
     out
+}
+
+/// gRPC server registrations (contract M7a S3), allow-listed per language on the names the
+/// generated code gives them: Go `Register{X}Server(…)`, Python `add_{X}Servicer_to_server(…)`,
+/// JS/TS `addService(<…>.{X}.service, …)`, Java a class extending `{X}Grpc.{X}ImplBase` or
+/// `{X}ImplBase`, C# a class deriving `{X}.{X}Base`. `X` is matched against proto service names
+/// downstream; a registration naming no committed proto service serves nothing.
+fn grpc_servers(language: Language, facts: &FileScope<'_>, out: &mut FileRoutes) {
+    let mut push = |service: &str, span: Span| {
+        if !service.is_empty() {
+            out.grpc_servers.push(GrpcServer {
+                service: service.to_owned(),
+                span,
+            });
+        }
+    };
+    match language {
+        Language::Go
+        | Language::Python
+        | Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript => {
+            for chain in &facts.chains {
+                crate::work::tick(chain.links.len());
+                for link in &chain.links {
+                    let service = match language {
+                        Language::Go => link
+                            .name
+                            .strip_prefix("Register")
+                            .and_then(|n| n.strip_suffix("Server")),
+                        Language::Python => link
+                            .name
+                            .strip_prefix("add_")
+                            .and_then(|n| n.strip_suffix("Servicer_to_server")),
+                        _ if link.name == "addService" => match link.args.first() {
+                            Some(Arg::Name { text, .. }) => text
+                                .strip_suffix(".service")
+                                .map(|t| t.rsplit('.').next().unwrap_or(t)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(service) = service {
+                        push(service, link.span);
+                    }
+                }
+            }
+        }
+        Language::Java | Language::CSharp => {
+            for d in &facts.facts.definitions {
+                crate::work::tick(d.supertypes.len());
+                for st in &d.supertypes {
+                    let mut segments = st.name.rsplit('.');
+                    let last = segments.next().unwrap_or("");
+                    let outer = segments.next();
+                    let service = if language == Language::Java {
+                        last.strip_suffix("ImplBase")
+                            .filter(|x| outer.is_none_or(|o| o.strip_suffix("Grpc") == Some(*x)))
+                    } else {
+                        last.strip_suffix("Base").filter(|x| outer == Some(*x))
+                    };
+                    if let Some(service) = service {
+                        push(service, st.span);
+                    }
+                }
+            }
+        }
+        Language::Kotlin => {}
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -563,6 +657,7 @@ fn spring(facts: &FileScope<'_>, out: &mut FileRoutes) {
                                         span: d.span,
                                         enclosing: Some(m),
                                         host: None,
+                                        path_name: None,
                                     });
                                 }
                             }
@@ -595,12 +690,15 @@ const EXPRESS_VERBS: &[&str] = &[
 struct ExpressNames {
     module: HashSet<String>,
     router: HashSet<String>,
+    /// Some chain constructs straight from `require("express")` (contract M7c S3).
+    inline: bool,
 }
 
 fn express_names(facts: &FileFacts) -> ExpressNames {
     let mut names = ExpressNames {
         module: HashSet::new(),
         router: HashSet::new(),
+        inline: facts.chains.iter().any(|c| inline_express(c).is_some()),
     };
     for i in facts.imports.iter().filter(|i| i.module == "express") {
         names.module.extend(i.alias.clone());
@@ -634,8 +732,45 @@ fn express_names(facts: &FileFacts) -> ExpressNames {
     names
 }
 
+/// `require("express")()` (an app) and `require("express").Router()` (a router), constructed
+/// inline with no binding of the module (contract M7c S3).
+fn inline_express(chain: &CallChain) -> Option<RouterKind> {
+    let [require, ctor, ..] = chain.links.as_slice() else {
+        return None;
+    };
+    if chain.root.is_some()
+        || require.name != "require"
+        || require.args.first().and_then(literal).as_deref() != Some("express")
+    {
+        return None;
+    }
+    match ctor.name.as_str() {
+        "" => Some(RouterKind::App),
+        "Router" => Some(RouterKind::Router),
+        _ => None,
+    }
+}
+
+/// Whether a router construction passes a `caseSensitive` option (`Router({ caseSensitive })`).
+/// Its value is not read (a boolean literal reaches the facts without its text), so any
+/// mention keeps exact-case matching, as before M7i.
+fn case_sensitive_option(chain: &CallChain) -> bool {
+    let ctor = if inline_express(chain).is_some() {
+        chain.links.get(1)
+    } else {
+        chain.links.first()
+    };
+    matches!(
+        ctor.and_then(|l| l.args.first()),
+        Some(Arg::Object { entries, .. }) if entries.iter().any(|e| e.key == "caseSensitive")
+    )
+}
+
 /// The router kind a binding's initialiser creates, if any.
 fn router_kind(names: &ExpressNames, chain: &CallChain) -> Option<RouterKind> {
+    if let Some(kind) = inline_express(chain) {
+        return Some(kind);
+    }
     // Only the first link decides: a construction followed by any links (`Router()`,
     // `Router().use(…)`, `express()`) binds; the rest are mounts and routes on it.
     let first = chain.links.first()?;
@@ -649,7 +784,7 @@ fn router_kind(names: &ExpressNames, chain: &CallChain) -> Option<RouterKind> {
 
 fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
     let names = express_names(facts);
-    if names.module.is_empty() && names.router.is_empty() {
+    if names.module.is_empty() && names.router.is_empty() && !names.inline {
         return;
     }
     let mut binding_router: HashMap<usize, usize> = HashMap::new(); // binding → router
@@ -671,6 +806,7 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 span: b.span,
                 binding: Some(bi),
                 top_level: b.scope.is_none(),
+                case_sensitive: case_sensitive_option(chain),
             });
         }
     }
@@ -690,6 +826,7 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                     span: c.span,
                     binding: None,
                     top_level: true,
+                    case_sensitive: case_sensitive_option(c),
                 });
                 out.routers.len() - 1
             })
@@ -724,6 +861,13 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
             _ => (None, &links[..]),
         };
         for link in verbs {
+            // `app.set("case sensitive routing", …)` / `app.enable(…)`: any value counts.
+            if matches!(link.name.as_str(), "set" | "enable")
+                && link.args.first().and_then(literal).as_deref() == Some("case sensitive routing")
+            {
+                out.routers[router].case_sensitive = true;
+                continue;
+            }
             if link.name == "use" {
                 let (prefix, children) = match link.args.first() {
                     Some(a @ Arg::Template { .. }) => (literal(a), &link.args[1..]),
@@ -751,12 +895,27 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 None => continue,
             };
             let Some(path_arg) = path_arg else { continue };
-            if !matches!(path_arg, Arg::Template { .. }) {
-                continue;
-            }
-            let Some(path) = literal(path_arg) else {
-                dynamic(out, chain.span, format!("{path_arg:?}"));
-                continue;
+            // A string folds here; a name folds across files in the endpoint stage (contract
+            // M7c S1); anything else is counted, never dropped silently.
+            let (path, path_name) = match path_arg {
+                Arg::Template { .. } => match literal(path_arg) {
+                    Some(path) => (path, None),
+                    None => {
+                        dynamic(out, chain.span, format!("{path_arg:?}"));
+                        continue;
+                    }
+                },
+                Arg::Name { text, span } => (
+                    String::new(),
+                    Some(PathName {
+                        text: text.clone(),
+                        span: *span,
+                    }),
+                ),
+                _ => {
+                    dynamic(out, chain.span, format!("{path_arg:?}"));
+                    continue;
+                }
             };
             out.routes.push(RouteFact {
                 framework: Framework::Express,
@@ -767,6 +926,7 @@ fn express(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 span: chain.span,
                 enclosing: chain.enclosing,
                 host: None,
+                path_name,
             });
         }
     }
@@ -917,6 +1077,7 @@ fn gin(facts: &FileScope<'_>, out: &mut FileRoutes) {
             span: chain.span,
             enclosing: chain.enclosing,
             host: None,
+            path_name: None,
         });
     }
 }
@@ -1225,6 +1386,7 @@ fn chi(facts: &FileScope<'_>, out: &mut FileRoutes) {
             span: chain.span,
             enclosing: chain.enclosing,
             host: None,
+            path_name: None,
         });
     }
 }
@@ -1238,12 +1400,12 @@ const FASTAPI_METHODS: &[&str] = &[
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
 
-/// A FastAPI app or router bound in this file: its own prefix (`None` when
-/// a `prefix` keyword is present but not a literal; `""` for apps and when
-/// absent), and the binding for endpoint identity.
+/// A FastAPI app or router bound in this file: its router in [`FileRoutes::routers`] and its
+/// own prefix (`None` when a `prefix` keyword is present but not a literal; `""` for apps and
+/// when absent).
 struct FastAPIApp {
     prefix: Option<String>,
-    binding: usize,
+    router: usize,
 }
 
 fn fastapi(facts: &FileScope<'_>, out: &mut FileRoutes) {
@@ -1309,14 +1471,31 @@ fn fastapi(facts: &FileScope<'_>, out: &mut FileRoutes) {
             bi,
             FastAPIApp {
                 prefix,
-                binding: bi,
+                router: out.routers.len(),
             },
         );
+        out.routers.push(RouterDecl {
+            name: b.name.clone(),
+            kind: if is_router {
+                RouterKind::Router
+            } else {
+                RouterKind::App
+            },
+            span: b.span,
+            binding: Some(bi),
+            // A Python module-level assignment is a top-level `Constant` definition that scopes
+            // its own binding: importable from other modules like an unscoped one.
+            top_level: b.scope.is_none_or(|s| {
+                facts.facts.definitions.get(s).is_some_and(|d| {
+                    d.parent.is_none() && d.kind == DefKind::Constant && d.name == b.name
+                })
+            }),
+            // FastAPI (Starlette) matches paths case-sensitively.
+            case_sensitive: true,
+        });
     }
-    // Routes per decorator, with the local path and the router they hang
-    // off (`None` for apps); prefixes compose in the post-pass below.
-    let mut locals: Vec<String> = Vec::new();
-    let mut routers_of: Vec<Option<usize>> = Vec::new();
+    // Routes per decorator on the app or router they hang off, the router's own literal
+    // prefix folded in (contract M7a S2); a non-literal own prefix leaves the prefix unknown.
     for (di, d) in facts.facts.definitions.iter().enumerate() {
         if !matches!(d.kind, DefKind::Function | DefKind::Method) {
             continue;
@@ -1364,28 +1543,29 @@ fn fastapi(facts: &FileScope<'_>, out: &mut FileRoutes) {
                 dynamic(out, deco.span, format!("@{obj}.{method}"));
                 continue;
             };
+            let (path, base) = match &app.prefix {
+                Some(own) => (join(own, &path), RouteBase::Router(app.router)),
+                None => (path, RouteBase::Unknown(bi)),
+            };
             for m in methods {
                 out.routes.push(RouteFact {
                     framework: Framework::FastAPI,
                     method: m,
                     path: path.clone(),
-                    base: match &app.prefix {
-                        Some(_) => RouteBase::Root,
-                        None => RouteBase::Unknown(app.binding),
-                    },
+                    base,
                     handler: Handler::Definition(di),
                     span: deco.span,
                     enclosing: Some(di),
                     host: None,
+                    path_name: None,
                 });
-                locals.push(path.clone());
-                routers_of.push(Some(bi));
             }
         }
     }
-    // `app.include_router(router)` / `router.include_router(sub)` edges:
-    // (parent binding, child binding, extra prefix).
-    let mut includes: Vec<(usize, usize, String)> = Vec::new();
+    // `parent.include_router(child, prefix=…)` mounts, composed with every other mount by the
+    // shared router composer, across files (contract M7a S2). The child is a local app or
+    // router, an imported name, or `module.router` through an imported submodule; a
+    // non-literal prefix is an unknown one.
     for chain in &facts.chains {
         let Some(last) = chain.links.last() else {
             continue;
@@ -1399,232 +1579,34 @@ fn fastapi(facts: &FileScope<'_>, out: &mut FileRoutes) {
         if root.contains('.') {
             continue;
         }
-        let Some(parent) = facts.binding_index_at(root, chain.span) else {
-            continue;
-        };
-        if !apps.contains_key(&parent) {
-            continue;
-        }
-        let Some(Arg::Name { text, .. }) = last.args.first() else {
-            continue;
-        };
-        if text.contains('.') {
-            continue;
-        }
-        let Some(child) = facts.binding_index_at(text, chain.span) else {
-            continue;
-        };
-        if !apps.contains_key(&child) || child == parent {
-            continue;
-        }
-        let extra = match crate::clients::kwarg(&last.args, "prefix") {
-            None => String::new(),
-            Some(arg) => match literal(arg) {
-                Some(p) => p,
-                None => continue,
-            },
-        };
-        includes.push((parent, child, extra));
-    }
-    // Full prefixes per router: its own, under every include edge into it
-    // (an include cycle or unknown component composes nothing: the route
-    // keeps its collected path). Parents per router, in edge order: one
-    // linear pass, so composing does not rescan every edge per level
-    // (contract M6d S13).
-    let mut parents_of: HashMap<usize, Vec<(usize, String)>> = HashMap::new();
-    for (parent, child, extra) in &includes {
-        crate::work::tick(1);
-        parents_of
-            .entry(*child)
-            .or_default()
-            .push((*parent, extra.clone()));
-    }
-    // Whether the include edges hold a directed cycle (iterative DFS, one
-    // linear pass). Shared-prefix memoisation below is only valid when no
-    // composition path revisits a router; a cyclic file keeps the legacy
-    // per-route walk (a router including its includer is degenerate input).
-    fn has_include_cycle(includes: &[(usize, usize, String)]) -> bool {
-        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (parent, child, _) in includes {
-            crate::work::tick(1);
-            children.entry(*parent).or_default().push(*child);
-        }
-        let mut color: HashMap<usize, u8> = HashMap::new();
-        for &root in children.keys() {
-            if color.contains_key(&root) {
-                continue;
-            }
-            color.insert(root, 1);
-            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
-            while let Some((node, ci)) = stack.pop() {
-                let kids: &[usize] = children.get(&node).map_or(&[], Vec::as_slice);
-                if ci < kids.len() {
-                    stack.push((node, ci + 1));
-                    let next = kids[ci];
-                    crate::work::tick(1);
-                    match color.get(&next) {
-                        Some(1) => return true,
-                        Some(_) => {}
-                        None => {
-                            color.insert(next, 1);
-                            stack.push((next, 0));
-                        }
-                    }
-                } else {
-                    color.insert(node, 2);
-                }
-            }
-        }
-        false
-    }
-    fn full_prefix(
-        apps: &HashMap<usize, FastAPIApp>,
-        includes: &[(usize, usize, String)],
-        router: usize,
-        seen: &mut HashSet<usize>,
-        depth: usize,
-    ) -> Vec<String> {
-        if depth >= MAX_GROUP_DEPTH || !seen.insert(router) {
-            return Vec::new();
-        }
-        let own = match apps.get(&router) {
-            Some(FastAPIApp {
-                prefix: Some(p), ..
-            }) => p.clone(),
-            _ => {
-                seen.remove(&router);
-                return Vec::new();
-            }
-        };
-        let mut out = Vec::new();
-        let mut included = false;
-        for (parent, child, extra) in includes {
-            crate::work::tick(1);
-            if *child != router {
-                continue;
-            }
-            included = true;
-            for base in full_prefix(apps, includes, *parent, seen, depth + 1) {
-                out.push(join(&join(&base, extra), &own));
-            }
-        }
-        if !included {
-            out.push(own);
-        }
-        seen.remove(&router);
-        out
-    }
-    /// Shared-prefix composition over an acyclic include graph: (prefix,
-    /// levels above the router) per router, memoised by router. Levels
-    /// replace the legacy walk's depth parameter: a path of k edges reaches
-    /// exactly the calls below the depth cap, so the top level keeps levels
-    /// below `MAX_GROUP_DEPTH`. Diamond paths still expand per path
-    /// (amendment 14 F4: a router included twice serves both), which bounds
-    /// work by the output. The `seen` guard never fires on an acyclic graph
-    /// (firing means a repeated router on one path, i.e. a cycle), so
-    /// memoised values are path-independent; it stays as termination
-    /// defense, exactly as in the legacy walk.
-    fn full_prefix_levels(
-        apps: &HashMap<usize, FastAPIApp>,
-        parents_of: &HashMap<usize, Vec<(usize, String)>>,
-        router: usize,
-        seen: &mut HashSet<usize>,
-        memo: &mut HashMap<usize, Vec<(String, usize)>>,
-    ) -> Vec<(String, usize)> {
-        if let Some(hit) = memo.get(&router) {
-            return hit.clone();
-        }
-        if !seen.insert(router) {
-            return Vec::new();
-        }
-        let own = match apps.get(&router) {
-            Some(FastAPIApp {
-                prefix: Some(p), ..
-            }) => p.clone(),
-            _ => {
-                seen.remove(&router);
-                memo.insert(router, Vec::new());
-                return Vec::new();
-            }
-        };
-        let mut out = Vec::new();
-        let mut included = false;
-        if let Some(parents) = parents_of.get(&router) {
-            for (parent, extra) in parents {
-                crate::work::tick(1);
-                included = true;
-                for (base, levels) in full_prefix_levels(apps, parents_of, *parent, seen, memo) {
-                    out.push((join(&join(&base, extra), &own), levels + 1));
-                }
-            }
-        }
-        if !included {
-            out.push((own, 0));
-        }
-        seen.remove(&router);
-        memo.insert(router, out.clone());
-        out
-    }
-    // One prefix list per router: a route's composition is a pure function
-    // of its router, so routes sharing one share the work.
-    let mut seen_routers = HashSet::new();
-    let mut routers = Vec::new();
-    for router in routers_of.iter().flatten() {
-        if seen_routers.insert(*router) {
-            routers.push(*router);
-        }
-    }
-    let mut composed: HashMap<usize, Vec<String>> = HashMap::new();
-    if has_include_cycle(&includes) {
-        for router in &routers {
-            composed.insert(
-                *router,
-                full_prefix(&apps, &includes, *router, &mut HashSet::new(), 0),
-            );
-        }
-    } else {
-        let mut memo: HashMap<usize, Vec<(String, usize)>> = HashMap::new();
-        for router in &routers {
-            composed.insert(
-                *router,
-                full_prefix_levels(&apps, &parents_of, *router, &mut HashSet::new(), &mut memo)
-                    .into_iter()
-                    .filter(|(_, levels)| *levels < MAX_GROUP_DEPTH)
-                    .map(|(prefix, _)| prefix)
-                    .collect(),
-            );
-        }
-    }
-    // Compose include_router edges into router paths: one row per prefix
-    // (a router included twice serves both).
-    let mut rewritten: Vec<(usize, Vec<String>)> = Vec::new();
-    for (i, route) in out.routes.iter().enumerate() {
-        let (Some(router), Some(local)) = (routers_of.get(i).copied().flatten(), locals.get(i))
+        let Some(parent) = facts
+            .binding_index_at(root, chain.span)
+            .and_then(|bi| apps.get(&bi))
         else {
             continue;
         };
-        // Zero (unknown) or identical prefixes: keep the collected row.
-        let fresh: Vec<String> = composed.get(&router).map_or(Vec::new(), |prefixes| {
-            prefixes
-                .iter()
-                .map(|prefix| join(prefix, local))
-                .filter(|composed| composed != &route.path)
-                .collect()
+        let Some(Arg::Name { text, .. }) = last.args.first() else {
+            continue;
+        };
+        let child_local = (!text.contains('.'))
+            .then(|| facts.binding_index_at(text, chain.span))
+            .flatten()
+            .and_then(|bi| apps.get(&bi))
+            .map(|a| a.router);
+        if child_local == Some(parent.router) {
+            continue;
+        }
+        let prefix = match crate::clients::kwarg(&last.args, "prefix") {
+            None => Some(String::new()),
+            Some(arg) => literal(arg),
+        };
+        out.mounts.push(Mount {
+            parent: parent.router,
+            prefix,
+            child: text.clone(),
+            child_local,
+            span: chain.span,
         });
-        if !fresh.is_empty() {
-            rewritten.push((i, fresh));
-        }
-    }
-    for (i, paths) in rewritten {
-        let mut paths = paths.into_iter();
-        if let Some(first) = paths.next() {
-            out.routes[i].path = first;
-        }
-        for path in paths {
-            let mut clone = out.routes[i].clone();
-            clone.path = path;
-            out.routes.push(clone);
-        }
     }
 }
 
@@ -1683,6 +1665,7 @@ fn net_http(facts: &FileScope<'_>, out: &mut FileRoutes) {
             span: chain.span,
             enclosing: chain.enclosing,
             host,
+            path_name: None,
         });
     }
 }
@@ -1855,6 +1838,35 @@ public class AuthController {
 
     const EXPRESS_APP: &str = "import express from \"express\";\nimport { authRouter } from \"./routes/auth\";\n\nexport const app = express();\napp.use(express.json());\napp.use(\"/api/v1\", authRouter);\napp.get(\"/health\", health);\n// app.post(\"/commented\", h);\n";
 
+    /// Contract M7i S1 (stress F32): Express routers match paths case-insensitively unless they
+    /// opt in: `Router({ caseSensitive })` or the app's `set`/`enable("case sensitive
+    /// routing")`. Any opt-in counts (its value is not read), so matching stays exact as before.
+    #[test]
+    fn express_routers_record_a_case_sensitive_opt_in() {
+        let src = "import express, { Router } from \"express\";\n\
+                   const app = express();\nconst strict = express();\nstrict.enable(\"case sensitive routing\");\n\
+                   const set = express();\nset.set(\"case sensitive routing\", true);\n\
+                   const r = Router();\nconst cs = Router({ caseSensitive: true });\nconst other = Router({ mergeParams: true });\n";
+        let facts = extract(Language::TypeScript, src.as_bytes()).unwrap();
+        let sensitive: Vec<(String, bool)> = routes(Language::TypeScript, &facts)
+            .routers
+            .iter()
+            .map(|r| (r.name.clone(), r.case_sensitive))
+            .collect();
+        let want = |n: &str, cs: bool| (n.to_owned(), cs);
+        assert_eq!(
+            sensitive,
+            [
+                want("app", false),
+                want("strict", true),
+                want("set", true),
+                want("r", false),
+                want("cs", true),
+                want("other", false),
+            ]
+        );
+    }
+
     #[test]
     fn express_apps_routes_and_mounts() {
         assert_eq!(
@@ -1876,6 +1888,7 @@ public class AuthController {
                     .span,
                 binding: Some(facts.bindings.iter().position(|b| b.name == "app").unwrap()),
                 top_level: true,
+                case_sensitive: false,
             }]
         );
         assert_eq!(r.mounts.len(), 1, "{:?}", r.mounts);
@@ -2011,6 +2024,19 @@ public class AuthController {
         // A parameter named like an app is not one.
         let param = "import express from \"express\";\nexport function routes(app) { app.get(\"/p\", h); }\n";
         assert!(summary(Language::JavaScript, param).is_empty());
+        // Contract M7c S3 (stress F12): the inline factory forms, with no `express` binding.
+        let inline = "const app = require(\"express\")();\napp.get(\"/a\", h);\nconst r = require(\"express\").Router();\nr.get(\"/b\", h);\nconst other = require(\"koa\")();\nother.get(\"/c\", h);\n";
+        assert_eq!(
+            summary(Language::JavaScript, inline),
+            ["GET /a router app name h", "GET /b router r name h"]
+        );
+        let facts = extract(Language::JavaScript, inline.as_bytes()).unwrap();
+        let kinds: Vec<RouterKind> = routes(Language::JavaScript, &facts)
+            .routers
+            .iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(kinds, [RouterKind::App, RouterKind::Router]);
     }
 
     const GIN: &str = "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\nfunc main() {\n\tr := gin.Default()\n\tapi := r.Group(\"/billing\")\n\tapi.POST(\"/invoices/:id/pay\", payInvoice)\n\tr.POST(\"/internal/mfa/email\", mfaEcho)\n\tv := api.Group(\"/v\")\n\tv.GET(\"/x\", func(c *gin.Context) {})\n\tr.Group(\"/inline\").Handle(\"PATCH\", \"/y\", auth, h.Y)\n\tr.Handle(http.MethodDelete, \"/z\", h.Z)\n\tr.Any(\"/all\", h.All)\n}\n\nfunc register(g *gin.RouterGroup, e *gin.Engine) {\n\tg.GET(\"/param\", h.P)\n\te.GET(\"/engine\", h.E)\n}\n";
@@ -2133,20 +2159,68 @@ public class AuthController {
         assert!(small > 0 && large <= 5 * small, "{small} → {large}");
     }
 
-    /// Contract M6d S9: FastAPI decorators enter as routes — app and router
-    /// verbs, `APIRouter` prefixes, and `include_router` composition (with
-    /// its own prefix). Handlers are the decorated functions.
+    /// `parent <- child prefix` per mount (`?` when unknown), `local` when the child is a router
+    /// of the same file.
+    fn mounts(language: Language, src: &str) -> Vec<String> {
+        let facts = extract(language, src.as_bytes()).unwrap();
+        let r = routes(language, &facts);
+        r.mounts
+            .iter()
+            .map(|m| {
+                let prefix = m
+                    .prefix
+                    .as_deref()
+                    .map_or("?".to_owned(), |p| format!("{p:?}"));
+                let local = if m.child_local.is_some() {
+                    " local"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} <- {} {prefix}{local}",
+                    r.routers[m.parent].name, m.child
+                )
+            })
+            .collect()
+    }
+
+    /// Contract M6d S9, M7a S2: FastAPI decorators enter as routes on their app or router, an
+    /// `APIRouter`'s own prefix folded into the path; `include_router` is a mount (with its
+    /// own prefix) that the shared composer composes, in this file and across files. Handlers
+    /// are the decorated functions.
     #[test]
     fn fastapi_decorators_prefixes_and_includes() {
-        let src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\nrouter = APIRouter(prefix=\"/api\")\nv1 = APIRouter()\n\n@app.get(\"/health\")\ndef health():\n    pass\n\n@router.post(\"/login\")\ndef login():\n    pass\n\n@v1.get(\"/users\")\ndef users():\n    pass\n\n@v1.delete(\"/users/{id}\")\ndef drop_user():\n    pass\n\napp.include_router(router)\napp.include_router(v1, prefix=\"/v1\")\napp.include_router(router, prefix=\"/v2\")\n";
+        let src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\nrouter = APIRouter(prefix=\"/api\")\nv1 = APIRouter()\n\n@app.get(\"/health\")\ndef health():\n    pass\n\n@router.post(\"/login\")\ndef login():\n    pass\n\n@v1.get(\"/users\")\ndef users():\n    pass\n\n@v1.delete(\"/users/{id}\")\ndef drop_user():\n    pass\n\napp.include_router(router)\napp.include_router(v1, prefix=\"/v1\")\napp.include_router(router, prefix=\"/v2\")\napp.include_router(articles.router, prefix=settings.PREFIX)\n";
         assert_eq!(
             summary(Language::Python, src),
             [
-                "GET /health root def health",
-                "POST /api/login root def login",
-                "GET /v1/users root def users",
-                "DELETE /v1/users/{} root def drop_user",
-                "POST /v2/api/login root def login",
+                "GET /health router app def health",
+                "POST /api/login router router def login",
+                "GET /users router v1 def users",
+                "DELETE /users/{} router v1 def drop_user",
+            ]
+        );
+        assert_eq!(
+            mounts(Language::Python, src),
+            [
+                "app <- router \"\" local",
+                "app <- v1 \"/v1\" local",
+                "app <- router \"/v2\" local",
+                "app <- articles.router ?",
+            ]
+        );
+        let facts = extract(Language::Python, src.as_bytes()).unwrap();
+        let kinds: Vec<(String, RouterKind, bool)> = routes(Language::Python, &facts)
+            .routers
+            .iter()
+            .map(|r| (r.name.clone(), r.kind, r.top_level))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("app".to_owned(), RouterKind::App, true),
+                ("router".to_owned(), RouterKind::Router, true),
+                ("v1".to_owned(), RouterKind::Router, true),
             ]
         );
         // Without the fastapi import nothing is a route.
@@ -2154,20 +2228,52 @@ public class AuthController {
         assert!(summary(Language::Python, &no_import).is_empty());
     }
 
-    /// S13: an include cycle keeps the legacy per-route walk — a router
-    /// including its includer is degenerate input, and shared-prefix
-    /// memoisation is only valid when no path revisits a router. This pins
-    /// the legacy rows (a route keeps its collected path where the cycle
-    /// cuts composition); the always-memo mutant serves y at `/y`.
+    /// Contract M7a S3 (stress F17): allow-listed gRPC server registrations name the proto
+    /// service they serve; near misses name nothing.
     #[test]
-    fn fastapi_include_cycles_keep_legacy_rows() {
+    fn grpc_server_registrations_name_their_service() {
+        let servers = |language: Language, src: &str| -> Vec<String> {
+            let facts = extract(language, src.as_bytes()).unwrap();
+            routes(language, &facts)
+                .grpc_servers
+                .iter()
+                .map(|s| s.service.clone())
+                .collect()
+        };
+        let go = "package main\nfunc main() {\n\tpb.RegisterProductCatalogServiceServer(srv, svc)\n\thealthpb.RegisterHealthServer(srv, h)\n\tpb.RegisterServer(srv, x)\n\tregisterFooServer(srv)\n}\n";
+        assert_eq!(
+            servers(Language::Go, go),
+            ["ProductCatalogService", "Health"]
+        );
+        let py = "def serve():\n    demo_pb2_grpc.add_EmailServiceServicer_to_server(svc, server)\n    add_to_server(svc, server)\n";
+        assert_eq!(servers(Language::Python, py), ["EmailService"]);
+        let js = "function main() {\n  server.addService(shopProto.CurrencyService.service, {convert});\n  server.addService(load(x), {});\n  router.add(shopProto.Other.service);\n}\n";
+        assert_eq!(servers(Language::JavaScript, js), ["CurrencyService"]);
+        let java = "class A {\n  static class AdServiceImpl extends hipstershop.AdServiceGrpc.AdServiceImplBase {}\n  static class G extends GreeterImplBase {}\n  static class X extends FooGrpc.BarImplBase {}\n  static class Y extends ImplBase {}\n}\n";
+        assert_eq!(servers(Language::Java, java), ["AdService", "Greeter"]);
+        let cs = "namespace cartservice {\n  public class CartService : Hipstershop.CartService.CartServiceBase {}\n  internal class HealthCheckService : HealthBase {}\n  class X : Foo.BarBase {}\n}\n";
+        assert_eq!(servers(Language::CSharp, cs), ["CartService"]);
+    }
+
+    /// Contract M7a S2: include cycles are mounts like any other; the shared composer's
+    /// on-path guard terminates them (pinned in `rb-indexer` routes).
+    #[test]
+    fn fastapi_include_cycles_are_recorded_mounts() {
         let src = "from fastapi import FastAPI, APIRouter\n\napp = FastAPI()\na = APIRouter(prefix=\"/a\")\nb = APIRouter(prefix=\"/b\")\n\n@app.get(\"/h\")\ndef h():\n    pass\n\n@a.get(\"/x\")\ndef x():\n    pass\n\n@b.get(\"/y\")\ndef y():\n    pass\n\napp.include_router(a)\na.include_router(b)\nb.include_router(a)\n";
         assert_eq!(
             summary(Language::Python, src),
             [
-                "GET /h root def h",
-                "GET /a/x root def x",
-                "GET /a/b/y root def y",
+                "GET /h router app def h",
+                "GET /a/x router a def x",
+                "GET /b/y router b def y",
+            ]
+        );
+        assert_eq!(
+            mounts(Language::Python, src),
+            [
+                "app <- a \"\" local",
+                "a <- b \"\" local",
+                "b <- a \"\" local"
             ]
         );
     }
@@ -2213,9 +2319,9 @@ public class AuthController {
         assert_eq!(
             summary(Language::Python, src),
             [
-                "GET /x root def multi",
-                "POST /x root def multi",
-                "ANY /any root def any_method",
+                "GET /x router app def multi",
+                "POST /x router app def multi",
+                "ANY /any router app def any_method",
             ]
         );
         assert_eq!(

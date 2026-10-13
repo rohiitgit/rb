@@ -174,6 +174,7 @@ fn import(node: Node<'_>, module: String) -> Import {
         alias: None,
         wildcard: false,
         is_static: false,
+        global: false,
         span: span(node),
     }
 }
@@ -357,6 +358,9 @@ fn csharp_import(node: Node<'_>, source: &[u8]) -> Option<Import> {
         })
         .map(|n| text(*n, source))?;
     let mut out = import(node, target);
+    out.global = children
+        .iter()
+        .any(|n| !n.is_named() && text(*n, source) == "global");
     if is_static {
         out.is_static = true;
     } else if let Some(name) = alias {
@@ -368,6 +372,25 @@ fn csharp_import(node: Node<'_>, source: &[u8]) -> Option<Import> {
 #[cfg(test)]
 mod tests {
     use crate::{Import, Language, extract};
+
+    /// Contract M7d S1: a C# `global using` applies to its whole project and says so.
+    #[test]
+    fn csharp_global_usings_are_marked() {
+        let src = "global using Microsoft.Extensions.DependencyInjection;\nusing System;\n";
+        let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
+        let marked: Vec<(&str, bool)> = facts
+            .imports
+            .iter()
+            .map(|i: &Import| (i.module.as_str(), i.global))
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                ("Microsoft.Extensions.DependencyInjection", true),
+                ("System", false)
+            ]
+        );
+    }
 
     /// `module [names] alias wildcard static` per import.
     fn summary(language: Language, src: &str) -> Vec<String> {

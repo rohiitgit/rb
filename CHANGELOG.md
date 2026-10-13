@@ -1,5 +1,88 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M7 CLOSED (evaluator passes 1–2)
+- **Pass 1** (`tasks/eval-m7-pass1.md`): FAIL, 17 findings (0 S1). Answered by M7j.
+- **Pass 2** (`tasks/eval-m7-pass2.md`): FAIL with 1 blocking item, a records error (U2 marked done), now marked ◐. Every code fix of M7j was reproduced against the release binary. 14 items resolved, 2 accepted as recorded residue. 4 new S4 items: the binary of record rebuilt after the `PIPELINE` bump (lesson added), E6's wording corrected, two residues recorded.
+- **Close state:** M7a–M7j on stacked branches up to `m7j-close`, not pushed. Stress register: 25 findings fixed, 7 partly, each with its residue; 7 UX proposals done, 3 partly; 4 optimisations done, 2 partly, 1 declined. Real-Docker 1,047/0/0.
+- **Files:** `crates/rb-api/src/lib.rs` (doc comment), `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7j,eval-m7-pass2,stress-findings,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M7j: the M7 close fixes (evaluator pass 1)
+- **Correctness:** `case: folded` is decided per candidate (it was copied from the first). After `--limit`, the certainty histogram counts every row found. `--pick N` beyond the only candidate is refused.
+- **Bounds:** `rb doctor` waits at most 10 s for the database, and every `warn`/`fail` row has a fix. JSON spec spans take one pass (20,000-path spec: 45.4 s in M7i, 10.8 s now; M7h 11.0 s).
+- **`rb path`** notes `case folded`.
+- **Records:** the stress register's counts and statuses, the Observations classified, partial fixes marked ◐; README and usage guide corrected; the shared DB's checkouts repaired after a mutant wrote them.
+- **Verification:** mutants m144–m150. Real-Docker suites 1,047/0/0 (log kept). Invariant vs M7i 31/31. `PIPELINE` `m7j-1`.
+- **Files:** `crates/rb-indexer/src/stitch.rs`, `crates/rb-frameworks/src/spec.rs`, `crates/rb-store/src/code.rs`, `crates/rb-api/src/{lib,render}.rs`, `crates/rb-cli/src/{doctor,code,path}.rs`, `crates/rb-cli/tests/e2e.rs`, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7h,contract-m7i,contract-m7j,eval-m7-pass1,todo,stress-findings,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M7i: precision and cost remainder (stress batch F, part 2)
+- **Express case:** routes match client paths case-insensitively, as Express does, unless their router opts into `caseSensitive`; such links say `case: folded` and are never `synthetic`.
+- **Specs:** `rb status` counts routes only a spec states (`18 routes (3 from specs only)`); JSON specs carry each operation's path-key span.
+- **Callers of a handler:** the endpoint it handles is named after the target; an empty tree points to `rb path`.
+- **Hub answers:** `callers`/`impact --limit N` (a summary first, `truncated: limit`); `callers --exclude-tests`.
+- **Indexing:** one `rb index` per repository at a time (the second waits, then is usually up to date). Cached facts stream: mattermost's cached peak 2,148 → 1,658 MiB.
+- **Verification:** fixes F31, F32, U5, O3, O4; O7 declined with measurements. Mutants m123–m143. Real-Docker suites 1,041/0/0. Invariant vs M7h 29/31, 2 classified. `PIPELINE` `m7i-1`.
+- **Files:** `crates/rb-frameworks/src/{endpoint,routes,spec}.rs`, `crates/rb-indexer/src/{routes,stitch}.rs`, `crates/rb-store/src/{lib,code,query,db_tests}.rs`, `crates/rb-api/src/{lib,render}.rs`, `crates/rb-cli/src/{main,code}.rs`, `crates/rb-cli/tests/{e2e,api}.rs`, three goldens, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7i,todo,stress-findings,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M7h: the CLI remainder (stress batch F, part 1)
+- **Checkouts:** `rb index` records each repository's checkout (migration `0007_repo_checkout`). Without `--repo`, a question, `check` or `dump` inside that checkout answers from it whatever it was named, and `rb index .` re-indexes it. Several repositories at one checkout, or a directory name already recorded at another checkout, give a directive, never a guess.
+- **`find`:** `--kind` alone lists that kind; a search that matches nothing says `no matches for "x"` on stderr.
+- **`service NAME --limit`** says that page flags page the service list.
+- **Cypher:** writes are refused as `cypher is read-only: …`; a RETURN/`--cols` count mismatch is a `--cols` error (exit 2). A bad `RB_CYPHER_TIMEOUT_MS` is named as the variable in `cypher`, `check` and `serve`.
+- **`rb doctor`:** one row per prerequisite (database, Postgres and AGE, migrations, age-load dir and mount, Docker, SCIP images, work dir, disk), each with its fix; exits 1 on a failure.
+- **Docs:** README and usage guide; a stray code fence in the README removed.
+- **Verification:** fixes F3, U1, U4, U7, U9. Mutants m99–m122. Real-Docker suites 1,028/0/0. Invariant vs M7g 31/31 byte-identical.
+- **Files:** `migrations/0007_repo_checkout.sql`, `crates/rb-store/src/{lib,db_tests}.rs`, `crates/rb-api/src/{lib,error}.rs`, `crates/rb-cli/src/{main,doctor}.rs`, `crates/rb-cli/tests/{e2e.rs,common/mod.rs}`, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7h,todo,stress-findings}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M7g: honesty about what was not analysed (stress batch E, part 2)
+- **Languages:** php, scala, swift, dart and elixir files are named (`lang`). Code in a language without a grammar is counted per language (`language_unsupported`), and `rb status` prints `not analysed (no grammar): php 84 files`.
+- **Frameworks:** a service that depends on a known framework rb has no pack for (14 packages: koa, fastify, hapi, routing-controllers, NestJS controllers, echo, fiber, flask, Django views, tornado, Micronaut, Quarkus) gets `framework_unsupported`, and `rb status` names it.
+- **`rb check`:** `orphan_endpoints` needs a non-ambiguous consumer (Cypher rule and relational twin together). `--baseline FILE` accepts the violations listed in a saved `rb check` output. A stderr note counts the client call sites that are linked to no endpoint.
+- **Docs:** README per-language support matrix and known gaps; usage guide brought up to M7g.
+- **Verification:** F30, F25 and F24 partly fixed (residue in the contract). Mutants m87–m98. Real-Docker suites 1,013/0/0 (the polyglot `check` golden re-blessed: +1 ambiguous-only orphan). Invariant vs M7f 27/31 identical, 4 diffs classified. `rb check` 0.16 s on mattermost. `PIPELINE` `m7g-1`.
+- **Files:** `crates/rb-git/src/lib.rs`, `crates/rb-indexer/src/{lib,syntax,packages}.rs`, `crates/rb-store/src/check.rs`, `crates/rb-api/src/lib.rs`, `crates/rb-cli/src/main.rs`, `crates/rb-cli/tests/golden/polyglot-monorepo/check.txt`, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7g,todo,stress-findings,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M7f: the error contract and targets (stress batch E, part 1)
+- **Error wording:** CLI error text names what the user typed: positionals by clap usage name (`<TEXT> is required`), `--cols` (not `--columns`), and the repo directive as a predicate (`--repo is needed: …`, one helper replacing 4 copies).
+- **Unreachable database:** the new `unavailable` kind (exit 6, HTTP 503) gives a one-line cause with a hint, with no anyhow chain, and the envelope under `--json` (`rb_store::Unavailable`).
+- **`rb check`:** every error exits 2 (never 1, "violations") through the same envelope; an unknown repo is `not_found`; the dead "only repository" fallback is removed.
+- **Targets:** a near-miss key in symbol syntax (`Db#load()`) resolves when `find`'s rule gives exactly one symbol. Suggested commands are shell-quoted.
+- **Cypher:** `RETURN n`/`e`/`p` render as agtype text; scalars stay byte-identical.
+- **`rb path`:** accepts `--json`.
+- **Verification:** fixes F4–F8, F14. 14 mutants killed. Real-Docker suites 1,009/0/0 (2 server tests updated: an absent database is now 503 `unavailable`, not 500). Invariant vs M7e 31/31 byte-identical (no graph change). No `PIPELINE` bump.
+- **Files:** `crates/rb-api/src/{error,render,lib}.rs`, `crates/rb-cli/src/main.rs`, `crates/rb-store/src/{lib,age,db_tests}.rs`, `crates/rb-server/src/tests.rs`; records `tasks/{contract-m7f,todo,stress-findings,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M7e: input hygiene (stress batch D)
+- One exclusion decision per commit (`crates/rb-indexer/src/exclude.rs`), from five rules in order: `rb.toml` `ignore` (new key, shared CODEOWNERS dialect), Go `vendor/` beside `vendor/modules.txt`, `node_modules`, `.gitattributes` `linguist-vendored`/`-generated`, and tsconfig `outDir` compiler outputs. Excluded files keep their `File` node (`excluded: <reason>`) and are never parsed, scanned, detected or indexed. Counted per reason (`excluded` diagnostic) and shown by `rb status`.
+- go-gin-example: 2.64 s → 0.64 s, 359 → 87 MiB, 10,077 → 1,259 nodes, 1,059 → 0 ambiguous references. nestjs-realworld: `dist/` duplicates gone.
+- Fixes F16, F22, F13, F29. Tests first, 15 mutants killed (1 equivalent recorded). Real-Docker suites 1,004/0/0. Invariant vs M7d 28/31 identical, diffs classified by identity. `PIPELINE m7e-1`.
+- Files: `crates/rb-indexer/src/{exclude,lib}.rs`, `crates/rb-git/src/boundaries.rs`, `crates/rb-scip/src/jobs.rs`, `crates/rb-api/src/lib.rs`, `crates/rb-cli/src/main.rs`; records `tasks/{contract-m7e,todo,stress-findings}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M7a–M7d: stress-campaign fixes (batches A–C)
+Source: `tasks/stress-findings.md` (31 findings from a usability/robustness/correctness campaign over 18 fixtures and 13 public repos). Each milestone was tests-first with killed mutants, verified with real-Docker suites (0 failed, 0 skipped), and checked by an invariant run over 31 targets with every differing row classified. This entry was backfilled at M7e; M7a–M7d had skipped the changelog.
+- **M7a** (`372963c`, contract `tasks/contract-m7a.md`): `exact`-label correctness.
+  - gRPC endpoints are attributed by server registration (F17).
+  - FastAPI goes through the shared router composer (F18).
+  - Go protobuf getters are no longer RPCs (F19).
+  - `PIPELINE m7a-1`.
+- **M7b** (`a66c460`, `tasks/contract-m7b.md`): regressions and hangs.
+  - `rb status` lists all repos again; two red DB suites are green (F1).
+  - Bounded Docker CLI calls (F2).
+  - O(1) ancestor lookups in rb-syntax: a 4,000-link chain dropped from over 300 s to 3 s (F9/F10).
+  - Pruned mount composition: 44 s → 1 s (F11).
+  - Streamed blob sniffing: a 1 GiB blob drops from 2 GiB to 16 MiB of memory (F15).
+- **M7c** (`8078ac2`, `tasks/contract-m7c.md`): HTTP recall.
+  - Express name-valued paths fold through a shared constant lookup (`rb-indexer/src/constants.rs`) (F20).
+  - Default-imported axios instances resolve (F21).
+  - `require('express')()` is recognised (F12).
+  - TS gRPC stubs need a generated import (F27).
+  - bookcars went from 0 to 107 routes and +175 stitched calls. `PIPELINE m7c-1`.
+- **M7d** (`79216ce`, `tasks/contract-m7d.md`): DI and SQL roles.
+  - .NET implicit and global usings; implementation-registered owners; constructor parameters only (F28; open generics deferred).
+  - Framework-provided Nest points are `external` (F26).
+  - `.sql` files are migrations only by evidence (F23).
+  - `PIPELINE m7d-1`.
+- Files: `crates/rb-{syntax,frameworks,indexer,scip,git,cli,api}/src/*`; records `tasks/{stress-findings,contract-m7a..m7d,lessons,todo}.md`, `IMPLEMENT.md`.
+
 ## [2026-10-13] (wall clock) M6l CLOSED (evaluator passes 1–2)
 - Phase 1: XML `di_unresolved` diagnostics site the document (`owner_path` → `xml_path`) + unit (mutant kills) + spring-xml fixture (`missing` ref, no new nodes/edges, guards hold) + reviewed re-bless (coverage +1/+1, newly-sited diagnostic only).
 - Pass 1: short review — the fix surface, one mutant kill, no other rows shift.

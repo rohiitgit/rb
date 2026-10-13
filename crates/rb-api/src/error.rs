@@ -35,10 +35,12 @@ pub enum ErrorKind {
     MethodNotAllowed,
     /// Server only: a `POST` body that is not `application/json`.
     UnsupportedMediaType,
+    /// The database cannot be reached (contract M7f S2).
+    Unavailable,
 }
 
 impl ErrorKind {
-    pub const ALL: [ErrorKind; 13] = [
+    pub const ALL: [ErrorKind; 14] = [
         ErrorKind::InvalidParam,
         ErrorKind::NotFound,
         ErrorKind::Ambiguous,
@@ -52,6 +54,7 @@ impl ErrorKind {
         ErrorKind::MisdirectedRequest,
         ErrorKind::MethodNotAllowed,
         ErrorKind::UnsupportedMediaType,
+        ErrorKind::Unavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -69,6 +72,7 @@ impl ErrorKind {
             ErrorKind::MisdirectedRequest => "misdirected_request",
             ErrorKind::MethodNotAllowed => "method_not_allowed",
             ErrorKind::UnsupportedMediaType => "unsupported_media_type",
+            ErrorKind::Unavailable => "unavailable",
         }
     }
 
@@ -80,6 +84,7 @@ impl ErrorKind {
             ErrorKind::NotFound | ErrorKind::NoLiveSnapshot | ErrorKind::SnapshotNotRetained => 3,
             ErrorKind::Ambiguous => 4,
             ErrorKind::Cypher | ErrorKind::CypherTimeout => 5,
+            ErrorKind::Unavailable => 6,
             ErrorKind::Busy
             | ErrorKind::DeadlineExceeded
             | ErrorKind::Internal
@@ -97,7 +102,7 @@ impl ErrorKind {
             ErrorKind::Ambiguous => 409,
             ErrorKind::SnapshotNotRetained => 410,
             ErrorKind::Cypher | ErrorKind::CypherTimeout => 422,
-            ErrorKind::Busy | ErrorKind::DeadlineExceeded => 503,
+            ErrorKind::Busy | ErrorKind::DeadlineExceeded | ErrorKind::Unavailable => 503,
             ErrorKind::Internal => 500,
             ErrorKind::MisdirectedRequest => 421,
             ErrorKind::MethodNotAllowed => 405,
@@ -117,8 +122,19 @@ pub struct ApiError {
     pub candidates: Vec<Value>,
 }
 
-/// Parameters given positionally on the command line: they have no flag to name.
-const POSITIONAL: &[&str] = &["target", "q", "endpoint", "table", "name", "query"];
+/// How the CLI names a parameter whose API name is not its flag (contract M7f S1): positionals by
+/// clap's usage name (`rb find <TEXT>`), and flags spelled differently on the command line.
+const CLI_NAMES: &[(&str, &str)] = &[
+    ("target", "<TARGET>"),
+    ("q", "<TEXT>"),
+    ("endpoint", "<QUERY>"),
+    ("query", "<QUERY>"),
+    ("table", "<TABLE>"),
+    ("name", "<SERVICE>"),
+    ("from", "<FROM>"),
+    ("to", "<TO>"),
+    ("columns", "--cols"),
+];
 
 impl ApiError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
@@ -180,15 +196,19 @@ impl ApiError {
         out
     }
 
-    /// The message as the CLI's text mode prints it: a named parameter appears as its flag
-    /// (`depth` → `--depth`, `timeout_ms` → `--timeout-ms`).
+    /// The message as the CLI's text mode prints it: a named parameter appears as the CLI names
+    /// it, its flag (`depth` → `--depth`, `timeout_ms` → `--timeout-ms`, `columns` → `--cols`)
+    /// or a positional's usage name (`q` → `<TEXT>`).
     pub fn cli_text(&self) -> String {
-        match &self.param {
-            Some(p) if !POSITIONAL.contains(&p.as_str()) => match self.message.strip_prefix(p) {
-                Some(rest) => format!("--{}{rest}", p.replace('_', "-")),
-                None => self.message.clone(),
-            },
-            _ => self.message.clone(),
+        let Some(p) = &self.param else {
+            return self.message.clone();
+        };
+        let Some(rest) = self.message.strip_prefix(p.as_str()) else {
+            return self.message.clone();
+        };
+        match CLI_NAMES.iter().find(|(api, _)| api == p) {
+            Some((_, cli)) => format!("{cli}{rest}"),
+            None => format!("--{}{rest}", p.replace('_', "-")),
         }
     }
 }
@@ -210,6 +230,12 @@ impl From<anyhow::Error> for ApiError {
             Ok(api) => return api,
             Err(e) => e,
         };
+        if let Some(u) = e.downcast_ref::<rb_store::Unavailable>() {
+            return ApiError::new(
+                ErrorKind::Unavailable,
+                format!("{u}; is it running? (`docker compose up -d`)"),
+            );
+        }
         match e.downcast_ref::<rb_store::CypherError>() {
             Some(c @ rb_store::CypherError::NoProjection { .. }) => {
                 ApiError::invalid("snapshot", format!("is not live: {c}"))
@@ -217,7 +243,11 @@ impl From<anyhow::Error> for ApiError {
             Some(c @ rb_store::CypherError::Timeout { .. }) => {
                 ApiError::new(ErrorKind::CypherTimeout, c.to_string())
             }
-            Some(c @ rb_store::CypherError::Refused(_)) => {
+            Some(rb_store::CypherError::Columns { given }) => ApiError::invalid(
+                "columns",
+                format!("must name one column per RETURN item (got {given})"),
+            ),
+            Some(c @ (rb_store::CypherError::Refused(_) | rb_store::CypherError::ReadOnly(_))) => {
                 ApiError::new(ErrorKind::Cypher, c.to_string())
             }
             None => ApiError::new(ErrorKind::Internal, format!("{e:#}")),
@@ -229,6 +259,29 @@ impl From<anyhow::Error> for ApiError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Contract M7h S4: a Cypher write is `cypher` saying read-only; a RETURN/`--cols` count
+    /// mismatch is `invalid_param` on `columns`, shown as `--cols`.
+    #[test]
+    fn cypher_writes_and_column_mismatches_have_their_kinds() {
+        let read_only = ApiError::from(anyhow::Error::from(rb_store::CypherError::ReadOnly(
+            "permission denied for schema rb_x_1".into(),
+        )));
+        assert_eq!(read_only.kind, ErrorKind::Cypher);
+        assert_eq!(
+            read_only.cli_text(),
+            "cypher is read-only: the query was refused (permission denied for schema rb_x_1)"
+        );
+        let columns = ApiError::from(anyhow::Error::from(rb_store::CypherError::Columns {
+            given: 1,
+        }));
+        assert_eq!(columns.kind, ErrorKind::InvalidParam);
+        assert_eq!(columns.param.as_deref(), Some("columns"));
+        assert_eq!(
+            columns.cli_text(),
+            "--cols must name one column per RETURN item (got 1)"
+        );
+    }
 
     /// Contract M5 D5: the table, every kind once.
     #[test]
@@ -253,6 +306,7 @@ mod tests {
                 ("misdirected_request", 1, 421),
                 ("method_not_allowed", 1, 405),
                 ("unsupported_media_type", 1, 415),
+                ("unavailable", 6, 503),
             ]
         );
     }
@@ -269,10 +323,29 @@ mod tests {
             ApiError::invalid("timeout_ms", "must be between 1 and 30000 (got 0)").cli_text(),
             "--timeout-ms must be between 1 and 30000 (got 0)"
         );
-        // A positional parameter has no flag: the message stays as it is.
+        // Contract M7f S1: a positional prints as clap's usage name, a flag whose CLI name differs
+        // from its API name prints as the CLI name.
+        for (param, cli) in [
+            ("target", "<TARGET> is required"),
+            ("q", "<TEXT> is required"),
+            ("endpoint", "<QUERY> is required"),
+            ("query", "<QUERY> is required"),
+            ("table", "<TABLE> is required"),
+            ("name", "<SERVICE> is required"),
+            ("from", "<FROM> is required"),
+            ("to", "<TO> is required"),
+            ("columns", "--cols is required"),
+        ] {
+            assert_eq!(
+                ApiError::invalid(param, "is required").cli_text(),
+                cli,
+                "{param}"
+            );
+        }
+        // The JSON message keeps the API name.
         assert_eq!(
-            ApiError::invalid("target", "is required").cli_text(),
-            "target is required"
+            ApiError::invalid("q", "is required").message,
+            "q is required"
         );
         let a = ApiError::ambiguous(
             "x matches 2",
@@ -299,6 +372,17 @@ mod tests {
         assert_eq!(
             (e.kind, e.param.as_deref()),
             (ErrorKind::InvalidParam, Some("snapshot"))
+        );
+        // Contract M7f S2: an unreachable database is `unavailable`, with a hint, never a chain.
+        let down = anyhow::Error::from(rb_store::Unavailable {
+            url: "postgresql://rb:***@127.0.0.1:1/rb".into(),
+            cause: "Connection refused (os error 61)".into(),
+        });
+        let e = ApiError::from(down);
+        assert_eq!(e.kind, ErrorKind::Unavailable);
+        assert_eq!(
+            e.message,
+            "cannot reach the database at postgresql://rb:***@127.0.0.1:1/rb: Connection refused (os error 61); is it running? (`docker compose up -d`)"
         );
         let other = anyhow::anyhow!("inner").context("outer");
         assert_eq!(

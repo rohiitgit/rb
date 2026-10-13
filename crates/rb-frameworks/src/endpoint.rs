@@ -592,12 +592,24 @@ pub struct PathMatch {
     pub suffix: bool,
     /// The endpoint's `{*}` took part.
     pub wildcard: bool,
+    /// A literal matched only with its case folded (an Express endpoint, contract M7i S1).
+    pub case_folded: bool,
 }
 
 /// Whether `client` matches `endpoint` segment by segment (D9): an endpoint `{}` matches any
 /// client segment, a client `{}` only an endpoint `{}`, an endpoint `{*}` (last) zero or more
 /// trailing client segments. Returns whether the `{*}` was used.
 pub fn matches(client: &[Segment], endpoint: &[Segment]) -> Option<bool> {
+    matches_folding(client, endpoint, false).map(|(wild, _)| wild)
+}
+
+/// [`matches`], with literals compared case-insensitively when `fold_case`; also returns
+/// whether some literal matched only with its case folded.
+fn matches_folding(
+    client: &[Segment],
+    endpoint: &[Segment],
+    fold_case: bool,
+) -> Option<(bool, bool)> {
     let wild = endpoint.last() == Some(&Segment::Wild);
     let fixed = if wild {
         &endpoint[..endpoint.len() - 1]
@@ -607,13 +619,18 @@ pub fn matches(client: &[Segment], endpoint: &[Segment]) -> Option<bool> {
     if client.len() < fixed.len() || (!wild && client.len() != fixed.len()) {
         return None;
     }
+    let mut folded = false;
     let ok = fixed.iter().zip(client).all(|(e, c)| match (e, c) {
         (Segment::Param, _) => true,
-        (Segment::Lit(a), Segment::Lit(b)) => a == b,
+        (Segment::Lit(a), Segment::Lit(b)) if a == b => true,
+        (Segment::Lit(a), Segment::Lit(b)) if fold_case && a.eq_ignore_ascii_case(b) => {
+            folded = true;
+            true
+        }
         (Segment::Wild, _) => true,
         _ => false,
     });
-    ok.then_some(wild)
+    ok.then_some((wild, folded))
 }
 
 /// Exact match of a client path, or, when its base is unknown, a match of its known part (with
@@ -625,10 +642,24 @@ pub fn match_path(
     base_unknown: bool,
     endpoint: &[Segment],
 ) -> Option<PathMatch> {
+    match_path_folding(client, base_unknown, endpoint, false)
+}
+
+/// [`match_path`], with literals compared case-insensitively when `fold_case` (an endpoint
+/// whose routers match paths case-insensitively, as Express's do by default).
+pub fn match_path_folding(
+    client: &[Segment],
+    base_unknown: bool,
+    endpoint: &[Segment],
+    fold_case: bool,
+) -> Option<PathMatch> {
     if !base_unknown {
-        return matches(client, endpoint).map(|wildcard| PathMatch {
-            suffix: false,
-            wildcard,
+        return matches_folding(client, endpoint, fold_case).map(|(wildcard, case_folded)| {
+            PathMatch {
+                suffix: false,
+                wildcard,
+                case_folded,
+            }
         });
     }
     if !client.iter().any(|s| matches!(s, Segment::Lit(_))) {
@@ -639,9 +670,10 @@ pub fn match_path(
         if literal_segments(tail) == 0 {
             return None;
         }
-        matches(client, tail).map(|wildcard| PathMatch {
+        matches_folding(client, tail, fold_case).map(|(wildcard, case_folded)| PathMatch {
             suffix: true,
             wildcard,
+            case_folded,
         })
     })
 }
@@ -1237,6 +1269,7 @@ mod tests {
         let m = Some(PathMatch {
             suffix: true,
             wildcard: false,
+            case_folded: false,
         });
         assert_eq!(match_path(&segs("/latest"), true, &segs("/api/latest")), m);
         assert_eq!(
@@ -1249,6 +1282,7 @@ mod tests {
             Some(PathMatch {
                 suffix: true,
                 wildcard: true,
+                case_folded: false,
             })
         );
         assert_eq!(match_path(&segs("/x/y"), true, &segs("/v1/api/{*}")), None);
@@ -1256,6 +1290,45 @@ mod tests {
 
     fn segs(p: &str) -> Vec<Segment> {
         segments(&norm_path(p))
+    }
+
+    /// Contract M7i S1 (stress F32): with case folding (an Express endpoint), literals match
+    /// whatever their case and the match says it folded; without it, case still differs.
+    #[test]
+    fn case_folding_matches_literals_whatever_their_case() {
+        let folded = |suffix| {
+            Some(PathMatch {
+                suffix,
+                wildcard: false,
+                case_folded: true,
+            })
+        };
+        let endpoint = segs("/api/notifications/{id}");
+        assert_eq!(
+            match_path(&segs("/api/Notifications/7"), false, &endpoint),
+            None
+        );
+        assert_eq!(
+            match_path_folding(&segs("/api/Notifications/7"), false, &endpoint, true),
+            folded(false)
+        );
+        assert_eq!(
+            match_path_folding(&segs("/Notifications/{}"), true, &endpoint, true),
+            folded(true)
+        );
+        // Same case: no folding was needed, and none is reported.
+        assert_eq!(
+            match_path_folding(&segs("/api/notifications/7"), false, &endpoint, true),
+            Some(PathMatch {
+                suffix: false,
+                wildcard: false,
+                case_folded: false,
+            })
+        );
+        assert_eq!(
+            match_path_folding(&segs("/api/other/7"), false, &endpoint, true),
+            None
+        );
     }
 
     #[test]
@@ -1281,7 +1354,8 @@ mod tests {
             m,
             Some(PathMatch {
                 suffix: true,
-                wildcard: false
+                wildcard: false,
+                case_folded: false,
             })
         );
         assert_eq!(match_path(&segs("/{}"), true, &segs("/a/{}")), None);

@@ -1,3 +1,4 @@
 orphan_endpoints services/auth -> HTTP GET /api/v1/login @services/auth
+orphan_endpoints services/billing/cmd/billing -> HTTP POST /internal/mfa/email @services/billing/cmd/billing
 orphan_endpoints services/notification -> HTTP POST /internal/mfa/sms @services/notification
-check: 2 violations
+check: 3 violations

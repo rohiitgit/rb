@@ -46,18 +46,27 @@ impl FactsCache for NoCache {
 
 /// Files worth parsing, with their language; skipped files that deserve a diagnostic.
 ///
-/// Binary and generated files and languages without a grammar are skipped silently (their `File`
-/// node already says why). Oversized files are reported, since they are expected to be source.
+/// Binary and generated files are skipped silently (their `File` node already says why).
+/// Oversized files are reported, since they are expected to be source; code files of a language
+/// with no grammar are counted per language (`language_unsupported`, contract M7g S1).
 pub(crate) fn parse_plan(files: &[FileEntry]) -> (Vec<(&FileEntry, Language)>, Vec<Diagnostic>) {
     let mut plan = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut unsupported: BTreeMap<&str, usize> = BTreeMap::new();
     for f in files {
-        let Some(language) = f.lang.and_then(Language::from_lang) else {
-            continue;
-        };
         if f.binary || f.generated {
             continue;
         }
+        let Some(language) = f.lang.and_then(Language::from_lang) else {
+            // Data formats have their own readers; only code counts as unanalysed.
+            if let Some(lang) = f
+                .lang
+                .filter(|l| !matches!(*l, "sql" | "protobuf" | "prisma"))
+            {
+                *unsupported.entry(lang).or_default() += 1;
+            }
+            continue;
+        };
         if f.size > rb_syntax::MAX_PARSE_BYTES {
             diagnostics.push(Diagnostic {
                 kind: "extraction_skipped".into(),
@@ -69,6 +78,12 @@ pub(crate) fn parse_plan(files: &[FileEntry]) -> (Vec<(&FileEntry, Language)>, V
         }
         plan.push((f, language));
     }
+    diagnostics.extend(unsupported.into_iter().map(|(language, files)| Diagnostic {
+        kind: "language_unsupported".into(),
+        path: None,
+        span: None,
+        detail: json!({ "language": language, "files": files }),
+    }));
     (plan, diagnostics)
 }
 
@@ -293,6 +308,38 @@ mod tests {
             binary: false,
             generated: false,
         }
+    }
+
+    /// Contract M7g S1 (stress F30): code files of a language with no grammar are counted, one
+    /// `language_unsupported` per language; data formats read by their own stages (SQL, proto,
+    /// Prisma), unknown extensions, and binary or generated files are not code to report.
+    #[test]
+    fn plan_counts_code_languages_without_a_grammar() {
+        let mut generated = entry("gen.php", 10);
+        generated.generated = true;
+        let files = vec![
+            entry("a.php", 10),
+            entry("b.php", 10),
+            entry("main.rs", 10),
+            entry("schema.sql", 10),
+            entry("api.proto", 10),
+            entry("README.md", 10),
+            entry("a.ts", 10),
+            generated,
+        ];
+        let (_, diagnostics) = parse_plan(&files);
+        let counted: Vec<String> = diagnostics
+            .iter()
+            .filter(|d| d.kind == "language_unsupported")
+            .map(|d| d.detail.to_string())
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                r#"{"files":2,"language":"php"}"#,
+                r#"{"files":1,"language":"rust"}"#,
+            ]
+        );
     }
 
     #[test]

@@ -67,8 +67,33 @@ fn histogram<'c>(certainties: impl Iterator<Item = &'c Certainty>) -> String {
 
 pub(crate) fn render_callers(ix: &SnapshotIndex, tree: &CallerTree) -> String {
     let d = Describer::new(ix);
-    let mut out = format!("callers of {}\n", line(&d, tree.target));
+    let mut out = format!("callers of {}", line(&d, tree.target));
+    if !tree.target_entry.is_empty() {
+        let _ = write!(out, "  (entry: {})", tree.target_entry.join(", "));
+    }
+    out.push('\n');
     out.push_str(&precision_lines(tree.precision, tree.pruned_by_rta));
+    if let Some(n) = tree.excluded_tests {
+        let _ = writeln!(out, "excluded: {n} callers in test code (--exclude-tests)");
+    }
+    // Every row found, first, when `--limit` cut the rows shown (contract M7i S4).
+    if let Some(s) = &tree.summary {
+        let counts = |xs: &[(String, usize)]| -> String {
+            xs.iter()
+                .map(|(k, n)| format!("{k} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let _ = writeln!(
+            out,
+            "summary: {} callers found, {} shown (--limit {})",
+            s.callers, s.shown, s.shown
+        );
+        let _ = writeln!(out, "  by service: {}", counts(&s.by_service));
+        if !s.by_entry.is_empty() {
+            let _ = writeln!(out, "  by entry: {}", counts(&s.by_entry));
+        }
+    }
     fn walk(
         d: &Describer<'_>,
         cs: &[Caller],
@@ -95,10 +120,28 @@ pub(crate) fn render_callers(ix: &SnapshotIndex, tree: &CallerTree) -> String {
     }
     let mut all = Vec::new();
     walk(&d, &tree.callers, 1, &mut out, &mut all);
-    if all.is_empty() {
-        out.push_str("  (no callers found)\n");
+    // A handler's callers are HTTP clients, which `rb path` follows (contract M7i S2).
+    let endpoint = tree
+        .target_entry
+        .iter()
+        .find_map(|m| m.strip_prefix("endpoint "));
+    match (all.is_empty(), endpoint) {
+        (true, Some(name)) => {
+            let path_arg = name.split("  (").next().unwrap_or(name);
+            let _ = writeln!(
+                out,
+                "  (no callers found: it handles endpoint {name}, so its callers are HTTP clients: `rb path {}`)",
+                rb_api::render::shell_arg(path_arg)
+            );
+        }
+        (true, None) => out.push_str("  (no callers found)\n"),
+        (false, _) => {}
     }
-    out.push_str(&histogram(all.iter()));
+    // Every row found, also when `--limit` cut the rows shown (contract M7j E4).
+    match &tree.summary {
+        Some(s) => out.push_str(&histogram(s.certainties.iter())),
+        None => out.push_str(&histogram(all.iter())),
+    }
     out.push_str(&truncated_line(&tree.truncated));
     out
 }
@@ -115,8 +158,13 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
         let _ = writeln!(out, "  with {}", line(&d, r));
     }
     out.push_str(&precision_lines(impact.precision, impact.pruned_by_rta));
-    let section = |title: &str, xs: &[Impacted], out: &mut String| {
-        let _ = writeln!(out, "{title} ({}):", xs.len());
+    // A list `--limit` cut shows its full length and the rows shown (contract M7i S4).
+    let count = |name: &str, shown: usize| match impact.totals.get(name) {
+        Some(total) => format!("{total}, {shown} shown"),
+        None => shown.to_string(),
+    };
+    let section = |name: &str, title: &str, xs: &[Impacted], out: &mut String| {
+        let _ = writeln!(out, "{title} ({}):", count(name, xs.len()));
         for x in xs {
             let _ = writeln!(
                 out,
@@ -127,8 +175,14 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
             );
         }
     };
-    section("breaks: requiring edges into it", &impact.breaks, &mut out);
     section(
+        "breaks",
+        "breaks: requiring edges into it",
+        &impact.breaks,
+        &mut out,
+    );
+    section(
+        "affects",
         "affects: reaches those through calls or references",
         &impact.affects,
         &mut out,
@@ -138,7 +192,7 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
     let _ = writeln!(
         out,
         "endpoints: handled by the removed or impacted code ({}):",
-        impact.endpoints.len()
+        count("endpoints", impact.endpoints.len())
     );
     for x in &impact.endpoints {
         let _ = writeln!(
@@ -160,7 +214,11 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
             let _ = writeln!(out, "orphans: not computed ({reason})");
         }
         Orphans::Computed(list) => {
-            let _ = writeln!(out, "orphans: may become dead code ({}):", list.len());
+            let _ = writeln!(
+                out,
+                "orphans: may become dead code ({}):",
+                count("orphans", list.len())
+            );
             for o in list {
                 let _ = writeln!(
                     out,
@@ -173,7 +231,7 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
             }
         }
     }
-    section("tests", &impact.tests, &mut out);
+    section("tests", "tests", &impact.tests, &mut out);
     let services: Vec<String> = impact
         .services
         .iter()
@@ -209,13 +267,17 @@ pub(crate) fn render_impact(ix: &SnapshotIndex, impact: &Impact) -> String {
             owners.join("; ")
         }
     );
-    out.push_str(&histogram(
-        impact
-            .breaks
-            .iter()
-            .chain(&impact.affects)
-            .map(|x| &x.certainty),
-    ));
+    if impact.certainties_found.is_empty() {
+        out.push_str(&histogram(
+            impact
+                .breaks
+                .iter()
+                .chain(&impact.affects)
+                .map(|x| &x.certainty),
+        ));
+    } else {
+        out.push_str(&histogram(impact.certainties_found.iter()));
+    }
     out.push_str(&truncated_line(&impact.truncated));
     out
 }
@@ -260,6 +322,200 @@ mod tests {
         assert!(precision_lines(Precision::Rta, 3).contains("rta: 3 dispatch steps pruned"));
         assert_eq!(parse_precision("cha"), Ok(Precision::Cha));
         assert!(parse_precision("vta").is_err());
+    }
+
+    /// Contract M7j E6 (stress observation, evaluator item 12): `--pick N` beyond the only
+    /// candidate is refused, never ignored; `--pick 1` on it is fine.
+    #[test]
+    fn a_pick_beyond_the_only_candidate_is_refused() {
+        use rb_model::{Attrs, GraphBuilder, NodeKey, NodeKind};
+        let mut b = GraphBuilder::new();
+        b.add_node(
+            NodeKey::new(NodeKind::Symbol, "Db#load()."),
+            "load",
+            Attrs::new(),
+        )
+        .unwrap();
+        let ep = NodeKey::new(NodeKind::Endpoint, "HTTP GET /x @.");
+        b.add_node(ep, "GET /x", Attrs::new()).unwrap();
+        let ix = rb_store::code::SnapshotIndex::new(b.finish().unwrap());
+        assert!(rb_api::render::pick_target(&ix, "load", Some(1)).is_ok());
+        let err = rb_api::render::pick_target(&ix, "load", Some(3)).unwrap_err();
+        assert_eq!(err.kind, rb_api::ErrorKind::InvalidParam);
+        assert_eq!(
+            err.cli_text(),
+            "--pick is 3, but only 1 candidate matches \"load\""
+        );
+        assert!(rb_api::render::pick_endpoint(&ix, "GET /x", Some(1)).is_ok());
+        let err = rb_api::render::pick_endpoint(&ix, "GET /x", Some(2)).unwrap_err();
+        assert_eq!(
+            err.cli_text(),
+            "--pick is 2, but only 1 candidate matches \"GET /x\""
+        );
+    }
+
+    /// Contract M7i S4 (stress U5): with `--exclude-tests` the text counts what it left out;
+    /// with a `--limit` that cuts, a summary of every caller comes first and `truncated` names
+    /// `limit`; `impact` headers keep each cut list's full length.
+    #[test]
+    fn limited_answers_summarise_first_and_keep_totals() {
+        use rb_model::{
+            Attrs, Certainty, EdgeKind, GraphBuilder, NewEdge, NodeKey, NodeKind, Provenance,
+        };
+        let mut b = GraphBuilder::new();
+        let mut svc = Attrs::new();
+        svc.insert("role".into(), json!("service"));
+        b.add_node(NodeKey::new(NodeKind::Service, "app"), "app", svc)
+            .unwrap();
+        let sym = |k: &str| NodeKey::new(NodeKind::Symbol, k);
+        for (path, name) in [
+            ("app/A.java", "T"),
+            ("app/B.java", "b1"),
+            ("app/B.java", "b2"),
+            ("app/test/BTest.java", "t1"),
+        ] {
+            let f = NodeKey::new(NodeKind::File, path);
+            if !b.has_node(&f) {
+                b.add_node(f.clone(), path, Attrs::new()).unwrap();
+                b.add_edge(NewEdge::new(
+                    f.clone(),
+                    EdgeKind::InService,
+                    NodeKey::new(NodeKind::Service, "app"),
+                    Provenance::Manifest,
+                    Certainty::Exact,
+                ))
+                .unwrap();
+            }
+            b.add_node(sym(name), name, Attrs::new()).unwrap();
+            b.add_edge(NewEdge::new(
+                sym(name),
+                EdgeKind::DefinedIn,
+                f,
+                Provenance::Treesitter,
+                Certainty::Exact,
+            ))
+            .unwrap();
+            if name != "T" {
+                b.add_edge(NewEdge::new(
+                    sym(name),
+                    EdgeKind::Calls,
+                    sym("T"),
+                    Provenance::Heuristic,
+                    Certainty::Heuristic,
+                ))
+                .unwrap();
+            }
+        }
+        let graph = b.finish().unwrap();
+        let ix = rb_store::code::SnapshotIndex::new(graph.clone());
+        let t = graph.nodes().iter().find(|n| n.name == "T").unwrap().id;
+        let mut tree = rb_store::code::callers(
+            &ix,
+            t,
+            rb_store::code::CallerOptions {
+                depth: 1,
+                include_references: false,
+                min_certainty: Certainty::Ambiguous,
+                precision: Precision::Cha,
+                caps: Default::default(),
+                exclude_tests: true,
+            },
+        );
+        rb_store::code::limit_callers(&ix, &mut tree, 1);
+        let text = render_callers(&ix, &tree);
+        for want in [
+            "certainty: heuristic 2\n",
+            "excluded: 1 callers in test code (--exclude-tests)\n",
+            "summary: 2 callers found, 1 shown (--limit 1)\n  by service: app 2\n",
+            "truncated: limit\n",
+        ] {
+            assert!(text.contains(want), "{want}\n---\n{text}");
+        }
+        let json = rb_api::render::callers_json(&ix, &tree);
+        assert_eq!(json["excluded_tests"], 1);
+        assert_eq!(
+            json["summary"]["by_service"],
+            json!([{"service": "app", "callers": 2}])
+        );
+
+        let mut impact = rb_store::code::impact(&ix, t, Certainty::Ambiguous, Precision::Cha);
+        rb_store::code::limit_impact(&mut impact, 1);
+        let text = render_impact(&ix, &impact);
+        assert!(
+            text.contains("breaks: requiring edges into it (3, 1 shown):\n"),
+            "{text}"
+        );
+        // Contract M7j E4: the histogram counts every row found, not the rows shown.
+        assert!(text.contains("certainty: heuristic 3\n"), "{text}");
+        assert_eq!(
+            rb_api::render::impact_json(&ix, &impact)["totals"],
+            json!({"breaks": 3})
+        );
+    }
+
+    /// Contract M7i S2 (stress F31): `callers` of an endpoint handler names what it handles
+    /// after the target, and an empty tree says its callers are HTTP clients, with the
+    /// copy-pasteable `rb path`; the JSON carries `target_entry` only when it has marks.
+    #[test]
+    fn callers_of_a_handler_name_its_endpoint() {
+        use rb_model::{
+            Attrs, Certainty, EdgeKind, GraphBuilder, NewEdge, NodeKey, NodeKind, Provenance,
+        };
+        let mut b = GraphBuilder::new();
+        let sym = |k: &str| NodeKey::new(NodeKind::Symbol, k);
+        for name in ["GetTags", "helper"] {
+            b.add_node(sym(name), name, Attrs::new()).unwrap();
+        }
+        let ep = NodeKey::new(NodeKind::Endpoint, "HTTP GET /api/v1/tags @.");
+        b.add_node(ep.clone(), "GET /api/v1/tags", Attrs::new())
+            .unwrap();
+        b.add_edge(NewEdge::new(
+            ep,
+            EdgeKind::HandledBy,
+            sym("GetTags"),
+            Provenance::Treesitter,
+            Certainty::Exact,
+        ))
+        .unwrap();
+        let graph = b.finish().unwrap();
+        let ix = rb_store::code::SnapshotIndex::new(graph.clone());
+        let id = |name: &str| graph.nodes().iter().find(|n| n.name == name).unwrap().id;
+        let opts = rb_store::code::CallerOptions {
+            depth: 2,
+            include_references: true,
+            min_certainty: Certainty::Ambiguous,
+            precision: Precision::Cha,
+            caps: Default::default(),
+            exclude_tests: false,
+        };
+        let tree = rb_store::code::callers(&ix, id("GetTags"), opts);
+        assert_eq!(tree.target_entry, ["endpoint GET /api/v1/tags"]);
+        let text = render_callers(&ix, &tree);
+        assert!(
+            text.starts_with("callers of GetTags  (entry: endpoint GET /api/v1/tags)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  (no callers found: it handles endpoint GET /api/v1/tags, so its callers are HTTP clients: `rb path 'GET /api/v1/tags'`)\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            rb_api::render::callers_json(&ix, &tree)["target_entry"],
+            json!(["endpoint GET /api/v1/tags"])
+        );
+        // Not a handler: the answer is as before.
+        let plain = rb_store::code::callers(&ix, id("helper"), opts);
+        assert!(plain.target_entry.is_empty());
+        let text = render_callers(&ix, &plain);
+        assert!(text.starts_with("callers of helper\n"), "{text}");
+        assert!(text.contains("  (no callers found)\n"), "{text}");
+        assert!(
+            rb_api::render::callers_json(&ix, &plain)
+                .get("target_entry")
+                .is_none()
+        );
     }
 
     /// Contract M4b S13 and M4a open item 7 in the text and JSON answers: the endpoint of a
@@ -372,6 +628,7 @@ mod tests {
                 min_certainty: Certainty::Ambiguous,
                 precision: Precision::Rta,
                 caps: Default::default(),
+                exclude_tests: false,
             },
         );
         let callers = render_callers(&rb_store::code::SnapshotIndex::new(graph.clone()), &tree);

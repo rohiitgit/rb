@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use tree_sitter::Node;
 
-use crate::{Arg, CallLink, Init, Language, MAX_EXPR_BYTES, ObjectEntry, span, strings, text};
+use crate::{
+    Arg, CallLink, Init, Language, MAX_EXPR_BYTES, ObjectEntry, Parents, span, strings, text,
+};
 
 /// A chain before its enclosing definition is resolved.
 pub(crate) struct RawChain<'t> {
@@ -99,7 +101,12 @@ fn syntax(language: Language) -> Syntax {
 }
 
 /// Every outermost call chain in the file, in source order.
-pub(crate) fn chains<'t>(language: Language, root: Node<'t>, source: &[u8]) -> Vec<RawChain<'t>> {
+pub(crate) fn chains<'t>(
+    language: Language,
+    root: Node<'t>,
+    source: &[u8],
+    parents: &Parents<'t>,
+) -> Vec<RawChain<'t>> {
     let syn = syntax(language);
     let mut out = Vec::new();
     let mut stack = vec![root];
@@ -108,8 +115,8 @@ pub(crate) fn chains<'t>(language: Language, root: Node<'t>, source: &[u8]) -> V
         if syn.skip.contains(&node.kind()) {
             continue;
         }
-        if node.kind() == syn.call && !is_inner_link(language, &syn, node) {
-            out.push(chain(language, &syn, node, source));
+        if node.kind() == syn.call && !is_inner_link(language, &syn, node, parents) {
+            out.push(chain(language, &syn, node, source, parents));
         }
         let children: Vec<Node<'t>> = node.children(&mut cursor).collect();
         stack.extend(children.into_iter().rev());
@@ -183,14 +190,19 @@ fn split<'t>(
 }
 
 /// A call that is the receiver of another call in the same chain (`a.b()` in `a.b().c()`).
-fn is_inner_link(language: Language, syn: &Syntax, call: Node<'_>) -> bool {
-    let Some(parent) = call.parent() else {
+fn is_inner_link<'t>(
+    language: Language,
+    syn: &Syntax,
+    call: Node<'t>,
+    parents: &Parents<'t>,
+) -> bool {
+    let Some(parent) = parents.of(call) else {
         return false;
     };
     let outer = if parent.kind() == syn.call {
         Some(parent)
     } else if parent.kind() == syn.member.0 {
-        parent.parent().filter(|p| p.kind() == syn.call)
+        parents.of(parent).filter(|p| p.kind() == syn.call)
     } else {
         None
     };
@@ -258,7 +270,13 @@ fn call_type_args(language: Language, call: Node<'_>, source: &[u8]) -> Vec<Stri
     Vec::new()
 }
 
-fn chain<'t>(language: Language, syn: &Syntax, outer: Node<'t>, source: &[u8]) -> RawChain<'t> {
+fn chain<'t>(
+    language: Language,
+    syn: &Syntax,
+    outer: Node<'t>,
+    source: &[u8],
+    parents: &Parents<'t>,
+) -> RawChain<'t> {
     let mut links = Vec::new();
     let mut root = None;
     let mut call = outer;
@@ -285,18 +303,18 @@ fn chain<'t>(language: Language, syn: &Syntax, outer: Node<'t>, source: &[u8]) -
         node: outer,
         root,
         links,
-        assigned: assignment_target(outer, source),
+        assigned: assignment_target(outer, source, parents),
     }
 }
 
 /// The left side of the assignment whose right side is `call` (parentheses looked through):
 /// `this.rt = b.build()`, `web = WebClient.create(…)` (TS/JS and Java `assignment_expression`).
-fn assignment_target(call: Node<'_>, source: &[u8]) -> Option<String> {
+fn assignment_target<'t>(call: Node<'t>, source: &[u8], parents: &Parents<'t>) -> Option<String> {
     let mut node = call;
-    let mut parent = node.parent()?;
+    let mut parent = parents.of(node)?;
     while parent.kind() == "parenthesized_expression" {
         node = parent;
-        parent = node.parent()?;
+        parent = parents.of(node)?;
     }
     if parent.kind() != "assignment_expression"
         || parent.child_by_field_name("right").map(|r| r.id()) != Some(node.id())

@@ -47,6 +47,11 @@ const NEST: &str = "@nestjs/common";
 // `Microsoft.Extensions.DependencyInjection`.
 const DOTNET_DI: &str = "Microsoft.Extensions.DependencyInjection";
 
+/// The Microsoft DI namespace or one below it.
+pub fn is_dotnet_di(module: &str) -> bool {
+    module == DOTNET_DI || module.starts_with("Microsoft.Extensions.DependencyInjection.")
+}
+
 /// `IServiceCollection` registration calls (contract M6j S6, keys in M6k S6):
 /// plain and `TryAdd*` forms plus their `Keyed` variants (the key literal rides
 /// qualifiers; non-literal keys skip).
@@ -965,15 +970,16 @@ pub fn kotlin_di(facts: &FileFacts) -> FileDi {
 /// it); points do not (consumers often import nothing) — the lane resolves only points
 /// whose owner class is itself registered, so unregistered consumers stay silent.
 /// Lifetimes are not modeled (all lifetimes resolve identically here); factories,
-/// instances and `typeof` stay unread.
-pub fn dotnet_di(facts: &FileFacts) -> FileDi {
+/// instances and `typeof` stay unread. `implicit_di`: the file's project imports the
+/// namespace for it (implicit or global usings, contract M7d S1).
+pub fn dotnet_di(facts: &FileFacts, implicit_di: bool) -> FileDi {
     let mut out = FileDi::default();
-    if facts.imports.iter().any(|i| {
-        !i.is_static
-            && (i.module == DOTNET_DI
-                || i.module
-                    .starts_with("Microsoft.Extensions.DependencyInjection."))
-    }) {
+    if implicit_di
+        || facts
+            .imports
+            .iter()
+            .any(|i| !i.is_static && is_dotnet_di(&i.module))
+    {
         for chain in &facts.chains {
             let Some(last) = chain.links.last() else {
                 continue;
@@ -1033,7 +1039,9 @@ pub fn dotnet_di(facts: &FileFacts) -> FileDi {
             .of(i)
             .iter()
             .copied()
-            .filter(|b| !b.member && !b.type_name.is_empty())
+            // Parameters only: a constructor body's locals share its class scope (C#
+            // constructors are no definitions), but are never injected (contract M7d).
+            .filter(|b| !b.member && !b.type_name.is_empty() && b.parameter.is_some())
             .collect();
         params.sort_by_key(|b| b.span);
         for b in params {
@@ -2554,7 +2562,7 @@ mod tests {
     /// `origin name: type [names]` per .NET bean.
     fn dotnet_beans(src: &str) -> Vec<String> {
         let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
-        let out = dotnet_di(&facts);
+        let out = dotnet_di(&facts, false);
         out.beans
             .iter()
             .map(|b| {
@@ -2572,7 +2580,7 @@ mod tests {
     /// `owner.form name: element` per .NET point.
     fn dotnet_points(src: &str) -> Vec<String> {
         let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
-        let out = dotnet_di(&facts);
+        let out = dotnet_di(&facts, false);
         out.points
             .iter()
             .map(|p| {
@@ -2585,6 +2593,21 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Contract M7d (found measuring microservices-demo): locals declared in a constructor
+    /// body are no injection points; constructor parameters (and primary-constructor
+    /// parameters) are.
+    #[test]
+    fn dotnet_constructor_locals_are_not_points() {
+        let src = "public class Store {\npublic Store(IConfiguration configuration) {\nSecretVersionName v = new SecretVersionName(1);\nvar x = 2;\n}\n}\npublic class Primary(IClock clock) {}\n";
+        assert_eq!(
+            dotnet_points(src),
+            [
+                "Store.constructor configuration: IConfiguration",
+                "Primary.constructor clock: IClock",
+            ]
+        );
     }
 
     /// `origin name: type [names] q=…` per NestJS bean.
@@ -2653,7 +2676,7 @@ mod tests {
             ]
         );
         let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
-        let created: Vec<(String, Vec<String>)> = dotnet_di(&facts)
+        let created: Vec<(String, Vec<String>)> = dotnet_di(&facts, false)
             .beans
             .iter()
             .map(|b| (b.type_name.clone(), b.created.clone()))
@@ -2675,7 +2698,7 @@ mod tests {
     fn dotnet_top_level_registrations_emit_unanchored() {
         let src = "using Microsoft.Extensions.DependencyInjection;\nvar builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddSingleton<IService, ServiceImpl>();\n";
         let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
-        let out = dotnet_di(&facts);
+        let out = dotnet_di(&facts, false);
         assert!(out.beans.is_empty());
         assert_eq!(out.unanchored.len(), 1);
         assert_eq!(out.unanchored[0].type_name, "IService");
@@ -2699,7 +2722,7 @@ mod tests {
     fn dotnet_keyed_registrations_match_by_key() {
         let src = "using Microsoft.Extensions.DependencyInjection;\npublic class Startup {\npublic void ConfigureServices(object services) {\nservices.AddKeyedSingleton<IService, ServiceImpl>(\"main\");\nservices.AddKeyedSingleton<IService, OtherImpl>(\"other\");\n}\n}\npublic class Consumer {\npublic Consumer([FromKeyedServices(\"main\")] IService svc) {\n}\n}\n";
         let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
-        let out = dotnet_di(&facts);
+        let out = dotnet_di(&facts, false);
         let keys: Vec<Vec<String>> = out.beans.iter().map(|b| b.qualifiers.clone()).collect();
         assert_eq!(keys, [vec!["main".to_owned()], vec!["other".to_owned()]]);
         assert_eq!(out.points.len(), 1);
@@ -2708,7 +2731,7 @@ mod tests {
         let facts = extract(Language::CSharp, src.as_bytes()).unwrap();
         let _ = facts;
         let dyn_facts = extract(Language::CSharp, dynamic.as_bytes()).unwrap();
-        assert!(dotnet_di(&dyn_facts).beans.is_empty());
+        assert!(dotnet_di(&dyn_facts, false).beans.is_empty());
     }
 
     /// Contract M6j S3: NestJS injectables, controllers, constructor points and token

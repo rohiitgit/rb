@@ -49,7 +49,7 @@ needed; without it, `rb` runs SCIP indexers in containers for exact edges.
 
 ```sh
 # 3. Ask questions
-target/debug/rb status --repo demo          # services, endpoints, di: lines
+target/debug/rb status --repo demo          # sql/code/http/di/rta lines, plus what was not analysed
 target/debug/rb service shop --repo demo    # the service card: APIs, packages, tables, call graph
 
 target/debug/rb callers "Db#load()." --repo demo
@@ -65,29 +65,41 @@ target/debug/rb check --repo demo           # exit 0 when clean
 ```
 
 A name matching several symbols asks you to `--pick` one instead of guessing.
-`--repo` defaults to the git checkout you run from (when that repo is
-indexed); an explicit `--repo` always wins. Anywhere else you get a plain
-directive instead of a guess: either *no indexed repository matches this
-checkout* or *no git repository found — run from inside one*.
+Targets are forgiving: `Db#load()` or `Db#load` resolve when exactly one
+symbol matches (the same rule as `rb find`), and a miss suggests a
+copy-pasteable `rb find` command. `--repo` defaults to the repository indexed
+from the git checkout you run from (whatever name you gave it with
+`rb index --repo`), and `rb index .` there re-indexes that repository; an
+explicit `--repo` always wins. When a checkout matches nothing, or several
+repositories, you get a directive instead of a guess, such as
+`--repo is needed: no indexed repository matches this checkout ("x"); index it (rb index .) or pass --repo`.
+The one exception is `rb status`, which there lists every indexed repository.
 Clean up with `psql "$RB_DATABASE_URL" -c "DELETE FROM rb.repo WHERE
 name='demo'"` and `rb gc`. That's the whole loop: **index → ask → diff/serve**.
 
-> **Want bare `rb` instead of `./target/debug/rb`?** Add this alias (DB and
-> age-load dir baked in — both must match the running stack):
-> `alias rb='RB_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb RB_AGE_LOAD_DIR=/Users/rohit/conductor/workspaces/newide/spokane/var/age-load /Users/rohit/conductor/workspaces/newide/spokane/target/debug/rb'`
-> Then open a new shell (or `source ~/.zshrc`) and `rb status` works from anywhere.
+> **Want bare `rb` instead of `./target/debug/rb`?** From the repository root,
+> add an alias with the DB and the age-load dir baked in (both must match the
+> running stack; the double quotes expand `$PWD` once, when you define it):
+> `alias rb="RB_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb RB_AGE_LOAD_DIR=$PWD/var/age-load $PWD/target/debug/rb"`
+> Put it in `~/.zshrc`, open a new shell, and `rb status` works from anywhere.
 
 ## Guided tour: what you can ask
 
 **Find things.** `rb find login --kind symbol` searches nodes by key or name
-(exact matches first). `rb service` lists services; `rb service <name>` shows
+(exact matches first); `rb find --kind endpoint` lists endpoints (20 a page;
+`--limit`/`--offset` page through them). `rb service` lists services; `rb service <name>` shows
 the card: endpoints it exposes, packages, database tables, dependencies
 (`via http`, `via calls`, `via package`), and a call-graph summary.
 
 **Trace code.** `rb callers <target> [--depth N]` walks up the call graph as a
 tree (entry points marked: `endpoint …`, `main`, `top-level`). `rb impact
 <target>` walks down: what breaks, what becomes dead code (`orphans:`), which
-tests touch it, which endpoints it handles.
+tests touch it, which endpoints it handles. On a hub, `--limit N` shows N rows:
+`rb callers` first summarises everything found (per service, per entry kind),
+and `rb impact`'s headers keep each list's full length. `rb callers
+--exclude-tests` leaves out (and counts) callers in test code. The target's own
+entry marks follow its name; a handler's callers are HTTP clients, which
+`rb path` follows.
 
 **Follow requests.** `rb path "POST /api/v1/login"` joins the upstream
 (client calls in other services and *their* callers) and the downstream (the
@@ -103,15 +115,66 @@ another service's API.
 **Compare and gate.** `rb diff` diffs two snapshots (endpoints, table access,
 dependencies, nodes, edges — never re-indexes). `rb check` runs the
 architecture rules (`orphan_endpoints`, `unowned_table_writes`,
-`service_cycles`) for CI: exit 0 clean, 1 violations, 2 errors.
+`service_cycles`) for CI: exit 0 clean, 1 violations, 2 on any error (an
+unreachable database included, so an outage never reads as violations). An
+endpoint counts as called only through an unambiguous client link, and
+`rb check` notes on stderr how many client calls it could not link. To adopt
+the gate on an existing codebase, save today's output and gate only on new
+violations:
+
+```sh
+rb check --repo demo > .rb-baseline           # accept what exists today
+rb check --repo demo --baseline .rb-baseline  # exit 1 only on new violations
+```
+
 `rb cypher "MATCH …"` runs read-only Cypher (2 s statement timeout, 10k rows
-max). `rb serve` exposes every question above over loopback HTTP with
-byte-identical `--json` bodies.
+max; a write is refused as `cypher is read-only`); nodes, edges and paths come
+back as their agtype text. `rb serve`
+exposes every question above over loopback HTTP with byte-identical `--json`
+bodies (`rb path` takes `--json` too).
 
 **Trust, but verify.** Answers carry certainty and evidence; ambiguous names
 error with candidates instead of picking; limits are maxima, never silent
 clamps (`invalid_param` otherwise); dumps (`rb dump`) are canonical and
 byte-identical across machines, so any two runs can be diffed.
+
+Errors have one shape everywhere: one `Error:` line in text mode, the
+`{"api": 1, "error": {"kind", "message", …}}` envelope under `--json` and over
+HTTP, and an exit code (HTTP status) per kind:
+
+| Exit | Kind | HTTP |
+|---|---|---|
+| 0 | success (`rb check`: no violations) | 200 |
+| 1 | `rb check` violations; any other unexpected failure (`internal`) | 500 |
+| 2 | `invalid_param` (a bad flag or argument); every `rb check` error | 400 |
+| 3 | `not_found`, `no_live_snapshot`, `snapshot_not_retained` | 404 / 404 / 410 |
+| 4 | `ambiguous` (candidates listed; pass `--pick`) | 409 |
+| 5 | `cypher`, `cypher_timeout` | 422 |
+| 6 | `unavailable`: the database cannot be reached | 503 |
+
+## What rb leaves out, and says so
+
+`rb` would rather tell you it did not look than answer zero.
+
+- **Vendored and built code is excluded from analysis** (it keeps its file node
+  for ownership and `rb find`, but is never parsed or treated as a project):
+  Go `vendor/` next to `vendor/modules.txt`, any `node_modules/`, files that
+  `.gitattributes` marks `linguist-vendored` or `linguist-generated`, and
+  TypeScript compiler output under a tsconfig `outDir` (never `.ts` sources).
+  Add your own globs in `rb.toml`: `ignore = ["generated/**", "*.pb.go"]`.
+- **Code in a language without a grammar** (PHP, Ruby, Rust, C/C++, Scala,
+  Swift, Dart, Elixir) is counted, not silently skipped.
+- **Frameworks without a pack** (echo, fiber, flask, Django views, tornado, koa,
+  fastify, hapi, routing-controllers, NestJS controllers, Micronaut, Quarkus)
+  are named per service, so "0 routes" never reads as "has no routes".
+
+`rb status` prints each of these when it applies:
+
+```
+  excluded from analysis: go_vendor 1020 files
+  not analysed (no grammar): php 84 files
+  frameworks without a pack (routes and clients not read): echo in api
+```
 
 ## How it works (60 seconds)
 
@@ -122,20 +185,46 @@ HTTP stitching → DI resolution → RTA/entry/orphans → snapshot → AGE grap
 ```
 
 Each `rb index` publishes one immutable snapshot (live + up to `--keep`
-retired, default 2); only the live snapshot keeps an AGE graph. Reads hit the
+retired, default 2); only the live snapshot keeps an AGE graph. Two runs on one
+repository at once take turns (the second says `waiting:`); the second then
+usually finds the first's snapshot up to date (with `--force` or another
+`--rev` it indexes again). Reads hit the
 live pointer in one read-only transaction. Nothing is an LLM call anywhere in
 this pipeline — that is why the output is deterministic.
 
-## Languages and frameworks
+## Language support
 
-| Area | Coverage |
+What `rb` reads, per language. Everything parsed gets definitions, calls,
+references and implementations from Tree-sitter (`heuristic`); the SCIP column
+adds compiler-grade `exact` edges where a build can run in a container.
+
+| Language | Parsed | `exact` via SCIP | HTTP routes | HTTP / RPC clients | Dependency injection | Data access |
+|---|---|---|---|---|---|---|
+| **Java** | yes | scip-java (Maven, Gradle) | Spring MVC (class × method prefixes, context path; OpenAPI interfaces handled by implementors) | RestTemplate, WebClient, RestClient, Feign, gRPC stubs, OpenAPI-generated clients | Spring (stereotypes, `@Bean`, qualifiers, Lombok), Guice, Dagger, Spring XML | JPA + Spring Data (mappings, derived and `@Query` methods, JPQL), MyBatis XML mappers, SQL in strings |
+| **TypeScript / JavaScript** | yes (TS, TSX, JS) | scip-typescript (npm, pnpm, Yarn) | Express (routers, mounts, constant paths, `require('express')()`; paths matched case-insensitively, as Express does, unless the router mentions `caseSensitive` or the app sets `case sensitive routing`: any value counts, since the value is not read) | fetch, axios (incl. shared default-exported instances), HTTP client wrappers, gRPC stubs, OpenAPI-generated clients | NestJS (providers, constructor points, tokens) | Prisma (models and queries), TypeORM (models only), SQL in strings |
+| **Python** | yes | scip-python | FastAPI (decorators, `APIRouter` prefixes, `include_router` across modules) | requests, httpx | none | SQLAlchemy and Django models (mappings, not queries), SQL in strings |
+| **Go** | yes | scip-go | gin (incl. groups passed as parameters), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings |
+| **Kotlin** | yes | scip-java (Gradle) | none | none | `beans { }` DSL (function and top-level `val` forms) | SQL in strings |
+| **C#** | yes (`heuristic` only) | none | none | none | .NET DI (`Add*`/`TryAdd*`/keyed, minimal hosting, implicit and global usings, implementation owners, constructor and `[Inject]` points) | SQL in strings |
+
+Across languages:
+- **Endpoints.** `.proto` gRPC services (attributed to the services that
+  register a server) and OpenAPI/Swagger specs.
+- **Data.** SQL migration files, aiosql/HugSQL query files and Prisma schemas.
+- **Config and wiring.** Spring `application.*` config and profiles, Kafka and
+  RabbitMQ topics (Java), nginx and Spring Cloud Gateway routes, Compose and
+  Kubernetes service names, and CODEOWNERS for file ownership.
+- **Calls between services** are stitched from clients to endpoints and are
+  never `exact`.
+
+**Known gaps:**
+
+| Gap | What `rb` does |
 |---|---|
-| TypeScript/JS | calls, refs, routes, clients; `exact` via scip-typescript; NestJS DI |
-| Java | calls, refs; `exact` via scip-java (Maven + Gradle); Spring, Guice, Dagger, Spring XML |
-| Kotlin | calls, refs; `exact` via scip-java (Gradle); `beans { }` DSL incl. top-level `val` form |
-| C# (Tier B: heuristic, no SCIP) | namespaces (block/file-scoped/dotted/enclosing/global), .NET DI (registrations, ctor + property points, keyed services, minimal hosting) |
-| Python / Go | calls, refs, endpoints, clients; `exact` via scip-python / scip-go |
-| Data | SQL via a real Postgres parser; JPA, Spring Data, Prisma, TypeORM, SQLAlchemy, Django; migrations |
+| PHP, Ruby, Rust, C/C++, Scala, Swift, Dart, Elixir | recognised as code, not parsed; `rb status` counts them as `not analysed (no grammar)` |
+| echo, fiber (Go); flask, Django views, tornado (Python); koa, fastify, hapi, routing-controllers, NestJS controllers (JS/TS); Micronaut, Quarkus (JVM) | `rb status` names them per service as `frameworks without a pack` |
+| Kotlin and C# routes and clients; ASP.NET controllers; EF Core, gorm, TypeORM repository calls, SQLAlchemy queries; Spring `@HttpExchange` clients; .NET open-generic registrations | not read, and not yet reported |
+| SQL dialects other than Postgres | statements become `unparsed_sql` diagnostics |
 
 ## Setup reference
 
@@ -144,7 +233,14 @@ RB_DB_PORT=55433 docker compose up -d --wait   # default port is 55432
 cargo build && target/debug/rb migrate
 export RB_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb   # 55432 default
 export DOCKER_CONTEXT=desktop-linux            # if docker points elsewhere
+target/debug/rb doctor                         # checks all of the above, with fixes
 ```
+
+`rb doctor` prints one row per check (database, Postgres and AGE versions,
+migrations, the age-load directory and whether the database sees it, Docker,
+the SCIP images, the SCIP work dir and free disk), each `ok`, `warn` or `fail`
+with its fix (`skip` when it needs a check that failed), and exits 1 when one
+fails. A database that never answers fails after 10 s.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -152,7 +248,7 @@ export DOCKER_CONTEXT=desktop-linux            # if docker points elsewhere
 | `RB_AGE_LOAD_DIR` | `var/age-load` | must be the dir mounted at `/tmp/age/rb-load` in DB container |
 | `RB_SCIP_WORK_DIR` | `var/scip` | indexer exports + caches; must stay under home (Docker Desktop shares) |
 | `RB_KEEP_RETIRED` | `2` | retired snapshots kept (0–20) |
-| `RB_CYPHER_TIMEOUT_MS` | `2000` | Cypher statement timeout (1–30,000) |
+| `RB_CYPHER_TIMEOUT_MS` | `2000` | Cypher statement timeout (1–30,000) for `cypher`, `check` and `serve` when their flag is absent; a bad value is named as the variable |
 | `RB_SCIP_CPUS` / `RB_SCIP_MEMORY` | `2` / `4g` | per-SCIP-container budget (host-side, not cached) |
 
 SCIP images (only needed without `--no-scip`):
@@ -178,13 +274,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55432/rb cargo test --workspace
 ```
 
-Without `RB_TEST_DATABASE_URL`, DB tests print `skipping:` and pass — that is
-not a pass; use 55433 on the machine of record. The full loop lives at
-`var/m6l/scripts/verify.sh <tag>` (fmt → clippy → units → store → server →
-e2e → api → listener + stub checks; logs under `var/m6l/logs/`). The testing
-guide — fixtures, goldens (`RB_BLESS=1` rewrites them; **review the diff
-before committing**), precision guards, invariant/measurement practice,
-troubleshooting — is [docs/usage-and-testing.md](docs/usage-and-testing.md).
+Without `RB_TEST_DATABASE_URL`, DB tests print `skipping:` and pass. That is
+not a pass: use 55433 on the machine of record. The SCIP end-to-end tests also
+need a responsive Docker daemon with the images above, and must not share the
+machine with other builds (contention starves their fetches). The full run:
+
+```sh
+RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb DOCKER_CONTEXT=desktop-linux \
+  cargo test --workspace --no-fail-fast -- --test-threads=1
+```
+
+The testing guide (fixtures, goldens with `RB_BLESS=1`, which you **review
+before committing**, precision guards, invariant and measurement practice,
+troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 
 | Path | Contents |
 |---|---|
@@ -196,9 +298,15 @@ troubleshooting — is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 | `docker/`, `migrations/` | SCIP + egress images; embedded SQL schema |
 | `fixtures/` | 18 golden fixture repos (see the testing guide for the catalog) |
 | `tasks/`, `docs/`, `var/` | contracts, evaluations, lessons; design doc; per-milestone scripts/logs/evidence (gitignored scratch) |
-```
 
-**Status: M0–M6l closed** (foundations → structure → syntax → SQL/ORM →
-resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules breadth →
-Kotlin/C# → DI breadth → DI recall → XML siting). Detail per milestone:
-`CHANGELOG.md`, `IMPLEMENT.md`, contracts in `tasks/`.
+**Status: M0–M7j (M7 closed).** M0–M6l built the tool (foundations → structure → syntax →
+SQL/ORM → resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules
+breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7j fixed
+what a stress campaign over 18 fixtures and 13 public repositories found
+(`tasks/stress-findings.md`): wrong `exact` answers, hangs and blow-ups,
+silent recall losses, vendored and built code, the error contract,
+honesty about what was not analysed, the CLI's rough edges (checkouts
+known by path, `rb doctor`), and the last precision and cost items (Express
+case, spec-only routes, bounded hub answers, one index per repository,
+streamed caches). Detail per milestone: `CHANGELOG.md`,
+`IMPLEMENT.md`, contracts in `tasks/`.

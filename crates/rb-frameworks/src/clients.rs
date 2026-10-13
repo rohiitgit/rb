@@ -4030,6 +4030,23 @@ fn is_framework_client(type_name: &str) -> bool {
     matches!(simple, "HttpClient" | "WebClient" | "RestClient")
 }
 
+/// Whether the type `name` is imported from a module whose specifier names generated code
+/// (contract M7c S4): a specifier containing `grpc`, `_pb` or `proto`, or a whole path segment
+/// `gen`/`generated` (`./proto/greeter_grpc_pb`, `../gen/cart_pb`, `@acme/protos`, `./gen`).
+/// `google-auth-library`, or a class declared in the file, is not.
+fn generated_stub_import(facts: &FileFacts, name: &str) -> bool {
+    facts.imports.iter().any(|i| {
+        let module = i.module.to_ascii_lowercase();
+        let generated = module.contains("grpc")
+            || module.contains("_pb")
+            || module.contains("proto")
+            || module
+                .split('/')
+                .any(|seg| seg == "gen" || seg == "generated");
+        generated && i.names.iter().any(|n| n.local == name)
+    })
+}
+
 /// The binding `root` names and its type, when it resolves to one binding.
 fn binding_type<'f>(
     facts: &'f FileScope<'_>,
@@ -4069,6 +4086,25 @@ fn generated_calls(
             continue;
         };
         let [only] = links else {
+            // Go/TypeScript `pb.NewXClient(conn).Rpc(ctx, req)`: exactly a constructor then the
+            // RPC (contract M7a S1). Longer chains and constructor-after-constructor are SDK
+            // navigation (`….NewContainerClient(c).NewBlobClient(p)`), never an RPC.
+            if matches!(
+                language,
+                Language::Go | Language::TypeScript | Language::Tsx | Language::JavaScript
+            ) && let [ctor, rpc] = links
+                && let Some(service) = client_service(&ctor.name)
+                && !rpc.name.is_empty()
+                && client_service(&rpc.name).is_none()
+            {
+                out.generated.push(GeneratedCall {
+                    kind: GeneratedKind::Grpc,
+                    operation: rpc.name.clone(),
+                    carrier: service.to_owned(),
+                    span: rpc.span,
+                });
+                continue;
+            }
             // A stub chain's last link is its RPC; anything else multi-link is navigation.
             if matches!(
                 language,
@@ -4141,33 +4177,42 @@ fn generated_calls(
             }
         }
         // gRPC Go/TypeScript: bindings whose type is a `*Client` (TypeScript `new`), whose
-        // initialiser calls a `New*Client` constructor, or whose own statement holds exactly
-        // one such constructor (Go `client, _ := pb.NewGreeterClient(conn)`, whose binding
-        // carries no initialiser: the M6b-S4 statement-span association).
+        // initialiser ends in a `New*Client` constructor, or whose own statement holds exactly
+        // one chain ending in one (Go `client, _ := pb.NewGreeterClient(conn)`, whose binding
+        // carries no initialiser: the M6b-S4 statement-span association). The constructor must
+        // be the chain's last link: `resp, _ := pb.NewXClient(c).GetX(…)` binds the response,
+        // not the client (contract M7a S1).
         if matches!(
             language,
             Language::Go | Language::TypeScript | Language::Tsx | Language::JavaScript
         ) && let Some(bi) = local_binding(facts, language, root, chain.span)
         {
             let binding = &facts.bindings[bi];
-            let mut service = (!is_framework_client(&binding.type_name))
-                .then(|| client_type(last_segment(&binding.type_name)))
-                .flatten()
-                .map(str::to_owned);
+            // TS/JS: a `*Client` type is a stub only when imported from a generated-code
+            // module (contract M7c S4); Go stubs are recognised by their constructor.
+            let stub_type = |type_name: &str| {
+                language == Language::Go || generated_stub_import(facts, last_segment(type_name))
+            };
+            let mut service = (!is_framework_client(&binding.type_name)
+                && stub_type(&binding.type_name))
+            .then(|| client_type(last_segment(&binding.type_name)))
+            .flatten()
+            .map(str::to_owned);
             if service.is_none() {
                 match &binding.init {
                     Some(Init::Call { chain: ci }) => {
                         if let Some(init_chain) = facts.chains.get(*ci) {
-                            crate::work::tick(init_chain.links.len());
-                            for link in init_chain.links.iter().rev() {
-                                if let Some(svc) = client_service(&link.name) {
-                                    service = Some(svc.to_owned());
-                                    break;
-                                }
-                            }
+                            crate::work::tick(1);
+                            service = init_chain
+                                .links
+                                .last()
+                                .and_then(|link| client_service(&link.name))
+                                .map(str::to_owned);
                         }
                     }
-                    Some(Init::New { type_name, .. }) if !is_framework_client(type_name) => {
+                    Some(Init::New { type_name, .. })
+                        if !is_framework_client(type_name) && stub_type(type_name) =>
+                    {
                         service = client_type(last_segment(type_name)).map(str::to_owned);
                     }
                     None => {
@@ -4177,11 +4222,10 @@ fn generated_calls(
                             if !within(candidate.span, binding.span) {
                                 continue;
                             }
-                            for link in candidate.links.iter().rev() {
-                                if let Some(svc) = client_service(&link.name) {
-                                    found.push(svc.to_owned());
-                                    break;
-                                }
+                            if let Some(svc) =
+                                candidate.links.last().and_then(|l| client_service(&l.name))
+                            {
+                                found.push(svc.to_owned());
                             }
                         }
                         found.sort();
@@ -6435,6 +6479,43 @@ mod tests {
         assert_eq!(
             generated(Language::TypeScript, ts),
             ["grpc sayHello @Greeter"]
+        );
+    }
+
+    /// Contract M7a S1 (stress F19, microservices-demo): a binding is a gRPC client only when a
+    /// `New*Client` constructor is the last link of what it holds, so a response
+    /// (`resp, _ := pb.NewXClient(c).GetX(…)`) is no client and its getters are no RPCs; the
+    /// inline `pb.NewXClient(c).Rpc(…)` chain itself is the RPC call — exactly that two-link
+    /// shape, so an SDK's chained constructors (Azure's `….NewContainerClient(c).NewBlobClient(p)`,
+    /// found on mattermost) are no RPC.
+    #[test]
+    fn grpc_go_responses_are_not_clients_and_inline_constructors_are() {
+        let go = "package main\nimport pb \"example.com/demo\"\nfunc f(conn Conn, ctx Ctx, req Req) {\n  resp, err := pb.NewCartServiceClient(conn).GetCart(ctx, req)\n  _ = resp.GetItems()\n  var quote = pb.NewShippingServiceClient(conn).GetQuote(ctx, req)\n  _ = quote.GetCostUsd()\n  c, _ := pb.NewAdServiceClient(conn)\n  c.GetAds(ctx, req)\n  _ = err\n  _ = b.client.ServiceClient().NewContainerClient(b.container).Download(ctx)\n  _ = sdk.NewFooClient(c).NewBarClient(d)\n  return b.client.ServiceClient().NewContainerClient(b.container).NewBlobClient(p)\n}\n";
+        let mut found = generated(Language::Go, go);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "grpc GetAds @AdService",
+                "grpc GetCart @CartService",
+                "grpc GetQuote @ShippingService",
+            ]
+        );
+    }
+
+    /// Contract M7c S4 (stress F27, bookcars): a TS/JS `*Client` is a gRPC stub only when it
+    /// is imported from a generated-code module; a third-party SDK client
+    /// (google-auth-library's `OAuth2Client`) or a locally declared class is not.
+    #[test]
+    fn ts_grpc_stubs_come_from_generated_modules() {
+        let ts = "import { OAuth2Client } from 'google-auth-library';\nimport { GreeterClient } from './proto/greeter_grpc_pb';\nimport { CartClient } from '../gen/cart_pb';\nimport { ShopClient } from '@acme/protos';\nimport { AgentClient } from './agent';\nclass LocalClient {}\nexport function f(x) {\n  const auth = new OAuth2Client();\n  auth.verifyIdToken(x);\n  const g = new GreeterClient('addr');\n  g.sayHello(x);\n  const c = new CartClient('addr');\n  c.getCart(x);\n  const s = new ShopClient('addr');\n  s.list(x);\n  const l = new LocalClient();\n  l.send(x);\n  const a = new AgentClient();\n  a.run(x);\n}\n";
+        assert_eq!(
+            generated(Language::TypeScript, ts),
+            [
+                "grpc sayHello @Greeter",
+                "grpc getCart @Cart",
+                "grpc list @Shop",
+            ]
         );
     }
 

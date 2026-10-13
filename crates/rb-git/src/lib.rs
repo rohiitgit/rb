@@ -16,6 +16,11 @@ use rb_model::{FileEntry, Manifest, Skipped};
 /// Bytes inspected for binary / generated detection (Git uses the same 8000-byte window for NUL).
 const SNIFF_BYTES: usize = 8000;
 
+/// Blobs larger than this are sniffed by streaming their first bytes (`git cat-file`) instead of
+/// loading them: gix reads whole objects, which made a 1 GiB blob cost about 2 GiB of memory to
+/// sniff 8 KB (contract M7b S5).
+const STREAM_SNIFF_ABOVE: u64 = 64 << 20;
+
 /// An open repository.
 pub struct Repo {
     inner: gix::Repository,
@@ -42,6 +47,11 @@ impl Repo {
 
     /// Reads the tree of `rev` (e.g. `HEAD`, a branch, a SHA).
     pub fn manifest(&self, rev: &str) -> anyhow::Result<Manifest> {
+        self.manifest_with(rev, STREAM_SNIFF_ABOVE)
+    }
+
+    /// [`Repo::manifest`] with blobs over `stream_above` bytes sniffed by streaming.
+    fn manifest_with(&self, rev: &str, stream_above: u64) -> anyhow::Result<Manifest> {
         let commit = self
             .inner
             .rev_parse_single(rev)
@@ -82,15 +92,31 @@ impl Repo {
                     reason: "symlink",
                 }),
                 kind @ (EntryKind::Blob | EntryKind::BlobExecutable) => {
-                    let blob = self
+                    let size = self
                         .inner
-                        .find_blob(entry.oid)
-                        .with_context(|| format!("reading blob {} ({path})", entry.oid))?;
-                    let head = &blob.data[..blob.data.len().min(SNIFF_BYTES)];
+                        .find_header(entry.oid)
+                        .with_context(|| format!("reading blob header {} ({path})", entry.oid))?
+                        .size();
+                    let want = SNIFF_BYTES.min(usize::try_from(size).unwrap_or(usize::MAX));
+                    let streamed = (size > stream_above)
+                        .then(|| self.blob_head_streamed(entry.oid, want))
+                        .flatten()
+                        .filter(|head| head.len() == want);
+                    let head = match streamed {
+                        Some(head) => head,
+                        None => {
+                            let blob = self
+                                .inner
+                                .find_blob(entry.oid)
+                                .with_context(|| format!("reading blob {} ({path})", entry.oid))?;
+                            blob.data[..blob.data.len().min(SNIFF_BYTES)].to_vec()
+                        }
+                    };
+                    let head = head.as_slice();
                     files.push(FileEntry {
                         lang: language_for_path(&path),
                         blob_sha: entry.oid.to_string(),
-                        size: blob.data.len() as u64,
+                        size,
                         executable: kind == EntryKind::BlobExecutable,
                         binary: head.contains(&0),
                         generated: has_generated_marker(head),
@@ -106,6 +132,31 @@ impl Repo {
             files,
             skipped,
         })
+    }
+
+    /// The first `n` bytes of a blob, streamed through `git cat-file` and cut off there, so a
+    /// huge blob is never held in memory (contract M7b S5). `None` when the CLI cannot be run;
+    /// a short read is the caller's to reject.
+    fn blob_head_streamed(&self, id: gix::ObjectId, n: usize) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut child = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(self.inner.git_dir())
+            .args(["cat-file", "blob", &id.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut head = Vec::with_capacity(n);
+        let read = child
+            .stdout
+            .take()
+            .map(|out| out.take(n as u64).read_to_end(&mut head));
+        let _ = child.kill();
+        let _ = child.wait();
+        read?.ok()?;
+        Some(head)
     }
 
     /// Reads a blob's bytes by its hex SHA.
@@ -148,6 +199,12 @@ pub fn language_for_path(path: &str) -> Option<&'static str> {
         "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
         "cs" => "csharp",
         "rb" => "ruby",
+        // No grammar in rb; named so their files are reported as unanalysed code (M7g S1).
+        "php" => "php",
+        "scala" | "sc" => "scala",
+        "swift" => "swift",
+        "dart" => "dart",
+        "ex" | "exs" => "elixir",
         "sql" => "sql",
         "proto" => "protobuf",
         "prisma" => "prisma",
@@ -274,6 +331,39 @@ mod tests {
         );
     }
 
+    /// Contract M7b S5 (stress F15): a blob over the streaming threshold is sniffed from its
+    /// first bytes through `git cat-file`, never loaded whole; the manifest is the same as when
+    /// every blob is loaded (`stream_above: 0` streams them all). The fixture's sniff edges: a
+    /// NUL just past the window, a NUL just inside it, a generated marker past 512 bytes.
+    #[test]
+    fn streamed_sniffing_matches_loading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let mut late_nul = vec![b'a'; SNIFF_BYTES];
+        late_nul.push(0);
+        let mut early_nul = vec![b'a'; SNIFF_BYTES - 1];
+        early_nul.push(0);
+        let mut generated = vec![b' '; 600];
+        generated.extend_from_slice(b"// @generated\n");
+        write(dir, "late.txt", &late_nul);
+        write(dir, "early.bin", &early_nul);
+        write(dir, "gen.ts", &generated);
+        write(dir, "small.rs", b"fn main() {}\n");
+        write(dir, "empty", b"");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+        let repo = Repo::open(dir).unwrap();
+        let loaded = repo.manifest_with("HEAD", u64::MAX).unwrap();
+        let streamed = repo.manifest_with("HEAD", 0).unwrap();
+        assert_eq!(streamed, loaded);
+        let get = |p: &str| loaded.files.iter().find(|f| f.path == p).unwrap();
+        assert!(!get("late.txt").binary);
+        assert!(get("early.bin").binary);
+        assert!(get("gen.ts").generated);
+        assert_eq!(get("late.txt").size, SNIFF_BYTES as u64 + 1);
+    }
+
     #[test]
     fn non_utf8_paths_are_skipped_not_merged() {
         use std::os::unix::ffi::OsStrExt;
@@ -320,5 +410,17 @@ mod tests {
         assert_eq!(language_for_path("x.tsx"), Some("tsx"));
         assert_eq!(language_for_path("Makefile"), None);
         assert_eq!(language_for_path(".env"), None);
+        // Contract M7g S1: languages rb has no grammar for are still named, so a file of one
+        // is reported as unanalysed code, not as "other".
+        for (path, lang) in [
+            ("app/Http/Kernel.php", "php"),
+            ("src/Main.scala", "scala"),
+            ("Sources/App.swift", "swift"),
+            ("lib/main.dart", "dart"),
+            ("lib/app.ex", "elixir"),
+            ("test/app_test.exs", "elixir"),
+        ] {
+            assert_eq!(language_for_path(path), Some(lang), "{path}");
+        }
     }
 }

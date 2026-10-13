@@ -969,3 +969,150 @@ Same rules as M6d:
 - [x] M6k DI recall (closed 2026-10-12, amendments 1–10; passes 1–2 PASS).
 - [x] M6l XML diagnostic siting (closed 2026-10-13, amendments 1–3; passes 1–2 PASS).
 - Deferred beyond M6: scip-clang, `rust-analyzer scip`, scip-dotnet, the SCIP incremental below a single-root reactor, authentication/remote binding/`POST …/index` and move detection (only if asked for). Dropped: Groovy registrants.
+
+---
+
+# M7a: `exact`-label correctness (stress batch A), started 2026-10-13
+
+Contract: `tasks/contract-m7a.md`. Findings: `tasks/stress-findings.md` (F17, F18, F19).
+
+- [x] Phase 1 (S1/F19): Go/TS gRPC client typing. Constructor must be the last link; the `New*Client(c).Rpc` chain read as an RPC. The test failed first (getters reported, real calls missed). Mutants m1–m3 killed.
+- [x] Phase 2 (S2/F18): FastAPI through the shared router composer (`RouterDecl`/`Mount`), plus Python submodule mount targets and Python top-level `Constant` routers. The indexer test failed first (`DELETE /{}` merged, all exact). The 3 pack tests now pin per-file facts, and in-file composition is pinned at indexer level. Mutants m4–m7 killed.
+- [x] Phase 3 (S3/F17): gRPC server registrations (5 languages), registration-based attribution, `grpc_implementer_unknown` and `grpc_registration_ambiguous`. Tests failed first (copies exposed everything). Mutants m8–m12 killed; m9 first survived, and the test gained a one-copy-implemented-elsewhere case.
+- [x] Phase 4: PIPELINE `m7a-1`; fmt and clippy clean. DB suites: 980 pass, 2 fail (pre-existing F1). Invariant: 29/31 identical, with 2 classified (microservices-demo, fastapi-realworld). The mattermost false positives were caught and fixed by tightening to the two-link shape. Repros re-run; DB cleaned.
+
+## Review (M7a)
+- The three S1 `exact`-label errors from the stress campaign are fixed, tests-first, with 14 mutants killed. All 18 fixture dumps are byte-identical.
+- Residue recorded in the contract: inner prefixes are lost under an unknown top prefix; gRPC handler methods aren't linked; helper-registered health isn't read.
+- Not done: commit, and an evaluator pass.
+
+---
+
+# M7b: regressions and hangs (stress batch B), started 2026-10-13
+
+Contract: `tasks/contract-m7b.md`. Branch `m7b-regressions-and-hangs` (stacked on M7a).
+
+- [x] Phase 1 (S1/F1): `rb status` without `--repo` lists all repositories outside an indexed checkout. The two red tests (e2e `json_answers…`, api) now pass. README and testing guide updated.
+- [x] Phase 2 (S2/F2): `bounded_output` for every Docker CLI call (probe 10 s, others 60 s), killed and reaped. Test with a hanging fake (bounds 1 s, an order of magnitude above process start, after a flake at 300 ms). Mutants m15/m16 killed. Against the real wedged Docker Desktop, `rb index` finishes in 12 s (was an indefinite hang).
+- [x] Phase 3 (S3/F9/F10): a `Parents` map (one walk) replaces `Node::parent()` in the profiled hot spots only: `mentions` (es/java role), `call_qualifier`, `is_inner_link`, `assignment_target`. Each has a killing mutant (m17–m20, m23). `local_by_ancestry` and `type_qualifier` were converted, then reverted when their mutants (m21, m22) showed they are not hot. The timing test (7 pathological cases) runs in about 4.7 s in a debug build. The 1,500-link JS chain took 365 s in debug before. A probe also found a 3,000-segment member path at 85 s (release), now under 1 s.
+- [x] Phase 4 (S4/F11): `Composer::prefixes` explored every simple path of a mount cycle (unclean results are never memoised). It now stops once the known prefixes are capped and the result is unknown. Counted work at 6→12 routers went from 123× growth to within 4×, with endpoints pinned (365/725). On the F11 file: 44 s → 1 s, dumps byte-identical. Mutant m24 killed.
+- [x] Phase 5 (S5/F15): `find_header` for the size, and the head is streamed through `git cat-file` for blobs over 64 MiB (full load as fallback). The manifest is identical with streaming forced on and off (sniff-edge fixture). Mutant m25 killed. 1 GiB blob: 2,063 MiB → 16 MiB peak RSS, 2.66 s → 1.30 s.
+- [x] Phase 6: fmt and clippy clean. DB suites 986/0, no skips. Invariant against M7a 31/31 identical. Repros: F1 lists all repos; F2 12 s on real wedged Docker; F9 chain 4k 3 s (was >300 s); F10 nested 20k under 1 s; F11 1 s (was 44 s); F15 16 MiB (was 2 GiB). DB cleaned.
+
+## Review (M7b)
+- Batch B is complete. Both suites are green with the DB and without skips. Every hang and blow-up found by the stress campaign is now bounded.
+- Residue: role walks are O(n·depth) on one long chain (3 s at 4k links); blobs of 64 MiB and under are still loaded to sniff.
+
+---
+
+# M7c: HTTP recall on supported stacks (stress batch C, part 1), started 2026-10-13
+
+Contract: `tasks/contract-m7c.md`. Branch `m7c-http-recall` (stacked on M7b). Docker Desktop was restarted and is responsive. Phase 0 ran the full suite against real Docker.
+
+- [x] Phase 0: full workspace with DB and real Docker: 986 passed, 0 failed, 0 skipped. All SCIP e2e green (contract-packs, go-chi, gradle, lombok and others). No leftover containers or networks.
+- [x] Phase 1 (S3/F12, S4/F27): `require('express')()` / `.Router()` inline factories; TS `*Client` gRPC stub only when imported from a generated module (grpc/_pb/proto, or a `gen`/`generated` segment; the gen segment keeps the M6f pin). Tests failed first. Mutants m26–m30 killed.
+- [x] Phase 2 (S2/F21): `imported_instance` resolves `default` through the target's `default_export`. The test failed first (both calls dropped). Mutant m31 killed.
+- [x] Phase 3a (S1 groundwork): `constants.rs` (shared `Constants`, implements `Lookup`, no properties) extracted from stitch `Folding`, which now wraps it and adds service properties. `external` also resolves default imports through `default_export`. `Folder::object_member` folds `obj.key` on a const TS/JS object-literal binding, local or imported (last entry; nothing if a spread follows). The stitch test failed first (all `dynamic`). Mutants m32–m35 killed; m34/m35 first survived on a test-ordering mistake (bindings declared after use), and the test was fixed.
+- [x] Phase 3b (S1/F20): `RouteFact.path_name` (Express keeps `Arg::Name`; other non-literal paths are now counted as `route_path_dynamic` instead of a silent `continue`). `add_endpoints` folds the name (`Constant`/`Literal` origin only), caps it at `heuristic`, or counts it dynamic. The bookcars-shaped test failed first. Mutants m36–m39 killed.
+- [x] Phase 4: PIPELINE `m7c-1`. Real Docker: 990/0/0. Invariant: 29/31 identical; bookcars +107 endpoints / +175 CONSUMES (6/6 sampled correct), all 16 new unmatched classified; mattermost −29 false gRPC sites.
+
+## Review (M7c)
+- Batch C part 1 is complete. Express and axios recall on bookcars went from 0 routes and 0 matched calls to 107 routes and 175 stitched calls.
+- New finding F32 (Express case-insensitive matching). Residue: anonymous default-exported objects.
+
+---
+
+# M7d: DI and SQL roles (stress batch C, part 2), started 2026-10-13
+
+Contract: `tasks/contract-m7d.md`. Branch `m7d-di-and-sql` (stacked on M7c `8078ac2`).
+
+- [x] Phase 1 (S1, S2, F28): `Import.global` (rb-syntax); `.csproj` loaded as a manifest; `DotnetImplicit` (Web/Worker/BlazorWasm SDK with `ImplicitUsings` on, or a project-wide `global using`) feeds `dotnet_di(facts, implicit_di)`; owners accepted by `created` (implementation). Mutants m40–m45 killed (m44 needed an implicit-off negative). **S3 (open generics) deferred:** C# `typeof(X)` arguments are `Arg::Other` without text, so reading them needs an extractor change.
+- [x] Phase 2 (S4, F26): lane points with no qualifier, no repository type, and a type imported from outside the repository are bucketed `external` (no `di_unresolved`); a type imported from nowhere stays unresolved. Mutants m46/m47 killed.
+- [x] Phase 3 (S5, F23): `add_migrations` becomes `add_sql_file`, with `is_migration`: `-- name:` gives queries; path conventions (migrations dir, Flyway V/U/R, numbered, up/down) give migration; else DDL (or nothing parsed) gives migration, DML only gives `QUERIES` from the file. Mutants m48–m53 killed (m49 needed a dir-only case).
+- [x] Phase 4: PIPELINE `m7d-1`. The first invariant caught the pg_dump `-- Name:` misclassification and constructor-body locals as .NET points; both were fixed test-first (m54–m57). Second run: real Docker 995/0/0; invariant 26/31 identical, all diffs classified.
+
+## Review (M7d)
+- Batch C is complete (M7c + M7d). S3 (open generics) is deferred. Lesson added on content markers.
+
+---
+
+# M7e: input hygiene (stress batch D), started 2026-10-13
+
+Contract and design: `tasks/contract-m7e.md`. Branch `m7e-input-hygiene` (stacked on M7d `79216ce`). Skills applied: engineer (state/derived/invariants declared), karpathy-loops (read-first, contract-first, TDD, scope lock), system-design (diagram, numbers, trade-offs, LLD).
+
+- [x] Phase 1 (S1, S4): `rb_git::boundaries::rb_toml_ignore` (`RbToml.ignore`, shared dialect, loud errors); `exclude::decide` with 5 rules in order; `rb_scip::jobs::strip_json_comments` made pub (reused, not copied). Mutants m58–m66 killed (m62 needed the file an escaping outDir would reach); m63 (empty outDir guard) is an equivalent mutant (prefix `D//` matches no path) and the guard is kept for intent.
+- [x] Phase 2 (S2): `index_commit` decides once; `analysed` replaces `manifest.files` at the 13 analysis sites (codeowners, `assemble` and `packages` existence keep the full manifest); `Content.excluded` sets the `File` attr; one `excluded {reason, files}` diagnostic per reason. Temp-git-repo test (vendored module with its own go.mod, committed node_modules) failed first. Mutants m67–m70 killed.
+- [x] Phase 3 (S3): `Coverage.excluded` (JSON field skipped when empty, so unaffected repos answer byte-identically), diagnostics loaded once and partitioned; CLI `excluded_line`. Mutants m71/m72 killed.
+- [x] Phase 4: PIPELINE `m7e-1`. Real Docker 1,004/0/0. Invariant 28/31 identical; every row of the 3 diffs classified by identity (laravel was a prediction miss, correct behaviour). go-gin 2.64 s → 0.64 s, 359 → 87 MiB, 10,077 → 1,259 nodes, 1,059 → 0 ambiguous. CHANGELOG backfilled.
+
+## Review (M7e)
+- Batch D is complete. Exclusion is decided once from the full tree and counted per reason. Residue: `rb.toml` `include` opt-back-in, gitattributes macros and negations, `outDir` via `extends`.
+
+---
+
+# M7f: error contract and targets (stress batch E, part 1), started 2026-10-13
+
+Contract: `tasks/contract-m7f.md`. Branch `m7f-error-contract` (stacked on M7e `be2d93d`). Record set (from `git show --stat a4e891b`): CHANGELOG.md, IMPLEMENT.md, contract, todo, stress-findings, lessons.
+
+- [x] Phase 1 (S1, S7): `CLI_NAMES` (positionals by clap usage name, `columns`→`--cols`); one `repo_needed` helper replaces 4 copies (`--repo is needed: …`); `path --json`. Mutants m73–m75 killed.
+- [x] Phase 2 (S2, S3): `rb_store::Unavailable` (redacted URL, root cause) from `connect`; `ErrorKind::Unavailable` (exit 6, 503) with a hint; `main` captures `--json`/check up front and routes typed errors through `answer_err`; `check` exits 2 on every error, with envelope; `live_snapshot` typed (`not_found`, `no_live_snapshot`), dead fallback deleted. Verified on the real binary against a closed port. Mutants m76–m79 killed (m79 needed an exact-cause assertion).
+- [x] Phase 3 (S4, S5): `near_miss_symbols` (find's rule; only for key-syntax input with `#` or `(`); `shell_arg` quoting in 3 suggestion sites. Mutants m80–m83 killed (m81 needed a plain-fragment negative).
+- [x] Phase 4 (S6): `column_text`: `agtype_out` text for graph values (suffix `::vertex|edge|path`, not a string), `::text` otherwise. Probed live: scalars, lists and maps identical; `1.0`, numeric and `-0.0` would differ under `agtype_out`, so the suffix test stays. DB test failed first. Mutants m84–m86 killed (m86 needed a `1.0` case).
+- [x] Phase 5: real Docker 1,009/0/0 after updating 2 server tests that pinned the incidental `500 internal` (now `503 unavailable`, per S2); no golden changed; invariant 31/31 byte-identical; repros show the new behaviour; full record set written.
+
+## Review (M7f)
+- Batch E part 1 is complete. One error contract: typed kinds, envelope everywhere, exit 6 for an unreachable database, and 2 for any `check` error.
+
+---
+
+# M7g: honesty about what was not analysed (stress batch E, part 2), started 2026-10-13
+
+Contract: `tasks/contract-m7g.md`. Branch `m7g-honesty` (stacked on M7f `83f720b`). Record set: CHANGELOG, IMPLEMENT, contract, todo, stress-findings, lessons.
+
+- [x] Phase 1 (S1, F30): php/scala/swift/dart/elixir named; `parse_plan` counts code languages without a grammar (data formats, binary and generated files excluded); one `counts_line` helper behind the `excluded` and `not analysed` lines. Mutants m87–m90 killed (m88 re-applied on fmt text).
+- [x] Phase 2 (S2, F25): `FRAMEWORKS_WITHOUT_A_PACK` (14 entries) matched per manager (Go `/vN`, Maven group); one diagnostic per service and framework; status line. Mutants m91, m92, m94 killed; m93 showed the PyPI case arm was dead (names arrive normalised), so it was deleted.
+- [x] Phase 3 (S3, F24): orphan Cypher (`OPTIONAL MATCH … certainty > 1 … COUNT = 0`) and twin (`certainty > Ambiguous`) changed together, the literal bound to `Certainty::Ambiguous.rank()` by test; `--baseline` reads `rb check`'s own text output; stderr caveat from `http_coverage`. Mutants m95–m98 killed (m98 needed a non-rule arrow line).
+- [x] Phase 4: PIPELINE `m7g-1`; real-Docker suites 1,013/0/0 (the polyglot `check` golden re-blessed: one ambiguous-only endpoint is now an orphan, as S3 states); invariant against M7f 27/31 identical, 4 diffs classified (3 `framework_unsupported`, laravel `php`); `rb check` orphan counts unchanged on 8 real repos, mattermost 0.16 s; README and usage guide updated; records.
+
+# M7h: the CLI remainder (stress batch F, part 1), started 2026-10-13
+
+Contract: `tasks/contract-m7h.md`. Branch `m7h-ux` (stacked on M7g `52b7b90`). Record set: CHANGELOG, IMPLEMENT, contract, todo, stress-findings, lessons, README, usage guide.
+
+- [x] Phase 1 (S1, F3/U1): migration `0007_repo_checkout`; `Store::{record_checkout, repo_checkouts}`; one CLI `infer_repo` used by questions, `check`, `dump`; `rb index` without `--repo` reuses the checkout's repo.
+- [x] Phase 2 (S2, S3): `find --kind` without text; `service NAME --limit` wording; `find` no-match note; env-named `RB_CYPHER_TIMEOUT_MS`.
+- [x] Phase 3 (S4): Cypher read-only and `--cols` mismatch errors.
+- [x] Phase 4 (S5): `rb doctor`.
+- [x] Phase 5: real-Docker suites 1,028/0/0; invariant against M7g 31/31 identical; F3 repro answers from the checkout; `rb doctor` 10/10 ok; README and usage guide; records.
+
+---
+
+# M8a: accuracy benchmark with answer keys, part 1 (contract written 2026-10-13; starts after M7i and the M7 close)
+
+Contract: `tasks/contract-m8a.md`. Branch `m8a-bench` (stacked on the M7 close). Record set: CHANGELOG, IMPLEMENT, contract, todo, bench-findings (new), lessons, README, usage guide. Part 2 (M8b): microSecEnD, blind hand keys, `exact` sample.
+
+- [ ] Phase 1 (S1–S3): `crates/rb-bench` core: dump v2 reader, `locate` (symbol and file identity), `EdgeId` merge, `score` with exhaustive buckets, ambiguous site hits. Tests first; mutants from the next free number.
+- [ ] Phase 2 (S6, S8, S9): scoreboard v1 writer (sorted, no timestamps), `render`, `render --certainty`, `compare` (per-cell gate, pins/keys exit 2, accept file with milestone tag, exact-`fp` never acceptable, perf warn-only).
+- [ ] Phase 3 (S7): `bench/{manifest.tsv, fetch.sh, run.sh}`; ports `bench_index.sh` timing and `real_one.sh` pin check; 13 stress pins.
+- [ ] Phase 4 (S4): SCIP agreement adapter (`calls`, `calls_file_scope`, `covered_share`); real run on ≥ 1 Java, TS, Go, Python repo.
+- [ ] Phase 5 (S5): PyCG adapter (name mapping, scope rules, case count asserted); real run on every case.
+- [ ] Phase 6 (S8, S10, S11): double run + `cmp`; first scoreboard `bench/scoreboard/m8a.json`; `bench-findings.md`; docs; fmt/clippy; real-Docker suites; invariant against the M7 close (31/31 expected); records; M8b contract.
+
+# M7i: precision and cost remainder (stress batch F, part 2), started 2026-10-13
+
+Contract: `tasks/contract-m7i.md`. Branch `m7i-precision-cost` (stacked on M7h `735d3ae`). Record set: CHANGELOG, IMPLEMENT, contract, todo, stress-findings, lessons, README, usage guide.
+
+- [x] Phase 1 (S1, F32): Express case-sensitive opt-in per router; `fold_case` endpoints; folded index buckets; `case: folded`, never synthetic. Mutants m123–m130 killed. (Implemented before this contract was written; the contract records it.)
+- [x] Phase 2 (S2, F31): spec-only route count; JSON spec spans; callers of a handler.
+- [x] Phase 3 (S3, S5; O3, O4): per-repo index lock; streamed facts.
+- [x] Phase 4 (S4, U5): `--limit` and `--exclude-tests` for callers and impact.
+- [x] Phase 5: real-Docker suites 1,041/0/0 (3 goldens re-blessed after review, the parity harness taught `exclude_tests`); invariant against M7h 29/31, 2 classified (bookcars +4 folded `CONSUMES`, go-gin spec spans); go-gin `3 from specs only`; mattermost cached RSS 2,148 → 1,658 MiB; docs; records. Then the M7 close pass.
+
+# M7j: the M7 close fixes (evaluator pass 1), started 2026-10-13
+
+Contract: `tasks/contract-m7j.md`. Branch `m7j-close` (stacked on M7i `77675c8`). Input: `tasks/eval-m7-pass1.md`.
+
+- [x] E3: shared-DB checkouts repaired (5 repos had the m103 mutant's `/y/demo`); mutant leftover repo `tmpzc8i9d` removed; `rb gc`.
+- [x] Phase 1 (E1, E4, E6, E7): per-candidate `case`; histogram over every row found; `--pick` beyond one; `rb path` case note.
+- [x] Phase 2 (E2, E5): bounded `rb doctor`; linear JSON spans.
+- [x] Phase 3 (E8): records and docs; full real-Docker run with log 1,047/0/0; invariant against M7i 31/31; E5 10.8 s (M7i 45.4 s); evaluator pass 2 next.
+- [x] Evaluator pass 2 (`tasks/eval-m7-pass2.md`): FAIL, 1 blocking item (U2 marked done; a records error). E1–E7 reproduced. Fixed: U2 ◐; E6 wording; binary of record rebuilt from the closing tree (`m7j-1` checked); N2 and N4 recorded as residue. **M7 closed.**

@@ -588,6 +588,9 @@ pub struct Import {
     pub wildcard: bool,
     /// Java `import static`.
     pub is_static: bool,
+    /// C# `global using`: in effect in every file of the project (contract M7d S1).
+    #[serde(default)]
+    pub global: bool,
     pub span: Span,
 }
 
@@ -656,6 +659,31 @@ pub struct Binding {
 }
 
 /// Parses `source` and extracts its definitions and references.
+/// Every node's parent by node id, from one walk (contract M7b S3). tree-sitter's
+/// `Node::parent()` re-descends from the root, so a walk that climbs ancestors per node is
+/// quadratic in depth (cubic over a long chain) with it; with this map each step is O(1).
+pub(crate) struct Parents<'t>(HashMap<usize, Node<'t>>);
+
+impl<'t> Parents<'t> {
+    pub(crate) fn new(root: Node<'t>) -> Self {
+        let mut map = HashMap::new();
+        let mut stack = vec![root];
+        let mut cursor = root.walk();
+        while let Some(node) = stack.pop() {
+            let children: Vec<Node<'t>> = node.children(&mut cursor).collect();
+            for child in children {
+                map.insert(child.id(), node);
+                stack.push(child);
+            }
+        }
+        Parents(map)
+    }
+
+    pub(crate) fn of(&self, node: Node<'t>) -> Option<Node<'t>> {
+        self.0.get(&node.id()).copied()
+    }
+}
+
 pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
     let grammar = queries::for_language(language);
     let mut parser = Parser::new();
@@ -664,6 +692,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         .parse(source, None)
         .context("tree-sitter produced no tree")?;
     let root = tree.root_node();
+    let parents = Parents::new(root);
 
     let (mut raw_defs, mut raw_refs) = capture(grammar, root, source);
     raw_defs.sort_by_key(|d| (d.node.start_byte(), std::cmp::Reverse(d.node.end_byte())));
@@ -718,14 +747,14 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             enclosing: enclosing(r.name.start_byte(), &starts, &ends, &lexical_parent)
                 .map(|i| nearest_kept(i, &kept, &lexical_parent)),
             qualifier: match r.kind {
-                RefKind::Call => call_qualifier(r.name, source),
+                RefKind::Call => call_qualifier(r.name, source, &parents),
                 RefKind::Class | RefKind::Type => type_qualifier(r.name, source),
                 RefKind::Implementation => None,
             },
         })
         .collect();
 
-    let raw_chains = calls::chains(language, root, source);
+    let raw_chains = calls::chains(language, root, source, &parents);
     let chain_index: HashMap<usize, usize> = raw_chains
         .iter()
         .enumerate()
@@ -822,7 +851,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
         .filter(|(_, k)| k.is_some())
         .map(|(d, _)| d.name.byte_range())
         .collect();
-    let mentions = mentions::mentions(language, root, source, &declared, &defined);
+    let mentions = mentions::mentions(language, root, source, &declared, &defined, &parents);
     let name_tokens = tokens::tokens(
         language,
         root,
@@ -1075,8 +1104,8 @@ fn type_qualifier(name: Node<'_>, source: &[u8]) -> Option<String> {
     Some(text(scope, source))
 }
 
-fn call_qualifier(name: Node<'_>, source: &[u8]) -> Option<String> {
-    let member = name.parent()?;
+fn call_qualifier<'t>(name: Node<'t>, source: &[u8], parents: &Parents<'t>) -> Option<String> {
+    let member = parents.of(name)?;
     // Kotlin navigation receivers are positional (no `object:` field): the receiver precedes
     // the member name (contract M6i S2).
     if member.kind() == "navigation_expression" {
@@ -1807,6 +1836,76 @@ export function hash(s: string): string {
             assert!(
                 format!("{EXTRACTOR_VERSION};").contains(&pinned),
                 "EXTRACTOR_VERSION lacks {pinned}"
+            );
+        }
+    }
+
+    /// Contract M7b S3 (stress F9/F10): walks that climb ancestors read them from the walk,
+    /// not `Node::parent()` (which re-descends from the root), so pathological depth stays
+    /// fast. Measured before (release): a 1,500-link JS chain ~50 s (cubic), 10,000 nested Go
+    /// calls 8 s and JS 17 s (quadratic), a 3,000-segment member path 85 s. The bound is wide
+    /// (load-tolerant) and still bites.
+    #[test]
+    fn deep_chains_and_nested_calls_extract_quickly() {
+        let cases = [
+            (
+                Language::JavaScript,
+                format!(
+                    "const b = mk();\nconst x = b{}.build();\n",
+                    ".add(1)".repeat(1500)
+                ),
+            ),
+            (
+                Language::Java,
+                format!(
+                    "class M {{ Object x = b{}.build(); }}\n",
+                    ".add(1)".repeat(3000)
+                ),
+            ),
+            (
+                Language::Go,
+                format!(
+                    "package main\nfunc f(a int) int {{ return a }}\nfunc main() {{ _ = {}1{} }}\n",
+                    "f(".repeat(10_000),
+                    ")".repeat(10_000)
+                ),
+            ),
+            (
+                Language::JavaScript,
+                format!(
+                    "function f(a) {{ return a }}\nconst x = {}1{};\n",
+                    "f(".repeat(10_000),
+                    ")".repeat(10_000)
+                ),
+            ),
+            // Long member paths (`a.b.b.b…`): 85 s release at 3,000 before, found probing;
+            // these climb every enclosing member/field access per token.
+            (
+                Language::JavaScript,
+                format!("const z = a{}.f();\n", ".b".repeat(2000)),
+            ),
+            (
+                Language::Java,
+                format!("class M {{ Object z = a{}.f(); }}\n", ".b".repeat(2000)),
+            ),
+            // Nested callbacks.
+            (
+                Language::JavaScript,
+                format!(
+                    "const r = {}1{};\n",
+                    "a(() => ".repeat(3000),
+                    ")".repeat(3000)
+                ),
+            ),
+        ];
+        for (language, src) in cases {
+            let started = std::time::Instant::now();
+            let facts = extract(language, src.as_bytes()).unwrap();
+            let elapsed = started.elapsed();
+            assert!(!facts.chains.is_empty(), "{language:?}");
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "{language:?}: {elapsed:?}"
             );
         }
     }

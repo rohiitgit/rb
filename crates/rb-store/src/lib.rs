@@ -52,6 +52,8 @@ pub mod limits {
         Tree,
         Work,
         Rows,
+        /// The rows a question shows (`--limit`, contract M7i S4).
+        Shown,
     }
 
     impl Limit {
@@ -63,6 +65,7 @@ pub mod limits {
                 Limit::Tree => "tree",
                 Limit::Work => "work",
                 Limit::Rows => "rows",
+                Limit::Shown => "limit",
             }
         }
     }
@@ -342,6 +345,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0006_reader_role",
         include_str!("../../../migrations/0006_reader_role.sql"),
     ),
+    (
+        "0007_repo_checkout",
+        include_str!("../../../migrations/0007_repo_checkout.sql"),
+    ),
 ];
 
 /// Name of the newest embedded migration; recorded in each snapshot's `tool_versions`.
@@ -364,6 +371,10 @@ const MIGRATION_LOCK: i64 = 0x7262_6d69_6772;
 /// several processes has killed backends with `failed to re-find shared lock object`). Taken
 /// after any repository row lock, never before.
 pub const RB_AGE_DDL_LOCK: i64 = 0x7262_6167_6464;
+
+/// The class of the per-repository `rb index` lock (contract M7i S3); the object is
+/// `hashtext(repo)`. Session-level: held until released or the connection closes.
+pub const INDEX_LOCK_CLASS: i32 = 0x7262_6978;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotInfo {
@@ -470,8 +481,12 @@ pub enum CypherError {
     NoProjection { snapshot: i64 },
     /// The statement timeout cancelled the query.
     Timeout { limit_ms: u64 },
-    /// The database refused the query: syntax, a write in the read-only transaction, a
-    /// privilege `rb_reader` lacks.
+    /// A write: refused by the read-only transaction, or by the write privilege `rb_reader`
+    /// lacks, whichever the database checks first (contract M7h S4); the database's message.
+    ReadOnly(String),
+    /// The RETURN items and the `given` columns differ in number (contract M7h S4).
+    Columns { given: usize },
+    /// The database refused the query otherwise: syntax, a function `rb_reader` may not call.
     Refused(String),
 }
 
@@ -487,6 +502,13 @@ impl std::fmt::Display for CypherError {
                 "cypher query cancelled by its statement timeout of {limit_ms} ms \
                  (limit `timeout_ms`: --timeout-ms, at most {CYPHER_TIMEOUT_MS_MAX})"
             ),
+            CypherError::ReadOnly(message) => {
+                write!(f, "cypher is read-only: the query was refused ({message})")
+            }
+            CypherError::Columns { given } => write!(
+                f,
+                "columns must name one column per RETURN item (got {given})"
+            ),
             CypherError::Refused(message) => write!(f, "cypher: {message}"),
         }
     }
@@ -494,18 +516,36 @@ impl std::fmt::Display for CypherError {
 
 impl std::error::Error for CypherError {}
 
-/// Classifies a database error from a Cypher query; anything that is not the server's answer
-/// (a broken connection) stays as it is.
-fn cypher_error(e: postgres::Error, limits: CypherLimits) -> anyhow::Error {
-    match e.as_db_error() {
-        Some(db) if *db.code() == postgres::error::SqlState::QUERY_CANCELED => {
-            CypherError::Timeout {
-                limit_ms: limits.timeout_ms,
-            }
-            .into()
+/// Classifies a database error from a Cypher query of `columns` columns; anything that is not
+/// the server's answer (a broken connection) stays as it is.
+fn cypher_error(e: postgres::Error, limits: CypherLimits, columns: usize) -> anyhow::Error {
+    use postgres::error::SqlState;
+    let Some(db) = e.as_db_error() else {
+        return e.into();
+    };
+    let message = db.message();
+    // `rb_reader` reads every graph table and may use its schema, so a privilege it lacks on a
+    // schema, table or relation is one only a write needs; a denied function is not a write.
+    let write_privilege = *db.code() == SqlState::INSUFFICIENT_PRIVILEGE
+        && [
+            "permission denied for schema",
+            "permission denied for table",
+            "permission denied for relation",
+            "permission denied for sequence",
+        ]
+        .iter()
+        .any(|p| message.starts_with(p));
+    if *db.code() == SqlState::QUERY_CANCELED {
+        CypherError::Timeout {
+            limit_ms: limits.timeout_ms,
         }
-        Some(db) => CypherError::Refused(db.message().to_owned()).into(),
-        None => e.into(),
+        .into()
+    } else if *db.code() == SqlState::READ_ONLY_SQL_TRANSACTION || write_privilege {
+        CypherError::ReadOnly(message.to_owned()).into()
+    } else if message == "return row and column definition list do not match" {
+        CypherError::Columns { given: columns }.into()
+    } else {
+        CypherError::Refused(message.to_owned()).into()
     }
 }
 
@@ -541,8 +581,10 @@ pub struct Store {
 
 impl Store {
     pub fn connect(url: &str) -> anyhow::Result<Self> {
-        let mut client = Client::connect(url, NoTls)
-            .with_context(|| format!("connecting to {}", redact(url)))?;
+        let mut client = Client::connect(url, NoTls).map_err(|e| Unavailable {
+            url: redact(url),
+            cause: root_cause(&e),
+        })?;
         // AGE's cypher() and agtype live in ag_catalog; rb.* is always schema-qualified.
         client.batch_execute(r#"SET search_path = ag_catalog, "$user", public"#)?;
         Ok(Self {
@@ -633,6 +675,89 @@ impl Store {
             &[&name, &origin_url],
         )?;
         Ok(row.get(0))
+    }
+
+    /// The server's version and the installed AGE extension's (`None` when not installed), for
+    /// `rb doctor` (contract M7h S5).
+    pub fn server_versions(&mut self) -> anyhow::Result<(String, Option<String>)> {
+        let row = self.client.query_one(
+            "SELECT current_setting('server_version'),
+                    (SELECT extversion FROM pg_extension WHERE extname = 'age')",
+            &[],
+        )?;
+        Ok((row.get(0), row.get(1)))
+    }
+
+    /// The embedded migrations not applied yet, in order (all of them on a fresh database).
+    pub fn pending_migrations(&mut self) -> anyhow::Result<Vec<&'static str>> {
+        let applied: Vec<String> = match self
+            .client
+            .query_one(
+                "SELECT to_regclass('public.rb_schema_migrations') IS NOT NULL",
+                &[],
+            )?
+            .get(0)
+        {
+            true => self
+                .client
+                .query("SELECT name FROM public.rb_schema_migrations", &[])?
+                .iter()
+                .map(|r| r.get(0))
+                .collect(),
+            false => vec![],
+        };
+        Ok(MIGRATIONS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !applied.iter().any(|a| a == name))
+            .collect())
+    }
+
+    /// Whether the server sees the file `name` that the host wrote into `dir`, at the path the
+    /// AGE loader reads (`/tmp/age/<server_rel>/<name>`): the mount the projection needs.
+    pub fn server_sees_load_file(&mut self, dir: &LoadDir, name: &str) -> anyhow::Result<bool> {
+        let path = format!("/tmp/age/{}/{name}", dir.server_rel);
+        let row = self
+            .client
+            .query_one("SELECT (pg_stat_file($1, true)).size IS NOT NULL", &[&path])?;
+        Ok(row.get(0))
+    }
+
+    /// Takes `repo`'s index lock if no other session holds it (contract M7i S3).
+    pub fn try_lock_index(&mut self, repo: &str) -> anyhow::Result<bool> {
+        let row = self.client.query_one(
+            "SELECT pg_try_advisory_lock($1, hashtext($2))",
+            &[&INDEX_LOCK_CLASS, &repo],
+        )?;
+        Ok(row.get(0))
+    }
+
+    /// Waits for `repo`'s index lock and takes it.
+    pub fn lock_index(&mut self, repo: &str) -> anyhow::Result<()> {
+        self.client.execute(
+            "SELECT pg_advisory_lock($1, hashtext($2))",
+            &[&INDEX_LOCK_CLASS, &repo],
+        )?;
+        Ok(())
+    }
+
+    /// Records the checkout `repo` was indexed from (contract M7h S1); a repository that does
+    /// not exist is left uncreated.
+    pub fn record_checkout(&mut self, repo: &str, checkout: &str) -> anyhow::Result<()> {
+        self.client.execute(
+            "UPDATE rb.repo SET checkout = $2 WHERE name = $1",
+            &[&repo, &checkout],
+        )?;
+        Ok(())
+    }
+
+    /// Every repository with the checkout it was last indexed from (`None` before M7h), by name.
+    pub fn repo_checkouts(&mut self) -> anyhow::Result<Vec<(String, Option<String>)>> {
+        let rows = self.client.query(
+            "SELECT name, checkout FROM rb.repo ORDER BY name COLLATE \"C\"",
+            &[],
+        )?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     pub fn repo_names(&mut self) -> anyhow::Result<Vec<String>> {
@@ -1264,20 +1389,38 @@ impl Store {
         &mut self,
         rows: &[(String, String)],
     ) -> anyhow::Result<HashMap<(String, String), Vec<u8>>> {
+        let mut out = HashMap::new();
+        self.for_each_facts(rows, |key, bytes| {
+            out.insert(key, bytes.to_vec());
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Streams the cached facts of `rows` (blob, extractor) to `f`, one row at a time, so a
+    /// caller decoding them never holds every row's bytes at once (contract M7i S5: a cached
+    /// index of mattermost held about 300 MB of them twice). Missing rows are skipped; the
+    /// first error from `f` stops the stream.
+    pub fn for_each_facts(
+        &mut self,
+        rows: &[(String, String)],
+        mut f: impl FnMut((String, String), &[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use postgres::fallible_iterator::FallibleIterator;
         let (blobs, extractors): (Vec<&str>, Vec<&str>) =
             rows.iter().map(|(b, e)| (b.as_str(), e.as_str())).unzip();
-        Ok(self
-            .client
-            .query(
-                "SELECT c.blob_sha, c.extractor, c.facts
-                 FROM rb.file_facts_cache c
-                 JOIN unnest($1::text[], $2::text[]) AS k(blob_sha, extractor)
-                   USING (blob_sha, extractor)",
-                &[&blobs, &extractors],
-            )?
-            .iter()
-            .map(|r| ((r.get(0), r.get(1)), r.get(2)))
-            .collect())
+        let params: [&(dyn postgres::types::ToSql + Sync); 2] = [&blobs, &extractors];
+        let mut it = self.client.query_raw(
+            "SELECT c.blob_sha, c.extractor, c.facts
+             FROM rb.file_facts_cache c
+             JOIN unnest($1::text[], $2::text[]) AS k(blob_sha, extractor)
+               USING (blob_sha, extractor)",
+            params,
+        )?;
+        while let Some(row) = it.next()? {
+            f((row.get(0), row.get(1)), row.get::<_, &[u8]>(2))?;
+        }
+        Ok(())
     }
 
     /// Stores syntax facts. Rows are content-addressed, so an existing row is already correct.
@@ -1491,7 +1634,7 @@ impl Store {
         ))?;
         let mut rows = tx
             .query(sql.as_str(), &[])
-            .map_err(|e| cypher_error(e, limits))?;
+            .map_err(|e| cypher_error(e, limits, columns.len()))?;
         tx.commit()?;
         let truncated = if rows.len() > limits.rows {
             rows.truncate(limits.rows);
@@ -1583,7 +1726,37 @@ fn into_object(v: Value) -> anyhow::Result<rb_model::Attrs> {
 }
 
 /// Hides the password in a `postgresql://user:pass@host/db` URL for error messages.
-fn redact(url: &str) -> String {
+/// The database could not be reached (contract M7f S2): the URL with its password redacted,
+/// and the innermost cause (`Connection refused (os error 61)`), never the whole chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unavailable {
+    pub url: String,
+    pub cause: String,
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot reach the database at {}: {}",
+            self.url, self.cause
+        )
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+/// The innermost error of a chain, as the user-facing cause.
+fn root_cause(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut cur = e;
+    while let Some(next) = cur.source() {
+        cur = next;
+    }
+    cur.to_string()
+}
+
+/// A connection URL without its password (`user:***@`), as errors and `rb doctor` print it.
+pub fn redact(url: &str) -> String {
     match (url.find("://"), url.rfind('@')) {
         (Some(s), Some(at)) if at > s => {
             let creds = &url[s + 3..at];
@@ -1599,6 +1772,18 @@ fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreachable_database_is_unavailable_with_its_root_cause() {
+        let e = Store::connect("postgresql://rb:secret@127.0.0.1:1/rb")
+            .err()
+            .unwrap();
+        let u = e.downcast_ref::<Unavailable>().expect("typed");
+        assert_eq!(u.url, "postgresql://rb:***@127.0.0.1:1/rb");
+        // The innermost cause, as the OS words it (its error code differs by platform).
+        assert!(u.cause.starts_with("Connection refused"), "{}", u.cause);
+        assert!(!format!("{e:?}").contains("Caused by"), "{e:?}");
+    }
 
     #[test]
     fn redacts_passwords() {
