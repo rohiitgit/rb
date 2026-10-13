@@ -231,6 +231,23 @@ pub fn rb_exit_env(url: &str, args: &[&str], env: &[(&str, &str)]) -> (i32, Stri
     )
 }
 
+/// `rb` run from `dir` (no `--repo` needed there), with its exit code, stdout and stderr.
+pub fn rb_exit_in(url: &str, dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .args(args)
+        .current_dir(dir)
+        .env("RB_DATABASE_URL", url)
+        .env("RB_AGE_LOAD_DIR", workspace_root().join("var/age-load"))
+        .env("RB_SCIP_WORK_DIR", workspace_root().join("var/scip"))
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
 /// A running `rb serve` on an ephemeral loopback port; stopped with SIGINT when dropped (and
 /// killed if it does not stop), so a failed assertion leaves no server behind.
 pub struct Served {

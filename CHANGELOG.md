@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M7h: the CLI remainder (stress batch F, part 1)
+- **Checkouts:** `rb index` records each repository's checkout (migration `0007_repo_checkout`). Without `--repo`, a question, `check` or `dump` inside that checkout answers from it whatever it was named, and `rb index .` re-indexes it. Several repositories at one checkout, or a directory name already recorded at another checkout, give a directive, never a guess.
+- **`find`:** `--kind` alone lists that kind; a search that matches nothing says `no matches for "x"` on stderr.
+- **`service NAME --limit`** says that page flags page the service list.
+- **Cypher:** writes are refused as `cypher is read-only: …`; a RETURN/`--cols` count mismatch is a `--cols` error (exit 2). A bad `RB_CYPHER_TIMEOUT_MS` is named as the variable in `cypher`, `check` and `serve`.
+- **`rb doctor`:** one row per prerequisite (database, Postgres and AGE, migrations, age-load dir and mount, Docker, SCIP images, work dir, disk), each with its fix; exits 1 on a failure.
+- **Docs:** README and usage guide; a stray code fence in the README removed.
+- **Verification:** fixes F3, U1, U4, U7, U9. Mutants m99–m122. Real-Docker suites 1,028/0/0. Invariant vs M7g 31/31 byte-identical.
+- **Files:** `migrations/0007_repo_checkout.sql`, `crates/rb-store/src/{lib,db_tests}.rs`, `crates/rb-api/src/{lib,error}.rs`, `crates/rb-cli/src/{main,doctor}.rs`, `crates/rb-cli/tests/{e2e.rs,common/mod.rs}`, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7h,todo,stress-findings}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M7g: honesty about what was not analysed (stress batch E, part 2)
 - **Languages:** php, scala, swift, dart and elixir files are named (`lang`). Code in a language without a grammar is counted per language (`language_unsupported`), and `rb status` prints `not analysed (no grammar): php 84 files`.
 - **Frameworks:** a service that depends on a known framework rb has no pack for (14 packages: koa, fastify, hapi, routing-controllers, NestJS controllers, echo, fiber, flask, Django views, tornado, Micronaut, Quarkus) gets `framework_unsupported`, and `rb status` names it.

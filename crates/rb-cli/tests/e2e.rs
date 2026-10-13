@@ -734,6 +734,17 @@ fn check_gates() {
     // A repository that was never indexed exits 2.
     let (code, _, stderr) = rb_exit(&url, &["check", "--repo", "t_check_missing"]);
     assert_eq!(code, 2, "{stderr}");
+    // Contract M7h S3: a bad RB_CYPHER_TIMEOUT_MS is named as the variable, and exits 2.
+    let (code, _, stderr) = rb_exit_env(
+        &url,
+        &["check", "--repo", "t_check_missing"],
+        &[("RB_CYPHER_TIMEOUT_MS", "0")],
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert_eq!(
+        stderr,
+        "Error: RB_CYPHER_TIMEOUT_MS must be between 1 and 30000 (got 0)\n"
+    );
 }
 
 /// Contract M6i S4: language fixtures without injections. Determinism, the store round
@@ -1650,6 +1661,17 @@ fn cypher_guard_rails() {
             &["cypher", "RETURN 1", "--repo", &name, "--timeout-ms", bad],
         );
         assert!(err.contains("--timeout-ms"), "{bad}: {err}");
+        // Contract M7h S3: the same value from the environment is named as the variable.
+        let (code, _, err) = rb_exit_env(
+            &url,
+            &["cypher", "RETURN 1", "--repo", &name],
+            &[("RB_CYPHER_TIMEOUT_MS", bad)],
+        );
+        assert_eq!(code, 2, "{err}");
+        assert_eq!(
+            err.trim_end(),
+            format!("Error: RB_CYPHER_TIMEOUT_MS must be between 1 and 30000 (got {bad})")
+        );
     }
     let err = rb_fails(
         &url,
@@ -1660,7 +1682,20 @@ fn cypher_guard_rails() {
             &name,
         ],
     );
-    assert!(err.contains("read-only"), "{err}");
+    assert!(
+        err.contains("cypher is read-only: the query was refused ("),
+        "{err}"
+    );
+    // Contract M7h S4: a RETURN/--cols count mismatch is a --cols error (exit 2).
+    let (code, _, err) = rb_exit(
+        &url,
+        &["cypher", "RETURN 1, 2", "--repo", &name, "--cols", "a"],
+    );
+    assert_eq!(code, 2, "{err}");
+    assert_eq!(
+        err.trim_end(),
+        "Error: --cols must name one column per RETURN item (got 1)"
+    );
     for (query, function) in [
         (
             "RETURN pg_catalog.pg_read_file('/etc/hostname'::pg_text)",
@@ -4664,4 +4699,173 @@ fn without_failed_stderr(dump: &str) -> (Vec<String>, BTreeMap<String, String>) 
         })
         .collect();
     (rows, tails)
+}
+
+/// Contract M7h S1 (stress F3): a checkout indexed under an explicit `--repo` is that repository
+/// from inside it (and from a subdirectory): questions, `check` and `dump` need no `--repo`, and
+/// `rb index .` re-indexes it instead of creating a second repository. Indexed under a second
+/// name too, the checkout is a directive naming both.
+#[test]
+fn a_checkout_is_its_repository_whatever_its_name() {
+    let Some(url) = db_url() else { return };
+    let repo = repo_from(&[
+        (
+            "src/a.ts",
+            "export function b(): number { return 1; }\nexport function a(): number { return b(); }\n",
+        ),
+        ("src/sub/keep.txt", "x\n"),
+    ]);
+    let root = repo.path();
+    let path = root.to_str().unwrap();
+    let (a, b) = (
+        format!("t_checkout_a_{}", std::process::id()),
+        format!("t_checkout_b_{}", std::process::id()),
+    );
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![a.clone(), b.clone()],
+    };
+    rb(&url, &["index", path, "--repo", &a, "--no-scip"]);
+    // As if indexed before M7h: no checkout recorded. An up-to-date run records it.
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .execute("UPDATE rb.repo SET checkout = NULL WHERE name = $1", &[&a])
+        .unwrap();
+    let (code, _, _) = rb_exit_in(&url, root, &["callers", "b"]);
+    assert_eq!(
+        code, 2,
+        "no checkout recorded and the directory is not named {a}"
+    );
+    assert!(rb(&url, &["index", path, "--repo", &a, "--no-scip"]).contains("up to date"));
+    for dir in [root.to_path_buf(), root.join("src/sub")] {
+        let (code, stdout, stderr) = rb_exit_in(&url, &dir, &["callers", "b"]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stdout.contains("a()"), "{stdout}");
+        let (code, _, stderr) = rb_exit_in(&url, &dir, &["check"]);
+        assert_eq!(code, 0, "{stderr}");
+        let (code, dump, stderr) = rb_exit_in(&url, &dir, &["dump"]);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(dump, rb(&url, &["dump", "--repo", &a]));
+    }
+    // Contract M7h S2/S3: `find --kind` alone lists that kind; an empty `find` says so.
+    let (code, files, _) = rb_exit_in(&url, root, &["find", "--kind", "file"]);
+    assert_eq!(code, 0);
+    assert_eq!(files.lines().count(), 2, "{files}");
+    let (code, stdout, stderr) = rb_exit_in(&url, root, &["find", "zzz_nothing"]);
+    assert_eq!((code, stdout.as_str()), (0, ""));
+    assert_eq!(stderr, "no matches for \"zzz_nothing\"\n");
+    let before = Store::connect(&url).unwrap().repo_names().unwrap();
+    let (code, stdout, stderr) = rb_exit_in(&url, root, &["index", ".", "--no-scip"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.starts_with(&format!("{a}: up to date")), "{stdout}");
+    let after = Store::connect(&url).unwrap().repo_names().unwrap();
+    assert_eq!(after, before, "no second repository");
+
+    rb(&url, &["index", path, "--repo", &b, "--no-scip"]);
+    let (code, _, stderr) = rb_exit_in(&url, root, &["callers", "b"]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "is indexed as several repositories ({a}, {b}); pass --repo"
+        )),
+        "{stderr}"
+    );
+    let (code, _, stderr) = rb_exit_in(&url, root, &["index", ".", "--no-scip"]);
+    assert_ne!(code, 0, "{stderr}");
+    assert!(stderr.contains("several repositories"), "{stderr}");
+}
+
+/// Contract M7h S3: `rb serve` reads RB_CYPHER_TIMEOUT_MS before it binds, and a bad value is
+/// named as the variable (the non-loopback bind would otherwise be the refusal).
+#[test]
+fn serve_names_a_bad_timeout_variable() {
+    let Some(url) = db_url() else { return };
+    let (code, _, stderr) = rb_exit_env(
+        &url,
+        &["serve", "--bind", "0.0.0.0:1"],
+        &[("RB_CYPHER_TIMEOUT_MS", "x")],
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert_eq!(
+        stderr,
+        "Error: RB_CYPHER_TIMEOUT_MS must be between 1 and 30000 (got x)\n"
+    );
+}
+
+/// Contract M7h S5 (stress U7): `rb doctor` against the test database passes the database,
+/// AGE, migration and mount checks (the machine-dependent Docker and disk rows may only warn),
+/// exits 0, and gives the same rows as JSON; an unreachable database fails its row, skips the
+/// rows that need it, and exits 1.
+#[test]
+fn doctor_reports_each_check() {
+    let Some(url) = db_url() else { return };
+    let (code, text, stderr) = rb_exit_in(&url, &workspace_root(), &["doctor"]);
+    assert_eq!(code, 0, "{text}{stderr}");
+    for name in [
+        "database",
+        "postgres",
+        "age",
+        "migrations",
+        "age-load dir",
+        "age-load mount",
+    ] {
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("ok") && l[6..].starts_with(name)),
+            "{name}:\n{text}"
+        );
+    }
+    assert!(!text.lines().any(|l| l.starts_with("fail")), "{text}");
+    let (code, json, _) = rb_exit_in(&url, &workspace_root(), &["doctor", "--json"]);
+    assert_eq!(code, 0);
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let names: Vec<&str> = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "database",
+            "postgres",
+            "age",
+            "migrations",
+            "age-load dir",
+            "age-load mount",
+            "docker",
+            "scip images",
+            "scip work dir",
+            "disk"
+        ]
+    );
+
+    // A load dir the database does not see fails the mount check.
+    let unmounted = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("doctor")
+        .env("RB_DATABASE_URL", &url)
+        .env("RB_AGE_LOAD_DIR", unmounted.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("fail  age-load mount  the database does not see this directory"),
+        "{text}"
+    );
+
+    let dead = "postgresql://rb:secret@127.0.0.1:1/rb";
+    let (code, text, _) = rb_exit_in(dead, &workspace_root(), &["doctor"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.starts_with("fail  database"), "{text}");
+    assert!(!text.contains("secret"), "{text}");
+    for name in ["postgres", "age", "migrations", "age-load mount"] {
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("skip") && l[6..].starts_with(name)),
+            "{name}:\n{text}"
+        );
+    }
 }

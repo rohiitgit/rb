@@ -314,6 +314,15 @@ pub fn parse(
     p: &Params,
     settings: &Settings,
 ) -> Result<Request, ApiError> {
+    // A card is one answer; its page parameters belong to the list (contract M7h S2).
+    if endpoint == Endpoint::Service
+        && let Some(page) = ["limit", "offset"].into_iter().find(|k| p.get(k).is_some())
+    {
+        return Err(ApiError::invalid(
+            page,
+            "pages the service list (`rb service` without a name); a service card has no pages",
+        ));
+    }
     p.only(endpoint.params())?;
     let usize_of = |n: u64| usize::try_from(n).expect("bounded by D6");
     let pick =
@@ -321,11 +330,19 @@ pub fn parse(
     let query = match endpoint {
         Endpoint::Status => Query::Status,
         Endpoint::Snapshots => Query::Snapshots(Page::read(p, LIST_LIMIT_MAX, LIST_LIMIT_MAX)?),
-        Endpoint::Find => Query::Find {
-            q: p.text("q")?,
-            kind: p.kind_opt("kind")?,
-            page: Page::read(p, FIND_LIMIT_DEFAULT, FIND_LIMIT_MAX)?,
-        },
+        Endpoint::Find => {
+            let kind = p.kind_opt("kind")?;
+            // A kind alone lists that kind (contract M7h S2); else the text is required.
+            let q = match (p.get("q"), kind) {
+                (None | Some(""), Some(_)) => String::new(),
+                _ => p.text("q")?,
+            };
+            Query::Find {
+                q,
+                kind,
+                page: Page::read(p, FIND_LIMIT_DEFAULT, FIND_LIMIT_MAX)?,
+            }
+        }
         Endpoint::Services => Query::Services(Page::read(p, LIST_LIMIT_MAX, LIST_LIMIT_MAX)?),
         Endpoint::Service => Query::Service {
             name: p.text("name")?,
@@ -1247,6 +1264,38 @@ mod tests {
             &Params::from_pairs(pairs.iter().copied()).unwrap(),
             &Settings::default(),
         )
+    }
+
+    /// Contract M7h S2 (stress U4): `find` with a kind and no text lists that kind; with
+    /// neither, the text is required. A card's page parameters say what they page.
+    #[test]
+    fn find_by_kind_alone_and_card_pages_explained() {
+        for pairs in [
+            &[("kind", "endpoint")][..],
+            &[("q", ""), ("kind", "endpoint")],
+        ] {
+            assert_eq!(
+                parse_pairs(Endpoint::Find, pairs)
+                    .unwrap()
+                    .query
+                    .normalised(),
+                json!({"q": "", "kind": "endpoint", "limit": 20, "offset": 0})
+            );
+        }
+        for pairs in [&[][..], &[("q", "")]] {
+            let err = parse_pairs(Endpoint::Find, pairs).unwrap_err();
+            assert_eq!(err.cli_text(), "<TEXT> is required");
+        }
+        for page in ["limit", "offset"] {
+            let err = parse_pairs(Endpoint::Service, &[("name", "x"), (page, "2")]).unwrap_err();
+            assert_eq!(err.param.as_deref(), Some(page));
+            assert_eq!(
+                err.cli_text(),
+                format!(
+                    "--{page} pages the service list (`rb service` without a name); a service card has no pages"
+                )
+            );
+        }
     }
 
     /// Contract M5 S12, D6: per bounded parameter, its maximum is accepted and one above is

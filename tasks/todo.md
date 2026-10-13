@@ -1073,3 +1073,26 @@ Contract: `tasks/contract-m7g.md`. Branch `m7g-honesty` (stacked on M7f `83f720b
 - [x] Phase 2 (S2, F25): `FRAMEWORKS_WITHOUT_A_PACK` (14 entries) matched per manager (Go `/vN`, Maven group); one diagnostic per service and framework; status line. Mutants m91, m92, m94 killed; m93 showed the PyPI case arm was dead (names arrive normalised), so it was deleted.
 - [x] Phase 3 (S3, F24): orphan Cypher (`OPTIONAL MATCH … certainty > 1 … COUNT = 0`) and twin (`certainty > Ambiguous`) changed together, the literal bound to `Certainty::Ambiguous.rank()` by test; `--baseline` reads `rb check`'s own text output; stderr caveat from `http_coverage`. Mutants m95–m98 killed (m98 needed a non-rule arrow line).
 - [x] Phase 4: PIPELINE `m7g-1`; real-Docker suites 1,013/0/0 (the polyglot `check` golden re-blessed: one ambiguous-only endpoint is now an orphan, as S3 states); invariant against M7f 27/31 identical, 4 diffs classified (3 `framework_unsupported`, laravel `php`); `rb check` orphan counts unchanged on 8 real repos, mattermost 0.16 s; README and usage guide updated; records.
+
+# M7h: the CLI remainder (stress batch F, part 1), started 2026-10-13
+
+Contract: `tasks/contract-m7h.md`. Branch `m7h-ux` (stacked on M7g `52b7b90`). Record set: CHANGELOG, IMPLEMENT, contract, todo, stress-findings, lessons, README, usage guide.
+
+- [x] Phase 1 (S1, F3/U1): migration `0007_repo_checkout`; `Store::{record_checkout, repos_at_checkout, repo_checkout}`; one CLI `infer_repo` used by questions, `check`, `dump`; `rb index` without `--repo` reuses the checkout's repo.
+- [x] Phase 2 (S2, S3): `find --kind` without text; `service NAME --limit` wording; `find` no-match note; env-named `RB_CYPHER_TIMEOUT_MS`.
+- [x] Phase 3 (S4): Cypher read-only and `--cols` mismatch errors.
+- [x] Phase 4 (S5): `rb doctor`.
+- [x] Phase 5: real-Docker suites 1,028/0/0; invariant against M7g 31/31 identical; F3 repro answers from the checkout; `rb doctor` 10/10 ok; README and usage guide; records.
+
+---
+
+# M8a: accuracy benchmark with answer keys, part 1 (contract written 2026-10-13; starts after M7i and the M7 close)
+
+Contract: `tasks/contract-m8a.md`. Branch `m8a-bench` (stacked on the M7 close). Record set: CHANGELOG, IMPLEMENT, contract, todo, bench-findings (new), lessons, README, usage guide. Part 2 (M8b): microSecEnD, blind hand keys, `exact` sample.
+
+- [ ] Phase 1 (S1–S3): `crates/rb-bench` core: dump v2 reader, `locate` (symbol and file identity), `EdgeId` merge, `score` with exhaustive buckets, ambiguous site hits. Tests first; mutants from the next free number.
+- [ ] Phase 2 (S6, S8, S9): scoreboard v1 writer (sorted, no timestamps), `render`, `render --certainty`, `compare` (per-cell gate, pins/keys exit 2, accept file with milestone tag, exact-`fp` never acceptable, perf warn-only).
+- [ ] Phase 3 (S7): `bench/{manifest.tsv, fetch.sh, run.sh}`; ports `bench_index.sh` timing and `real_one.sh` pin check; 13 stress pins.
+- [ ] Phase 4 (S4): SCIP agreement adapter (`calls`, `calls_file_scope`, `covered_share`); real run on ≥ 1 Java, TS, Go, Python repo.
+- [ ] Phase 5 (S5): PyCG adapter (name mapping, scope rules, case count asserted); real run on every case.
+- [ ] Phase 6 (S8, S10, S11): double run + `cmp`; first scoreboard `bench/scoreboard/m8a.json`; `bench-findings.md`; docs; fmt/clippy; real-Docker suites; invariant against the M7 close (31/31 expected); records; M8b contract.

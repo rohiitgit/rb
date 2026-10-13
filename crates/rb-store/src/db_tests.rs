@@ -1346,3 +1346,129 @@ fn cypher_renders_graph_values_and_keeps_scalars_raw() {
     // Where `agtype_out` writes a scalar differently, the old rendering stands.
     assert_eq!(one(&mut store, "RETURN 1.0"), "1");
 }
+
+/// Contract M7h S1: a repository remembers the checkout it was indexed from; recording one for
+/// a repository that does not exist creates nothing (a failed first index leaves no row).
+#[test]
+fn repos_remember_their_checkout() {
+    let Some(db) = db() else { return };
+    let (a, b) = (repo_name("checkout_a"), repo_name("checkout_b"));
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![a.clone(), b.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    store.ensure_repo(&a, None).unwrap();
+    store.ensure_repo(&b, None).unwrap();
+    let mine = |store: &mut Store| -> Vec<(String, Option<String>)> {
+        let mut rows = store.repo_checkouts().unwrap();
+        rows.retain(|(name, _)| name == &a || name == &b);
+        rows
+    };
+    assert_eq!(mine(&mut store), vec![(a.clone(), None), (b.clone(), None)]);
+
+    store.record_checkout(&a, "/x/demo").unwrap();
+    store.record_checkout(&b, "/x/demo").unwrap();
+    store.record_checkout(&a, "/y/demo").unwrap();
+    assert_eq!(
+        mine(&mut store),
+        vec![
+            (a.clone(), Some("/y/demo".into())),
+            (b.clone(), Some("/x/demo".into()))
+        ]
+    );
+
+    let ghost = repo_name("checkout_ghost");
+    store.record_checkout(&ghost, "/z").unwrap();
+    assert!(store.repo_names().unwrap().iter().all(|r| r != &ghost));
+}
+
+/// Contract M7h S4 (stress U9): every Cypher write is refused as read-only, whichever check
+/// stops it (a missing privilege or the read-only transaction); a denied function stays a plain
+/// refusal; a RETURN whose item count differs from the columns asked for names the columns.
+#[test]
+fn cypher_writes_read_as_read_only_and_columns_as_columns() {
+    use crate::CypherError;
+    let Some(db) = db() else { return };
+    let repo = repo_name("cywrites");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"c".repeat(40),
+            &json!({}),
+            &sample_graph(3, 1),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let limits = crate::CypherLimits::default();
+    let refusal = |store: &mut Store, q: &str, cols: &[&str]| -> CypherError {
+        let cols: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+        let err = store.cypher(live.id, q, &cols, limits).unwrap_err();
+        err.downcast::<CypherError>().unwrap()
+    };
+    for write in [
+        "CREATE (n:Novel {key: 'x'}) RETURN n",
+        "MATCH (n) SET n.key = 'x' RETURN n",
+        "MATCH (n) DETACH DELETE n RETURN 1",
+        "MERGE (n:Novel {key: 'x'}) RETURN n",
+    ] {
+        match refusal(&mut store, write, &["c"]) {
+            CypherError::ReadOnly(_) => {}
+            other => panic!("{write}: {other:?}"),
+        }
+    }
+    let denied = refusal(&mut store, "RETURN pg_catalog.pg_current_logfile()", &["c"]);
+    assert!(
+        matches!(&denied, CypherError::Refused(m) if m.contains("permission denied for function")),
+        "{denied:?}"
+    );
+    assert_eq!(
+        refusal(&mut store, "RETURN 1, 2", &["c"]),
+        CypherError::Columns { given: 1 }
+    );
+    assert_eq!(
+        refusal(&mut store, "RETURN 1", &["a", "b"]),
+        CypherError::Columns { given: 2 }
+    );
+    let read_only = refusal(&mut store, "CREATE (n:Novel) RETURN n", &["c"]);
+    assert!(
+        read_only
+            .to_string()
+            .starts_with("cypher is read-only: the query was refused ("),
+        "{read_only}"
+    );
+}
+
+/// Contract M7h S5: what `rb doctor` asks the database: its and AGE's versions, the embedded
+/// migrations not applied (none after `migrate`), and whether the server sees a file the host
+/// writes into the load directory (and not one it never wrote).
+#[test]
+fn doctor_probes_read_the_server() {
+    let Some(db) = db() else { return };
+    let mut store = Store::connect(&db.url).unwrap();
+    let (postgres, age) = store.server_versions().unwrap();
+    assert!(
+        postgres.chars().next().is_some_and(|c| c.is_ascii_digit()),
+        "{postgres}"
+    );
+    assert!(age.is_some_and(|v| !v.is_empty()));
+    assert_eq!(store.pending_migrations().unwrap(), Vec::<&str>::new());
+    let dir = load_dir();
+    let name = format!("rb-doctor-test-{}.probe", std::process::id());
+    std::fs::write(dir.host.join(&name), b"probe").unwrap();
+    let seen = store.server_sees_load_file(&dir, &name);
+    std::fs::remove_file(dir.host.join(&name)).unwrap();
+    assert!(seen.unwrap());
+    assert!(
+        !store
+            .server_sees_load_file(&dir, "rb-doctor-never-written")
+            .unwrap()
+    );
+}

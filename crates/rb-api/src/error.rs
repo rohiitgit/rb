@@ -243,7 +243,11 @@ impl From<anyhow::Error> for ApiError {
             Some(c @ rb_store::CypherError::Timeout { .. }) => {
                 ApiError::new(ErrorKind::CypherTimeout, c.to_string())
             }
-            Some(c @ rb_store::CypherError::Refused(_)) => {
+            Some(rb_store::CypherError::Columns { given }) => ApiError::invalid(
+                "columns",
+                format!("must name one column per RETURN item (got {given})"),
+            ),
+            Some(c @ (rb_store::CypherError::Refused(_) | rb_store::CypherError::ReadOnly(_))) => {
                 ApiError::new(ErrorKind::Cypher, c.to_string())
             }
             None => ApiError::new(ErrorKind::Internal, format!("{e:#}")),
@@ -255,6 +259,29 @@ impl From<anyhow::Error> for ApiError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Contract M7h S4: a Cypher write is `cypher` saying read-only; a RETURN/`--cols` count
+    /// mismatch is `invalid_param` on `columns`, shown as `--cols`.
+    #[test]
+    fn cypher_writes_and_column_mismatches_have_their_kinds() {
+        let read_only = ApiError::from(anyhow::Error::from(rb_store::CypherError::ReadOnly(
+            "permission denied for schema rb_x_1".into(),
+        )));
+        assert_eq!(read_only.kind, ErrorKind::Cypher);
+        assert_eq!(
+            read_only.cli_text(),
+            "cypher is read-only: the query was refused (permission denied for schema rb_x_1)"
+        );
+        let columns = ApiError::from(anyhow::Error::from(rb_store::CypherError::Columns {
+            given: 1,
+        }));
+        assert_eq!(columns.kind, ErrorKind::InvalidParam);
+        assert_eq!(columns.param.as_deref(), Some("columns"));
+        assert_eq!(
+            columns.cli_text(),
+            "--cols must name one column per RETURN item (got 1)"
+        );
+    }
 
     /// Contract M5 D5: the table, every kind once.
     #[test]

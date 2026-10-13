@@ -1,9 +1,9 @@
 # Using and testing Repository Brain
 
 This is the operator's guide: how to run the `rb` tool end to end, and how to
-run every test suite. It reflects the tree as of M7g (M0–M7g). Design rationale
+run every test suite. It reflects the tree as of M7h (M0–M7h). Design rationale
 lives in `docs/repository-brain-design.md`; the per-milestone contracts,
-evaluations and measurements in `tasks/`; the short tour in `README.md`. M7a–M7g
+evaluations and measurements in `tasks/`; the short tour in `README.md`. M7a–M7h
 came out of a stress campaign over 18 fixtures and 13 public repositories; its
 findings, repros and what each milestone fixed are in `tasks/stress-findings.md`.
 
@@ -139,12 +139,27 @@ Notes that bite newcomers:
   A key in symbol syntax that misses (`Db#load()`, `Db#load`) resolves when
   `rb find`'s rule (case-insensitive substring of key or name) yields exactly
   one symbol; a miss suggests a quoted, copy-pasteable `rb find` command.
-- `--repo` defaults to the git checkout you run from (sanitised like `index`
-  names it, honoured only when indexed); explicit `--repo` wins. Outside any
-  indexed checkout the CLI refuses to guess and says so:
-  `--repo is needed: no indexed repository matches this checkout ("x"); …` or
-  `--repo is needed: no git repository found in "…"; …`. `rb status` is the
-  exception: outside an indexed checkout it lists every repository.
+- `--repo` defaults to the repository indexed from the git checkout you run
+  from: `rb index` records each repository's checkout (its canonical git
+  root), whatever `--repo` named it, and `rb index .` there re-indexes it.
+  A repository indexed before M7h (no checkout recorded) is found by the
+  directory name, sanitised like `index` names it. An explicit `--repo` wins.
+  Otherwise the CLI refuses to guess and says so:
+  `--repo is needed: no indexed repository matches this checkout ("x"); …`,
+  `… this checkout ("…") is indexed as several repositories (a, b); …`,
+  `… repository "api" was indexed from another checkout ("…"); …` or
+  `… no git repository found in "…"; …`. `rb status` is the exception: there
+  it lists every repository.
+- `rb find --kind endpoint` (no text) lists every node of a kind; a search
+  that matches nothing says `no matches for "x"` on stderr (stdout stays
+  empty, exit 0).
+- Cypher is read-only: a write is refused as `cypher is read-only: …` (exit 5);
+  a RETURN whose item count differs from `--cols` is a `--cols` error (exit 2).
+- `RB_CYPHER_TIMEOUT_MS` sets the default timeout of `cypher`, `check` and
+  `serve`; a bad value is reported as the variable, not as the flag.
+- `rb doctor` checks the environment (database, AGE, migrations, the age-load
+  mount, Docker, the SCIP images, the work dir, disk) and prints a fix for
+  each row that is not `ok`; it exits 1 when one fails.
 - **Errors have one shape.** Text mode prints one `Error:` line, naming flags and arguments as you typed them (`--cols`, `<TEXT>`). `--json` and HTTP return the envelope `{"api": 1, "error": {"kind", "message", …}}`. Exit code and HTTP status per kind:
 
   | Exit | Kind | HTTP |
@@ -169,7 +184,7 @@ cargo test --workspace
 ```
 
 Per-crate: `cargo test -p rb-syntax --lib`, `-p rb-frameworks`,
-`-p rb-indexer`, etc. (121 + 201 + 352 lib tests at M7g close; 1,013 across the workspace).
+`-p rb-indexer`, etc. (121 + 201 + 352 lib tests at M7h close; 1,028 across the workspace).
 
 ### 5.2 Database-backed suites
 
@@ -178,9 +193,9 @@ is not a pass**. Always set it:
 
 ```sh
 export RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb
-cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (75 tests)
+cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (78 tests)
 cargo test -p rb-server -- --nocapture  # serve binding, limits, parity (12 tests)
-cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (47 tests)
+cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (50 tests)
 cargo test -p rb-cli --test api     # CLI↔HTTP identity over 150 parameter sets (1 test)
 ```
 
@@ -260,12 +275,14 @@ part of the tree.)
 
 | Symptom | Cause / fix |
 |---|---|
+| Not sure what is wrong with the setup | `rb doctor`: one row per prerequisite, each with its fix |
 | `skipping:` lines in e2e/api | `RB_TEST_DATABASE_URL` unset — set it; skips are not passes |
 | DB connection refused / exit 6 `unavailable` | compose not up (a Docker Desktop restart stops it: `docker compose up -d --wait`), or wrong port (55432 vs 55433); `pg_isready -h 127.0.0.1 -p <port>` |
 | `scip: docker is not responding` (index continues heuristic after ~10 s) | the Docker daemon is wedged, typically after the disk filled: restart Docker Desktop, then `docker version` must answer |
 | SCIP jobs `unsupported` | missing images or wrong Docker context (`DOCKER_CONTEXT=desktop-linux`); `--no-scip` needs none |
 | `t_*` repos / graphs left behind | killed runs; e2e start-up cleans `t_*` once per run; otherwise delete the `rb.repo` rows and run `rb gc` |
 | Unexpected `excluded from analysis` counts | `rb.toml` `ignore`, a `.gitattributes` linguist mark, a `vendor/modules.txt`, or a tsconfig `outDir`; the `File` node's `excluded` attribute names the reason |
+| `--repo is needed: … several repositories` | the checkout was indexed under more than one name; pass `--repo`, or delete the extra repository (`DELETE FROM rb.repo WHERE name = …`, then `rb gc`) |
 | `rb check` fails CI on day one | adopt it with a baseline: `rb check > .rb-baseline`, then `rb check --baseline .rb-baseline` |
 | Disk pressure during SCIP | `docker system df`; per-repo caches under `var/scip/cache`; `rb cache prune --facts --scip --dry-run` first |
 | `rb serve` still listening after tests | kill it; the verify loop asserts no listener (`lsof -iTCP -sTCP:LISTEN`) |

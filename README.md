@@ -67,9 +67,11 @@ target/debug/rb check --repo demo           # exit 0 when clean
 A name matching several symbols asks you to `--pick` one instead of guessing.
 Targets are forgiving: `Db#load()` or `Db#load` resolve when exactly one
 symbol matches (the same rule as `rb find`), and a miss suggests a
-copy-pasteable `rb find` command. `--repo` defaults to the git checkout you
-run from (when that repo is indexed); an explicit `--repo` always wins.
-Anywhere else you get a directive instead of a guess, such as
+copy-pasteable `rb find` command. `--repo` defaults to the repository indexed
+from the git checkout you run from (whatever name you gave it with
+`rb index --repo`), and `rb index .` there re-indexes that repository; an
+explicit `--repo` always wins. When a checkout matches nothing, or several
+repositories, you get a directive instead of a guess, such as
 `--repo is needed: no indexed repository matches this checkout ("x"); index it (rb index .) or pass --repo`.
 The one exception is `rb status`, which there lists every indexed repository.
 Clean up with `psql "$RB_DATABASE_URL" -c "DELETE FROM rb.repo WHERE
@@ -84,7 +86,7 @@ name='demo'"` and `rb gc`. That's the whole loop: **index → ask → diff/serve
 ## Guided tour: what you can ask
 
 **Find things.** `rb find login --kind symbol` searches nodes by key or name
-(exact matches first). `rb service` lists services; `rb service <name>` shows
+(exact matches first); `rb find --kind endpoint` lists every endpoint. `rb service` lists services; `rb service <name>` shows
 the card: endpoints it exposes, packages, database tables, dependencies
 (`via http`, `via calls`, `via package`), and a call-graph summary.
 
@@ -120,7 +122,8 @@ rb check --repo demo --baseline .rb-baseline  # exit 1 only on new violations
 ```
 
 `rb cypher "MATCH …"` runs read-only Cypher (2 s statement timeout, 10k rows
-max); nodes, edges and paths come back as their agtype text. `rb serve`
+max; a write is refused as `cypher is read-only`); nodes, edges and paths come
+back as their agtype text. `rb serve`
 exposes every question above over loopback HTTP with byte-identical `--json`
 bodies (`rb path` takes `--json` too).
 
@@ -221,7 +224,13 @@ RB_DB_PORT=55433 docker compose up -d --wait   # default port is 55432
 cargo build && target/debug/rb migrate
 export RB_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb   # 55432 default
 export DOCKER_CONTEXT=desktop-linux            # if docker points elsewhere
+target/debug/rb doctor                         # checks all of the above, with fixes
 ```
+
+`rb doctor` prints one row per check (database, Postgres and AGE versions,
+migrations, the age-load directory and whether the database sees it, Docker,
+the SCIP images, the SCIP work dir and free disk), each `ok`, `warn` or `fail`
+with its fix, and exits 1 when one fails.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -229,7 +238,7 @@ export DOCKER_CONTEXT=desktop-linux            # if docker points elsewhere
 | `RB_AGE_LOAD_DIR` | `var/age-load` | must be the dir mounted at `/tmp/age/rb-load` in DB container |
 | `RB_SCIP_WORK_DIR` | `var/scip` | indexer exports + caches; must stay under home (Docker Desktop shares) |
 | `RB_KEEP_RETIRED` | `2` | retired snapshots kept (0–20) |
-| `RB_CYPHER_TIMEOUT_MS` | `2000` | Cypher statement timeout (1–30,000) |
+| `RB_CYPHER_TIMEOUT_MS` | `2000` | Cypher statement timeout (1–30,000) for `cypher`, `check` and `serve` when their flag is absent; a bad value is named as the variable |
 | `RB_SCIP_CPUS` / `RB_SCIP_MEMORY` | `2` / `4g` | per-SCIP-container budget (host-side, not cached) |
 
 SCIP images (only needed without `--no-scip`):
@@ -279,13 +288,13 @@ troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 | `docker/`, `migrations/` | SCIP + egress images; embedded SQL schema |
 | `fixtures/` | 18 golden fixture repos (see the testing guide for the catalog) |
 | `tasks/`, `docs/`, `var/` | contracts, evaluations, lessons; design doc; per-milestone scripts/logs/evidence (gitignored scratch) |
-```
 
-**Status: M0–M7g.** M0–M6l built the tool (foundations → structure → syntax →
+**Status: M0–M7h.** M0–M6l built the tool (foundations → structure → syntax →
 SQL/ORM → resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules
-breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7g fixed
+breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7h fixed
 what a stress campaign over 18 fixtures and 13 public repositories found
 (`tasks/stress-findings.md`): wrong `exact` answers, hangs and blow-ups,
-silent recall losses, vendored and built code, the error contract, and
-honesty about what was not analysed. Detail per milestone: `CHANGELOG.md`,
+silent recall losses, vendored and built code, the error contract,
+honesty about what was not analysed, and the CLI's rough edges (checkouts
+known by path, `rb doctor`). Detail per milestone: `CHANGELOG.md`,
 `IMPLEMENT.md`, contracts in `tasks/`.

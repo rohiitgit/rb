@@ -342,6 +342,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0006_reader_role",
         include_str!("../../../migrations/0006_reader_role.sql"),
     ),
+    (
+        "0007_repo_checkout",
+        include_str!("../../../migrations/0007_repo_checkout.sql"),
+    ),
 ];
 
 /// Name of the newest embedded migration; recorded in each snapshot's `tool_versions`.
@@ -470,8 +474,12 @@ pub enum CypherError {
     NoProjection { snapshot: i64 },
     /// The statement timeout cancelled the query.
     Timeout { limit_ms: u64 },
-    /// The database refused the query: syntax, a write in the read-only transaction, a
-    /// privilege `rb_reader` lacks.
+    /// A write: refused by the read-only transaction, or by the write privilege `rb_reader`
+    /// lacks, whichever the database checks first (contract M7h S4); the database's message.
+    ReadOnly(String),
+    /// The RETURN items and the `given` columns differ in number (contract M7h S4).
+    Columns { given: usize },
+    /// The database refused the query otherwise: syntax, a function `rb_reader` may not call.
     Refused(String),
 }
 
@@ -487,6 +495,13 @@ impl std::fmt::Display for CypherError {
                 "cypher query cancelled by its statement timeout of {limit_ms} ms \
                  (limit `timeout_ms`: --timeout-ms, at most {CYPHER_TIMEOUT_MS_MAX})"
             ),
+            CypherError::ReadOnly(message) => {
+                write!(f, "cypher is read-only: the query was refused ({message})")
+            }
+            CypherError::Columns { given } => write!(
+                f,
+                "columns must name one column per RETURN item (got {given})"
+            ),
             CypherError::Refused(message) => write!(f, "cypher: {message}"),
         }
     }
@@ -494,18 +509,36 @@ impl std::fmt::Display for CypherError {
 
 impl std::error::Error for CypherError {}
 
-/// Classifies a database error from a Cypher query; anything that is not the server's answer
-/// (a broken connection) stays as it is.
-fn cypher_error(e: postgres::Error, limits: CypherLimits) -> anyhow::Error {
-    match e.as_db_error() {
-        Some(db) if *db.code() == postgres::error::SqlState::QUERY_CANCELED => {
-            CypherError::Timeout {
-                limit_ms: limits.timeout_ms,
-            }
-            .into()
+/// Classifies a database error from a Cypher query of `columns` columns; anything that is not
+/// the server's answer (a broken connection) stays as it is.
+fn cypher_error(e: postgres::Error, limits: CypherLimits, columns: usize) -> anyhow::Error {
+    use postgres::error::SqlState;
+    let Some(db) = e.as_db_error() else {
+        return e.into();
+    };
+    let message = db.message();
+    // `rb_reader` reads every graph table and may use its schema, so a privilege it lacks on a
+    // schema, table or relation is one only a write needs; a denied function is not a write.
+    let write_privilege = *db.code() == SqlState::INSUFFICIENT_PRIVILEGE
+        && [
+            "permission denied for schema",
+            "permission denied for table",
+            "permission denied for relation",
+            "permission denied for sequence",
+        ]
+        .iter()
+        .any(|p| message.starts_with(p));
+    if *db.code() == SqlState::QUERY_CANCELED {
+        CypherError::Timeout {
+            limit_ms: limits.timeout_ms,
         }
-        Some(db) => CypherError::Refused(db.message().to_owned()).into(),
-        None => e.into(),
+        .into()
+    } else if *db.code() == SqlState::READ_ONLY_SQL_TRANSACTION || write_privilege {
+        CypherError::ReadOnly(message.to_owned()).into()
+    } else if message == "return row and column definition list do not match" {
+        CypherError::Columns { given: columns }.into()
+    } else {
+        CypherError::Refused(message.to_owned()).into()
     }
 }
 
@@ -635,6 +668,71 @@ impl Store {
             &[&name, &origin_url],
         )?;
         Ok(row.get(0))
+    }
+
+    /// The server's version and the installed AGE extension's (`None` when not installed), for
+    /// `rb doctor` (contract M7h S5).
+    pub fn server_versions(&mut self) -> anyhow::Result<(String, Option<String>)> {
+        let row = self.client.query_one(
+            "SELECT current_setting('server_version'),
+                    (SELECT extversion FROM pg_extension WHERE extname = 'age')",
+            &[],
+        )?;
+        Ok((row.get(0), row.get(1)))
+    }
+
+    /// The embedded migrations not applied yet, in order (all of them on a fresh database).
+    pub fn pending_migrations(&mut self) -> anyhow::Result<Vec<&'static str>> {
+        let applied: Vec<String> = match self
+            .client
+            .query_one(
+                "SELECT to_regclass('public.rb_schema_migrations') IS NOT NULL",
+                &[],
+            )?
+            .get(0)
+        {
+            true => self
+                .client
+                .query("SELECT name FROM public.rb_schema_migrations", &[])?
+                .iter()
+                .map(|r| r.get(0))
+                .collect(),
+            false => vec![],
+        };
+        Ok(MIGRATIONS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !applied.iter().any(|a| a == name))
+            .collect())
+    }
+
+    /// Whether the server sees the file `name` that the host wrote into `dir`, at the path the
+    /// AGE loader reads (`/tmp/age/<server_rel>/<name>`): the mount the projection needs.
+    pub fn server_sees_load_file(&mut self, dir: &LoadDir, name: &str) -> anyhow::Result<bool> {
+        let path = format!("/tmp/age/{}/{name}", dir.server_rel);
+        let row = self
+            .client
+            .query_one("SELECT (pg_stat_file($1, true)).size IS NOT NULL", &[&path])?;
+        Ok(row.get(0))
+    }
+
+    /// Records the checkout `repo` was indexed from (contract M7h S1); a repository that does
+    /// not exist is left uncreated.
+    pub fn record_checkout(&mut self, repo: &str, checkout: &str) -> anyhow::Result<()> {
+        self.client.execute(
+            "UPDATE rb.repo SET checkout = $2 WHERE name = $1",
+            &[&repo, &checkout],
+        )?;
+        Ok(())
+    }
+
+    /// Every repository with the checkout it was last indexed from (`None` before M7h), by name.
+    pub fn repo_checkouts(&mut self) -> anyhow::Result<Vec<(String, Option<String>)>> {
+        let rows = self.client.query(
+            "SELECT name, checkout FROM rb.repo ORDER BY name COLLATE \"C\"",
+            &[],
+        )?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     pub fn repo_names(&mut self) -> anyhow::Result<Vec<String>> {
@@ -1493,7 +1591,7 @@ impl Store {
         ))?;
         let mut rows = tx
             .query(sql.as_str(), &[])
-            .map_err(|e| cypher_error(e, limits))?;
+            .map_err(|e| cypher_error(e, limits, columns.len()))?;
         tx.commit()?;
         let truncated = if rows.len() > limits.rows {
             rows.truncate(limits.rows);
@@ -1614,7 +1712,8 @@ fn root_cause(e: &(dyn std::error::Error + 'static)) -> String {
     cur.to_string()
 }
 
-fn redact(url: &str) -> String {
+/// A connection URL without its password (`user:***@`), as errors and `rb doctor` print it.
+pub fn redact(url: &str) -> String {
     match (url.find("://"), url.rfind('@')) {
         (Some(s), Some(at)) if at > s => {
             let creds = &url[s + 3..at];

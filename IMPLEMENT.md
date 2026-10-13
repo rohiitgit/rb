@@ -743,3 +743,13 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Verification:**
   - Mutants m87–m98 killed (m93 exposed dead code, now deleted). Real-Docker 1,013/0/0.
   - Invariant 27/31 byte-identical, 4 classified. `PIPELINE` `m7g-1`.
+
+## M7h The CLI remainder (stress batch F, part 1): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7h.md` (decision diagram, S1–S5, amendment 1). Fixes F3, U1, U4, U7, U9 and the M7f residue.
+- **Implemented:**
+  - Checkouts recorded per repository, used for `--repo` inference and by `rb index .`.
+  - `find --kind` alone, the `find` no-match note, the card page wording.
+  - Cypher read-only and `--cols` errors; the environment-named timeout.
+  - `rb doctor`.
+- **Verification:** 24 mutants killed. Real-Docker 1,028/0/0. Invariant 31/31 identical.

@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, ensure};
 
 mod code;
+mod doctor;
 mod path;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rb_api::{Answer, ApiError, Endpoint, Params};
@@ -157,7 +158,8 @@ enum Command {
     },
     /// Search nodes by key or name (exact matches first, then ranked substring matches).
     Find {
-        text: String,
+        /// Text to search for; optional with `--kind`, which then lists that kind.
+        text: Option<String>,
         /// Restrict to one node kind (symbol, file, service, table, owner, endpoint, package).
         #[arg(long)]
         kind: Option<String>,
@@ -347,14 +349,12 @@ enum Command {
         #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..=3_600_000))]
         deadline_ms: u64,
         /// The default Cypher statement timeout in milliseconds (a request may set its own,
-        /// 1-30000).
+        /// 1-30000; default: `RB_CYPHER_TIMEOUT_MS`, else 2000).
         #[arg(
             long,
-            env = "RB_CYPHER_TIMEOUT_MS",
-            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
             value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
         )]
-        cypher_timeout_ms: u64,
+        cypher_timeout_ms: Option<u64>,
     },
     /// Remove what interrupted or older runs left behind: AGE graphs named `rb_*` that are not a
     /// live snapshot's, and `building` snapshot rows. Never runs implicitly.
@@ -369,6 +369,13 @@ enum Command {
         /// `rb-scip-egress`) and any egress proxy container left by an interrupted run.
         #[arg(long)]
         egress: bool,
+    },
+    /// Check the environment: the database, AGE, migrations, the age-load mount, Docker, the
+    /// SCIP images and disk. Prints one row per check with its fix; exits 1 when one fails.
+    Doctor {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Manage the caches stored in the database.
     Cache {
@@ -386,14 +393,13 @@ enum Command {
         /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
-        /// The Cypher statement timeout in milliseconds for each rule (1-30000).
+        /// The Cypher statement timeout in milliseconds for each rule (1-30000; default:
+        /// `RB_CYPHER_TIMEOUT_MS`, else 2000).
         #[arg(
             long,
-            env = "RB_CYPHER_TIMEOUT_MS",
-            default_value_t = rb_store::CYPHER_TIMEOUT_MS_DEFAULT,
             value_parser = clap::value_parser!(u64).range(1..=rb_store::CYPHER_TIMEOUT_MS_MAX)
         )]
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         /// Accept the violations listed in this file (as `rb check` prints them: save today's
         /// output to adopt the gate, then only new violations fail).
         #[arg(long)]
@@ -414,10 +420,10 @@ enum Command {
         /// Comma-separated names for the RETURN columns, in order (default `result`).
         #[arg(long)]
         cols: Option<String>,
-        /// Statement timeout in milliseconds (1-30000; default 2000); a query over it is
-        /// cancelled with an error, never cut short. At most 10,000 rows are printed, then
-        /// `truncated: rows`.
-        #[arg(long, env = "RB_CYPHER_TIMEOUT_MS")]
+        /// Statement timeout in milliseconds (1-30000; default: `RB_CYPHER_TIMEOUT_MS`, else
+        /// 2000); a query over it is cancelled with an error, never cut short. At most 10,000
+        /// rows are printed, then `truncated: rows`.
+        #[arg(long)]
         timeout_ms: Option<String>,
     },
 }
@@ -490,6 +496,26 @@ fn report_failure(e: anyhow::Error, json: bool, check: bool) -> ExitCode {
 }
 
 fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
+    // Before connecting: the database is one of the things it checks.
+    if let Command::Doctor { json } = cli.command {
+        let scip_work_dir = std::env::var_os("RB_SCIP_WORK_DIR")
+            .map_or_else(|| PathBuf::from("var/scip"), PathBuf::from);
+        let rows = doctor::diagnose(&doctor::Inputs {
+            database_url: &cli.database_url,
+            age_load_dir: &cli.age_load_dir,
+            scip_work_dir: &scip_work_dir,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        });
+        print!(
+            "{}",
+            if json {
+                doctor::render_json(&rows)
+            } else {
+                doctor::render_text(&rows)
+            }
+        );
+        return Ok(doctor::exit_code(&rows));
+    }
     if let Command::Serve {
         bind,
         workers,
@@ -505,7 +531,10 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
             queue: usize::from(queue),
             deadline: Duration::from_millis(deadline_ms),
             settings: rb_api::Settings {
-                cypher_timeout_ms,
+                cypher_timeout_ms: cypher_timeout(
+                    cypher_timeout_ms,
+                    env_text(CYPHER_TIMEOUT_VAR).as_deref(),
+                )?,
                 ..settings()?
             },
             hold: match std::env::var("RB_TEST_HOLD_MS") {
@@ -619,6 +648,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
             timeout_ms,
             baseline,
         } => {
+            let timeout_ms = cypher_timeout(timeout_ms, env_text(CYPHER_TIMEOUT_VAR).as_deref())?;
             return check_rules(
                 &mut store,
                 repo,
@@ -682,7 +712,7 @@ fn asked(command: Command) -> Option<Asked> {
             snapshot,
             json,
         } => {
-            p.set("q", text)
+            p.set_opt("q", text)
                 .set_opt("kind", kind)
                 .set_opt("limit", limit)
                 .set_opt("offset", offset)
@@ -827,6 +857,7 @@ fn asked(command: Command) -> Option<Asked> {
         | Command::Serve { .. }
         | Command::Dump { .. }
         | Command::Gc { .. }
+        | Command::Doctor { .. }
         | Command::Cache { .. } => return None,
     })
 }
@@ -841,13 +872,20 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
     // guesses nothing (README; contract M7b S1).
     let repo = match repo {
         Some(r) => Some(r),
-        None => match cwd_repo_name() {
-            Some(name) if is_indexed(store, &name) => Some(name),
-            _ if matches!(endpoint, Endpoint::Status) => None,
-            name => return answer_err(out, repo_needed(name.as_deref(), &cwd_display())),
+        None => match cwd_repo(store) {
+            Ok(name) => Some(name),
+            Err(_) if matches!(endpoint, Endpoint::Status) => None,
+            Err(directive) => return answer_err(out, directive),
         },
     };
-    let settings = settings()?;
+    let mut settings = settings()?;
+    // Cypher without `--timeout-ms` takes its default from the environment (contract M7h S3).
+    if matches!(endpoint, Endpoint::Cypher) && params.get("timeout_ms").is_none() {
+        match cypher_timeout(None, env_text(CYPHER_TIMEOUT_VAR).as_deref()) {
+            Ok(ms) => settings.cypher_timeout_ms = ms,
+            Err(e) => return answer_err(out, e),
+        }
+    }
     let answered = rb_api::parse(endpoint, repo.as_deref(), &params, &settings)
         .and_then(|req| rb_api::run(store, &mut rb_api::LoadEach, &req, &settings));
     match answered {
@@ -858,6 +896,9 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
                     print!("{}", render_text(&output, evidence));
                     // A page that is not the last says so on stderr: stdout stays rows only.
                     if let Some(line) = more_line(&output.answer) {
+                        eprintln!("{line}");
+                    }
+                    if let Some(line) = no_match_line(&output.answer, &output.query) {
                         eprintln!("{line}");
                     }
                 }
@@ -949,6 +990,35 @@ fn sweep_leftover_graphs(database_url: &str) {
 }
 
 /// The request layer's settings: D6's caps, lowered by `RB_TEST_CAPS` in tests (contract M5 S14).
+/// The Cypher timeout's environment variable, read by `cypher`, `check` and `serve` when their
+/// flag is absent.
+const CYPHER_TIMEOUT_VAR: &str = "RB_CYPHER_TIMEOUT_MS";
+
+/// An environment variable's text, `None` when unset (or not Unicode).
+fn env_text(var: &str) -> Option<String> {
+    std::env::var(var).ok()
+}
+
+/// The flag's timeout, else the environment's (`env`), else the default. A bad environment
+/// value is named as the variable, never as the flag (contract M7h S3); decimal digits only,
+/// as the request layer reads numbers.
+fn cypher_timeout(flag: Option<u64>, env: Option<&str>) -> Result<u64, ApiError> {
+    if let Some(ms) = flag {
+        return Ok(ms);
+    }
+    let Some(text) = env else {
+        return Ok(rb_store::CYPHER_TIMEOUT_MS_DEFAULT);
+    };
+    let max = rb_store::CYPHER_TIMEOUT_MS_MAX;
+    match text.parse::<u64>() {
+        Ok(ms) if text.bytes().all(|b| b.is_ascii_digit()) && (1..=max).contains(&ms) => Ok(ms),
+        _ => Err(ApiError::new(
+            rb_api::ErrorKind::InvalidParam,
+            format!("{CYPHER_TIMEOUT_VAR} must be between 1 and {max} (got {text})"),
+        )),
+    }
+}
+
 fn settings() -> anyhow::Result<rb_api::Settings> {
     match std::env::var(rb_api::Settings::TEST_CAPS_VAR) {
         Ok(spec) => rb_api::Settings::default()
@@ -971,6 +1041,23 @@ fn more_line(answer: &Answer) -> Option<String> {
         offset + 1,
         offset + shown as u64
     ))
+}
+
+/// `no matches for "x"` (with the kind, when given) when `find` lists nothing at all (contract
+/// M7h S3): an empty stdout alone reads like a broken pipe.
+fn no_match_line(answer: &Answer, query: &Value) -> Option<String> {
+    let Answer::Find(page) = answer else {
+        return None;
+    };
+    if page.total != 0 {
+        return None;
+    }
+    let q = query["q"].as_str().unwrap_or_default();
+    Some(match (q, query["kind"].as_str()) {
+        ("", Some(kind)) => format!("no {kind} nodes"),
+        (q, Some(kind)) => format!("no matches for {q:?} (kind {kind})"),
+        (q, None) => format!("no matches for {q:?}"),
+    })
 }
 
 /// The text rendering of an answer (the CLI's own; JSON is `rb-api`'s).
@@ -1049,9 +1136,21 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
     let path = path
         .canonicalize()
         .with_context(|| format!("repository path {}", path.display()))?;
+    let checkout = git_root(&path).unwrap_or_else(|| path.clone());
+    let checkout_text = checkout.to_string_lossy().into_owned();
+    store.migrate()?;
+    // Without `--repo`, a checkout indexed before keeps its repository whatever it was named
+    // (contract M7h S1); a directory name never silently takes over another checkout's.
     let repo = match repo {
         Some(r) => r,
-        None => repo_name_from_path(&path),
+        None => match infer_repo(
+            &checkout_text,
+            &repo_name_from_path(&path),
+            &repo_checkouts(store),
+        ) {
+            Inferred::One(name) | Inferred::Unindexed(name) => name,
+            other => return Err(repo_needed(Some(&other), &checkout_text).into()),
+        },
     };
     ensure!(
         !repo.is_empty()
@@ -1068,7 +1167,6 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
     );
 
     let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(&rev)?;
-    store.migrate()?;
     // Decided here, before the "up to date" check: a snapshot indexed without Docker, or
     // without an indexer image, is heuristic and must be rebuilt once they answer (contract M3b
     // amendments 17 and 29). The images are looked up once; the jobs run in and cache under
@@ -1098,6 +1196,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         let mut unfinished = |id: i64| store.unfinished_scip_jobs(id);
         match rebuild_reason(&live, &commit_sha, &tools, scip_on, &mut unfinished)? {
             None => {
+                store.record_checkout(&repo, &checkout_text)?;
                 println!(
                     "{repo}: up to date — live snapshot {} already covers {} (use --force to rebuild)",
                     live.id,
@@ -1162,6 +1261,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         &diagnostics,
         &LoadDir::new(load_dir),
     )?;
+    store.record_checkout(&repo, &checkout_text)?;
     if let Some(id) = retention.live_marked_retired {
         eprintln!(
             "warning: {repo}'s live pointer names snapshot {id}, whose status is not `live`; retention kept it"
@@ -2589,10 +2689,7 @@ fn check_rules(
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
     let repo = match repo {
         Some(r) => r,
-        None => match cwd_repo_name() {
-            Some(name) if is_indexed(store, &name) => name,
-            name => return Err(repo_needed(name.as_deref(), &cwd_display()).into()),
-        },
+        None => cwd_repo(store)?,
     };
     // Typed like every question's errors (contract M7f S3): `not_found` and `no_live_snapshot`.
     if !store.repo_names()?.contains(&repo) {
@@ -2642,11 +2739,18 @@ fn git_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The `--repo` directive when no repository can be inferred (contract M7f S1): `checkout` is the
-/// unindexed checkout's name, `None` outside any git checkout (then `cwd` is named).
-fn repo_needed(checkout: Option<&str>, cwd: &str) -> ApiError {
+/// The `--repo` directive when no repository can be inferred (contracts M7f S1, M7h S1):
+/// `checkout` is what the checkout at `cwd` means, `None` outside any git checkout.
+fn repo_needed(checkout: Option<&Inferred>, cwd: &str) -> ApiError {
     let why = match checkout {
-        Some(name) => format!(
+        Some(Inferred::Several(names)) => format!(
+            "this checkout ({cwd:?}) is indexed as several repositories ({}); pass --repo",
+            names.join(", ")
+        ),
+        Some(Inferred::Elsewhere { name, checkout }) => format!(
+            "repository {name:?} was indexed from another checkout ({checkout:?}); pass --repo {name} to use it, or index this checkout under another name (`rb index . --repo NAME`)"
+        ),
+        Some(Inferred::Unindexed(name) | Inferred::One(name)) => format!(
             "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
         ),
         None => format!(
@@ -2663,20 +2767,78 @@ fn cwd_display() -> String {
         .unwrap_or_else(|_| "?".into())
 }
 
-/// The repository implied by the working directory: the enclosing git root's
-/// directory name, sanitised exactly like `index` names it. No existence
-/// check: callers decide between using it and reporting it.
-fn cwd_repo_name() -> Option<String> {
-    let root = git_root(&std::env::current_dir().ok()?)?;
-    Some(repo_name_from_path(&root))
+/// What a checkout means among the indexed repositories (contract M7h S1).
+#[derive(Debug, PartialEq)]
+enum Inferred {
+    One(String),
+    /// Several repositories were indexed from this checkout.
+    Several(Vec<String>),
+    /// The repository named like the checkout's directory was indexed from another checkout.
+    Elsewhere {
+        name: String,
+        checkout: String,
+    },
+    /// Nothing indexed matches; `rb index .` would name it this.
+    Unindexed(String),
 }
 
-/// Whether a repository of this name is indexed (store errors count as no).
-fn is_indexed(store: &mut Store, name: &str) -> bool {
+/// The repository the checkout at `root` (canonical) means, among `repos` (name, recorded
+/// checkout): the one recorded there; else the one named `dir_name`, unless it was recorded
+/// at another checkout.
+fn infer_repo(root: &str, dir_name: &str, repos: &[(String, Option<String>)]) -> Inferred {
+    let mut at: Vec<String> = repos
+        .iter()
+        .filter(|(_, checkout)| checkout.as_deref() == Some(root))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if at.len() > 1 {
+        return Inferred::Several(at);
+    }
+    if let Some(name) = at.pop() {
+        return Inferred::One(name);
+    }
+    match repos.iter().find(|(name, _)| name == dir_name) {
+        Some((name, None)) => Inferred::One(name.clone()),
+        Some((name, Some(checkout))) => Inferred::Elsewhere {
+            name: name.clone(),
+            checkout: checkout.clone(),
+        },
+        None => Inferred::Unindexed(dir_name.to_owned()),
+    }
+}
+
+/// Every repository with its recorded checkout. A database without migration 0007 records
+/// none, so every repository keeps the directory-name rule; store errors count as no
+/// repositories.
+fn repo_checkouts(store: &mut Store) -> Vec<(String, Option<String>)> {
     store
-        .repo_names()
-        .map(|names| names.iter().any(|r| r == name))
-        .unwrap_or(false)
+        .repo_checkouts()
+        .or_else(|_| {
+            store
+                .repo_names()
+                .map(|names| names.into_iter().map(|n| (n, None)).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// The repository the working directory's checkout means, or the `--repo` directive.
+fn cwd_repo(store: &mut Store) -> Result<String, ApiError> {
+    let root = std::env::current_dir()
+        .and_then(|cwd| cwd.canonicalize())
+        .ok()
+        .and_then(|cwd| git_root(&cwd));
+    let Some(root) = root else {
+        return Err(repo_needed(None, &cwd_display()));
+    };
+    let root_text = root.to_string_lossy();
+    match infer_repo(
+        &root_text,
+        &repo_name_from_path(&root),
+        &repo_checkouts(store),
+    ) {
+        Inferred::One(name) => Ok(name),
+        other => Err(repo_needed(Some(&other), &root_text)),
+    }
 }
 
 fn short(sha: &str) -> &str {
@@ -3455,7 +3617,7 @@ mod tests {
     /// for questions and for `check`/`dump`, naming the checkout or the directory.
     #[test]
     fn repo_directive_reads_as_a_predicate_on_repo() {
-        let unindexed = repo_needed(Some("demo_spring"), "/w");
+        let unindexed = repo_needed(Some(&Inferred::Unindexed("demo_spring".into())), "/w");
         assert_eq!(
             unindexed.cli_text(),
             "--repo is needed: no indexed repository matches this checkout (\"demo_spring\"); index it (`rb index .`) or pass --repo"
@@ -3466,6 +3628,122 @@ mod tests {
             repo_needed(None, "/tmp").cli_text(),
             "--repo is needed: no git repository found in \"/tmp\"; run rb from inside an indexed git checkout (or pass --repo)"
         );
+    }
+
+    /// Contract M7h S1 (stress F3): a checkout means the one repository recorded at it; else a
+    /// repository named like its directory that has no checkout recorded (indexed before M7h);
+    /// several at one checkout, or a name match recorded elsewhere, is a directive, never a guess.
+    #[test]
+    fn a_checkout_means_the_repository_recorded_at_it() {
+        let rows = |r: &[(&str, Option<&str>)]| -> Vec<(String, Option<String>)> {
+            r.iter()
+                .map(|(n, c)| (n.to_string(), c.map(str::to_owned)))
+                .collect()
+        };
+        let one = |n: &str| Inferred::One(n.into());
+        // Recorded under another name than the directory's.
+        let repos = rows(&[("st_demo", Some("/w/demo_spring")), ("other", Some("/w/x"))]);
+        assert_eq!(
+            infer_repo("/w/demo_spring", "demo_spring", &repos),
+            one("st_demo")
+        );
+        // A recorded checkout wins over a same-named repository without one.
+        let repos = rows(&[("demo_spring", None), ("st_demo", Some("/w/demo_spring"))]);
+        assert_eq!(
+            infer_repo("/w/demo_spring", "demo_spring", &repos),
+            one("st_demo")
+        );
+        // Several repositories at one checkout.
+        let repos = rows(&[("a", Some("/w/r")), ("b", Some("/w/r"))]);
+        assert_eq!(
+            infer_repo("/w/r", "r", &repos),
+            Inferred::Several(vec!["a".into(), "b".into()])
+        );
+        // The directory-name rule, only for a repository with no checkout recorded.
+        assert_eq!(infer_repo("/w/r", "r", &rows(&[("r", None)])), one("r"));
+        assert_eq!(
+            infer_repo("/b/api", "api", &rows(&[("api", Some("/a/api"))])),
+            Inferred::Elsewhere {
+                name: "api".into(),
+                checkout: "/a/api".into()
+            }
+        );
+        assert_eq!(
+            infer_repo("/w/r", "r", &rows(&[("q", None)])),
+            Inferred::Unindexed("r".into())
+        );
+    }
+
+    /// Contract M7h S1: each case that is not one repository reads as a `--repo` directive.
+    #[test]
+    fn checkout_directives_name_the_candidates() {
+        let several = repo_needed(
+            Some(&Inferred::Several(vec!["a".into(), "b".into()])),
+            "/w/r",
+        );
+        assert_eq!(
+            several.cli_text(),
+            "--repo is needed: this checkout (\"/w/r\") is indexed as several repositories (a, b); pass --repo"
+        );
+        let elsewhere = repo_needed(
+            Some(&Inferred::Elsewhere {
+                name: "api".into(),
+                checkout: "/a/api".into(),
+            }),
+            "/b/api",
+        );
+        assert_eq!(
+            elsewhere.cli_text(),
+            "--repo is needed: repository \"api\" was indexed from another checkout (\"/a/api\"); pass --repo api to use it, or index this checkout under another name (`rb index . --repo NAME`)"
+        );
+    }
+
+    /// Contract M7h S3: the Cypher timeout is the flag's, else `RB_CYPHER_TIMEOUT_MS`'s, else
+    /// the default; a bad environment value is named as the variable, never as the flag.
+    #[test]
+    fn a_bad_timeout_from_the_environment_names_the_variable() {
+        let default = rb_store::CYPHER_TIMEOUT_MS_DEFAULT;
+        assert_eq!(cypher_timeout(Some(7), Some("0")).unwrap(), 7);
+        assert_eq!(cypher_timeout(None, Some("250")).unwrap(), 250);
+        assert_eq!(cypher_timeout(None, None).unwrap(), default);
+        for bad in ["0", "30001", "+5", "x", ""] {
+            let err = cypher_timeout(None, Some(bad)).unwrap_err();
+            assert_eq!(err.kind, rb_api::ErrorKind::InvalidParam);
+            assert_eq!(
+                err.cli_text(),
+                format!("RB_CYPHER_TIMEOUT_MS must be between 1 and 30000 (got {bad})")
+            );
+        }
+    }
+
+    /// Contract M7h S3: `find` that lists nothing says so on stderr (stdout stays rows only);
+    /// a page past the end, or any match, says nothing.
+    #[test]
+    fn an_empty_find_says_so() {
+        let found = |total: u64| {
+            Answer::Find(rb_api::Paged::from_rows(
+                total,
+                rb_api::Page {
+                    limit: 20,
+                    offset: 0,
+                },
+                vec![],
+            ))
+        };
+        let query = |q: &str, kind: Option<&str>| serde_json::json!({"q": q, "kind": kind});
+        assert_eq!(
+            no_match_line(&found(0), &query("zzz", None)).as_deref(),
+            Some("no matches for \"zzz\"")
+        );
+        assert_eq!(
+            no_match_line(&found(0), &query("zzz", Some("endpoint"))).as_deref(),
+            Some("no matches for \"zzz\" (kind endpoint)")
+        );
+        assert_eq!(
+            no_match_line(&found(0), &query("", Some("table"))).as_deref(),
+            Some("no table nodes")
+        );
+        assert_eq!(no_match_line(&found(3), &query("zzz", None)), None);
     }
 
     /// Contract M7e S3: the status line names what was not analysed and why, in the stored
