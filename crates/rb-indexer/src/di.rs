@@ -656,7 +656,12 @@ fn resolve_lane_point<'a>(
         .definitions
         .get(p.owner)
         .is_some_and(|d| {
-            d.kind == DefKind::Class && !beans.iter().any(|b| simple(&b.bean.type_name) == d.name)
+            // Contract M7d S2: `AddX<IService, Impl>` registers `Impl` too.
+            d.kind == DefKind::Class
+                && !beans.iter().any(|b| {
+                    simple(&b.bean.type_name) == d.name
+                        || b.bean.created.iter().any(|c| simple(c) == d.name)
+                })
         })
     {
         return;
@@ -711,6 +716,17 @@ fn resolve_lane_point<'a>(
         candidates = set.into_iter().collect();
     }
     if candidates.is_empty() {
+        // Contract M7d S4: a type imported from outside the repository that no bean serves
+        // is provided by the framework or a library (`Repository<E>` from `typeorm`).
+        if p.qualifier.is_none()
+            && types.is_empty()
+            && inputs
+                .index
+                .imported_from_outside(owner_path, simple(&p.element))
+        {
+            *out.buckets.get_mut("external").unwrap() += 1;
+            return;
+        }
         *out.buckets.get_mut("unresolved").unwrap() += 1;
         // Contract M6k S1: the diagnostic sites where the point is written (the
         // record for anchored points), never the owner's path with foreign spans.
@@ -961,6 +977,88 @@ fn resolve_xml_points<'a>(
     out
 }
 
+/// Which C# files import Microsoft DI without a `using` of their own (contract M7d S1): those
+/// of a project (nearest `.csproj`) whose SDK's implicit usings include it — Web, Worker,
+/// BlazorWebAssembly — with `<ImplicitUsings>` on, or where some file has a
+/// `global using Microsoft.Extensions.DependencyInjection;`. Files under no `.csproj` form one
+/// project for global usings.
+struct DotnetImplicit {
+    /// `.csproj` directories (`""` for the root).
+    projects: Vec<String>,
+    /// Projects importing DI implicitly (`None`: files under no `.csproj`).
+    on: BTreeSet<Option<String>>,
+}
+
+impl DotnetImplicit {
+    fn new(inputs: &Inputs<'_>) -> Self {
+        let dir = |p: &str| {
+            p.rsplit_once('/')
+                .map_or(String::new(), |(d, _)| d.to_owned())
+        };
+        let mut projects = Vec::new();
+        let mut on = BTreeSet::new();
+        for (path, text) in inputs
+            .manifests
+            .iter()
+            .filter(|(p, _)| p.ends_with(".csproj"))
+        {
+            projects.push(dir(path));
+            if csproj_imports_di(text) {
+                on.insert(Some(dir(path)));
+            }
+        }
+        // Longest directory first, so the nearest project wins.
+        projects.sort_by_key(|d| std::cmp::Reverse(d.len()));
+        let mut found = DotnetImplicit { projects, on };
+        let globals: Vec<Option<String>> = inputs
+            .files
+            .iter()
+            .filter(|(_, (language, facts))| {
+                *language == Language::CSharp
+                    && facts
+                        .imports
+                        .iter()
+                        .any(|i| i.global && !i.is_static && spring::is_dotnet_di(&i.module))
+            })
+            .map(|(path, _)| found.project(path))
+            .collect();
+        found.on.extend(globals);
+        found
+    }
+
+    fn project(&self, path: &str) -> Option<String> {
+        self.projects
+            .iter()
+            .find(|d| d.is_empty() || path.starts_with(&format!("{d}/")))
+            .cloned()
+    }
+
+    fn applies(&self, path: &str) -> bool {
+        self.on.contains(&self.project(path))
+    }
+}
+
+/// A `.csproj` whose SDK's implicit usings include Microsoft DI, with them enabled.
+fn csproj_imports_di(text: &str) -> bool {
+    let sdk = text
+        .split_once("Sdk=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(sdk, _)| sdk.trim());
+    let implicit = text
+        .split_once("<ImplicitUsings>")
+        .and_then(|(_, rest)| rest.split_once("</ImplicitUsings>"))
+        .is_some_and(|(v, _)| matches!(v.trim().to_ascii_lowercase().as_str(), "enable" | "true"));
+    implicit
+        && matches!(
+            sdk,
+            Some(
+                "Microsoft.NET.Sdk.Web"
+                    | "Microsoft.NET.Sdk.Worker"
+                    | "Microsoft.NET.Sdk.BlazorWebAssembly"
+            )
+        )
+}
+
 pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
     let mut out = Resolution::default();
     for b in BUCKETS {
@@ -980,12 +1078,13 @@ pub(crate) fn resolve_nest<'a>(inputs: &Inputs<'a>) -> Resolution {
     if ts.is_empty() {
         return out;
     }
+    let implicit = DotnetImplicit::new(inputs);
     let per_file: Vec<(&'a str, &'a FileFacts, FileDi)> = ts
         .iter()
         .map(|(path, language, facts)| {
             let di = match language {
                 Language::Kotlin => spring::kotlin_di(facts),
-                Language::CSharp => spring::dotnet_di(facts),
+                Language::CSharp => spring::dotnet_di(facts, implicit.applies(path)),
                 _ => spring::nest_di(facts),
             };
             (*path, *facts, di)
@@ -3719,6 +3818,81 @@ mod tests {
         assert!(e.dst.contains("IService#"), "{}", e.dst);
     }
 
+    /// Contract M7d S1+S2 (stress F28, eShopOnWeb): a file imports DI implicitly when its
+    /// project does — a Web/Worker/BlazorWebAssembly SDK `.csproj` with implicit usings, or a
+    /// `global using Microsoft.Extensions.DependencyInjection;` anywhere in the project — and
+    /// a class registered as an implementation (`AddScoped<IX, X>`) is a registered owner.
+    /// The plain SDK's implicit usings do not include DI, so its registrations stay unread.
+    #[test]
+    fn dotnet_implicit_and_global_usings_and_implementation_owners() {
+        let web_proj = "<Project Sdk=\"Microsoft.NET.Sdk.Web\">\n  <PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n";
+        let plain_proj = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <ImplicitUsings>enable</ImplicitUsings>\n  </PropertyGroup>\n</Project>\n";
+        let web_prog = "var builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddScoped<IBasketService, BasketService>();\nbuilder.Services.AddScoped<IRepo, Repo>();\n";
+        let web_svc = "public interface IBasketService {}\npublic interface IRepo {}\npublic class Repo : IRepo {}\npublic class BasketService : IBasketService {\npublic BasketService(IRepo repo) {}\n}\n";
+        let lib = "public interface IRepo2 {}\npublic class Repo2 : IRepo2 {}\npublic class Setup2 {\npublic void C(object s) {\ns.AddScoped<IRepo2, Repo2>();\ns.AddScoped<Consumer2>();\n}\n}\npublic class Consumer2 {\npublic Consumer2(IRepo2 r) {}\n}\n";
+        let globals = "global using Microsoft.Extensions.DependencyInjection;\n";
+        // A Web SDK project with implicit usings switched off reads nothing either.
+        let off_proj = web_proj.replace("enable", "disable");
+        let off = lib.replace("2", "4");
+        let api = "public interface IRepo3 {}\npublic class Repo3 : IRepo3 {}\npublic interface IC3 {}\npublic class Setup3 {\npublic void C(object s) {\ns.AddScoped<IRepo3, Repo3>();\ns.AddScoped<IC3, Consumer3>();\n}\n}\npublic class Consumer3 : IC3 {\npublic Consumer3(IRepo3 r) {}\n}\n";
+        let (r, _) = resolve_lang_with(
+            &[
+                ("src/Web/Program.cs", Language::CSharp, web_prog),
+                ("src/Web/Services.cs", Language::CSharp, web_svc),
+                ("src/Lib/Setup.cs", Language::CSharp, lib),
+                ("src/Api/GlobalUsings.cs", Language::CSharp, globals),
+                ("src/Api/Setup.cs", Language::CSharp, api),
+                ("src/Off/Setup.cs", Language::CSharp, &off),
+            ],
+            &[],
+            &[
+                ("src/Web/Web.csproj", web_proj),
+                ("src/Lib/Lib.csproj", plain_proj),
+                ("src/Api/Api.csproj", plain_proj),
+                ("src/Off/Off.csproj", &off_proj),
+            ],
+        );
+        let srcs: Vec<&str> = r.injections.iter().map(|e| e.src.as_str()).collect();
+        assert_eq!(srcs.len(), 2, "{srcs:?}");
+        assert!(
+            srcs.iter().any(|s| s.contains("BasketService#")),
+            "{srcs:?}"
+        );
+        assert!(srcs.iter().any(|s| s.contains("Consumer3#")), "{srcs:?}");
+    }
+
+    /// Contract M7d S4 (stress F26, nestjs-realworld): a point whose type is imported from
+    /// outside the repository and that no bean serves (`@InjectRepository(E) r: Repository<E>`,
+    /// TypeORM-provided) is `external`, as in the Spring lane; a type that resolves nowhere
+    /// and is imported from nowhere stays `unresolved`.
+    #[test]
+    fn nest_framework_provided_points_are_external() {
+        let src = "import { Injectable } from '@nestjs/common';\nimport { InjectRepository } from '@nestjs/typeorm';\nimport { Repository } from 'typeorm';\n@Injectable()\nexport class ArticleService {\n  constructor(\n    @InjectRepository(ArticleEntity) private readonly repo: Repository<ArticleEntity>,\n    private readonly missing: MissingService,\n  ) {}\n}\n";
+        let (r, _) = resolve_lang(
+            &[("src/article.service.ts", Language::TypeScript, src)],
+            &[],
+        );
+        assert!(r.injections.is_empty(), "{:?}", r.injections);
+        assert_eq!(
+            r.buckets.get("external").copied().unwrap_or(0),
+            1,
+            "{:?}",
+            r.buckets
+        );
+        assert_eq!(
+            r.buckets.get("unresolved").copied().unwrap_or(0),
+            1,
+            "{:?}",
+            r.buckets
+        );
+        let unresolved: Vec<&Diagnostic> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "di_unresolved")
+            .collect();
+        assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+    }
+
     /// Contract M6k S5+S6: a marked property points, and a keyed point matches the
     /// keyed registration.
     #[test]
@@ -3791,6 +3965,15 @@ mod tests {
     /// Resolves mixed-language files with XML texts (contract M6j S10): returns the
     /// resolution and the counted operations its `resolve` took.
     fn resolve_lang(files: &[(&str, Language, &str)], xml: &[(&str, &str)]) -> (Resolution, u64) {
+        resolve_lang_with(files, xml, &[])
+    }
+
+    /// [`resolve_lang`] with manifest texts by path (`.csproj` files for .NET).
+    fn resolve_lang_with(
+        files: &[(&str, Language, &str)],
+        xml: &[(&str, &str)],
+        manifests: &[(&str, &str)],
+    ) -> (Resolution, u64) {
         let facts: Vec<(String, Language, FileFacts)> = files
             .iter()
             .map(|(p, l, s)| {
@@ -3817,6 +4000,10 @@ mod tests {
         let raw = RawScan::default();
         let xml_map: BTreeMap<&str, String> =
             xml.iter().map(|(p, t)| (*p, (*t).to_owned())).collect();
+        let manifest_map: BTreeMap<&str, String> = manifests
+            .iter()
+            .map(|(p, t)| (*p, (*t).to_owned()))
+            .collect();
         work::take();
         let r = resolve(&Inputs {
             files: &by_path,
@@ -3826,7 +4013,7 @@ mod tests {
             deployable: &empty,
             depends: &depends,
             unparsed: &raw,
-            manifests: &BTreeMap::new(),
+            manifests: &manifest_map,
             xml: &xml_map,
         });
         (r, work::take())

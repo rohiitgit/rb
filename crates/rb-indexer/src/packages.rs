@@ -46,7 +46,7 @@ pub(crate) fn is_input(path: &str) -> bool {
             // `tsconfig.json` texts feed exact alias resolution (contract M6c
             // S4); the packages stage ignores unknown basenames.
             | "tsconfig.json"
-    )
+    ) || name.ends_with(".csproj") // .NET SDK and implicit usings (contract M7d S1)
 }
 
 /// What this stage reads: the projects, the texts of [`is_input`] files, and every path of the

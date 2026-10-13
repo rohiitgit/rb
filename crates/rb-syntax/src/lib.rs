@@ -588,6 +588,9 @@ pub struct Import {
     pub wildcard: bool,
     /// Java `import static`.
     pub is_static: bool,
+    /// C# `global using`: in effect in every file of the project (contract M7d S1).
+    #[serde(default)]
+    pub global: bool,
     pub span: Span,
 }
 

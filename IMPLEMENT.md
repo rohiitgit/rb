@@ -711,3 +711,12 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - 14 mutants killed. Real-Docker suites 990/0/0.
   - Invariant 29/31 identical. bookcars: +107 endpoints and +175 stitched calls. mattermost: −29 false gRPC sites.
   - `PIPELINE` `m7c-1`.
+
+## M7d DI and SQL roles (stress batch C, part 2): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7d.md` (amendment 1). Fixes F28 (except open generics), F26, F23.
+- **Changes:** .NET implicit and global usings import DI; implementation-registered owners; constructor parameters only. Framework-provided lane points are `external`. `.sql` files are migrations only by evidence.
+- **Verification:**
+  - 18 mutants killed (m40–m57). Real-Docker suites 995/0/0.
+  - Invariant 26/31 identical, diffs classified.
+  - `PIPELINE` `m7d-1`.

@@ -122,7 +122,10 @@ use serde_json::{Value, json};
 /// `m7c-1` HTTP recall: Express paths written as names fold across files (object
 /// members, default imports) or are counted dynamic (S1); default-imported axios
 /// instances (S2); `require('express')()` (S3); TS gRPC stubs need a generated import (S4).
-pub const PIPELINE: &str = "m7c-1";
+/// `m7d-1` DI and SQL roles: .NET implicit/global usings import DI (S1), implementation-
+/// registered owners (S2), framework-provided points are `external` (S4), `.sql` files are
+/// migrations only by evidence, else `QUERIES` (S5).
+pub const PIPELINE: &str = "m7d-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -1232,7 +1235,7 @@ pub fn assemble(
         )?);
     }
     for (path, text) in &content.sql {
-        diagnostics.extend(sql::add_migrations(&mut b, path, text)?);
+        diagnostics.extend(sql::add_sql_file(&mut b, path, text)?);
     }
     for (path, text) in &content.mappers {
         diagnostics.extend(sql::add_mapper_queries(&mut b, path, text)?);

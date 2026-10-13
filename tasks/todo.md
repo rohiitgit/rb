@@ -1019,3 +1019,17 @@ Contract: `tasks/contract-m7c.md`. Branch `m7c-http-recall` (stacked on M7b). Do
 ## Review (M7c)
 - Batch C part 1 is complete. Express and axios recall on bookcars went from 0 routes and 0 matched calls to 107 routes and 175 stitched calls.
 - New finding F32 (Express case-insensitive matching). Residue: anonymous default-exported objects.
+
+---
+
+# M7d: DI and SQL roles (stress batch C, part 2), started 2026-10-13
+
+Contract: `tasks/contract-m7d.md`. Branch `m7d-di-and-sql` (stacked on M7c `8078ac2`).
+
+- [x] Phase 1 (S1, S2, F28): `Import.global` (rb-syntax); `.csproj` loaded as a manifest; `DotnetImplicit` (Web/Worker/BlazorWasm SDK with `ImplicitUsings` on, or a project-wide `global using`) feeds `dotnet_di(facts, implicit_di)`; owners accepted by `created` (implementation). Mutants m40–m45 killed (m44 needed an implicit-off negative). **S3 (open generics) deferred:** C# `typeof(X)` arguments are `Arg::Other` without text, so reading them needs an extractor change.
+- [x] Phase 2 (S4, F26): lane points with no qualifier, no repository type, and a type imported from outside the repository are bucketed `external` (no `di_unresolved`); a type imported from nowhere stays unresolved. Mutants m46/m47 killed.
+- [x] Phase 3 (S5, F23): `add_migrations` becomes `add_sql_file`, with `is_migration`: `-- name:` gives queries; path conventions (migrations dir, Flyway V/U/R, numbered, up/down) give migration; else DDL (or nothing parsed) gives migration, DML only gives `QUERIES` from the file. Mutants m48–m53 killed (m49 needed a dir-only case).
+- [x] Phase 4: PIPELINE `m7d-1`. The first invariant caught the pg_dump `-- Name:` misclassification and constructor-body locals as .NET points; both were fixed test-first (m54–m57). Second run: real Docker 995/0/0; invariant 26/31 identical, all diffs classified.
+
+## Review (M7d)
+- Batch C is complete (M7c + M7d). S3 (open generics) is deferred. Lesson added on content markers.

@@ -1,6 +1,6 @@
 # M7d contract: DI and SQL roles (stress batch C, part 2) (2026-10-13)
 
-**Status:** contract written 2026-10-13 from `tasks/stress-findings.md` batch C; not started. Stacked on M7c.
+**Status:** S1, S2, S4, S5 implemented 2026-10-13; S3 deferred (see amendment 1). Stacked on M7c (`8078ac2`).
 
 ## Why
 
@@ -26,3 +26,32 @@
 - fmt, clippy, and workspace tests with the DB and real Docker: 0 failures, no skips.
 - Invariant against M7c on all targets, with every diff classified (eShopOnWeb, nestjs-realworld and fastapi-realworld are expected to change).
 - `PIPELINE` bumped to `m7d-1`.
+
+## Progress (amendment 1, 2026-10-13)
+
+| Claim | Done | Evidence |
+|---|---|---|
+| S1 (F28a) | `Import.global` (C# `global using`); `.csproj` loaded as a manifest; `DotnetImplicit`: a project is on if its SDK is Web, Worker or BlazorWebAssembly with `ImplicitUsings` enable/true, or if any of its files has a global DI using. `dotnet_di(facts, implicit_di)`. | Mutants m40, m41, m42, m44 (the implicit-off negative was added after m44 survived) and m45 killed. |
+| S2 (F28b) | The lane's owner check also accepts a bean's `created` (implementation) types. | Mutant m43 killed. eShopOnWeb: 5 new `INJECTS` from implementation-registered owners. |
+| S3 (F28c) | **Deferred.** C# `typeof(X)` arguments are `Arg::Other` without text; reading them needs an extractor change. `IRepository<>`/`IAppLogger<>` points stay unresolved. | Residue |
+| S4 (F26) | A lane point with no qualifier, no repository type, and a type imported (by name) from outside the repository is `external`, with no `di_unresolved`. | Mutants m46/m47 killed. nestjs-realworld: 8 `no_bean` became `external`. |
+| S5 (F23) | `add_sql_file` + `is_migration`: `-- name:` (aiosql/yesql, exact case, not pg_dump's `-- Name: …; Type:`) or `-- :name` (HugSQL) gives queries; migration path conventions give migration; else DDL (or nothing parsed) gives migration, otherwise `QUERIES` from the file. | Mutants m48–m55 killed (m49 and m55 needed marker- or dir-only cases). fastapi-realworld: 13 aiosql rows `MIGRATES`→`QUERIES`. |
+| (found) | C# constructor-body locals were taken as constructor points (constructors are no definitions in the C# facts). The C# `parameter` arm now records its position, and `dotnet_di` takes parameters only. This also drops eShopOnWeb's 2 `event Action` false points. | Mutants m56/m57 killed. |
+
+**Measurement mistake caught by the invariant (first run):** the first `-- name:` rule was case-insensitive and matched pg_dump's `-- Name: x; Type: TABLE` comments, reclassifying 87 mattermost schema dumps as query files. It was fixed test-first and recorded in `tasks/lessons.md`.
+
+**Verification (second run):**
+- fmt and clippy clean.
+- Workspace with DB and **real Docker** (`var/m7d/logs/p4-workspace2.log`): **995 passed, 0 failed, 0 skipped**.
+- Invariant against M7c (`var/m7d/logs/invariant2.txt`, sha256 `4735c4d1…`): **26/31 identical**, all 18 fixtures included. Classified:
+  - **fastapi-realworld:** 13 aiosql rows `MIGRATES`→`QUERIES`.
+  - **mattermost:** 3 INSERT-only seed files in `testlib/testdata`, `MIGRATES`→`QUERIES` (DML-only, no migration path).
+  - **nestjs-realworld:** −8 `no_bean`, now `external`.
+  - **eShopOnWeb:** +5 `INJECTS` net (implementation owners; `CatalogItemService → HttpService` became ambiguous because Web and BlazorAdmin both register `HttpService`); −2 false `event Action` points; +17 `di_unresolved` newly visible on now-registered owners (open generics S3, framework types through namespace usings, `AddDbContext`), all residue.
+  - **microservices-demo:** +3 `di_unresolved` on real constructor parameters of framework types (`IConfiguration`, `IDistributedCache`); the false local-variable points never reached the final binary.
+- `PIPELINE` `m7d-1`.
+
+**Residue:**
+- S3 (open generics).
+- Framework types arriving through C# namespace usings are not "imported from outside" by name, so they stay `unresolved`, not `external`.
+- `AddDbContext`, factories and `Directory.Build.props` stay unread.

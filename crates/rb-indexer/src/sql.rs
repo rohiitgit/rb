@@ -222,9 +222,10 @@ pub(crate) fn add_mapper_queries(
     Ok(diagnostics)
 }
 
-/// Adds `MIGRATES` edges for every statement of a `.sql` file. Statements that do not parse are
-/// diagnostics; they never hide the ones that do.
-pub(crate) fn add_migrations(
+/// Adds a `.sql` file's edges: `MIGRATES` for every statement of a migration, `QUERIES` (from
+/// the file) for every statement of a query file ([`is_migration`], contract M7d S5).
+/// Statements that do not parse are diagnostics; they never hide the ones that do.
+pub(crate) fn add_sql_file(
     b: &mut GraphBuilder,
     path: &str,
     text: &str,
@@ -248,12 +249,78 @@ pub(crate) fn add_migrations(
             access.record(&file, table, Certainty::Exact, &at);
         }
     }
-    access.emit(b, EdgeKind::Migrates, Provenance::SqlFile)?;
+    let kind = if is_migration(path, text, &analysis) {
+        EdgeKind::Migrates
+    } else {
+        EdgeKind::Queries
+    };
+    access.emit(b, kind, Provenance::SqlFile)?;
     Ok(analysis
         .errors
         .iter()
         .map(|e| unparsed(path, Some(span(e.range)), &e.error, None))
         .collect())
+}
+
+/// Whether a `.sql` file is a migration (contract M7d S5): never a query file of named
+/// statements (`-- name:` aiosql/yesql, `-- :name` HugSQL); else a migrations path convention (a
+/// `migrations`/`migration`/`migrate`/`flyway`/`liquibase` directory, Flyway `V…__`/`U…__`/
+/// `R__`, a numbered `001_…` name, `.up.sql`/`.down.sql`); else any DDL statement, or a file
+/// of which nothing parsed (its diagnostics stand as before).
+fn is_migration(path: &str, text: &str, analysis: &rb_sql::Analysis) -> bool {
+    // aiosql/yesql write `-- name: q`, HugSQL `-- :name q`; pg_dump's `-- Name: t; Type: …`
+    // comments are none of them.
+    if text.lines().any(|l| {
+        let l = l.trim_start();
+        (l.starts_with("-- name:") && !l.contains("; Type:")) || l.starts_with("-- :name ")
+    }) {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    let (dirs, file) = lower.rsplit_once('/').unwrap_or(("", lower.as_str()));
+    let dir_named = dirs.split('/').any(|d| {
+        matches!(
+            d,
+            "migrations" | "migration" | "migrate" | "flyway" | "liquibase"
+        )
+    });
+    let versioned = |prefix: char| {
+        file.strip_prefix(prefix)
+            .and_then(|r| r.split_once("__"))
+            .is_some_and(|(v, _)| {
+                !v.is_empty()
+                    && v.chars()
+                        .all(|c| c.is_ascii_digit() || c == '_' || c == '.')
+            })
+    };
+    let numbered = file
+        .split(['_', '-', '.'])
+        .next()
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    if dir_named
+        || versioned('v')
+        || versioned('u')
+        || file.starts_with("r__")
+        || numbered
+        || file.ends_with(".up.sql")
+        || file.ends_with(".down.sql")
+    {
+        return true;
+    }
+    analysis.statements.is_empty()
+        || analysis.statements.iter().any(|s| {
+            s.tables.iter().any(|t| {
+                t.ops.iter().any(|o| {
+                    matches!(
+                        o,
+                        rb_sql::Op::Create
+                            | rb_sql::Op::Alter
+                            | rb_sql::Op::Drop
+                            | rb_sql::Op::Truncate
+                    )
+                })
+            })
+        })
 }
 
 /// Adds `QUERIES` edges for a file's SQL candidates, from their enclosing symbol (or the file);
@@ -465,7 +532,7 @@ mod tests {
     fn migrations_record_every_statement_with_its_line() {
         let sql = "-- users\nCREATE TABLE users (id bigserial);\nCREATE INDEX users_id ON users (id);\n\nINSERT INTO auth.roles VALUES (1);\n";
         let (g, diagnostics) = graph_with("db/V1__init.sql", |b| {
-            add_migrations(b, "db/V1__init.sql", sql).unwrap()
+            add_sql_file(b, "db/V1__init.sql", sql).unwrap()
         });
         assert!(diagnostics.is_empty());
         assert_eq!(
@@ -538,10 +605,57 @@ mod tests {
         assert_eq!(diagnostics[1].detail["id"], json!("dyn"));
     }
 
+    /// Contract M7d S5 (stress F23, fastapi-realworld): a `.sql` file is a migration only by
+    /// evidence — a migrations path convention, or DDL; an aiosql/HugSQL query file
+    /// (`-- name:`) or a DML-only file holds queries of that file (`QUERIES`).
+    #[test]
+    fn sql_files_are_migrations_only_by_evidence() {
+        let named = "-- name: get-article^\nSELECT slug FROM articles WHERE id = 1;\n\n-- name: create-article!\nINSERT INTO articles (slug) VALUES ('x');\n";
+        let select = "SELECT id FROM users;\n";
+        let ddl = "CREATE TABLE users (id bigserial);\n";
+        for (path, sql, migrates, queries) in [
+            ("app/db/queries/sql/articles.sql", named, 0, 1),
+            ("db/migrations/0001_seed.sql", select, 1, 0),
+            ("db/migrations/seed.sql", select, 1, 0),
+            ("sql/001_seed.sql", select, 1, 0),
+            ("db/V3__seed.sql", select, 1, 0),
+            ("db/seed.up.sql", select, 1, 0),
+            ("schema.sql", ddl, 1, 0),
+            ("reports/top_users.sql", select, 0, 1),
+            // A `-- name:` file is queries even under a migrations directory.
+            ("migrations/queries.sql", named, 0, 1),
+            // HugSQL marks its queries `-- :name`.
+            (
+                "src/hug.sql",
+                "-- :name create-users :!\nCREATE TABLE users (id int);\n",
+                0,
+                1,
+            ),
+            // A pg_dump schema's `-- Name: x; Type: TABLE` comments are no query markers
+            // (found measuring mattermost: 87 dumps under `server/scripts`).
+            (
+                "server/scripts/dump.sql",
+                "--\n-- Name: audits; Type: TABLE; Schema: public; Owner: -\n--\nCREATE TABLE public.audits (id int);\n",
+                1,
+                0,
+            ),
+        ] {
+            let (g, _) = graph_with(path, |b| add_sql_file(b, path, sql).unwrap());
+            assert_eq!(
+                (
+                    edges(&g, EdgeKind::Migrates).len(),
+                    edges(&g, EdgeKind::Queries).len()
+                ),
+                (migrates, queries),
+                "{path}"
+            );
+        }
+    }
+
     #[test]
     fn unparsable_migrations_are_diagnostics_not_edges() {
         let sql = "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB;";
-        let (g, diagnostics) = graph_with("m.sql", |b| add_migrations(b, "m.sql", sql).unwrap());
+        let (g, diagnostics) = graph_with("m.sql", |b| add_sql_file(b, "m.sql", sql).unwrap());
         assert!(edges(&g, EdgeKind::Migrates).is_empty());
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].kind, "unparsed_sql");
@@ -556,7 +670,7 @@ mod tests {
     #[test]
     fn byte_order_mark_and_bad_statements_do_not_hide_good_ones() {
         let sql = "\u{feff}CREATE TABLE widgets (id int);\nCREATE TABLE b (id INT AUTO_INCREMENT);\nCREATE TABLE gadgets (id int);\n";
-        let (g, diagnostics) = graph_with("V1.sql", |b| add_migrations(b, "V1.sql", sql).unwrap());
+        let (g, diagnostics) = graph_with("V1.sql", |b| add_sql_file(b, "V1.sql", sql).unwrap());
         assert_eq!(
             edges(&g, EdgeKind::Migrates),
             [
