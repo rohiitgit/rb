@@ -318,7 +318,8 @@ pub enum Query {
     },
 }
 
-/// The largest `pick` accepted; a pick beyond the candidates lists them again.
+/// The largest `pick` accepted. A pick beyond several candidates lists them again; beyond the
+/// only one it is refused (contract M7j E6).
 const PICK_MAX: u64 = u32::MAX as u64;
 
 /// Reads `params` for `endpoint` (contract M5 S12): unknown parameters, missing required ones and

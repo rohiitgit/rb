@@ -565,3 +565,7 @@
 ## 2026-10-13: mutants of database writes run against a scratch database
 - **Mistake:** M7h mutant m103 removed the `WHERE` from `record_checkout` (`… WHERE name = $1 OR true`) and ran its test against the shared database. The store test's own repositories were fine, but every other repository's checkout became `/y/demo`. The evaluator found it two milestones later as wrong directives.
 - **Rule:** A mutant that can widen a write (`UPDATE`/`DELETE` predicates, `ON CONFLICT` targets) runs only against a test that uses `ScratchDb`, or against a disposable database. After any mutation run on the shared database, compare `SELECT name, checkout FROM rb.repo` (and row counts of the touched tables) before and after.
+
+## 2026-10-13: the binary of record is built from the last code change
+- **Mistake:** M7j's verify script built `var/m7j/bin/rb` and ran the suites. `PIPELINE` was bumped afterwards, so the binary of record wrote `m7i-1` snapshots. It would have taken M7i snapshots as up to date. M7i's binary had the same gap. Evaluator pass 2 found it from timestamps.
+- **Rule:** Bump `PIPELINE` (and every other code change) before the verify run. The verify script refuses a dirty `crates/` (`git diff --quiet HEAD -- crates migrations`) and prints `git rev-parse HEAD` next to the binary's sha256.

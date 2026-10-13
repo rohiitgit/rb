@@ -63,3 +63,12 @@ The evaluator found no wrong `exact` answer. Three answers mislead, and the reco
   - **E2:** `rb doctor` against a silent listener exits 1 in about 12 s with `fail  database … answered nothing within 10 s` (e2e). On the machine of record, 10/10 rows ok.
 - `PIPELINE` `m7j-1` (E1 can change `CONSUMES` attributes), so snapshots indexed by M7i rebuild once.
 - **Database:** after the runs, the shared database holds only the 4 user repositories, with no checkout recorded.
+
+## Amendment 2 (2026-10-13, after evaluator pass 2)
+
+- **Pass 2** (`tasks/eval-m7-pass2.md`): FAIL with 1 blocking item, a records error. Every code fix E1–E7 was reproduced against the release binary. 14 of the 17 pass-1 items are resolved, 2 accepted as recorded residue (13 and 17), and 1 was not resolved (14: U2 was marked done). Fixed here: U2 is ◐ with the path spellings that still do not resolve.
+- **E6 wording:** `--pick N` beyond the *only* candidate is `invalid_param`. Beyond *several* it still lists them as `ambiguous` (M5 amendment 5, unchanged). The `PICK_MAX` doc comment now says both.
+- **N1 (binary of record):** `var/m7j/bin/rb` had been built before the `PIPELINE` bump, so it recorded `m7i-1`. It was rebuilt from the closing tree; that it records `m7j-1` was checked by indexing a scratch repository. Lesson added.
+- **Residue (pass 2, S4):**
+  - N2: the doctor bound covers all database probes together, so a server that stalls after connecting reports "answered nothing" and drops the rows that had passed. A stall inside the mount probe can leave its probe file behind.
+  - N4: a JSON span is the first matching `"key":` after `"paths"`, so a same-named key nested earlier can take it (also recorded on F31).

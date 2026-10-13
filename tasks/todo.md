@@ -1115,3 +1115,4 @@ Contract: `tasks/contract-m7j.md`. Branch `m7j-close` (stacked on M7i `77675c8`)
 - [x] Phase 1 (E1, E4, E6, E7): per-candidate `case`; histogram over every row found; `--pick` beyond one; `rb path` case note.
 - [x] Phase 2 (E2, E5): bounded `rb doctor`; linear JSON spans.
 - [x] Phase 3 (E8): records and docs; full real-Docker run with log 1,047/0/0; invariant against M7i 31/31; E5 10.8 s (M7i 45.4 s); evaluator pass 2 next.
+- [x] Evaluator pass 2 (`tasks/eval-m7-pass2.md`): FAIL, 1 blocking item (U2 marked done; a records error). E1–E7 reproduced. Fixed: U2 ◐; E6 wording; binary of record rebuilt from the closing tree (`m7j-1` checked); N2 and N4 recorded as residue. **M7 closed.**

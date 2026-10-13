@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M7 CLOSED (evaluator passes 1–2)
+- **Pass 1** (`tasks/eval-m7-pass1.md`): FAIL, 17 findings (0 S1). Answered by M7j.
+- **Pass 2** (`tasks/eval-m7-pass2.md`): FAIL with 1 blocking item, a records error (U2 marked done), now marked ◐. Every code fix of M7j was reproduced against the release binary. 14 items resolved, 2 accepted as recorded residue. 4 new S4 items: the binary of record rebuilt after the `PIPELINE` bump (lesson added), E6's wording corrected, two residues recorded.
+- **Close state:** M7a–M7j on stacked branches up to `m7j-close`, not pushed. Stress register: 25 findings fixed, 7 partly, each with its residue; 7 UX proposals done, 3 partly; 4 optimisations done, 2 partly, 1 declined. Real-Docker 1,047/0/0.
+- **Files:** `crates/rb-api/src/lib.rs` (doc comment), `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m7j,eval-m7-pass2,stress-findings,lessons,todo}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M7j: the M7 close fixes (evaluator pass 1)
 - **Correctness:** `case: folded` is decided per candidate (it was copied from the first). After `--limit`, the certainty histogram counts every row found. `--pick N` beyond the only candidate is refused.
 - **Bounds:** `rb doctor` waits at most 10 s for the database, and every `warn`/`fail` row has a fix. JSON spec spans take one pass (20,000-path spec: 45.4 s in M7i, 10.8 s now; M7h 11.0 s).

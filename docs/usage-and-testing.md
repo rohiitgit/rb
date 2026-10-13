@@ -1,9 +1,9 @@
 # Using and testing Repository Brain
 
 This is the operator's guide: how to run the `rb` tool end to end, and how to
-run every test suite. It reflects the tree as of M7i (M0–M7i). Design rationale
+run every test suite. It reflects the tree as of M7j (M0–M7j, M7 closed). Design rationale
 lives in `docs/repository-brain-design.md`; the per-milestone contracts,
-evaluations and measurements in `tasks/`; the short tour in `README.md`. M7a–M7i
+evaluations and measurements in `tasks/`; the short tour in `README.md`. M7a–M7j
 came out of a stress campaign over 18 fixtures and 13 public repositories; its
 findings, repros and what each milestone fixed are in `tasks/stress-findings.md`.
 

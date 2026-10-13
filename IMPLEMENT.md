@@ -768,3 +768,10 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Verification:**
   - 7 mutants killed. Real-Docker 1,047/0/0, with the log kept.
   - Invariant 31/31 identical. E5 10.8 s (M7i 45.4 s).
+
+## M7 closed (evaluator passes 1–2): 2026-10-13
+
+- **The series:** M7a–M7j fixed the stress campaign's findings (`tasks/stress-findings.md`).
+- **Pass 1:** 17 findings, answered by M7j.
+- **Pass 2:** 1 blocking records error (U2), corrected at the close, plus 4 S4 items (fixed or recorded as residue).
+- **Next:** M8a (accuracy benchmark), whose contract is drafted separately.
