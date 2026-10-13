@@ -52,7 +52,7 @@ struct IndexArgs {
     /// Path to the repository (its root, containing .git).
     path: PathBuf,
     /// Repository name in the Brain ([a-z0-9_], max 40). Defaults to the directory name.
-    #[arg(long)]
+    #[arg(long, env = "RB_REPO")]
     repo: Option<String>,
     /// Revision to index.
     #[arg(long, default_value = "HEAD")]
@@ -124,7 +124,7 @@ enum Command {
     Index(IndexArgs),
     /// Show the live snapshot and counts per repository.
     Status {
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
@@ -132,7 +132,7 @@ enum Command {
     },
     /// List a repository's kept snapshots (live, retired, failed), newest first.
     Snapshots {
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Rows listed (1-1000; default 1000).
         #[arg(long)]
@@ -146,7 +146,7 @@ enum Command {
     },
     /// Print the canonical, id-independent dump of a snapshot.
     Dump {
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Snapshot id (default: the repo's live snapshot).
         #[arg(long)]
@@ -167,7 +167,7 @@ enum Command {
         /// Matches skipped first (default 0): `--offset` and `--limit` page through them.
         #[arg(long)]
         offset: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -180,7 +180,7 @@ enum Command {
     Service {
         /// Service directory (e.g. `services/auth`, `.` for the repo root) or name.
         service: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Services listed (without a service) (1-1000; default 1000).
         #[arg(long)]
@@ -198,7 +198,7 @@ enum Command {
     /// Show which migrations and code touch a table (by `schema.table` or bare name).
     TableDeps {
         table: String,
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -220,7 +220,7 @@ enum Command {
         /// A symbol key, `path:line`, a key suffix (`AuthService#login().`), `Class.method` or a
         /// name.
         target: String,
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -251,7 +251,7 @@ enum Command {
     Impact {
         /// As for `callers`; a table key (`public.users`) also works.
         target: String,
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -275,7 +275,7 @@ enum Command {
         /// An endpoint key, `<METHOD> <path>`, part of an endpoint name, or a handler or client
         /// symbol (as for `callers`).
         query: String,
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -309,7 +309,7 @@ enum Command {
         from: Option<String>,
         /// As `from`; default: the live snapshot.
         to: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
@@ -375,7 +375,7 @@ enum Command {
     /// Check the live snapshot against the built-in architecture rules: prints violations
     /// (sorted by rule, source, target) and exits 0 when clean, 1 on violations, 2 on errors.
     Check {
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Run only this rule (orphan_endpoints, unowned_table_writes, service_cycles).
         #[arg(long)]
@@ -396,7 +396,7 @@ enum Command {
     Cypher {
         /// openCypher query, e.g. "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)".
         query: String,
-        #[arg(long)]
+        #[arg(long, env = "RB_REPO")]
         repo: Option<String>,
         /// Run against this snapshot (only the live one has an AGE graph).
         #[arg(long)]

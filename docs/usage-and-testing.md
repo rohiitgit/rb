@@ -114,7 +114,8 @@ Notes that bite newcomers:
 - Ambiguous names are never picked silently (`ambiguous` error + candidates).
 `--repo` defaults to the git checkout you run from (sanitised like `index`
 names it, honoured only when indexed); explicit `--repo` wins, and outside
-any indexed repo the old "several repositories" error stands.
+any indexed repo the old "several repositories" error stands. `RB_REPO`
+supplies a default below the flag: flag > `RB_REPO` > working directory.
 
 ## 5. Testing
 
