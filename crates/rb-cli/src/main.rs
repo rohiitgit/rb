@@ -13,7 +13,7 @@ use anyhow::{Context, bail, ensure};
 mod code;
 mod path;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rb_api::{Answer, Endpoint, Params};
+use rb_api::{Answer, ApiError, Endpoint, Params};
 use rb_model::{ServiceRole, canonical_dump};
 use rb_store::{LoadDir, ServiceCard, SnapshotInfo, Store, TableAccess, TableDeps};
 use serde_json::{Value, json};
@@ -52,7 +52,7 @@ struct IndexArgs {
     /// Path to the repository (its root, containing .git).
     path: PathBuf,
     /// Repository name in the Brain ([a-z0-9_], max 40). Defaults to the directory name.
-    #[arg(long, env = "RB_REPO")]
+    #[arg(long)]
     repo: Option<String>,
     /// Revision to index.
     #[arg(long, default_value = "HEAD")]
@@ -124,7 +124,7 @@ enum Command {
     Index(IndexArgs),
     /// Show the live snapshot and counts per repository.
     Status {
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
@@ -132,7 +132,7 @@ enum Command {
     },
     /// List a repository's kept snapshots (live, retired, failed), newest first.
     Snapshots {
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Rows listed (1-1000; default 1000).
         #[arg(long)]
@@ -146,7 +146,7 @@ enum Command {
     },
     /// Print the canonical, id-independent dump of a snapshot.
     Dump {
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Snapshot id (default: the repo's live snapshot).
         #[arg(long)]
@@ -167,7 +167,7 @@ enum Command {
         /// Matches skipped first (default 0): `--offset` and `--limit` page through them.
         #[arg(long)]
         offset: Option<String>,
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -180,7 +180,7 @@ enum Command {
     Service {
         /// Service directory (e.g. `services/auth`, `.` for the repo root) or name.
         service: Option<String>,
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Services listed (without a service) (1-1000; default 1000).
         #[arg(long)]
@@ -198,7 +198,7 @@ enum Command {
     /// Show which migrations and code touch a table (by `schema.table` or bare name).
     TableDeps {
         table: String,
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -220,7 +220,7 @@ enum Command {
         /// A symbol key, `path:line`, a key suffix (`AuthService#login().`), `Class.method` or a
         /// name.
         target: String,
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -251,7 +251,7 @@ enum Command {
     Impact {
         /// As for `callers`; a table key (`public.users`) also works.
         target: String,
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -275,7 +275,7 @@ enum Command {
         /// An endpoint key, `<METHOD> <path>`, part of an endpoint name, or a handler or client
         /// symbol (as for `callers`).
         query: String,
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Answer from this kept snapshot (`rb snapshots` lists them) instead of the live one.
         #[arg(long)]
@@ -309,7 +309,7 @@ enum Command {
         from: Option<String>,
         /// As `from`; default: the live snapshot.
         to: Option<String>,
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Emit JSON (the API's envelope) instead of text.
         #[arg(long)]
@@ -375,7 +375,7 @@ enum Command {
     /// Check the live snapshot against the built-in architecture rules: prints violations
     /// (sorted by rule, source, target) and exits 0 when clean, 1 on violations, 2 on errors.
     Check {
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Run only this rule (orphan_endpoints, unowned_table_writes, service_cycles).
         #[arg(long)]
@@ -396,7 +396,7 @@ enum Command {
     Cypher {
         /// openCypher query, e.g. "MATCH (f:File)-[:IN_SERVICE]->(s:Service) RETURN s.name, count(f)".
         query: String,
-        #[arg(long, env = "RB_REPO")]
+        #[arg(long)]
         repo: Option<String>,
         /// Run against this snapshot (only the live one has an AGE graph).
         #[arg(long)]
@@ -784,7 +784,39 @@ fn asked(command: Command) -> Option<Asked> {
 /// code the server uses, and prints it; a refused request prints its message and exits with
 /// D5's code.
 fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Result<ExitCode> {
-    let repo = repo.or_else(|| inferred_repo(store));
+    // `--repo` wins; else the working directory's checkout when indexed; else a
+    // directive error — never a guess across several repositories.
+    let repo = match repo {
+        Some(r) => Some(r),
+        None => match cwd_repo_name() {
+            Some(name) if is_indexed(store, &name) => Some(name),
+            Some(name) => {
+                return answer_err(
+                    out,
+                    ApiError::invalid(
+                        "repo",
+                        format!(
+                            "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
+                        ),
+                    ),
+                );
+            }
+            None => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".into());
+                return answer_err(
+                    out,
+                    ApiError::invalid(
+                        "repo",
+                        format!(
+                            "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
+                        ),
+                    ),
+                );
+            }
+        },
+    };
     let settings = settings()?;
     let answered = rb_api::parse(endpoint, repo.as_deref(), &params, &settings)
         .and_then(|req| rb_api::run(store, &mut rb_api::LoadEach, &req, &settings));
@@ -802,15 +834,18 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
             }
             Ok(ExitCode::SUCCESS)
         }
-        Err(e) => {
-            match out {
-                // The error body the server sends for the same request (contract M5 S14).
-                Out::Json => print!("{}", e.body()),
-                Out::Text { .. } => eprintln!("Error: {}", e.cli_text()),
-            }
-            Ok(ExitCode::from(e.kind.exit_code()))
-        }
+        Err(e) => answer_err(out, e),
     }
+}
+
+/// Prints a refused request exactly like `answer` does and exits with its code.
+fn answer_err(out: Out, e: ApiError) -> anyhow::Result<ExitCode> {
+    match out {
+        // The error body the server sends for the same request (contract M5 S14).
+        Out::Json => print!("{}", e.body()),
+        Out::Text { .. } => eprintln!("Error: {}", e.cli_text()),
+    }
+    Ok(ExitCode::from(e.kind.exit_code()))
 }
 
 /// The SCIP budget `rb index`'s flags set (contract M6a D9); every unset flag keeps
@@ -2377,7 +2412,25 @@ fn check_rules(
 }
 
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
-    let repo = repo.or_else(|| inferred_repo(store));
+    let repo = match repo {
+        Some(r) => Some(r),
+        None => match cwd_repo_name() {
+            Some(name) if is_indexed(store, &name) => Some(name),
+            Some(name) => {
+                bail!(
+                    "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
+                )
+            }
+            None => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".into());
+                bail!(
+                    "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
+                )
+            }
+        },
+    };
     let repo = match repo {
         Some(r) => r,
         None => {
@@ -2432,18 +2485,19 @@ fn git_root(start: &Path) -> Option<PathBuf> {
 }
 
 /// The repository implied by the working directory: the enclosing git root's
-/// directory name, sanitised exactly like `index` names it — but only when a
-/// repository of that name is indexed, so anything else keeps the old errors
-/// (`--repo` always wins when given).
-fn inferred_repo(store: &mut Store) -> Option<String> {
+/// directory name, sanitised exactly like `index` names it. No existence
+/// check: callers decide between using it and reporting it.
+fn cwd_repo_name() -> Option<String> {
     let root = git_root(&std::env::current_dir().ok()?)?;
-    let name = repo_name_from_path(&root);
+    Some(repo_name_from_path(&root))
+}
+
+/// Whether a repository of this name is indexed (store errors count as no).
+fn is_indexed(store: &mut Store, name: &str) -> bool {
     store
         .repo_names()
-        .ok()?
-        .iter()
-        .any(|r| r == &name)
-        .then_some(name)
+        .map(|names| names.iter().any(|r| r == name))
+        .unwrap_or(false)
 }
 
 fn short(sha: &str) -> &str {

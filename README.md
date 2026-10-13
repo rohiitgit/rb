@@ -65,10 +65,10 @@ target/debug/rb check --repo demo           # exit 0 when clean
 ```
 
 A name matching several symbols asks you to `--pick` one instead of guessing.
-`--repo` defaults to the git repository of your working directory (when that
-repo is indexed); an explicit `--repo` always wins, and outside any indexed
-repo you must pass one. `RB_REPO` sets a default when neither applies
-(flag > `RB_REPO` > working directory).
+`--repo` defaults to the git checkout you run from (when that repo is
+indexed); an explicit `--repo` always wins. Anywhere else you get a plain
+directive instead of a guess: either *no indexed repository matches this
+checkout* or *no git repository found — run from inside one*.
 Clean up with `psql "$RB_DATABASE_URL" -c "DELETE FROM rb.repo WHERE
 name='demo'"` and `rb gc`. That's the whole loop: **index → ask → diff/serve**.
 
