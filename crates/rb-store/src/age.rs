@@ -278,7 +278,7 @@ pub(crate) fn cypher_sql(graph: &str, query: &str, columns: &[String]) -> anyhow
             bail!("could not find a safe dollar-quote tag for this query");
         }
     }
-    let select: Vec<String> = columns.iter().map(|c| format!("(t.{c})::text")).collect();
+    let select: Vec<String> = columns.iter().map(|c| column_text(c)).collect();
     let defs: Vec<String> = columns
         .iter()
         .map(|c| format!("{c} ag_catalog.agtype"))
@@ -288,6 +288,17 @@ pub(crate) fn cypher_sql(graph: &str, query: &str, columns: &[String]) -> anyhow
         select.join(", "),
         defs.join(", ")
     ))
+}
+
+/// A result column as text (contract M7f S6): scalars as `agtype::text` gives them (a string
+/// raw, unquoted), graph values — vertices, edges, paths, alone or inside a list or map — as
+/// `agtype_out`'s text (`{…}::vertex`), which `agtype::text` refuses. A string is never
+/// re-rendered, even one spelling `::vertex`.
+fn column_text(c: &str) -> String {
+    let out = format!("ag_catalog.agtype_out(t.{c})::text");
+    format!(
+        "CASE WHEN {out} !~ '^\"' AND {out} ~ '::(vertex|edge|path)' THEN {out} ELSE (t.{c})::text END"
+    )
 }
 
 fn is_identifier(s: &str) -> bool {
@@ -311,8 +322,12 @@ mod tests {
         let sql = cypher_sql("rb_x_1", "MATCH (n) RETURN n.key, 1", &cols).unwrap();
         assert_eq!(
             sql,
-            "SELECT (t.svc)::text, (t.n)::text FROM ag_catalog.cypher('rb_x_1', $rbq$MATCH (n) RETURN n.key, 1$rbq$) \
-             AS t(svc ag_catalog.agtype, n ag_catalog.agtype)"
+            format!(
+                "SELECT {}, {} FROM ag_catalog.cypher('rb_x_1', $rbq$MATCH (n) RETURN n.key, 1$rbq$) \
+                 AS t(svc ag_catalog.agtype, n ag_catalog.agtype)",
+                column_text("svc"),
+                column_text("n")
+            )
         );
         let sneaky = cypher_sql("rb_x_1", "RETURN 1 $rbq$; DROP TABLE x; --", &cols[..1]).unwrap();
         assert!(sneaky.contains("$rbq1$RETURN 1 $rbq$; DROP TABLE x; --$rbq1$"));

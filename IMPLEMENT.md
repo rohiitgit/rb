@@ -728,3 +728,10 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Verification:**
   - 15 mutants killed. Real-Docker 1,004/0/0. Invariant 28/31 identical, classified.
   - go-gin-example: 4× faster, 4× less memory, 8× smaller graph.
+
+## M7f The error contract and targets (stress batch E, part 1): implemented 2026-10-13
+
+- **Contract:** `tasks/contract-m7f.md` (error contract table and diagram, S1–S7, amendment 1). Fixes F4–F8, F14.
+- **Verification:**
+  - 14 mutants killed. Real-Docker 1,009/0/0.
+  - Invariant 31/31 byte-identical. The exit-code table gains `unavailable` (6 / 503).

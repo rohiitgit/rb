@@ -1306,3 +1306,43 @@ fn a_publish_leaves_statistics_that_cover_the_new_snapshot() {
         );
     }
 }
+
+/// Contract M7f S6 (stress F14): vertices, edges and paths come back as their agtype text
+/// (`{…}::vertex`) instead of an internal cast error, while scalars stay raw as before (a
+/// string is not re-quoted).
+#[test]
+fn cypher_renders_graph_values_and_keeps_scalars_raw() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("cyvalues");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"c".repeat(40),
+            &json!({}),
+            &sample_graph(3, 1),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let limits = crate::CypherLimits::default();
+    let one = |store: &mut Store, q: &str| -> String {
+        let out = store.cypher(live.id, q, &["c".into()], limits).unwrap();
+        out.rows[0][0].clone()
+    };
+    let vertex = one(&mut store, "MATCH (n) RETURN n LIMIT 1");
+    assert!(vertex.ends_with("::vertex"), "{vertex}");
+    let edge = one(&mut store, "MATCH ()-[e]->() RETURN e LIMIT 1");
+    assert!(edge.ends_with("::edge"), "{edge}");
+    let path = one(&mut store, "MATCH p=()-[]->() RETURN p LIMIT 1");
+    assert!(path.ends_with("::path"), "{path}");
+    assert_eq!(one(&mut store, "RETURN 'x::vertex'"), "x::vertex");
+    assert_eq!(one(&mut store, "RETURN 1.5"), "1.5");
+    // Where `agtype_out` writes a scalar differently, the old rendering stands.
+    assert_eq!(one(&mut store, "RETURN 1.0"), "1");
+}

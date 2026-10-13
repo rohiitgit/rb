@@ -549,3 +549,7 @@
 ## 2026-10-13: before a new milestone series, list the project's record files and keep every one
 - **Mistake:** M7a–M7d updated `IMPLEMENT.md`, contracts, todo and lessons, but not `CHANGELOG.md`, which every earlier milestone (M0–M6l) kept. The gap was caught only when the karpathy-loops changelog rule was applied at M7e, and it was backfilled there.
 - **Rule:** At the start of a milestone series, read the last close commit's file list (`git show --stat <last close>`) and copy its record set into the plan's final phase as checkboxes: `CHANGELOG.md`, `IMPLEMENT.md`, contract, todo, lessons, design doc rows.
+
+## 2026-10-13: changing an error kind means grepping every test for the old kind first
+- **Mistake:** M7f S2 turned "database unreachable" from `internal` (500) into `unavailable` (503). Two `rb-server` tests used a closed port only to keep workers busy, but asserted `(500, "internal")`; they failed in the 40-minute real-Docker run instead of a 3-second unit run.
+- **Rule:** When an error's kind, exit code or status changes, `grep -rn '"<old kind>"\|<old status>'` across `crates/*/src/tests.rs` and `crates/*/tests/` before the full run. Classify each hit as intent (keep and justify) or incidental (update with a note).

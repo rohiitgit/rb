@@ -541,8 +541,10 @@ pub struct Store {
 
 impl Store {
     pub fn connect(url: &str) -> anyhow::Result<Self> {
-        let mut client = Client::connect(url, NoTls)
-            .with_context(|| format!("connecting to {}", redact(url)))?;
+        let mut client = Client::connect(url, NoTls).map_err(|e| Unavailable {
+            url: redact(url),
+            cause: root_cause(&e),
+        })?;
         // AGE's cypher() and agtype live in ag_catalog; rb.* is always schema-qualified.
         client.batch_execute(r#"SET search_path = ag_catalog, "$user", public"#)?;
         Ok(Self {
@@ -1583,6 +1585,35 @@ fn into_object(v: Value) -> anyhow::Result<rb_model::Attrs> {
 }
 
 /// Hides the password in a `postgresql://user:pass@host/db` URL for error messages.
+/// The database could not be reached (contract M7f S2): the URL with its password redacted,
+/// and the innermost cause (`Connection refused (os error 61)`), never the whole chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unavailable {
+    pub url: String,
+    pub cause: String,
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot reach the database at {}: {}",
+            self.url, self.cause
+        )
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+/// The innermost error of a chain, as the user-facing cause.
+fn root_cause(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut cur = e;
+    while let Some(next) = cur.source() {
+        cur = next;
+    }
+    cur.to_string()
+}
+
 fn redact(url: &str) -> String {
     match (url.find("://"), url.rfind('@')) {
         (Some(s), Some(at)) if at > s => {
@@ -1599,6 +1630,18 @@ fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreachable_database_is_unavailable_with_its_root_cause() {
+        let e = Store::connect("postgresql://rb:secret@127.0.0.1:1/rb")
+            .err()
+            .unwrap();
+        let u = e.downcast_ref::<Unavailable>().expect("typed");
+        assert_eq!(u.url, "postgresql://rb:***@127.0.0.1:1/rb");
+        // The innermost cause, as the OS words it (its error code differs by platform).
+        assert!(u.cause.starts_with("Connection refused"), "{}", u.cause);
+        assert!(!format!("{e:?}").contains("Caused by"), "{e:?}");
+    }
 
     #[test]
     fn redacts_passwords() {

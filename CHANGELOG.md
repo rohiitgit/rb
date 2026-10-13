@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026-10-13] (wall clock) M7f: the error contract and targets (stress batch E, part 1)
+- **Error wording:** CLI error text names what the user typed: positionals by clap usage name (`<TEXT> is required`), `--cols` (not `--columns`), and the repo directive as a predicate (`--repo is needed: …`, one helper replacing 4 copies).
+- **Unreachable database:** the new `unavailable` kind (exit 6, HTTP 503) gives a one-line cause with a hint, with no anyhow chain, and the envelope under `--json` (`rb_store::Unavailable`).
+- **`rb check`:** every error exits 2 (never 1, "violations") through the same envelope; an unknown repo is `not_found`; the dead "only repository" fallback is removed.
+- **Targets:** a near-miss key in symbol syntax (`Db#load()`) resolves when `find`'s rule gives exactly one symbol. Suggested commands are shell-quoted.
+- **Cypher:** `RETURN n`/`e`/`p` render as agtype text; scalars stay byte-identical.
+- **`rb path`:** accepts `--json`.
+- **Verification:** fixes F4–F8, F14. 14 mutants killed. Real-Docker suites 1,009/0/0 (2 server tests updated: an absent database is now 503 `unavailable`, not 500). Invariant vs M7e 31/31 byte-identical (no graph change). No `PIPELINE` bump.
+- **Files:** `crates/rb-api/src/{error,render,lib}.rs`, `crates/rb-cli/src/main.rs`, `crates/rb-store/src/{lib,age,db_tests}.rs`, `crates/rb-server/src/tests.rs`; records `tasks/{contract-m7f,todo,stress-findings,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M7e: input hygiene (stress batch D)
 - One exclusion decision per commit (`crates/rb-indexer/src/exclude.rs`), from five rules in order: `rb.toml` `ignore` (new key, shared CODEOWNERS dialect), Go `vendor/` beside `vendor/modules.txt`, `node_modules`, `.gitattributes` `linguist-vendored`/`-generated`, and tsconfig `outDir` compiler outputs. Excluded files keep their `File` node (`excluded: <reason>`) and are never parsed, scanned, detected or indexed. Counted per reason (`excluded` diagnostic) and shown by `rb status`.
 - go-gin-example: 2.64 s → 0.64 s, 359 → 87 MiB, 10,077 → 1,259 nodes, 1,059 → 0 ambiguous references. nestjs-realworld: `dist/` duplicates gone.

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 
 mod code;
 mod path;
@@ -291,6 +291,9 @@ enum Command {
         full: bool,
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        /// The same as `--format json`, as on every other question (contract M7f S7).
+        #[arg(long)]
+        json: bool,
         /// Choose among several matching endpoints (1-based, as listed).
         #[arg(long)]
         pick: Option<String>,
@@ -438,13 +441,48 @@ enum Format {
 }
 
 fn main() -> ExitCode {
-    match run_cli(Cli::parse()) {
+    let cli = Cli::parse();
+    let json = wants_json(&cli.command);
+    let check = matches!(cli.command, Command::Check { .. });
+    match run_cli(cli) {
         Ok(code) => code,
-        Err(e) => {
-            eprintln!("Error: {e:?}");
-            ExitCode::FAILURE
-        }
+        Err(e) => report_failure(e, json, check),
     }
+}
+
+/// Whether the command asked for JSON output, known before it runs (contract M7f S2).
+fn wants_json(command: &Command) -> bool {
+    match command {
+        Command::Status { json, .. }
+        | Command::Snapshots { json, .. }
+        | Command::Find { json, .. }
+        | Command::Service { json, .. }
+        | Command::TableDeps { json, .. }
+        | Command::Callers { json, .. }
+        | Command::Impact { json, .. }
+        | Command::Diff { json, .. }
+        | Command::Cypher { json, .. }
+        | Command::Check { json, .. } => *json,
+        Command::Path { json, format, .. } => *json || *format == Format::Json,
+        _ => false,
+    }
+}
+
+/// A failed command (contract M7f S2/S3): a refused request or an unreachable database prints as
+/// every question's error does — the envelope under `--json`, else one `Error:` line — and exits
+/// by its kind; anything else keeps its full chain and exit 1. `rb check` exits 2 on any error,
+/// so a failure is never read as violations (1).
+fn report_failure(e: anyhow::Error, json: bool, check: bool) -> ExitCode {
+    let code = if e.is::<ApiError>() || e.is::<rb_store::Unavailable>() {
+        let api = ApiError::from(e);
+        let code = api.kind.exit_code();
+        let _ = answer_err(Out::json_if(json), api);
+        ExitCode::from(code)
+    } else {
+        eprintln!("Error: {e:?}");
+        ExitCode::FAILURE
+    };
+    if check { ExitCode::from(2) } else { code }
 }
 
 fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
@@ -717,6 +755,7 @@ fn asked(command: Command) -> Option<Asked> {
             hops,
             full,
             format,
+            json,
             pick,
             precision,
         } => {
@@ -731,7 +770,7 @@ fn asked(command: Command) -> Option<Asked> {
                 Endpoint::Path,
                 repo,
                 p,
-                Out::json_if(format == Format::Json),
+                Out::json_if(json || format == Format::Json),
             )
         }
         Command::Cypher {
@@ -793,31 +832,7 @@ fn answer(store: &mut Store, (endpoint, repo, params, out): Asked) -> anyhow::Re
         None => match cwd_repo_name() {
             Some(name) if is_indexed(store, &name) => Some(name),
             _ if matches!(endpoint, Endpoint::Status) => None,
-            Some(name) => {
-                return answer_err(
-                    out,
-                    ApiError::invalid(
-                        "repo",
-                        format!(
-                            "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
-                        ),
-                    ),
-                );
-            }
-            None => {
-                let cwd = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "?".into());
-                return answer_err(
-                    out,
-                    ApiError::invalid(
-                        "repo",
-                        format!(
-                            "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
-                        ),
-                    ),
-                );
-            }
+            name => return answer_err(out, repo_needed(name.as_deref(), &cwd_display())),
         },
     };
     let settings = settings()?;
@@ -2414,10 +2429,8 @@ fn check_rules(
         truncated,
     } = match outcome {
         Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: {e:?}");
-            return Ok(ExitCode::from(2));
-        }
+        // Errors exit 2, never 1 (violations), through the shared rendering (contract M7f S3).
+        Err(e) => return Ok(report_failure(e, json, true)),
     };
     // A cut row list would silently pass a violating snapshot: say so loudly (contract M6h S4).
     if truncated {
@@ -2436,41 +2449,24 @@ fn check_rules(
 
 fn live_snapshot(store: &mut Store, repo: Option<String>) -> anyhow::Result<SnapshotInfo> {
     let repo = match repo {
-        Some(r) => Some(r),
+        Some(r) => r,
         None => match cwd_repo_name() {
-            Some(name) if is_indexed(store, &name) => Some(name),
-            Some(name) => {
-                bail!(
-                    "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
-                )
-            }
-            None => {
-                let cwd = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "?".into());
-                bail!(
-                    "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
-                )
-            }
+            Some(name) if is_indexed(store, &name) => name,
+            name => return Err(repo_needed(name.as_deref(), &cwd_display()).into()),
         },
     };
-    let repo = match repo {
-        Some(r) => r,
-        None => {
-            let names = store.repo_names()?;
-            match names.as_slice() {
-                [only] => only.clone(),
-                [] => bail!("no repositories indexed yet"),
-                many => bail!(
-                    "several repositories indexed; pass --repo (one of: {})",
-                    many.join(", ")
-                ),
-            }
-        }
-    };
-    store
-        .live_snapshot(&repo)?
-        .with_context(|| format!("repository {repo:?} has no live snapshot"))
+    // Typed like every question's errors (contract M7f S3): `not_found` and `no_live_snapshot`.
+    if !store.repo_names()?.contains(&repo) {
+        return Err(ApiError::not_found(format!("repository {repo:?} is not indexed")).into());
+    }
+    match store.live_snapshot(&repo)? {
+        Some(snap) => Ok(snap),
+        None => Err(ApiError::new(
+            rb_api::ErrorKind::NoLiveSnapshot,
+            format!("repository {repo:?} has no live snapshot"),
+        )
+        .into()),
+    }
 }
 
 /// Derives a valid repo name from a directory name: lowercase, `[a-z0-9_]`, max 40 characters.
@@ -2505,6 +2501,27 @@ fn git_root(start: &Path) -> Option<PathBuf> {
         cur = dir.parent();
     }
     None
+}
+
+/// The `--repo` directive when no repository can be inferred (contract M7f S1): `checkout` is the
+/// unindexed checkout's name, `None` outside any git checkout (then `cwd` is named).
+fn repo_needed(checkout: Option<&str>, cwd: &str) -> ApiError {
+    let why = match checkout {
+        Some(name) => format!(
+            "no indexed repository matches this checkout ({name:?}); index it (`rb index .`) or pass --repo"
+        ),
+        None => format!(
+            "no git repository found in {cwd:?}; run rb from inside an indexed git checkout (or pass --repo)"
+        ),
+    };
+    ApiError::invalid("repo", format!("is needed: {why}"))
+}
+
+/// The working directory as the directive names it.
+fn cwd_display() -> String {
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into())
 }
 
 /// The repository implied by the working directory: the enclosing git root's
@@ -2761,6 +2778,53 @@ mod tests {
             assert!(parse(args).is_ok(), "{args:?}");
         }
         assert!(asked(Cli::try_parse_from(["rb", "migrate"]).unwrap().command).is_none());
+    }
+
+    /// Contract M7f S2+S3 (stress F5/F6): a refused request or an unreachable database exits by
+    /// its kind (`unavailable` 6, `not_found` 3); `rb check` exits 2 on any error, so an outage
+    /// is never read as violations (1); other failures keep exit 1.
+    #[test]
+    fn failures_exit_by_kind_and_check_errors_exit_2() {
+        let down = || {
+            anyhow::Error::from(rb_store::Unavailable {
+                url: "postgresql://rb:***@127.0.0.1:1/rb".into(),
+                cause: "Connection refused".into(),
+            })
+        };
+        assert_eq!(report_failure(down(), false, false), ExitCode::from(6));
+        assert_eq!(report_failure(down(), true, true), ExitCode::from(2));
+        let missing =
+            || anyhow::Error::from(ApiError::not_found("repository \"x\" is not indexed"));
+        assert_eq!(report_failure(missing(), false, false), ExitCode::from(3));
+        assert_eq!(report_failure(missing(), false, true), ExitCode::from(2));
+        assert_eq!(
+            report_failure(anyhow::anyhow!("disk full"), false, false),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            report_failure(anyhow::anyhow!("disk full"), false, true),
+            ExitCode::from(2)
+        );
+        // Which commands asked for JSON, known before the command runs.
+        let wants = |args: &[&str]| wants_json(&Cli::try_parse_from(args).unwrap().command);
+        assert!(wants(&["rb", "check", "--json"]));
+        assert!(wants(&["rb", "status", "--json"]));
+        assert!(wants(&["rb", "path", "x", "--format", "json"]));
+        assert!(!wants(&["rb", "callers", "x"]));
+        assert!(!wants(&["rb", "migrate"]));
+    }
+
+    /// Contract M7f S7: `rb path --json` is `--format json`, as `--json` is on every other
+    /// question; without either it is text.
+    #[test]
+    fn path_takes_json_like_every_other_question() {
+        let out = |args: &[&str]| {
+            let (_, _, _, out) = asked(Cli::try_parse_from(args).unwrap().command).unwrap();
+            matches!(out, Out::Json)
+        };
+        assert!(out(&["rb", "path", "GET /x", "--json"]));
+        assert!(out(&["rb", "path", "GET /x", "--format", "json"]));
+        assert!(!out(&["rb", "path", "GET /x"]));
     }
 
     /// Contract M5 D18: a page that is not the last names the rows shown and the next offset.
@@ -3202,6 +3266,23 @@ mod tests {
 
     /// Contract M3b amendment 50: a timeout's detail is printed once; other statuses print
     /// their reason; coverage lists `relationships dropped` (amendment 52).
+    /// Contract M7f S1 (stress F4): the repo directive is a predicate on `--repo`, the same
+    /// for questions and for `check`/`dump`, naming the checkout or the directory.
+    #[test]
+    fn repo_directive_reads_as_a_predicate_on_repo() {
+        let unindexed = repo_needed(Some("demo_spring"), "/w");
+        assert_eq!(
+            unindexed.cli_text(),
+            "--repo is needed: no indexed repository matches this checkout (\"demo_spring\"); index it (`rb index .`) or pass --repo"
+        );
+        assert_eq!(unindexed.param.as_deref(), Some("repo"));
+        assert!(unindexed.message.starts_with("repo is needed: "));
+        assert_eq!(
+            repo_needed(None, "/tmp").cli_text(),
+            "--repo is needed: no git repository found in \"/tmp\"; run rb from inside an indexed git checkout (or pass --repo)"
+        );
+    }
+
     /// Contract M7e S3: the status line names what was not analysed and why, in the stored
     /// (canonical) order; nothing excluded prints no line.
     #[test]

@@ -1047,3 +1047,18 @@ Contract and design: `tasks/contract-m7e.md`. Branch `m7e-input-hygiene` (stacke
 
 ## Review (M7e)
 - Batch D is complete. Exclusion is decided once from the full tree and counted per reason. Residue: `rb.toml` `include` opt-back-in, gitattributes macros and negations, `outDir` via `extends`.
+
+---
+
+# M7f: error contract and targets (stress batch E, part 1), started 2026-10-13
+
+Contract: `tasks/contract-m7f.md`. Branch `m7f-error-contract` (stacked on M7e `be2d93d`). Record set (from `git show --stat a4e891b`): CHANGELOG.md, IMPLEMENT.md, contract, todo, stress-findings, lessons.
+
+- [x] Phase 1 (S1, S7): `CLI_NAMES` (positionals by clap usage name, `columns`→`--cols`); one `repo_needed` helper replaces 4 copies (`--repo is needed: …`); `path --json`. Mutants m73–m75 killed.
+- [x] Phase 2 (S2, S3): `rb_store::Unavailable` (redacted URL, root cause) from `connect`; `ErrorKind::Unavailable` (exit 6, 503) with a hint; `main` captures `--json`/check up front and routes typed errors through `answer_err`; `check` exits 2 on every error, with envelope; `live_snapshot` typed (`not_found`, `no_live_snapshot`), dead fallback deleted. Verified on the real binary against a closed port. Mutants m76–m79 killed (m79 needed an exact-cause assertion).
+- [x] Phase 3 (S4, S5): `near_miss_symbols` (find's rule; only for key-syntax input with `#` or `(`); `shell_arg` quoting in 3 suggestion sites. Mutants m80–m83 killed (m81 needed a plain-fragment negative).
+- [x] Phase 4 (S6): `column_text`: `agtype_out` text for graph values (suffix `::vertex|edge|path`, not a string), `::text` otherwise. Probed live: scalars, lists and maps identical; `1.0`, numeric and `-0.0` would differ under `agtype_out`, so the suffix test stays. DB test failed first. Mutants m84–m86 killed (m86 needed a `1.0` case).
+- [x] Phase 5: real Docker 1,009/0/0 after updating 2 server tests that pinned the incidental `500 internal` (now `503 unavailable`, per S2); no golden changed; invariant 31/31 byte-identical; repros show the new behaviour; full record set written.
+
+## Review (M7f)
+- Batch E part 1 is complete. One error contract: typed kinds, envelope everywhere, exit 6 for an unreachable database, and 2 for any `check` error.

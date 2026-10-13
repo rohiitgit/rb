@@ -34,11 +34,15 @@ pub fn describe_line(d: &Describer<'_>, id: i64) -> String {
 /// The node `input` names (Q1, Q2). Several candidates are listed, never picked silently, unless
 /// `pick` (1-based, in the listed order) chooses one.
 pub fn pick_target(ix: &SnapshotIndex, input: &str, pick: Option<usize>) -> Result<i64, ApiError> {
-    let candidates = rb_store::code::resolve_target(ix, input);
+    let mut candidates = rb_store::code::resolve_target(ix, input);
+    if candidates.is_empty() {
+        candidates = near_miss_symbols(ix, input);
+    }
     let d = Describer::new(ix);
     match (candidates.as_slice(), pick) {
         ([], _) => Err(ApiError::not_found(format!(
-            "nothing matches {input:?} (try `rb find {input}`)"
+            "nothing matches {input:?} (try `rb find {}`)",
+            shell_arg(input)
         ))),
         ([only], _) => Ok(*only),
         (many, Some(n)) if (1..=many.len()).contains(&n) => Ok(many[n - 1]),
@@ -59,6 +63,43 @@ pub fn pick_target(ix: &SnapshotIndex, input: &str, pick: Option<usize>) -> Resu
                     .collect(),
             ))
         }
+    }
+}
+
+/// Symbols a near-miss key names (contract M7f S4): `rb find`'s rule — a case-insensitive
+/// substring of a symbol's key or name — for an input written in symbol-key syntax (`#` or `(`),
+/// in key order. Plain words already resolve by name, and stay out so a short word never lists
+/// half the graph.
+fn near_miss_symbols(ix: &SnapshotIndex, input: &str) -> Vec<i64> {
+    if !input.contains(['#', '(']) {
+        return Vec::new();
+    }
+    let needle = input.trim().to_lowercase();
+    let mut hits: Vec<(&str, i64)> = ix
+        .graph()
+        .nodes()
+        .iter()
+        .filter(|n| n.kind == NodeKind::Symbol)
+        .filter(|n| {
+            n.key.to_lowercase().contains(&needle) || n.name.to_lowercase().contains(&needle)
+        })
+        .map(|n| (n.key.as_str(), n.id))
+        .collect();
+    hits.sort_unstable();
+    hits.into_iter().map(|(_, id)| id).collect()
+}
+
+/// `arg` as a shell word (contract M7f S5): as written when it holds only characters no shell
+/// splits or expands, else single-quoted.
+pub(crate) fn shell_arg(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c));
+    if plain {
+        arg.to_owned()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
     }
 }
 
@@ -358,7 +399,8 @@ pub fn pick_endpoint(
     let view = PathView::new(ix);
     match (candidates.as_slice(), pick) {
         ([], _) => Err(ApiError::not_found(format!(
-            "no endpoint matches {input:?} (try `rb find {input} --kind endpoint`)"
+            "no endpoint matches {input:?} (try `rb find {} --kind endpoint`)",
+            shell_arg(input)
         ))),
         ([only], _) => Ok(*only),
         (many, Some(n)) if (1..=many.len()).contains(&n) => Ok(many[n - 1]),
@@ -535,6 +577,27 @@ mod tests {
                 ErrorKind::NotFound,
                 "nothing matches \"walk\" (try `rb find walk`)"
             )
+        );
+        // Contract M7f S4 (stress F7): a near-miss key (`A#run()` without the trailing `.`)
+        // resolves when `find`'s rule — a case-insensitive substring of a symbol's key or name —
+        // yields exactly one symbol; several are ambiguous, as everywhere.
+        let near = pick_target(&ix, "A#run()", None).unwrap();
+        assert_eq!(ix.node(near).key, "a/A.java/A#run().");
+        assert_eq!(pick_target(&ix, "a#RUN()", None).unwrap(), near);
+        assert_eq!(
+            pick_target(&ix, "#run(", None).unwrap_err().kind,
+            ErrorKind::Ambiguous
+        );
+        // A plain fragment is no key syntax: it stays not found, never a substring sweep.
+        assert_eq!(
+            pick_target(&ix, "un", None).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+        // Contract M7f S5 (stress F8): the suggested command quotes what a shell would split.
+        let miss = pick_target(&ix, "Z#run()", None).unwrap_err();
+        assert_eq!(
+            miss.message,
+            "nothing matches \"Z#run()\" (try `rb find 'Z#run()'`)"
         );
     }
 }

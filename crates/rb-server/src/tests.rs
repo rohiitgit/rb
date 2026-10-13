@@ -319,12 +319,13 @@ fn a_full_queue_is_busy_at_once() {
         started.elapsed()
     );
     assert_eq!((busy.status, busy.kind().as_str()), (503, "busy"));
-    // The first two were answered, after the hold, by the (absent) database.
+    // The first two were answered, after the hold, by the (absent) database: `unavailable`
+    // since contract M7f S2 (was `internal`).
     for t in [running, queued] {
         let reply = t.join().unwrap();
         assert_eq!(
             (reply.status, reply.kind().as_str()),
-            (500, "internal"),
+            (503, "unavailable"),
             "{reply:?}"
         );
     }
@@ -597,6 +598,7 @@ fn transport_refusals_are_hyper_bare_statuses() {
         &r,
         &format!("/v1/repos/x/callers?target={}", "a".repeat(65_000)),
     );
-    assert_eq!(reply.status, 500, "{reply:?}");
-    assert_eq!(reply.kind(), "internal");
+    // The absent database answers `unavailable` (contract M7f S2).
+    assert_eq!(reply.status, 503, "{reply:?}");
+    assert_eq!(reply.kind(), "unavailable");
 }

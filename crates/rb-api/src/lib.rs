@@ -1117,7 +1117,8 @@ fn answer(
                 Resolved::One(n) => n,
                 Resolved::None => {
                     return Err(ApiError::not_found(format!(
-                        "no table matches {table:?} (try `rb find {table} --kind table`)"
+                        "no table matches {table:?} (try `rb find {} --kind table`)",
+                        render::shell_arg(table)
                     )));
                 }
                 Resolved::Ambiguous(candidates) => {
