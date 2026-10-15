@@ -525,11 +525,13 @@ fn mapping_paths(d: &Decoration) -> Result<Vec<String>, String> {
     let Some(arg) = arg else {
         return Ok(vec![String::new()]);
     };
-    let values: Vec<&DecorationArg> = if arg.items.is_empty() && !arg.value.starts_with('{') {
-        vec![arg]
-    } else {
-        arg.items.iter().collect()
-    };
+    // A string literal is a path even when it starts with `{` (`"{taskId}"`).
+    let values: Vec<&DecorationArg> =
+        if arg.items.is_empty() && (arg.literal || !arg.value.starts_with('{')) {
+            vec![arg]
+        } else {
+            arg.items.iter().collect()
+        };
     if values.is_empty() {
         return Ok(vec![String::new()]);
     }
@@ -1834,6 +1836,25 @@ public class AuthController {
             diagnostics(Language::Java, src),
             [("route_path_dynamic".to_owned(), "Paths.BASE".to_owned())]
         );
+    }
+
+    /// Contract M9a C6 (bench B12a): a string literal is a path whatever its first character;
+    /// only a non-literal `{…}` is an array.
+    #[test]
+    fn spring_literal_paths_starting_with_a_brace_are_paths() {
+        let src = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\n@RequestMapping(\"/\")\nclass T {\n    @GetMapping(value = \"{taskId}\") void get() {}\n    @PutMapping({}) void put() {}\n    @PostMapping({\"/a\", \"{b}\"}) void post() {}\n}\n";
+        assert_eq!(
+            summary(Language::Java, src),
+            [
+                "GET /{} root def get",
+                "PUT / root def put",
+                "POST /a root def post",
+                "POST /{} root def post",
+            ]
+        );
+        let bare = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass U { @GetMapping(\"{id}\") void get() {} }\n";
+        assert_eq!(summary(Language::Java, bare), ["GET /{} root def get"]);
+        assert!(diagnostics(Language::Java, src).is_empty());
     }
 
     const EXPRESS_APP: &str = "import express from \"express\";\nimport { authRouter } from \"./routes/auth\";\n\nexport const app = express();\napp.use(express.json());\napp.use(\"/api/v1\", authRouter);\napp.get(\"/health\", health);\n// app.post(\"/commented\", h);\n";

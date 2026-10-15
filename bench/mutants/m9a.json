@@ -1,0 +1,20 @@
+[
+ {
+  "id": "m230",
+  "crate": "rb-frameworks",
+  "test": "spring_literal_paths_starting_with_a_brace_are_paths",
+  "file": "routes.rs",
+  "old": "if arg.items.is_empty() && (arg.literal || !arg.value.starts_with('{')) {",
+  "new": "if arg.items.is_empty() && !arg.value.starts_with('{') {",
+  "what": "brace guard ignores literals"
+ },
+ {
+  "id": "m231",
+  "crate": "rb-frameworks",
+  "test": "spring_literal_paths_starting_with_a_brace_are_paths",
+  "file": "routes.rs",
+  "old": "if arg.items.is_empty() && (arg.literal || !arg.value.starts_with('{')) {",
+  "new": "if arg.items.is_empty() && (arg.literal || true) {",
+  "what": "non-literal {} read as a path"
+ }
+]
