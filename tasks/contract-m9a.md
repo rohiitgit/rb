@@ -243,7 +243,14 @@ No M9a mutant touches a database write.
 
 ## Amendments
 
-None yet. Append each amendment after the previous one's last sentence (lesson of 2026-10-11).
+Append each amendment after the previous one's last sentence (lesson of 2026-10-11).
+
+**Amendment 1 (2026-10-16, after P0–P4, commits `9d27a56`..`2b5e956`).**
+- **C3's counter was wrong.** The go-chi-sqlx status reads `relationships dropped 2 (0 in project, 0 anonymous)`, not `(2 in project …)`. `in_project` counts a drop only when both ends have a Tree-sitter definition, and the interface method `Payer#Pay.` has none. A non-zero `in_project` means the join failed to anchor a definition both sides know, so 0 is correct here. The golden holds `0 in project`.
+- **D1 covers one more reader.** The gin call-site scan in `param_compositions` reads `Inputs::files`, not `Inputs::routes`, so a gin group composed in a test file still prefixed a route after the routes filter. Both readers now go through one `serves()` test, so mutant m232 bites both places.
+- **P0 also fixed a runner race.** With `--jobs 4` the four pool threads took the first four specs, all assigned to worktree 0, and mutated one tree at once. Each worktree now runs its specs in sequence.
+- **D4 choices the contract left open.** Within one search location `.properties` beats YAML, and a later location beats an earlier one. Both follow Spring Boot's config-location rules, which the native backend uses. An empty `server.servlet.context-path` counts as none, as for local files.
+- **Probe (P4).** Indexing piggymetrics gives 11 `EXPOSES`, all `synthetic`, under `/accounts`, `/statistics`, `/notifications` and `/uaa`, and 4 `config_server_context_path` diagnostics. `rb diff` against the pre-P4 snapshot shows 3 new heuristic Feign `CONSUMES` (`/uaa/users`, `/statistics/{}`, `/accounts/{}`); the table above predicted up to 2 for the scored `service_flows` cell. The probe repository was deleted and `rb.repo` is unchanged.
 
 ## Result
 

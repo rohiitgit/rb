@@ -165,6 +165,25 @@ Notes that bite newcomers:
   `18 routes (3 from specs only)`. Express routes match client paths
   case-insensitively (as Express does by default); such a link carries
   `case: folded` (JSON, dumps) and `rb path` notes `case folded`.
+- An endpoint is `exact` only when code registers it. An OpenAPI operation
+  with no code route is `synthetic`; a code route the spec also states stays
+  `exact`. Routes registered in test files (`rb_model::is_test_path`: `_test.go`,
+  `src/test/`, `*.spec.ts`, …) are not endpoints and set no prefix; each such
+  file gets one `routes_in_test_code` diagnostic with its route count.
+- A context path set in a `native` Spring Cloud Config server's shared files
+  (`search-locations: classpath:/shared`) applies to the client whose
+  `spring.application.name` names the file (`account-service.yml`), or to
+  every client through the shared `application.yml`. It is `synthetic`, and each
+  client gets a `config_server_context_path` diagnostic. Two such servers in
+  one repository apply nothing (`config_server_ambiguous`).
+- Go with SCIP: a type that satisfies an interface gets `IMPLEMENTS` to it from
+  the type (`Card# → Payer#`). scip-go also links each method to the interface
+  method; that link gives no edge, since the interface method has no node, and
+  is counted in `relationships dropped` on the `scip:` line.
+- `rb table-deps` shows a Spring Data repository type with its own `QUERIES`
+  row: all four ops, `synthetic`. That row stands for the CRUD it inherits
+  (`save`, `findById`, `delete`, …), not for a query it states. Its declared
+  methods have their own rows.
 - Two `rb index` runs of one repository take turns: the second prints
   `waiting: another rb index of <repo> is running`, then usually finds the
   first's snapshot up to date.
@@ -291,7 +310,13 @@ part of the tree.)
   `python3 -I bench/mutants/run.py bench/mutants/m8b.json --jobs 4` (parallel
   worktrees; the main tree stays clean): a full all-KILLED run is cached in
   `var/bench/mutants-cache.json` and re-reports instantly while code and
-  specs are unchanged.
+  specs are unchanged. A spec names `file` under `crates/<crate>/src`;
+  `crate` defaults to `rb-bench`, and any other crate runs
+  `cargo test -q -p <crate> --lib [test]`, where `test` is an optional name
+  filter (M9a's `bench/mutants/m9a.json` uses both). KILLED needs a failing
+  test in the output (`test result: FAILED` or `panicked at`). A build error,
+  or a mutation that leaves the file unchanged, is INVALID: it gives no
+  verdict, so rewrite the spec.
 - **Stress repros:** `tasks/stress-findings.md` lists each finding with its
   repro and what fixed it. Re-run the repros of the findings a change touches.
 
@@ -333,6 +358,12 @@ cargo run -q -p rb-bench -- compare bench/scoreboard/m8a.json bench/scoreboard/m
   `sql`, `orm`, `routes`, `manifest`) by the M3b rule, and judges' verdicts
   live in `bench/samples/exact.tsv` (keyed by rb's edge identity and pin, so
   they carry over); the gate fails while a drawn edge lacks a verdict.
+  Verdicts are appended, never edited. Adding any changes the
+  `exact:verdicts` key hash, so `compare` against the previous close exits 2.
+  Re-score the base first: run `rb-bench score` with HEAD's `rb-bench` over
+  the base's dumps against the new verdicts, check that the result equals the
+  committed base except for `keys["exact:verdicts"]`, then `compare` against
+  it (M9a: `var/m9a/m8b-rescored.json`).
 - **Keys (M8a).** *SCIP agreement*: on each stress repo with SCIP mode, the
   `scip`-provenance `CALLS` of the SCIP run against the `--no-scip` run, in
   files SCIP covered. It is labelled `agreement`, never accuracy: it goes

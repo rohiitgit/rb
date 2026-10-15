@@ -135,7 +135,10 @@ use serde_json::{Value, json};
 /// `m7i-1` Express routes match case-insensitively unless their router opts in
 /// (`CONSUMES` `case: folded`); JSON spec operations carry their path key's span.
 /// `m7j-1` `case: folded` decided per candidate (it was copied from the first).
-pub const PIPELINE: &str = "m7j-1";
+/// `m9a-1` `exact` precision: test-file routes are not endpoints (B7), spec-only
+/// endpoints are `synthetic` (B8), literal `"{id}"` paths (B12a), Go method sources take
+/// no interface bypass (B13), native config server context paths (B14).
+pub const PIPELINE: &str = "m9a-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

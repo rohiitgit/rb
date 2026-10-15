@@ -117,7 +117,10 @@ a trace of one request.
 
 **Follow data.** `rb table-deps users` rolls every accessor of a table up to
 entry points per service, and lists services that reach the table only through
-another service's API.
+another service's API. A Spring Data repository type has its own `QUERIES` row
+with all four ops (`read+insert+update+delete`, `synthetic`). That row stands
+for the CRUD methods it inherits from the framework, not for a query it states.
+Its declared methods (`findByEmail`, `@Query`) get rows of their own.
 
 **Compare and gate.** `rb diff` diffs two snapshots (endpoints, table access,
 dependencies, nodes, edges — never re-indexes). `rb check` runs the
@@ -216,11 +219,16 @@ adds compiler-grade `exact` edges where a build can run in a container.
 
 Across languages:
 - **Endpoints.** `.proto` gRPC services (attributed to the services that
-  register a server) and OpenAPI/Swagger specs.
+  register a server) and OpenAPI/Swagger specs. An endpoint is `exact` only
+  when code registers it; one that only a spec states is `synthetic`. Routes
+  registered in test files are not endpoints; one `routes_in_test_code`
+  diagnostic counts them per file.
 - **Data.** SQL migration files, aiosql/HugSQL query files and Prisma schemas.
-- **Config and wiring.** Spring `application.*` config and profiles, Kafka and
-  RabbitMQ topics (Java), nginx and Spring Cloud Gateway routes, Compose and
-  Kubernetes service names, and CODEOWNERS for file ownership.
+- **Config and wiring.** Spring `application.*` config and profiles, a
+  `native` Spring Cloud Config server's shared files (context paths only,
+  matched to clients by `spring.application.name`), Kafka and RabbitMQ topics
+  (Java), nginx and Spring Cloud Gateway routes, Compose and Kubernetes
+  service names, and CODEOWNERS for file ownership.
 - **Calls between services** are stitched from clients to endpoints and are
   never `exact`.
 
