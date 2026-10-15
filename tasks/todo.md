@@ -1142,3 +1142,19 @@ Contract: `tasks/contract-m8b.md`. Branch `m8` (after the M8a commit `6c059ea`).
 - [x] T5: `sample.rs` (M3b draw, largest-remainder allocation, Wilson); `rb-bench sample`; four adversarial judges (audited) gave 249 verdicts in `bench/samples/exact.tsv`: manifest 60/60, orm 9/9, routes 58/60, scip 57/60, sql 59/60; the gate refuses missing verdicts and new wrong ones.
 - [x] T6, T7: the certainty table filled (raw keys and `table_ops` counted once); `m8b.json` scored twice identically; `compare` against m8a exits 2 (new keys), and all 260 M8a cells are unchanged. Mutants m201–m228 all killed (m213, m214, m219, m223 needed tests). Findings B7–B13.
 - [x] Amendment 2 (evaluator pass 1, 2026-10-15): 6 microSecEnD override files (`bench/keys/microsecend/*.md`, 23 removals: 6 context-path + 17 key errors, with 2 artifacts kept as fn, + 4 true prefixed additions); re-score `d7346ffb…` changes exactly the 6 microsecend endpoint cells (endpoints P 88.7 % R 75.8 %; `exact` 122/130); 3 hand-key second adjudications (31/37/72 statements, no entries); transcript audit clean; mutants m201–m229 all killed (m228 rewritten stale, m229 new); Result, B7/B9/B11/B12, new B14, CHANGELOG, IMPLEMENT and lessons corrected. Evaluator pass 2 (`tasks/eval-m8b-pass2.md`) VERDICT PASS with 1 prose should-fix (B12 piggymetrics) and 4 notes, all answered here; M8b closed 2026-10-16.
+
+---
+
+# M9a: `exact` precision from the M8 benchmark, started 2026-10-16
+
+Plan: `tasks/plan-m9.md` (from an opencode plan session; claims unverified until each contract checks them). Contract: `tasks/contract-m9a.md` (planner verified every root cause; 7 plan corrections). Branch `m9`, from `main` at `0453fda`; every M9 part commits there.
+
+- [x] Contract written (B7, B8, B12a, B13, B14, B11; C1–C12; mutants m230–m247).
+- [ ] P0: mutant runner handles any crate, build errors INVALID; m8b battery re-run; M8 dumps re-scored byte-identical.
+- [ ] P1: B12a (`"{taskId}"` literal).
+- [ ] P2: B7 (test-file routes) and B8 (spec-only routes `synthetic`).
+- [ ] P3: B13 (method → interface `IMPLEMENTS` dropped and counted).
+- [ ] P4: B14 (config-server shared context paths).
+- [ ] P5: `PIPELINE` `m9a-1`, docs, fmt/clippy, real-Docker suites, batteries; commit.
+- [ ] P6: bench run, invariant, new sample verdicts, score ×2, re-scored base, compare.
+- [ ] P7: records; evaluator passes 1 and 2.
