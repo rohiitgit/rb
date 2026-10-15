@@ -287,7 +287,11 @@ part of the tree.)
   until proven otherwise. Usually the test lacks the input that only that
   rule explains, sometimes the code is dead (delete it), rarely the mutant is
   equivalent (record why). Re-check mutation text after any `cargo fmt`
-  (reflows break exact matches).
+  (reflows break exact matches). Run the battery with
+  `python3 -I bench/mutants/run.py bench/mutants/m8b.json --jobs 4` (parallel
+  worktrees; the main tree stays clean): a full all-KILLED run is cached in
+  `var/bench/mutants-cache.json` and re-reports instantly while code and
+  specs are unchanged.
 - **Stress repros:** `tasks/stress-findings.md` lists each finding with its
   repro and what fixed it. Re-run the repros of the findings a change touches.
 

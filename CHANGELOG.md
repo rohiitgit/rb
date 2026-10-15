@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026-10-16] (wall clock) Mutant battery: parallel runs and a result cache
+- `bench/mutants/run.py` takes `--jobs N`: each spec runs in its own detached git worktree with a persistent per-job target dir, so the main tree is never dirtied (linting can run concurrently) and 29 specs finish in ~40 s on 4 jobs instead of ~4 min sequential.
+- A full all-KILLED run is cached in `var/bench/mutants-cache.json` (gitignored), keyed by source and specs hashes; an unchanged re-run re-reports in under a second.
+- Default sequential behavior is unchanged; usage guide §5.4 documents the flags.
+- SIGTERM (tool timeouts) routes through the file-restore `finally` instead of leaving a mutant applied.
+
 ## [2026-10-14] (wall clock) M8b: an accuracy benchmark with answer keys, part 2
 - **Three independent keys,** so every class and every certainty label but `dispatch` (not stored) is now measured:
   - **microSecEnD:** 12 of 17 Java microservice apps pass an evidence check after pinning (`bench/pin_microsecend.py`). They score endpoints and service-to-service flows.
