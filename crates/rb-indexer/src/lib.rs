@@ -513,6 +513,8 @@ struct SpringConfig {
     overrides: BTreeMap<String, stitch::Overrides>,
     /// Services with a `config_unread` diagnostic.
     unread: BTreeSet<String>,
+    /// Spring Cloud Config clients (the `config_client` reason).
+    clients: BTreeSet<String>,
 }
 
 /// Build dependencies that make a service a Spring Cloud Config client.
@@ -787,6 +789,7 @@ fn spring_config(
         reasons.extend(reason);
         if client {
             reasons.insert("config_client");
+            out.clients.insert(service.clone());
         }
         files.insert(path);
         let overrides = out.overrides.entry(service).or_default();
@@ -810,6 +813,111 @@ fn spring_config(
         out.properties.entry(service).or_default().extend(map);
     }
     (out, diagnostics)
+}
+
+const CONTEXT_PATH_KEY: &str = "server.servlet.context-path";
+
+/// Context paths a native Spring Cloud Config server sets for its clients (contract M9a D4).
+/// The server is the one service whose effective configuration activates the `native` profile
+/// and lists `search-locations`; each `classpath:` location is the server's
+/// `src/main/resources/<dir>/` (`file:` and placeholder locations are not read). A config
+/// client takes `server.servlet.context-path` from the unconditional documents of
+/// `application.*` and then `<spring.application.name>.*` there, in location order
+/// (`.properties` above YAML in one location), all above its local files. Each application is
+/// counted; several such servers apply nothing.
+fn config_server_context_paths(
+    config: &BTreeMap<&str, String>,
+    spring: &SpringConfig,
+    context_paths: &mut BTreeMap<String, String>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let servers: Vec<(&String, &String)> = spring
+        .properties
+        .iter()
+        .filter_map(|(service, p)| {
+            let native = p
+                .get(ACTIVE_PROFILES_KEY)
+                .is_some_and(|v| split_profiles(v).iter().any(|profile| profile == "native"));
+            let locations = ["search-locations", "searchLocations"]
+                .iter()
+                .find_map(|k| p.get(&format!("spring.cloud.config.server.native.{k}")))?;
+            native.then_some((service, locations))
+        })
+        .collect();
+    if servers.len() > 1 {
+        diagnostics.push(Diagnostic {
+            kind: "config_server_ambiguous".into(),
+            path: None,
+            span: None,
+            detail: json!({ "servers": servers.iter().map(|(s, _)| s).collect::<Vec<_>>() }),
+        });
+        return diagnostics;
+    }
+    let Some(&(server, locations)) = servers.first() else {
+        return diagnostics;
+    };
+    let resources = if server == boundaries::ROOT_DIR {
+        "src/main/resources".to_owned()
+    } else {
+        format!("{server}/src/main/resources")
+    };
+    let dirs: Vec<String> = locations
+        .split(',')
+        .map(str::trim)
+        .filter(|l| !l.contains('{'))
+        .filter_map(|l| l.strip_prefix("classpath:"))
+        .map(|d| match d.trim_matches('/') {
+            "" => format!("{resources}/"),
+            d => format!("{resources}/{d}/"),
+        })
+        .collect();
+    for client in &spring.clients {
+        rb_frameworks::work::tick(1);
+        let name = spring
+            .properties
+            .get(client)
+            .and_then(|p| p.get("spring.application.name"));
+        let Some(name) = name.filter(|_| client != server) else {
+            continue;
+        };
+        // Lowest first, so the last value found wins.
+        let mut found: Option<(&str, String)> = None;
+        for stem in ["application", name.trim()] {
+            for dir in &dirs {
+                for ext in ["yml", "yaml", "properties"] {
+                    let Some((&file, text)) =
+                        config.get_key_value(format!("{dir}{stem}.{ext}").as_str())
+                    else {
+                        continue;
+                    };
+                    let entries: BTreeMap<String, String> = if ext == "properties" {
+                        rb_frameworks::fold::properties_documents(text)
+                            .into_iter()
+                            .filter(|d| !rb_frameworks::fold::conditional_document(d))
+                            .flatten()
+                            .collect()
+                    } else {
+                        select_yaml_documents(text, &BTreeSet::new()).0
+                    };
+                    let value = entries.get(CONTEXT_PATH_KEY).map_or("", |v| v.trim());
+                    if !value.is_empty() {
+                        found = Some((file, value.to_owned()));
+                    }
+                }
+            }
+        }
+        let Some((file, value)) = found else {
+            continue;
+        };
+        diagnostics.push(Diagnostic {
+            kind: "config_server_context_path".into(),
+            path: Some(file.to_owned()),
+            span: None,
+            detail: json!({ "service": client, "file": file, "context_path": value }),
+        });
+        context_paths.insert(client.clone(), value);
+    }
+    diagnostics
 }
 
 /// Builds the snapshot graph from the structural, syntax, SQL and ORM facts; returns the
@@ -1055,7 +1163,7 @@ pub fn assemble(
     let index = index.with_aliases(aliases.clone());
     diagnostics.extend(resolve::add_edges(&mut b, &index, &exact_files)?);
     // Endpoints (contract M4a S4–S8): Spring's context path from each service's
-    // `application.properties`; a YAML file that sets one is counted as unread.
+    // configuration, then from a native config server's shared files (contract M9a D4).
     let service_of = |path: &str| {
         boundaries
             .project_for(path)
@@ -1063,14 +1171,19 @@ pub fn assemble(
     };
     let (spring, config_diagnostics) = spring_config(&content.config, &service_of);
     diagnostics.extend(config_diagnostics);
-    let context_paths: BTreeMap<String, String> = spring
+    let mut context_paths: BTreeMap<String, String> = spring
         .properties
         .iter()
         .filter_map(|(service, p)| {
-            let ctx = p.get("server.servlet.context-path")?.trim();
+            let ctx = p.get(CONTEXT_PATH_KEY)?.trim();
             (!ctx.is_empty()).then(|| (service.clone(), ctx.to_owned()))
         })
         .collect();
+    diagnostics.extend(config_server_context_paths(
+        &content.config,
+        &spring,
+        &mut context_paths,
+    ));
     let has_project = |path: &str| boundaries.project_for(path).is_some();
     // Spring DI (contract M4b S4–S8): `INJECTS` from injection points to beans.
     // (`deployable` computed above: manifest-detected plus `@SpringBootApplication` modules.)
@@ -3032,5 +3145,177 @@ mod tests {
         let root = g.nodes().iter().find(|n| n.key == ".").unwrap();
         assert_eq!(root.attrs["role"], "unassigned");
         assert_eq!(root.name, "(unassigned)");
+    }
+
+    /// Contract M9a D4 (bench B14): a native config server's shared files set its clients'
+    /// context paths, matched by `spring.application.name`, above local files and with
+    /// `<name>.*` above `application.*`; the prefixed path is `synthetic` and counted.
+    #[test]
+    fn config_server_shared_files_set_client_context_paths() {
+        let controller = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass C { @GetMapping(\"/x\") String x() { return \"\"; } }\n";
+        let facts = rb_syntax::extract(rb_syntax::Language::Java, controller.as_bytes()).unwrap();
+        // Each top directory is a service with a `pom.xml` and the controller; returns its
+        // `EXPOSES` targets with their certainty and the `config_server_*` diagnostics.
+        let run = |config: &[(&str, &str)]| -> (Vec<String>, Vec<String>) {
+            let dirs: BTreeSet<&str> = config
+                .iter()
+                .map(|(p, _)| p.split('/').next().unwrap())
+                .collect();
+            let poms: Vec<String> = dirs.iter().map(|d| format!("{d}/pom.xml")).collect();
+            let java: Vec<String> = dirs
+                .iter()
+                .map(|d| format!("{d}/src/main/java/p/C.java"))
+                .collect();
+            let paths = config.iter().map(|(p, _)| *p);
+            let manifest = Manifest {
+                commit_sha: "c".repeat(40),
+                files: paths
+                    .clone()
+                    .chain(poms.iter().map(String::as_str))
+                    .chain(java.iter().map(String::as_str))
+                    .map(entry)
+                    .collect(),
+                skipped: vec![],
+            };
+            let projects = dirs
+                .iter()
+                .zip(&poms)
+                .map(|(d, pom)| project(d, pom))
+                .collect();
+            let boundaries = Boundaries::new(projects, vec![]);
+            let content = Content {
+                facts: java
+                    .iter()
+                    .map(|p| (p.as_str(), (rb_syntax::Language::Java, &facts)))
+                    .collect(),
+                config: config
+                    .iter()
+                    .map(|(p, t)| (*p, (*t).to_owned()))
+                    .chain(poms.iter().map(|p| (p.as_str(), "<project/>\n".to_owned())))
+                    .collect(),
+                ..Content::default()
+            };
+            let (g, diagnostics) = assemble(&manifest, None, &boundaries, &content).unwrap();
+            let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+            let exposes = g
+                .edges()
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Exposes)
+                .map(|e| format!("{} [{}]", key(e.dst), e.certainty.as_str()))
+                .collect();
+            let counted = diagnostics
+                .iter()
+                .filter(|d| d.kind.starts_with("config_server_"))
+                .map(|d| format!("{} {}", d.kind, d.detail))
+                .collect();
+            (exposes, counted)
+        };
+        let res = "src/main/resources";
+        let client = |name: &str| {
+            format!(
+                "spring:\n  application:\n    name: {name}\n  cloud:\n    config:\n      uri: http://config:8888\n"
+            )
+        };
+        let native = "spring:\n  cloud:\n    config:\n      server:\n        native:\n          search-locations: classpath:/shared, file:/extra, classpath:/{application}\n  profiles:\n     active: native\n";
+        let (acct, notes, stats) = (
+            client("acct-service"),
+            client("notes-service"),
+            client("stats-service"),
+        );
+        let shared = [
+            (
+                format!("config/{res}/shared/application.yml"),
+                "server:\n  servlet:\n    context-path: /app\n",
+            ),
+            (
+                format!("config/{res}/shared/acct-service.yml"),
+                "server:\n  servlet:\n    context-path: /accounts\n",
+            ),
+            // Not read: a `file:` location and a placeholder location.
+            (
+                format!("config/{res}/extra/notes-service.yml"),
+                "server:\n  servlet:\n    context-path: /from-file\n",
+            ),
+            (
+                format!("config/{res}/{{application}}/notes-service.yml"),
+                "server:\n  servlet:\n    context-path: /from-placeholder\n",
+            ),
+        ];
+        let mut files: Vec<(String, &str)> = vec![
+            (format!("config/{res}/application.yml"), native),
+            // The client's directory is not its name; its local context path ranks lowest.
+            (format!("account/{res}/bootstrap.yml"), &acct),
+            (
+                format!("account/{res}/application.properties"),
+                "server.servlet.context-path=/local\n",
+            ),
+            (format!("notes/{res}/bootstrap.yml"), &notes),
+            (format!("stats/{res}/bootstrap.yml"), &stats),
+            // The same name without a config client.
+            (
+                format!("other/{res}/application.properties"),
+                "spring.application.name=acct-service\n",
+            ),
+        ];
+        files.extend(shared.iter().map(|(p, t)| (p.clone(), *t)));
+        let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        assert_eq!(
+            run(&borrowed),
+            (
+                vec![
+                    "HTTP GET /accounts/x @account [synthetic]".to_owned(),
+                    "HTTP GET /x @config [exact]".to_owned(),
+                    "HTTP GET /app/x @notes [synthetic]".to_owned(),
+                    "HTTP GET /x @other [exact]".to_owned(),
+                    "HTTP GET /app/x @stats [synthetic]".to_owned(),
+                ],
+                vec![
+                    r#"config_server_context_path {"context_path":"/accounts","file":"config/src/main/resources/shared/acct-service.yml","service":"account"}"#.to_owned(),
+                    r#"config_server_context_path {"context_path":"/app","file":"config/src/main/resources/shared/application.yml","service":"notes"}"#.to_owned(),
+                    r#"config_server_context_path {"context_path":"/app","file":"config/src/main/resources/shared/application.yml","service":"stats"}"#.to_owned(),
+                ],
+            )
+        );
+        // A git backend serves nothing rb reads, even with native locations configured.
+        let git = "spring:\n  cloud:\n    config:\n      server:\n        git:\n          uri: https://example.com/cfg\n        native:\n          search-locations: classpath:/shared\n  profiles:\n     active: git\n";
+        let git_files = [
+            (format!("config/{res}/application.yml"), git),
+            (format!("account/{res}/bootstrap.yml"), acct.as_str()),
+            (shared[1].0.clone(), shared[1].1),
+        ];
+        let borrowed: Vec<(&str, &str)> = git_files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        assert_eq!(
+            run(&borrowed),
+            (
+                vec![
+                    "HTTP GET /x @account [exact]".to_owned(),
+                    "HTTP GET /x @config [exact]".to_owned(),
+                ],
+                vec![],
+            )
+        );
+        // Two native servers: nothing applies, and they are counted.
+        let two = [
+            (format!("config/{res}/application.yml"), native),
+            (format!("config2/{res}/application.yml"), native),
+            (format!("account/{res}/bootstrap.yml"), acct.as_str()),
+            (shared[1].0.clone(), shared[1].1),
+            (
+                format!("config2/{res}/shared/acct-service.yml"),
+                shared[1].1,
+            ),
+        ];
+        let borrowed: Vec<(&str, &str)> = two.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        assert_eq!(
+            run(&borrowed),
+            (
+                vec![
+                    "HTTP GET /x @account [exact]".to_owned(),
+                    "HTTP GET /x @config [exact]".to_owned(),
+                    "HTTP GET /x @config2 [exact]".to_owned(),
+                ],
+                vec![r#"config_server_ambiguous {"servers":["config","config2"]}"#.to_owned()],
+            )
+        );
     }
 }

@@ -79,5 +79,86 @@
   "old": "                if bypass && !is_type(&facts.definitions[i]) {\n                    dropped(rel);\n",
   "new": "                if bypass && !is_type(&facts.definitions[i]) {\n",
   "what": "the drop not counted"
+ },
+ {
+  "id": "m239",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "            native.then_some((service, locations))\n",
+  "new": "            Some((service, locations))\n",
+  "what": "native profile gate removed"
+ },
+ {
+  "id": "m240",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "for stem in [\"application\", name.trim()] {",
+  "new": "for stem in [\"application\", client.as_str()] {",
+  "what": "client name from the service directory"
+ },
+ {
+  "id": "m241",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "    if servers.len() > 1 {\n",
+  "new": "    if false {\n",
+  "what": "single-server gate removed"
+ },
+ {
+  "id": "m242",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "        context_paths.insert(client.clone(), value);\n",
+  "new": "        context_paths.entry(client.clone()).or_insert(value);\n",
+  "what": "local beats remote"
+ },
+ {
+  "id": "m243",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "for stem in [\"application\", name.trim()] {",
+  "new": "for stem in [name.trim(), \"application\"] {",
+  "what": "remote application.* beats <name>.*"
+ },
+ {
+  "id": "m244",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "    for client in &spring.clients {\n",
+  "new": "    for client in spring.properties.keys() {\n",
+  "what": "config-client gate removed"
+ },
+ {
+  "id": "m245",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": ".filter_map(|l| l.strip_prefix(\"classpath:\"))",
+  "new": ".filter_map(|l| l.strip_prefix(\"classpath:\").or_else(|| l.strip_prefix(\"file:\")))",
+  "what": "file: locations read"
+ },
+ {
+  "id": "m246",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": ".filter(|l| !l.contains('{'))",
+  "new": ".filter(|_| true)",
+  "what": "{...} locations read"
+ },
+ {
+  "id": "m247",
+  "crate": "rb-indexer",
+  "test": "context_path",
+  "file": "routes.rs",
+  "old": "format!(\"{ctx}/{route_path}\"),\n                            Certainty::Synthetic,",
+  "new": "format!(\"{ctx}/{route_path}\"),\n                            Certainty::Exact,",
+  "what": "context-path certainty exact"
  }
 ]
