@@ -118,6 +118,27 @@ pub fn compare(base: &Scoreboard, head: &Scoreboard, accept: &Accept) -> Report 
     for key in head.cells.keys().filter(|k| !base.cells.contains_key(*k)) {
         let _ = writeln!(out, "new {}", key.id());
     }
+    // The `exact` sample (T5): a drawn edge without a verdict, or one more wrong `exact` edge,
+    // fails whatever the accept file says.
+    for (family, h) in &head.samples {
+        let b = base.samples.get(family).copied().unwrap_or_default();
+        if h.missing > 0 {
+            exit = REGRESSION;
+            let _ = writeln!(
+                out,
+                "REGRESSION exact sample {family}: {} drawn edges have no verdict (never acceptable)",
+                h.missing
+            );
+        }
+        if h.wrong > b.wrong {
+            exit = REGRESSION;
+            let _ = writeln!(
+                out,
+                "REGRESSION exact sample {family}: wrong {} → {} (never acceptable)",
+                b.wrong, h.wrong
+            );
+        }
+    }
     for id in accept.cells.keys().filter(|id| !used.contains(*id)) {
         let _ = writeln!(out, "unused accept line: {id}");
     }
@@ -362,6 +383,54 @@ mod tests {
 
     fn one(r: Record) -> Scoreboard {
         board(vec![(key("pycg", "a"), r)])
+    }
+
+    #[test]
+    fn the_exact_sample_gates_missing_verdicts_and_new_wrong_edges() {
+        use crate::sample::Tally;
+        let mut b = one(record(1, 0, 0));
+        b.samples.insert(
+            "sql".to_owned(),
+            Tally {
+                right: 59,
+                wrong: 1,
+                missing: 0,
+            },
+        );
+        assert_eq!(run(&b, &b, "").exit, PASS);
+        let mut h = b.clone();
+        h.samples.insert(
+            "sql".to_owned(),
+            Tally {
+                right: 58,
+                wrong: 1,
+                missing: 1,
+            },
+        );
+        let rep = run(&b, &h, "");
+        assert_eq!(rep.exit, REGRESSION);
+        assert!(
+            rep.text
+                .contains("exact sample sql: 1 drawn edges have no verdict"),
+            "{}",
+            rep.text
+        );
+        let mut h = b.clone();
+        h.samples.insert(
+            "sql".to_owned(),
+            Tally {
+                right: 58,
+                wrong: 2,
+                missing: 0,
+            },
+        );
+        let rep = run(&b, &h, "m8a\texact sample sql\tno\n");
+        assert_eq!(rep.exit, REGRESSION);
+        assert!(
+            rep.text.contains("wrong 1 → 2 (never acceptable)"),
+            "{}",
+            rep.text
+        );
     }
 
     #[test]

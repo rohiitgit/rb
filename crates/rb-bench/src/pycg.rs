@@ -213,6 +213,8 @@ impl Names {
                 Caller::Module(path) => (Class::CallsFileScope, Loc::file(path)),
                 Caller::Function(name) => (Class::Calls, self.loc.get(name)?.clone()),
             },
+            // PyCG scores calls only; `found` yields no other class.
+            _ => return None,
         };
         let dst = self.loc.get(&self.by_loc.get(&id.dst)?.0)?.clone();
         Some(EdgeId {

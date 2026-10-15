@@ -10,15 +10,6 @@ use crate::compare::pct;
 use crate::score::{Cell, Status};
 use crate::scoreboard::{Label, Scoreboard};
 
-/// The classes whose answer keys arrive in M8b; shown, never as a number.
-pub const CLASSES_KEYED_IN_M8B: [&str; 5] = [
-    "endpoints",
-    "handler_binding",
-    "table_queries",
-    "table_maps",
-    "service_flows",
-];
-
 /// Strongest first, as the certainty table reads.
 const LABELS: [Certainty; 5] = [
     Certainty::Exact,
@@ -103,11 +94,6 @@ pub fn render(board: &Scoreboard) -> String {
             reasons(&c.unmatchable),
         );
     }
-    let _ = writeln!(
-        out,
-        "\nNo key yet (M8b): {}.",
-        CLASSES_KEYED_IN_M8B.join(", ")
-    );
     out
 }
 
@@ -115,7 +101,13 @@ pub fn render(board: &Scoreboard) -> String {
 /// share of its call sites whose candidates include the right target.
 pub fn render_certainty(board: &Scoreboard) -> String {
     let mut totals: BTreeMap<Label, Cell> = BTreeMap::new();
-    for r in board.cells.values() {
+    // `handkey_raw` restates `handkey` before adjudication: counted once, adjudicated.
+    for (_, r) in board
+        .cells
+        .iter()
+        // `table_ops` restates `table_queries` edges once per op: the edges count once.
+        .filter(|(k, _)| k.bench != crate::handkey::RAW_BENCH && k.class != "table_ops")
+    {
         add(totals.entry(r.label).or_default(), &r.cell);
     }
     let mut out =
@@ -123,14 +115,29 @@ pub fn render_certainty(board: &Scoreboard) -> String {
     for c in LABELS {
         let cols: Vec<String> = [Label::Accuracy, Label::Agreement]
             .iter()
-            .map(|l| column(c, *l, totals.get(l)))
+            .map(|l| column(c, totals.get(l)))
             .collect();
         let _ = writeln!(out, "| {} | {} | {} |", c.as_str(), cols[0], cols[1]);
+    }
+    if !board.samples.is_empty() {
+        out.push_str("\n| `exact` sample family | Right / judged | Wilson 95 % | Without a verdict |\n|---|---|---|---|\n");
+        for (family, t) in &board.samples {
+            let n = t.right + t.wrong;
+            let interval = crate::sample::wilson(t.right, n)
+                .map_or("n/a".to_owned(), |(lo, hi)| {
+                    format!("{:.1}–{:.1} %", 100.0 * lo, 100.0 * hi)
+                });
+            let _ = writeln!(
+                out,
+                "| {family} | {} / {n} | {interval} | {} |",
+                t.right, t.missing
+            );
+        }
     }
     out
 }
 
-fn column(c: Certainty, label: Label, total: Option<&Cell>) -> String {
+fn column(c: Certainty, total: Option<&Cell>) -> String {
     if c == Certainty::Dispatch {
         return "n/a (not stored)".to_owned();
     }
@@ -139,8 +146,7 @@ fn column(c: Certainty, label: Label, total: Option<&Cell>) -> String {
         (n(&t.tp), n(&t.fp))
     });
     if tp + fp == 0 {
-        let none = matches!(c, Certainty::Exact | Certainty::Synthetic) && label == Label::Accuracy;
-        return if none { "no key (M8b)" } else { "no edges" }.to_owned();
+        return "no edges".to_owned();
     }
     let edges = format!("{} of {} edges", pct(tp, tp + fp), tp + fp);
     match total {
@@ -185,10 +191,50 @@ Scoreboard m8a (rb c, binary b)
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | pycg | calls | noscip | accuracy | 1 / 0 / 1 | 9 | 4 | 3 | 1 | 1 | 75.0% | 75.0% | module_scope 5 | – |
 | scip | calls | noscip | agreement | 1 / 0 / 0 | 10 | 10 | 8 | 2 | 2 | 80.0% | 80.0% | – | – |
-
-No key yet (M8b): endpoints, handler_binding, table_queries, table_maps, service_flows.
 ";
         assert_eq!(render(&sample()), expected);
+    }
+
+    #[test]
+    fn table_ops_are_not_counted_as_edges() {
+        let mut r = record(1, 0, 0);
+        r.cell.tp = BTreeMap::from([(Certainty::Synthetic, 1)]);
+        let mut q = key("handkey", "t");
+        q.class = "table_queries".to_owned();
+        let mut ops = key("handkey", "t");
+        ops.class = "table_ops".to_owned();
+        let text = render_certainty(&board(vec![(q, r.clone()), (ops, r)]));
+        assert!(text.contains("| synthetic | 100.0% of 1 edges |"), "{text}");
+    }
+
+    #[test]
+    fn a_raw_hand_key_is_not_counted_twice() {
+        let mut r = record(1, 0, 0);
+        r.cell.tp = BTreeMap::from([(Certainty::Exact, 1)]);
+        let mut raw = key("handkey_raw", "t");
+        raw.class = "endpoints".to_owned();
+        let mut adj = key("handkey", "t");
+        adj.class = "endpoints".to_owned();
+        let text = render_certainty(&board(vec![(raw, r.clone()), (adj, r)]));
+        assert!(text.contains("| exact | 100.0% of 1 edges |"), "{text}");
+    }
+
+    #[test]
+    fn the_exact_sample_renders_with_wilson_intervals() {
+        let mut b = sample();
+        b.samples.insert(
+            "sql".to_owned(),
+            crate::sample::Tally {
+                right: 30,
+                wrong: 30,
+                missing: 2,
+            },
+        );
+        let text = render_certainty(&b);
+        assert!(
+            text.contains("| sql | 30 / 60 | 37.7–62.3 % | 2 |"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -196,9 +242,9 @@ No key yet (M8b): endpoints, handler_binding, table_queries, table_maps, service
         let expected = "\
 | Label | Accuracy (independent keys) | Agreement (SCIP) |
 |---|---|---|
-| exact | no key (M8b) | no edges |
+| exact | no edges | no edges |
 | dispatch | n/a (not stored) | n/a (not stored) |
-| synthetic | no key (M8b) | no edges |
+| synthetic | no edges | no edges |
 | heuristic | 100.0% of 3 edges | 100.0% of 8 edges |
 | ambiguous | 0.0% of 1 edges | site hit 50.0% of 2 sites; 0.0% of 2 edges |
 ";

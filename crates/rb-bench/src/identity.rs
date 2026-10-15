@@ -31,6 +31,42 @@ impl Loc {
             name: FILE_NAME.to_owned(),
         }
     }
+
+    /// A service, by its directory (rb's `Service` key).
+    pub fn service(key: &str) -> Loc {
+        Loc {
+            path: key.to_owned(),
+            line: 0,
+            name: "<service>".to_owned(),
+        }
+    }
+
+    /// An HTTP endpoint: its service, method (`ANY` when a key names none) and normalised path.
+    pub fn endpoint(service: &str, method: &str, path: &str) -> Loc {
+        Loc {
+            path: "<endpoint>".to_owned(),
+            line: 0,
+            name: format!("{service} {method} {path}"),
+        }
+    }
+
+    /// A table by name; the schema only when the source writes one.
+    pub fn table(name: &str) -> Loc {
+        Loc {
+            path: "<table>".to_owned(),
+            line: 0,
+            name: name.to_owned(),
+        }
+    }
+
+    /// The same place without its name, for keys that give only file:line (hand keys).
+    pub fn unnamed(&self) -> Loc {
+        Loc {
+            path: self.path.clone(),
+            line: self.line,
+            name: String::new(),
+        }
+    }
 }
 
 /// The edge classes scored (contract M8a, Edge classes).
@@ -40,6 +76,18 @@ pub enum Class {
     Calls,
     /// `CALLS` from a file: top-level code, in both modes.
     CallsFileScope,
+    /// `EXPOSES`: a service's HTTP endpoint exists (contract M8b).
+    Endpoints,
+    /// `HANDLED_BY`: an endpoint's handler location.
+    HandlerBinding,
+    /// `QUERIES`: the function (or file) holding a call site, to a table.
+    TableQueries,
+    /// `QUERIES` per operation (`read`, `insert`, …): the ops scored apart.
+    TableOps,
+    /// `MAPS_TO`: an entity class to its table.
+    TableMaps,
+    /// A service calling another over HTTP (`CONSUMES` into the other's endpoint).
+    ServiceFlows,
 }
 
 impl Class {
@@ -47,6 +95,12 @@ impl Class {
         match self {
             Class::Calls => "calls",
             Class::CallsFileScope => "calls_file_scope",
+            Class::Endpoints => "endpoints",
+            Class::HandlerBinding => "handler_binding",
+            Class::TableQueries => "table_queries",
+            Class::TableOps => "table_ops",
+            Class::TableMaps => "table_maps",
+            Class::ServiceFlows => "service_flows",
         }
     }
 
@@ -54,6 +108,8 @@ impl Class {
         match self {
             Class::Calls => e.kind == EdgeKind::Calls && e.src_kind != NodeKind::File,
             Class::CallsFileScope => e.kind == EdgeKind::Calls && e.src_kind == NodeKind::File,
+            // Built from their own rows by `structural`, never by `found`.
+            _ => false,
         }
     }
 }

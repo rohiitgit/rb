@@ -1,0 +1,48 @@
+# hand key: hk_todo (zhashkevych/todo-app) @ 1789ed69bd5f449bd605e23a92a1e87a83cb9fda
+# routes: pkg/handler/handler.go InitRoutes (gin)
+
+# ---- ENDPOINT ----
+ENDPOINT GET /swagger/*any pkg/handler/handler.go:24
+ENDPOINT POST /auth/sign-up pkg/handler/auth.go:22
+ENDPOINT POST /auth/sign-in pkg/handler/auth.go:58
+ENDPOINT POST /api/lists/ pkg/handler/list.go:24
+ENDPOINT GET /api/lists/ pkg/handler/list.go:64
+ENDPOINT GET /api/lists/:id pkg/handler/list.go:94
+ENDPOINT PUT /api/lists/:id pkg/handler/list.go:116
+ENDPOINT DELETE /api/lists/:id pkg/handler/list.go:143
+ENDPOINT POST /api/lists/:id/items/ pkg/handler/item.go:10
+ENDPOINT GET /api/lists/:id/items/ pkg/handler/item.go:40
+ENDPOINT GET /api/items/:id pkg/handler/item.go:62
+ENDPOINT PUT /api/items/:id pkg/handler/item.go:84
+ENDPOINT DELETE /api/items/:id pkg/handler/item.go:111
+
+# ---- QUERIES ----
+QUERIES users insert pkg/repository/auth_postgres.go:17
+QUERIES users read pkg/repository/auth_postgres.go:29
+QUERIES todo_lists insert pkg/repository/todo_list_postgres.go:19
+QUERIES users_lists insert pkg/repository/todo_list_postgres.go:19
+QUERIES todo_lists read pkg/repository/todo_list_postgres.go:43
+QUERIES users_lists read pkg/repository/todo_list_postgres.go:43
+QUERIES todo_lists read pkg/repository/todo_list_postgres.go:53
+QUERIES users_lists read pkg/repository/todo_list_postgres.go:53
+QUERIES todo_lists delete pkg/repository/todo_list_postgres.go:64
+QUERIES users_lists read pkg/repository/todo_list_postgres.go:64
+QUERIES todo_lists update pkg/repository/todo_list_postgres.go:72
+QUERIES users_lists read pkg/repository/todo_list_postgres.go:72
+QUERIES todo_items insert pkg/repository/todo_item_postgres.go:18
+QUERIES lists_items insert pkg/repository/todo_item_postgres.go:18
+QUERIES todo_items read pkg/repository/todo_item_postgres.go:44
+QUERIES lists_items read pkg/repository/todo_item_postgres.go:44
+QUERIES users_lists read pkg/repository/todo_item_postgres.go:44
+QUERIES todo_items read pkg/repository/todo_item_postgres.go:56
+QUERIES lists_items read pkg/repository/todo_item_postgres.go:56
+QUERIES users_lists read pkg/repository/todo_item_postgres.go:56
+QUERIES todo_items delete pkg/repository/todo_item_postgres.go:68
+QUERIES lists_items read pkg/repository/todo_item_postgres.go:68
+QUERIES users_lists read pkg/repository/todo_item_postgres.go:68
+QUERIES todo_items update pkg/repository/todo_item_postgres.go:76
+QUERIES lists_items read pkg/repository/todo_item_postgres.go:76
+QUERIES users_lists read pkg/repository/todo_item_postgres.go:76
+
+# ---- MAPS ----
+# none: no ORM dependency in go.mod; structs carry only sqlx db:"" tags (todo.go, user.go)

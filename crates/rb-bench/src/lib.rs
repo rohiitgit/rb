@@ -10,10 +10,14 @@
 
 pub mod compare;
 pub mod dump;
+pub mod handkey;
 pub mod identity;
+pub mod msecend;
 pub mod pycg;
 pub mod render;
 pub mod run;
+pub mod sample;
 pub mod scip_ref;
 pub mod score;
 pub mod scoreboard;
+pub mod structural;

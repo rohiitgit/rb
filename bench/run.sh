@@ -9,6 +9,8 @@
 # A target's previous outputs are removed before it runs, so a failed run leaves no stale dump.
 # Every repository it creates is named bench_<name>_<mode> and removed on every exit path.
 # Exit: 0 when every run and dump succeeded, 1 when any failed, 9 when refused (disk, doctor).
+# Kinds: stress, microsecend and handkey targets are indexed (modes from the manifest), pycg cases one by
+# one, and dataset rows (answer keys) are only fetched.
 # Usage: bench/run.sh BIN [name ...]
 # Start it detached so it outlives the terminal (lesson L281):
 #   nohup bench/run.sh target/release/rb > var/bench/run.log 2>&1 & disown
@@ -158,8 +160,9 @@ while IFS=$'\t' read -r name kind url sha modes; do
   [[ -z $name || $name == \#* || $name == name ]] && continue
   (( ${#want} )) && (( ! ${want[(Ie)$name]} )) && continue
   case $kind in
-    stress) stress $name $modes ;;
+    stress | microsecend | handkey) stress $name $modes ;;
     pycg) enough_disk || exit 9; pycg $sha ;;
+    dataset) ;;
     *) fail "$name: kind $kind is not known" ;;
   esac
 done < bench/manifest.tsv

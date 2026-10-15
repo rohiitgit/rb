@@ -1,5 +1,34 @@
 # Changelog
 
+## [2026-10-14] (wall clock) M8b: an accuracy benchmark with answer keys, part 2
+- **Three independent keys,** so every class and every certainty label but `dispatch` (not stored) is now measured:
+  - **microSecEnD:** 12 of 17 Java microservice apps pass an evidence check after pinning (`bench/pin_microsecend.py`). They score endpoints and service-to-service flows.
+  - **Blind hand keys** (`bench/keys/`): one stress repo and two repos rb had never run on. They cover endpoints, handlers, table access and entity mappings, and were adjudicated by a blind adjudicator through `rb-bench statements` and `bench/adjudicate.py`.
+  - **The `exact` sample:** 249 edges in 5 families judged against the source (`bench/samples/exact.tsv`), with Wilson intervals. The gate refuses a missing verdict or a new wrong `exact` edge.
+- **Scoreboard** (`bench/scoreboard/m8b.json`, the same M7 binary):
+  - `exact` is right on 122 of 130 independently judged edges (6 misses from unapplied config-server context paths, 2 from test-code routes), and the sample bounds every family above 86 % (`orm`, with only 9 edges, above 70 %). The certainty table counts `table_ops` rows once (`synthetic` 16 of 24) and every other label but `dispatch` (not stored) is measured.
+  - microSecEnD endpoints: precision 88.7 %, recall 75.8 % after 19 key-error removals through append-only overrides (`bench/keys/microsecend/*.md`).
+  - The 260 M8a cells are unchanged.
+- **Findings B7–B14:**
+  - routes in test code exposed as `exact`;
+  - spec annotations overriding the router;
+  - gin method-value handlers unbound;
+  - `fmt.Sprintf` SQL unread;
+  - the Spring Data repository-type convention (all 8 wrong `synthetic` edges);
+  - Spring Data REST and service-discovery calls missed;
+  - SCIP `IMPLEMENTS` from methods;
+  - unapplied config-server context paths (B14).
+- **Verification:**
+  - Mutants m201–m229, all killed (m228 rewritten after its line gained the `table_ops` clause; m229 covers that exclusion).
+  - Two scorings `cmp`-identical.
+  - Real-Docker 1,122/0/0, and rb-bench's 79 tests after the last fixes.
+  - The `rb` binary is unchanged.
+- **Files:**
+  - **Crate:** `crates/rb-bench/src/{structural,msecend,handkey,sample}.rs` (new) and `{identity,pycg,run,render,compare,scoreboard,main,lib}.rs`.
+  - **Bench:** `bench/{manifest.tsv,run.sh,pin_microsecend.py,adjudicate.py}`, `bench/keys/`, `bench/samples/exact.tsv`, `bench/mutants/m8b.json`, `bench/scoreboard/m8b{,-perf}.json`.
+  - **Docs:** `README.md`, `docs/usage-and-testing.md`.
+  - **Records:** `tasks/{contract-m8b,eval-m8b-pass1,bench-findings,todo,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M8a: an accuracy benchmark with answer keys, part 1
 - **What:** rb's first measurement against answer keys. The new `rb-bench` crate reads `rb dump` and matches edges by location (a symbol is the path and line of its name token, a file its path), so SCIP keys, heuristic keys and external keys compare. It scores every gold item and found edge into exactly one bucket, stores counts only, renders tables and gates a milestone per cell (`compare`: 0 pass, 1 regression, 2 not comparable; a new wrong `exact` edge is never excusable).
 - **Keys:** SCIP agreement (Tier B against the same commit's `scip` `CALLS`, labelled agreement, not accuracy), and PyCG's 119 micro-benchmark cases (independent).

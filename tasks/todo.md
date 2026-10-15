@@ -1127,3 +1127,18 @@ Contract: `tasks/contract-m8a.md`. Branch `m8`, from `main` at `eabfc80` (the me
 
 ## Review (M8a)
 - The accuracy benchmark exists and is re-runnable from a clean checkout. PyCG gives Tier B precision 92–99 % and recall 25–50 % on Python calls. SCIP agreement shows Go and TS gaps (B2, B3) and an rb SCIP-mode recall bug across Go modules (B1). Java, Kotlin and Python SCIP coverage is zero (B4); M8b brings independent keys for the remaining classes and `exact`.
+
+---
+
+# M8b: accuracy benchmark with answer keys, part 2, started 2026-10-14
+
+Contract: `tasks/contract-m8b.md`. Branch `m8` (after the M8a commit `6c059ea`). Record set: CHANGELOG, IMPLEMENT, contract, todo, bench-findings, lessons, README, usage guide.
+
+- [x] T1 (D1): microSecEnD license (Apache-2.0); dataset at `63653e09`; `bench/pin_microsecend.py` pins 17 apps by branch and date. Evidence is checked by file, line and span fit, with dataset errors (files in no commit) counted apart; 12 kept, 5 excluded (80–87 %).
+- [x] Structural identity: classes `endpoints`, `handler_binding`, `table_queries`, `table_ops`, `table_maps`, `service_flows` (`structural.rs`), with endpoint paths normalised (query strings dropped, catch-alls as parameters).
+- [x] T2: `msecend.rs` maps services through evidence files, with the dataset's own internal/infrastructural roles, the trace-name join and the trailing-comma repair. Endpoints are scored only where the model lists them. 36 of 36 internal services mapped.
+- [x] T3: blind labellers for spring_boot_microservices (dev set), hk_polls and hk_todo (new, chosen by rule, pinned first); `bench/keys/FORMAT.md`; transcripts audited (no path outside the checkout).
+- [x] T4: `rb-bench statements`, blind adjudicators (audited), `bench/adjudicate.py` (self-tested on every entry kind). All 133 verdicts agree with the keys, so there are no entries; raw and adjudicated keys are both scored.
+- [x] T5: `sample.rs` (M3b draw, largest-remainder allocation, Wilson); `rb-bench sample`; four adversarial judges (audited) gave 249 verdicts in `bench/samples/exact.tsv`: manifest 60/60, orm 9/9, routes 58/60, scip 57/60, sql 59/60; the gate refuses missing verdicts and new wrong ones.
+- [x] T6, T7: the certainty table filled (raw keys and `table_ops` counted once); `m8b.json` scored twice identically; `compare` against m8a exits 2 (new keys), and all 260 M8a cells are unchanged. Mutants m201–m228 all killed (m213, m214, m219, m223 needed tests). Findings B7–B13.
+- [x] Amendment 2 (evaluator pass 1, 2026-10-15): 6 microSecEnD override files (`bench/keys/microsecend/*.md`, 19 key-error removals + 4 true prefixed additions); re-score `d7346ffb…` changes exactly the 6 microsecend endpoint cells (endpoints P 88.7 % R 75.8 %; `exact` 122/130); 3 hand-key second adjudications (31/37/72 statements, no entries); transcript audit clean; mutants m201–m229 all killed (m228 rewritten stale, m229 new); Result, B7/B9/B11/B12, new B14, CHANGELOG, IMPLEMENT and lessons corrected. Close after a verification-only re-check.

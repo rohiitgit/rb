@@ -21,8 +21,9 @@ a file's service, CODEOWNERS); or by what the code states literally (SQL at a
 known sink or in a `.sql` file, an ORM mapping by stated name, a route with a
 literal path, a manifest version); otherwise `heuristic`/`ambiguous` —
 the tool never guesses silently). The accuracy benchmark (`bench/`, usage
-guide §5.5) measures how often `heuristic` and `ambiguous` call edges are
-right; keys for `exact` and `synthetic` come in M8b. No LLM, no embeddings: deterministic Rust +
+guide §5.5) measures how often each label is right against independent answer
+keys: PyCG, the microSecEnD diagrams, blind hand keys and a judged sample of
+`exact` edges (`bench/scoreboard/`). No LLM, no embeddings: deterministic Rust +
 Postgres + Apache AGE, byte-identical results on every run.
 
 - New here? Start at [5-minute quickstart](#5-minute-quickstart), then the

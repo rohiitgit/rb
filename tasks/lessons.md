@@ -586,3 +586,15 @@
 - **Mistake:** M8a evaluator pass 1 asked for aliases of merged declarations. `Locator::canonical` was added with unit tests, but no scorer called it. Pass 2 found the express artifact it was meant to prevent (2 false disagreements) still in the committed scoreboard.
 - **Rule:** When closing an evaluator finding, name the call site that applies the fix and add a test through the public scoring path (`agreement`, `score_case`), not only through the helper. Then re-score and diff the cells the finding predicted.
 
+
+## 2026-10-14: probe a dataset's shape before writing its adapter, and measure what fails before excluding it
+- **Mistake (caught):** M8b's first microSecEnD run kept 8 of 17 applications and mapped 0 services. Both came from assumptions about the data, not from pinning. Config-repository evidence was filed under each app's URL, and the model and its own trace spell service names differently (`_` vs `-`).
+- **Rule:** Before trusting an exclusion or a zero, look at the failing items (missing file? which repository? ever in history?) and fix the rule for the cause found, with the cause counted in its own bucket. A benchmark that silently loses half its keys measures the adapter, not the tool.
+
+## 2026-10-14: blind keys stay blind after rb's output is seen
+- **Context:** the hand keys disagreed with rb on 40 Spring Data edges, where rb's repository type "queries" through inherited CRUD. Widening `FORMAT.md` to accept that convention would have raised rb's score after seeing its output.
+- **Rule:** A key's semantics are frozen when the labeller starts. A disagreement that is a convention, not an error, is recorded as a finding with its count (B11), never fixed by editing the format or the key.
+
+## 2026-10-15: an evaluator finding is closed by a re-score, not by a mechanism
+- **Mistake (caught):** the M8b tree already contained the microSecEnD override mechanism and the re-generated statements when pass 1 landed, so "fixed" looked done. But no override file existed (the 6 spurious tp were still in the scoreboard), the committed `statements.txt` still predated the normalisation in one target's record, and the Result still quoted pre-fix numbers.
+- **Rule:** For each finding name the artifact that proves it: the override file, the re-scored cell diff (here exactly the 6 microsecend endpoint cells), the `diff` of statements vs committed, the pasted tool output. A mechanism without its output is not a fix.

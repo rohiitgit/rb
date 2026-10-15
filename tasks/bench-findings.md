@@ -94,3 +94,78 @@ On the same Apple M4, mattermost `--no-scip`:
 - **SCIP timings:**
   - The cold pass over all 11 SCIP targets took 3,199 s (53 min): 0.9–1,530 s per target, with nestjs alone taking 25.5 min to fail its fetch.
   - A warm rerun takes seconds per target (mattermost 20 s).
+
+---
+
+# M8b findings (independent keys: microSecEnD, blind hand keys, the `exact` sample)
+
+**Scoreboard:** `bench/scoreboard/m8b.json`, the same M7 close binary (sha256 `a038653b…`). The 260 M8a cells are unchanged; 54 cells and the `exact` sample are new.
+
+## B7. Routes registered in test code become `exact` endpoints (major, `exact` precision)
+
+- **hk_todo** (blind key, adjudicated): rb exposes `GET /identity` and `POST /sign-up` as `exact` endpoints of the application. Both are registered only in test files (`pkg/handler/middleware_test.go:92`, `pkg/handler/auth_test.go:80`), and the app's router has neither.
+- These are 2 of the 8 wrong `exact` edges among the 130 that the independent keys judge (the other 6 are the missing context paths, B14).
+- **Fix direction:** keep routes registered in test files out of `EXPOSES`, or label them, as rb's own `is_test_path` already does for orphans and DI.
+
+## B8. Routes read from API-spec annotations override the code (major, `exact` precision)
+
+The `exact` sample's `routes` family is 58 of 60. Both wrong edges are in go_gin_example, where a Swagger annotation contradicts the router:
+- **`GET /auth`:** the code registers `r.POST("/auth", api.GetAuth)` (`routers/router.go:30`). GET comes only from `@Router /auth [get]`.
+- **`POST /api/v1/tags/import`:** the code registers `/tags/import` on the root engine (`router.go:48`), outside the `/api/v1` group.
+
+A spec route that the code also registers should take the code's method and path, and a spec-only route should not be `exact`.
+
+## B9. Gin handlers given as method values are not bound (major, Tier B recall)
+
+- **hk_todo:** `handler_binding` is 0 of 13, although 13 of 13 endpoints are found. 12 of the 13 routes use a method value (`auth.POST("/sign-up", h.signUp)`); the 13th (`GET /swagger/*any`) is a library handler (`handler.go:24`), bound at its registration line.
+- rb's own diagnostics say so: `route_handler_unresolved` 14.
+- With method-value handlers resolved, `rb path` and `callers` of a handler would work on this stack.
+
+## B10. SQL with table names from `fmt.Sprintf` constants is not read (major, Tier B recall)
+
+- **hk_todo:** `table_queries` is 0 of 26 and `table_ops` 0 of 26.
+- Every statement builds its table name as `fmt.Sprintf("SELECT … FROM %s …", todoListsTable)`, with the names from constants in `pkg/repository/postgres.go:9-13`.
+- The constants are literal strings in the same package, so they can be resolved statically.
+
+## B11. A repository type "queries" its table through inherited CRUD, labelled `synthetic` (convention, documented)
+
+- **The edges:** for every Spring Data repository interface, rb emits a `synthetic` `QUERIES` from the interface type itself to its entity's table with all four ops, standing for the inherited `save`/`findById`/`delete`. The blind format (`bench/keys/FORMAT.md`, written before any rb output was seen) counts only queries a function states. The adjudicator, blind to which side said what, judged all of these FALSE under it.
+- **Size:** 8 `table_queries` false positives across spring_boot_microservices and hk_polls (16 of 24 `synthetic` edges right; `table_ops` rows restate the same 8 edges once per op and are excluded from the certainty table, amendment 2). These are all of the wrong `synthetic` edges: 16 of 16 outside this convention.
+- **Not a key change:** the format will not be loosened after seeing rb's output (contract M8b T4). The choice for rb is to document the convention in `rb table-deps` output, or to attribute inherited CRUD to its callers.
+
+## B12. microSecEnD: endpoints and service flows (accuracy, independent key)
+
+- **Coverage:** 12 of 17 applications pass D1's evidence check. In every one, each internal service maps to its own rb service.
+- **Endpoints:** precision 88.7 %, recall 75.8 % (47 of 62 after amendment 2's 19 key-error removals; `bench/keys/microsecend/*.md`). Of the 28 first-scoring misses, 19 were model artifacts, now removed:
+  - bare class prefixes listed as endpoints: `/api` ×3 (fernando), `/catalog`, `/movies`, `/ratingsdata` (koushik), `/recipients` (piggymetrics), `/comments` ×2 (anilallewar, rohitghatol), `/recommendation` (mdeket);
+  - Feign-client paths credited to the wrong service: 6 on `card-statement-composite` (`CardService.java:18-24`, `StatementService.java:17-23`), `/newuser` on user-service (mdeket), `/accounts/{}` and `/statistics/{}` (piggymetrics).
+- **Real rb misses (9 fn):** 4 no-leading-slash joins — `value = "{taskId}"` / `"{userName}"` under class `/` (anilallewar `TaskController.java:48`, `UserController.java:51`; the rohitghatol fork too); 5 Spring Data REST endpoints (`@RepositoryRestResource`), mse_jferrater 0 of 5. On genuinely served endpoints rb is 7/7 (fernando), 4/4 (koushik), 6/6 (piggymetrics), 12/12 (mdeket), 4/6 (anilallewar, rohitghatol), 0/5 (jferrater).
+- **Service flows:** 4 of 14 in-scope flows found, 0 false. 271 of the 285 model flows are out of scope: through gateways, registries or config servers (228), external (30), databases (9), messaging (4).
+- **A miss form read in the source** (mse_callista): RestTemplate URLs built at runtime from `LoadBalancerClient` service discovery, so rb sees a dynamic URL.
+
+## B14. Context paths from Spring Cloud Config shared files are not applied (major, `exact` precision)
+
+- **piggymetrics** serves account-service under `/accounts`, statistics-service under `/statistics` and notification-service under `/notifications`, set as `server.servlet.context-path` in the config server's shared files (`config/src/main/resources/shared/account-service.yml:21`, `statistics-service.yml:21`, `notification-service.yml:12`).
+- rb exposes the controller paths without the prefix (`GET /{}`, `POST /`, `GET /current`, `PUT /current` on account; `GET /current`, `GET /{}` on statistics; `/recipients/current` on notification), all `exact`. The model lists the same unprefixed forms, so 6 tp were spurious; the override file removes them (now 6 fp) and adds the true prefixed paths (now fn). The dataset authors knew about context paths elsewhere (auth-service's `/uaa/users` is prefixed in the model), so this is an rb gap, not a dataset convention.
+- **Fix direction:** read `server.servlet.context-path` (including config-server shared/default files) into the endpoint's effective path, as context paths from local config already are.
+
+## B13. SCIP `IMPLEMENTS` from a method (minor, `exact` precision)
+
+- The `exact` sample's `scip` family is 57 of 60, and all 3 wrong edges are mattermost `IMPLEMENTS`.
+- **Two start at a method** (`SqlChannelMemberHistoryStore#GetMembershipChanges()` → `store/ChannelMemberHistoryStore#`), where the relation belongs to its type or to the interface's method: the SCIP relationship joined onto the wrong symbol.
+- **One is plainly wrong:** `ElasticsearchInterfaceTestSuite#` → `IndexerJobInterface#`, a suite without `MakeWorker`.
+
+## Data quality of the keys (recorded, not rb findings)
+
+- **microSecEnD:**
+  - 5 of 17 applications fail the evidence check after pinning (80–87 % resolved; real line drift).
+  - Two traceability files have trailing commas.
+  - 99 evidence items (79 in kept applications) name config-repository files under the application's own URL; they exist in no commit.
+  - The model writes `account_service` where its trace keys `account-service`.
+  - Some models list no `Endpoints` at all (mse_piomin), so their rb endpoints are `out_of_scope{no_endpoint_list}`.
+- **The `exact` sample's one wrong `sql` edge is borderline:** a materialized view recorded as a table, with the name and ops right.
+- **The judges' conventions,** stated in `bench/samples/exact.tsv` evidence:
+  - `CREATE INDEX` counts as `alter`;
+  - an empty `COPY … FROM stdin` counts as `insert`;
+  - a pointer-receiver method set counts for `IMPLEMENTS`.
+- **The hand-key adjudications changed nothing.** All 133 verdicts agreed with the labellers. The labeller and the adjudicator are one model family, so an error they share would pass both.

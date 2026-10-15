@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::dump::{Dump, parse};
 use crate::scoreboard::{CellKey, Label, Perf, Rb, Record, Run, SCHEMA, Scoreboard};
-use crate::{pycg, scip_ref};
+use crate::{handkey, msecend, pycg, sample, scip_ref};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -156,6 +156,16 @@ pub fn pycg_cases(root: &Path) -> Result<Vec<String>, String> {
     Ok(cases)
 }
 
+/// A microSecEnD application's dataset directory, from its upstream URL
+/// (`https://github.com/Owner/Repo.git` is `owner_repo`).
+pub fn msecend_app(url: &str) -> Result<String, String> {
+    let slug = url
+        .strip_prefix("https://github.com/")
+        .and_then(|s| s.strip_suffix(".git"))
+        .ok_or_else(|| format!("not a GitHub URL: {url}"))?;
+    Ok(slug.replacen('/', "_", 1).to_lowercase())
+}
+
 /// The dump file of a PyCG case (`bench/run.sh` writes `/` as `__`).
 fn pycg_dump(out: &Path, case: &str) -> PathBuf {
     out.join("pycg")
@@ -172,6 +182,8 @@ pub fn scoreboard(
     targets: &[Target],
     out: &Path,
     repos: &Path,
+    keys: &Path,
+    samples: &Path,
     milestone: &str,
     rb: Rb,
 ) -> Result<(Scoreboard, Vec<String>), String> {
@@ -184,6 +196,7 @@ pub fn scoreboard(
             .collect(),
         keys: BTreeMap::new(),
         cells: BTreeMap::new(),
+        samples: BTreeMap::new(),
     };
     let mut notes = Vec::new();
     for t in targets.iter().filter(|t| t.kind == "stress") {
@@ -231,6 +244,114 @@ pub fn scoreboard(
             };
             board.cells.insert(key, record);
         }
+    }
+    // Hand keys: every target with `<keys>/<name>/key.txt`, raw and adjudicated (T3, T4).
+    for t in targets {
+        let dir = keys.join(&t.name);
+        let Ok(raw_text) = fs::read_to_string(dir.join("key.txt")) else {
+            continue;
+        };
+        let adjudication = fs::read_to_string(dir.join("adjudication.md")).unwrap_or_default();
+        let raw = handkey::parse_key(&raw_text).map_err(|e| format!("{}: {e}", t.name))?;
+        let effective = handkey::adjudicate(raw.clone(), &adjudication)
+            .map_err(|e| format!("{}: {e}", t.name))?;
+        let checkout = repos.join(&t.name);
+        handkey::check_places(&effective, &checkout).map_err(|e| format!("{}: {e}", t.name))?;
+        let mut hash = Sha256::new();
+        hash.update(raw_text.as_bytes());
+        hash.update(adjudication.as_bytes());
+        board
+            .keys
+            .insert(format!("handkey:{}", t.name), hex(&hash.finalize()));
+        let dump = read_dump(&out.join(format!("{}.noscip.jsonl", t.name)))?
+            .ok_or_else(|| format!("{}: no noscip dump for its hand key", t.name))?;
+        for (bench, key) in [(handkey::RAW_BENCH, &raw), ("handkey", &effective)] {
+            for (class, cell) in handkey::score_key(key, &dump) {
+                let key = CellKey {
+                    bench: bench.to_owned(),
+                    target: t.name.clone(),
+                    mode: "noscip".to_owned(),
+                    class: class.as_str().to_owned(),
+                };
+                let record = Record {
+                    label: Label::Accuracy,
+                    cell,
+                    covered: None,
+                };
+                board.cells.insert(key, record);
+            }
+        }
+        notes.push(format!(
+            "{}: hand key {} lines, {} after adjudication",
+            t.name,
+            raw.len(),
+            effective.len()
+        ));
+    }
+    // The `exact` sample (T5): drawn from the stress dumps, tallied against the verdicts at each
+    // target's pin. A drawn edge without a verdict is `missing`, which the gate refuses.
+    let verdict_text = fs::read_to_string(samples).unwrap_or_default();
+    let verdicts = sample::parse_verdicts(&verdict_text)?;
+    let mut stress_dumps = Vec::new();
+    for t in targets.iter().filter(|t| t.kind == "stress") {
+        for mode in ["noscip", "scip"] {
+            if let Some(d) = read_dump(&out.join(format!("{}.{mode}.jsonl", t.name)))? {
+                stress_dumps.push((t.name.clone(), mode, d));
+            }
+        }
+    }
+    if !stress_dumps.is_empty() {
+        let drawn = sample::draw(stress_dumps.iter().map(|(t, m, d)| (t.as_str(), *m, d)));
+        board.samples = sample::tally(&drawn, &board.pins, &verdicts);
+        board.keys.insert(
+            "exact:verdicts".to_owned(),
+            hex(&Sha256::digest(verdict_text.as_bytes())),
+        );
+        let missing: u64 = board.samples.values().map(|t| t.missing).sum();
+        if missing > 0 {
+            notes.push(format!(
+                "exact sample: {missing} drawn edges have no verdict"
+            ));
+        }
+    }
+    let mut models = Sha256::new();
+    let apps: Vec<&Target> = targets.iter().filter(|t| t.kind == "microsecend").collect();
+    for t in &apps {
+        let app = msecend_app(&t.url)?;
+        let dir = repos.join("microsecend").join("dataset").join(&app);
+        let model = read(&dir.join(format!("{app}.json")))?;
+        let trace = read(&dir.join(format!("{app}_traceability.json")))?;
+        models.update(format!("{app}\n").as_bytes());
+        // The app's endpoint overrides, from a blind adjudication of the model (T2).
+        let overrides = fs::read_to_string(keys.join("microsecend").join(format!("{}.md", t.name)))
+            .unwrap_or_default();
+        models.update(model.as_bytes());
+        models.update(trace.as_bytes());
+        models.update(overrides.as_bytes());
+        let dump = read_dump(&out.join(format!("{}.noscip.jsonl", t.name)))?
+            .ok_or_else(|| format!("{}: no noscip dump", t.name))?;
+        let (cells, app_notes) = msecend::score_app(&model, &trace, &overrides, &dump)
+            .map_err(|e| format!("{}: {e}", t.name))?;
+        for (class, cell) in cells {
+            let key = CellKey {
+                bench: "microsecend".to_owned(),
+                target: t.name.clone(),
+                mode: "noscip".to_owned(),
+                class: class.as_str().to_owned(),
+            };
+            let record = Record {
+                label: Label::Accuracy,
+                cell,
+                covered: None,
+            };
+            board.cells.insert(key, record);
+        }
+        notes.push(format!("{}: {}", t.name, app_notes.join("; ")));
+    }
+    if !apps.is_empty() {
+        board
+            .keys
+            .insert("microsecend:models".to_owned(), hex(&models.finalize()));
     }
     for t in targets.iter().filter(|t| t.kind == "pycg") {
         let snippets = repos.join(&t.name).join("micro-benchmark/snippets");
@@ -305,6 +426,15 @@ mod tests {
         let t = parse_manifest(text).unwrap();
         assert_eq!(t.iter().filter(|t| t.kind == "stress").count(), 13);
         assert_eq!(t.iter().filter(|t| t.kind == "pycg").count(), 1);
+        assert_eq!(t.iter().filter(|t| t.kind == "microsecend").count(), 12);
+        assert_eq!(t.iter().filter(|t| t.kind == "dataset").count(), 1);
+        for a in t.iter().filter(|t| t.kind == "microsecend") {
+            assert!(msecend_app(&a.url).is_ok(), "{}", a.url);
+        }
+        assert_eq!(
+            msecend_app("https://github.com/jferrater/Tap-And-Eat-MicroServices.git").unwrap(),
+            "jferrater_tap-and-eat-microservices"
+        );
     }
 
     fn write_meta(dir: &Path, label: &str, sha: &str, exit: &str) {
@@ -369,10 +499,28 @@ mod tests {
         fs::create_dir_all(out.join("pycg")).unwrap();
         let dump = "[\"rb-dump\",2,\"x\"]\n[\"N\",\"file\",\"main.py\",\"main.py\",{}]\n";
         fs::write(out.join("pycg/a__one.jsonl"), dump).unwrap();
-        let err = scoreboard(&target, &out, &repos, "m8a", rb()).unwrap_err();
+        let err = scoreboard(
+            &target,
+            &out,
+            &repos,
+            &tmp.path().join("keys"),
+            &tmp.path().join("exact.tsv"),
+            "m8a",
+            rb(),
+        )
+        .unwrap_err();
         assert!(err.contains("1 of 2 cases have no dump"), "{err}");
         fs::write(out.join("pycg/b__c__two.jsonl"), dump).unwrap();
-        let (board, _) = scoreboard(&target, &out, &repos, "m8a", rb()).unwrap();
+        let (board, _) = scoreboard(
+            &target,
+            &out,
+            &repos,
+            &tmp.path().join("keys"),
+            &tmp.path().join("exact.tsv"),
+            "m8a",
+            rb(),
+        )
+        .unwrap();
         assert_eq!(board.cells.len(), 4);
         assert!(board.cells.keys().any(|k| k.target == "b/c/two"));
         assert_eq!(board.keys.len(), 1);
@@ -382,10 +530,107 @@ mod tests {
             r#"{"main": ["main.f"]}"#,
         )
         .unwrap();
-        let (board, _) = scoreboard(&target, &out, &repos, "m8a", rb()).unwrap();
+        let (board, _) = scoreboard(
+            &target,
+            &out,
+            &repos,
+            &tmp.path().join("keys"),
+            &tmp.path().join("exact.tsv"),
+            "m8a",
+            rb(),
+        )
+        .unwrap();
         assert_ne!(
             board.keys["pycg:callgraph.json"], first,
             "the key hash follows the key"
         );
+    }
+
+    #[test]
+    fn a_hand_key_is_scored_raw_and_adjudicated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (out, repos, keys) = (
+            tmp.path().join("out"),
+            tmp.path().join("repos"),
+            tmp.path().join("keys"),
+        );
+        for d in [&out, &repos.join("t/a"), &keys.join("t")] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(repos.join("t/a/X.java"), "class X {\n  void q() {}\n}\n").unwrap();
+        fs::write(
+            keys.join("t/key.txt"),
+            "QUERIES users read a/X.java:2\nMAPS users a/X.java:1\n",
+        )
+        .unwrap();
+        fs::write(
+            keys.join("t/adjudication.md"),
+            "- REMOVE `MAPS users a/X.java:1` — no entity\n",
+        )
+        .unwrap();
+        let dump = [
+            r#"["rb-dump",2,"x"]"#,
+            r#"["N","symbol","rb-heuristic . . . `a/X.java`/X#q().","q",{}]"#,
+            r#"["E","symbol","rb-heuristic . . . `a/X.java`/X#q().","DEFINED_IN","file","a/X.java","treesitter",5,{},[["a/X.java",[1,7,1,8]]]]"#,
+            r#"["E","symbol","rb-heuristic . . . `a/X.java`/X#q().","QUERIES","table","public.users","sql_literal",5,{"ops":["read"],"schema_assumed":true},[["a/X.java",[1,10,1,11]]]]"#,
+        ];
+        fs::write(out.join("t.noscip.jsonl"), dump.join("\n") + "\n").unwrap();
+        let target = parse_manifest(
+            &ROW.replacen("go_clean_arch", "t", 1)
+                .replace("noscip,scip", "noscip")
+                .replacen("stress", "handkey", 1),
+        )
+        .unwrap();
+        let rb = Rb {
+            commit: "c".into(),
+            binary_sha256: "b".into(),
+        };
+        let (board, _) = scoreboard(
+            &target,
+            &out,
+            &repos,
+            &keys,
+            &tmp.path().join("exact.tsv"),
+            "m8b",
+            rb,
+        )
+        .unwrap();
+        let cell = |bench: &str, class: &str| {
+            board
+                .cells
+                .iter()
+                .find(|(k, _)| k.bench == bench && k.class == class)
+                .map(|(_, r)| r.cell.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            cell("handkey_raw", "table_maps").fn_,
+            1,
+            "the raw key's MAPS line"
+        );
+        assert_eq!(
+            cell("handkey", "table_maps").gold,
+            0,
+            "removed by adjudication"
+        );
+        assert_eq!(cell("handkey", "table_queries").tp_total(), 1);
+        assert!(board.keys.contains_key("handkey:t"));
+        fs::write(keys.join("t/key.txt"), "MAPS users a/X.java:9\n").unwrap();
+        fs::write(keys.join("t/adjudication.md"), "").unwrap();
+        let rb = Rb {
+            commit: "c".into(),
+            binary_sha256: "b".into(),
+        };
+        let err = scoreboard(
+            &target,
+            &out,
+            &repos,
+            &keys,
+            &tmp.path().join("exact.tsv"),
+            "m8b",
+            rb,
+        )
+        .unwrap_err();
+        assert!(err.contains("past the end"), "{err}");
     }
 }

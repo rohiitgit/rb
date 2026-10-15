@@ -316,7 +316,20 @@ cargo run -q -p rb-bench -- compare bench/scoreboard/m8a.json bench/scoreboard/m
   --accept bench/accept.tsv --perf bench/scoreboard/m8a-perf.json bench/scoreboard/m8b-perf.json
 ```
 
-- **Keys.** *SCIP agreement*: on each stress repo with SCIP mode, the
+- **Keys (M8b adds three).** *microSecEnD*: 12 Java microservice
+  applications' hand-made dataflow diagrams (`kind microsecend` in the
+  manifest, pinned and checked by `bench/pin_microsecend.py`); scores
+  `service_flows` and `endpoints`. *Hand keys*: `bench/keys/<target>/key.txt`,
+  written blind to rb's output in the format of `bench/keys/FORMAT.md`
+  (endpoints, handlers, table access, entity mappings), adjudicated through
+  `rb-bench statements` → a blind adjudicator → `bench/adjudicate.py`, which
+  appends `ADD`/`REMOVE` entries to `adjudication.md` (`key.txt` is never
+  edited; the raw key is scored too, as `handkey_raw`). *The `exact` sample*:
+  `rb-bench sample OUT` draws up to 60 `exact` edges per family (`scip`,
+  `sql`, `orm`, `routes`, `manifest`) by the M3b rule, and judges' verdicts
+  live in `bench/samples/exact.tsv` (keyed by rb's edge identity and pin, so
+  they carry over); the gate fails while a drawn edge lacks a verdict.
+- **Keys (M8a).** *SCIP agreement*: on each stress repo with SCIP mode, the
   `scip`-provenance `CALLS` of the SCIP run against the `--no-scip` run, in
   files SCIP covered. It is labelled `agreement`, never accuracy: it goes
   through rb's own SCIP join and sees only call sites rb's parser found.
@@ -343,8 +356,8 @@ cargo run -q -p rb-bench -- compare bench/scoreboard/m8a.json bench/scoreboard/m
   carries this line: *"Scoreboard against the previous close: `rb-bench
   compare` exit 0, or every accepted cell classified."*
 - **Mutants of `rb-bench`** re-run with
-  `python3 -I bench/mutants/run.py bench/mutants/m8a.json` (a spec whose text
-  no longer occurs reports `STALE` and must be refreshed).
+  `python3 -I bench/mutants/run.py bench/mutants/m8a.json` and `m8b.json` (a
+  spec whose text no longer occurs reports `STALE` and must be refreshed).
 - `bench/run.sh` refuses to start unless `rb doctor` passes and 6 GiB are
   free; it exits 1 when any run or dump failed (`FAILED:` lines say which).
 

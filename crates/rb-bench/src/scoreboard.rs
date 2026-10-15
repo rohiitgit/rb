@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::sample::Tally;
 use crate::score::{Cell, Status};
 
 pub const SCHEMA: u64 = 1;
@@ -74,6 +75,8 @@ pub struct Scoreboard {
     /// Every answer key by name (a key file's path, or `scip:<target>`), to its sha256.
     pub keys: BTreeMap<String, String>,
     pub cells: BTreeMap<CellKey, Record>,
+    /// The `exact` sample per family (contract M8b, T5); empty before M8b.
+    pub samples: BTreeMap<String, Tally>,
 }
 
 /// The file form: the cells as a sorted list of flat rows.
@@ -85,6 +88,8 @@ struct Wire {
     pins: BTreeMap<String, String>,
     keys: BTreeMap<String, String>,
     cells: Vec<Row>,
+    #[serde(default)]
+    samples: BTreeMap<String, Tally>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -105,6 +110,7 @@ impl Scoreboard {
             rb: self.rb.clone(),
             pins: self.pins.clone(),
             keys: self.keys.clone(),
+            samples: self.samples.clone(),
             cells: self
                 .cells
                 .iter()
@@ -150,6 +156,7 @@ impl Scoreboard {
             pins: wire.pins,
             keys: wire.keys,
             cells,
+            samples: wire.samples,
         })
     }
 
@@ -233,6 +240,7 @@ pub(crate) mod tests {
             pins: BTreeMap::from([("pycg".to_owned(), "p".to_owned())]),
             keys: BTreeMap::from([("scip:x".to_owned(), "k".to_owned())]),
             cells: cells.into_iter().collect(),
+            samples: BTreeMap::new(),
         }
     }
 
