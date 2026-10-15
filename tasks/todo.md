@@ -1150,11 +1150,11 @@ Contract: `tasks/contract-m8b.md`. Branch `m8` (after the M8a commit `6c059ea`).
 Plan: `tasks/plan-m9.md` (from an opencode plan session; claims unverified until each contract checks them). Contract: `tasks/contract-m9a.md` (planner verified every root cause; 7 plan corrections). Branch `m9`, from `main` at `0453fda`; every M9 part commits there.
 
 - [x] Contract written (B7, B8, B12a, B13, B14, B11; C1–C12; mutants m230–m247).
-- [ ] P0: mutant runner handles any crate, build errors INVALID; m8b battery re-run; M8 dumps re-scored byte-identical.
-- [ ] P1: B12a (`"{taskId}"` literal).
-- [ ] P2: B7 (test-file routes) and B8 (spec-only routes `synthetic`).
-- [ ] P3: B13 (method → interface `IMPLEMENTS` dropped and counted).
-- [ ] P4: B14 (config-server shared context paths).
-- [ ] P5: `PIPELINE` `m9a-1`, docs, fmt/clippy, real-Docker suites, batteries; commit.
+- [x] P0: mutant runner handles any crate, build errors INVALID; m8b battery re-run; M8 dumps re-scored byte-identical.
+- [x] P1: B12a (`"{taskId}"` literal).
+- [x] P2: B7 (test-file routes) and B8 (spec-only routes `synthetic`).
+- [x] P3: B13 (method → interface `IMPLEMENTS` dropped and counted).
+- [x] P4: B14 (config-server shared context paths).
+- [x] P5: `PIPELINE` `m9a-1`, docs, fmt/clippy, real-Docker suites, batteries; commit.
 - [ ] P6: bench run, invariant, new sample verdicts, score ×2, re-scored base, compare.
 - [ ] P7: records; evaluator passes 1 and 2.
