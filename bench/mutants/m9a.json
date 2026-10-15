@@ -52,5 +52,32 @@
   "old": "        .map(|r| r.path_certainty)\n        .max()\n",
   "new": "        .map(|r| r.path_certainty)\n        .min()\n",
   "what": "EXPOSES takes the weakest registration"
+ },
+ {
+  "id": "m236",
+  "crate": "rb-indexer",
+  "test": "scip::tests::go_implicit_satisfaction_lands_on_the_type_not_the_method",
+  "file": "scip.rs",
+  "old": "                if bypass && !is_type(&facts.definitions[i]) {\n                    dropped(rel);\n                    continue;\n                }\n",
+  "new": "",
+  "what": "non-type guard removed"
+ },
+ {
+  "id": "m237",
+  "crate": "rb-indexer",
+  "test": "scip::tests::go_implicit_satisfaction_lands_on_the_type_not_the_method",
+  "file": "scip.rs",
+  "old": "                if bypass && !is_type(&facts.definitions[i]) {\n",
+  "new": "                if bypass {\n",
+  "what": "guard drops type sources too"
+ },
+ {
+  "id": "m238",
+  "crate": "rb-indexer",
+  "test": "scip::tests::go_implicit_satisfaction_lands_on_the_type_not_the_method",
+  "file": "scip.rs",
+  "old": "                if bypass && !is_type(&facts.definitions[i]) {\n                    dropped(rel);\n",
+  "new": "                if bypass && !is_type(&facts.definitions[i]) {\n",
+  "what": "the drop not counted"
  }
 ]

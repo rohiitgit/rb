@@ -4,5 +4,9 @@
 # key unification regressed.
 IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Card#Pay(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Cash#Pay().
 IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Payer# -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Card#
+# A method's link to the interface method makes no method-to-type edge
+# (contract M9a D3).
+IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Card#Pay(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Payer#
+IMPLEMENTS scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Cash#Pay(). -> scip-go gomod github.com/acme/shop . `github.com/acme/shop`/Payer#
 DEPENDS_ON * -> gomod/github.com/go-chi/chi/v5@v5.3.2
 DEPENDS_ON * -> gomod/github.com/golang/go/src@go1.23

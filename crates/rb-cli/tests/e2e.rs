@@ -3756,8 +3756,9 @@ fn scip_go_available() -> Result<(), String> {
 
 /// Contract M6d S9: the chi/SQL fixture. Nested `Route` prefixes, `Group`,
 /// `With` chains and verbs become endpoints; `database/sql` sites become
-/// `QUERIES`; the two implicit `Payer` implementations get `IMPLEMENTS`
-/// edges (method and type) without any declared heritage (guards); call
+/// `QUERIES`; the two implicit `Payer` implementations get type-level
+/// `IMPLEMENTS` edges without any declared heritage, and their methods none
+/// (contract M9a D3; guards); call
 /// dispatch through the interface stays unmatched (RTA through Go interfaces
 /// is future work, recorded as residue). The `go.sum`-pinned fetch makes the
 /// job reproducible.

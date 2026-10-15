@@ -129,8 +129,10 @@ pub(crate) struct Coverage {
     pub occurrences_unconverted: usize,
     /// `is_implementation` relationships that gave no edge because their source or target
     /// symbol has no matched project definition (a local class expression, a field, an
-    /// external type; contract M3b amendment 52). Relationships the direction rule rejects
-    /// (the reverse side of an override) are not dropped: their forward twin is the edge.
+    /// external type; contract M3b amendment 52), or because a method links to an interface
+    /// method its holder satisfies implicitly (contract M9a D3). Relationships the direction
+    /// rule rejects (the reverse side of an override) are not dropped: their forward twin is
+    /// the edge.
     pub relationships_dropped: usize,
     /// The subset of `relationships_dropped` whose source and target are both defined in this
     /// project: each has a definition occurrence in the index's documents (a local one in the
@@ -642,14 +644,20 @@ pub(crate) fn join(
                 // supertypes (Go's implicit idiom — nothing to walk), the
                 // target type is an interface by the indexer's own kinds, and
                 // it is anchored. The spec method itself has no node, so the
-                // edge lands on the interface. Anything else takes the walk
-                // below (a spec-to-impl twin lands on a class there and is
-                // rejected as today).
+                // edge lands on the interface, and only a type may start it
+                // (contract M9a D3): a method's link is dropped and counted,
+                // its type's own link gives the type-level edge. Anything else
+                // takes the walk below (a spec-to-impl twin lands on a class
+                // there and is rejected as today).
                 let type_symbol = rb_scip::type_symbol_of(&rel.symbol);
                 let bypass = type_symbol.as_deref().is_some_and(|ts| {
                     symbol_kinds.get(ts).is_some_and(|k| *k == "Interface")
                         && supertypes.get(&holder).is_some_and(Vec::is_empty)
                 });
+                if bypass && !is_type(&facts.definitions[i]) {
+                    dropped(rel);
+                    continue;
+                }
                 let target = if bypass {
                     type_symbol.filter(|ts| nodes.contains(ts.as_str()))
                 } else if target_local {
@@ -3092,11 +3100,12 @@ mod tests {
 
     /// Contract M6d S9: Go's implicit satisfaction needs no declared
     /// heritage — an origin-attested implementation of an interface lands on
-    /// the interface type (the spec method has no node), measured on scip-go
-    /// (is_implementation on the method only, kinds as it reports them). An
-    /// attested link at a struct needs the walk.
+    /// the interface type (the spec method has no node), kinds as scip-go
+    /// reports them. Contract M9a D3 (bench B13): only a type's link makes the
+    /// edge; a method's link to the interface method is dropped and counted.
+    /// An attested link at a struct needs the walk.
     #[test]
-    fn go_implicit_satisfaction_needs_no_declared_heritage() {
+    fn go_implicit_satisfaction_lands_on_the_type_not_the_method() {
         let src = "package main\ntype Payer interface {\n\tPay(amount int) string\n}\ntype Card struct{}\nfunc (c Card) Pay(amount int) string {\n\treturn \"\"\n}\ntype Base struct{}\n";
         let facts = rb_syntax::extract(Language::Go, src.as_bytes()).unwrap();
         let at = |token: &str, n: usize| {
@@ -3123,6 +3132,7 @@ mod tests {
                     path: "main.go".into(),
                     occurrences: vec![
                         def(at("Payer", 0), sym("`example.com/shop`/Payer#")),
+                        def(at("Card", 0), sym("`example.com/shop`/Card#")),
                         def(at("Base", 0), sym("`example.com/shop`/Base#")),
                         def(at("Pay", 2), sym("`example.com/shop`/Card#Pay().")),
                     ],
@@ -3142,14 +3152,22 @@ mod tests {
                 &[Language::Go],
                 &rb_scip::TsScopes::build([]),
             );
-            edge_lines(&joined)
+            let lines = edge_lines(&joined)
                 .into_iter()
                 .filter(|l| l.contains(" Implements "))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (lines, joined.coverage.relationships_dropped)
         };
         let pay = sym("`example.com/shop`/Card#Pay().");
+        let card = sym("`example.com/shop`/Card#");
         let spec = sym("`example.com/shop`/Payer#Pay.");
         let iface = sym("`example.com/shop`/Payer#");
+        let interface = SymbolInfo {
+            symbol: iface.clone(),
+            kind: "Interface".into(),
+            ..Default::default()
+        };
+        // The method's link: no method-to-type edge, one dropped relationship.
         assert_eq!(
             go(vec![
                 SymbolInfo {
@@ -3162,13 +3180,26 @@ mod tests {
                     }],
                     ..Default::default()
                 },
+                interface.clone(),
+            ]),
+            (Vec::new(), 1),
+        );
+        // The struct's own link lands on the interface.
+        assert_eq!(
+            go(vec![
                 SymbolInfo {
-                    symbol: iface.clone(),
-                    kind: "Interface".into(),
+                    symbol: card.clone(),
+                    kind: "Struct".into(),
+                    relationships: vec![Relationship {
+                        symbol: iface.clone(),
+                        is_implementation: true,
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 },
+                interface,
             ]),
-            [format!("{pay} Implements {iface}")],
+            (vec![format!("{card} Implements {iface}")], 0),
         );
         // The same attestation at a struct needs the walk: no edge (the
         // holder declares no supertypes, so the walk fails too — this pins
@@ -3191,6 +3222,7 @@ mod tests {
                     ..Default::default()
                 },
             ])
+            .0
             .is_empty()
         );
     }
