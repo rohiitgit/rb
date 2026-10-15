@@ -14,7 +14,11 @@ Apache AGE graph of files, services, symbols, tables, endpoints, packages and
 the edges between them (`DEFINED_IN`, `CONTAINS`, `CALLS`, `REFERENCES`,
 `IMPLEMENTS`, `INJECTS`, `EXPOSES`, `HANDLED_BY`, `CONSUMES`, `QUERIES`,
 `MAPS_TO`, `MIGRATES`, `DEPENDS_ON`, `IN_SERVICE`, …), with per-edge certainty
-(`exact` only from SCIP indexers, otherwise `heuristic`/`ambiguous`/…),
+(`exact` only when proven: by SCIP indexers for calls, references and
+implementations; by structure read directly (definitions, containment, a
+file's service, CODEOWNERS); or by a literal the code states, such as SQL at a
+known sink, an ORM mapping by stated name, a literal route, a manifest version;
+otherwise `heuristic`/`ambiguous`/…),
 evidence spans, and a diagnostics table (unresolved references, syntax errors,
 unreadable manifests, …).
 
@@ -283,11 +287,85 @@ part of the tree.)
   until proven otherwise. Usually the test lacks the input that only that
   rule explains, sometimes the code is dead (delete it), rarely the mutant is
   equivalent (record why). Re-check mutation text after any `cargo fmt`
-  (reflows break exact matches).
+  (reflows break exact matches). Run the battery with
+  `python3 -I bench/mutants/run.py bench/mutants/m8b.json --jobs 4` (parallel
+  worktrees; the main tree stays clean): a full all-KILLED run is cached in
+  `var/bench/mutants-cache.json` and re-reports instantly while code and
+  specs are unchanged.
 - **Stress repros:** `tasks/stress-findings.md` lists each finding with its
   repro and what fixed it. Re-run the repros of the findings a change touches.
 
-### 5.5 Troubleshooting
+### 5.5 Accuracy benchmark (`bench/`, `rb-bench`)
+
+The invariant shows *that* a graph changed; the benchmark says whether it got
+better or worse against answer keys (contract M8a). Everything it needs is
+committed: `bench/manifest.tsv` (targets and pins), `bench/fetch.sh`,
+`bench/run.sh`, `bench/cleanup.sh`, and the `rb-bench` crate (scoring,
+rendering, the gate).
+
+```bash
+# 1. Index and dump every target with one binary (minutes warm; a cold SCIP
+#    pass is an hour). Run it detached; it runs from a copy of itself.
+nohup bench/run.sh var/m8a/bin/rb > var/bench/run.log 2>&1 & disown
+# 2. Score: writes the scoreboard (counts only, deterministic) and the perf file.
+cargo run -q -p rb-bench -- score var/bench/out/<sha12> --milestone m8a \
+  --rb-commit $(git rev-parse HEAD) \
+  --write bench/scoreboard/m8a.json --perf bench/scoreboard/m8a-perf.json
+# 3. Read it.
+cargo run -q -p rb-bench -- render bench/scoreboard/m8a.json
+cargo run -q -p rb-bench -- render bench/scoreboard/m8a.json --certainty
+# 4. Gate a milestone against the previous close: 0 pass, 1 regression,
+#    2 not comparable (other pins or keys: re-score the base first).
+cargo run -q -p rb-bench -- compare bench/scoreboard/m8a.json bench/scoreboard/m8b.json \
+  --accept bench/accept.tsv --perf bench/scoreboard/m8a-perf.json bench/scoreboard/m8b-perf.json
+```
+
+- **Keys (M8b adds three).** *microSecEnD*: 12 Java microservice
+  applications' hand-made dataflow diagrams (`kind microsecend` in the
+  manifest, pinned and checked by `bench/pin_microsecend.py`); scores
+  `service_flows` and `endpoints`. *Hand keys*: `bench/keys/<target>/key.txt`,
+  written blind to rb's output in the format of `bench/keys/FORMAT.md`
+  (endpoints, handlers, table access, entity mappings), adjudicated through
+  `rb-bench statements` → a blind adjudicator → `bench/adjudicate.py`, which
+  appends `ADD`/`REMOVE` entries to `adjudication.md` (`key.txt` is never
+  edited; the raw key is scored too, as `handkey_raw`). *The `exact` sample*:
+  `rb-bench sample OUT` draws up to 60 `exact` edges per family (`scip`,
+  `sql`, `orm`, `routes`, `manifest`) by the M3b rule, and judges' verdicts
+  live in `bench/samples/exact.tsv` (keyed by rb's edge identity and pin, so
+  they carry over); the gate fails while a drawn edge lacks a verdict.
+- **Keys (M8a).** *SCIP agreement*: on each stress repo with SCIP mode, the
+  `scip`-provenance `CALLS` of the SCIP run against the `--no-scip` run, in
+  files SCIP covered. It is labelled `agreement`, never accuracy: it goes
+  through rb's own SCIP join and sees only call sites rb's parser found.
+  *PyCG*: the 119 micro-benchmark cases' `callgraph.json` against each case's
+  `--no-scip` dump, in PyCG's names (`accuracy`). Endpoints, table access,
+  service flows and `exact` precision get keys in M8b; until then they show
+  `no key`.
+- **Identity.** Edges are matched by location, not by key: a symbol is the
+  path and line of its name token (from `DEFINED_IN`), a file is its path.
+  Anything that can't be matched is counted under a reason
+  (`unmatchable{…}`, `out_of_scope{…}`), never dropped, and a cell with no
+  in-scope gold is `vacuous`, never 100 %.
+- **The gate** is per cell: any `tp` drop, any rise in `fp`, `fn` or an
+  excluded count, less gold, less SCIP coverage, a lower ambiguous-site hit
+  rate, or a cell that vanishes or turns vacuous fails. A line
+  `milestone<TAB>bench:target:mode:class<TAB>reason` in the accept file
+  excuses one cell for that milestone (others are reported stale); a new
+  wrong `exact` edge is never excusable. Perf only warns (wall above 1.25×,
+  RSS above 1.15×, same hardware only).
+- **At every milestone close**, commit `bench/scoreboard/<ms>.json` and
+  `-perf.json`, quote `render` output in the contract's Result (never typed
+  by hand), and classify every `changed` line `compare` prints, as the
+  invariant's diffs are classified. Every contract's Verification section
+  carries this line: *"Scoreboard against the previous close: `rb-bench
+  compare` exit 0, or every accepted cell classified."*
+- **Mutants of `rb-bench`** re-run with
+  `python3 -I bench/mutants/run.py bench/mutants/m8a.json` and `m8b.json` (a
+  spec whose text no longer occurs reports `STALE` and must be refreshed).
+- `bench/run.sh` refuses to start unless `rb doctor` passes and 6 GiB are
+  free; it exits 1 when any run or dump failed (`FAILED:` lines say which).
+
+### 5.6 Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|

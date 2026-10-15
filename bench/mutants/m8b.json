@@ -1,0 +1,205 @@
+[
+ {
+  "id": "m201",
+  "file": "structural.rs",
+  "old": "                || s.starts_with('*')\n",
+  "new": "",
+  "what": "catch-all not a parameter"
+ },
+ {
+  "id": "m202",
+  "file": "structural.rs",
+  "old": "let path = path.split(['?', '#']).next().unwrap_or(path);",
+  "new": "let path = path;",
+  "what": "query string kept"
+ },
+ {
+  "id": "m203",
+  "file": "structural.rs",
+  "old": ".and_then(|v| v.as_bool()) == Some(true);",
+  "new": ".and_then(|v| v.as_bool()) == Some(false);",
+  "what": "assumed schema kept"
+ },
+ {
+  "id": "m204",
+  "file": "structural.rs",
+  "old": "line: start.map_or(0, |l| l as u32 + 1),",
+  "new": "line: start.map_or(0, |l| l as u32),",
+  "what": "anonymous handler 0-based"
+ },
+ {
+  "id": "m205",
+  "file": "structural.rs",
+  "old": ".max_by_key(|d| d.len())",
+  "new": ".min_by_key(|d| d.len())",
+  "what": "shortest service directory"
+ },
+ {
+  "id": "m206",
+  "file": "structural.rs",
+  "old": "dst: Loc::service(to),",
+  "new": "dst: Loc::service(from),",
+  "what": "flow target is the caller"
+ },
+ {
+  "id": "m207",
+  "file": "msecend.rs",
+  "old": "                removed = true;\n                continue;",
+  "new": "                removed = true;",
+  "what": "trailing commas kept"
+ },
+ {
+  "id": "m208",
+  "file": "msecend.rs",
+  "old": "} else if has(\"internal\") {",
+  "new": "} else if has(\"internal_x\") {",
+  "what": "no service internal"
+ },
+ {
+  "id": "m209",
+  "file": "msecend.rs",
+  "old": "let path = path.strip_prefix(&format!(\"{git_ref}/\")).unwrap_or(path);",
+  "new": "let path = path;",
+  "what": "doubled ref kept"
+ },
+ {
+  "id": "m210",
+  "file": "msecend.rs",
+  "old": "let same = |n: &str| n.to_lowercase().replace('-', \"_\");",
+  "new": "let same = |n: &str| n.to_owned();",
+  "what": "model and trace names not joined"
+ },
+ {
+  "id": "m211",
+  "file": "msecend.rs",
+  "old": "starts_with(\"message_\")",
+  "new": "starts_with(\"message_x\")",
+  "what": "messaging flows in scope"
+ },
+ {
+  "id": "m212",
+  "file": "msecend.rs",
+  "old": "dst: Loc::endpoint(service, \"ANY\", path),",
+  "new": "dst: Loc::endpoint(service, \"GET\", path),",
+  "what": "found endpoints keep a method"
+ },
+ {
+  "id": "m213",
+  "file": "msecend.rs",
+  "old": "Class::ServiceFlows if id.src == id.dst =>",
+  "new": "Class::ServiceFlows if false =>",
+  "what": "self flows in scope"
+ },
+ {
+  "id": "m214",
+  "file": "handkey.rs",
+  "old": "method: method.to_uppercase(),",
+  "new": "method: method.to_string(),",
+  "what": "methods case-sensitive"
+ },
+ {
+  "id": "m215",
+  "file": "handkey.rs",
+  "old": "            key.remove(at);",
+  "new": "            let _ = at;",
+  "what": "REMOVE ignored"
+ },
+ {
+  "id": "m216",
+  "file": "handkey.rs",
+  "old": "if k.line as usize > text.lines().count() {",
+  "new": "if k.line as usize > text.lines().count() + 1 {",
+  "what": "one past the end accepted"
+ },
+ {
+  "id": "m217",
+  "file": "handkey.rs",
+  "old": "unnamed(handler_bindings(dump, &locator), false, true),",
+  "new": "unnamed(handler_bindings(dump, &locator), false, false),",
+  "what": "handler names kept"
+ },
+ {
+  "id": "m218",
+  "file": "handkey.rs",
+  "old": "Some(l) if is_test_path(&l.path) => Scope::Out(TEST),",
+  "new": "Some(l) if false && is_test_path(&l.path) => Scope::Out(TEST),",
+  "what": "test code in scope"
+ },
+ {
+  "id": "m219",
+  "file": "handkey.rs",
+  "old": "Sha256::digest(text.as_bytes())[0] % 5 == 0",
+  "new": "Sha256::digest(text.as_bytes())[0] % 5 == 9",
+  "what": "no agreements shown"
+ },
+ {
+  "id": "m220",
+  "file": "run.rs",
+  "old": "(\"handkey\", &effective)",
+  "new": "(\"handkey\", &raw)",
+  "what": "adjudication not applied"
+ },
+ {
+  "id": "m221",
+  "file": "sample.rs",
+  "old": "(0..k).map(|i| &sorted[n / 2 + i * n]).collect()",
+  "new": "(0..k).map(|i| &sorted[i * n]).collect()",
+  "what": "M3b without the half stride"
+ },
+ {
+  "id": "m222",
+  "file": "sample.rs",
+  "old": ".max(usize::from(n > 0))",
+  "new": "",
+  "what": "no floor of one per stratum"
+ },
+ {
+  "id": "m223",
+  "file": "sample.rs",
+  "old": "(\"noscip\", P::Orm, _) => Some(\"orm\"),",
+  "new": "(\"noscip\", P::Orm, _) => None,",
+  "what": "orm family dropped"
+ },
+ {
+  "id": "m224",
+  "file": "sample.rs",
+  "old": "Some(true) => t.right += 1,",
+  "new": "Some(true) => t.wrong += 1,",
+  "what": "right verdicts counted wrong"
+ },
+ {
+  "id": "m225",
+  "file": "sample.rs",
+  "old": "let (k, n, z) = (k as f64, n as f64, 1.96_f64);",
+  "new": "let (k, n, z) = (k as f64, n as f64, 1.0_f64);",
+  "what": "68 % interval"
+ },
+ {
+  "id": "m226",
+  "file": "compare.rs",
+  "old": "if h.missing > 0 {",
+  "new": "if h.missing > 1 {",
+  "what": "one missing verdict accepted"
+ },
+ {
+  "id": "m227",
+  "file": "msecend.rs",
+  "old": "Class::Endpoints if !listed.contains(id.src.path.as_str()) => {",
+  "new": "Class::Endpoints if false && !listed.contains(id.src.path.as_str()) => {",
+  "what": "services without an endpoint list scored"
+ },
+ {
+  "id": "m228",
+  "file": "render.rs",
+  "old": ".filter(|(k, _)| k.bench != crate::handkey::RAW_BENCH && k.class != \"table_ops\")",
+  "new": ".filter(|(k, _)| k.bench != \"nothing\" && k.class != \"table_ops\")",
+  "what": "raw hand keys counted twice"
+ },
+ {
+  "id": "m229",
+  "file": "render.rs",
+  "old": " && k.class != \"table_ops\"",
+  "new": "",
+  "what": "table_ops rows counted as edges"
+ }
+]

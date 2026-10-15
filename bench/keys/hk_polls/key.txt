@@ -1,0 +1,50 @@
+# hk_polls @ 362fad90cab17e76453b3b9e273c594de6ee3d7f
+# Spring Boot backend: polling-app-server (no server.servlet.context-path set)
+
+# ---- ENDPOINT ----
+ENDPOINT POST /api/auth/signin polling-app-server/src/main/java/com/example/polls/controller/AuthController.java:52
+ENDPOINT POST /api/auth/signup polling-app-server/src/main/java/com/example/polls/controller/AuthController.java:68
+ENDPOINT GET /api/polls polling-app-server/src/main/java/com/example/polls/controller/PollController.java:41
+ENDPOINT POST /api/polls polling-app-server/src/main/java/com/example/polls/controller/PollController.java:49
+ENDPOINT GET /api/polls/{pollId} polling-app-server/src/main/java/com/example/polls/controller/PollController.java:61
+ENDPOINT POST /api/polls/{pollId}/votes polling-app-server/src/main/java/com/example/polls/controller/PollController.java:68
+ENDPOINT GET /api/user/me polling-app-server/src/main/java/com/example/polls/controller/UserController.java:39
+ENDPOINT GET /api/user/checkUsernameAvailability polling-app-server/src/main/java/com/example/polls/controller/UserController.java:45
+ENDPOINT GET /api/user/checkEmailAvailability polling-app-server/src/main/java/com/example/polls/controller/UserController.java:51
+ENDPOINT GET /api/users/{username} polling-app-server/src/main/java/com/example/polls/controller/UserController.java:57
+ENDPOINT GET /api/users/{username}/polls polling-app-server/src/main/java/com/example/polls/controller/UserController.java:70
+ENDPOINT GET /api/users/{username}/votes polling-app-server/src/main/java/com/example/polls/controller/UserController.java:78
+
+# ---- QUERIES ----
+# PollRepository (entity Poll -> polls)
+QUERIES polls read polling-app-server/src/main/java/com/example/polls/repository/PollRepository.java:16
+QUERIES polls read polling-app-server/src/main/java/com/example/polls/repository/PollRepository.java:18
+QUERIES polls read polling-app-server/src/main/java/com/example/polls/repository/PollRepository.java:20
+QUERIES polls read polling-app-server/src/main/java/com/example/polls/repository/PollRepository.java:22
+QUERIES polls read polling-app-server/src/main/java/com/example/polls/repository/PollRepository.java:24
+# RoleRepository (entity Role -> roles)
+QUERIES roles read polling-app-server/src/main/java/com/example/polls/repository/RoleRepository.java:12
+# UserRepository (entity User -> users)
+QUERIES users read polling-app-server/src/main/java/com/example/polls/repository/UserRepository.java:12
+QUERIES users read polling-app-server/src/main/java/com/example/polls/repository/UserRepository.java:14
+QUERIES users read polling-app-server/src/main/java/com/example/polls/repository/UserRepository.java:16
+QUERIES users read polling-app-server/src/main/java/com/example/polls/repository/UserRepository.java:18
+QUERIES users read polling-app-server/src/main/java/com/example/polls/repository/UserRepository.java:20
+QUERIES users read polling-app-server/src/main/java/com/example/polls/repository/UserRepository.java:22
+# VoteRepository @Query JPQL (FROM Vote -> votes)
+QUERIES votes read polling-app-server/src/main/java/com/example/polls/repository/VoteRepository.java:17
+QUERIES votes read polling-app-server/src/main/java/com/example/polls/repository/VoteRepository.java:20
+QUERIES votes read polling-app-server/src/main/java/com/example/polls/repository/VoteRepository.java:23
+QUERIES votes read polling-app-server/src/main/java/com/example/polls/repository/VoteRepository.java:26
+QUERIES votes read polling-app-server/src/main/java/com/example/polls/repository/VoteRepository.java:29
+QUERIES votes read polling-app-server/src/main/java/com/example/polls/repository/VoteRepository.java:32
+# file-level SQL (DML only)
+QUERIES roles insert polling-app-server/src/main/resources/data.sql:0
+QUERIES roles insert polling-app-server/src/main/resources/db/migration/V2__default_roles.sql:0
+
+# ---- MAPS ----
+MAPS choices polling-app-server/src/main/java/com/example/polls/model/Choice.java:10
+MAPS polls polling-app-server/src/main/java/com/example/polls/model/Poll.java:17
+MAPS roles polling-app-server/src/main/java/com/example/polls/model/Role.java:8
+MAPS users polling-app-server/src/main/java/com/example/polls/model/User.java:21
+MAPS votes polling-app-server/src/main/java/com/example/polls/model/Vote.java:13

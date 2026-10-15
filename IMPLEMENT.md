@@ -775,3 +775,36 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Pass 1:** 17 findings, answered by M7j.
 - **Pass 2:** 1 blocking records error (U2), corrected at the close, plus 4 S4 items (fixed or recorded as residue).
 - **Next:** M8a (accuracy benchmark), whose contract is drafted separately.
+
+## M8a An accuracy benchmark with answer keys, part 1: implemented 2026-10-13
+
+- **Discussed and decided:** the benchmark contract was written in plan mode, its draft reviewed adversarially (4 blockers), and the work split into M8a (harness, gate, SCIP agreement, PyCG) and M8b (microSecEnD, blind hand keys, `exact` sample). Contract: `tasks/contract-m8a.md`, S1–S11 with amendments 1–3.
+- **Built:**
+  - `crates/rb-bench` (dump reader, location identity, scoring, scoreboard, gate, render, SCIP and PyCG adapters, `score|render|compare` CLI).
+  - `bench/` (manifest, fetch, run, cleanup, mutant battery).
+  - The first scoreboard `bench/scoreboard/m8a.json`, and the findings `tasks/bench-findings.md` (B1–B6).
+- **Verification:**
+  - Evaluator passes 1 and 2, both FAIL with 2 blocking items each, all answered (amendments 1 and 4).
+  - Mutants m151–m200 (49 live, all killed).
+  - Scoreboard determinism across runs and scorings.
+  - Real-Docker 1,094/0/0.
+- **Status:** complete. The M8b contract is written (`tasks/contract-m8b.md`).
+
+## M8b An accuracy benchmark with answer keys, part 2: implemented 2026-10-14
+
+- **Contract:** `tasks/contract-m8b.md`, T1–T7 with amendment 1.
+- **Keys added:**
+  - **microSecEnD:** 12 apps pinned, scoring endpoints and service flows.
+  - **Blind hand keys:** spring_boot_microservices, hk_polls, hk_todo. Labelled and adjudicated without sight of rb's output, with audited transcripts.
+  - **The `exact` sample:** 249 judged edges.
+- **Built:** `structural.rs` (identity for endpoints, handlers, tables and services), `msecend.rs`, `handkey.rs`, `sample.rs`; the `statements` and `sample` commands; `bench/pin_microsecend.py` and `bench/adjudicate.py`.
+- **Results:**
+  - `bench/scoreboard/m8b.json` (amendment 2 re-score `d7346ffb…`: microsecend endpoints P 88.7 % R 75.8 % after 23 removals; `exact` 122/130);
+  - findings B7–B14 in `tasks/bench-findings.md` (B14: config-server context paths).
+- **Verification:**
+  - Mutants m201–m229 (29 specs, full battery re-run, all killed).
+  - Determinism (`cmp`-identical twice, accuracy and perf).
+  - Real-Docker 1,122/0/0.
+  - Evaluator pass 1 (`tasks/eval-m8b-pass1.md`) FAIL answered by amendment 2 (6 override files, 3 second adjudications, corrected Result/B11/B12/CHANGELOG); close after a verification-only re-check.
+- **Status:** closed 2026-10-16 on evaluator pass 2 (`tasks/eval-m8b-pass2.md`) VERDICT PASS (1 prose should-fix, 4 notes, all answered). M8 (benchmark) is done; the rb fixes it found (B1, B4, B7–B10, B12–B14) are input for the next rb milestone.
+

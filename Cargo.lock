@@ -2096,6 +2096,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rb-model",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "rb-cli"
 version = "0.1.0"
 dependencies = [

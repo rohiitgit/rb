@@ -569,3 +569,32 @@
 ## 2026-10-13: the binary of record is built from the last code change
 - **Mistake:** M7j's verify script built `var/m7j/bin/rb` and ran the suites. `PIPELINE` was bumped afterwards, so the binary of record wrote `m7i-1` snapshots. It would have taken M7i snapshots as up to date. M7i's binary had the same gap. Evaluator pass 2 found it from timestamps.
 - **Rule:** Bump `PIPELINE` (and every other code change) before the verify run. The verify script refuses a dirty `crates/` (`git diff --quiet HEAD -- crates migrations`) and prints `git rev-parse HEAD` next to the binary's sha256.
+
+## 2026-10-13: never edit a shell script that a detached run is executing
+- **Mistake:** During M8a phase 5 I added a PyCG loop to `bench/run.sh` while a `nohup` run of the same file was still in its SCIP pass. zsh reads a script incrementally, so after the main loop the run would have continued from a byte offset that the edit had shifted. The file was restored to its launch-time text, and the new version was parked until the run ended.
+- **Rule:** A long-running script copies itself into its output directory and re-executes the copy before doing any work (`bench/run.sh` does this from M8a on). Until a script does that, don't touch it while `pgrep -f` shows it running.
+
+## 2026-10-13: a benchmark's claims come from its inputs, not from a constant
+- **Mistake:** `rb-bench score` asserted non-vacuous cells for a hard-coded list of benches. A probe run with a two-target manifest failed on PyCG cells that it was never asked to produce, and `perf` read every `.meta` in the directory, including a run still in progress.
+- **Rule:** Derive every "must be present" assertion from the manifest being scored, and read only that manifest's targets' files. Then a partial run can be scored honestly, and a missing target is still an error.
+
+## 2026-10-13: a heredoc that carries Markdown must have a quoted delimiter
+- **Mistake:** During the M8a close I wrote the contract's Result through `python3 - <<EOF` (unquoted, to expand one path). The shell ran every backtick-quoted name in the text as a command substitution. That included `python3 -I bench/mutants/run.py …`, which started a full mutant battery, and their output went into the contract. Nothing was lost, because the runner restores files by hash, but the Result had to be rewritten.
+- **Rule:** Write prose files with the file tool, or pipe them through `<<'EOF'` (quoted). Pass paths as fixed strings inside the script, never by expansion. After any generated write, grep the file for `command not found`, `Usage:` and tool output lines.
+
+## 2026-10-13: a fix the scoring path never calls is no fix
+- **Mistake:** M8a evaluator pass 1 asked for aliases of merged declarations. `Locator::canonical` was added with unit tests, but no scorer called it. Pass 2 found the express artifact it was meant to prevent (2 false disagreements) still in the committed scoreboard.
+- **Rule:** When closing an evaluator finding, name the call site that applies the fix and add a test through the public scoring path (`agreement`, `score_case`), not only through the helper. Then re-score and diff the cells the finding predicted.
+
+
+## 2026-10-14: probe a dataset's shape before writing its adapter, and measure what fails before excluding it
+- **Mistake (caught):** M8b's first microSecEnD run kept 8 of 17 applications and mapped 0 services. Both came from assumptions about the data, not from pinning. Config-repository evidence was filed under each app's URL, and the model and its own trace spell service names differently (`_` vs `-`).
+- **Rule:** Before trusting an exclusion or a zero, look at the failing items (missing file? which repository? ever in history?) and fix the rule for the cause found, with the cause counted in its own bucket. A benchmark that silently loses half its keys measures the adapter, not the tool.
+
+## 2026-10-14: blind keys stay blind after rb's output is seen
+- **Context:** the hand keys disagreed with rb on 40 Spring Data edges, where rb's repository type "queries" through inherited CRUD. Widening `FORMAT.md` to accept that convention would have raised rb's score after seeing its output.
+- **Rule:** A key's semantics are frozen when the labeller starts. A disagreement that is a convention, not an error, is recorded as a finding with its count (B11), never fixed by editing the format or the key.
+
+## 2026-10-15: an evaluator finding is closed by a re-score, not by a mechanism
+- **Mistake (caught):** the M8b tree already contained the microSecEnD override mechanism and the re-generated statements when pass 1 landed, so "fixed" looked done. But no override file existed (the 6 spurious tp were still in the scoreboard), the committed `statements.txt` still predated the normalisation in one target's record, and the Result still quoted pre-fix numbers.
+- **Rule:** For each finding name the artifact that proves it: the override file, the re-scored cell diff (here exactly the 6 microsecend endpoint cells), the `diff` of statements vs committed, the pasted tool output. A mechanism without its output is not a fix.

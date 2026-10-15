@@ -1,5 +1,60 @@
 # Changelog
 
+## [2026-10-16] (wall clock) Mutant battery: parallel runs and a result cache
+- `bench/mutants/run.py` takes `--jobs N`: each spec runs in its own detached git worktree with a persistent per-job target dir, so the main tree is never dirtied (linting can run concurrently) and 29 specs finish in ~40 s on 4 jobs instead of ~4 min sequential.
+- A full all-KILLED run is cached in `var/bench/mutants-cache.json` (gitignored), keyed by source and specs hashes; an unchanged re-run re-reports in under a second.
+- Default sequential behavior is unchanged; usage guide §5.4 documents the flags.
+- SIGTERM (tool timeouts) routes through the file-restore `finally` instead of leaving a mutant applied.
+
+## [2026-10-14] (wall clock) M8b: an accuracy benchmark with answer keys, part 2
+- **Three independent keys,** so every class and every certainty label but `dispatch` (not stored) is now measured:
+  - **microSecEnD:** 12 of 17 Java microservice apps pass an evidence check after pinning (`bench/pin_microsecend.py`). They score endpoints and service-to-service flows.
+  - **Blind hand keys** (`bench/keys/`): one stress repo and two repos rb had never run on. They cover endpoints, handlers, table access and entity mappings, and were adjudicated by a blind adjudicator through `rb-bench statements` and `bench/adjudicate.py`.
+  - **The `exact` sample:** 249 edges in 5 families judged against the source (`bench/samples/exact.tsv`), with Wilson intervals. The gate refuses a missing verdict or a new wrong `exact` edge.
+- **Scoreboard** (`bench/scoreboard/m8b.json`, the same M7 binary):
+  - `exact` is right on 122 of 130 independently judged edges (6 misses from unapplied config-server context paths, 2 from test-code routes), and the sample bounds every family above 86 % (`orm`, with only 9 edges, above 70 %). The certainty table counts `table_ops` rows once (`synthetic` 16 of 24) and every other label but `dispatch` (not stored) is measured.
+  - microSecEnD endpoints: precision 88.7 %, recall 75.8 % after 23 removals through append-only overrides (`bench/keys/microsecend/*.md`: 6 context-path forms, 17 key errors; 2 further artifacts stay in gold as fn).
+  - The 260 M8a cells are unchanged.
+- **Findings B7–B14:**
+  - routes in test code exposed as `exact`;
+  - spec annotations overriding the router;
+  - gin method-value handlers unbound;
+  - `fmt.Sprintf` SQL unread;
+  - the Spring Data repository-type convention (all 8 wrong `synthetic` edges);
+  - Spring Data REST and service-discovery calls missed;
+  - SCIP `IMPLEMENTS` from methods;
+  - unapplied config-server context paths (B14).
+- **Verification:**
+  - Mutants m201–m229, all killed (m228 rewritten after its line gained the `table_ops` clause; m229 covers that exclusion).
+  - Two scorings `cmp`-identical.
+  - Real-Docker 1,122/0/0, and rb-bench's 79 tests after the last fixes.
+  - The `rb` binary is unchanged.
+- **Files:**
+  - **Crate:** `crates/rb-bench/src/{structural,msecend,handkey,sample}.rs` (new) and `{identity,pycg,run,render,compare,scoreboard,main,lib}.rs`.
+  - **Bench:** `bench/{manifest.tsv,run.sh,pin_microsecend.py,adjudicate.py}`, `bench/keys/`, `bench/samples/exact.tsv`, `bench/mutants/m8b.json`, `bench/scoreboard/m8b{,-perf}.json`.
+  - **Docs:** `README.md`, `docs/usage-and-testing.md`.
+  - **Records:** `tasks/{contract-m8b,eval-m8b-pass1,bench-findings,todo,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-10-13] (wall clock) M8a: an accuracy benchmark with answer keys, part 1
+- **What:** rb's first measurement against answer keys. The new `rb-bench` crate reads `rb dump` and matches edges by location (a symbol is the path and line of its name token, a file its path), so SCIP keys, heuristic keys and external keys compare. It scores every gold item and found edge into exactly one bucket, stores counts only, renders tables and gates a milestone per cell (`compare`: 0 pass, 1 regression, 2 not comparable; a new wrong `exact` edge is never excusable).
+- **Keys:** SCIP agreement (Tier B against the same commit's `scip` `CALLS`, labelled agreement, not accuracy), and PyCG's 119 micro-benchmark cases (independent).
+- **Committed tooling:** `bench/` (manifest of 14 pinned targets, `fetch.sh`, `run.sh` with per-run timing, disk floor and self-copy, `cleanup.sh`, mutant specs). These replace the gitignored `var/` scripts as the source of truth.
+- **First scoreboard** (`bench/scoreboard/m8a.json`, M7 close binary):
+  - PyCG `calls` P 92.3 % R 25.0 %, module-level P 98.9 % R 50.5 %.
+  - SCIP `calls` agreement P 74.3 % R 49.7 %, dominated by mattermost.
+  - Findings B1–B6 in `tasks/bench-findings.md`. The biggest: SCIP mode drops about 7,700 calls across Go modules on mattermost (6,108 of its 6,147 disagreements).
+- **Docs:** the README and usage guide no longer say "`exact` only from SCIP" and name every producer of `exact`; usage guide §5.5 covers the benchmark.
+- **Evaluator passes:**
+  - **Pass 1:** FAIL, 2 blocking (ambiguous sites, aliases); fixed.
+  - **Pass 2:** FAIL, 2 blocking (aliases unused by scoring, S4 overclaimed) and 6 should-fix; answered in amendment 4. That covers aliases in SCIP agreement, a gate rule for certainty downgrades, hardened `run.sh` (stale outputs removed, exit 1 on failure, clean-up on every exit, process-group timeout, `rb doctor` first), more real PyCG cases, and records corrected.
+- **Verification:**
+  - Mutants m151–m200: 49 live specs killed against the final code, m193 retired.
+  - Determinism: final scoring of run 4 `cmp`-identical twice; runs 2 and 3 identical earlier.
+  - Gate self-tests on the real scoreboard.
+  - Real-Docker 1,094/0/0 (rb-bench's 51 tests after amendment 4).
+  - The `rb` binary is byte-identical to M7's (invariant vacuous, L489).
+- **Files:** `crates/rb-bench/{Cargo.toml,src/{lib,dump,identity,score,scoreboard,compare,render,run,scip_ref,pycg,main}.rs}`, `Cargo.lock`, `bench/{manifest.tsv,fetch.sh,run.sh,cleanup.sh,mutants/{run.py,m8a.json},scoreboard/{m8a,m8a-perf}.json}`, `README.md`, `docs/usage-and-testing.md`; records `tasks/{contract-m8a,contract-m8b,eval-m8a-pass1,eval-m8a-pass2,bench-findings,todo,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-10-13] (wall clock) M7 CLOSED (evaluator passes 1–2)
 - **Pass 1** (`tasks/eval-m7-pass1.md`): FAIL, 17 findings (0 S1). Answered by M7j.
 - **Pass 2** (`tasks/eval-m7-pass2.md`): FAIL with 1 blocking item, a records error (U2 marked done), now marked ◐. Every code fix of M7j was reproduced against the release binary. 14 items resolved, 2 accepted as recorded residue. 4 new S4 items: the binary of record rebuilt after the `PIPELINE` bump (lesson added), E6's wording corrected, two residues recorded.

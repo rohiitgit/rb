@@ -1,0 +1,345 @@
+[
+ {
+  "id": "m151",
+  "file": "dump.rs",
+  "old": "Some(DUMP_VERSION) => Ok(commit.clone()),",
+  "new": "Some(_) => Ok(commit.clone()),",
+  "what": "any dump version accepted"
+ },
+ {
+  "id": "m152",
+  "file": "dump.rs",
+  "old": "Some(\"D\") if row.len() == 5 => {}",
+  "new": "Some(\"D\") => {}",
+  "what": "D rows of any shape"
+ },
+ {
+  "id": "m153",
+  "file": "identity.rs",
+  "old": "                ls[0].clone()\n            });",
+  "new": "                ls[ls.len() - 1].clone()\n            });",
+  "what": "highest definition site"
+ },
+ {
+  "id": "m154",
+  "file": "identity.rs",
+  "old": "holders[l] > 1",
+  "new": "holders[l] > 2",
+  "what": "collision needs three"
+ },
+ {
+  "id": "m155",
+  "file": "identity.rs",
+  "old": "x.certainty = x.certainty.max(found.certainty);",
+  "new": "x.certainty = x.certainty.min(found.certainty);",
+  "what": "merge keeps lowest certainty"
+ },
+ {
+  "id": "m156",
+  "file": "identity.rs",
+  "old": "Class::Calls => e.kind == EdgeKind::Calls && e.src_kind != NodeKind::File,",
+  "new": "Class::Calls => e.kind == EdgeKind::Calls,",
+  "what": "calls include file sources"
+ },
+ {
+  "id": "m157",
+  "file": "identity.rs",
+  "old": "line: line + 1,",
+  "new": "line,",
+  "what": "0-based line"
+ },
+ {
+  "id": "m158",
+  "file": "score.rs",
+  "old": "(Scope::Out(r), _) => bump(&mut cell.out_of_scope, r.to_owned()),",
+  "new": "(Scope::Out(_), _) => cell.fn_ += 1,",
+  "what": "out-of-scope gold as fn"
+ },
+ {
+  "id": "m159",
+  "file": "score.rs",
+  "old": "if !gold.located.contains_key(id) {",
+  "new": "if true {",
+  "what": "gold edges also fp"
+ },
+ {
+  "id": "m160",
+  "file": "score.rs",
+  "old": ".filter(|(id, _)| gold.located.contains_key(id))",
+  "new": ".filter(|(id, _)| !gold.located.contains_key(id))",
+  "what": "ambiguous hit inverted"
+ },
+ {
+  "id": "m161",
+  "file": "score.rs",
+  "old": "} else if self.tp_total() + self.fp_total() == 0 {",
+  "new": "} else if self.fp_total() == 0 {",
+  "what": "flagged ignores tp"
+ },
+ {
+  "id": "m162",
+  "file": "score.rs",
+  "old": "Scope::Out(r) => bump(&mut cell.found_out_of_scope, r.to_owned()),",
+  "new": "Scope::Out(r) => {\n                bump(&mut cell.found_out_of_scope, r.to_owned());\n                in_scope.push((id, f));\n            }",
+  "what": "out-of-scope edges enter ambiguous sites"
+ },
+ {
+  "id": "m163",
+  "file": "score.rs",
+  "old": ".filter(|(id, _)| gold.located.contains_key(id))",
+  "new": ".filter(|(id, f)| gold.located.contains_key(id) && f.certainty == Certainty::Ambiguous)",
+  "what": "hits only from ambiguous-certainty edges"
+ },
+ {
+  "id": "m164",
+  "file": "identity.rs",
+  "old": ".is_ok_and(|ls| ls.iter().any(|l| holders[l] > 1))",
+  "new": ".is_ok_and(|ls| holders[&ls[0]] > 1)",
+  "what": "collision ignores alias sites"
+ },
+ {
+  "id": "m165",
+  "file": "identity.rs",
+  "old": "let line = u32::try_from(span[0]).map_err(|_| reason::NEGATIVE_SPAN)?;",
+  "new": "let line = u32::try_from(span[0]).unwrap_or(0);",
+  "what": "negative span located"
+ },
+ {
+  "id": "m166",
+  "file": "identity.rs",
+  "old": "Class::Calls => e.kind == EdgeKind::Calls && e.src_kind != NodeKind::File,",
+  "new": "Class::Calls => e.kind == EdgeKind::Calls && e.src_kind == NodeKind::Symbol,",
+  "what": "other-kind sources dropped"
+ },
+ {
+  "id": "m167",
+  "file": "identity.rs",
+  "old": "self.aliases.get(loc).unwrap_or(loc).clone()",
+  "new": "loc.clone()",
+  "what": "aliases ignored"
+ },
+ {
+  "id": "m168",
+  "file": "compare.rs",
+  "old": "if hc.tp_total() < bc.tp_total() {",
+  "new": "if false {",
+  "what": "tp drop not a regression"
+ },
+ {
+  "id": "m169",
+  "file": "compare.rs",
+  "old": "                c == Certainty::Exact,",
+  "new": "                false,",
+  "what": "exact fp acceptable"
+ },
+ {
+  "id": "m170",
+  "file": "compare.rs",
+  "old": "            let (x, y) = (count(bm, r), count(hm, r));\n            if y > x {",
+  "new": "            let (x, y) = (count(bm, r), count(hm, r));\n            if y > x + 1 {",
+  "what": "reason count rise by one ignored"
+ },
+ {
+  "id": "m171",
+  "file": "compare.rs",
+  "old": "if hc.gold < bc.gold {",
+  "new": "if false {",
+  "what": "gold drop ignored"
+ },
+ {
+  "id": "m172",
+  "file": "compare.rs",
+  "old": "if y.files * x.of < x.files * y.of",
+  "new": "if y.files * x.of > x.files * y.of",
+  "what": "coverage direction inverted"
+ },
+ {
+  "id": "m173",
+  "file": "compare.rs",
+  "old": "hc.ambiguous_hits * bs < bc.ambiguous_hits * hs",
+  "new": "hc.ambiguous_hits * bs > bc.ambiguous_hits * hs",
+  "what": "ambiguous rate direction inverted"
+ },
+ {
+  "id": "m174",
+  "file": "compare.rs",
+  "old": "if sh != sb && sh != Status::Scored {",
+  "new": "if sh != sb && sh == Status::Scored {",
+  "what": "status regression inverted"
+ },
+ {
+  "id": "m175",
+  "file": "compare.rs",
+  "old": "            let (x, y) = (b.get(name), h.get(name));\n            if x != y {",
+  "new": "            let (x, y) = (b.get(name), h.get(name));\n            if false && x != y {",
+  "what": "pins/keys unchecked"
+ },
+ {
+  "id": "m176",
+  "file": "compare.rs",
+  "old": "if ms == milestone {",
+  "new": "if true {",
+  "what": "stale accept lines applied"
+ },
+ {
+  "id": "m177",
+  "file": "compare.rs",
+  "old": "            None => vec![Worse {\n                what: \"cell vanished\".to_owned(),\n                exact_fp: false,\n            }],",
+  "new": "            None => vec![],",
+  "what": "vanished cell ignored"
+ },
+ {
+  "id": "m178",
+  "file": "compare.rs",
+  "old": "h.wall_s > 1.25 * b.wall_s",
+  "new": "h.wall_s > 2.5 * b.wall_s",
+  "what": "wall threshold doubled"
+ },
+ {
+  "id": "m179",
+  "file": "compare.rs",
+  "old": "if base.hardware != head.hardware {",
+  "new": "if false {",
+  "what": "perf across hardware"
+ },
+ {
+  "id": "m180",
+  "file": "compare.rs",
+  "old": "Some(reason) if !w.exact_fp => {",
+  "new": "Some(reason) => {",
+  "what": "accept excuses exact fp"
+ },
+ {
+  "id": "m181",
+  "file": "scoreboard.rs",
+  "old": "if cells.insert(row.key, record).is_some() {",
+  "new": "if cells.insert(row.key, record).is_some() && false {",
+  "what": "duplicate cells accepted"
+ },
+ {
+  "id": "m182",
+  "file": "scoreboard.rs",
+  "old": "&& r.cell.status() != Status::Vacuous",
+  "new": "&& true",
+  "what": "vacuous cells count as measured"
+ },
+ {
+  "id": "m183",
+  "file": "scoreboard.rs",
+  "old": "if schema != Some(SCHEMA) {",
+  "new": "if false {",
+  "what": "any schema read"
+ },
+ {
+  "id": "m184",
+  "file": "render.rs",
+  "old": "            Status::Flagged => 1,\n            Status::Vacuous => 2,",
+  "new": "            Status::Flagged => 2,\n            Status::Vacuous => 1,",
+  "what": "flagged/vacuous columns swapped"
+ },
+ {
+  "id": "m185",
+  "file": "scip_ref.rs",
+  "old": "if e.src_key.starts_with(\"scip-\") {",
+  "new": "if e.src_key.starts_with(\"rb-\") {",
+  "what": "coverage from heuristic keys"
+ },
+ {
+  "id": "m186",
+  "file": "scip_ref.rs",
+  "old": ".filter(|e| e.kind != EdgeKind::Calls || e.provenance == Provenance::Scip)",
+  "new": ".filter(|e| e.kind != EdgeKind::Calls || true)",
+  "what": "heuristic rows of the SCIP dump become reference"
+ },
+ {
+  "id": "m187",
+  "file": "scip_ref.rs",
+  "old": "if covered.contains(id.src.path.as_str()) && covered.contains(id.dst.path.as_str()) {",
+  "new": "if covered.contains(id.src.path.as_str()) {",
+  "what": "uncovered targets in scope"
+ },
+ {
+  "id": "m188",
+  "file": "pycg.rs",
+  "old": ".strip_suffix(\"/__init__\")",
+  "new": ".strip_suffix(\"/__nope__\")",
+  "what": "package __init__ not the package"
+ },
+ {
+  "id": "m189",
+  "file": "pycg.rs",
+  "old": "let callable = steps.iter().rposition(|s| matches!(s, Step::Callable(_)));",
+  "new": "let callable = steps.iter().position(|s| matches!(s, Step::Callable(_)));",
+  "what": "outermost callable as caller"
+ },
+ {
+  "id": "m190",
+  "file": "pycg.rs",
+  "old": "Caller::Module(path) => (Class::CallsFileScope, Loc::file(path)),",
+  "new": "Caller::Module(path) => (Class::Calls, Loc::file(path)),",
+  "what": "module-level terms stay in calls"
+ },
+ {
+  "id": "m191",
+  "file": "pycg.rs",
+  "old": "if callee.starts_with(\"<builtin>\") {",
+  "new": "if callee.starts_with(\"<nope>\") {",
+  "what": "builtins not recognised"
+ },
+ {
+  "id": "m192",
+  "file": "pycg.rs",
+  "old": "if callee.contains(\"<lambda\") {",
+  "new": "if callee.contains(\"<nope\") {",
+  "what": "lambdas not recognised"
+ },
+ {
+  "id": "m194",
+  "file": "run.rs",
+  "old": ".filter(|c| !pycg_dump(out, c).exists())",
+  "new": ".filter(|c| false && !pycg_dump(out, c).exists())",
+  "what": "missing dumps unchecked"
+ },
+ {
+  "id": "m195",
+  "file": "run.rs",
+  "old": "key.update(callgraph.as_bytes());",
+  "new": "",
+  "what": "key hash ignores content"
+ },
+ {
+  "id": "m196",
+  "file": "run.rs",
+  "old": "let valid_sha = sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit());",
+  "new": "let valid_sha = true;",
+  "what": "any sha accepted"
+ },
+ {
+  "id": "m197",
+  "file": "pycg.rs",
+  "old": "if caller.contains(\"<lambda\") {",
+  "new": "if caller.contains(\"<nope\") {",
+  "what": "lambda callers unmatchable"
+ },
+ {
+  "id": "m198",
+  "file": "pycg.rs",
+  "old": "marked(&id.src).or_else(|| marked(&id.dst))",
+  "new": "marked(&id.dst)",
+  "what": "scope reads the callee only"
+ },
+ {
+  "id": "m199",
+  "file": "scip_ref.rs",
+  "old": "dst: locator.canonical(&id.dst),",
+  "new": "dst: id.dst.clone(),",
+  "what": "Tier B targets not mapped to SCIP aliases"
+ },
+ {
+  "id": "m200",
+  "file": "compare.rs",
+  "old": "        if y < x {\n            add(format!(\"tp at or above",
+  "new": "        if y > x {\n            add(format!(\"tp at or above",
+  "what": "certainty downgrade inverted"
+ }
+]

@@ -1,0 +1,56 @@
+# The accuracy benchmark's pinned inputs (contract M8a, S7). One row per target; tab-separated.
+# name: [a-z0-9_]; the DB repository is bench_<name>_<mode>.
+# kind: stress (a real repo, scored by SCIP agreement and timed) or pycg (the PyCG micro-benchmark).
+# modes: comma-separated, from noscip and scip.
+# Stress pins are the stress campaign's (tasks/stress-findings.md; var/stress/repos.tsv), mattermost M5's.
+name	kind	url	sha	modes
+microservices_demo	stress	https://github.com/GoogleCloudPlatform/microservices-demo.git	38e7348eb289eb5b87c0c6e8cb19ced0449dc389	noscip,scip
+spring_boot_microservices	stress	https://github.com/sivaprasadreddy/spring-boot-microservices-course.git	5899a53015228692410b8120df82924e665a5d70	noscip,scip
+express_ts_boilerplate	stress	https://github.com/w3tecch/express-typescript-boilerplate.git	17727010f7f098d8ca8b78da0a5b3c7297659381	noscip,scip
+bookcars	stress	https://github.com/aelassas/bookcars.git	4ea6c110eac5c835323102dc4f654263dea98c2c	noscip,scip
+go_gin_example	stress	https://github.com/eddycjy/go-gin-example.git	4f5174ca325b37f23edadad7c88d49586816a69c	noscip,scip
+go_clean_arch	stress	https://github.com/bxcodec/go-clean-arch.git	e06c6d0cb37069b0ef56e3df67f80ca130a1ab82	noscip,scip
+fastapi_realworld	stress	https://github.com/nsidnev/fastapi-realworld-example-app.git	029eb7781c60d5f563ee8990a0cbfb79b244538c	noscip,scip
+microblog	stress	https://github.com/miguelgrinberg/microblog.git	a975ef64864354867c88e0ed3a17ba7d17dca752	noscip,scip
+nestjs_realworld	stress	https://github.com/lujakob/nestjs-realworld-example-app.git	c1c2cc4e448b279ff083272df1ac50d20c3304fa	noscip,scip
+eshop_on_web	stress	https://github.com/dotnet-architecture/eShopOnWeb.git	4da8212117e87d808d4bbc7da6286fd2147ce606	noscip
+kotlin_spring_realworld	stress	https://github.com/gothinkster/kotlin-spring-realworld-example-app.git	848c29e3abfe1bd72001cc7d7a3227aebec96e9b	noscip,scip
+laravel_realworld	stress	https://github.com/alexeymezenin/laravel-realworld-example-app.git	1f482bfe92e0419ab5b9bb7c4c01b9e776c020b1	noscip
+mattermost	stress	https://github.com/mattermost/mattermost.git	b2ce71db9c18e547ab0c8b042361798201c0f735	noscip,scip
+pycg	pycg	https://github.com/vitsalis/PyCG.git	8d5dc40837803beef1d8d379fbf2cdad6cd94641	noscip
+# microSecEnD applications (contract M8b, T1, D1): pinned and checked by bench/pin_microsecend.py.
+# microSecEnD dataset 63653e09177b6d757eada4521f8bace8a8c20766 (Apache-2.0); pins by D1 (bench/pin_microsecend.py)
+# mse_anilallewar anilallewar/microservices-basics-spring-boot: branch master, model added 2023-01-26, pin ac0a24915647, evidence resolved 52/54 (96.3 %), 17 dataset errors, 17 heuristic/implicit: kept
+mse_anilallewar	microsecend	https://github.com/anilallewar/microservices-basics-spring-boot.git	ac0a249156471ad98fa5ba5508fda9deabba6975	noscip
+# mse_apssouza22 apssouza22/java-microservice: branch master, model added 2023-01-26, pin 9172a9004dd9, evidence resolved 63/77 (81.8 %), 0 dataset errors, 17 heuristic/implicit: EXCLUDED
+# mse_callista callistaenterprise/blog-microservices: branch master, model added 2023-01-26, pin 1681bdb6b1b0, evidence resolved 81/81 (100.0 %), 6 dataset errors, 25 heuristic/implicit, JSON repaired: kept
+mse_callista	microsecend	https://github.com/callistaenterprise/blog-microservices.git	1681bdb6b1b0c64147d059f2c2e04726bce8e2f4	noscip
+# mse_ewolff ewolff/microservice: branch master, model added 2023-01-26, pin d1ccf504df56, evidence resolved 27/31 (87.1 %), 0 dataset errors, 12 heuristic/implicit: EXCLUDED
+# mse_ewolff_kafka ewolff/microservice-kafka: branch master, model added 2023-01-26, pin 27f3a13dfb2f, evidence resolved 20/25 (80.0 %), 2 dataset errors, 14 heuristic/implicit: EXCLUDED
+# mse_fernandoabcampos fernandoabcampos/spring-netflix-oss-microservices: branch master, model added 2023-01-26, pin 8668c4dffd94, evidence resolved 34/34 (100.0 %), 15 dataset errors, 16 heuristic/implicit: kept
+mse_fernandoabcampos	microsecend	https://github.com/fernandoabcampos/spring-netflix-oss-microservices.git	8668c4dffd9464b5d724f4d1a9547e029ee03d12	noscip
+# mse_georgwittberger georgwittberger/apache-spring-boot-microservice-example: branch master, model added 2023-01-26, pin 5b97bd98fce6, evidence resolved 10/12 (83.3 %), 0 dataset errors, 10 heuristic/implicit, JSON repaired: EXCLUDED
+# mse_jferrater jferrater/Tap-And-Eat-MicroServices: branch master, model added 2023-01-26, pin 3ad20b8fa421, evidence resolved 38/38 (100.0 %), 0 dataset errors, 9 heuristic/implicit: kept
+mse_jferrater	microsecend	https://github.com/jferrater/Tap-And-Eat-MicroServices.git	3ad20b8fa421dc837ef423270a9bf9ece1615a03	noscip
+# mse_koushikkothagal koushikkothagal/spring-boot-microservices-workshop: branch master, model added 2023-01-26, pin 8b01c6d153f7, evidence resolved 17/18 (94.4 %), 0 dataset errors, 4 heuristic/implicit: kept
+mse_koushikkothagal	microsecend	https://github.com/koushikkothagal/spring-boot-microservices-workshop.git	8b01c6d153f7b6aee49fa91a5b1c62c1a0c09408	noscip
+# mse_mdeket mdeket/spring-cloud-movie-recommendation: branch master, model added 2023-01-26, pin 5aa5ee9e2e64, evidence resolved 28/29 (96.6 %), 11 dataset errors, 12 heuristic/implicit: kept
+mse_mdeket	microsecend	https://github.com/mdeket/spring-cloud-movie-recommendation.git	5aa5ee9e2e64c33e294409e39cb9708591230e08	noscip
+# mse_mudigal mudigal-technologies/microservices-sample: branch master, model added 2023-01-26, pin 18c297697d6e, evidence resolved 44/48 (91.7 %), 4 dataset errors, 35 heuristic/implicit: kept
+mse_mudigal	microsecend	https://github.com/mudigal-technologies/microservices-sample.git	18c297697d6eb4fbdd280ac98609f3e06dccbbcc	noscip
+# mse_piomin piomin/sample-spring-oauth2-microservices: branch with_database, model added 2023-01-26, pin fd577d98413f, evidence resolved 40/40 (100.0 %), 0 dataset errors, 11 heuristic/implicit: kept
+mse_piomin	microsecend	https://github.com/piomin/sample-spring-oauth2-microservices.git	fd577d98413fa43910aaebabddfa3b02e551c864	noscip
+# mse_rohitghatol rohitghatol/spring-boot-microservices: branch master, model added 2023-01-26, pin a3c9df9350a0, evidence resolved 39/39 (100.0 %), 24 dataset errors, 16 heuristic/implicit: kept
+mse_rohitghatol	microsecend	https://github.com/rohitghatol/spring-boot-microservices.git	a3c9df9350a07578df281949e6018d01ac37238e	noscip
+# mse_shabbirdwd53 shabbirdwd53/Springboot-Microservice: branch main, model added 2023-01-26, pin e0faba5a247e, evidence resolved 39/39 (100.0 %), 0 dataset errors, 14 heuristic/implicit: kept
+mse_shabbirdwd53	microsecend	https://github.com/shabbirdwd53/Springboot-Microservice.git	e0faba5a247ebb0cbd2ee14a10f115d689aa9ed6	noscip
+# mse_petclinic spring-petclinic/spring-petclinic-microservices: branch main, model added 2023-01-26, pin ec7ea229bb84, evidence resolved 33/41 (80.5 %), 18 dataset errors, 17 heuristic/implicit: EXCLUDED
+# mse_piggymetrics sqshq/piggymetrics: branch master, model added 2023-01-26, pin 6bb2cf9ddbca, evidence resolved 90/90 (100.0 %), 2 dataset errors, 24 heuristic/implicit: kept
+mse_piggymetrics	microsecend	https://github.com/sqshq/piggymetrics.git	6bb2cf9ddbca980b664d3edbb6ff775d75369278	noscip
+# mse_yidongnan yidongnan/spring-cloud-netflix-example: branch master, model added 2023-01-26, pin 3b86bf0e20a7, evidence resolved 58/60 (96.7 %), 0 dataset errors, 15 heuristic/implicit: kept
+mse_yidongnan	microsecend	https://github.com/yidongnan/spring-cloud-netflix-example.git	3b86bf0e20a7c7da8f4e3e7e2cb15bf4cd407743	noscip
+microsecend	dataset	https://github.com/tuhh-softsec/microSecEnD.git	63653e09177b6d757eada4521f8bace8a8c20766	-
+# Hand-key targets (contract M8b, D3): chosen by rule, pinned before rb first ran on them (2026-10-14).
+# Their answer keys are bench/keys/<name>/key.txt; spring_boot_microservices (above) is the dev set.
+hk_polls	handkey	https://github.com/callicoder/spring-security-react-ant-design-polls-app.git	362fad90cab17e76453b3b9e273c594de6ee3d7f	noscip
+hk_todo	handkey	https://github.com/zhashkevych/todo-app.git	1789ed69bd5f449bd605e23a92a1e87a83cb9fda	noscip

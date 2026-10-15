@@ -1,0 +1,42 @@
+# Hand key: spring_boot_microservices @ 5899a53015228692410b8120df82924e665a5d70
+# Services: api-gateway (config-only routes, no code handlers), bookstore-webapp,
+# catalog-service, order-service, notification-service (no controllers).
+# No service sets server.servlet.context-path.
+
+# ---- ENDPOINT: bookstore-webapp ----
+ENDPOINT GET / bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/ProductController.java:24
+ENDPOINT GET /products bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/ProductController.java:29
+ENDPOINT GET /api/products bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/ProductController.java:36
+ENDPOINT GET /cart bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/OrderController.java:34
+ENDPOINT POST /api/orders bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/OrderController.java:40
+ENDPOINT GET /orders/{orderNumber} bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/OrderController.java:46
+ENDPOINT GET /api/orders/{orderNumber} bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/OrderController.java:53
+ENDPOINT GET /orders bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/OrderController.java:59
+ENDPOINT GET /api/orders bookstore-webapp/src/main/java/com/sivalabs/bookstore/webapp/web/controllers/OrderController.java:65
+
+# ---- ENDPOINT: catalog-service ----
+ENDPOINT GET /api/products catalog-service/src/main/java/com/sivalabs/bookstore/catalog/web/controllers/ProductController.java:27
+ENDPOINT GET /api/products/{code} catalog-service/src/main/java/com/sivalabs/bookstore/catalog/web/controllers/ProductController.java:33
+
+# ---- ENDPOINT: order-service ----
+ENDPOINT POST /api/orders order-service/src/main/java/com/sivalabs/bookstore/orders/web/controllers/OrderController.java:40
+ENDPOINT GET /api/orders order-service/src/main/java/com/sivalabs/bookstore/orders/web/controllers/OrderController.java:47
+ENDPOINT GET /api/orders/{orderNumber} order-service/src/main/java/com/sivalabs/bookstore/orders/web/controllers/OrderController.java:54
+
+# ---- QUERIES ----
+QUERIES products read catalog-service/src/main/java/com/sivalabs/bookstore/catalog/domain/ProductRepository.java:7
+QUERIES products insert catalog-service/src/main/resources/db/migration/V2__add_books_data.sql:0
+QUERIES order_events read notification-service/src/main/java/com/sivalabs/bookstore/notifications/domain/OrderEventRepository.java:6
+QUERIES orders read order-service/src/main/java/com/sivalabs/bookstore/orders/domain/OrderRepository.java:11
+QUERIES orders read order-service/src/main/java/com/sivalabs/bookstore/orders/domain/OrderRepository.java:13
+QUERIES orders read order-service/src/main/java/com/sivalabs/bookstore/orders/domain/OrderRepository.java:26
+QUERIES orders read order-service/src/main/java/com/sivalabs/bookstore/orders/domain/OrderRepository.java:33
+# uncertain: JPQL "left join fetch o.items" reads the order_items table
+QUERIES order_items read order-service/src/main/java/com/sivalabs/bookstore/orders/domain/OrderRepository.java:33
+
+# ---- MAPS ----
+MAPS products catalog-service/src/main/java/com/sivalabs/bookstore/catalog/domain/ProductEntity.java:17
+MAPS order_events notification-service/src/main/java/com/sivalabs/bookstore/notifications/domain/OrderEventEntity.java:14
+MAPS orders order-service/src/main/java/com/sivalabs/bookstore/orders/domain/OrderEntity.java:25
+MAPS order_items order-service/src/main/java/com/sivalabs/bookstore/orders/domain/OrderItemEntity.java:16
+MAPS order_events order-service/src/main/java/com/sivalabs/bookstore/orders/domain/OrderEventEntity.java:17
