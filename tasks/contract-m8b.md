@@ -1,6 +1,6 @@
 # M8b contract: an accuracy benchmark with answer keys, part 2 (2026-10-13)
 
-**Status:** contract written 2026-10-13 from M8a's Part 2 plan (`tasks/contract-m8a.md`) and M8a's result; implemented 2026-10-14 (amendment 1) on branch `m8`, after the M8a commit `6c059ea`. Evaluator pass 1 (`tasks/eval-m8b-pass1.md`) FAIL answered 2026-10-15 (amendment 2); close after a verification-only re-check.
+**Status:** contract written 2026-10-13 from M8a's Part 2 plan (`tasks/contract-m8a.md`) and M8a's result; implemented 2026-10-14 (amendment 1) on branch `m8`, after the M8a commit `6c059ea`. Evaluator pass 1 (`tasks/eval-m8b-pass1.md`) FAIL answered 2026-10-15 (amendment 2). Evaluator pass 2 (`tasks/eval-m8b-pass2.md`, verification-only re-check) VERDICT PASS 2026-10-16; **M8b closed** (1 prose should-fix and 4 notes answered: B12 piggymetrics, `?` doc comments, removal counts).
 
 ## Why
 
@@ -110,7 +110,7 @@ MAPS <table> <file>:<entity class line>
   - **Files:** one `key.txt` per target (not separate `endpoints`/`tables` files). The labeller's reasoning is in `labelling.md`.
   - **Transcripts:** raw transcripts stay in `var/bench/labels/<target>/`, because they contain whole third-party source files. The committed record is `labelling.md`, `adjudication.md` and the audit (each transcript touched no path outside its checkout and its own output files).
   - **Adjudication:** the effective key is `key.txt` plus `adjudication.md`'s append-only `- ADD`/`- REMOVE` entries. `bench/adjudicate.py` replays the verdicts, and a self-test target showed it emits every entry kind.
-  - **Statements:** produced by `rb-bench statements`. Disputes and about one in five agreements are written alike in hash order. Lines use `?` where a side states no handler and `*` where it states no ops.
+  - **Statements:** produced by `rb-bench statements`. Disputes and about one in five agreements are written alike in hash order, existence as `*` (no bare `?`). Lines use `*` where a side states no ops.
 - **T5:**
   - **Identity:** verdicts are keyed by rb's own edge identity (`rb_model::diff::EdgeId`), not by location, so `MIGRATES` and `DEPENDS_ON` (to tables, to packages) carry over too.
   - **Families:** `manifest` is `DEPENDS_ON` from a manifest; `routes` is `EXPOSES`/`HANDLED_BY`; `scip` is drawn from SCIP dumps, the rest from `noscip`.
@@ -122,7 +122,8 @@ MAPS <table> <file>:<entity class line>
 
 - **F1 (blocking) + F2, microSecEnD overrides.** The evaluator's 6 wrong-path
   endpoints (piggymetrics context-path, B14) and 19 model artifacts (bare
-  class prefixes, Feign-client paths on the wrong service) are confirmed
+  class prefixes, Feign-client paths on the wrong service; 17 removed, 2 kept
+  in gold as fn) are confirmed
   against the source at each pin and corrected by append-only override files,
   replayed by the amendment-1 mechanism (`msecend::apply_overrides`,
   `run.rs:325-330`):
@@ -227,7 +228,7 @@ Scoreboard m8b (rb e08efcb801c28422afab450251ee0ba093cd57f3, binary a038653b8478
   - handler bindings 26 of 39: 12 of hk_todo's 13 routes use gin method values (B9; the 13th is the `/swagger/*any` library handler);
   - table access 24 of 54: hk_todo's `fmt.Sprintf` SQL, B10.
 - **microSecEnD:**
-  - endpoints: precision 88.7 %, recall 75.8 % (62 gold after 19 key-error removals; 6 fp are the unprefixed context-path forms; 15 fn are 4 true prefixed paths rb misses, 4 no-leading-slash joins, 5 Spring Data REST, and 2 already-listed prefixed forms rb misses);
+  - endpoints: precision 88.7 %, recall 75.8 % (62 gold after 23 removals: 6 context-path forms and 17 key errors, with 2 further artifacts kept in gold as fn; 6 fp are the unprefixed context-path forms; 15 fn are 4 true prefixed paths rb misses, 4 no-leading-slash joins, 5 Spring Data REST, and 2 already-listed prefixed forms rb misses);
   - service flows: 4 of the 14 the key can judge (B12).
 
 **By claim:**

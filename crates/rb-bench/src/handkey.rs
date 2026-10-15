@@ -268,8 +268,8 @@ fn sampled(text: &str) -> bool {
 }
 
 /// The statements an adjudicator judges (T4): every fact on which the key and rb disagree, and
-/// about one in five on which they agree, each written as a key line (`?` where a side states no
-/// handler, `*` where it states no ops), deduplicated and ordered by a hash. Nothing says which
+/// about one in five on which they agree, each written as a key line (existence as `*`,
+/// `*` where a side states no ops), deduplicated and ordered by a hash. Nothing says which
 /// side made a statement, and agreements read exactly like disagreements.
 pub fn statements(key: &[KeyLine], dump: &Dump) -> Vec<String> {
     use sha2::{Digest, Sha256};

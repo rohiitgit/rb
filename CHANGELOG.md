@@ -7,7 +7,7 @@
   - **The `exact` sample:** 249 edges in 5 families judged against the source (`bench/samples/exact.tsv`), with Wilson intervals. The gate refuses a missing verdict or a new wrong `exact` edge.
 - **Scoreboard** (`bench/scoreboard/m8b.json`, the same M7 binary):
   - `exact` is right on 122 of 130 independently judged edges (6 misses from unapplied config-server context paths, 2 from test-code routes), and the sample bounds every family above 86 % (`orm`, with only 9 edges, above 70 %). The certainty table counts `table_ops` rows once (`synthetic` 16 of 24) and every other label but `dispatch` (not stored) is measured.
-  - microSecEnD endpoints: precision 88.7 %, recall 75.8 % after 19 key-error removals through append-only overrides (`bench/keys/microsecend/*.md`).
+  - microSecEnD endpoints: precision 88.7 %, recall 75.8 % after 23 removals through append-only overrides (`bench/keys/microsecend/*.md`: 6 context-path forms, 17 key errors; 2 further artifacts stay in gold as fn).
   - The 260 M8a cells are unchanged.
 - **Findings B7–B14:**
   - routes in test code exposed as `exact`;

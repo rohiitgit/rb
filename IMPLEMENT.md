@@ -799,12 +799,12 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - **The `exact` sample:** 249 judged edges.
 - **Built:** `structural.rs` (identity for endpoints, handlers, tables and services), `msecend.rs`, `handkey.rs`, `sample.rs`; the `statements` and `sample` commands; `bench/pin_microsecend.py` and `bench/adjudicate.py`.
 - **Results:**
-  - `bench/scoreboard/m8b.json` (amendment 2 re-score `d7346ffb…`: microsecend endpoints P 88.7 % R 75.8 % after 19 key-error removals; `exact` 122/130);
+  - `bench/scoreboard/m8b.json` (amendment 2 re-score `d7346ffb…`: microsecend endpoints P 88.7 % R 75.8 % after 23 removals; `exact` 122/130);
   - findings B7–B14 in `tasks/bench-findings.md` (B14: config-server context paths).
 - **Verification:**
   - Mutants m201–m229 (29 specs, full battery re-run, all killed).
   - Determinism (`cmp`-identical twice, accuracy and perf).
   - Real-Docker 1,122/0/0.
   - Evaluator pass 1 (`tasks/eval-m8b-pass1.md`) FAIL answered by amendment 2 (6 override files, 3 second adjudications, corrected Result/B11/B12/CHANGELOG); close after a verification-only re-check.
-- **Status:** complete pending that re-check. M8 (benchmark) is done; the rb fixes it found (B1, B4, B7–B10, B12–B14) are input for the next rb milestone.
+- **Status:** closed 2026-10-16 on evaluator pass 2 (`tasks/eval-m8b-pass2.md`) VERDICT PASS (1 prose should-fix, 4 notes, all answered). M8 (benchmark) is done; the rb fixes it found (B1, B4, B7–B10, B12–B14) are input for the next rb milestone.
 
