@@ -390,7 +390,7 @@ fn param_compositions<'a>(
         return out;
     }
     for (path2, (language, facts)) in inputs.files {
-        if *language != Language::Go {
+        if *language != Language::Go || !serves(path2) {
             continue;
         }
         let scope = FileScope::new(facts);
@@ -464,17 +464,41 @@ fn join_prefix(prefix: &str, path: &str) -> String {
     }
 }
 
+/// Whether a file's routes can serve: test code serves nothing (contract M9a D1).
+fn serves(path: &str) -> bool {
+    !rb_model::is_test_path(path)
+}
+
 /// Adds every endpoint with its edges; returns the route diagnostics and the endpoints, in key
 /// order.
 pub(crate) fn add_endpoints(
     b: &mut GraphBuilder,
     inputs: &Inputs<'_, '_>,
 ) -> anyhow::Result<(Vec<Diagnostic>, Vec<EndpointRef>)> {
+    let mut diagnostics = Vec::new();
+    // Every reader below (routes, routers and mounts, gin compositions, interface routes, gRPC
+    // servers) sees production files only; gin call sites are filtered where they are found.
+    let mut production: BTreeMap<&str, FileRoutes> = BTreeMap::new();
+    for (&path, file) in inputs.routes {
+        if serves(path) {
+            production.insert(path, file.clone());
+        } else if !file.routes.is_empty() {
+            diagnostics.push(Diagnostic {
+                kind: "routes_in_test_code".to_owned(),
+                path: Some(path.to_owned()),
+                span: None,
+                detail: json!({ "routes": file.routes.len() }),
+            });
+        }
+    }
+    let inputs = &Inputs {
+        routes: &production,
+        ..*inputs
+    };
     let mut composer = Composer::new(inputs);
     // gin parameter groups composed from their call sites (contract M6b S2).
     let param_composed = param_compositions(inputs);
     let mut endpoints: BTreeMap<String, Endpoint> = BTreeMap::new();
-    let mut diagnostics = Vec::new();
     let diag = |kind: &str, path: &str, span: Span, detail: serde_json::Value| Diagnostic {
         kind: kind.to_owned(),
         path: Some(path.to_owned()),
@@ -687,8 +711,8 @@ struct Declared<'s> {
 /// Spec operations and proto RPCs as endpoint registrations under the shared key space, so a
 /// code route for the same method+path joins its handler for free (contract M6f S3/S4).
 /// Unreadable specs are counted (`openapi_unread`); specs outside any project stay
-/// endpoint-less and counted; operations with no code route are kept, exact, unhandled and
-/// counted per registration.
+/// endpoint-less and counted; operations with no code route are kept, `synthetic` (proto RPCs
+/// `exact`), unhandled and counted per registration.
 fn add_spec_endpoints(
     b: &GraphBuilder,
     endpoints: &mut BTreeMap<String, Endpoint>,
@@ -850,8 +874,10 @@ fn add_spec_endpoints(
                 e.operations.insert(op.operation.clone());
             }
             e.any_host = true;
+            // A stated document, not a served route (contract M9a D2): the endpoint is `exact`
+            // only when a code registration joins it.
             e.registrations.push(Registration {
-                path_certainty: Certainty::Exact,
+                path_certainty: Certainty::Synthetic,
                 handler: Vec::new(),
                 candidates: 0,
                 at: Evidence {
@@ -2004,9 +2030,73 @@ mod tests {
         );
     }
 
+    /// Contract M9a D1 (bench B7): test files feed no endpoint, prefix or composition; each one
+    /// with route facts is counted once, and its other route diagnostics are not emitted.
+    #[test]
+    fn routes_in_test_files_are_not_endpoints() {
+        let gin = "package main\nimport \"github.com/gin-gonic/gin\"\nfunc Register(router *gin.RouterGroup) {\n\trouter.GET(\"/login\", Login)\n}\nfunc Login(c *gin.Context) {\n}\nfunc main() {\n\tr := gin.Default()\n\tr.GET(\"/ping\", Login)\n\tRegister(r.Group(\"/api\"))\n}\n";
+        let gin_test = "package main\nimport \"github.com/gin-gonic/gin\"\nfunc TestRoutes() {\n\tr := gin.Default()\n\tr.GET(\"/identity\", Login)\n\tRegister(r.Group(\"/t\"))\n}\n";
+        let spring = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass C { @GetMapping(\"/a\") void a() {} }\n";
+        let spring_test = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass Fake { @GetMapping(\"/fake\") void f() {} @GetMapping(Paths.X) void g() {} }\n";
+        let app = "import express from \"express\";\nconst app = express();\napp.get(\"/health\", (req, res) => res.end());\n";
+        let app_spec = "import express from \"express\";\nconst app = express();\napp.post(\"/sign-up\", (req, res) => res.end());\n";
+        let built = build(
+            &[
+                ("svc/main.go", Language::Go, gin),
+                ("svc/main_test.go", Language::Go, gin_test),
+                ("jsvc/src/main/java/p/C.java", Language::Java, spring),
+                (
+                    "jsvc/src/test/java/p/Fake.java",
+                    Language::Java,
+                    spring_test,
+                ),
+                ("web/src/app.ts", Language::TypeScript, app),
+                ("web/src/app.spec.ts", Language::TypeScript, app_spec),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built)
+                .iter()
+                .filter(|e| e.starts_with("EXPOSES"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "EXPOSES jsvc -> HTTP GET /a @jsvc [exact]",
+                "EXPOSES svc -> HTTP GET /api/login @svc [heuristic]",
+                "EXPOSES svc -> HTTP GET /ping @svc [exact]",
+                "EXPOSES web -> HTTP GET /health @web [exact]",
+            ]
+        );
+        let counted: Vec<(&str, String)> = built
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "routes_in_test_code")
+            .map(|d| (d.path.as_deref().unwrap(), d.detail.to_string()))
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                (
+                    "jsvc/src/test/java/p/Fake.java",
+                    r#"{"routes":1}"#.to_owned()
+                ),
+                ("svc/main_test.go", r#"{"routes":1}"#.to_owned()),
+                ("web/src/app.spec.ts", r#"{"routes":1}"#.to_owned()),
+            ]
+        );
+        assert!(
+            !diagnostics(&built)
+                .iter()
+                .any(|d| d.starts_with("route_path_dynamic")),
+            "{:?}",
+            diagnostics(&built)
+        );
+    }
+
     /// Contract M6f S3/S4: spec operations become endpoints under the shared key, so a code
     /// route for the same method+path joins its handler for free; an operation with no code
-    /// route is kept, exact, unhandled and counted.
+    /// route is kept, `synthetic` (contract M9a D2), unhandled and counted.
     #[test]
     fn spec_operations_become_endpoints_and_join_code_routes() {
         let app = "import express from \"express\";\nexport const app = express();\napp.get(\"/users\", (req, res) => res.end());\napp.post(\"/users\", (req, res) => res.end());\n";
@@ -2019,7 +2109,7 @@ mod tests {
         assert_eq!(
             edges(&built),
             [
-                "EXPOSES api -> HTTP GET /missing @api [exact]",
+                "EXPOSES api -> HTTP GET /missing @api [synthetic]",
                 "EXPOSES api -> HTTP GET /users @api [exact]",
                 "EXPOSES api -> HTTP POST /users @api [exact]",
                 "HANDLED_BY HTTP GET /users @api -> api/src/app.ts [exact]",

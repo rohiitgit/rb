@@ -16,5 +16,41 @@
   "old": "if arg.items.is_empty() && (arg.literal || !arg.value.starts_with('{')) {",
   "new": "if arg.items.is_empty() && (arg.literal || true) {",
   "what": "non-literal {} read as a path"
+ },
+ {
+  "id": "m232",
+  "crate": "rb-indexer",
+  "test": "routes::tests::routes_in_test_files_are_not_endpoints",
+  "file": "routes.rs",
+  "old": "    !rb_model::is_test_path(path)\n",
+  "new": "    !false\n",
+  "what": "test-path filter off"
+ },
+ {
+  "id": "m233",
+  "crate": "rb-indexer",
+  "test": "routes::tests::routes_in_test_files_are_not_endpoints",
+  "file": "routes.rs",
+  "old": "} else if !file.routes.is_empty() {",
+  "new": "} else if false {",
+  "what": "routes_in_test_code not pushed"
+ },
+ {
+  "id": "m234",
+  "crate": "rb-indexer",
+  "test": "routes::tests::spec_operations",
+  "file": "routes.rs",
+  "old": "path_certainty: Certainty::Synthetic,",
+  "new": "path_certainty: Certainty::Exact,",
+  "what": "OpenAPI registration exact"
+ },
+ {
+  "id": "m235",
+  "crate": "rb-indexer",
+  "test": "routes::tests::spec_operations",
+  "file": "routes.rs",
+  "old": "        .map(|r| r.path_certainty)\n        .max()\n",
+  "new": "        .map(|r| r.path_certainty)\n        .min()\n",
+  "what": "EXPOSES takes the weakest registration"
  }
 ]

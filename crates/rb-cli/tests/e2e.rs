@@ -4284,10 +4284,10 @@ fn scip_java_gradle_catalog() {
 }
 
 /// Contract M6f S7: the contract-packs fixture. `openapi.yaml` (3 operations) and `svc.proto`
-/// (3 services... see fixture: Greeter + Users) become exact endpoints of the root service; the
+/// (3 services... see fixture: Greeter + Users) become endpoints of the root service; the
 /// spec operations matching the committed `UsersApi` interface are handled by its declaration
-/// (`exact`) and `UserController` (`heuristic`); `POST /users` and the GRPC methods stay
-/// unhandled and counted. `OrderClient`'s operationId call and stub call stitch `synthetic`
+/// (`exact`) and `UserController` (`heuristic`); `POST /users` (spec only, `synthetic`, contract
+/// M9a D2) and the GRPC methods (`exact`) stay unhandled and counted. `OrderClient`'s operationId call and stub call stitch `synthetic`
 /// `CONSUMES` edges, as do the TypeScript client's; `UserMapper.xml` statements reach
 /// `public.users` exactly (the `<if>` statement is a counted diagnostic). Cached, fresh from an
 /// emptied per-repository cache and a second repository name dump identically.

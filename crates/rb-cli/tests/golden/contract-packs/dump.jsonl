@@ -92,7 +92,7 @@
 ["E","service",".","EXPOSES","endpoint","GRPC acme.Users/Watch @.","treesitter",5,{},[["svc.proto",[11,6,11,11]]]]
 ["E","service",".","EXPOSES","endpoint","HTTP GET /users @.","treesitter",5,{},[["openapi.yaml",[5,0,5,9]],["src/main/java/acme/UsersApi.java",[9,2,9,13]]]]
 ["E","service",".","EXPOSES","endpoint","HTTP GET /users/{} @.","treesitter",5,{},[["openapi.yaml",[10,0,10,14]],["src/main/java/acme/UsersApi.java",[12,2,12,22]]]]
-["E","service",".","EXPOSES","endpoint","HTTP POST /users @.","treesitter",5,{},[["openapi.yaml",[5,0,5,9]]]]
+["E","service",".","EXPOSES","endpoint","HTTP POST /users @.","treesitter",3,{},[["openapi.yaml",[5,0,5,9]]]]
 ["E","service",".","DEPENDS_ON","package","maven/org.springframework.boot/spring-boot-starter-web@?","manifest",5,{"scope":"runtime","version_from":"unresolved"},[["pom.xml",[13,59,13,120]]]]
 ["E","endpoint","HTTP GET /users @.","HANDLED_BY","symbol","rb-heuristic . . . `src/main/java/acme/UserController.java`/UserController#listUsers().","treesitter",2,{},[["src/main/java/acme/UsersApi.java",[9,2,9,13]]]]
 ["E","endpoint","HTTP GET /users @.","HANDLED_BY","symbol","rb-heuristic . . . `src/main/java/acme/UsersApi.java`/UsersApi#listUsers().","treesitter",5,{},[["src/main/java/acme/UsersApi.java",[9,2,9,13]]]]
