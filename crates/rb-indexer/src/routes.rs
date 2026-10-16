@@ -1925,6 +1925,38 @@ mod tests {
         assert!(a.attrs.is_empty());
     }
 
+    /// Contract M9b C2 (B9): a gin handler written as a method value of the receiver binds to
+    /// the method even when it is declared in another file than the receiver's type.
+    #[test]
+    fn gin_method_value_handlers_bind_across_files() {
+        let handler = "package handler\nimport \"github.com/gin-gonic/gin\"\ntype Handler struct{}\nfunc (h *Handler) InitRoutes() *gin.Engine {\n\tr := gin.New()\n\tr.POST(\"/x\", h.signUp)\n\treturn r\n}\n";
+        let auth = "package handler\nimport \"github.com/gin-gonic/gin\"\nfunc (h *Handler) signUp(c *gin.Context) {}\n";
+        let built = build(
+            &[
+                ("svc/handler.go", Language::Go, handler),
+                ("svc/auth.go", Language::Go, auth),
+            ],
+            &[],
+        );
+        let handled: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("HANDLED_BY"))
+            .collect();
+        assert_eq!(
+            handled,
+            [
+                "HANDLED_BY HTTP POST /x @svc -> rb-heuristic . . . `svc/auth.go`/Handler#signUp(). [heuristic]"
+            ]
+        );
+        assert!(
+            !diagnostics(&built)
+                .iter()
+                .any(|d| d.starts_with("route_handler_unresolved")),
+            "{:?}",
+            diagnostics(&built)
+        );
+    }
+
     /// S2: a group passed to a parameterised register function composes from the
     /// call site; the endpoint key is path-based, its certainty heuristic, and both
     /// sites are evidence. Unreached registrations stay `prefix_unknown`.

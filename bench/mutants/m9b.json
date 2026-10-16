@@ -1,0 +1,47 @@
+[
+ {
+  "id": "m261",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "                    own.extend(self.go_methods_of(c, name, want));\n",
+  "new": "                    own.extend(Vec::<Sym<'a>>::new());\n",
+  "what": "receiver table not consulted in members"
+ },
+ {
+  "id": "m262",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "            .get(&(key, def.name.as_str()))\n",
+  "new": "            .iter().find(|((_, r), _)| *r == def.name.as_str()).map(|(_, m)| m)\n",
+  "what": "receiver table looked up without package_key"
+ },
+ {
+  "id": "m263",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "                    if d.receiver.is_none() {\n",
+  "new": "                    if true {\n",
+  "what": "receiver-carrying defs kept in the bare-name package table"
+ },
+ {
+  "id": "m264",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "            .get(&(key, def.name.as_str()))\n",
+  "new": "            .iter().find(|((k, r), _)| k.0 == key.0 && *r == def.name.as_str()).map(|(_, m)| m)\n",
+  "what": "receiver table looked up by directory only (replaces 'by the caller's file', amendment 2)"
+ },
+ {
+  "id": "m285",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "                    (None, Some(_)) => continue,\n",
+  "new": "                    (None, Some(_)) => &mut sc.top,\n",
+  "what": "receiver-carrying defs kept in the file's top scope (amendment 2)"
+ }
+]

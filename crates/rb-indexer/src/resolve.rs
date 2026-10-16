@@ -258,7 +258,14 @@ pub(crate) struct Index<'a> {
     /// Top-level definitions by name per Java package and per Go (directory, package), so the
     /// same-package level costs a lookup rather than a scan of the package.
     packages: BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<Sym<'a>>>>,
+    /// Go methods declared in another file than their receiver type (`parent: None`, `receiver:
+    /// Some`), by (the method's package key, receiver type name), then by method name (contract
+    /// M9b D5). They are members of that type and never package-level names.
+    go_methods: GoMethods<'a>,
 }
+
+/// [`Index::go_methods`]: (package key, receiver type name) → method name → definitions.
+type GoMethods<'a> = BTreeMap<((&'a str, &'a str), &'a str), BTreeMap<&'a str, Vec<Sym<'a>>>>;
 
 /// The declarations of one name in one file, sorted by the start of their extent. Extents are
 /// nested or disjoint (scopes are), so `parent` links each declaration to the nearest enclosing
@@ -414,6 +421,7 @@ impl<'a> Index<'a> {
         let mut defs_by_name: BTreeMap<&str, BTreeMap<&str, Vec<usize>>> = BTreeMap::new();
         let mut fields: BTreeMap<&str, BTreeMap<(usize, &str), Vec<&Binding>>> = BTreeMap::new();
         let mut packages: BTreeMap<(&str, &str), BTreeMap<&str, Vec<Sym>>> = BTreeMap::new();
+        let mut go_methods: GoMethods = BTreeMap::new();
         for (&path, (language, facts)) in files {
             let (l, f) = (
                 raw_locals.entry(path).or_default(),
@@ -446,14 +454,27 @@ impl<'a> Index<'a> {
                     .enumerate()
                     .filter(|(_, d)| d.parent.is_none())
                 {
-                    table.entry(d.name.as_str()).or_default().push((path, i));
+                    if let Some(receiver) = d.receiver.as_deref() {
+                        go_methods
+                            .entry((key, receiver))
+                            .or_default()
+                            .entry(d.name.as_str())
+                            .or_default()
+                            .push((path, i));
+                    }
+                    // A method of a type declared in another file is no package-level name.
+                    if d.receiver.is_none() {
+                        table.entry(d.name.as_str()).or_default().push((path, i));
+                    }
                 }
             }
             let mut sc = Scopes::default();
             for (i, d) in facts.definitions.iter().enumerate() {
-                let table = match d.parent {
-                    Some(p) => sc.of.entry(p).or_default(),
-                    None => &mut sc.top,
+                let table = match (d.parent, &d.receiver) {
+                    (Some(p), _) => sc.of.entry(p).or_default(),
+                    // A method of a type declared in another file is no top-level name.
+                    (None, Some(_)) => continue,
+                    (None, None) => &mut sc.top,
                 };
                 table.entry(d.name.as_str()).or_default().push(i);
             }
@@ -481,6 +502,7 @@ impl<'a> Index<'a> {
                 .collect(),
             fields,
             packages,
+            go_methods,
         }
     }
 
@@ -966,7 +988,11 @@ impl<'a> Index<'a> {
         for _ in 0..MAX_INHERITANCE_DEPTH {
             let found: Vec<Sym<'a>> = level
                 .iter()
-                .flat_map(|&c| self.named(c.0, Some(c.1), name, want))
+                .flat_map(|&c| {
+                    let mut own = self.named(c.0, Some(c.1), name, want);
+                    own.extend(self.go_methods_of(c, name, want));
+                    own
+                })
                 .collect();
             if !found.is_empty() {
                 return found;
@@ -981,6 +1007,28 @@ impl<'a> Index<'a> {
             }
         }
         Vec::new()
+    }
+
+    /// The methods named `name` that Go files declare for the top-level type `t` outside its own
+    /// file (contract M9b D5): looked up by the package of `t`'s file, so a same-named type of
+    /// another directory, or of the external `_test` package beside it, gets none of them.
+    fn go_methods_of(&self, t: Sym<'a>, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
+        let (language, facts) = self.files[t.0];
+        let def = self.def(t);
+        if language != Language::Go || def.parent.is_some() {
+            return Vec::new();
+        }
+        let Some(key) = package_key(t.0, language, facts) else {
+            return Vec::new();
+        };
+        self.go_methods
+            .get(&(key, def.name.as_str()))
+            .and_then(|methods| methods.get(name))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&s| want(self.def(s).kind))
+            .collect()
     }
 
     /// The resolved direct supertypes of `t` (all candidates of each name).
@@ -1795,6 +1843,48 @@ func (s *Server) helper() {}
             ]
         );
         assert_eq!(unresolved(&built), [("svc/server.go".into(), 1, 0, 0)]);
+    }
+
+    /// Contract M9b D5: a Go method declared in another file than its receiver type is a member
+    /// of that type, found through the type's own package (directory and package name), and is
+    /// never a bare package-level name.
+    #[test]
+    fn go_methods_in_sibling_files_are_members() {
+        let built = build(
+            &[
+                ("svc/h.go", GO, "package svc\ntype H struct{}\n"),
+                (
+                    "svc/m.go",
+                    GO,
+                    "package svc\nfunc (h *H) M() {}\nfunc bare() { M() }\n",
+                ),
+                (
+                    "svc/use.go",
+                    GO,
+                    "package svc\nfunc run(h *H) {\n\th.M()\n\th.T()\n\th.N()\n}\nfunc other() { M() }\n",
+                ),
+                // An internal test file attaches like any other.
+                ("svc/z_test.go", GO, "package svc\nfunc (h *H) T() {}\n"),
+                // The external test package in the same directory has its own `H`.
+                ("svc/x_test.go", GO, "package svc_test\ntype H struct{}\n"),
+                (
+                    "svc/y_test.go",
+                    GO,
+                    "package svc_test\nfunc (h *H) N() {}\nfunc use3(h *H) { h.M() }\n",
+                ),
+                // Another package with its own `H`, which has no `M`.
+                ("b/h.go", GO, "package b\ntype H struct{}\n"),
+                ("b/use.go", GO, "package b\nfunc run2(h *H) { h.M() }\n"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "use:run(). -> m:H#M(). [heuristic]",
+                "use:run(). -> z_test:H#T(). [heuristic]",
+            ]
+        );
     }
 
     #[test]
