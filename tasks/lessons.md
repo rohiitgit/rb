@@ -598,3 +598,11 @@
 ## 2026-10-15: an evaluator finding is closed by a re-score, not by a mechanism
 - **Mistake (caught):** the M8b tree already contained the microSecEnD override mechanism and the re-generated statements when pass 1 landed, so "fixed" looked done. But no override file existed (the 6 spurious tp were still in the scoreboard), the committed `statements.txt` still predated the normalisation in one target's record, and the Result still quoted pre-fix numbers.
 - **Rule:** For each finding name the artifact that proves it: the override file, the re-scored cell diff (here exactly the 6 microsecend endpoint cells), the `diff` of statements vs committed, the pasted tool output. A mechanism without its output is not a fix.
+
+## 2026-10-16: check that a benchmark's base dumps still exist before the gate
+- **Context:** M9a's invariant and gate compare against the M8 base dumps in `var/bench/out/a038653b8478/`, which are gitignored. At 03:19 the base's mattermost dumps were deleted by a process outside the session, with the mattermost `.jsonl` in `var/m7e/inv/`. Nothing in git noticed.
+- **Rule:** Before an invariant or a gate, check that every base dump the manifest names exists and is non-empty, and re-score the base to confirm it reproduces the committed scoreboard byte for byte. If a dump is missing, regenerate it only from the base's own binary (sha256 checked), touch only the missing files, and compare `rb status` counts with the original run's `.out` before using it.
+
+## 2026-10-16: check the disk at every milestone start
+- **Context:** `target/` grew to 48 GiB over a series of milestones and took free space down to 2.4 GiB during M9a, under `bench/run.sh`'s 6 GiB floor. `cargo clean` freed 48.0 GiB.
+- **Rule:** At each milestone start, run `du -sh target` and `df -h .`. Run `cargo clean` when free space is under twice the bench floor plus one release build.

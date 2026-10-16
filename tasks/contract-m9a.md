@@ -1,6 +1,6 @@
 # M9a contract: `exact` precision from the M8 benchmark (2026-10-16)
 
-**Status:** contract written 2026-10-16 from `tasks/plan-m9.md` §4 "M9a" and `tasks/bench-findings.md` B7, B8, B11, B12 (part a), B13, B14. Every root cause below was re-read in the code at branch `m9` (`0453fda`) and checked against the M8 dumps (`var/bench/out/a038653b8478/`). Not yet implemented. Commits go on branch `m9`.
+**Status:** implemented; evaluator pass 1 pending. The contract was written 2026-10-16 from `tasks/plan-m9.md` §4 "M9a" and `tasks/bench-findings.md` B7, B8, B11, B12 (part a), B13, B14. Every root cause below was re-read in the code at branch `m9` (`0453fda`) and checked against the M8 dumps (`var/bench/out/a038653b8478/`). Commits go on branch `m9`.
 
 ## Why
 
@@ -252,6 +252,118 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **D4 choices the contract left open.** Within one search location `.properties` beats YAML, and a later location beats an earlier one. Both follow Spring Boot's config-location rules, which the native backend uses. An empty `server.servlet.context-path` counts as none, as for local files.
 - **Probe (P4).** Indexing piggymetrics gives 11 `EXPOSES`, all `synthetic`, under `/accounts`, `/statistics`, `/notifications` and `/uaa`, and 4 `config_server_context_path` diagnostics. `rb diff` against the pre-P4 snapshot shows 3 new heuristic Feign `CONSUMES` (`/uaa/users`, `/statistics/{}`, `/accounts/{}`); the table above predicted up to 2 for the scored `service_flows` cell. The probe repository was deleted and `rb.repo` is unchanged.
 
+**Amendment 2 (2026-10-16, P6, binary from `7a82313`).**
+- **The base was restored.** The M8 base's mattermost dumps (`var/bench/out/a038653b8478/mattermost.{noscip,scip}.jsonl`) were deleted at 03:19 by a process outside this session's agents. The mattermost `.jsonl` in `var/m7e/inv/` went too. With the user's approval both dumps were regenerated from the M8 binary `var/m7j/bin/rb` (sha256 `a038653b…`), and only those two `.jsonl` files were written. The regenerated runs report the original counts: `noscip` 58,506 nodes, 169,043 edges, 8,350 diagnostics; `scip` 58,445 nodes, 161,561 edges, 5,788 diagnostics. The `scip` run's `rb status` body is identical line for line. Re-scoring the restored base with the M8b verdicts is byte-identical to `bench/scoreboard/m8b.json` and `m8b-perf.json` (`var/m9a/m8b-rescore-restored{,-perf}.json`).
+- **Disk.** Free space fell to 2.4 GiB, under `run.sh`'s 6 GiB floor. With the user's approval `cargo clean` freed 48.0 GiB before the build of record.
+- **One accept line.** `compare` reports `microsecend:mse_piggymetrics:noscip:service_flows: found_out_of_scope{not_in_model} 0 → 1`. The invariant shows the edge behind it: a `heuristic` `CONSUMES` `AuthServiceClient#createUser() → HTTP POST /uaa/users @auth-service`, which replaces the `http_unmatched` at the Feign client (`AuthServiceClient.java:12`). auth-service serves `POST /users` under the context path `/uaa` from `config/src/main/resources/shared/auth-service.yml:12`, so the flow is real. The model has it (account_service → auth_service, `feign_connection`) but marks auth_service infrastructural, so the scorer puts it out of scope. It is neither `exact` nor wrong. Amendment 1's probe recorded it as the third Feign `CONSUMES`. The line is in `bench/accept-m9a.tsv`, and the orchestrator reviewed and accepted it (C5).
+- **Perf warnings, re-measured.** `compare --perf` warned on 14 `noscip-fresh` walls, all on small targets (hk_todo 0.3 → 0.6 s, the largest base wall 0.7 s). mattermost raised none. `var/m9a/logs/perf-ab.txt` re-measured hk_todo, mse_callista and hk_polls, alternating the M8 and M9a binaries, 3 runs each:
+  - hk_todo runs 2–3: M8 0.19 and 0.19 s, M9a 0.20 and 0.20 s.
+  - mse_callista runs 2–3: M8 0.26 and 0.24 s, M9a 0.29 and 0.23 s.
+  - hk_polls runs 1–3: M8 0.30, 0.30, 0.30 s, M9a 0.29, 0.28, 0.32 s.
+  - CPU time is 0.05–0.12 s on both sides. M9a's first mse_callista run took 1,036.59 s wall on 0.07 s CPU; the machine slept during it, so it is not rb's time.
+  - The warning did not persist on re-measure, so under the NFR rule it does not block. The A/B covers 3 of the 14 warned targets; the other 11 show a similar step (0.20–0.33 s) in the bench run and were not re-measured one by one.
+- **Predicted vs measured, where they differ.**
+  - `handkey:hk_todo:noscip:handler_binding` (and `handkey_raw`): `found_out_of_scope{test} 1 → 0` was not predicted. The base's `HANDLED_BY` from `GET /identity` to `TestHandler_userIdentity()` (`middleware_test.go`) was already out of scope as `test`. C1 removes the endpoint, so its binding goes with it.
+  - `microsecend:mse_{anilallewar,rohitghatol}:noscip:service_flows` are unchanged, against "possible: tp +1".
+  - C8's method: the contract asked for a scratch repository. P6 instead indexed hk_todo with both binaries: the M9a binary records `"pipeline": "m9a-1"` and the M8 binary `"pipeline": "m7j-1"` (`perf-ab.txt`). The repositories were removed (`repositories left like bench\_%: 0`).
+- **C4's count was mixed.** The contract says 264 `IMPLEMENTS` from 5 `*Suite#` test types, 38 to `AppIface#`. A recount over both mattermost `scip` dumps gives 277 from 5 types, 38 to `AppIface#`, the same in M8 and M9a. 264 of them (36 to `AppIface#`) come from the 4 types declared in `_test.go` files: `MmctlUnitTestSuite#` 136, `MmctlE2ETestSuite#` 84, `OpensearchInterfaceTestSuite#` 27, `ElasticsearchInterfaceTestSuite#` 17. The fifth, `CommonTestSuite#` (13, 2 to `AppIface#`), is declared in `server/enterprise/elasticsearch/common/test_suite.go`, which `is_test_path` does not match. B13b records both counts.
+
 ## Result
 
-Not yet built.
+**Commits (branch `m9`):** `fb8f827` contract, `9d27a56` P0, `5f139da` P1, `d68a6ec` P2, `244ed90` P3, `2b5e956` P4, `d299183` P5, `7a82313` M9b contract and todo, then the P6/P7 records commit `M9a P6/P7: bench gate passes, records`.
+
+**Binary of record (C8):** `var/m9a/bin/rb`, sha256 `05a600c9ff2deb9b55e2a71905eb97bcd71e51aceaeea15d7bbf7fe7aedae9b5`, built from `7a82313f2033b3398eb303a3b836a6d8e944d3e7` with `crates/` and `migrations/` clean. `PIPELINE` `m9a-1`. Bench outputs: `var/bench/out/05a600c9ff2d/`, `failures: 0`, and all 27 `noscip` fresh/cached dump pairs identical (`var/m9a/logs/bench-run.log`).
+
+**Claims.**
+
+| # | Met | Evidence |
+|---|---|---|
+| C1 | met | Unit test green (`var/m9a/logs/test.log`). Invariant C1: 22 rows (hk_todo 8; mattermost 7 `noscip`, 7 `scip`), all test-file endpoints and their `routes_in_test_code` diagnostics (`invariant.txt`). hk_todo endpoints `fp exact 2 → 0` (`compare.txt`). |
+| C2 | met | Unit tests and the contract-packs golden (`test.log`). Invariant C2: 6 rows, go_gin_example's 3 spec-only `EXPOSES` `exact` → `synthetic` in each mode (`invariant.txt`). |
+| C3 | met | Unit test and the go-chi-sqlx golden (`test.log`). Invariant C3: 1,740 rows, which are 1,732 removed method → type `IMPLEMENTS` plus 8 `scip_status` rows. Per target the removed edges equal the `relationships_dropped` delta: microservices_demo 3, go_clean_arch 25, mattermost 1,704 (`invariant.txt`; recount over both dumps). |
+| C4 | met | The `*Suite#` `IMPLEMENTS` on mattermost are the same in both dumps: 277 from 5 types, 38 to `AppIface#`. No such row is in the invariant diff. B13b recorded in `tasks/bench-findings.md`. |
+| C5 | met | Unit test (`test.log`). Invariant C5: 78 piggymetrics rows. Endpoints `tp synthetic 0 → 6`, `fp exact 6 → 0`, `fn 6 → 0`. One accepted out-of-scope flow (amendment 2). |
+| C6 | met | Unit test (`test.log`). Invariant C6: 10 rows each for mse_anilallewar and mse_rohitghatol. Endpoints `tp exact 4 → 6`, `fn 2 → 0` in each. |
+| C7 | met (evaluator reads) | The B11 text is in README, the usage guide and the design doc (P5, `d299183`). `synthetic` stays 8 wrong: 16/24 → 22/30 (`certainty-m9a.txt`); `table_queries` cells unchanged. |
+| C8 | met | HEAD, sha256 and `PIPELINE` above; `perf-ab.txt` records `m9a-1` against `m7j-1`. |
+| C9 | met | 157 dumps compared (27 `noscip`, 11 `scip`, 119 PyCG cases), all non-empty; 0 unclassified (`invariant.txt`). |
+| C10 | met | Every family has 0 edges without a verdict (`certainty-m9a.txt`). `compare` exits 0 with one accepted line (`compare.txt`). Two more scorings, `var/m9a/score/m9a-{second,third}.json` and their perf files, are `cmp`-identical to the committed scoreboards. |
+| C11 | met | mattermost within the NFR; 14 small-target wall warnings re-measured without persisting (amendment 2). The warm run wrote its outputs from 04:03:00 to 04:05:48, under 20 min. Scoring took 1.44 s (`var/m9a/score/time3.txt`). |
+| C12 | met | m230–m247: 18 of 18 KILLED (`mutants-m9a.log`); m8b.json: 29 of 29 KILLED (`mutants-m8b.log`); none STALE or INVALID. |
+
+**Invariant (C9, `var/m9a/logs/invariant.txt`).** Base `a038653b8478`, head `05a600c9ff2d`. 119 of 119 PyCG cases identical. Buckets: C1 22, C2 6, C3 1,740, C5 78, C6 20, META 0, unclassified 0. Differing targets: microservices_demo `scip` (C3 5), go_gin_example `noscip` and `scip` (C2 3 each), go_clean_arch `scip` (C3 27), mattermost `noscip` (C1 7) and `scip` (C1 7, C3 1,708), mse_anilallewar (C6 10), mse_rohitghatol (C6 10), mse_piggymetrics (C5 78), hk_todo (C1 8). Every other dump is byte-identical.
+
+**Cells, measured beside predicted.** 8 of the 314 cells changed; 306 are identical.
+
+| Cell (`bench:target:mode:class`) | Base (re-scored m8b) | Predicted | Measured | Claim |
+|---|---|---|---|---|
+| `handkey:hk_todo:noscip:endpoints` (and `handkey_raw`) | tp exact 13, fp exact 2 | fp 0 | fp exact 2 → 0 | C1 |
+| `handkey:hk_todo:noscip:handler_binding` (and `handkey_raw`) | found_out_of_scope{test} 1 | identical | found_out_of_scope{test} 1 → 0 | C1, not predicted |
+| `microsecend:mse_piggymetrics:noscip:endpoints` | tp 0, fp exact 6, fn 6 | tp synthetic 6, fp 0, fn 0 | tp synthetic 0 → 6, fp exact 6 → 0, fn 6 → 0 | C5 |
+| `microsecend:mse_anilallewar:noscip:endpoints` | tp exact 4, fn 2 | tp exact 6, fn 0 | tp exact 4 → 6, fn 2 → 0 | C6 |
+| `microsecend:mse_rohitghatol:noscip:endpoints` | tp exact 4, fn 2 | tp exact 6, fn 0 | tp exact 4 → 6, fn 2 → 0 | C6 |
+| `microsecend:mse_piggymetrics:noscip:service_flows` | fn 2 | up to 2 heuristic tp | tp heuristic 0 → 2, fn 2 → 0, found_out_of_scope{not_in_model} 0 → 1 (accepted) | C5 |
+| `microsecend:mse_{anilallewar,rohitghatol}:noscip:service_flows` | fn 1 each | possible tp +1 | unchanged | C6 |
+
+**Gate (`var/m9a/logs/compare.txt`).** `rb-bench compare var/m9a/m8b-rescored.json bench/scoreboard/m9a.json --accept bench/accept-m9a.tsv --perf` printed (the accept reason is elided here; it is in `bench/accept-m9a.tsv`):
+
+```
+changed handkey:hk_todo:noscip:endpoints: fp exact 2 → 0
+changed handkey:hk_todo:noscip:handler_binding: found_out_of_scope{test} 1 → 0
+changed handkey_raw:hk_todo:noscip:endpoints: fp exact 2 → 0
+changed handkey_raw:hk_todo:noscip:handler_binding: found_out_of_scope{test} 1 → 0
+changed microsecend:mse_anilallewar:noscip:endpoints: tp exact 4 → 6
+changed microsecend:mse_anilallewar:noscip:endpoints: fn 2 → 0
+changed microsecend:mse_piggymetrics:noscip:endpoints: tp synthetic 0 → 6
+changed microsecend:mse_piggymetrics:noscip:endpoints: fp exact 6 → 0
+changed microsecend:mse_piggymetrics:noscip:endpoints: fn 6 → 0
+changed microsecend:mse_piggymetrics:noscip:service_flows: tp heuristic 0 → 2
+changed microsecend:mse_piggymetrics:noscip:service_flows: fn 2 → 0
+changed microsecend:mse_piggymetrics:noscip:service_flows: found_out_of_scope{not_in_model} 0 → 1
+accepted microsecend:mse_piggymetrics:noscip:service_flows: found_out_of_scope{not_in_model} 0 → 1 (…)
+changed microsecend:mse_rohitghatol:noscip:endpoints: tp exact 4 → 6
+changed microsecend:mse_rohitghatol:noscip:endpoints: fn 2 → 0
+exit=0
+```
+
+The 14 perf warnings follow in the log (amendment 2). The re-scored base (D6, `var/m9a/m8b-rescored.json`) differs from `m8b.json` only in `keys["exact:verdicts"]`; its pins and cells are equal.
+
+**Aggregates (from `compare.txt`).**
+- handkey endpoints: P 95.1 % → 100.0 %, R 100.0 % (handkey_raw the same). Predicted P 100 %.
+- microsecend endpoints: P 88.7 % → 100.0 %, R 75.8 % → 91.9 % (57 of 62; the contract attributes the 5 fn left to B12b). As predicted.
+- microsecend service_flows: R 28.6 % → 42.9 % (4 → 6 of 14), P 100.0 %. This follows from piggymetrics' 2 new tp.
+- Every other aggregate is unchanged.
+
+**Certainty table (`var/m9a/logs/certainty-m8b.txt`, `certainty-m9a.txt`).**
+
+| Label | m8b | m9a | Predicted |
+|---|---|---|---|
+| `exact` | 93.8 % of 130 | 100.0 % of 126 | 126/126 |
+| `synthetic` | 66.7 % of 24 | 73.3 % of 30 | 22/30 (73.3 %) |
+| `heuristic` | 99.2 % of 118; agreement 74.7 % of 24,179 | 99.2 % of 120; agreement 74.7 % of 24,179 | not stated (the 2 piggymetrics flows) |
+| `ambiguous` | site hit 100.0 % of 1; 50.0 % of 2 edges | unchanged | unchanged |
+| `dispatch` | not stored | not stored | |
+
+**Sample families.**
+
+| Family | m8b | m9a | Wilson 95 % (m9a) | Without a verdict |
+|---|---|---|---|---|
+| manifest | 60 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| orm | 9 / 9 | 9 / 9 | 70.1–100.0 % | 0 |
+| routes | 58 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| scip | 57 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| sql | 59 / 60 | 59 / 60 | 91.1–99.7 % | 0 |
+
+The run redrew 80 edges, as predicted: 25 `routes` (go_gin_example 5, mattermost 17, microservices_demo 3) and 55 `scip` (mattermost 54, microservices_demo 1). 4 blind judges, told to assume each edge false, judged all 80 TRUE. 18 of their citations were spot-checked against the source. The verdicts are appended to `bench/samples/exact.tsv` (81 added lines, none edited); inputs and transcripts are in `var/bench/labels/exact-m9a/`. No `*Suite#` `IMPLEMENTS` edge was drawn.
+
+**Perf (`bench/scoreboard/m9a-perf.json` against `m8b-perf.json`).**
+
+| mattermost | m8b wall | m9a wall | m8b peak RSS | m9a peak RSS |
+|---|---|---|---|---|
+| `noscip-fresh` | 24.73 s | 21.49 s | 1,801,732,096 B | 1,869,234,176 B |
+| `noscip-cached` | 18.07 s | 14.5 s | 1,663,696,896 B | 1,733,443,584 B |
+| `scip` | 21.54 s | 18.9 s | 2,135,392,256 B | 2,379,431,936 B |
+
+`noscip-fresh` sits inside the NFR (≤ 30.9 s, ≤ 1.93 GiB). The small-target warnings are in amendment 2.
+
+**Verification (P5, `var/m9a/logs/`).** Real-Docker suites: 1,129 passed, 0 failed, 0 `skipping:` (`test.log`, exit 0). fmt and clippy CLEAN (`fmt-clippy.log`). Mutants as in C12. `SELECT name, checkout FROM rb.repo` identical before and after P5 (`repo-before.txt`, `repo-after.txt`) and P6 (`repo-before-p6.txt`, `repo-after-p6.txt`).

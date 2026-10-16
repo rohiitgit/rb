@@ -808,3 +808,28 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - Evaluator pass 1 (`tasks/eval-m8b-pass1.md`) FAIL answered by amendment 2 (6 override files, 3 second adjudications, corrected Result/B11/B12/CHANGELOG); close after a verification-only re-check.
 - **Status:** closed 2026-10-16 on evaluator pass 2 (`tasks/eval-m8b-pass2.md`) VERDICT PASS (1 prose should-fix, 4 notes, all answered). M8 (benchmark) is done; the rb fixes it found (B1, B4, B7–B10, B12–B14) are input for the next rb milestone.
 
+## M9a `exact` precision from the M8 benchmark: implemented 2026-10-16
+
+- **Discussed and decided:** the plan (`tasks/plan-m9.md`) was checked against the code and the M8 dumps before the contract (`tasks/contract-m9a.md`, C1–C12, amendments 1–2). Seven plan corrections, among them: B8 comes from generated OpenAPI files, not `@Router` comments; re-sourcing B13's method edges would duplicate 1,695 type edges and add 2 false ones, so they are dropped and counted; B14 reads only what a `native` config server provably serves.
+- **Built:**
+  - B7: the endpoint stage reads no test file (`routes_in_test_code` diagnostic).
+  - B8: spec-only endpoints `synthetic`.
+  - B12a: literal `"{…}"` Spring paths.
+  - B13: no `IMPLEMENTS` from a Go method under the bypass.
+  - B14: context paths from a `native` config server's shared files (`config_server_context_path`, `config_server_ambiguous`).
+  - B11: documented only.
+  - The mutant runner names its crate and counts build errors as INVALID. `PIPELINE` `m9a-1`.
+- **Files:** `crates/rb-frameworks/src/routes.rs`, `crates/rb-indexer/src/{lib,routes,scip}.rs`, `crates/rb-cli/tests/e2e.rs`, the contract-packs and go-chi-sqlx goldens, `bench/mutants/{run.py,m9a.json}`, `bench/samples/exact.tsv`, `bench/scoreboard/m9a{,-perf}.json`, `bench/accept-m9a.tsv`, `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
+- **Results:**
+  - `exact` 100.0 % of 126 (M8b 93.8 % of 130); sample `routes` and `scip` 60/60 after 80 new verdicts, all TRUE.
+  - microSecEnD endpoints P 100.0 %, R 91.9 %.
+  - 8 of 314 cells changed, one accepted (a correct out-of-scope Feign flow). Invariant: 0 unclassified rows over 157 dumps.
+  - B13b recorded: 277 `IMPLEMENTS` from 5 `*Suite#` types on mattermost, deferred to M9b.
+- **Verification:**
+  - Mutants m230–m247 and m8b all KILLED.
+  - Real-Docker 1,129/0/0.
+  - fmt and clippy clean; `rb.repo` unchanged.
+  - Two scorings `cmp`-identical.
+  - Perf inside the NFR after a re-measure (amendment 2).
+- **Status:** implemented, evaluator pending.
+

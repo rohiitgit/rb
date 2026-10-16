@@ -1,5 +1,28 @@
 # Changelog
 
+## [2026-10-16 13:10] (wall clock) M9a: `exact` precision from the M8 benchmark
+- **Fixes** (contract `tasks/contract-m9a.md`, C1–C12):
+  - **B7:** routes registered in test files are not endpoints. Each such file gets one `routes_in_test_code` diagnostic.
+  - **B8:** a spec-only endpoint (an OpenAPI operation with no code route) is `synthetic`. Code routes stay `exact`.
+  - **B12a:** a Java string literal such as `"{taskId}"` is a path, not an empty array.
+  - **B13:** under the Go bypass a method source gives no `IMPLEMENTS`; the drop is counted in `relationships_dropped`.
+  - **B14:** a `native` Spring Cloud Config server's shared files set its clients' context paths (`synthetic`, with a `config_server_context_path` diagnostic).
+  - **B11:** inherited Spring Data CRUD documented; no output change.
+- **Mutant runner:** `bench/mutants/run.py` takes `crate` and `test` per spec, counts a build error as INVALID, and runs each worktree's specs in sequence.
+- **Scoreboard** (`bench/scoreboard/m9a.json`, binary sha256 `05a600c9…` from `7a82313`):
+  - `exact` 100.0 % of 126 independently judged edges (M8b 93.8 % of 130). The sample's `routes` and `scip` families are both 60/60 after 80 redrawn edges were judged, all TRUE.
+  - microSecEnD endpoints P 88.7 % → 100.0 %, R 75.8 % → 91.9 %; handkey endpoints P 95.1 % → 100.0 %.
+  - 8 of 314 cells changed. `compare` against the re-scored base exits 0 with one accepted line: a correct Feign flow into piggymetrics' auth-service, which the model marks infrastructural.
+  - Invariant over 157 dumps: C1 22, C2 6, C3 1,740, C5 78, C6 20 rows, 0 unclassified.
+- **Bench state:** the M8 base's mattermost dumps were deleted outside the session and regenerated from the M8 binary; re-scoring the base is byte-identical to `m8b.json`. `cargo clean` freed 48.0 GiB after free space fell to 2.4 GiB.
+- **Verification:** mutants m230–m247 18/18 and m8b 29/29 KILLED; real-Docker 1,129/0/0; fmt and clippy clean; `rb.repo` unchanged; two scorings `cmp`-identical; mattermost `noscip-fresh` 21.49 s (M8b 24.73 s). `PIPELINE` `m9a-1`.
+- **Files:**
+  - **Code:** `crates/rb-frameworks/src/routes.rs`, `crates/rb-indexer/src/{lib,routes,scip}.rs`, `crates/rb-cli/tests/e2e.rs`, goldens `crates/rb-cli/tests/golden/{contract-packs,go-chi-sqlx}/`.
+  - **Bench:** `bench/mutants/{run.py,m9a.json}`, `bench/samples/exact.tsv` (80 verdicts appended), `bench/scoreboard/m9a{,-perf}.json`, `bench/accept-m9a.tsv`.
+  - **Docs:** `README.md`, `docs/usage-and-testing.md`, `docs/repository-brain-design.md`.
+  - **Records:** `tasks/{contract-m9a,plan-m9,bench-findings,todo,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+- **Status:** implemented; evaluator pass 1 pending.
+
 ## [2026-10-16] (wall clock) Mutant battery: parallel runs and a result cache
 - `bench/mutants/run.py` takes `--jobs N`: each spec runs in its own detached git worktree with a persistent per-job target dir, so the main tree is never dirtied (linting can run concurrently) and 29 specs finish in ~40 s on 4 jobs instead of ~4 min sequential.
 - A full all-KILLED run is cached in `var/bench/mutants-cache.json` (gitignored), keyed by source and specs hashes; an unchanged re-run re-reports in under a second.

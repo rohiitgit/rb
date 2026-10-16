@@ -314,7 +314,7 @@ troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 | `fixtures/` | 18 golden fixture repos (see the testing guide for the catalog) |
 | `tasks/`, `docs/`, `var/` | contracts, evaluations, lessons; design doc; per-milestone scripts/logs/evidence (gitignored scratch) |
 
-**Status: M0–M7j (M7 closed).** M0–M6l built the tool (foundations → structure → syntax →
+**Status: M0–M9a (M9a implemented, under evaluation).** M0–M6l built the tool (foundations → structure → syntax →
 SQL/ORM → resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules
 breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7j fixed
 what a stress campaign over 18 fixtures and 13 public repositories found
@@ -323,5 +323,9 @@ silent recall losses, vendored and built code, the error contract,
 honesty about what was not analysed, the CLI's rough edges (checkouts
 known by path, `rb doctor`), and the last precision and cost items (Express
 case, spec-only routes, bounded hub answers, one index per repository,
-streamed caches). Detail per milestone: `CHANGELOG.md`,
+streamed caches). M8a–M8b added an accuracy benchmark with answer keys
+(`bench/`, `tasks/bench-findings.md`). M9a fixes the wrong `exact` edges
+it found (test-file routes, spec-only routes, literal-brace Spring paths,
+Go method `IMPLEMENTS`, config-server context paths) and is under
+evaluation. Detail per milestone: `CHANGELOG.md`,
 `IMPLEMENT.md`, contracts in `tasks/`.

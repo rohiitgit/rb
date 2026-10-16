@@ -1156,5 +1156,11 @@ Plan: `tasks/plan-m9.md` (from an opencode plan session; claims unverified until
 - [x] P3: B13 (method → interface `IMPLEMENTS` dropped and counted).
 - [x] P4: B14 (config-server shared context paths).
 - [x] P5: `PIPELINE` `m9a-1`, docs, fmt/clippy, real-Docker suites, batteries; commit.
-- [ ] P6: bench run, invariant, new sample verdicts, score ×2, re-scored base, compare.
-- [ ] P7: records; evaluator passes 1 and 2.
+- [x] P6: bench run, invariant, new sample verdicts, score ×2, re-scored base, compare. Binary `05a600c9…` from `7a82313`, 0 failures. M8 base's mattermost dumps restored from the M8 binary (re-score byte-identical); invariant 0 unclassified over 157 dumps; 80 redrawn edges judged, all TRUE; `compare` exit 0 with one accepted line; 14 small-target perf warnings re-measured (contract amendment 2).
+- [ ] P7: records done; evaluator pass 1 pending.
+
+## Review (M9a)
+- The 8 wrong `exact` edges the M8b keys found are gone: `exact` 100.0 % of 126 (M8b 93.8 % of 130), and the sample's `routes` and `scip` families are 60/60.
+- microSecEnD endpoints P 88.7 % → 100.0 %, R 75.8 % → 91.9 %; handkey endpoints P 95.1 % → 100.0 %. 8 of 314 cells moved; the one accepted line is a correct flow the model puts out of scope.
+- Two predictions missed: hk_todo's out-of-scope test handler binding also left (1 → 0), and the anilallewar and rohitghatol flows did not gain a tp. C4's "264 from 5 types" was two counts mixed: 277 from 5 types, 264 from the 4 in `_test.go` files (B13b, M9b).
+- Gitignored bench state can vanish: the M8 base dumps were deleted mid-milestone and had to be regenerated before the gate (lesson). `target/` had grown to 48 GiB (lesson).
