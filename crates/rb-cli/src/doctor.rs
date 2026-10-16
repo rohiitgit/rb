@@ -446,10 +446,11 @@ mod tests {
         );
 
         assert_eq!(images_row(&[]).status, Status::Ok);
-        let absent = images_row(&["rb-scip-go:0.2.7"]);
+        let go = rb_scip::jobs::SCIP_GO_IMAGE;
+        let absent = images_row(&[go]);
         assert_eq!(
-            (absent.status, absent.detail.as_str()),
-            (Status::Warn, "absent: rb-scip-go:0.2.7")
+            (absent.status, absent.detail),
+            (Status::Warn, format!("absent: {go}"))
         );
 
         let home = Path::new("/Users/me");

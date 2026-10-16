@@ -605,6 +605,32 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - No change under `crates/`; no `worktrees/` or `bench/__pycache__/` touched.
   - Disk at the end: 23 GiB free.
 
+**PI note (2026-10-17, phase PI; base `d73ab58`).** Logs in `var/m9c/logs/pi/`, scripts in `var/m9c/pi/scripts/` (`python3 -I`, read-only).
+- **Built.** `docker/scip-go/Dockerfile` is the candidate with its two draft header lines replaced by the old file's first line; the body is byte-identical (`diff`). `docker build --no-cache -t rb-scip-go:0.2.7-xtools0.50.0 docker/scip-go` (`build.log`): MVS raises x/tools, x/mod, x/sync, x/sys and the `go` line as amendment 2 lists, `go.mod: OK`, `go.sum: OK`, `dep golang.org/x/tools v0.50.0`, and the self-test step runs. Image ID **`sha256:47eab8656c7edde2633c48b0650da7896e04d8cedd198a7accd1576fb685c9af`**. Its scip-go binary is byte-identical to `rb-scip-go:probe-m9c`'s (sha256 `6ceaa102…dba542`, `image-compare.txt`), so P0b's measurements hold for it. Against `rb-scip-go:0.2.7` the binary differs in the four module versions, in `mod … v0.2.7+dirty` with `vcs.modified=true` (the edited `go.mod`/`go.sum`), and in `DefaultGODEBUG`, which follows the `go 1.26.0` line. The `go` toolchain and the fetch commands are unchanged.
+- **Code.** `SCIP_GO_IMAGE = "rb-scip-go:0.2.7-xtools0.50.0"`. A new unit, `jobs::tests::scip_go_image_tag_names_the_dockerfile_pins`, ties the tag to the Dockerfile's `SCIP_GO_VERSION` and `XTOOLS_VERSION`, requires the self-test's `grep`, and requires both READMEs' build line. It failed first on the old constant (`unit-failfirst.log`). The doctor test's literal is now the constant. Both READMEs are updated: the scip-go README gains the x/tools row, the pins, a self-test section and the tag.
+- **Old tag elsewhere.** Repo-wide `0.2.7` grep outside `worktrees/`: what remains is records (`IMPLEMENT.md`, `tasks/*`), the design doc's indexer row (scip-go is still 0.2.7), the Dockerfile's `ARG`, and `rb-scip/src/symbol.rs:340`'s comment. That comment records a measurement taken on `rb-scip-go:0.2.7`; the key forms it pins hold on the new image (the e2e asserts `go/github.com/go-chi/chi/v5@v5.3.2`, `go/github.com/gin-gonic/gin@v1.10.0` and `go/github.com/golang/go/src@go1.23`). None changed.
+- **Goldens (IMG), `golden-diff.txt`.** Both e2e failed first on `scip-status.txt` only (`e2e-failfirst.log`). After `RB_BLESS=1` (`e2e-bless.log`, 2 passed), only these two rows changed. Every other golden the two tests bless came out byte-identical.
+  - go-chi-sqlx line 2: `external 0 → 34`, `unmatched 54 → 20`. **chi's part is 11** (`NewRouter`, `Mux#Get/Route/Group/Handle`, `Router#` ×2, `Router#Post/Get/Delete/With`, all `v5.3.2`); stdlib is 23 (`go1.23`, as P0b measured offline).
+  - polyglot line 5 (billing): `external 10 → 41`, `unmatched 44 → 13`: 31 stdlib `go1.23` (`net/http`, `net/http/httptest`, `database/sql`, `testing`, `log`, `io`).
+  - Unchanged as predicted: `references matched` 14 and 4, `7 exact calls (scip)`, the `Card#`/`Cash# → Payer#` guards, and polyglot line 1.
+  - Classified per reference (`ref-outcomes.txt`). The old and new indexes come from `rb.scip_index`, exported `READ ONLY` for the same input hashes (`export_idx.sql`); the references are every Go reference `rb_syntax::extract` gives (chi 69, billing 58). Matching at the name span reproduces rb's counters exactly on both images, and every moved reference is `none → stdlib/chi member`.
+  - The new indexes keep every old occurrence (125/125, 189/189), with equal definitions. Invalid locals fall 19 → 0 and 25 → 0 (`fixture-externals.txt`).
+  - billing adds 54 stdlib member occurrences, of which 31 move a reference. Of the other 23, 15 are terms (fields, constants), which rb counts no reference for. The other 8 lie in the generated testmain document outside the root.
+- **Controls.**
+  - Self-test (`selftest-control.txt`, the Dockerfile's test run offline in each image): `rb-scip-go:0.2.7` exits 0, writes no `Getenv` symbol, **FAIL**. The new image writes `scip-go gomod github.com/golang/go/src go1.25 os/Getenv().`, **PASS**.
+  - Image (`image-control.txt`): an Edit set the constant back to `rb-scip-go:0.2.7`, then `cargo build -p rb-cli`. `scip_go_chi_sqlx` **failed** on the `scip:` line (`external 0 … unmatched 54` against the blessed `external 34 … unmatched 20`). The old image's index was served from its own cache row (first index 1.9 s), keyed by its image ID. An Edit restored the constant.
+- **Verify.**
+  - `cargo fmt --all --check` exit 0 (`fmt.log`); `cargo clippy --workspace --all-targets -- -D warnings` exit 0 (`clippy.log`).
+  - `cargo test -p rb-scip`: 81 passed (`unit.log`); `cargo test -p rb-cli --bin rb`: 46 passed, the doctor test among them.
+  - Full `cargo test -p rb-cli --test e2e -- --test-threads=1` after `cargo build -p rb-cli` (`e2e-full.log`): 50 passed, 2 failed, `grep -c 'skipping:'` = 0. All 15 `scip_*` passed.
+  - The 2 failures were `a_checkout_is_its_repository_whatever_its_name` and `check_gates`. Each failed at an `rb check` whose Cypher statement hit its 2,000 ms timeout, at load ~5. Neither runs scip-go: one indexes `--no-scip`, the other with `ScipOptions::disabled`. Neither is in `bench/mutants/timing_tests.txt`.
+  - Re-run alone at load 2.4 (`e2e-rerun-load.log`): 2 passed, 0 skipped. So the suite is 52/52 over the two logs, not in one run.
+- **Safety.** `SELECT * FROM rb.repo ORDER BY 1` is identical before and after (`repo-{before,after}.txt`, 4 rows). No probe repository was created. Test repositories left: 0. `rb-scip-go:0.2.7` was not touched; `rb-scip-go:probe-m9c` is kept. Disk: 22 GiB free before the build, 19 GiB after the runs.
+- **Deviations.**
+  - The image-control log is `var/m9c/logs/pi/image-control.txt`, not `var/m9c/logs/image-control.txt`.
+  - The commit title is "M9c PI: scip-go image with x/tools v0.50.0 (export data v5)", as the orchestrator gave it, not PI's "scip-go reads Go 1.27.2 export data".
+  - The unit test and the README's "Why x/tools v0.50.0" and "Self-test" sections are additions within PI's files.
+
 ## Result
 
 Not yet built.

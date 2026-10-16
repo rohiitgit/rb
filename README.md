@@ -272,7 +272,7 @@ SCIP images (only needed without `--no-scip`):
 docker build -t rb-scip-java:0.13.1 docker/scip-java
 docker build -t rb-egress-proxy:1.11.3 docker/egress-proxy
 docker pull --platform linux/amd64 sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845
-docker build -t rb-scip-go:0.2.7 docker/scip-go
+docker build -t rb-scip-go:0.2.7-xtools0.50.0 docker/scip-go
 docker pull --platform linux/amd64 sourcegraph/scip-python@sha256:1847528ce710f58d13200e8c0237f8028342eee3f8a073a9f6109107f930be23
 ```
 

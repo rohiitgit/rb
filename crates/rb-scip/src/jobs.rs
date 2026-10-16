@@ -13,8 +13,11 @@ pub const SCIP_JAVA_IMAGE: &str = "rb-scip-java:0.13.1";
 /// The scip-go image: built locally from `docker/scip-go` (no published image
 /// is suitable). Like scip-java, a local image has no registry digest, so the
 /// cache key uses its image ID, resolved at run time; when absent the job is
-/// `unsupported` and nothing builds it implicitly.
-pub const SCIP_GO_IMAGE: &str = "rb-scip-go:0.2.7";
+/// `unsupported` and nothing builds it implicitly. scip-go v0.2.7 with
+/// golang.org/x/tools raised to v0.50.0, the first that reads the export data
+/// Go 1.27.2 writes (version 5); `rb-scip-go:0.2.7` loaded no imported package
+/// (contract M9c amendment 2).
+pub const SCIP_GO_IMAGE: &str = "rb-scip-go:0.2.7-xtools0.50.0";
 /// scip-python v0.6.6 is published for linux/amd64 only; on arm64 hosts it
 /// runs emulated (like scip-typescript). Pinned by digest after measuring
 /// against the disk budget (contract M6d S2).
@@ -1201,6 +1204,41 @@ impl TsScopes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract M9c amendment 2 (PI): the scip-go tag names what its Dockerfile pins, scip-go's
+    /// version and the raised x/tools (the first that reads Go 1.27.2's export data), so a
+    /// Dockerfile change that keeps the old tag fails here. The build-time self-test stays in
+    /// the Dockerfile, and both READMEs build the tag `rb index` runs.
+    #[test]
+    fn scip_go_image_tag_names_the_dockerfile_pins() {
+        let dockerfile = include_str!("../../../docker/scip-go/Dockerfile");
+        let arg = |name: &str| {
+            let prefix = format!("ARG {name}=");
+            dockerfile
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("no {prefix} in the Dockerfile"))
+        };
+        let xtools = arg("XTOOLS_VERSION");
+        assert_eq!(xtools, "v0.50.0");
+        let tag = format!(
+            "rb-scip-go:{}-xtools{}",
+            arg("SCIP_GO_VERSION"),
+            xtools.trim_start_matches('v')
+        );
+        assert_eq!(SCIP_GO_IMAGE, tag);
+        assert!(
+            dockerfile.contains("grep -aq ' os/Getenv()[.]' index.scip"),
+            "the build-time self-test is gone"
+        );
+        let build = format!("docker build -t {SCIP_GO_IMAGE} docker/scip-go");
+        for readme in [
+            include_str!("../../../docker/scip-go/README.md"),
+            include_str!("../../../README.md"),
+        ] {
+            assert!(readme.contains(&build), "{build}");
+        }
+    }
 
     fn summary(files: &[&str]) -> Vec<String> {
         workspace_summary(files, &[]).0
