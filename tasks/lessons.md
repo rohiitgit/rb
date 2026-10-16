@@ -606,3 +606,15 @@
 ## 2026-10-16: check the disk at every milestone start
 - **Context:** `target/` grew to 48 GiB over a series of milestones and took free space down to 2.4 GiB during M9a, under `bench/run.sh`'s 6 GiB floor. `cargo clean` freed 48.0 GiB.
 - **Rule:** At each milestone start, run `du -sh target` and `df -h .`. Run `cargo clean` when free space is under twice the bench floor plus one release build.
+
+## 2026-10-16: a mutant is killed by its named test, not by any panic
+- **Mistake (caught by M9a evaluator pass 1, E2):** the runner counted any `panicked at` as KILLED. Under `--jobs 4` the machine was loaded, a wall-clock test (`…_stay_fast`) panicked, and unfiltered `rb-indexer` specs that changed no test result read KILLED.
+- **Rule:** Every spec outside rb-bench names its `test` filter, and KILLED needs a failing test whose name contains it (`---- <name> stdout ----`). A run whose failures all lie outside the filter is INVALID, never a kill. The mutant caches in `/tmp/rbmut-target-*` grow to about 5 GiB each; delete them when the disk is short.
+
+## 2026-10-16: "as for X" in a contract is a claim to test with X's edge cases
+- **Mistake (caught by M9a evaluator pass 1, E3):** amendment 1 said an empty remote context path "counts as none, as for local files". The local rule takes the highest value first and then drops an empty one. The remote loop skipped empty values while searching, so a lower path survived. No test held an empty remote value over a lower one, and the mutant that removed the rule survived.
+- **Rule:** When a rule is stated as equivalent to an existing one, write one test row per edge of the existing rule (empty, absent, overridden) on both sides, and see each row fail on a mutant before calling the two equivalent.
+
+## 2026-10-16: a spot check is a file, or it did not happen
+- **Mistake (caught by M9a evaluator pass 1, E4):** the Result said "18 citations were spot-checked", and the disk figures came from tool output, but no list, command or output was kept.
+- **Rule:** Every audit is a script with a logged output (`var/m9a/scripts/check_citations.py` → `logs/citations.txt`, with a shifted-line control that shows the check can fail). A number seen only in a session's tool output is written to a log, with its source, before it goes into a record.

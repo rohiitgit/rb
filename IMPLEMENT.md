@@ -831,5 +831,12 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - fmt and clippy clean; `rb.repo` unchanged.
   - Two scorings `cmp`-identical.
   - Perf inside the NFR after a re-measure (amendment 2).
-- **Status:** implemented, evaluator pending.
+- **Evaluator pass 1 (PASS, 4 should-fix, 4 notes), answered in amendment 3 (`624da45`):**
+  - E3: an empty remote context path now clears a lower one (`PIPELINE` `m9a-2`).
+  - E1: the B14 and B7 tests cover every rule, with mutants m248–m260.
+  - E2: a mutant kill needs a failing test that matches the spec's filter.
+  - E4: every citation of the 80 new verdicts is script-checked (258 of 259 OK); the disk figures are logged.
+  - E5 and E6 are residue.
+  - Re-close: binary `2e36cd60…`, dumps identical by row to the first run, scoreboard cells unchanged, `compare` exit 0, perf warnings re-measured without persisting.
+- **Status:** implemented; evaluator pass 1 answered, pass 2 pending.
 

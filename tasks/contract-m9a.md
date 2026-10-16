@@ -1,6 +1,6 @@
 # M9a contract: `exact` precision from the M8 benchmark (2026-10-16)
 
-**Status:** implemented; evaluator pass 1 pending. The contract was written 2026-10-16 from `tasks/plan-m9.md` §4 "M9a" and `tasks/bench-findings.md` B7, B8, B11, B12 (part a), B13, B14. Every root cause below was re-read in the code at branch `m9` (`0453fda`) and checked against the M8 dumps (`var/bench/out/a038653b8478/`). Commits go on branch `m9`.
+**Status:** implemented; evaluator pass 1 PASS answered (amendment 3); pass 2 pending. The contract was written 2026-10-16 from `tasks/plan-m9.md` §4 "M9a" and `tasks/bench-findings.md` B7, B8, B11, B12 (part a), B13, B14. Every root cause below was re-read in the code at branch `m9` (`0453fda`) and checked against the M8 dumps (`var/bench/out/a038653b8478/`). Commits go on branch `m9`.
 
 ## Why
 
@@ -240,6 +240,8 @@ No M9a mutant touches a database write.
   - Boot 1 `server.context-path` and `contextPath`.
   - Profile-specific remote files (`<name>-<profile>.yml`) and git backends.
   - Attributing inherited CRUD to callers (B11).
+  - **D1 follows `is_test_path` exactly (evaluator pass 1, E5).** `is_test_path` is shared by DI, RTA, liveness and `rb impact`, so M9a does not change it. Production routes it matches by name lose their endpoint and get only a `routes_in_test_code` diagnostic: `jsvc/src/main/java/com/ex/test/DiagController.java` (a production package named `test` under `src/main`), `jsvc/src/main/java/com/ex/AbTest.java`, `web/src/routes/tests/index.ts` (mounted at `/lab`, so `GET /lab/results` is lost), and `web/src/helpers.spec.ts` (mounted at `/spec`). The other way round, `gosvc/testdata/fixture.go` stays an `exact` endpoint `GET /from-testdata` under its own service `gosvc/testdata`, though Go never compiles `testdata/`. The bench has none of these outside mattermost's `e2e-tests` (kept on purpose, plan correction 1). The cost is recall, not precision. A later fix would let `src/main/` override directory names and add `testdata/`.
+  - **B14 inputs outside D4 (evaluator pass 1, E6).** A client's `spring.cloud.config.name`, which Spring uses before `spring.application.name`, is not read. `context-path: delta` (no leading `/`) gives `/delta/x`, a value Spring refuses at startup. `optional:classpath:` and `classpath*:` locations are not read. D4 orders every remote `application.*` below any `<name>.*`, whatever the location; Spring Boot orders by location first. The two differ only when several locations each hold both files.
 
 ## Amendments
 
@@ -269,11 +271,58 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - C8's method: the contract asked for a scratch repository. P6 instead indexed hk_todo with both binaries: the M9a binary records `"pipeline": "m9a-1"` and the M8 binary `"pipeline": "m7j-1"` (`perf-ab.txt`). The repositories were removed (`repositories left like bench\_%: 0`).
 - **C4's count was mixed.** The contract says 264 `IMPLEMENTS` from 5 `*Suite#` test types, 38 to `AppIface#`. A recount over both mattermost `scip` dumps gives 277 from 5 types, 38 to `AppIface#`, the same in M8 and M9a. 264 of them (36 to `AppIface#`) come from the 4 types declared in `_test.go` files: `MmctlUnitTestSuite#` 136, `MmctlE2ETestSuite#` 84, `OpensearchInterfaceTestSuite#` 27, `ElasticsearchInterfaceTestSuite#` 17. The fifth, `CommonTestSuite#` (13, 2 to `AppIface#`), is declared in `server/enterprise/elasticsearch/common/test_suite.go`, which `is_test_path` does not match. B13b records both counts.
 
+**Amendment 3 (2026-10-16, evaluator pass 1 answered; code `624da45`).** Pass 1 (`tasks/eval-m9a-pass1.md`) gave PASS with 4 should-fix findings and 4 notes. Each is answered below. Logs are in `var/m9a/logs/`.
+- **E3 (fixed, test first).** Spring Cloud Config's remote sources rank above local files. Spring serves an empty `server.servlet.context-path` at the root: Spring's YAML loader reads a null as `""`, and the servlet factory takes `""` as the root context. The remote loop skipped empty values while searching, so a lower path survived. Now the highest value found wins, empty included, and an empty value removes the client's context path. The `config_server_context_path` diagnostic still names the file, with `context_path` `""`.
+  - Red before the fix (`e3-red.log`): only the evaluator's `svc-e` shape (remote `""` over local `/local-eps`, which gave `/app/x`) and a remote `<name>.yml` `""` over a remote `application.yml` `/app` failed.
+  - Local files already behaved this way: their merge takes the highest value, then drops an empty one. New rows pin it: `application.yml` `""` over `bootstrap.yml` `/boot`; `application-dev.properties` `key=` over `/base`; `application-dev.yml` null over `/base`. All pass on unchanged local code.
+  - `PIPELINE` `m9a-1` → `m9a-2`. The bench has no such case: the r2 dumps equal r1's (below).
+- **E1 (tests).** `config_server_shared_files_set_client_context_paths` now has one client per rule:
+  - `.properties` over YAML in one location;
+  - a later location over an earlier one, with padded entries and a trailing `/`;
+  - profile-gated YAML and `.properties` documents ignored;
+  - a server that is itself a named config client keeps its route;
+  - an absent key overrides nothing, and an empty value clears;
+  - camelCase `searchLocations`;
+  - a server at the repository root.
+
+  `routes_in_test_files_are_not_endpoints` counts 2 routes in one test file. Mutants m248–m260 cover the evaluator's e02–e12, with e03 re-expressed against the new code as m249, plus m259 (the E3 clear) and m260 (an absent key counts as empty). None is equivalent. The evaluator's own specs re-run with e01, e02 and e04–e12 KILLED, and e03 STALE because its line was replaced (`mutants-eval-r2.log`).
+- **E2 (runner).** Outside rb-bench a spec must name its `test` filter, or it is INVALID. With a filter, KILLED needs a failing test whose name contains it (`---- <name> stdout ----`); failures only outside the filter are INVALID. Shown in `e2e-runner-check.log` (specs in `e2-throwaway.json`):
+  - an rb-indexer spec with no filter: INVALID;
+  - m201's mutation with the filter `wilson_intervals`: INVALID, `failures only outside the filter: structural::tests::paths_normalise`;
+  - the same mutation with no filter: KILLED (the rb-bench control);
+  - the runner's verdict on the evaluator's `…_stay_fast` failure under a `config_server…` filter: INVALID.
+- **E4 (records).** "18 citations spot-checked" is replaced by a script over all of them. `var/m9a/scripts/check_citations.py` → `citations.txt`:
+  - It reads all 80 new verdicts, the same lines as the judges' `verdicts-*.tsv`, at their pins. All 3 checkouts are at their pins.
+  - 259 citations: OK 258, MISMATCH 1, UNRESOLVED 0. Control with every cited line moved +7: OK 64, MISMATCH 190, UNRESOLVED 5.
+  - The MISMATCH is reported, not fixed: exact.tsv line 276 cites `src/cartservice/src/services/CartService.cs:41` for "overrides EmptyCart", but `EmptyCart` is at line 45 (line 41 is the `{` of `GetCart`). The override exists, so the verdict TRUE stands.
+  - Amendment 2's disk figures were seen only in the session's tool output. `disk.txt` records them with that source.
+- **E5, E6 (notes).** Recorded with their cases in "Residue recorded here". `is_test_path` is unchanged.
+- **E7 (note).** No change: the Result already reports the missed `service_flows` predictions.
+- **E8 (note).** The re-measure scripts `perf_ab3.sh` and `perf_ab4.sh` print with `print -r --` and emit no `bad option`.
+- **Verification (code commit).**
+  - fmt and clippy CLEAN (`fmt-clippy-r2.log`).
+  - Unit tests (`unit-*-r2.log`): rb-indexer 357/0, rb-frameworks 204/0, rb-bench 79/0.
+  - Real-Docker e2e (`e2e-r2.log`): 52 passed, 0 failed, 0 `skipping:`. A first attempt (`e2e-r2-try1.log`) failed 2 scip-java tests. Its `--no-cache` step hit `repo.maven.apache.org:443 failed to respond` in the fetch phase, and the second test replayed the cached failure. Per the lesson of 2026-10-11, the row was cleared by a `--force --no-cache` index of the same fixture layout (`t_scipfix`, scip-java ok). Both tests then passed, and the full suite passed.
+  - `rb.repo` identical before and after (`repo-{before,after}-r2.txt`).
+  - Batteries: m9a 31/31 KILLED (`mutants-m9a-r2.log`), m8b 29/29 KILLED (`mutants-m8b-r2.log`).
+- **Binary of record (r2).** `var/m9a/bin/rb`, sha256 `2e36cd607eab2ac472886238d18e27ba3d3d0340d5835aa480e9a5fb4b047f17`, built from `624da45a6a9e748f0a5a77e70f8a18efb8db6e83` with `crates/` and `migrations/` clean (`build-r2.log`). The r1 binary is kept as `var/m9a/bin/rb.r1`. Bench: `var/bench/out/2e36cd607eab/`, `failures: 0`, all 27 `noscip` fresh/cached pairs identical, 0 `bench_` repositories left (`bench-run-r2.log`).
+- **r2 diff.** By row identity, `var/m9a/scripts/r2diff.py` finds all 157 dumps identical to r1's `05a600c9ff2d`: 0 differing rows (`r2-diff.txt`). The same script over the M8 base and r1 gives the invariant's 1,866 rows in 10 dumps, so the 0 is not vacuous.
+- **Score and gate.**
+  - Two scorings are `cmp`-identical (`var/m9a/score/m9a-r2-second{,-perf}.json`). `bench/scoreboard/m9a.json` differs from r1's only in `rb` (commit and binary sha).
+  - `rb-bench sample`: 0 drawn edges without a verdict, and the drawn list is byte-identical to r1's (`sample-missing-r2.txt`).
+  - `compare` against `var/m9a/m8b-rescored.json` exits 0 with the same 14 `changed` lines and 1 `accepted` line as r1 (`compare-r2.txt`).
+- **Perf warnings, re-measured.**
+  - `compare --perf` warned on all 27 `noscip-fresh` walls, mattermost included (24.7 → 39.4 s). The run's load was 3.95–6.0, and scoring took 8.5 s against r1's 1.44 s.
+  - `perf_ab3.sh` (`perf-ab3.txt`) alternated the M8, r1 and r2 binaries, 3 runs each, on the 27 targets. 234 runs exited 0. spring_boot_microservices exited 1 on all three binaries in 0.01 s: its 42-character repository name was too long.
+  - r2 against M8, mean wall: within 0.68–1.19× on 24 targets. go_gin_example was 1.27×, from one 1.55 s run. mattermost was 32.09 against 31.61 s (1.02×), with one ~50 s run on each binary.
+  - `perf_ab4.sh` (`perf-ab4.txt`, M8 vs r2, all runs exit 0): go_gin_example 0.49 / 0.49 s (5 runs); spring_boot_microservices median 0.41 / 0.42 s (5 runs); mattermost 22.88 / 23.82 s (3 runs, 1.04×), max RSS 1,990,934,528 / 1,951,055,872 B.
+  - No warning persists, and mattermost is inside the NFR (≤ 30.9 s, ≤ 1.93 GiB). The bench run's own mattermost RSS, 2,041,479,168 B, is under the 1.15× limit.
+
 ## Result
 
-**Commits (branch `m9`):** `fb8f827` contract, `9d27a56` P0, `5f139da` P1, `d68a6ec` P2, `244ed90` P3, `2b5e956` P4, `d299183` P5, `7a82313` M9b contract and todo, then the P6/P7 records commit `M9a P6/P7: bench gate passes, records`.
+**Commits (branch `m9`):** `fb8f827` contract, `9d27a56` P0, `5f139da` P1, `d68a6ec` P2, `244ed90` P3, `2b5e956` P4, `d299183` P5, `7a82313` M9b contract and todo, `cd912d4` P6/P7 records, `55fbed0` perf re-measure, `624da45` the pass 1 answer (E1–E4), then the re-close commit `M9a: re-close after evaluator pass 1`.
 
-**Binary of record (C8):** `var/m9a/bin/rb`, sha256 `05a600c9ff2deb9b55e2a71905eb97bcd71e51aceaeea15d7bbf7fe7aedae9b5`, built from `7a82313f2033b3398eb303a3b836a6d8e944d3e7` with `crates/` and `migrations/` clean. `PIPELINE` `m9a-1`. Bench outputs: `var/bench/out/05a600c9ff2d/`, `failures: 0`, and all 27 `noscip` fresh/cached dump pairs identical (`var/m9a/logs/bench-run.log`).
+**Binary of record (C8):** `var/m9a/bin/rb`, sha256 `2e36cd607eab2ac472886238d18e27ba3d3d0340d5835aa480e9a5fb4b047f17`, built from `624da45a6a9e748f0a5a77e70f8a18efb8db6e83` with `crates/` and `migrations/` clean (`var/m9a/logs/build-r2.log`). `PIPELINE` `m9a-2`. Bench outputs: `var/bench/out/2e36cd607eab/`, `failures: 0`, all 27 `noscip` fresh/cached dump pairs identical (`var/m9a/logs/bench-run-r2.log`), and all 157 dumps identical by row to the first run's (amendment 3). The first binary of record (`05a600c9…`, from `7a82313`, `PIPELINE` `m9a-1`, outputs `var/bench/out/05a600c9ff2d/`) is kept as `var/m9a/bin/rb.r1`. The numbers below come from the first run and hold unchanged for r2.
 
 **Claims.**
 
@@ -286,11 +335,11 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 | C5 | met | Unit test (`test.log`). Invariant C5: 78 piggymetrics rows. Endpoints `tp synthetic 0 → 6`, `fp exact 6 → 0`, `fn 6 → 0`. One accepted out-of-scope flow (amendment 2). |
 | C6 | met | Unit test (`test.log`). Invariant C6: 10 rows each for mse_anilallewar and mse_rohitghatol. Endpoints `tp exact 4 → 6`, `fn 2 → 0` in each. |
 | C7 | met (evaluator reads) | The B11 text is in README, the usage guide and the design doc (P5, `d299183`). `synthetic` stays 8 wrong: 16/24 → 22/30 (`certainty-m9a.txt`); `table_queries` cells unchanged. |
-| C8 | met | HEAD, sha256 and `PIPELINE` above; `perf-ab.txt` records `m9a-1` against `m7j-1`. |
+| C8 | met | HEAD, sha256 and `PIPELINE` above (`build-r2.log`); `perf-ab.txt` recorded `m9a-1` against `m7j-1` for the first binary; `PIPELINE` `m9a-2` after E3 (amendment 3). |
 | C9 | met | 157 dumps compared (27 `noscip`, 11 `scip`, 119 PyCG cases), all non-empty; 0 unclassified (`invariant.txt`). |
-| C10 | met | Every family has 0 edges without a verdict (`certainty-m9a.txt`). `compare` exits 0 with one accepted line (`compare.txt`). Two more scorings, `var/m9a/score/m9a-{second,third}.json` and their perf files, are `cmp`-identical to the committed scoreboards. |
-| C11 | met | mattermost within the NFR; 14 small-target wall warnings re-measured without persisting (amendment 2). The warm run wrote its outputs from 04:03:00 to 04:05:48, under 20 min. Scoring took 1.44 s (`var/m9a/score/time3.txt`). |
-| C12 | met | m230–m247: 18 of 18 KILLED (`mutants-m9a.log`); m8b.json: 29 of 29 KILLED (`mutants-m8b.log`); none STALE or INVALID. |
+| C10 | met | Every family has 0 edges without a verdict (`certainty-m9a.txt`; r2: `sample-missing-r2.txt`). `compare` exits 0 with one accepted line (`compare.txt`; r2: `compare-r2.txt`, the same lines). Two more scorings, `var/m9a/score/m9a-{second,third}.json` and their perf files, were `cmp`-identical to the r1 scoreboards; for r2, `var/m9a/score/m9a-r2-second{,-perf}.json` is `cmp`-identical to the committed ones. The 80 new verdicts' citations are checked in `citations.txt` (amendment 3, E4). |
+| C11 | met | mattermost within the NFR; 14 small-target wall warnings re-measured without persisting (amendment 2). The warm run wrote its outputs from 04:03:00 to 04:05:48, under 20 min. Scoring took 1.44 s (`var/m9a/score/time3.txt`). r2: `compare --perf` warned on all 27 `noscip-fresh` walls under a load of 4–6 (mattermost 39.35 s). A/B/C re-measures put r2 within 1.04× of M8 on mattermost (23.82 / 22.88 s, ≤ 30.9 s) and found no persisting warning (`perf-ab3.txt`, `perf-ab4.txt`, amendment 3). Scoring took 8.51 s under that load (`var/m9a/score/r2-time1.txt`), under 30 s. The perf table below is the first run's. |
+| C12 | met | m230–m247: 18 of 18 KILLED (`mutants-m9a.log`); m8b.json: 29 of 29 KILLED (`mutants-m8b.log`); none STALE or INVALID. After pass 1, under the stricter runner (E2): m230–m260 31 of 31 KILLED (`mutants-m9a-r2.log`), m8b 29 of 29 KILLED (`mutants-m8b-r2.log`). |
 
 **Invariant (C9, `var/m9a/logs/invariant.txt`).** Base `a038653b8478`, head `05a600c9ff2d`. 119 of 119 PyCG cases identical. Buckets: C1 22, C2 6, C3 1,740, C5 78, C6 20, META 0, unclassified 0. Differing targets: microservices_demo `scip` (C3 5), go_gin_example `noscip` and `scip` (C2 3 each), go_clean_arch `scip` (C3 27), mattermost `noscip` (C1 7) and `scip` (C1 7, C3 1,708), mse_anilallewar (C6 10), mse_rohitghatol (C6 10), mse_piggymetrics (C5 78), hk_todo (C1 8). Every other dump is byte-identical.
 
@@ -355,7 +404,7 @@ The 14 perf warnings follow in the log (amendment 2). The re-scored base (D6, `v
 | scip | 57 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
 | sql | 59 / 60 | 59 / 60 | 91.1–99.7 % | 0 |
 
-The run redrew 80 edges, as predicted: 25 `routes` (go_gin_example 5, mattermost 17, microservices_demo 3) and 55 `scip` (mattermost 54, microservices_demo 1). 4 blind judges, told to assume each edge false, judged all 80 TRUE. 18 of their citations were spot-checked against the source. The verdicts are appended to `bench/samples/exact.tsv` (81 added lines, none edited); inputs and transcripts are in `var/bench/labels/exact-m9a/`. No `*Suite#` `IMPLEMENTS` edge was drawn.
+The run redrew 80 edges, as predicted: 25 `routes` (go_gin_example 5, mattermost 17, microservices_demo 3) and 55 `scip` (mattermost 54, microservices_demo 1). 4 blind judges, told to assume each edge false, judged all 80 TRUE. All 259 file:line citations in their evidence were checked against the pinned source by script: 258 OK, 1 MISMATCH (a judge's off-by-4 line on `CartService.cs`, verdict unaffected; `var/m9a/logs/citations.txt`, amendment 3). The earlier "18 spot-checked" had no record. The disk figures of amendment 2 are in `var/m9a/logs/disk.txt` with their source. The verdicts are appended to `bench/samples/exact.tsv` (81 added lines, none edited); inputs and transcripts are in `var/bench/labels/exact-m9a/`. No `*Suite#` `IMPLEMENTS` edge was drawn.
 
 **Perf (`bench/scoreboard/m9a-perf.json` against `m8b-perf.json`).**
 

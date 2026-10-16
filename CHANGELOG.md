@@ -1,5 +1,25 @@
 # Changelog
 
+## [2026-10-16 15:10] (wall clock) M9a: evaluator pass 1 answered, re-closed
+- **E3 (fix):** a config server's empty `server.servlet.context-path` now overrides a lower local or remote path, so the routes stay at the root, as Spring serves them. Local files already behaved this way. `PIPELINE` `m9a-2`.
+- **E1 (tests):** the B14 test covers every D4 and amendment 1 rule, and the B7 test counts 2 routes in one file. Mutants m248–m260 (the evaluator's e02–e12, plus 2 for the fix) are all KILLED.
+- **E2 (runner):** `bench/mutants/run.py` requires a `test` filter outside rb-bench, and a kill needs a failing test that matches the filter. A flaky test elsewhere now reads INVALID.
+- **E4 (records):**
+  - `var/m9a/scripts/check_citations.py` checks all 259 file:line citations of the 80 new verdicts against the pinned source: 258 OK, 1 MISMATCH (a judge's off-by-4 line, verdict unaffected; `var/m9a/logs/citations.txt`).
+  - The disk events are in `var/m9a/logs/disk.txt`.
+- **E5, E6:** recorded as residue in the contract.
+- **Re-close:**
+  - Binary sha256 `2e36cd60…` from `624da45`. The bench reports 0 failures, and its 157 dumps are identical by row to the first M9a run.
+  - Scoreboard cells unchanged; two scorings `cmp`-identical; sample 0 missing.
+  - `compare` exits 0 with the same lines. 27 perf warnings under load were re-measured A/B: mattermost r2 is 23.82 s against M8's 22.88 s, and none persisted.
+- **Verification:** mutants m9a 31/31 and m8b 29/29 KILLED; unit tests 357 + 204 + 79 passed; real-Docker e2e 52/0/0 after one Maven fetch failure was cleared; fmt and clippy clean; `rb.repo` unchanged.
+- **Files:**
+  - **Code:** `crates/rb-indexer/src/{lib,routes}.rs`.
+  - **Bench:** `bench/mutants/{run.py,m9a.json}`, `bench/scoreboard/m9a{,-perf}.json`.
+  - **Docs:** `docs/{usage-and-testing,repository-brain-design}.md`.
+  - **Records:** `tasks/{contract-m9a,eval-m9a-pass1,todo,lessons,bench-findings}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+- **Status:** evaluator pass 1 PASS answered; pass 2 pending.
+
 ## [2026-10-16 13:10] (wall clock) M9a: `exact` precision from the M8 benchmark
 - **Fixes** (contract `tasks/contract-m9a.md`, C1–C12):
   - **B7:** routes registered in test files are not endpoints. Each such file gets one `routes_in_test_code` diagnostic.
