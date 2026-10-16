@@ -36,6 +36,69 @@
   "what": "receiver table looked up by directory only (replaces 'by the caller's file', amendment 2)"
  },
  {
+  "id": "m265",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "            .and_then(|scope| consts.fold(path, facts, scope, candidate));\n",
+  "new": "            .and_then(|_| None::<(String, Vec<String>)>);\n",
+  "what": "fold disabled"
+ },
+ {
+  "id": "m266",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "                .is_some_and(|i| (path, i) != (c.file, c.binding));\n",
+  "new": "                .is_some_and(|_| false);\n",
+  "what": "shadow check removed"
+ },
+ {
+  "id": "m267",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "                let constant = b.constant;\n",
+  "new": "                let constant = true;\n",
+  "what": "var bindings enter the table"
+ },
+ {
+  "id": "m268",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "        table.retain(|k, _| declared.get(k) == Some(&1));\n",
+  "new": "        table.retain(|_, _| true);\n",
+  "what": "duplicate declarations keep a value"
+ },
+ {
+  "id": "m269",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "            _ => return None,\n",
+  "new": "            _ => {}\n",
+  "what": "unknown verbs skipped instead of refusing"
+ },
+ {
+  "id": "m270",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "            Some('%') => out.push('%'),\n",
+  "new": "            Some('%') => out.push_str(\"%%\"),\n",
+  "what": "%% kept as %%"
+ },
+ {
+  "id": "m271",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "        if link.name != \"Sprintf\" || chain.root.as_deref() != Some(\"fmt\") {\n",
+  "new": "        if link.name != \"Sprintf\" {\n",
+  "what": "fmt qualifier check removed"
+ },
+ {
   "id": "m285",
   "crate": "rb-indexer",
   "test": "resolve::tests::go_methods_in_sibling_files_are_members",
@@ -43,5 +106,23 @@
   "old": "                    (None, Some(_)) => continue,\n",
   "new": "                    (None, Some(_)) => &mut sc.top,\n",
   "what": "receiver-carrying defs kept in the file's top scope (amendment 2)"
+ },
+ {
+  "id": "m286",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "        if !fmt_is_the_fmt_package(facts, scope, chain.span) {\n",
+  "new": "        if false {\n",
+  "what": "fmt import check removed (amendment 3)"
+ },
+ {
+  "id": "m287",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "                let test_file = rb_model::is_test_path(path);\n",
+  "new": "                let test_file = false;\n",
+  "what": "test-file constants enter the table (amendment 3)"
  }
 ]

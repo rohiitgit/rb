@@ -332,7 +332,7 @@ pub(crate) enum TypeLevel {
 
 /// The package a file's same-package level searches: `("", package)` for Java, `(dir, package)`
 /// for Go (a directory may also hold an external `_test` package).
-fn package_key<'a>(
+pub(crate) fn package_key<'a>(
     path: &'a str,
     language: Language,
     facts: &'a FileFacts,

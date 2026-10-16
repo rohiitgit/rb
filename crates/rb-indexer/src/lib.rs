@@ -1131,9 +1131,17 @@ pub fn assemble(
     diagnostics.extend(manifest_diagnostics);
     diagnostics.extend(packages::unsupported_frameworks(&manifest_edges));
     // ORM mappings from every file first, so accesses can resolve entities across files.
+    // Go package constants for `fmt.Sprintf` SQL (contract M9b D6), before any file's queries.
+    let go_consts = sql::GoConsts::new(&content.facts);
     for (path, (_, facts)) in &content.facts {
         syntax::add_symbols(&mut b, path, facts, &keys[path])?;
-        diagnostics.extend(sql::add_queries(&mut b, path, facts, &keys[path])?);
+        diagnostics.extend(sql::add_queries(
+            &mut b,
+            path,
+            facts,
+            &keys[path],
+            &go_consts,
+        )?);
     }
     for e in scip_edges {
         let src = match e.src {
