@@ -34,5 +34,59 @@
   "old": "                                    out.extend(self.named(f, None, exported, want));\n",
   "new": "                                    out.extend(self.named(f, None, name, want));\n",
   "what": "default import resolved by its local name"
+ },
+ {
+  "id": "m304",
+  "crate": "rb-syntax",
+  "test": "tests::go_results_aliases_and_embedded_fields_are_facts",
+  "file": "decorations.rs",
+  "old": "            .then(|| def.child_by_field_name(\"result\"))\n",
+  "new": "            .then(|| def.child_by_field_name(\"no_result\"))\n",
+  "what": "Go `result` not recorded"
+ },
+ {
+  "id": "m305",
+  "crate": "rb-syntax",
+  "test": "tests::go_results_aliases_and_embedded_fields_are_facts",
+  "file": "decorations.rs",
+  "old": "    (language == Language::Go && def.kind() == \"type_alias\")\n",
+  "new": "    (language == Language::Go && def.kind() == \"no_alias\")\n",
+  "what": "`type_alias` gets no `alias_of`"
+ },
+ {
+  "id": "m306",
+  "crate": "rb-syntax",
+  "test": "tests::go_results_aliases_and_embedded_fields_are_facts",
+  "file": "bindings.rs",
+  "old": "            if node.kind() == \"field_declaration\" && declared.is_empty() {\n",
+  "new": "            if node.kind() == \"field_declaration\" && declared.is_empty() && false {\n",
+  "what": "unnamed field pushes no binding"
+ },
+ {
+  "id": "m307",
+  "crate": "rb-syntax",
+  "test": "bindings::tests::go_var_specs_and_call_pairs_bind",
+  "file": "bindings.rs",
+  "old": "                let literal = (node.kind() == \"var_spec\")\n",
+  "new": "                let literal = (node.kind() == \"no_spec\")\n",
+  "what": "untyped `var_spec` literal not typed"
+ },
+ {
+  "id": "m308",
+  "crate": "rb-syntax",
+  "test": "bindings::tests::go_var_specs_and_call_pairs_bind",
+  "file": "bindings.rs",
+  "old": "                let value = value.or_else(|| (call_pair && i == 0).then(|| rights[0]));\n",
+  "new": "                let value = value.or_else(|| (call_pair && i == 1).then(|| rights[0]));\n",
+  "what": "second name of a call pair gets the init"
+ },
+ {
+  "id": "m309",
+  "crate": "rb-syntax",
+  "test": "tests::python_raise_is_a_call_reference",
+  "file": "queries.rs",
+  "old": "(raise_statement . [(identifier) @name (attribute attribute: (identifier) @name)]) @reference.call\n",
+  "new": "(raise_statement [(identifier) @name (attribute attribute: (identifier) @name)]) @reference.call\n",
+  "what": "raise query without the `.` anchor"
  }
 ]

@@ -72,6 +72,19 @@ const CSHARP_SUPPLEMENT: &str = "
 (invocation_expression function: (member_access_expression name: (identifier) @name)) @reference.call
 ";
 
+/// Go's `tags.scm` matches `type_spec` only; tree-sitter-go 0.25 parses `type A = B` as
+/// `type_alias`, which then had no definition (contract M9c D3).
+const GO_SUPPLEMENT: &str = "
+(type_alias name: (type_identifier) @name) @definition.type
+";
+
+/// Python instantiates a bare class it raises (`raise A`, `raise m.A`), so the raised name is a
+/// call (contract M9c D5). The `.` anchor takes only the first child, so the `from` cause
+/// (`raise A from e`) is none; `raise A()` is already a call.
+const PYTHON_SUPPLEMENT: &str = "
+(raise_statement . [(identifier) @name (attribute attribute: (identifier) @name)]) @reference.call
+";
+
 const KOTLIN_ANONYMOUS: &[&str] = &["anonymous_function", "lambda_literal"];
 const CSHARP_ANONYMOUS: &[&str] = &["anonymous_function", "lambda_expression"];
 
@@ -121,14 +134,14 @@ pub(crate) fn for_language(language: Language) -> &'static Grammar {
         Language::Python => PYTHON.get_or_init(|| {
             build(
                 tree_sitter_python::LANGUAGE.into(),
-                &[tree_sitter_python::TAGS_QUERY],
+                &[tree_sitter_python::TAGS_QUERY, PYTHON_SUPPLEMENT],
                 PYTHON_ANONYMOUS,
             )
         }),
         Language::Go => GO.get_or_init(|| {
             build(
                 tree_sitter_go::LANGUAGE.into(),
-                &[tree_sitter_go::TAGS_QUERY],
+                &[tree_sitter_go::TAGS_QUERY, GO_SUPPLEMENT],
                 GO_ANONYMOUS,
             )
         }),
@@ -158,7 +171,9 @@ pub(crate) fn all_sources() -> String {
         tree_sitter_java::TAGS_QUERY,
         JAVA_SUPPLEMENT,
         tree_sitter_python::TAGS_QUERY,
+        PYTHON_SUPPLEMENT,
         tree_sitter_go::TAGS_QUERY,
+        GO_SUPPLEMENT,
         KOTLIN_TAGS,
         tree_sitter_c_sharp::TAGS_QUERY,
         CSHARP_SUPPLEMENT,

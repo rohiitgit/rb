@@ -669,6 +669,31 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - `SELECT * FROM rb.repo ORDER BY 1` is identical before and after (`repo-before.txt`, `repo-after-probe.txt`, 4 rows).
   - `t_m9c_*` repositories left: 0. No e2e ran while the probe existed.
 
+**P2 note (2026-10-17, phase P2, facts; base `6d71eb2`).** Logs in `var/m9c/logs/p2/`. P2 predicts no cell, so nothing is measured against a prediction here.
+- **Built.**
+  - D3:
+    - Go `return_type` is the `result` text (`decorations::return_type`).
+    - `Definition::alias_of` comes from `decorations::alias_of`, and the `GO_SUPPLEMENT` query makes `type_alias` a `type` definition.
+    - `Binding::embedded`: an unnamed `field_declaration` becomes a member named by the last segment of `type_identifier`, `qualified_type`, `generic_type` or `pointer_type`.
+    - An untyped `var_spec` is typed by `go_literal_type`, the `:=` rule moved into one helper that both arms use.
+    - The `:=` call pair.
+  - D5's query is `PYTHON_SUPPLEMENT`. Both supplements are in `all_sources`, so the extractor fingerprint changes.
+- **Tests, red first** (`red.log`): `go_results_aliases_and_embedded_fields_are_facts` and `python_raise_is_a_call_reference` (lib), and `go_var_specs_and_call_pairs_bind` (bindings), each failing on its assertions. To make them compile, the two fields were added first with inert values (`None`, `false`).
+- **Existing tests changed** (each failed on exactly the D3 change, `unit-before-updates.log`):
+  - `decorations::signature_tests::go_and_python_have_neither`: the Go row `F: - []` → `F: int []` (D3 records results). The name is kept as C4 states it, and a doc line says so.
+  - `bindings::tests::go_initialisers_and_constants`: gains `x = call f`, because `x, y := f()` now initialises `x` (D3).
+- **Readings of D3.**
+  - The call pair applies to `:=` as D3's bullet writes it (two names, one `call_expression`). `var a, b = f()` is unchanged.
+  - An embedded built-in (`error`) gets a member binding with an empty type, as `push` filters built-ins.
+  - A same-file method on an alias name attaches to the alias definition (`attach_go_methods` keys on top-level types by name). Go puts such a method on the alias's target. This is not handled here: P3's `alias_of` resolution reads the target.
+- **Verify.**
+  - `cargo test -p rb-syntax`: 124 passed (`unit.log`), the timing test among them.
+  - Downstream, beyond P2's verify: `cargo test -p rb-frameworks` 205 passed, `cargo test -p rb-indexer --lib` 366 passed (`downstream-*.log`).
+  - fmt and clippy exit 0.
+  - e2e not run (P6 runs the suite). With the fingerprint changed, every cached fact is re-extracted.
+- **Mutants.** m304–m309 KILLED (`mutants.log`). The whole file, m300–m309, was re-run on the P2 tree: 10 KILLED (`mutants-full.log`).
+- **Deviation.** Four `lib.rs` edits went out in one parallel block, against the one-edit-per-message rule. Each one was grepped and found landed (5 of 5) before anything ran.
+
 ## Result
 
 Not yet built.

@@ -39,6 +39,8 @@ pub(crate) struct RawBinding<'t> {
     /// = axios` holds `axios.get`; a `require("module")` call holds the
     /// module), per local name (contract M6b S9).
     pub destructured_from: Option<String>,
+    /// Go: an embedded struct field, named by its type's last segment (contract M9c D3).
+    pub embedded: bool,
 }
 
 /// Every binding in the file, in source order.
@@ -480,6 +482,7 @@ fn push<'t>(
             modifiers: Vec::new(),
             initialised: false,
             destructured_from: None,
+            embedded: false,
         });
     }
     name.is_some()
@@ -1452,14 +1455,30 @@ fn go<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 .then(|| go_position(node))
                 .flatten();
             for (i, name) in declared.iter().enumerate() {
-                let pushed = push(out, Some(*name), ty.clone(), member, node, node, source);
-                positioned(out, pushed, position.map(|p| p + i));
                 let value = nth_value(values, i).filter(|_| {
                     values.is_some_and(|v| {
                         v.kind() != "expression_list" || v.named_child_count() == declared.len()
                     })
                 });
+                // An untyped `var` takes its literal's type under the `:=` rule (contract M9c
+                // D3): `var ( appG = app.Gin{C: c} )`.
+                let literal = (node.kind() == "var_spec")
+                    .then(|| value.and_then(|v| go_literal_type(v, source)))
+                    .flatten();
+                let ty = ty.clone().or(literal);
+                let pushed = push(out, Some(*name), ty, member, node, node, source);
+                positioned(out, pushed, position.map(|p| p + i));
                 initialised(out, pushed, value, constant);
+            }
+            // An embedded field (`*SqlStore`, `store.Base`) is a member named by its type's last
+            // segment, as Go names it, typed by that type (contract M9c D3).
+            if node.kind() == "field_declaration" && declared.is_empty() {
+                let named = node.child_by_field_name("type").and_then(go_embedded_name);
+                if push(out, named, ty, true, node, node, source)
+                    && let Some(b) = out.last_mut()
+                {
+                    b.embedded = true;
+                }
             }
         }
         "short_var_declaration" => {
@@ -1473,27 +1492,19 @@ fn go<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
             let mut rc = right.walk();
             let lefts: Vec<Node<'t>> = left.named_children(&mut lc).collect();
             let rights: Vec<Node<'t>> = right.named_children(&mut rc).collect();
+            // `u, err := f(…)`: the one call initialises the first name only (contract M9c D3).
+            let call_pair =
+                lefts.len() == 2 && rights.len() == 1 && rights[0].kind() == "call_expression";
             for (i, name) in lefts.iter().enumerate() {
-                // A composite literal types its name only in a one-to-one assignment.
-                let ty = rights
-                    .get(i)
-                    .filter(|_| lefts.len() == rights.len())
-                    .and_then(|value| {
-                        let is_literal = match value.kind() {
-                            "composite_literal" => true,
-                            "unary_expression" => value
-                                .child_by_field_name("operand")
-                                .is_some_and(|o| o.kind() == "composite_literal"),
-                            _ => false,
-                        };
-                        is_literal.then(|| type_name(*value, source)).flatten()
-                    });
-                let name = Some(*name).filter(|n| n.kind() == "identifier");
-                let pushed = push(out, name, ty, false, node, node, source);
                 let value = rights
                     .get(i)
                     .copied()
                     .filter(|_| lefts.len() == rights.len());
+                // A composite literal types its name only in a one-to-one assignment.
+                let ty = value.and_then(|v| go_literal_type(v, source));
+                let name = Some(*name).filter(|n| n.kind() == "identifier");
+                let pushed = push(out, name, ty, false, node, node, source);
+                let value = value.or_else(|| (call_pair && i == 0).then(|| rights[0]));
                 initialised(out, pushed, value, false);
             }
         }
@@ -1518,6 +1529,30 @@ fn go<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
             }
         }
         _ => {}
+    }
+}
+
+/// The type a Go composite literal (`T{…}`, `&T{…}`) names; `None` for any other value.
+fn go_literal_type(value: Node<'_>, source: &[u8]) -> Option<String> {
+    let is_literal = match value.kind() {
+        "composite_literal" => true,
+        "unary_expression" => value
+            .child_by_field_name("operand")
+            .is_some_and(|o| o.kind() == "composite_literal"),
+        _ => false,
+    };
+    is_literal.then(|| type_name(value, source)).flatten()
+}
+
+/// The name node Go gives an embedded field: the last segment of its type (`SqlStore` of
+/// `*SqlStore`, `Base` of `store.Base`, `List` of `List[T]`).
+fn go_embedded_name(ty: Node<'_>) -> Option<Node<'_>> {
+    match ty.kind() {
+        "type_identifier" => Some(ty),
+        "qualified_type" => ty.child_by_field_name("name"),
+        "generic_type" => go_embedded_name(ty.child_by_field_name("type")?),
+        "pointer_type" => go_embedded_name(ty.named_child(0)?),
+        _ => None,
     }
 }
 
@@ -1744,6 +1779,68 @@ mod tests {
                 "t: Thing in Run",
                 "p: Thing in Run",
                 "q: ? in Run"
+            ]
+        );
+    }
+
+    /// Contract M9c C4 (D3): an untyped `var_spec` takes its composite literal's type under the
+    /// `:=` rule (one-to-one, `&` allowed), as gin's `var ( appG = app.Gin{C: c} )` needs; in
+    /// `a, b := f(…)` with exactly one call on the right, `a` holds the call and `b` nothing.
+    #[test]
+    fn go_var_specs_and_call_pairs_bind() {
+        let src = "package p
+var (
+\tappG = app.Gin{C: c}
+\tptr = &Thing{}
+\ttyped Store = NewStore()
+\tn = 1
+\tx, y = Thing{}, Other{}
+\tlone, extra = Pair{}
+)
+func f() {
+\tvar local = Thing{}
+\tu, err := article.NewService(r)
+\tth := Setup(t)
+\ta, b := Thing{}, g()
+\tm, ok := cache[k]
+\tp, q, z := three()
+}
+";
+        assert_eq!(
+            bound(Language::Go, src),
+            [
+                "appG: app.Gin in -",
+                "ptr: Thing in -",
+                "typed: Store in -",
+                "n: ? in -",
+                "x: Thing in -",
+                "y: Other in -",
+                "lone: ? in -",
+                "extra: ? in -",
+                "local: Thing in f",
+                "u: ? in f",
+                "err: ? in f",
+                "th: ? in f",
+                "a: Thing in f",
+                "b: ? in f",
+                "m: ? in f",
+                "ok: ? in f",
+                "p: ? in f",
+                "q: ? in f",
+                "z: ? in f",
+            ]
+        );
+        let calls: Vec<String> = inits(Language::Go, src)
+            .into_iter()
+            .filter(|row| row.contains("= call "))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "typed = call NewStore",
+                "u = call article.NewService",
+                "th = call Setup",
+                "b = call g",
             ]
         );
     }
@@ -2142,6 +2239,8 @@ mod tests {
                 "mutable = '/m'",
                 "r = call gin.Default",
                 "api = call r.Group",
+                // Contract M9c D3: the one call of `x, y := f()` initialises `x`, not `y`.
+                "x = call f",
             ]
         );
     }

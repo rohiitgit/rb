@@ -660,8 +660,22 @@ pub(crate) fn return_type(language: Language, def: Node<'_>, source: &[u8]) -> O
             };
             Some(text(ty, source))
         }
+        // A Go function's or method's `result` as written: `T`, `*T`, `(T, error)` (contract
+        // M9c D3).
+        Language::Go => matches!(def.kind(), "function_declaration" | "method_declaration")
+            .then(|| def.child_by_field_name("result"))
+            .flatten()
+            .map(|r| text(r, source)),
         _ => None,
     }
+}
+
+/// Go `type A = B`: the target type as written (contract M9c D3).
+pub(crate) fn alias_of(language: Language, def: Node<'_>, source: &[u8]) -> Option<String> {
+    (language == Language::Go && def.kind() == "type_alias")
+        .then(|| def.child_by_field_name("type"))
+        .flatten()
+        .map(|t| text(t, source))
 }
 
 /// Java modifiers that [`modifiers`] records.
@@ -1448,11 +1462,13 @@ mod signature_tests {
         );
     }
 
+    /// Neither has modifiers, and Python no return type. Go records its `result` as written
+    /// since contract M9c D3 (`go_results_aliases_and_embedded_fields_are_facts` has the forms).
     #[test]
     fn go_and_python_have_neither() {
         assert_eq!(
             signatures(Language::Go, "package p\nfunc F() int { return 1 }\n"),
-            ["F: - []"]
+            ["F: int []"]
         );
         assert_eq!(
             signatures(Language::Python, "def f() -> int:\n    return 1\n"),

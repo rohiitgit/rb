@@ -172,6 +172,7 @@ mod tests {
             class_constants: Vec::new(),
             type_params: Vec::new(),
             return_type: None,
+            alias_of: None,
             modifiers: Vec::new(),
         };
         // Corrupt input (e.g. a stale cache row): 0 -> 1 -> 0.
