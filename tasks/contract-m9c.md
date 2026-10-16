@@ -279,6 +279,86 @@ No spec's filter may select a wall-clock test (M9b N2 rule).
 
 Append each amendment after the previous one's last sentence (lesson of 2026-10-11).
 
+**Amendment 1 (2026-10-16, P0; M9b closed at `e428d15`).** P0's record is `var/m9c/probe-forms.txt`, written by `bench/probe/m9c_forms.py` (`python3 -I`, read-only) from HEAD `e428d15`. Logs are in `var/m9c/logs/`.
+- **Disk.** `du -sh target` 12G; `df -h .` 23 GiB free (23,135 MiB) at load 2.89 (`p0-disk.txt`). That is above twice the bench floor plus a release build, so no `cargo clean`.
+- **Base (D9).** The M9b run of record, `var/bench/out/36ed5ea46ddf/`, has all 38 manifest dumps (27 `noscip`, 11 `scip`) and 119 PyCG cases, none empty; so has M9a's `2e36cd607eab` (probe section `base`). HEAD's release `rb-bench` (up to date after `cargo build --release -p rb-bench`, sha256 `e9dea089…`) re-scores it with `--milestone m9b --rb-commit b651523…` in 1.52 s. `var/m9c/m9b-rescored.json` and `-perf.json` are `cmp`-identical to `bench/scoreboard/m9b.json` and `m9b-perf.json` (`p0-rescore.txt`). So the gate's base is the committed `m9b.json`.
+- **Probe.** It ports the planner's `agree.py`, `ts_classify.py`, `go_forms.py` and `b13b_rule.py` with their logic unchanged. It adds the base check, a cell-by-cell check against the scoreboard, the B1 split at the call token, and the `scipgo` section (below). Its location-identity agreement equals the scored cell on all 12 `scip` calls cells (6 targets × 2 classes) of both records. On M9a it reproduces 33 of the 35 numbers this contract quotes (section `checks`):
+  - bookcars fn 694 = 609 (admin 370, frontend 239) + 36 (34 named, 2 default) + 39 + 10;
+  - every Go form flag and upper bound;
+  - B1's 6,147 fp and 5,554 `pkg.f()`;
+  - D7's 431 / 291 (276 suites) / 7.
+- **B1 split, corrected.** The two numbers that differ are B1's smaller buckets, which the planner split by a rule that wasn't recorded. By the probe's rule (the call token's span; D8's definition for the first bucket), M9a's 6,147 fp are:
+  - 5,554 `pkg.Name()` calls whose one-identifier qualifier carries a server/public package occurrence. This is the number D8 is built for, and it reproduces exactly.
+  - 552 members of server/public values (not 548).
+  - 2 `model.F()` calls into server/public whose qualifier carries no occurrence at all (`channels/app/migrations.go:823`, `channels/app/platform/support_packet.go:162`; see GetClusterId below).
+  - 34 bare calls: 19 in server and 15 in `docs/site` scripts. Only 15 fp have a call site in `docs/site`, so "34 bare calls in `docs/site` scripts" mislabels them.
+  - 5 other: 3 `this.f()` in e2e-tests/playwright and 2 `platform.X()` inside server.
+- **What M9b moved.** B9 removed 4,485 of the 17,065 Go misses: 4,464 whose only blocker was B9, 16 flagged `ctor` and 5 `bare`. 19 misses still have B9 as their only blocker (17 `crossfile+fieldchain`, 2 `crossfile`; not classified). B9 recovered none of the call-segment, alias, embedding or package-var misses, and 16 of the 4,657 call-result ones. So B2's root causes hold at HEAD; only the base and the bounds move. The bounds are now: call results 4,007 (was 4,023), all five 11,546 (11,562), results and segments 6,812 (6,828). Call segments 2,171, aliases 3,127, embedding 1,313 and package vars 109 (889) are unchanged. bookcars, go_clean_arch, go_gin_example, express_ts_boilerplate and PyCG are identical in both records. microservices_demo's 27 are gone (tp 208, fn 0). go_gin_example's 9 read as stated: 4 `var ( appG = app.Gin{C: c} )`, 2 call results, and 3 through `*ArticlePoster` (2 promoted methods and the promoted field `a.Qr.Encode`).
+- **Predicted movement, re-based.** The base is the M9b run of record. "Predicted m9c" replaces the table above where they differ.
+
+  | Cell (`bench:target:mode:class`) | M9a | M9b (base) | Predicted m9c | Claim |
+  |---|---|---|---|---|
+  | `scip:bookcars:noscip:calls` | tp 1,155, fn 694 | tp 1,155, fn 694 | unchanged: tp +600 to +686 heuristic; fn 8 to 94; fp possible, each classified | C2, C3 |
+  | `scip:bookcars:noscip:calls_file_scope` | fn 7 | fn 7 | fn 5 | C2 |
+  | `scip:go_clean_arch:noscip:calls` | tp 37, fn 12 | tp 37, fn 12 | tp 49, fn 0 | C5 |
+  | `scip:go_gin_example:noscip:calls` | tp 152, fn 9 | tp 152, fn 9 | tp 161, fn 0 | C4, C5 |
+  | `scip:mattermost:noscip:calls`, B2 | fn 17,157 (Go 17,065) | fn 12,672 (Go 12,580, TS/JS 92) | fn falls; upper bound 11,546 of the M9b Go misses (6,812 from results and segments alone). fp heuristic rises in two places: where new edges reach server/public value methods (accept line, B1 residue), and at sites whose scip reference the scip-go type check dropped (the GetClusterId class, below) | C5 |
+  | `scip:mattermost:noscip:calls`, B1 | gold 33,312, fp 6,147 | gold 33,312, fp 6,141 (5,554 joinable) | gold +X (X ≥ the joined pairs), up to 5,554 fp → tp, fn + (X − joined tp). The 563 value-member fp, the 2 calls with no qualifier occurrence and the 3 `App#GetClusterId` stay | C9 |
+  | `scip:mattermost:noscip:calls` | `found_out_of_scope{not_covered}` 21,644 | 22,872 | rises (as above) | C2, C3, C5 |
+  | `scip:microservices_demo:noscip:calls` | tp 181, fn 27 | tp 208, fn 0 | unchanged | |
+  | `scip:express_ts_boilerplate:noscip:calls` | fn 24 | fn 24 | unchanged | |
+  | `pycg:*:calls` | tp 12 / 48 | tp 12 / 48 | tp 14 | C6 |
+  | `pycg:*:calls_file_scope` | tp 94 / 186 | tp 94 / 186 | tp 105 | C6 |
+  | `exact` sample, `scip` family | 60 / 60 right | 60 / 60 right | the FALSE `ElasticsearchInterfaceTestSuite#` row leaves the pool. **322** mattermost scip-go `IMPLEMENTS` leave (was 291) and 407 stay. go_clean_arch's 5 and microservices_demo's 3 stay. Redraw only if `rb-bench sample` lists drawn edges without a verdict | C8 |
+- **D7 as decided (changes C8's prediction).** The planner's reading put server's and server/public's indexes together and judged structs only. D7 reads "the job's SymbolInfo" and speaks of "a type". Read that way (probe, "each job's own index, structs and other named types"), 407 rows verify, 322 are dropped and 0 lie outside (was 431 / 291 / 7). The 31 extra drops:
+  - **25 test-plugin rows** (`MyPlugin#`, `Plugin#`, `PluginUsingLogAPI#` → `teams/WebHub#`, one → `plugins/AppIface#`). The planner's reading verified them through `plugin.MattermostPlugin`, but its `API API` and `Driver Driver` are named fields, and Go promotes no method through a named field. So they are false. A rule that takes "named by its fields" literally verifies them, because `Owner#Field.` symbols don't say whether a field is embedded. The type's signature text does (`struct{invalid type; …}` against `API API`).
+  - **7 rows from named non-struct types** (SCIP kind 54). 6 are false: `ByChannelDisplayName` and `ByPreference`, sort types over `model.ChannelList` and `model.Preferences`, related to `Users#`, `Builder#` and `ReaderProvider#`. 1 is true and kept: `*AllowedIPRanges` → `Auditable#`; `model/ip_filtering.go:12` declares `Auditable()`.
+  - **So P5 reads D7** as "methods of index types named by its *embedded* fields, as the type's signature lists them", and judges a kind 54 type by its own methods.
+  - **C8 gains three rows:** a struct with a named field `API API` whose type has the interface's methods (dropped), and a named slice type that declares the interface's method (kept) and one that doesn't (dropped).
+  - **New mutant m339** ("a named field counts as embedded", filter `scip_go_type_relationships_need_the_method_set`); C15's range becomes m300–m339.
+  - The judged sample reads as before: both TRUE type rows verify, and the FALSE `ElasticsearchInterfaceTestSuite#` row is dropped.
+- **B13b's cause.** 289 of the 291 rows the planner's reading drops come from a struct that embeds a field of `invalid type`, directly or through an embedded index struct (for example `MmctlUnitTestSuite struct{invalid type; mockCtrl invalid type; …}`). The 6 false kind-54 rows come from types over an invalid underlying type (probe `d7`). go/types answers `Implements` with true for both cases:
+  - `hasAllMethods`: "If V is not a valid type, or if it is a struct containing embedded fields with invalid types, the result is true".
+  - `implements`: true for an invalid underlying type.
+
+  scip-go relates every candidate that passes its method-count and mask filters (`internal/implementations/implementations.go:91-92`). Why the types are invalid is the next item.
+- **The 3 `App#GetClusterId` fp (Out of scope, open): classified.** It is none of the forms suspected (promoted method, type alias, cross-file method). The callee is `func (a *App) GetClusterId()` (`channels/app/cluster_discovery.go:14`), and B9 binds all 3 calls right. Each call is the value of a map-literal entry whose key is a server/public constant: `model.AuditKeyClusterID: a.GetClusterId()`. Why scip-go records no occurrence there:
+  1. scip-go emits a reference only for an identifier in go/types' `Info.Uses` (`internal/visitors/visitor_file.go:135`, `:226`).
+  2. Go 1.27.2's checker skips a map entry's value when the entry's key is invalid (`go/types/literals.go:286-288`, `if !x.isValid() { continue }`).
+  3. The key is invalid because, in rb's scip-go image, no imported package loads:
+     - The image builds scip-go v0.2.7 with Go 1.27.2 (`docker/scip-go/Dockerfile:10`), whose compiler writes unified export data version 5 (`cmd/compile/internal/noder/unified.go:29`, `uirVersion = pkgbits.V5`).
+     - scip-go loads imports from export data (`internal/loader/loader.go:24-30`, no `NeedDeps`) through x/tools v0.45.0, whose decoder refuses anything above version 4 ("export data version %d is greater than maximum supported version %d", `internal/pkgbits/decoder.go:86`).
+     - go/types then makes every import, the standard library included, a fake package with no members.
+     - The name isn't simply missing at the resolved version: `AuditKeyClusterID` exists in server/public v0.4.3 (`model/audit_record.go:19` in the job's module cache).
+  - **Proof from the index** (probe `scipgo`):
+    - The one occurrence on each of the 3 lines is the `model` qualifier.
+    - `rec := &model.AuditRecord{…}` is `var rec *invalid type`.
+    - 119,977 of server's 202,385 locals are typed `invalid type`, and 284 of go_clean_arch's 571: `dbHost := os.Getenv(…)` is `invalid type`, while `mysqlRepo.NewAuthorRepository(…)` is `*AuthorRepository`.
+    - In server, a selector-keyed entry's value keeps its occurrence when the key is an own-module package (4 of 4). It loses it when the key's package is another module (59 of 59) or when the key's head is a local variable (124 of 124).
+  - **Proof by reproduction**, offline in the same image (`logs/getclusterid.txt`, sources in `var/m9c/scripts/importer/`):
+    - `go list -export -deps ./...` writes export data for 257 of the 258 packages in go_clean_arch's dependency closure (all but `unsafe`).
+    - x/tools v0.45.0's `go/packages`, run with scip-go's load mode on a module that only imports `os`, reports `could not import os (… cannot decode "os", export data version 5 is greater than maximum supported version 4)` and types `home := os.Getenv("HOME")` as `invalid type`. On server/public's `model` it reports 245 distinct errors (one per failed import path, plus names left undefined by them, such as `msgpack`), and `could not import` errors for `ldap` and `net/http` are among them.
+  - **It also answers M9b amendment 1's open question.** Dependency members carry no occurrence because of rb's image (the toolchain and x/tools pairing), not because of scip-go 0.2.7 itself. One exception stays unexplained: server/public's index holds 4 `github.com/mattermost/ldap` `CompileFilter()` occurrences, while the offline reproduction fails to import `ldap` like every other package.
+  - **No M9c phase changes it.**
+    - D8 hands back only an unmatched reference whose qualifier carries a package occurrence. At the 3 sites the qualifiers (`a`, `c.App`) carry none, and the callee is in server's own module.
+    - D7 changes relationships, not references.
+    - The Tier B edges are already right.
+
+    The 3 stay fp under `bench/accept-m9b.tsv`'s mattermost line until the image is fixed.
+- **Flags for later phases.** None invalidates a phase, but each bounds what it measures.
+  - Every Go agreement cell is scored against references from this degraded type check, so the predictions hold for the image as built.
+  - **P3.** A new Tier B edge at a site whose reference the type check dropped scores as agreement fp, as the 3 do. Examples are the values of map entries keyed from another module (183 such lines in server: 59 + 124) and the arguments of `make(model.T, …)` (`support_packet.go:162`).
+  - **P5, D8.** D8's trigger is a symptom of the image. Once imports load, `model.NewId`'s member token gets a `server/public v0.4.3` occurrence. The reference then becomes `external`, not `unmatched`, and D8's hand-back stops firing. The cross-version join would then have to read external member occurrences of another job's module, the M9b plan's mechanism. As decided, D8 does not; P5 records this coupling in the design note.
+  - **P5, D7.** D7 is needed while the image stays as it is.
+  - **M9d.** An image whose toolchain writes export data x/tools v0.45.0 reads, or a scip-go on an x/tools that reads version 5 (which releases these are is not measured), changes every scip-go index on the bench. M9d re-measures B1, B13b and the Go agreement cells with it, before the `go.work` run.
+- **File:line at HEAD** (`var/m9c/scripts/check_citations.py`, `logs/citations.txt`).
+  - 22 of the 23 citations above hold unchanged at HEAD. `Content::go_modules` moved from `rb-indexer/src/lib.rs:406` to `lib.rs:409`.
+  - The control, which re-checks every citation 7 lines lower, reports 20 of 23 MISMATCH.
+  - `resolve.rs` at M9b's close differs from `5a310aa` only by `package_key` becoming `pub(crate)` (`resolve.rs:335`) and one test row (from line 1875); no cited line moved.
+  - `rb-indexer/src/lib.rs` gained M9b's data-rest service gate (`data_rest_services`, `lib.rs:836`), two `assemble` hunks, their tests, and `PIPELINE` `m9b-2` (`lib.rs:145`; C11 reads `m9b-2` → `m9c-1`).
+  - P5's join hangs off the SCIP job loop at `lib.rs:1076` (`scip::join` at `lib.rs:1085`).
+- **Safety.** No probe repository was created. `SELECT * FROM rb.repo ORDER BY 1` is identical before and after (`logs/repo-{before,after}-p0.txt`, 4 rows). The other database reads were `\d rb.scip_index` and two `READ ONLY` transactions over `rb.scip_index.stderr_tail`. The first matched no rows (wrong digest pattern). The second found the tail empty for the 20 most recent ok scip-go rows, the 13 exported ones among them. Container runs used `--network none` on scratch copies of the sources; the bench's module caches were mounted read-only or copied. No change under `crates/`.
+
 ## Result
 
 Not yet built.
