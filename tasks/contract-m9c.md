@@ -631,6 +631,44 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - The commit title is "M9c PI: scip-go image with x/tools v0.50.0 (export data v5)", as the orchestrator gave it, not PI's "scip-go reads Go 1.27.2 export data".
   - The unit test and the README's "Why x/tools v0.50.0" and "Self-test" sections are additions within PI's files.
 
+**P1 note (2026-10-17, phase P1, B3; base `6da3c99`).** Logs in `var/m9c/logs/p1/`, script `var/m9c/p1/calls_diff.py` (`python3 -I`, read-only).
+- **Built.**
+  - D1: `rb_scip::jobs::parse_jsonc`. `AliasMaps::build` reads `tsconfig.json` through it.
+  - `package.json` stays strict JSON, as Node reads it. D1's cause is the tsconfig, and strict text parses the same either way.
+  - D2 lives in `Index::imported`: for TS, TSX and JS, a `default` name resolves to the top-level definition that each target's `default_export` names.
+- **Tests, red first.**
+  - `red-jobs.log`: E0425, because `parse_jsonc` did not exist yet.
+  - `red-indexer.log`: 3 failed on their assertions: `rta::…::tsconfig_jsonc_resolves_aliases` (`None` for `@/utils/helper`), `namespace_calls_behind_jsonc_paths_resolve` and `default_imports_resolve_to_the_default_export` (no edges).
+  - C2 also has a unit `jobs::tests::tsconfig_jsonc_resolves_aliases` in rb-scip. Its cases: comments, trailing commas, `,}` `,]` `//` `/*` inside strings, an escaped quote, strict text equal to `serde_json`, and broken text giving `None`. It exists because m301 mutates rb-scip, and the runner runs only that crate's tests.
+- **Verify.**
+  - `cargo test -p rb-scip --lib jobs`: 26 passed (`unit-jobs.log`).
+  - `cargo test -p rb-indexer --lib`: 366 passed, rta and resolve among them (`unit-indexer.log`, load 5.2).
+  - fmt and clippy exit 0.
+- **Probe.**
+  - Indexed bookcars `--no-scip` as `t_m9c_bc` from `var/bench/repos/bookcars` (pin `4ea6c110`), in 7.6 s with facts cached.
+  - `ChangePassword().onSubmit()` → `` `admin/src/utils/helper.ts`/info() ``, `heuristic`, evidence `[66,17,66,21]` (line 67, `info`). The target's `DEFINED_IN` is `[22,13,22,17]` (line 23).
+  - Against the M9b record's dump: `CALLS` 1,406 → 2,207. 801 pairs added (all `heuristic`: admin 484, frontend 312, mobile 4, packages 1), 0 removed (`probe-calls-diff.txt`).
+  - The repo was then deleted, AGE graph included.
+- **Measured against predicted.** HEAD's release `rb-bench` (sha256 `e9dea089…`, the re-score's; rb-bench unchanged since `e428d15`) scored a one-target copy of the M9b record with the probe's dump as `bookcars.noscip.jsonl`. That is a probe, not the bench run: P7 measures the cells.
+
+  | Cell | M9b (base) | Predicted | Measured (P1 probe) |
+  |---|---|---|---|
+  | `scip:bookcars:noscip:calls` | tp 1,155, fp 0, fn 694 | tp +600 to +686 heuristic; fn 8 to 94; fp possible | tp 1,841 (+686, heuristic), fp 0, fn 8 |
+  | `scip:bookcars:noscip:calls_file_scope` | tp 40, fp 0, fn 7 | fn 5 | tp 47, fp 0, fn **0** |
+
+  - `calls` lands at the prediction's upper bound (645 + 41).
+  - `calls_file_scope` beats it by 5. P0's classifier filed 5 of the 7 base misses as "name not on line", and the prediction counted them as not recovered. They are bare calls to default imports through relative paths whose local name differs from the callee: `initGA()` → `frontend/src/utils/ga4.ts` `init`, and 4 `diacriticless(…)` → `removeDiacritics` in mobile's two `AutocompleteDropdown` copies. That is D2's form (`probe-file-scope.txt`).
+- **Seen, not fixed.**
+  - `join_dir` keeps `./` for `"baseUrl": "."`, which gives `mobile/./src/…`, a path `probe` never finds. bookcars mobile writes `"./"`, which works.
+  - The two bench tsconfigs with `"baseUrl": "."` (express_ts_boilerplate, mattermost `docs/site`) have no `paths`, so the gap moves nothing on the bench. It is recorded beside `baseUrl`-only bare specifiers.
+- **e2e.** Not run in P1 (P1's verify is unit tests plus the probe). The fixtures were scanned instead:
+  - no fixture `tsconfig*.json` fails strict JSON;
+  - the only relative default import (`health` in `ts-express-prisma`) is passed to `app.use`, never called, so no golden is predicted to move.
+- **Mutants.** m300–m303 KILLED (`mutants.log`, `--jobs 2`). None touches a DB write path.
+- **Safety.**
+  - `SELECT * FROM rb.repo ORDER BY 1` is identical before and after (`repo-before.txt`, `repo-after-probe.txt`, 4 rows).
+  - `t_m9c_*` repositories left: 0. No e2e ran while the probe existed.
+
 ## Result
 
 Not yet built.

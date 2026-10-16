@@ -1,0 +1,38 @@
+[
+ {
+  "id": "m300",
+  "crate": "rb-indexer",
+  "test": "rta::tests::tsconfig_jsonc_resolves_aliases",
+  "file": "rta.rs",
+  "old": "                rb_scip::jobs::parse_jsonc(text)\n",
+  "new": "                serde_json::from_str::<serde_json::Value>(text).ok()\n",
+  "what": "AliasMaps::build parses raw text"
+ },
+ {
+  "id": "m301",
+  "crate": "rb-scip",
+  "test": "jobs::tests::tsconfig_jsonc_resolves_aliases",
+  "file": "jobs.rs",
+  "old": "            b'\"' => quote = true,\n",
+  "new": "            b'\"' => quote = false,\n",
+  "what": "trailing-comma strip ignores strings"
+ },
+ {
+  "id": "m302",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::default_imports_resolve_to_the_default_export",
+  "file": "resolve.rs",
+  "old": "                    for n in import.names.iter().filter(|n| n.local == name) {\n",
+  "new": "                    for n in import.names.iter().filter(|n| n.local == name && n.name != \"default\") {\n",
+  "what": "default import names skipped again"
+ },
+ {
+  "id": "m303",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::default_imports_resolve_to_the_default_export",
+  "file": "resolve.rs",
+  "old": "                                    out.extend(self.named(f, None, exported, want));\n",
+  "new": "                                    out.extend(self.named(f, None, name, want));\n",
+  "what": "default import resolved by its local name"
+ }
+]

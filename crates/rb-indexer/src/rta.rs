@@ -233,7 +233,14 @@ impl AliasMaps {
                 Some(i) => path[..i].to_owned(),
                 None => String::new(),
             };
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+            // `tsc` reads `tsconfig.json` as JSONC (contract M9c D1); Node reads
+            // `package.json` as strict JSON.
+            let json = if name == "tsconfig.json" {
+                rb_scip::jobs::parse_jsonc(text)
+            } else {
+                serde_json::from_str::<serde_json::Value>(text).ok()
+            };
+            let Some(json) = json else {
                 continue;
             };
             if name == "tsconfig.json" {
@@ -1335,6 +1342,70 @@ mod tests {
             exports.resolve("svc/src/main.ts", "@acme/m/a"),
             Some("svc/src/exact-a.ts".to_owned())
         );
+    }
+
+    /// Contract M9c C2 (D1): a `tsconfig.json` is JSONC, as `tsc` reads it. bookcars
+    /// `admin/tsconfig.json` carries `/* */` comments and trailing commas, so strict parsing
+    /// dropped its `"@/*"`. Strict text resolves as before; broken text resolves nothing;
+    /// `package.json` stays strict JSON, as Node reads it.
+    #[test]
+    fn tsconfig_jsonc_resolves_aliases() {
+        let maps = AliasMaps::build(
+            &[
+                (
+                    "admin/tsconfig.json",
+                    r#"{
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    // Linting
+    "strict": true,
+
+    "paths": {
+      "@/*": ["./src/*"],
+      "@w/*": ["./weird,}dir/*"],
+      ":bookcars-types": ["../packages/bookcars-types"],
+    },
+  },
+  "include": ["src"],
+}
+"#,
+                ),
+                (
+                    "mobile/tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": "./", "paths": {"@/*": ["./src/*"]}}}"#,
+                ),
+                (
+                    "frontend/tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}"#,
+                ),
+                (
+                    "web/package.json",
+                    "{ \"name\": \"@acme/p\", \"main\": \"./index.js\", }",
+                ),
+            ]
+            .iter()
+            .map(|(p, t)| (*p, (*t).to_owned()))
+            .collect(),
+        );
+        assert_eq!(
+            maps.resolve("admin/src/pages/ChangePassword.tsx", "@/utils/helper"),
+            Some("admin/src/utils/helper".to_owned())
+        );
+        // A `,}` inside a string is text, not a trailing comma.
+        assert_eq!(
+            maps.resolve("admin/src/a.ts", "@w/x"),
+            Some("admin/weird,}dir/x".to_owned())
+        );
+        assert_eq!(
+            maps.resolve("mobile/src/a.ts", "@/utils/helper"),
+            Some("mobile/src/utils/helper".to_owned())
+        );
+        assert_eq!(maps.resolve("frontend/src/a.ts", "@/utils/helper"), None);
+        assert_eq!(maps.resolve("web/src/a.ts", "@acme/p"), None);
     }
 
     /// Invariant 9: alias resolution grows linearly (counted, 4× → ≤ 5×).

@@ -927,12 +927,21 @@ impl<'a> Index<'a> {
                     }));
                 }
                 _ => {
-                    for n in import
-                        .names
-                        .iter()
-                        .filter(|n| n.local == name && n.name != "default")
-                    {
-                        out.extend(top(&n.name));
+                    for n in import.names.iter().filter(|n| n.local == name) {
+                        if n.name != "default" {
+                            out.extend(top(&n.name));
+                        } else if matches!(
+                            language,
+                            Language::TypeScript | Language::Tsx | Language::JavaScript
+                        ) {
+                            // `import x from './m'` names what `m`'s `export default` names
+                            // (contract M9c D2); a target without one gives nothing.
+                            for &f in targets {
+                                if let Some(exported) = self.facts(f).default_export.as_deref() {
+                                    out.extend(self.named(f, None, exported, want));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1433,6 +1442,16 @@ mod tests {
     }
 
     fn build(files: &[(&str, Language, &str)], go_modules: &[(&str, &str)]) -> Built {
+        build_with_manifests(files, go_modules, &[])
+    }
+
+    /// [`build`] with manifest texts by path (`tsconfig.json`, `package.json`) for the
+    /// index's alias maps, as `lib.rs` builds them.
+    fn build_with_manifests(
+        files: &[(&str, Language, &str)],
+        go_modules: &[(&str, &str)],
+        manifests: &[(&str, &str)],
+    ) -> Built {
         let facts: Vec<(String, Language, FileFacts)> = files
             .iter()
             .map(|(p, l, src)| {
@@ -1462,6 +1481,16 @@ mod tests {
             crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
         }
         let index = Index::new(&by_path, &go, &keys);
+        let index = if manifests.is_empty() {
+            index
+        } else {
+            index.with_aliases(crate::rta::AliasMaps::build(
+                &manifests
+                    .iter()
+                    .map(|(p, t)| (*p, (*t).to_owned()))
+                    .collect(),
+            ))
+        };
         let diagnostics = add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
         Built {
             graph: b.finish().unwrap(),
@@ -1748,6 +1777,123 @@ function local() {}
         );
         // `express()` comes from an external package.
         assert_eq!(unresolved(&built), [("src/app.ts".into(), 0, 0, 1)]);
+    }
+
+    /// Contract M9c C2 (D1): bookcars' `admin/src/pages/ChangePassword.tsx` calls
+    /// `helper.info` through `import * as helper from '@/utils/helper'`, an alias of
+    /// `admin/tsconfig.json`, whose comments and trailing commas strict JSON refused. A named
+    /// import through the alias resolves too. `frontend/`'s broken tsconfig resolves nothing.
+    #[test]
+    fn namespace_calls_behind_jsonc_paths_resolve() {
+        let page = r#"import * as helper from '@/utils/helper'
+import { error } from '@/utils/helper'
+export function ChangePassword() {
+  helper.info('updated')
+  error()
+}
+"#;
+        let helper = "export const info = (message: string) => {\n  toast(message)\n}\n\
+                      export function error() {}\n";
+        let built = build_with_manifests(
+            &[
+                ("admin/src/pages/ChangePassword.tsx", Language::Tsx, page),
+                ("admin/src/utils/helper.ts", TS, helper),
+                ("frontend/src/pages/ChangePassword.tsx", Language::Tsx, page),
+                ("frontend/src/utils/helper.ts", TS, helper),
+            ],
+            &[],
+            &[
+                (
+                    "admin/tsconfig.json",
+                    r#"{
+  "compilerOptions": {
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "paths": {
+      "@/*": ["./src/*"],
+    },
+  },
+  "include": ["src"],
+}
+"#,
+                ),
+                (
+                    "frontend/tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}"#,
+                ),
+            ],
+        );
+        let calls = edges(&built, EdgeKind::Calls);
+        let admin: Vec<&String> = calls.iter().filter(|e| e.contains("-> helper:")).collect();
+        assert_eq!(
+            admin,
+            [
+                "ChangePassword:ChangePassword(). -> helper:error(). [heuristic]",
+                "ChangePassword:ChangePassword(). -> helper:info(). [heuristic]",
+            ],
+            "{calls:?}"
+        );
+        // Both callers are `ChangePassword:…`; only admin's resolve, so each edge is admin's.
+        let admin_calls = built
+            .graph
+            .edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| {
+                let key = |id| {
+                    built
+                        .graph
+                        .nodes()
+                        .iter()
+                        .find(|n| n.id == id)
+                        .unwrap()
+                        .key
+                        .clone()
+                };
+                (key(e.src), key(e.dst))
+            })
+            .filter(|(s, d)| s.contains("admin/src/pages") && d.contains("admin/src/utils"))
+            .count();
+        assert_eq!(admin_calls, 2);
+    }
+
+    /// Contract M9c C3 (D2): an `import x from './m'` names the definition `m`'s
+    /// `export default` names, whatever the local name; a target without a default export
+    /// gives nothing, as before.
+    #[test]
+    fn default_imports_resolve_to_the_default_export() {
+        let built = build(
+            &[
+                (
+                    "src/app.ts",
+                    TS,
+                    r#"import f from './m'
+import local from './n'
+import h from './o'
+export function run() {
+  f()
+  local()
+  h()
+}
+"#,
+                ),
+                ("src/m.ts", TS, "function f() {}\nexport default f\n"),
+                (
+                    "src/n.ts",
+                    TS,
+                    "export default function named() {}\nexport function local() {}\n",
+                ),
+                ("src/o.ts", TS, "export function h() {}\n"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "app:run(). -> m:f(). [heuristic]",
+                "app:run(). -> n:named(). [heuristic]",
+            ]
+        );
     }
 
     #[test]

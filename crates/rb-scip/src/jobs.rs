@@ -889,6 +889,46 @@ pub fn strip_json_comments(text: &str) -> String {
     out
 }
 
+/// `text` read as JSONC, as `tsc` reads a `tsconfig.json` (contract M9c D1):
+/// [`strip_json_comments`], then each `,` outside strings followed only by whitespace before
+/// `}` or `]` is dropped, then strict JSON. `None` when that is not JSON.
+pub fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
+    let text = strip_json_comments(text);
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut start = 0;
+    let mut quote = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote {
+            match b {
+                b'\\' => escaped = true,
+                b'"' => quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => quote = true,
+            b',' if bytes[i + 1..]
+                .iter()
+                .find(|c| !c.is_ascii_whitespace())
+                .is_some_and(|&c| c == b'}' || c == b']') =>
+            {
+                out.push_str(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&text[start..]);
+    serde_json::from_str(&out).ok()
+}
+
 /// A `files` entry as a path relative to its tsconfig directory: one leading `./` ignored;
 /// `None` for absolute paths, backslashes, empty segments and escapes above the directory.
 fn normalise_rel(entry: &str) -> Option<String> {
@@ -2185,6 +2225,59 @@ mod tests {
         };
         let (small, large) = (work(100), work(400));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M9c C2 (D1): JSONC as `tsc` reads it, bookcars `admin/tsconfig.json`'s shape.
+    /// Comments and trailing commas go; a `,}` or `,]` inside a string stays; strict JSON
+    /// parses as `serde_json` parses it; broken text is `None`.
+    #[test]
+    fn tsconfig_jsonc_resolves_aliases() {
+        let admin = r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2020", "DOM",],
+
+    /* Bundler mode */
+    "moduleResolution": "bundler", // trailing comment
+    "description": "keeps ,} and ,] and // and /* inside strings",
+    "paths": {
+      "@/*": ["./src/*"],
+      ":bookcars-types": ["../packages/bookcars-types"],
+    },
+  },
+  "include": ["src"],
+}
+"#;
+        let json = parse_jsonc(admin).expect("JSONC parses");
+        let options = &json["compilerOptions"];
+        assert_eq!(options["paths"]["@/*"], serde_json::json!(["./src/*"]));
+        assert_eq!(
+            options["paths"][":bookcars-types"],
+            serde_json::json!(["../packages/bookcars-types"])
+        );
+        assert_eq!(options["lib"], serde_json::json!(["ES2020", "DOM"]));
+        assert_eq!(
+            options["description"],
+            "keeps ,} and ,] and // and /* inside strings"
+        );
+        assert_eq!(json["include"], serde_json::json!(["src"]));
+        // An escaped quote does not end the string, so the comma before `}` inside it stays.
+        assert_eq!(
+            parse_jsonc(r#"{"a": "x\",}", "b": [1, 2 ,  ] ,}"#),
+            Some(serde_json::json!({"a": "x\",}", "b": [1, 2]}))
+        );
+        let strict = r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}, "n": [1, 2]}"#;
+        assert_eq!(
+            parse_jsonc(strict),
+            serde_json::from_str::<serde_json::Value>(strict).ok()
+        );
+        for broken in [
+            r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}"#,
+            r#"{"a": 1,, }"#,
+            "",
+        ] {
+            assert_eq!(parse_jsonc(broken), None, "{broken}");
+        }
     }
 
     /// Evaluator pass 1, M6e-12 (S10): a pattern escaping the tsconfig directory stays
