@@ -1184,7 +1184,15 @@ Contract: `tasks/contract-m9b.md` (10 plan corrections; amendments 0–6). Branc
 - [x] P5: `PIPELINE` `m9b-1`, N1, N2, docs; fmt/clippy CLEAN; real-Docker 1,135/0/0; batteries 28/28, 31/31, 29/29; commit `3b83d68`.
 - [x] P6: binary `3fc09844…` from `3b83d68`, 0 failures; jferrater adjudicated (17 TRUE, 12 ADD); invariant 0 unclassified; sample 0 missing; score ×2 `cmp`; `compare` exit 0 with 2 accepted cells; 1 perf warning re-measured as noise (amendment 6).
 - [x] P7: records done; evaluator pass 1 pending.
-- [ ] Evaluator pass 1.
+- [x] Evaluator pass 1 (`tasks/eval-m9b-pass1.md`): PASS, 6 should-fix, 4 notes; answered in amendment 7.
+  - [x] E3: named-type Go constants refused (row `N`, m296); `PIPELINE` `m9b-2`.
+  - [x] E2: `@Bean`/`withConfig`/Kotlin configurers cap (rows `adpt`, `bean`, `kcfg`, `kwith`, `neg`; m297–m299).
+  - [x] E1: rows `P`, `Q`, local type, `findAllById`, `data_rest_services` test; evaluator e1–e7 KILLED; m279–m284, m295; m267 re-anchored.
+  - [x] E4: runner matches the filter against full test paths; "6 crates".
+  - [x] E5: split 5 item / 2 collection / 5 search; `findById` gold omission recorded (key unedited).
+  - [x] E6: full `compare` command; `compare-r2.txt` exit 0; `GetClusterId` in M9c's open items.
+  - [x] Notes and the CRUD `exported = false` rule recorded as residue.
+  - [x] Re-close: e2e 52/0/0; batteries 39/31/29 KILLED; binary `36ed5ea4…` from `b651523`; bench 0 failures; r2 diff 0 rows; score ×2 `cmp`; sample 0 missing; `compare-r3.txt` exit 0; 24 perf warnings A/B noise.
 - [ ] Evaluator pass 2 (verification only).
 
 ## Review (M9b)
@@ -1192,3 +1200,4 @@ Contract: `tasks/contract-m9b.md` (10 plan corrections; amendments 0–6). Branc
 - B1 was not built. The probe showed scip-go records only namespace occurrences for another module, so the planned symbol join had nothing to join. Reading the index before writing code saved a phase.
 - Three surprises: the bare-name defect the contract said made no edges made 41 ambiguous ones on mattermost; mattermost's 2 folded SQL sites add no `QUERIES`; the jferrater key gained 12 entries, not "up to 10".
 - Process: the adjudicator gave TRUE/FALSE, and ADD/REMOVE was derived with `adjudicate.py`'s rules. C6 had been P4's code and is withdrawn with it. 3 of the 14 accepted mattermost fp go to server's own `App#GetClusterId`, which the accept line's B1 reason does not explain.
+- Pass 1 found two wrong-or-missing rules on inputs the bench lacks (a named-type Go constant folded by its literal; a `@Bean` configurer not capping) and seven mutants that the tests did not bite. Its records findings stood: the ADD split was 5/2/5, and jferrater's 17 of 17 is 17 of 18 with the served `findById` search that neither rb nor the key has.

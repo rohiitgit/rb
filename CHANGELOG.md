@@ -1,5 +1,28 @@
 # Changelog
 
+## [2026-10-16 19:24] (wall clock) M9b: evaluator pass 1 answered, re-closed
+- **E3 (fix):** a Go constant folds into `fmt.Sprintf` SQL only when it is untyped or `string`. A named type is refused, since `%s` prints it through its `String()` method. `PIPELINE` `m9b-2`.
+- **E2 (fix):** a `RepositoryRestConfigurer` registered by a method returning one (the `@Bean` form, including an anonymous `…Adapter`), by `RepositoryRestConfigurer.withConfig(…)`, or by a Kotlin class now caps data-rest endpoints at `heuristic` with `data_rest_base_unread`.
+- **E1 (tests):** new rows for `%d` alone, a local `fmt`, a function-local Go type, `findAllById`, the `…Adapter`, and a `data_rest_services` test (pom and Gradle gate, `base-path`/`basePath` from properties and YAML). The evaluator's e1–e7 are all KILLED. New mutants m279–m284 and m295–m299; m267 is re-anchored. m9b 39/39 KILLED.
+- **E4 (runner):** `timing_tests.txt` keeps each test's full path from `cargo test -- --list`, and a spec is INVALID when a timing test's path contains its filter, as cargo matches. 17 tests in 6 crates.
+- **E5, E6 (records):**
+  - The 12 jferrater ADD lines are 5 item, 2 collection and 5 search resources.
+  - `GET /customers/search/findById` (a query method on Spring Data 1.x) is served and missing from both rb and the key, so jferrater is 17 of 18, not 17 of 17. The key is not edited.
+  - The `compare` command is quoted in full, and `compare-r2.txt` re-runs it with the committed accept file (exit 0).
+  - The 3 `App#GetClusterId` fp are an open item in M9c's contract.
+- **Residue:** CRUD hidden by `@RestResource(exported = false)` is not built, because Spring's overload pick is version-dependent. Kotlin repositories, the raw-text dependency gate, Go type-alias receivers and promoted methods are recorded too.
+- **Re-close:**
+  - Binary sha256 `36ed5ea4…` from `b651523`. The bench reports 0 failures, and its 157 dumps are identical by row to the first M9b run (0 differing rows; a control finds the invariant's 7,713).
+  - Scoreboard cells unchanged; two scorings `cmp`-identical; sample 0 missing.
+  - `compare` exits 0 with the same lines. 24 `noscip-fresh` wall warnings under load were re-measured A/B against M9a: worst median 1.111×, mattermost 1.078× wall and 1.009× CPU, all noise.
+- **Verification:** unit tests 363 + 205 + 79 passed; real-Docker e2e 52/0/0; mutants m9b 39/39, m9a 31/31 and m8b 29/29 KILLED; fmt and clippy clean; `rb.repo` unchanged.
+- **Files:**
+  - **Code:** `crates/rb-indexer/src/{lib,resolve,routes,sql}.rs`, `crates/rb-frameworks/src/routes.rs`.
+  - **Bench:** `bench/mutants/{run.py,timing_tests.py,timing_tests.txt,m9b.json}`, `bench/scoreboard/m9b{,-perf}.json`.
+  - **Docs:** `docs/{usage-and-testing,repository-brain-design}.md`, `README.md`.
+  - **Records:** `tasks/{contract-m9b,contract-m9c,eval-m9b-pass1,bench-findings,todo,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+- **Status:** evaluator pass 1 PASS answered; pass 2 pending.
+
 ## [2026-10-16 16:55] (wall clock) M9b: recall from the M8 benchmark
 - **Fixes** (contract `tasks/contract-m9b.md`; C5 and C6 withdrawn):
   - **B9:** a Go method declared in another file than its receiver type is a member of that type, and never a bare package-level name.

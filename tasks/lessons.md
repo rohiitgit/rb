@@ -626,3 +626,15 @@
 ## 2026-10-16: "the defect produces no edges" is a claim about every target
 - **Mistake:** M9b's contract said B9's bare-name defect made no edge "in the four Go dumps we have". mattermost's dumps were missing at planning time, and on mattermost the fix removed 41 ambiguous `CALLS` and took a candidate from 40 more (contract-m9b amendment 6).
 - **Rule:** A claim that a defect produces no edges is checked on every target's dump, not on the ones at hand. If a dump is missing, the claim says so and P0 checks it before the build.
+
+## 2026-10-16: a framework registration is detected in every form its pinned reference shows
+- **Mistake (caught by M9b evaluator pass 1, E2):** D7 capped data-rest endpoints for a class extending `RepositoryRestConfigurer`, but the Spring Data REST 2.5.5 reference registers one as a `@Bean` returning an anonymous `…Adapter`, and 3.1+ adds `withConfig(…)`. The reference's own example was not detected.
+- **Rule:** Before coding a detector for a framework hook, list every registration form the pinned version's reference shows (subclass, `@Bean` factory, anonymous class, static factory, other JVM languages), and give each a test row and a mutant.
+
+## 2026-10-16: a folded value is what the formatter prints, not what the source writes
+- **Mistake (caught by M9b evaluator pass 1, E3):** the Go `Sprintf` fold put a typed constant's literal into `%s`, but Go prints a named type through its `String()` method.
+- **Rule:** When folding a value into a formatted string, check that the formatter prints the value as written. A value of a type that can carry formatting methods (`String()`, `Error()`, `Format`, `__str__`, `toString()`) is refused unless the type is a built-in string.
+
+## 2026-10-16: read a test's full path from cargo, and time an NFR with the build the record used
+- **Mistake (caught by running it):** a scan of `mod … {` blocks lost `tests::` from `resolve.rs`'s tests, because a raw string held `}` at column 0. Separately, scoring timed with the debug `rb-bench` took 36 s, against the record's 1.5 s, which had used the release build.
+- **Rule:** Take a Rust test's path from `cargo test -- --list`, not from parsing source. Time an NFR with the same binary and build profile as the record it is compared to, and name the binary in the log.

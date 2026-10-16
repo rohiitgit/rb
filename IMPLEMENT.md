@@ -862,4 +862,13 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - fmt and clippy clean; `rb.repo` unchanged.
   - Two scorings `cmp`-identical.
   - One perf warning (mattermost `scip` RSS 1.18×), re-measured A/B as noise.
-- **Status:** implemented, evaluator pending.
+- **Evaluator pass 1 (PASS, 6 should-fix, 4 notes), answered in amendment 7 (`b651523`):**
+  - E3: a Go constant of a named type no longer folds into `Sprintf` SQL (`PIPELINE` `m9b-2`).
+  - E2: a configurer registered by a `@Bean` method, by `withConfig` or by a Kotlin class caps data-rest endpoints.
+  - E1: rows and mutants for each evaluator survivor and a `data_rest_services` test; mutants m279–m284 and m295–m299.
+  - E4: the runner refuses a filter that any timing test's full path contains.
+  - E5: the ADD split is 5 item, 2 collection and 5 search; `/customers/search/findById` is a known gold omission, so jferrater is 17 of 18.
+  - E6: the full `compare` command is quoted; `compare-r2.txt` has exit 0; `GetClusterId` is an M9c open item.
+  - The `@RestResource(exported = false)` CRUD rule and E8–E9 are residue.
+  - Re-close: binary `36ed5ea4…`, dumps identical by row to the first run, scoreboard cells unchanged, `compare` exit 0, 24 load-driven perf warnings re-measured A/B as noise.
+- **Status:** evaluator pass 1 PASS answered; pass 2 pending.

@@ -268,6 +268,7 @@ No spec's filter may select a wall-clock test (M9b N2 rule).
 - **Recorded, not fixed:**
   - Single-implementer interface calls (0 measured misses; see trade-offs).
   - Calls on server/public values in SCIP mode (548 agreement fp): no occurrence names the member.
+  - **Open (from M9b, evaluator pass 1 E6):** 3 agreement fp `App#GetClusterId` inside server's own module (`channels/app/audit.go:109`, `channels/app/command_mobile_logs.go:48`, `channels/web/context.go:67`). M9b's B9 binds them right (receivers read in source, `var/m9b/logs/fp-new-sources.txt`), but server's scip-go index records no occurrence on the `GetClusterId` token at any of the 3 (the one occurrence on each line is the `model` qualifier of the map key; `var/m9b/logs/fp-occurrences.txt`). B1's qualifier join does not explain them: they do not leave the module. P0 classifies why scip-go 0.2.7 records none there before B1 is built; until then they stay fp under `bench/accept-m9b.tsv`'s mattermost line.
   - Cross-project `IMPLEMENTS` (a server type implementing a server/public interface).
   - `TsScopes` and `exclude::out_dir` on JSONC tsconfigs (6 on the bench); `baseUrl`-only bare specifiers (mattermost `components/…`).
   - TS `export *` barrels (express 3), parameter-property fields typed by decorators (express 14), TS inherited constructors, call segments outside Go (`MyClass().func()`).

@@ -2,8 +2,8 @@
   "schema": 1,
   "milestone": "m9b",
   "rb": {
-    "commit": "3b83d68be43e68aacd689c50c182459c34549e0a",
-    "binary_sha256": "3fc098445243a4ed9a4079bb6586f7574894a4b94ca5ebc092a68e9d60fc850a"
+    "commit": "b651523bdfaeb62e428b4cf47528f8b951d1917a",
+    "binary_sha256": "36ed5ea46ddf03410f0bec53062072becc6a3dbed63e2383afd62f5791ab2903"
   },
   "pins": {
     "bookcars": "4ea6c110eac5c835323102dc4f654263dea98c2c",
