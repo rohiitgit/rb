@@ -2044,6 +2044,18 @@ mod tests {
                 "kwith/src/Conf.kt",
                 "package p\nimport org.springframework.context.annotation.Bean\nimport org.springframework.data.rest.webmvc.config.RepositoryRestConfigurer\nclass Conf {\n    @Bean\n    fun cfg() = RepositoryRestConfigurer.withConfig { c -> c.setBasePath(\"/moved\") }\n}\n".to_owned(),
             ),
+            // A fully qualified configurer, with no import, caps too: as a `@Bean` return type
+            // and as a supertype (M9b pass 2, N1).
+            ("fqb/src/B.java", repo("fqbs", "PagingAndSortingRepository", "count")),
+            (
+                "fqb/src/Conf.java",
+                "package p;\nclass Conf {\n    @Bean\n    public org.springframework.data.rest.webmvc.config.RepositoryRestConfigurer cfg() {\n        return null;\n    }\n}\n".to_owned(),
+            ),
+            ("fqs/src/S.java", repo("fqss", "PagingAndSortingRepository", "count")),
+            (
+                "fqs/src/Cfg.java",
+                "package p;\nclass Cfg implements org.springframework.data.rest.webmvc.config.RepositoryRestConfigurer {}\n".to_owned(),
+            ),
             // Another type's `withConfig`, and a method returning another type, cap nothing.
             ("neg/src/N.java", repo("negs", "PagingAndSortingRepository", "count")),
             (
@@ -2069,6 +2081,8 @@ mod tests {
             ("conf".to_owned(), None),
             ("adpt".to_owned(), None),
             ("bean".to_owned(), None),
+            ("fqb".to_owned(), None),
+            ("fqs".to_owned(), None),
             ("kcfg".to_owned(), None),
             ("kwith".to_owned(), None),
             ("neg".to_owned(), None),
@@ -2101,6 +2115,8 @@ mod tests {
                 "EXPOSES based -> HTTP GET /svc/api/things/search/findByName @based [synthetic]",
                 "EXPOSES bean -> HTTP GET /beans @bean [heuristic]",
                 "EXPOSES conf -> HTTP GET /confs @conf [heuristic]",
+                "EXPOSES fqb -> HTTP GET /fqbs @fqb [heuristic]",
+                "EXPOSES fqs -> HTTP GET /fqss @fqs [heuristic]",
                 "EXPOSES kcfg -> HTTP GET /kcfgs @kcfg [heuristic]",
                 "EXPOSES kwith -> HTTP GET /kwiths @kwith [heuristic]",
                 "EXPOSES neg -> HTTP GET /negs @neg [synthetic]",
@@ -2128,6 +2144,8 @@ mod tests {
                 r#"data_rest_base_unread {"service":"adpt"}"#,
                 r#"data_rest_base_unread {"service":"bean"}"#,
                 r#"data_rest_base_unread {"service":"conf"}"#,
+                r#"data_rest_base_unread {"service":"fqb"}"#,
+                r#"data_rest_base_unread {"service":"fqs"}"#,
                 r#"data_rest_base_unread {"service":"kcfg"}"#,
                 r#"data_rest_base_unread {"service":"kwith"}"#,
             ]
