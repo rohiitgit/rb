@@ -838,5 +838,5 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - E4: every citation of the 80 new verdicts is script-checked (258 of 259 OK); the disk figures are logged.
   - E5 and E6 are residue.
   - Re-close: binary `2e36cd60…`, dumps identical by row to the first run, scoreboard cells unchanged, `compare` exit 0, perf warnings re-measured without persisting.
-- **Status:** implemented; evaluator pass 1 answered, pass 2 pending.
+- **Status:** closed 2026-10-16 on evaluator pass 2 (`tasks/eval-m9a-pass2.md`) VERDICT PASS (5 notes; N1 and N2 carried to M9b P5).
 

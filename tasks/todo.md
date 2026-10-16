@@ -1158,6 +1158,7 @@ Plan: `tasks/plan-m9.md` (from an opencode plan session; claims unverified until
 - [x] P5: `PIPELINE` `m9a-1`, docs, fmt/clippy, real-Docker suites, batteries; commit.
 - [x] P6: bench run, invariant, new sample verdicts, score ×2, re-scored base, compare. Binary `05a600c9…` from `7a82313`, 0 failures. M8 base's mattermost dumps restored from the M8 binary (re-score byte-identical); invariant 0 unclassified over 157 dumps; 80 redrawn edges judged, all TRUE; `compare` exit 0 with one accepted line; 14 small-target perf warnings re-measured (contract amendment 2).
 - [x] P7: records done; evaluator pass 1: PASS (4 should-fix, 4 notes, `tasks/eval-m9a-pass1.md`).
+- [x] Evaluator pass 2 (`tasks/eval-m9a-pass2.md`): PASS, 5 notes (amendment 4; N1, N2 carried to M9b P5). **M9a closed.**
 - [x] Pass 1 answered (contract amendment 3): E3 fix test first (`PIPELINE` `m9a-2`), E1 tests + mutants m248–m260, E2 runner filter rule, E4 `check_citations.py` (258/259 OK) and `disk.txt`, E5/E6 residue. Code `624da45`.
 - [x] Re-close: fmt/clippy, unit 357/204/79, e2e 52/0/0, batteries 31/31 + 29/29; binary `2e36cd60…`; bench 0 failures; dumps identical by row to r1; score ×2 `cmp`; sample 0 missing; `compare` exit 0; 27 perf warnings re-measured (`perf-ab3.txt`, `perf-ab4.txt`), none persists.
 - [ ] Evaluator pass 2 (verification only).

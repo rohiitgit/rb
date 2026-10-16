@@ -1,6 +1,6 @@
 # M9a contract: `exact` precision from the M8 benchmark (2026-10-16)
 
-**Status:** implemented; evaluator pass 1 PASS answered (amendment 3); pass 2 pending. The contract was written 2026-10-16 from `tasks/plan-m9.md` §4 "M9a" and `tasks/bench-findings.md` B7, B8, B11, B12 (part a), B13, B14. Every root cause below was re-read in the code at branch `m9` (`0453fda`) and checked against the M8 dumps (`var/bench/out/a038653b8478/`). Commits go on branch `m9`.
+**Status:** **closed 2026-10-16.** Evaluator pass 1 PASS answered (amendment 3); evaluator pass 2 (`tasks/eval-m9a-pass2.md`, verification only) VERDICT PASS with 5 notes (amendment 4). The contract was written 2026-10-16 from `tasks/plan-m9.md` §4 "M9a" and `tasks/bench-findings.md` B7, B8, B11, B12 (part a), B13, B14. Every root cause below was re-read in the code at branch `m9` (`0453fda`) and checked against the M8 dumps (`var/bench/out/a038653b8478/`). Commits go on branch `m9`.
 
 ## Why
 
@@ -317,6 +317,13 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - r2 against M8, mean wall: within 0.68–1.19× on 24 targets. go_gin_example was 1.27×, from one 1.55 s run. mattermost was 32.09 against 31.61 s (1.02×), with one ~50 s run on each binary.
   - `perf_ab4.sh` (`perf-ab4.txt`, M8 vs r2, all runs exit 0): go_gin_example 0.49 / 0.49 s (5 runs); spring_boot_microservices median 0.41 / 0.42 s (5 runs); mattermost 22.88 / 23.82 s (3 runs, 1.04×), max RSS 1,990,934,528 / 1,951,055,872 B.
   - No warning persists, and mattermost is inside the NFR (≤ 30.9 s, ≤ 1.93 GiB). The bench run's own mattermost RSS, 2,041,479,168 B, is under the 1.15× limit.
+
+**Amendment 4 (2026-10-16, evaluator pass 2; M9a closed).** Pass 2 (`tasks/eval-m9a-pass2.md`) re-ran every answer and gave VERDICT PASS with no blocking or should-fix finding. It re-indexed a 15-service config-server fixture with the binary of record (`pipeline` `m9a-2`), matching Spring on every row. The m9a battery gave 31/31 KILLED, `check_citations.py` re-ran byte-identical, the re-score and `compare` were `cmp`-identical to the records, and the release build reproduces sha `2e36cd60…`. Its 5 notes:
+- **N1:** no test pins the trimming of a remote context-path value (its mutant v03 survives; behaviour is right today). Carried to M9b P5 as a test plus a mutant.
+- **N2:** the runner still accepts a filter that selects a wall-clock test (`stay_fast`). Carried to M9b P5: the runner refuses filters that match a known timing test, and the usage guide says so.
+- **N3:** the e2e try-1 Maven timeout and the `t_scipfix` clearing run are described in amendment 3 but in no log. They stay as prose; the passing re-run (`e2e-r2.log`, 52/0/0) is the evidence of record.
+- **N4:** go_gin_example and mattermost were re-measured twice, not once, because the first re-measure was over by mean (1.27× from one outlier; 32.09 s with one ~50 s outlier per binary). The second A/B (`perf-ab4.txt`) is 1.00× and 1.04×, and CPU time is 1.02–1.03× of M8. Both re-measures are disclosed; the NFR text will say "re-measured until the noise is classified" from M9b on.
+- **N5:** the load range "3.95–6.0" is mattermost's run alone (all 27 runs span 2.98–6.0), and the lesson's "about 5 GiB" cache size is not logged. Read them so.
 
 ## Result
 

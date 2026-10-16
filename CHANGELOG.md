@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026-10-16 (wall clock)] M9a closed: evaluator pass 2 PASS
+- `tasks/eval-m9a-pass2.md`: VERDICT PASS, no blocking or should-fix finding, 5 notes. Recorded in contract amendment 4; N1 (a trimming test) and N2 (refuse timing-test filters in the mutant runner) are carried to M9b P5.
+- Status lines closed: contract, IMPLEMENT, todo, design §13, README.
+- Files: `tasks/contract-m9a.md`, `tasks/eval-m9a-pass2.md`, `IMPLEMENT.md`, `tasks/todo.md`, `docs/repository-brain-design.md`, `README.md`, `CHANGELOG.md`.
+
 ## [2026-10-16 15:10] (wall clock) M9a: evaluator pass 1 answered, re-closed
 - **E3 (fix):** a config server's empty `server.servlet.context-path` now overrides a lower local or remote path, so the routes stay at the root, as Spring serves them. Local files already behaved this way. `PIPELINE` `m9a-2`.
 - **E1 (tests):** the B14 test covers every D4 and amendment 1 rule, and the B7 test counts 2 routes in one file. Mutants m248–m260 (the evaluator's e02–e12, plus 2 for the fix) are all KILLED.
