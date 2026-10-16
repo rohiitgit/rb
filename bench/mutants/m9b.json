@@ -58,9 +58,9 @@
   "crate": "rb-indexer",
   "test": "sql::tests::sprintf_sql_folds_package_constants",
   "file": "sql.rs",
-  "old": "                let constant = b.constant;\n",
-  "new": "                let constant = true;\n",
-  "what": "var bindings enter the table"
+  "old": "                let constant = b.constant && b.type_name.is_empty();\n",
+  "new": "                let constant = b.type_name.is_empty();\n",
+  "what": "var bindings enter the table (re-anchored after pass 1 E3 rewrote the line)"
  },
  {
   "id": "m268",
@@ -162,6 +162,60 @@
   "what": "data-rest dependency gate removed"
  },
  {
+  "id": "m279",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "        && scope.binding_index_at(\"fmt\", at).is_none()\n",
+  "new": "        && true\n",
+  "what": "a local binding of fmt no longer refuses the fold (pass 1 e1; row Q)"
+ },
+ {
+  "id": "m280",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "            Some('s' | 'v') => out.push_str(next.next()?),\n",
+  "new": "            Some('s' | 'v' | 'd') => out.push_str(next.next()?),\n",
+  "what": "%d accepted as a string hole (pass 1 e2; row P)"
+ },
+ {
+  "id": "m281",
+  "crate": "rb-indexer",
+  "test": "tests::data_rest_services_need_the_dependency_and_read_the_base_path",
+  "file": "lib.rs",
+  "old": "                && DATA_REST_DEPENDENCIES.iter().any(|d| text.contains(d))\n",
+  "new": "                && true\n",
+  "what": "every build file names Spring Data REST (pass 1 e3)"
+ },
+ {
+  "id": "m282",
+  "crate": "rb-indexer",
+  "test": "tests::data_rest_services_need_the_dependency_and_read_the_base_path",
+  "file": "lib.rs",
+  "old": "    &[\"spring.data.rest.base-path\", \"spring.data.rest.basePath\"];\n",
+  "new": "    &[\"spring.data.rest.base-path\"];\n",
+  "what": "basePath (camelCase) key not read (pass 1 e4)"
+ },
+ {
+  "id": "m283",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "            Some(\"RepositoryRestConfigurer\" | \"RepositoryRestConfigurerAdapter\")\n",
+  "new": "            Some(\"RepositoryRestConfigurer\")\n",
+  "what": "RepositoryRestConfigurerAdapter no longer caps (pass 1 e5)"
+ },
+ {
+  "id": "m284",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "        if language != Language::Go || def.parent.is_some() {\n",
+  "new": "        if language != Language::Go {\n",
+  "what": "a function-local type gets the package type's cross-file methods (pass 1 e6)"
+ },
+ {
   "id": "m285",
   "crate": "rb-indexer",
   "test": "resolve::tests::go_methods_in_sibling_files_are_members",
@@ -250,5 +304,50 @@
   "old": "                        found = Some((file, value.trim().to_owned()));\n",
   "new": "                        found = Some((file, value.to_owned()));\n",
   "what": "remote context-path value not trimmed (N1; M9a pass 2's v03)"
+ },
+ {
+  "id": "m295",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    \"findAllById\",\n",
+  "new": "    \"findAllByIdX\",\n",
+  "what": "findAllById exported as a search resource (pass 1 e7)"
+ },
+ {
+  "id": "m296",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "                let constant = b.constant && b.type_name.is_empty();\n",
+  "new": "                let constant = b.constant;\n",
+  "what": "a named-type constant folds its literal, not its String() (pass 1 E3; row N)"
+ },
+ {
+  "id": "m297",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                        || d.return_type.as_deref().is_some_and(configurer)\n",
+  "new": "                        || false\n",
+  "what": "a method returning a configurer (the @Bean form) no longer caps (pass 1 E2)"
+ },
+ {
+  "id": "m298",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                        && c.links.first().is_some_and(|l| l.name == \"withConfig\")\n",
+  "new": "                        && c.links.first().is_some_and(|l| l.name == \"withConfigX\")\n",
+  "what": "RepositoryRestConfigurer.withConfig no longer caps (pass 1 E2; Kotlin row)"
+ },
+ {
+  "id": "m299",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "            matches!(language, Language::Java | Language::Kotlin)\n",
+  "new": "            *language == Language::Java\n",
+  "what": "Kotlin configurers no longer cap (pass 1 E2)"
  }
 ]

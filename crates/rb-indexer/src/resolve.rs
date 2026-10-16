@@ -1872,6 +1872,13 @@ func (s *Server) helper() {}
                     GO,
                     "package svc_test\nfunc (h *H) N() {}\nfunc use3(h *H) { h.M() }\n",
                 ),
+                // A function-local `H` is another type: the package `H`'s methods are not its
+                // own (M9b pass 1, E1).
+                (
+                    "svc/loc.go",
+                    GO,
+                    "package svc\nfunc loc() {\n\ttype H struct{}\n\tvar h H\n\th.M()\n}\n",
+                ),
                 // Another package with its own `H`, which has no `M`.
                 ("b/h.go", GO, "package b\ntype H struct{}\n"),
                 ("b/use.go", GO, "package b\nfunc run2(h *H) { h.M() }\n"),

@@ -512,20 +512,30 @@ pub(crate) fn add_endpoints(
     let consts = Constants::new(inputs.files, inputs.index);
     let mut folder = rb_frameworks::fold::Folder::new(&consts);
     // Services with a `RepositoryRestConfigurer`, which can move Spring Data REST's base path
-    // in code (contract M9b D7): their data-rest endpoints are capped, counted once.
+    // in code (contract M9b D7): their data-rest endpoints are capped, counted once. A
+    // configurer is a Java or Kotlin class extending one, a Java method returning one (the
+    // `@Bean` form, an anonymous `…Adapter` included; the annotation is not checked, as a cap
+    // only lowers certainty), or a `RepositoryRestConfigurer.withConfig(…)` call (Spring Data
+    // REST 3.1+), which is how a Kotlin `@Bean` with an inferred type is seen (M9b pass 1, E2).
+    let configurer = |name: &str| {
+        matches!(
+            name.rsplit('.').next(),
+            Some("RepositoryRestConfigurer" | "RepositoryRestConfigurerAdapter")
+        )
+    };
     let configured: BTreeSet<String> = inputs
         .files
         .iter()
         .filter(|(_, (language, facts))| {
-            *language == Language::Java
-                && facts.definitions.iter().any(|d| {
-                    d.supertypes.iter().any(|s| {
-                        matches!(
-                            s.name.rsplit('.').next(),
-                            Some("RepositoryRestConfigurer" | "RepositoryRestConfigurerAdapter")
-                        )
-                    })
-                })
+            matches!(language, Language::Java | Language::Kotlin)
+                && (facts.definitions.iter().any(|d| {
+                    d.supertypes.iter().any(|s| configurer(&s.name))
+                        || d.return_type.as_deref().is_some_and(configurer)
+                }) || facts.chains.iter().any(|c| {
+                    c.root.as_deref().and_then(|r| r.rsplit('.').next())
+                        == Some("RepositoryRestConfigurer")
+                        && c.links.first().is_some_and(|l| l.name == "withConfig")
+                }))
         })
         .map(|(path, _)| (inputs.service_of)(path))
         .collect();
@@ -2010,18 +2020,58 @@ mod tests {
                 "conf/src/Cfg.java",
                 "package p;\nimport org.springframework.data.rest.webmvc.config.RepositoryRestConfigurer;\nclass Cfg implements RepositoryRestConfigurer {}\n".to_owned(),
             ),
+            // Every other way a configurer is registered caps too (M9b pass 1, E1 and E2): a
+            // subclass of the 2.x `…Adapter`; the 2.5.5 reference's `@Bean` returning an
+            // anonymous `…Adapter`; a Kotlin class; a Kotlin `@Bean` of `withConfig` (3.1+),
+            // whose return type is inferred.
+            ("adpt/src/A.java", repo("adapts", "PagingAndSortingRepository", "count")),
+            (
+                "adpt/src/Cfg.java",
+                "package p;\nimport org.springframework.data.rest.webmvc.config.RepositoryRestConfigurerAdapter;\nclass Cfg extends RepositoryRestConfigurerAdapter {}\n".to_owned(),
+            ),
+            ("bean/src/B.java", repo("beans", "PagingAndSortingRepository", "count")),
+            (
+                "bean/src/Conf.java",
+                "package p;\nimport org.springframework.context.annotation.Bean;\nimport org.springframework.data.rest.webmvc.config.RepositoryRestConfigurer;\nimport org.springframework.data.rest.webmvc.config.RepositoryRestConfigurerAdapter;\nclass Conf {\n    @Bean\n    public RepositoryRestConfigurer repositoryRestConfigurer() {\n        return new RepositoryRestConfigurerAdapter() {\n            @Override\n            public void configureRepositoryRestConfiguration(RepositoryRestConfiguration config) {\n                config.setBasePath(\"/moved\");\n            }\n        };\n    }\n}\n".to_owned(),
+            ),
+            ("kcfg/src/K.java", repo("kcfgs", "PagingAndSortingRepository", "count")),
+            (
+                "kcfg/src/Cfg.kt",
+                "package p\nimport org.springframework.data.rest.webmvc.config.RepositoryRestConfigurer\nclass Cfg : RepositoryRestConfigurer\n".to_owned(),
+            ),
+            ("kwith/src/W.java", repo("kwiths", "PagingAndSortingRepository", "count")),
+            (
+                "kwith/src/Conf.kt",
+                "package p\nimport org.springframework.context.annotation.Bean\nimport org.springframework.data.rest.webmvc.config.RepositoryRestConfigurer\nclass Conf {\n    @Bean\n    fun cfg() = RepositoryRestConfigurer.withConfig { c -> c.setBasePath(\"/moved\") }\n}\n".to_owned(),
+            ),
+            // Another type's `withConfig`, and a method returning another type, cap nothing.
+            ("neg/src/N.java", repo("negs", "PagingAndSortingRepository", "count")),
+            (
+                "neg/src/Conf.java",
+                "package p;\nclass Conf {\n    RestTemplate rt() { return Builder.withConfig(x); }\n}\n".to_owned(),
+            ),
         ];
         let facts: Vec<(String, Language, FileFacts)> = files
             .iter()
             .map(|(p, src)| {
-                let f = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
-                ((*p).to_owned(), Language::Java, f)
+                let language = if p.ends_with(".kt") {
+                    Language::Kotlin
+                } else {
+                    Language::Java
+                };
+                let f = rb_syntax::extract(language, src.as_bytes()).unwrap();
+                ((*p).to_owned(), language, f)
             })
             .collect();
         let data_rest: BTreeMap<String, Option<String>> = [
             ("acct".to_owned(), None),
             ("based".to_owned(), Some("api".to_owned())),
             ("conf".to_owned(), None),
+            ("adpt".to_owned(), None),
+            ("bean".to_owned(), None),
+            ("kcfg".to_owned(), None),
+            ("kwith".to_owned(), None),
+            ("neg".to_owned(), None),
         ]
         .into();
         let built = build_from(
@@ -2047,8 +2097,13 @@ mod tests {
                 "EXPOSES acct -> HTTP PATCH /accounts/{} @acct [synthetic]",
                 "EXPOSES acct -> HTTP POST /accounts @acct [synthetic]",
                 "EXPOSES acct -> HTTP PUT /accounts/{} @acct [synthetic]",
+                "EXPOSES adpt -> HTTP GET /adapts @adpt [heuristic]",
                 "EXPOSES based -> HTTP GET /svc/api/things/search/findByName @based [synthetic]",
+                "EXPOSES bean -> HTTP GET /beans @bean [heuristic]",
                 "EXPOSES conf -> HTTP GET /confs @conf [heuristic]",
+                "EXPOSES kcfg -> HTTP GET /kcfgs @kcfg [heuristic]",
+                "EXPOSES kwith -> HTTP GET /kwiths @kwith [heuristic]",
+                "EXPOSES neg -> HTTP GET /negs @neg [synthetic]",
             ]
         );
         let handled: Vec<String> = edges(&built)
@@ -2067,7 +2122,16 @@ mod tests {
             .into_iter()
             .filter(|d| d.starts_with("data_rest_base_unread"))
             .collect();
-        assert_eq!(unread, [r#"data_rest_base_unread {"service":"conf"}"#]);
+        assert_eq!(
+            unread,
+            [
+                r#"data_rest_base_unread {"service":"adpt"}"#,
+                r#"data_rest_base_unread {"service":"bean"}"#,
+                r#"data_rest_base_unread {"service":"conf"}"#,
+                r#"data_rest_base_unread {"service":"kcfg"}"#,
+                r#"data_rest_base_unread {"service":"kwith"}"#,
+            ]
+        );
     }
 
     /// Contract M9b C2 (B9): a gin handler written as a method value of the receiver binds to

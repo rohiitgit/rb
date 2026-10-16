@@ -1989,9 +1989,9 @@ public class AuthController {
         const IMPORTS: &str = "package p;\nimport org.springframework.data.repository.CrudRepository;\nimport org.springframework.data.repository.Repository;\nimport org.springframework.data.rest.core.annotation.RepositoryRestResource;\nimport org.springframework.data.rest.core.annotation.RestResource;\n";
         let src = |body: &str| format!("{IMPORTS}{body}");
         // A CRUD base with two finders: 6 collection and item resources and 2 searches; the
-        // CRUD-named `findById` is no search.
+        // CRUD-named `findById` and `findAllById` are no searches.
         let crud = src(
-            "@RepositoryRestResource(path = \"accounts\", collectionResourceRel = \"accounts\")\npublic interface AccountRepository extends CrudRepository<Account, Long> {\n    Account findByEmail(String email);\n    List<Account> readByLastNameOrderByEmail(String lastName);\n    Account findById(Long id);\n}\n",
+            "@RepositoryRestResource(path = \"accounts\", collectionResourceRel = \"accounts\")\npublic interface AccountRepository extends CrudRepository<Account, Long> {\n    Account findByEmail(String email);\n    List<Account> readByLastNameOrderByEmail(String lastName);\n    Account findById(Long id);\n    List<Account> findAllById(Iterable<Long> ids);\n}\n",
         );
         assert_eq!(
             summary(Language::Java, &crud),

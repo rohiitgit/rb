@@ -142,7 +142,7 @@ use serde_json::{Value, json};
 /// `m9b-1` Go methods declared outside their receiver type's file are its members and no
 /// package-level names (B9); `fmt.Sprintf` SQL folds package constants (B10); Spring Data REST
 /// repositories expose `synthetic` endpoints (B12b).
-pub const PIPELINE: &str = "m9b-1";
+pub const PIPELINE: &str = "m9b-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -3202,6 +3202,63 @@ mod tests {
         let root = g.nodes().iter().find(|n| n.key == ".").unwrap();
         assert_eq!(root.attrs["role"], "unassigned");
         assert_eq!(root.name, "(unassigned)");
+    }
+
+    /// Contract M9b D7 (M9b pass 1, E1): a service serves Spring Data REST only when its Maven
+    /// or Gradle build names `spring-boot-starter-data-rest` or `spring-data-rest-webmvc`, and
+    /// its base path is read from `application.properties` or `application.yml` in either
+    /// relaxed form (`base-path`, `basePath`), without slashes; a blank one is none.
+    #[test]
+    fn data_rest_services_need_the_dependency_and_read_the_base_path() {
+        let starter = "<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-rest</artifactId></dependency>";
+        let config: BTreeMap<&str, String> = [
+            ("prop/pom.xml", format!("<project>{starter}</project>")),
+            (
+                "prop/src/main/resources/application.properties",
+                "spring.data.rest.basePath=/rest/\n".to_owned(),
+            ),
+            (
+                "yml/build.gradle",
+                "dependencies {\n    implementation 'org.springframework.boot:spring-boot-starter-data-rest'\n}\n".to_owned(),
+            ),
+            (
+                "yml/src/main/resources/application.yml",
+                "spring:\n  data:\n    rest:\n      base-path: /api/\n".to_owned(),
+            ),
+            (
+                "kts/build.gradle.kts",
+                "dependencies {\n    implementation(\"org.springframework.data:spring-data-rest-webmvc\")\n}\n".to_owned(),
+            ),
+            (
+                "blank/pom.xml",
+                format!("<project>{starter}</project>"),
+            ),
+            (
+                "blank/src/main/resources/application.properties",
+                "spring.data.rest.base-path=  /  \n".to_owned(),
+            ),
+            // A base path without the dependency serves nothing.
+            (
+                "web/pom.xml",
+                "<project><artifactId>spring-boot-starter-web</artifactId></project>".to_owned(),
+            ),
+            (
+                "web/src/main/resources/application.properties",
+                "spring.data.rest.base-path=/api\n".to_owned(),
+            ),
+        ]
+        .into();
+        let service_of = |p: &str| p.split('/').next().unwrap().to_owned();
+        let (spring, _) = spring_config(&config, &service_of);
+        assert_eq!(
+            data_rest_services(&config, &spring, &service_of),
+            BTreeMap::from([
+                ("blank".to_owned(), None),
+                ("kts".to_owned(), None),
+                ("prop".to_owned(), Some("rest".to_owned())),
+                ("yml".to_owned(), Some("api".to_owned())),
+            ])
+        );
     }
 
     /// Contract M9b N1 (M9a pass 2): a config server's context-path value is trimmed, so a

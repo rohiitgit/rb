@@ -327,7 +327,8 @@ fn is_migration(path: &str, text: &str, analysis: &rb_sql::Analysis) -> bool {
 /// Go package-level string constants for folding `fmt.Sprintf` SQL (contract M9b D6): per
 /// (package key, name), the declaring file, binding and value. A name enters only when its
 /// package declares it exactly once at the top level (a `const`, a `var`, a function or a type)
-/// and that declaration is a `const` of a non-test file whose value is one string literal.
+/// and that declaration is an untyped or `string` `const` of a non-test file whose value is one
+/// string literal.
 #[derive(Default)]
 pub(crate) struct GoConsts<'a> {
     table: BTreeMap<((&'a str, &'a str), &'a str), GoConst<'a>>,
@@ -363,7 +364,10 @@ impl<'a> GoConsts<'a> {
                     },
                     _ => None,
                 };
-                let constant = b.constant;
+                // Untyped or `string` only: `%s`/`%v` print a named type through its `String()`,
+                // `Error()` or `Format` method, not its literal (M9b pass 1, E3). `type_name` is
+                // empty for both (it leaves built-in scalars out).
+                let constant = b.constant && b.type_name.is_empty();
                 let test_file = rb_model::is_test_path(path);
                 if let (true, false, Some(value)) = (constant, test_file, value) {
                     let c = GoConst {
@@ -974,8 +978,12 @@ const REPORT = 'SELECT * FROM public.orders';
     /// no edge. Each case is its own function: same-key edges would merge.
     #[test]
     fn sprintf_sql_folds_package_constants() {
-        let consts = "package repository\nconst (\n\tusersTable = \"users\"\n\tlistsTable = \"todo_lists\"\n\tdupTable = \"dup\"\n\tlocalTable = \"shadowed\"\n)\nvar varTable = \"vars\"\n";
-        let use_go = "package repository\nimport (\n\t\"fmt\"\n\tother \"example.com/other\"\n)\nfunc A() { _ = fmt.Sprintf(\"SELECT id FROM %s WHERE id = $1\", usersTable) }\nfunc B() { _ = fmt.Sprintf(\"SELECT id FROM %v\", listsTable) }\nfunc C() { _ = fmt.Sprintf(\"SELECT id %% 2 FROM %s\", usersTable) }\nfunc D() {\n\tlocalTable := \"x\"\n\t_ = fmt.Sprintf(\"SELECT id FROM %s\", localTable)\n}\nfunc E() { _ = fmt.Sprintf(\"SELECT id FROM %s\", varTable) }\nfunc F() { _ = fmt.Sprintf(\"SELECT id FROM %s\", dupTable) }\nfunc G() { _ = fmt.Sprintf(\"SELECT id FROM %s\", testTable) }\nfunc H() { _ = fmt.Sprintf(\"SELECT id FROM %s WHERE note = '%d'\", usersTable) }\nfunc I() { _ = fmt.Sprintf(\"SELECT id FROM %[1]s\", usersTable) }\nfunc J() { _ = other.Sprintf(\"SELECT id FROM %s\", usersTable) }\nfunc K() { _ = fmt.Sprintf(\"SELECT id FROM %s\", tableName()) }\n";
+        // `tStringer` has a named type whose `String()` method `%s` calls, so its literal is not
+        // what Go prints (M9b pass 1, E3); `tTyped` is declared `string` and folds.
+        let consts = "package repository\ntype Tbl string\nfunc (t Tbl) String() string { return \"stringer_\" + string(t) }\nconst (\n\tusersTable = \"users\"\n\tlistsTable = \"todo_lists\"\n\tdupTable = \"dup\"\n\tlocalTable = \"shadowed\"\n\ttStringer Tbl = \"t_typed\"\n\ttTyped string = \"t_typedstr\"\n)\nvar varTable = \"vars\"\n";
+        // Row `H` refuses for its count (2 verbs, 1 value); row `P` refuses for `%d` alone, and
+        // row `Q` for a local binding of `fmt` (M9b pass 1, E1).
+        let use_go = "package repository\nimport (\n\t\"fmt\"\n\tother \"example.com/other\"\n)\nfunc A() { _ = fmt.Sprintf(\"SELECT id FROM %s WHERE id = $1\", usersTable) }\nfunc B() { _ = fmt.Sprintf(\"SELECT id FROM %v\", listsTable) }\nfunc C() { _ = fmt.Sprintf(\"SELECT id %% 2 FROM %s\", usersTable) }\nfunc D() {\n\tlocalTable := \"x\"\n\t_ = fmt.Sprintf(\"SELECT id FROM %s\", localTable)\n}\nfunc E() { _ = fmt.Sprintf(\"SELECT id FROM %s\", varTable) }\nfunc F() { _ = fmt.Sprintf(\"SELECT id FROM %s\", dupTable) }\nfunc G() { _ = fmt.Sprintf(\"SELECT id FROM %s\", testTable) }\nfunc H() { _ = fmt.Sprintf(\"SELECT id FROM %s WHERE note = '%d'\", usersTable) }\nfunc I() { _ = fmt.Sprintf(\"SELECT id FROM %[1]s\", usersTable) }\nfunc J() { _ = other.Sprintf(\"SELECT id FROM %s\", usersTable) }\nfunc K() { _ = fmt.Sprintf(\"SELECT id FROM %s\", tableName()) }\nfunc N() { _ = fmt.Sprintf(\"SELECT id FROM %s\", tStringer) }\nfunc O() { _ = fmt.Sprintf(\"SELECT id FROM %s\", tTyped) }\nfunc P() { _ = fmt.Sprintf(\"SELECT id FROM %d\", usersTable) }\nfunc Q() {\n\tfmt := struct{ Sprintf func(string, ...any) string }{}\n\t_ = fmt.Sprintf(\"SELECT id FROM %s\", usersTable)\n}\n";
         let files: Vec<(&str, &str)> = vec![
             ("repo/postgres.go", consts),
             // A second package-level declaration of `dupTable` (any kind).
@@ -1032,6 +1040,7 @@ const REPORT = 'SELECT * FROM public.orders';
                 r#"A(). -> public.users ops=["read"] Heuristic assumed"#,
                 r#"B(). -> public.todo_lists ops=["read"] Heuristic assumed"#,
                 r#"C(). -> public.users ops=["read"] Heuristic assumed"#,
+                r#"O(). -> public.t_typedstr ops=["read"] Heuristic assumed"#,
                 r#"S(). -> public.same_t ops=["read"] Heuristic assumed"#,
             ]
         );
@@ -1051,7 +1060,7 @@ const REPORT = 'SELECT * FROM public.orders';
         assert_eq!(
             folded,
             [
-                r#"repo/use.go {"constants":2,"sites":3}"#,
+                r#"repo/use.go {"constants":3,"sites":4}"#,
                 r#"repo/same.go {"constants":1,"sites":1}"#,
             ]
         );

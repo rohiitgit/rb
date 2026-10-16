@@ -185,11 +185,16 @@ Notes that bite newcomers:
   `GET /accounts/search/findByEmail` per query method. The context path and
   `spring.data.rest.base-path` prefix them. A `RepositoryRestConfigurer` in the
   service, which can move the base path in code, caps them at `heuristic`
-  and adds one `data_rest_base_unread` diagnostic `{service}`. Unannotated
-  repositories and default paths are not read.
+  and adds one `data_rest_base_unread` diagnostic `{service}`: a Java or
+  Kotlin class extending it (or `RepositoryRestConfigurerAdapter`), a Java
+  `@Bean` method returning one, or a `RepositoryRestConfigurer.withConfig(…)`
+  call. Unannotated repositories, Kotlin repositories and default paths are
+  not read.
 - Go SQL built with `fmt.Sprintf("SELECT … FROM %s", usersTable)` is parsed with
-  the package constant folded in, when `usersTable` is a string `const`
-  declared once in the package (any file but tests) and nothing shadows it.
+  the package constant folded in, when `usersTable` is an untyped or `string`
+  `const` declared once in the package (any file but tests) and nothing
+  shadows it. A constant of a named type is not folded: `%s` prints it
+  through its `String()` method.
   Only `%s`, `%v` and `%%` fold; anything else leaves the string as written.
   The edges stay `heuristic`, and each file with a folded call gets one
   `sql_folded` diagnostic `{sites, constants}`.
@@ -347,9 +352,12 @@ part of the tree.)
   `bench/mutants/timing_tests.txt`, written by
   `python3 -I bench/mutants/timing_tests.py`: every test whose assertion reads
   the clock (`.elapsed()`, `Instant`) or bounds a duration, or whose name
-  contains `stay_fast` (17 at M9b). Re-run it after adding a timing test. A
-  filter selects a listed test when its last `::` segment occurs in the
-  test's name.
+  contains `stay_fast` (17 in 6 crates at M9b), each with its full path as
+  `cargo test -- --list` prints it (`resolve::tests::name`). Re-run it after
+  adding a timing test; it compiles the test targets it reads. A filter
+  selects a listed test when the test's full path contains it, as cargo
+  matches, so a module filter such as `resolve` or `tests` is INVALID in a
+  crate with a timing test there; name the test.
 - **Stress repros:** `tasks/stress-findings.md` lists each finding with its
   repro and what fixed it. Re-run the repros of the findings a change touches.
 
