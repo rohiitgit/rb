@@ -636,5 +636,13 @@
 - **Rule:** When folding a value into a formatted string, check that the formatter prints the value as written. A value of a type that can carry formatting methods (`String()`, `Error()`, `Format`, `__str__`, `toString()`) is refused unless the type is a built-in string.
 
 ## 2026-10-16: read a test's full path from cargo, and time an NFR with the build the record used
-- **Mistake (caught by running it):** a scan of `mod … {` blocks lost `tests::` from `resolve.rs`'s tests, because a raw string held `}` at column 0. Separately, scoring timed with the debug `rb-bench` took 36 s, against the record's 1.5 s, which had used the release build.
+- **Mistake (caught by running it):** a scan of `mod … {` blocks lost `tests::` from `resolve.rs`'s tests, because a raw string held `}` at column 0. Separately, scoring timed with the debug `rb-bench` took 36 s, against the record's 1.5 s, which had used the release build. (Pass 2, N4: the build profile is only part of that gap. Release scoring also took 7.5–11 s on the loaded host that day; host load explains the rest.)
 - **Rule:** Take a Rust test's path from `cargo test -- --list`, not from parsing source. Time an NFR with the same binary and build profile as the record it is compared to, and name the binary in the log.
+
+## 2026-10-16: a verdict column prints the rule it applies, and that rule is the contract's
+- **Mistake (caught by M9b evaluator pass 2, S1):** `perf_ab5_summary.py` wrote `noise` on all 24 rows, and amendment 7 called them noise "under amendment 0's rule". The script let any target whose base CPU was under 1 s pass on wall alone, an exemption the rule does not have; six targets had a median CPU ratio of 1.105–1.303.
+- **Rule:** A script that classifies prints its rule as its first line, in the contract's words, and any exemption is either in the contract or not in the script. On sub-second runs, user+sys CPU from `/usr/bin/time` is too coarse for a 1.1× ratio: re-measure with more runs, alternate the order (ABBA), and record `instructions retired` (`/usr/bin/time -l`), which barely moves with load.
+
+## 2026-10-16: probe repositories outside `t_*` while a suite may run
+- **Context (M9b evaluator pass 2, N4):** the e2e harness's start-up clean-up deletes every `t_*` repository (`crates/rb-cli/tests/common/mod.rs`). An evaluator's `t_eval2_*` fixtures vanished when the suite started.
+- **Rule:** Name probes that must outlive a test run `bench_*` (removed by `bench/cleanup.sh`) or finish them before the suite starts. Never give a user repository a `t_` name.

@@ -852,7 +852,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Files:** `crates/rb-frameworks/src/routes.rs`, `crates/rb-indexer/src/{lib,resolve,routes,sql}.rs`, `bench/probe/scip_cross.py`, `bench/mutants/{run.py,timing_tests.py,timing_tests.txt,m9a.json,m9b.json}`, `bench/keys/microsecend/mse_jferrater.md`, `bench/scoreboard/m9b{,-perf}.json`, `bench/accept-m9b.tsv`, `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
 - **Results:**
   - hk_todo `handler_binding` 0 → 12 of 13, `table_queries` and `table_ops` 0 → 21 of 26 each, all `heuristic`.
-  - mse_jferrater endpoints 0 → 17 of 17 after a blind adjudication added 12 entries; microSecEnD endpoints R 77.0 % → 100.0 % on the re-scored base.
+  - mse_jferrater endpoints 0 → 17 of 18 after a blind adjudication added 12 entries (17 of 17 against the key, which lacks the served `/customers/search/findById` that rb also misses; corrected after pass 2, N3); microSecEnD endpoints R 77.0 % → 100.0 % on the re-scored base (74 of 75, 98.7 %, with that endpoint).
   - scip calls agreement P 74.3 % → 78.4 %, R 49.7 % → 62.4 %.
   - 10 of 314 cells changed; `compare` exits 0 with 2 accepted cells. Invariant: 0 unclassified rows over 157 dumps, 0 new `exact`.
   - `exact` 100.0 % of 126, unchanged; `synthetic` 83.0 % of 47.
@@ -871,4 +871,9 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - E6: the full `compare` command is quoted; `compare-r2.txt` has exit 0; `GetClusterId` is an M9c open item.
   - The `@RestResource(exported = false)` CRUD rule and E8–E9 are residue.
   - Re-close: binary `36ed5ea4…`, dumps identical by row to the first run, scoreboard cells unchanged, `compare` exit 0, 24 load-driven perf warnings re-measured A/B as noise.
-- **Status:** evaluator pass 1 PASS answered; pass 2 pending.
+- **Evaluator pass 2 (PASS, 0 blocking, 3 should-fix, 4 notes), answered in amendment 8 (`15baa12`):**
+  - S1: six of the 24 warnings had a median CPU ratio over amendment 0's 1.1× on 3 runs, and the summary script had an exemption the rule lacks. Re-measured with 20 runs per side in ABBA order: median CPU 0.932–1.097×, wall 0.944–1.029×, instructions retired 0.978–1.003×. All six are noise under the rule as written.
+  - S2: the Result's perf table shows m9a, r1 and r2 with their loads.
+  - S3: the three load-sensitive tests passed on a quieter host (try 3, `var/m9b/logs/r3/s3-try3.log`), and the full suite at `15baa12` is 1,136 passed, 0 failed, 0 skipped (`test-r3b.log`). The e2e statement timeout is `rb-store`'s `unowned_table_writes` query under a `LIMIT` (about 1.8 s on this host). The M9a binary hits it identically. Open item in `tasks/todo.md`.
+  - N1: a fully qualified configurer (return type and supertype) caps; the evaluator's x1 is KILLED. N2, N3: records corrected ("E4"; "17 of 18"). N4: `t_*` probes are deleted by the e2e start-up clean-up (lesson).
+- **Status:** closed 2026-10-16 on evaluator pass 2 (`tasks/eval-m9b-pass2.md`) VERDICT PASS (0 blocking; 3 should-fix and 4 notes answered in amendment 8).

@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-10-16 21:57] (wall clock) M9b closed: evaluator pass 2 PASS
+- `tasks/eval-m9b-pass2.md`: VERDICT PASS, 0 blocking, 3 should-fix, 4 notes. Answered in contract amendment 8.
+- **S1 (perf rule):** amendment 7 called all 24 `noscip-fresh` wall warnings noise, but six had a median CPU ratio of 1.105–1.303× on 3 runs, over amendment 0's 1.1×. The summary script had let a base CPU under 1 s pass on wall alone. Re-measured as an A/B of the M9a binary and r2, 20 runs per side, alternating ABBA (`var/m9b/scripts/perf_ab6.sh`): median CPU 0.932–1.097×, wall 0.944–1.029×, instructions retired 0.978–1.003×. All six are noise under the rule as written. Amendment 7's sentence is corrected, and both summary scripts print the rule they apply.
+- **S2:** the Result's perf table now shows m9a, r1 and r2 (the committed `m9b-perf.json`) with each run's load.
+- **S3:** the three tests that failed under host load (rb-syntax `deep_chains_and_nested_calls_extract_quickly`, e2e `check_gates` and `a_checkout_is_its_repository_whatever_its_name`) passed once the host was quieter. The full suite at `15baa12` is 1,136 passed, 0 failed, 0 skipped. Under load, the e2e failures come from `rb-store`'s `unowned_table_writes` query, which takes about 1.8 s under the `LIMIT` that rb appends. That code is unchanged since M7i, and the M9a binary hits the same timeout. Recorded as an open item.
+- **N1 (test):** a fully qualified `RepositoryRestConfigurer`, as a `@Bean` return type and as a supertype, caps data-rest endpoints. The evaluator's surviving mutant x1 is now KILLED (no new id).
+- **N2–N4 (records):** amendment 5 cites E4, not E5. "17 of 17" reads 17 of 18 in todo, IMPLEMENT, CHANGELOG and C4. The e2e start-up clean-up deleting `t_*` probes is noted, with a lesson.
+- **Verification:** fmt and clippy clean; rb-indexer 363/0 (`--test-threads=1`); full real-Docker suite 1,136/0/0; `rb.repo` unchanged; all probe repositories removed.
+- Status lines closed: contract, IMPLEMENT, todo, design §13, README.
+- Files: `crates/rb-indexer/src/routes.rs` (test), `tasks/{contract-m9b,eval-m9b-pass2,todo,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`, `README.md`, `docs/repository-brain-design.md`.
+
 ## [2026-10-16 19:24] (wall clock) M9b: evaluator pass 1 answered, re-closed
 - **E3 (fix):** a Go constant folds into `fmt.Sprintf` SQL only when it is untyped or `string`. A named type is refused, since `%s` prints it through its `String()` method. `PIPELINE` `m9b-2`.
 - **E2 (fix):** a `RepositoryRestConfigurer` registered by a method returning one (the `@Bean` form, including an anonymous `…Adapter`), by `RepositoryRestConfigurer.withConfig(…)`, or by a Kotlin class now caps data-rest endpoints at `heuristic` with `data_rest_base_unread`.
@@ -33,7 +44,7 @@
 - **Adjudication:** a blind adjudicator judged mse_jferrater's 17 endpoint statements TRUE against the pinned source and Spring Data REST 2.5.5. 12 ADD, 0 REMOVE in `bench/keys/microsecend/mse_jferrater.md`.
 - **Scoreboard** (`bench/scoreboard/m9b.json`, binary sha256 `3fc09844…` from `3b83d68`, `PIPELINE` `m9b-1`):
   - hk_todo `handler_binding` 0 → 12 of 13; `table_queries` and `table_ops` 0 → 21 of 26 each.
-  - mse_jferrater endpoints 0 → 17 of 17 (`synthetic`); microSecEnD endpoints R 77.0 % → 100.0 % on the re-scored base.
+  - mse_jferrater endpoints 0 → 17 of 18 (`synthetic`; 17 of 17 against the key, which lacks the served `/customers/search/findById` that rb also misses; corrected after evaluator pass 2, N3); microSecEnD endpoints R 77.0 % → 100.0 % on the re-scored base (74 of 75, 98.7 %, with that endpoint).
   - scip calls agreement P 74.3 % → 78.4 %, R 49.7 % → 62.4 %; mattermost tp 16,155 → 20,640, fn 17,157 → 12,672.
   - 10 of 314 cells changed. `compare` against the re-scored M9a base exits 0 with 2 accepted cells: two correct Feign flows the model puts out of scope, and 14 new mattermost fp with right receivers on tokens scip-go leaves without an occurrence.
   - `exact` 100.0 % of 126, unchanged; `synthetic` 83.0 % of 47; sample unchanged, 0 without a verdict.

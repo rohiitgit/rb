@@ -1173,7 +1173,7 @@ Plan: `tasks/plan-m9.md` (from an opencode plan session; claims unverified until
 
 # M9b: recall from the M8 benchmark, started 2026-10-16
 
-Contract: `tasks/contract-m9b.md` (10 plan corrections; amendments 0–6). Branch `m9`.
+Contract: `tasks/contract-m9b.md` (10 plan corrections; amendments 0–8). Branch `m9`.
 
 - [x] Contract written (B1, B9, B10, B12b, B13b; C1–C12; amendment 0 moved the mutant ids to m261–m284).
 - [x] P0: SCIP probe from the raw indexes; base re-scored `cmp`-identical; D4 failed, so B1 moves to M9c (amendment 1). B13b recorded.
@@ -1193,11 +1193,18 @@ Contract: `tasks/contract-m9b.md` (10 plan corrections; amendments 0–6). Branc
   - [x] E6: full `compare` command; `compare-r2.txt` exit 0; `GetClusterId` in M9c's open items.
   - [x] Notes and the CRUD `exported = false` rule recorded as residue.
   - [x] Re-close: e2e 52/0/0; batteries 39/31/29 KILLED; binary `36ed5ea4…` from `b651523`; bench 0 failures; r2 diff 0 rows; score ×2 `cmp`; sample 0 missing; `compare-r3.txt` exit 0; 24 perf warnings A/B noise.
-- [ ] Evaluator pass 2 (verification only).
+- [x] Evaluator pass 2 (`tasks/eval-m9b-pass2.md`): PASS, 0 blocking, 3 should-fix, 4 notes; answered in amendment 8. **M9b closed.**
+  - [x] S1: the six targets over 1.1× CPU re-measured, 20 ABBA runs per side (`perf_ab6.sh`): median CPU 0.932–1.097×, instructions 0.978–1.003×; noise under amendment 0 as written. Amendment 7's sentence corrected; `perf_ab5_summary.py` prints its rule.
+  - [x] S2: Result perf table has m9a, r1 and r2 columns.
+  - [x] S3: tries 1–2 failed under load; try 3 green (`var/m9b/logs/r3/s3-try3.log`). Full suite at `15baa12`: 1,134/2/0 under load (`test-r3.log`), then **1,136/0/0, 0 `skipping:`, exit 0** (`test-r3b.log`, `s3-green.txt`). Base binary fails `rb check` identically (`s3-check-ab.txt`).
+  - [x] N1: rows `fqb`, `fqs` (qualified configurer); x1 KILLED, no new id. Code `15baa12`.
+  - [x] N2, N3: "E4"; "17 of 18" in todo, IMPLEMENT, CHANGELOG and C4. N4: hazard noted, lesson added.
+- **Open item (from M9b pass 2, S3; M9c or later):** `rb check`'s `unowned_table_writes` rule takes 1.8–2.5 s on a 44-node graph on this host, at the 2,000 ms default statement timeout, so `check_gates` and `a_checkout_is_its_repository_whatever_its_name` fail under load. In `psql` the rule's Cypher runs in 52–67 ms without a `LIMIT` and in about 1.85 s with the `LIMIT` `rb-store` appends (`var/m9b/logs/r3/s3-limit-probe.txt`). The M9a binary fails identically (`s3-check-ab.txt`), so this is not an M9b regression. Find why the `Limit` node costs 1.8 s, and fix the query or the plan.
 
 ## Review (M9b)
-- Recall moved where the M8 keys said it was missing: hk_todo handlers 0 → 12 of 13, tables 0 → 21 of 26, mse_jferrater endpoints 0 → 17 of 17. scip calls agreement R 49.7 % → 62.4 %, P 74.3 % → 78.4 %. No new edge is `exact`.
+- Recall moved where the M8 keys said it was missing: hk_todo handlers 0 → 12 of 13, tables 0 → 21 of 26, mse_jferrater endpoints 0 → 17 of 18 (17 of 17 against the key, which lacks the served `/customers/search/findById` that rb also misses). scip calls agreement R 49.7 % → 62.4 %, P 74.3 % → 78.4 %. No new edge is `exact`.
 - B1 was not built. The probe showed scip-go records only namespace occurrences for another module, so the planned symbol join had nothing to join. Reading the index before writing code saved a phase.
 - Three surprises: the bare-name defect the contract said made no edges made 41 ambiguous ones on mattermost; mattermost's 2 folded SQL sites add no `QUERIES`; the jferrater key gained 12 entries, not "up to 10".
 - Process: the adjudicator gave TRUE/FALSE, and ADD/REMOVE was derived with `adjudicate.py`'s rules. C6 had been P4's code and is withdrawn with it. 3 of the 14 accepted mattermost fp go to server's own `App#GetClusterId`, which the accept line's B1 reason does not explain.
 - Pass 1 found two wrong-or-missing rules on inputs the bench lacks (a named-type Go constant folded by its literal; a `@Bean` configurer not capping) and seven mutants that the tests did not bite. Its records findings stood: the ADD split was 5/2/5, and jferrater's 17 of 17 is 17 of 18 with the served `findById` search that neither rb nor the key has.
+- Pass 2 found no wrong rule. Its findings were about evidence: a perf verdict applied a looser rule than the one it cited (re-measured: noise, by CPU and by instructions retired), a table showed one run's numbers under another's name, and three tests failed only on a loaded host. The `rb check` timeout behind two of them is old `rb-store` code that the M9a binary hits too (open item above).
