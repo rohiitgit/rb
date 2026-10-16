@@ -135,6 +135,8 @@ Following M6/M7 discipline (**≤ 5 source files per phase**, failing test + mut
   - `scip/go_clean_arch/calls`: recover the **12** constructor-assigned test calls (recall **75.5% → 100%**).
   - `pycg/calls` & `calls_file_scope`: lift recall on `imports`, `mro`, and `exceptions` categories.
 
+- **Note (2026-10-16, `tasks/contract-m9c.md` amendment 2):** the scip-go image fix moved from M9d into M9c, as phase PI before P1. The image (Go 1.27.2, scip-go 0.2.7 on x/tools v0.45.0) loaded no imported package, because Go 1.27.2 writes export data V5 and x/tools v0.45.0 reads only up to V4. It is rebuilt on x/tools v0.50.0 with a build-time self-test. M9c's D7 is withdrawn, and D8 becomes a `synthetic` symbol join. M9d keeps B4 and the `go.work` / version-skew question.
+
 ### **M9d (Optional / Infra) — SCIP Container Fetch Hardening (B4)**
 - **Scope:** B4 (`spring_boot_microservices`, `fastapi_realworld`, `kotlin_spring_realworld`, `nestjs_realworld` fetch/index failures). Audited per target; only recipes that fit the 6 GiB disk floor and 20-min warm budget land.
 

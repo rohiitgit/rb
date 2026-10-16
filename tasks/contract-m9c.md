@@ -264,16 +264,18 @@ No spec's filter may select a wall-clock test (M9b N2 rule).
 
 ## Out of scope
 
-- **M9d:** B4 (SCIP fetch and index failures). A single scip-go run under a generated `go.work` (B1 option a), with the open question of whether scip-go 0.2.7 ever emits dependency member occurrences.
+- **M9d** (amended 2): B4 (SCIP fetch and index failures). Also the `go.work` question. The scip-go image fix moved into M9c (PI, amendment 2), and with it the old open question is answered: scip-go 0.2.7 does emit dependency member occurrences once imports load. What remains for a generated `go.work`, or a local `replace` onto the defining root, is version skew. mattermost server type-checks against `server/public v0.4.3` from the module cache, not the in-repo tree. That leaves 172 agreement fp, 1,541 invalid locals, 4,092 member occurrences of symbols the in-repo server/public no longer defines, and every D8′ join `synthetic`. M9d measures whether a `go.work` run makes those joins exact and closes the skew.
 - **Recorded, not fixed:**
   - Single-implementer interface calls (0 measured misses; see trade-offs).
-  - Calls on server/public values in SCIP mode (548 agreement fp): no occurrence names the member.
-  - **Open (from M9b, evaluator pass 1 E6):** 3 agreement fp `App#GetClusterId` inside server's own module (`channels/app/audit.go:109`, `channels/app/command_mobile_logs.go:48`, `channels/web/context.go:67`). M9b's B9 binds them right (receivers read in source, `var/m9b/logs/fp-new-sources.txt`), but server's scip-go index records no occurrence on the `GetClusterId` token at any of the 3 (the one occurrence on each line is the `model` qualifier of the map key; `var/m9b/logs/fp-occurrences.txt`). B1's qualifier join does not explain them: they do not leave the module. P0 classifies why scip-go 0.2.7 records none there before B1 is built; until then they stay fp under `bench/accept-m9b.tsv`'s mattermost line.
-  - Cross-project `IMPLEMENTS` (a server type implementing a server/public interface).
+  - ~~Calls on server/public values in SCIP mode (548 agreement fp)~~ (amended 2): with the image fixed, D8′ joins them by symbol (amendment 2: 5,947 of the 6,141 fp carry a joinable symbol).
+  - ~~Open: 3 agreement fp `App#GetClusterId`~~ (amended 2): closed. Amendment 1 classified them (the map key's package failed to import); with the image fixed, all 3 carry the `App#GetClusterId()` occurrence and score tp (amendment 2).
+  - Cross-project `IMPLEMENTS` (a server type implementing a server/public interface): 352 `is_implementation` relationships in the fixed server index, still dropped (no node for the target in server's index). A symbol join of relationships, like D8′'s for references, is future work.
+  - The narrow D7 guard (drop a scip-go type relationship whose source embeds an `invalid type` field): 0 of 414 rows on the fixed image, not built (amendment 2). It is the fallback if a degraded index ever reappears past PI's self-test.
+  - Reading scip-go's package-load errors at run time: scip-go 0.2.7 does not report them (needs an upstream change).
   - `TsScopes` and `exclude::out_dir` on JSONC tsconfigs (6 on the bench); `baseUrl`-only bare specifiers (mattermost `components/…`).
   - TS `export *` barrels (express 3), parameter-property fields typed by decorators (express 14), TS inherited constructors, call segments outside Go (`MyClass().func()`).
   - Python `super(C, self)` (1 on the bench, microblog), `raise_assigned` and every data-flow form B5 lists.
-  - True Go implementers through dependency embeds lost by D7 (unmeasured; P0 counts what the dumps show).
+  - ~~True Go implementers through dependency embeds lost by D7~~ (amended 2): D7 is withdrawn; on the fixed image it would have dropped 3 such true rows.
 
 ## Amendments
 
@@ -358,6 +360,250 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - `rb-indexer/src/lib.rs` gained M9b's data-rest service gate (`data_rest_services`, `lib.rs:836`), two `assemble` hunks, their tests, and `PIPELINE` `m9b-2` (`lib.rs:145`; C11 reads `m9b-2` → `m9c-1`).
   - P5's join hangs off the SCIP job loop at `lib.rs:1076` (`scip::join` at `lib.rs:1085`).
 - **Safety.** No probe repository was created. `SELECT * FROM rb.repo ORDER BY 1` is identical before and after (`logs/repo-{before,after}-p0.txt`, 4 rows). The other database reads were `\d rb.scip_index` and two `READ ONLY` transactions over `rb.scip_index.stderr_tail`. The first matched no rows (wrong digest pattern). The second found the tail empty for the 20 most recent ok scip-go rows, the 13 exported ones among them. Container runs used `--network none` on scratch copies of the sources; the bench's module caches were mounted read-only or copied. No change under `crates/`.
+
+**Amendment 2 (2026-10-16, P0b: the scip-go image, root cause and re-plan; HEAD `f5d80b0`).** Amendment 1 found that rb's scip-go image cannot load imported packages. This amendment verifies that, measures a fixed image, and re-plans M9c around it. The fix moves from M9d into M9c as a new phase **PI**, before P1. D7 is withdrawn and D8 is redesigned. Records:
+- logs in `var/m9c/logs/p0b/`;
+- scripts in `var/m9c/p0b/scripts/` (`python3 -I`, read-only);
+- the image draft at `var/m9c/p0b/Dockerfile.candidate`;
+- raw indexes in `var/m9c/p0b/idx-{old,new,fixture}/`.
+
+- **Root cause, verified independently.**
+  - **Reproduction** (`repro.txt`). Inside `rb-scip-go:0.2.7` (`--network none`), scip-go 0.2.7's load mode (`NeedExportFile|NeedImports|NeedSyntax|NeedTypes|NeedTypesInfo|NeedModule|NeedName`) was built against x/tools v0.45.0 and against v0.49.0, then run on a module that imports `os`. Both report `could not import os (… cannot decode "os", export data version 5 is greater than maximum supported version 4)` and type `home := os.Getenv("HOME")` as `invalid type`. Both x/tools zips define pkgbits V0–V4 only. The image's Go 1.27.2 has `const uirVersion = pkgbits.V5`.
+  - **Upstream facts** (`versions.txt`, with sources).
+    - Go writes V2 in 1.26.x and V4 in 1.27.0 and 1.27.1. V5 came in **1.27.2** as a backport for golang/go#81188 and #81306 (method order).
+    - The first x/tools that reads V5 is **v0.50.0** (2026-09-08, commit `265dd1a`; V5 support in `89ed5c3`); v0.45.0–v0.49.0 do not.
+    - scip-go has **no release after v0.2.7**. Its `main` adopted x/tools v0.50.0 at `83daab2` (2026-09-09) and is at v0.52.0 (`c9c05f7`).
+    - rules_go#4752 (2026-10-15) reports the same error.
+  - **Scope in time.** `docker/scip-go/Dockerfile` has pinned Go 1.27.2 since the image was created (M6d phase 1, `1f155c7`, 2026-10-11). Every scip-go index rb has produced, the e2e goldens included, came from the degraded type check.
+  - **Silent by construction.** scip-go swallows package errors. Its log has no `could not import` line, only DEBUG `Neither def nor ref found`, and the job exits 0 (`var/m9c/logs/scipgo-offline-go_clean_arch.log`). So `rb status` cannot see the failure; only the index content shows it.
+  - **The probe matches rb's indexes.** `scripts/run_job.sh` runs each job's index phase as `go_runs` and `docker_args` do: the root's tracked files exported root-relative, the repository's Go module cache, the job env, `--network none`, `--cpus 2 --memory 4g`.
+    - The fetch phase is not re-run. The bench's fetch, behind rb's egress proxy, already filled `var/scip/cache/bench_<target>_scip/gomod`, and `go mod download` does not depend on the scip-go build. Each run uses an APFS clone of that cache.
+    - On the old image, all **13 of 13** ok scip-go jobs reproduce the indexes M9b P0 exported from `rb.scip_index`, item for item (`measure.txt`, section `control`).
+
+- **Options.**
+
+  | Option | What | Verdict |
+  |---|---|---|
+  | (a) newer scip-go release | none exists after v0.2.7; `main` at a pinned commit (`c9c05f7`, x/tools v0.52.0) | rejected: an unreleased commit that carries every scip-go change since v0.2.7, so indexing changes would be confounded with the type fix |
+  | **(b) v0.2.7 with x/tools v0.50.0** | `go get golang.org/x/tools@v0.50.0` at the verified v0.2.7 commit. MVS also raises x/mod 0.36→0.41, x/sync 0.20→0.23 and x/sys 0.44→0.48, and the `go` line 1.25→1.26 | **chosen**: it fixes the reader, the root cause; the code is v0.2.7's; the delta is the module graph, pinned by sha256 |
+  | (c) Go that writes ≤ V4 | 1.27.1 (V4) or 1.26.9 (V2). Every bench `go` line fits (max 1.26.7, mattermost; microservices_demo's `toolchain go1.27.1` is ignored under `GOTOOLCHAIN=local`) | rejected: pins the writer below the reader, so the next toolchain bump breaks it again, silently; a module with `go ≥ 1.27` fails closed; 1.27.1 is the release whose export data loses method order (#81188) |
+  | (d) on top of (b) | a build-time self-test that fails the build if scip-go cannot type a standard-library call | **added**. Reading scip-go's package errors at run time was considered and is not possible without patching scip-go |
+
+- **The fix** (`var/m9c/p0b/Dockerfile.candidate`, builds `build-2.log` and `build-3-final.log`).
+  - **Kept from the current Dockerfile:** the Ubuntu digest, the Go 1.27.2 sha256 per architecture, the v0.2.7 tag fetch with its commit verified, `-trimpath`, and the module cache and sources dropped after the build.
+  - **Added:**
+    - `go get golang.org/x/tools@v0.50.0` with `GOTOOLCHAIN=local`. GOSUMDB stays on, so new `go.sum` hashes are checked against sum.golang.org when written.
+    - `go mod verify`.
+    - The sha256 of the resulting `go.mod` (`ed3b5d9e…5d7e`) and `go.sum` (`8ce9cab7…a51e`), pinned as ARGs. A drift fails the build, which printed the values on its first run, `build-1-unpinned.log`.
+    - `go build` under `-mod=readonly`.
+    - `go version -m` must list `golang.org/x/tools v0.50.0`.
+    - The self-test, offline: `scip-go` on `import "os"; os.Getenv(…)` must write `… os/Getenv().`.
+  - **Self-test control** (`selftest-control.txt`): `rb-scip-go:0.2.7` writes no `Getenv` symbol (FAIL); the candidate writes `scip-go gomod github.com/golang/go/src go1.25 os/Getenv().` (PASS).
+  - **Tag:** `rb-scip-go:0.2.7-xtools0.50.0`, set in `SCIP_GO_IMAGE`. The old image is left in place.
+  - **Cache.** `rb.scip_index` is keyed `(input_hash, indexer_digest = image ID)` (`migrations/0004_scip_index.sql`, `Images::for_job`). A new ID misses every cached Go index, so no degraded index is reused. `RECIPE_GO` stays `m6d-go-1`: the commands do not change. `tool_versions.scip_go` records the new ID, so graphs indexed with the old image are no longer "up to date".
+  - **Image ID.** The probe indexes come from ID `63a929a6…`. A rebuild with every layer cached gave `dc6a2531…`, because the containerd store's attestation manifest changes per build. The tools are identical, but the ID, and so the cache key, is per build (see Risks).
+
+- **Probe numbers** (`jobs.txt`, `measure.txt`, `implements.txt`, `s2-residue.txt`, `superset.txt`, `package-versions.txt`, `invalid-guard.txt`, `unattributed.txt`, `server-memory.txt`, `fixture-chi.txt`).
+  - **Locals typed `invalid type`, old → new:**
+    - mattermost server 119,977 / 202,385 → **1,541** / 202,391;
+    - server/public 9,578 / 35,138 → 0;
+    - go_clean_arch 284 / 571 → 0;
+    - go_gin_example 172 / 450 → 0;
+    - the 4 microservices_demo jobs 1,552 → 0;
+    - the 5 other mattermost jobs 924 → 0.
+
+    The 1,541 left in server are version skew (`invalid-residue.txt`). server requires `server/public v0.4.3` from the module cache, with no local `replace` and no committed `go.work`. Names the in-repo server/public added after v0.4.3 (e.g. `AccessControlPolicy#MembershipRule`) are undefined against it.
+  - **The 3 `App#GetClusterId` sites:** each now carries `…/server/v8 . …/channels/app`/App#GetClusterId().` at the call token. The map key `model.AuditKeyClusterID` now resolves.
+  - **server → server/public member occurrences: 0 → 274,382**, all at `v0.4.3`.
+    - 270,290 name a symbol that server/public's own index defines, modulo version.
+    - 4,092 name one it no longer defines (skew).
+    - Server's other dependency members go 0 → 121,031 and stdlib members 0 → 89,787.
+    - server/public's dependency members go 4 → 11,213. The 4 were amendment 1's unexplained `ldap` ones.
+  - **Superset.** On 11 of 13 jobs the new index has the same documents and definitions and keeps every old occurrence. server/public re-hashes 48 anonymous-struct member symbols. Server re-hashes 32, renumbers 63 locals, and loses 68 occurrences at their range (the logged example is a `model` qualifier in a test file; the rest are not classified). No gold call pair is lost (below).
+  - **Cost.**
+    - scip-go wall time is unchanged per job (server 94 s on both images).
+    - At the 4g budget both images reach `memory.peak` = 4 GiB through page cache, with 1,077 old and 894 new `max` events and 0 `oom` / `oom_kill`.
+    - Unconstrained (12g), the peak is 4.79 GB old and 4.86 GB new.
+    - Server's index grows 114.8 → 177.9 MB, and its occurrences 1,418,316 → 1,911,159 (+35 %). server/public's index grows 25.7 → 28.5 MB.
+  - **New package uses:** 4 (server: `spf13/pflag v1.0.10`, `splitio/go-toolkit/v5 v5.5.0`; mmgotool: `pflag`; api/server: `pb33f/ordered-map/v2 v2.3.1`). These are reached only through promoted or indirect members, so they are new `Package` nodes and `scip` `DEPENDS_ON`.
+  - **Type → interface `IMPLEMENTS` rows rb would hold.** The emulation keeps both ends as dump nodes and reproduces the M9b dump exactly on the old indexes (729 / 5 / 3).
+    - **mattermost 729 → 414.** The **407 kept are exactly D7's 407 verified rows**, and the **322 dropped are exactly D7's 322 drops** (277 `*Suite#`, 45 others). 7 rows are added (`sqlxRows# → rowScanner#`, `nopReadSeekCloser# → reader#`, …).
+    - go_clean_arch 5 → 5; microservices_demo 3 → 3.
+    - Judged sample: both TRUE type rows stay; the FALSE `ElasticsearchInterfaceTestSuite#` row leaves.
+  - **D7 on the new indexes** (each job's own index, as amendment 1 decided):
+    - It would drop **3 of 414**: `sqlxRows# → rowScanner#` through the dependency embed `*sqlx.Rows`, `driverForPlugin# → Driver#` through the embedded `AppDriver`, and `request.Context# → CTX#`.
+    - go/types accepted each with valid types, so all 3 are true.
+    - It would catch **0** false rows.
+    - The narrow guard, a source type embedding an `invalid type` field (go/types' "assume implements" case), hits **0 of 414**, against 354 of 729 on the old indexes.
+  - **Cross-module type relationships:** 352 `is_implementation` from server types to server/public interfaces. rb drops them today: the target has no node in server's index.
+  - **The go-chi-sqlx e2e fixture**, offline with an e2e module cache:
+    - member occurrences 0 → 23, all stdlib (`database/sql`, `net/http`);
+    - invalid locals 19 → 3;
+    - `Card#`/`Cash# → Payer#` unchanged; own references 27 → 27.
+
+    No chi member shows, because that cache lacks chi's download metadata. The real e2e fetch fills it.
+  - **Agreement, emulated** (`p0b_measure.py`, section `agreement`). Gold pairs are rebuilt from the indexes; noscip edges are the M9b record's. S0 reproduces every scored cell.
+
+    | `scip` calls cell | S0 = M9b record | S1: image only | S2: image + symbol join (D8′) |
+    |---|---|---|---|
+    | mattermost | gold 33,312, tp 20,640, fp 6,141, fn 12,672 (P 0.771, R 0.620) | gold 33,343, tp 20,644, fp 6,137, fn 12,699 (31 new own pairs, 0 lost) | gold 41,878, tp 26,591, fp **190**, fn 15,287 (P 0.993, R 0.635; 8,535 joined pairs) |
+    | go_clean_arch | 49 / 37 / 0 / 12 | identical | identical |
+    | go_gin_example | 161 / 152 / 0 / 9 | identical | identical |
+    | microservices_demo | 208 / 208 / 0 / 0 | identical | identical |
+
+    The 6,141 M9b fp by what the new index holds at the call token:
+    - 5,947 carry a server/public symbol (joinable);
+    - 4 an own-module symbol (the 3 GetClusterId and 1 test call);
+    - 172 none (skew, e.g. `model.IsPropertyFieldRequired`, absent from v0.4.3);
+    - 15 are `docs/site` scripts and 3 TS.
+
+    Of the new call-shaped occurrences S2 could not place in an enclosing function, 8,549 of 8,550 are in files no scip-go document covers, which are out of scope. So S2's in-scope numbers are complete. File-scope pairs (`calls_file_scope`) were not emulated.
+
+- **Re-decisions.**
+  - **D7: withdrawn.** On the fixed image the method-set rule catches 0 false rows and drops 3 true ones; the image alone removes the 322. Withdrawn with it:
+    - the `relationships_unverified` counter;
+    - claim **C8**;
+    - mutants **m331, m332, m333, m339** (ids retired, not reused).
+
+    The narrow invalid-embed guard is not built either: it hits 0 rows. The PI self-test is the guard, at the source.
+  - **D8 → D8′ (B1, a symbol join to another job's definitions).** With imports loaded, `model.NewId`'s token carries `scip-go gomod github.com/mattermost/mattermost/server/public v0.4.3 …/model`/NewId().`. The join counts it `references_external` (`scip.rs:549-556`), not `unmatched`, so D8's qualifier hand-back would recover 0 of the 5,947. D8 is replaced:
+    - **Hand-back.** In a scip-go job, a reference the join counts `references_external` is handed back with its source, kind, symbol and evidence. Its kinds are those the per-job join turns into edges. Its package's manager is `gomod` and its name equals another ok scip-go job's `go.mod` module path (`Content::go_modules`). A namespace symbol (`…/pkg/`) is never handed back. `references_external` keeps its meaning.
+    - **Join, after the job loop.** The key is `(manager, package name, descriptors)` with the version dropped. It is looked up in the definitions of the job whose module path that is; that job's own symbols carry version `.`.
+      - Exactly one ok job with that module path must define the symbol and anchor a node. Then an edge with provenance `scip` and certainty **`synthetic`**.
+      - Two jobs with that module path: no edge, counted `ambiguous`.
+      - A symbol defined but not anchored, or not defined at all: no edge, counted `unanchored`.
+    - **Certainty.** Always `synthetic`. It is not `exact` because the type checker resolved the name against the required version (`v0.4.3` from the module cache), while the target is the in-repo definition with the same name (design doc: `synthetic` is derived but deterministic). The measured skew (172 fp, 4,092 undefined members) shows the two trees differ. A local `replace` or a `go.work` onto the defining root would make the join exact; that is M9d's question. Within one index `exact` stays as today.
+    - **Report and status.** One `scip_cross_project` diagnostic per (from root, to root): `{synthetic, ambiguous, unanchored}`. D8's `exact` field goes. `rb status`'s `exact calls (scip)` counts `exact` only, as before (C10).
+    - **Unchanged by D8′:** cross-module `IMPLEMENTS` (352 relationships, Out of scope) and the 172 skewed calls (M9d).
+  - **B2, B3, B5 are unaffected.** They resolve `noscip` facts and never read a SCIP index; `noscip` runs no container. P3's flagged risk mostly goes away:
+    - the map-entry values (GetClusterId class) now carry occurrences;
+    - Tier B edges into server/public members now score against D8′'s joined gold, as tp where right.
+
+    What stays is a Tier B edge at one of the 172 skewed sites (fp), and any wrong Tier B binding.
+  - **D9** (gate base) is unchanged: the M9b record and `bench/scoreboard/m9b.json`.
+
+- **Claims, revised.**
+  - **C8 withdrawn.**
+  - **C9′ (D8′),** unit `external_references_join_another_projects_definitions` (`lib`):
+    - two jobs: server's `scip-go gomod M v0.4.3 …/model`/NewId().` joins server/public's `scip-go gomod M . …/model`/NewId().` as `synthetic`;
+    - a stdlib and a dependency external reference do not join;
+    - a module path no job has: none;
+    - a defined but unanchored symbol: counted `unanchored`;
+    - two jobs with that module path: `ambiguous`, no edge;
+    - a namespace occurrence never joins;
+    - the diagnostic counts each.
+  - **C16 (PI, new):**
+    - the image build's self-test passes, and its control fails on `rb-scip-go:0.2.7` (logged);
+    - `scip_go_chi_sqlx` and `scip_polyglot_monorepo` pass on the new image, with every golden line that changes classified;
+    - the image control (below) fails the re-blessed golden.
+  - **C12 gains bucket IMG** (below).
+  - **C15:** mutants m300–m330, m334–m338 and m340; m331–m333 and m339 are retired.
+  - **Mutants for D8′, all with filter `external_references_join_another_projects_definitions`:**
+    - m334 "external reference not handed back";
+    - m335 "module-path check removed";
+    - m336 "joined edge labelled `Exact`";
+    - m337 "two defining jobs: first wins";
+    - **m340** "version kept in the lookup key".
+
+    m338 is unchanged.
+  - **The image has no Rust mutant.** It is verified three ways:
+    - the build-time self-test and its control;
+    - the e2e goldens;
+    - an **image control**: one local, uncommitted Edit points `SCIP_GO_IMAGE` back at `rb-scip-go:0.2.7`, `scip_go_chi_sqlx` is re-run against the re-blessed golden and must fail on the `scip:` status line, and an Edit reverts the constant (`var/m9c/logs/image-control.txt`).
+
+- **The e2e goldens will change** (PI blesses them; each changed line classified, IMG):
+  - `golden/go-chi-sqlx/scip-status.txt`: `external 0` rises (stdlib members 23 measured offline, plus chi's once fetched) and `unmatched 54` falls by the same. Unchanged: `references matched 14`, the `Card#`/`Cash# → Payer#` rows and `7 exact calls (scip)` (own references unchanged, 27 → 27).
+  - `golden/polyglot-monorepo/scip-status.txt` line 5 (billing): `external 10` rises and `unmatched 44` falls; its line 1 may move.
+  - The stdlib `Package` key is predicted to keep its version. Under the job env it follows the module's `go` line (measured `go1.23` on the fixture and `go1.25` on the self-test module run in the image). Inside `docker build` the same self-test printed `1.27.2`, so the version source depends on the environment. PI checks the `go/github.com/golang/go/src@go1.23` assertion and classifies any change.
+  - `must-exist`, `must-not-exist` and the `--no-scip` goldens are predicted unchanged. A change outside these lines stops the phase.
+
+- **Invariant bucket IMG (C12).** A `scip`-dump row or `.scip.status` line that differs from the M9b record only because a job's raw scip-go index differs. P7 exports the run's indexes read-only from `rb.scip_index` by the new image ID, as M9b P0 did, and diffs them against `var/m9b/idx/` with `p0b_measure.py`. IMG covers:
+  1. an `exact` `scip` edge whose evidence span gained or lost the own-index symbol it names (measured: 31 `CALLS` pairs on mattermost, 0 elsewhere);
+  2. an `IMPLEMENTS` row in `implements.txt`'s dropped (322) or added (7) list;
+  3. a `Package` node or `scip` `DEPENDS_ON` for a package first seen in a member occurrence (4);
+  4. `references_*` and `relationships_dropped` counters.
+
+  No `noscip` row may fall in IMG. A row that matches both IMG and B1 (certainty `synthetic`) is B1.
+
+- **Phases, revised.** Order: P0 (amendment 1), P0b (this amendment), **PI**, P1, P2, P3, P4, P5, P6, P7, P8. P1–P4 are unchanged, except that P3's fp risk is re-predicted as above.
+  - **PI. scip-go image** (new; before P1, so every later e2e run and probe uses the fixed image).
+    - **Files:**
+      - `docker/scip-go/Dockerfile` (the candidate, without its "draft" header lines);
+      - `docker/scip-go/README.md` (x/tools row, `go.mod`/`go.sum` pins, the self-test, the tag);
+      - `crates/rb-scip/src/jobs.rs` (`SCIP_GO_IMAGE = "rb-scip-go:0.2.7-xtools0.50.0"`);
+      - `crates/rb-cli/src/doctor.rs` (the test's tag literal becomes the constant);
+      - `README.md` (build command).
+
+      Blessed: `crates/rb-cli/tests/golden/{go-chi-sqlx,polyglot-monorepo}/scip-status.txt`.
+    - **Action:**
+      1. `df -h .` (≥ 8 GiB free).
+      2. `docker build -t rb-scip-go:0.2.7-xtools0.50.0 docker/scip-go`, log kept, and its `docker image inspect` ID recorded.
+      3. Change the constant, then `cargo build -p rb-cli`.
+      4. Run `scip_go_chi_sqlx` and `scip_polyglot_monorepo`. They are expected to fail on the goldens: that is the failing test.
+      5. Bless, then `git diff` both goldens row by row against the prediction above.
+      6. Run the image control.
+    - **Verify:**
+      - the build log shows `go.mod: OK`, `go.sum: OK`, the x/tools `dep` line and the self-test step;
+      - `cargo test -p rb-scip` and the doctor test;
+      - both e2e: 0 failed, 0 skipped;
+      - the image-control log;
+      - `SELECT * FROM rb.repo ORDER BY 1` identical before and after;
+      - `rb-scip-go:0.2.7` still present.
+    - **Done:** committed on `m9` as "M9c PI: scip-go reads Go 1.27.2 export data".
+  - **P5. B1 only (D8′) and C10.**
+    - **Files:** `crates/rb-indexer/src/scip.rs` (hand-back of external references), `crates/rb-indexer/src/lib.rs` (post-loop join, diagnostic), `crates/rb-store/src/query.rs`, scip-status goldens if they change (the diagnostic line).
+    - **Action:** C9′ and C10 tests first, then D8′.
+    - **Verify:**
+      - `cargo test -p rb-indexer --lib scip` and `lib`;
+      - the rb-store test on a `ScratchDb`;
+      - the SCIP e2e suites, each changed golden line classified;
+      - a probe: index mattermost in SCIP mode as `t_m9c_mm` and read `scip_cross_project` server → server/public (predicted `synthetic`: at least 18,250 call sites in covered files, plus part of the 8,549 in files no document covers; 8,535 in-scope pairs), then delete the repo;
+      - mutants m334–m338 and m340.
+  - **P7. Bench**, additions:
+    - before the run, `docker image inspect rb-scip-go:0.2.7-xtools0.50.0` (absent → stop: Go jobs would be `unsupported`);
+    - the first run is cold for every Go job (about 5 min of scip-go wall time over the 13 jobs, summed from `jobs.txt`);
+    - after the run, export the new raw indexes for bucket IMG;
+    - `rb-bench sample`: the `scip` pool changes in mattermost's stratum (−322 / +7 `IMPLEMENTS`, +31 `exact` `CALLS`, +4 `DEPENDS_ON`, `REFERENCES` from the new own occurrences), so the draw moves. Every drawn edge without a verdict is judged under the M8b protocol (adversarial, transcripts in `var/bench/labels/exact-m9c/`) before the gate. The gate fails on any unjudged edge.
+  - **P6** adds design notes for the image's export-data pairing and the self-test, and for D8′'s `synthetic` join. It no longer has a D7 note.
+
+- **Predicted movement, re-based again.** The base is the M9b record. "After PI" isolates the image; the last column is M9c's close.
+
+  | Cell | M9b (base) | After PI | Predicted m9c | Claim |
+  |---|---|---|---|---|
+  | `scip:mattermost:noscip:calls` | gold 33,312, tp 20,640, fp 6,141, fn 12,672 | gold 33,343, tp 20,644, fp 6,137, fn 12,699 | after P5: gold 41,878, tp 26,591, fp 190, fn 15,287. After P3, fn falls from 15,287 by up to 11,546 (the M9b-miss bound) plus whatever B2 recovers of the 2,615 new server → server/public misses; tp rises by the same; fp ≈ 190 plus each wrong Tier B edge (each classified) | C16, C9′, C5 |
+  | `scip:mattermost:noscip:calls` `found_out_of_scope{not_covered}` | 22,872 | unchanged (documents unchanged) | rises with B3 and B2 (amendment 1) | C2, C3, C5 |
+  | `scip:mattermost:noscip:calls_file_scope` | in scope gold 338, tp 332, fp 1, fn 6 | ≤ 1 pair (1 new in-scope site) | D8′ at file scope not emulated; measured and classified at P7 | C9′ |
+  | `scip:go_clean_arch`, `go_gin_example`, `microservices_demo` (`calls`) | as amendment 1 | identical (S1 = S0, measured) | as amendment 1: tp 49 / fn 0; tp 161 / fn 0; unchanged | C5 |
+  | `exact` sample, `scip` | 60 / 60 | the FALSE `ElasticsearchInterfaceTestSuite#` row and 321 other `IMPLEMENTS` leave the pool; redraw | 60 / 60 right after judging (none `synthetic`: D8′ edges never enter the pool) | C16 |
+  | `rb status` mattermost `exact calls (scip)` | record | about +31 (the in-scope pairs S1 measured; rb counts edges, not pairs) | the same (D8′ adds none) | C10 |
+  | all other cells | | identical | as amendment 1 | |
+
+  **Gate expectation (C13).** compare must accept `scip:mattermost:noscip:calls` if its fn ends above 12,672. The accept line cites buckets IMG (+27 fn) and B1 (+2,588 fn, from S2 − S1), net of B2. fp falls (6,141 → about 190), so only fn needs the line. No noscip edge changes certainty, so there is no `exact` fp to excuse.
+
+- **Risks.**
+  - **An untested pairing upstream.** v0.2.7's code with x/tools v0.50.0 is what we measured, not what scip-go released. Measured: builds; self-test; 13 of 13 jobs exit 0; documents and definitions equal on 11 of 13 and re-hashed only for anonymous struct members on the other 2; no gold pair lost.
+  - **The next Go bump.** A toolchain that writes V6 breaks the reader again. The self-test fails the build instead of the bench.
+  - **Version skew remains.** It leaves:
+    - 1,541 invalid locals;
+    - 172 agreement fp;
+    - 4,092 members `unanchored` under D8′;
+    - the 8 rows whose source has an invalid named field.
+
+    These belong to M9d's `go.work` question.
+  - **Memory.** server's scip-go sits at the 4g budget through page cache on both images (0 OOM). The unconstrained peak (page cache included) rises about 1.5 %, so a larger module could be killed where the old image was not. PI and P7 read `memory.events` if a Go job fails.
+  - **rb's own SCIP join on mattermost reads 35 % more occurrences.** Its time and RSS in SCIP mode rise (not an NFR cell; reported at P7).
+  - **The image ID changes per build** even with identical layers (attestation manifest). Every rebuild re-indexes all Go jobs. That is safe, but costs time. `--provenance=false` is the lever if it matters (not adopted: the ID must change for this fix anyway).
+  - **Exact-sample judging is new work in P7.**
+  - **D8′ adds about 8,535 in-scope `synthetic` scip `CALLS` pairs on mattermost** (from at least 18,250 call sites), a large new class. `exact calls (scip)` keeps excluding them (C10), and the sample never draws them.
+  - **The e2e fixture cache lacked chi's metadata,** so the chi part of the golden change is not measured offline. PI measures it.
+
+- **Out of scope** is amended in place (section above). `tasks/plan-m9.md` gets one note on the M9c/M9d split.
+- **Safety.**
+  - No probe repository was created; `SELECT * FROM rb.repo ORDER BY 1` is identical before and after (`repo-{before,after}.txt`, 4 rows, `READ ONLY`).
+  - Images built: `rb-scip-go:probe-m9c` (kept for PI's comparison; the planner's own, removable). The debug tag `rb-scip-go:probe-m9c-dbg` was removed. `rb-scip-go:0.2.7` was not touched.
+  - Every scip-go run used `--network none` on exported copies, with APFS clones of the bench's module caches. The importer probe read the cache through a read-only mount.
+  - No change under `crates/`; no `worktrees/` or `bench/__pycache__/` touched.
+  - Disk at the end: 23 GiB free.
 
 ## Result
 
