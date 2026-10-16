@@ -1,5 +1,29 @@
 # Changelog
 
+## [2026-10-16 16:55] (wall clock) M9b: recall from the M8 benchmark
+- **Fixes** (contract `tasks/contract-m9b.md`; C5 and C6 withdrawn):
+  - **B9:** a Go method declared in another file than its receiver type is a member of that type, and never a bare package-level name.
+  - **B10:** a Go `fmt.Sprintf` SQL format folds package `const` strings into `%s`/`%v` holes (`sql_folded` diagnostic). Certainty stays `heuristic`.
+  - **B12b:** `@RepositoryRestResource` repositories expose `synthetic` collection, item and search endpoints (`data_rest_base_unread` when a `RepositoryRestConfigurer` exists).
+  - **B1** moved to M9c: the P0 probe found that scip-go records no member occurrence of another module, so there is nothing to join (amendment 1). **B13b** recorded from the raw index for M9c.
+- **N1, N2 from M9a pass 2:** a test pins the remote context-path trim (m294). The mutant runner reports a spec whose filter selects a wall-clock test as INVALID (`bench/mutants/timing_tests.{py,txt}`, 17 tests).
+- **Adjudication:** a blind adjudicator judged mse_jferrater's 17 endpoint statements TRUE against the pinned source and Spring Data REST 2.5.5. 12 ADD, 0 REMOVE in `bench/keys/microsecend/mse_jferrater.md`.
+- **Scoreboard** (`bench/scoreboard/m9b.json`, binary sha256 `3fc09844…` from `3b83d68`, `PIPELINE` `m9b-1`):
+  - hk_todo `handler_binding` 0 → 12 of 13; `table_queries` and `table_ops` 0 → 21 of 26 each.
+  - mse_jferrater endpoints 0 → 17 of 17 (`synthetic`); microSecEnD endpoints R 77.0 % → 100.0 % on the re-scored base.
+  - scip calls agreement P 74.3 % → 78.4 %, R 49.7 % → 62.4 %; mattermost tp 16,155 → 20,640, fn 17,157 → 12,672.
+  - 10 of 314 cells changed. `compare` against the re-scored M9a base exits 0 with 2 accepted cells: two correct Feign flows the model puts out of scope, and 14 new mattermost fp with right receivers on tokens scip-go leaves without an occurrence.
+  - `exact` 100.0 % of 126, unchanged; `synthetic` 83.0 % of 47; sample unchanged, 0 without a verdict.
+  - Invariant over 157 dumps: C2 7,568, C3 28, C4 117 rows, 0 unclassified, 0 new `exact`.
+- **Perf:** one warning (mattermost `scip` RSS 1.18×). An A/B re-measure gives 0.975× RSS and 1.004× wall: noise.
+- **Verification:** mutants m9b 28/28, m9a 31/31, m8b 29/29 KILLED; real-Docker 1,135/0/0; fmt and clippy clean; `rb.repo` unchanged; two scorings `cmp`-identical.
+- **Files:**
+  - **Code:** `crates/rb-frameworks/src/routes.rs`, `crates/rb-indexer/src/{lib,resolve,routes,sql}.rs`.
+  - **Bench:** `bench/probe/scip_cross.py`, `bench/mutants/{run.py,timing_tests.py,timing_tests.txt,m9a.json,m9b.json}`, `bench/keys/microsecend/mse_jferrater.md`, `bench/scoreboard/m9b{,-perf}.json`, `bench/accept-m9b.tsv`.
+  - **Docs:** `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
+  - **Records:** `tasks/{contract-m9b,contract-m9c,bench-findings,todo,lessons}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+- **Status:** implemented; evaluator pass 1 pending.
+
 ## [2026-10-16 (wall clock)] M9a closed: evaluator pass 2 PASS
 - `tasks/eval-m9a-pass2.md`: VERDICT PASS, no blocking or should-fix finding, 5 notes. Recorded in contract amendment 4; N1 (a trimming test) and N2 (refuse timing-test filters in the mutant runner) are carried to M9b P5.
 - Status lines closed: contract, IMPLEMENT, todo, design §13, README.

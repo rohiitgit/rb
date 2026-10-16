@@ -1168,3 +1168,27 @@ Plan: `tasks/plan-m9.md` (from an opencode plan session; claims unverified until
 - microSecEnD endpoints P 88.7 % → 100.0 %, R 75.8 % → 91.9 %; handkey endpoints P 95.1 % → 100.0 %. 8 of 314 cells moved; the one accepted line is a correct flow the model puts out of scope.
 - Two predictions missed: hk_todo's out-of-scope test handler binding also left (1 → 0), and the anilallewar and rohitghatol flows did not gain a tp. C4's "264 from 5 types" was two counts mixed: 277 from 5 types, 264 from the 4 in `_test.go` files (B13b, M9b).
 - Gitignored bench state can vanish: the M8 base dumps were deleted mid-milestone and had to be regenerated before the gate (lesson). `target/` had grown to 48 GiB (lesson).
+
+---
+
+# M9b: recall from the M8 benchmark, started 2026-10-16
+
+Contract: `tasks/contract-m9b.md` (10 plan corrections; amendments 0–6). Branch `m9`.
+
+- [x] Contract written (B1, B9, B10, B12b, B13b; C1–C12; amendment 0 moved the mutant ids to m261–m284).
+- [x] P0: SCIP probe from the raw indexes; base re-scored `cmp`-identical; D4 failed, so B1 moves to M9c (amendment 1). B13b recorded.
+- [x] P1: B9, Go methods in sibling files are members; two bare-name tables cleaned (amendment 2).
+- [x] P2: B10, `fmt.Sprintf` SQL folds package constants (amendment 3).
+- [x] P3: B12b, Spring Data REST endpoints `synthetic` (amendment 4).
+- [x] P4: not built (D4 failed; C5 and C6 withdrawn, m279–m284 dropped).
+- [x] P5: `PIPELINE` `m9b-1`, N1, N2, docs; fmt/clippy CLEAN; real-Docker 1,135/0/0; batteries 28/28, 31/31, 29/29; commit `3b83d68`.
+- [x] P6: binary `3fc09844…` from `3b83d68`, 0 failures; jferrater adjudicated (17 TRUE, 12 ADD); invariant 0 unclassified; sample 0 missing; score ×2 `cmp`; `compare` exit 0 with 2 accepted cells; 1 perf warning re-measured as noise (amendment 6).
+- [x] P7: records done; evaluator pass 1 pending.
+- [ ] Evaluator pass 1.
+- [ ] Evaluator pass 2 (verification only).
+
+## Review (M9b)
+- Recall moved where the M8 keys said it was missing: hk_todo handlers 0 → 12 of 13, tables 0 → 21 of 26, mse_jferrater endpoints 0 → 17 of 17. scip calls agreement R 49.7 % → 62.4 %, P 74.3 % → 78.4 %. No new edge is `exact`.
+- B1 was not built. The probe showed scip-go records only namespace occurrences for another module, so the planned symbol join had nothing to join. Reading the index before writing code saved a phase.
+- Three surprises: the bare-name defect the contract said made no edges made 41 ambiguous ones on mattermost; mattermost's 2 folded SQL sites add no `QUERIES`; the jferrater key gained 12 entries, not "up to 10".
+- Process: the adjudicator gave TRUE/FALSE, and ADD/REMOVE was derived with `adjudicate.py`'s rules. C6 had been P4's code and is withdrawn with it. 3 of the 14 accepted mattermost fp go to server's own `App#GetClusterId`, which the accept line's B1 reason does not explain.

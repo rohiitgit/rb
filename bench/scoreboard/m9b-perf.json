@@ -1,0 +1,398 @@
+{
+  "schema": 1,
+  "milestone": "m9b",
+  "hardware": "Mac16,12 10 cpus 17179869184 bytes",
+  "binary_sha256": "3fc098445243a4ed9a4079bb6586f7574894a4b94ca5ebc092a68e9d60fc850a",
+  "runs": {
+    "bookcars:noscip-cached": {
+      "wall_s": 0.82,
+      "peak_rss_bytes": 101253120,
+      "load_start": 3.67,
+      "load_end": 3.67
+    },
+    "bookcars:noscip-fresh": {
+      "wall_s": 1.1,
+      "peak_rss_bytes": 169590784,
+      "load_start": 3.67,
+      "load_end": 3.67
+    },
+    "bookcars:scip": {
+      "wall_s": 1.66,
+      "peak_rss_bytes": 173785088,
+      "load_start": 3.67,
+      "load_end": 3.45
+    },
+    "eshop_on_web:noscip-cached": {
+      "wall_s": 0.57,
+      "peak_rss_bytes": 33652736,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "eshop_on_web:noscip-fresh": {
+      "wall_s": 0.56,
+      "peak_rss_bytes": 50462720,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "express_ts_boilerplate:noscip-cached": {
+      "wall_s": 0.26,
+      "peak_rss_bytes": 21299200,
+      "load_start": 3.67,
+      "load_end": 3.67
+    },
+    "express_ts_boilerplate:noscip-fresh": {
+      "wall_s": 0.3,
+      "peak_rss_bytes": 30490624,
+      "load_start": 3.67,
+      "load_end": 3.67
+    },
+    "express_ts_boilerplate:scip": {
+      "wall_s": 0.4,
+      "peak_rss_bytes": 31883264,
+      "load_start": 3.67,
+      "load_end": 3.67
+    },
+    "fastapi_realworld:noscip-cached": {
+      "wall_s": 0.4,
+      "peak_rss_bytes": 26640384,
+      "load_start": 3.45,
+      "load_end": 3.66
+    },
+    "fastapi_realworld:noscip-fresh": {
+      "wall_s": 0.39,
+      "peak_rss_bytes": 31899648,
+      "load_start": 3.45,
+      "load_end": 3.45
+    },
+    "fastapi_realworld:scip": {
+      "wall_s": 0.49,
+      "peak_rss_bytes": 31817728,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "go_clean_arch:noscip-cached": {
+      "wall_s": 0.36,
+      "peak_rss_bytes": 19791872,
+      "load_start": 3.45,
+      "load_end": 3.45
+    },
+    "go_clean_arch:noscip-fresh": {
+      "wall_s": 0.36,
+      "peak_rss_bytes": 22265856,
+      "load_start": 3.45,
+      "load_end": 3.45
+    },
+    "go_clean_arch:scip": {
+      "wall_s": 0.45,
+      "peak_rss_bytes": 31473664,
+      "load_start": 3.45,
+      "load_end": 3.45
+    },
+    "go_gin_example:noscip-cached": {
+      "wall_s": 0.48,
+      "peak_rss_bytes": 87801856,
+      "load_start": 3.45,
+      "load_end": 3.45
+    },
+    "go_gin_example:noscip-fresh": {
+      "wall_s": 0.53,
+      "peak_rss_bytes": 91209728,
+      "load_start": 3.45,
+      "load_end": 3.45
+    },
+    "go_gin_example:scip": {
+      "wall_s": 0.62,
+      "peak_rss_bytes": 91570176,
+      "load_start": 3.45,
+      "load_end": 3.45
+    },
+    "hk_polls:noscip-cached": {
+      "wall_s": 0.64,
+      "peak_rss_bytes": 32423936,
+      "load_start": 2.12,
+      "load_end": 2.12
+    },
+    "hk_polls:noscip-fresh": {
+      "wall_s": 0.64,
+      "peak_rss_bytes": 38486016,
+      "load_start": 2.12,
+      "load_end": 2.12
+    },
+    "hk_todo:noscip-cached": {
+      "wall_s": 0.6,
+      "peak_rss_bytes": 21102592,
+      "load_start": 2.12,
+      "load_end": 2.12
+    },
+    "hk_todo:noscip-fresh": {
+      "wall_s": 0.6,
+      "peak_rss_bytes": 24641536,
+      "load_start": 2.12,
+      "load_end": 2.12
+    },
+    "kotlin_spring_realworld:noscip-cached": {
+      "wall_s": 0.38,
+      "peak_rss_bytes": 18776064,
+      "load_start": 3.44,
+      "load_end": 3.44
+    },
+    "kotlin_spring_realworld:noscip-fresh": {
+      "wall_s": 0.39,
+      "peak_rss_bytes": 29917184,
+      "load_start": 3.66,
+      "load_end": 3.44
+    },
+    "kotlin_spring_realworld:scip": {
+      "wall_s": 0.5,
+      "peak_rss_bytes": 31408128,
+      "load_start": 3.44,
+      "load_end": 3.44
+    },
+    "laravel_realworld:noscip-cached": {
+      "wall_s": 0.37,
+      "peak_rss_bytes": 16859136,
+      "load_start": 3.44,
+      "load_end": 3.44
+    },
+    "laravel_realworld:noscip-fresh": {
+      "wall_s": 0.36,
+      "peak_rss_bytes": 16924672,
+      "load_start": 3.44,
+      "load_end": 3.44
+    },
+    "mattermost:noscip-cached": {
+      "wall_s": 14.47,
+      "peak_rss_bytes": 1863598080,
+      "load_start": 3.17,
+      "load_end": 3.08
+    },
+    "mattermost:noscip-fresh": {
+      "wall_s": 20.89,
+      "peak_rss_bytes": 2075607040,
+      "load_start": 3.44,
+      "load_end": 3.17
+    },
+    "mattermost:scip": {
+      "wall_s": 18.43,
+      "peak_rss_bytes": 2662825984,
+      "load_start": 3.08,
+      "load_end": 2.83
+    },
+    "microblog:noscip-cached": {
+      "wall_s": 0.37,
+      "peak_rss_bytes": 20054016,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "microblog:noscip-fresh": {
+      "wall_s": 0.41,
+      "peak_rss_bytes": 23969792,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "microblog:scip": {
+      "wall_s": 0.51,
+      "peak_rss_bytes": 31571968,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "microservices_demo:noscip-cached": {
+      "wall_s": 0.35,
+      "peak_rss_bytes": 46071808,
+      "load_start": 3.64,
+      "load_end": 3.64
+    },
+    "microservices_demo:noscip-fresh": {
+      "wall_s": 0.43,
+      "peak_rss_bytes": 61341696,
+      "load_start": 3.64,
+      "load_end": 3.64
+    },
+    "microservices_demo:scip": {
+      "wall_s": 0.52,
+      "peak_rss_bytes": 58589184,
+      "load_start": 3.64,
+      "load_end": 3.64
+    },
+    "mse_anilallewar:noscip-cached": {
+      "wall_s": 0.66,
+      "peak_rss_bytes": 38518784,
+      "load_start": 2.23,
+      "load_end": 2.23
+    },
+    "mse_anilallewar:noscip-fresh": {
+      "wall_s": 0.85,
+      "peak_rss_bytes": 64208896,
+      "load_start": 2.34,
+      "load_end": 2.23
+    },
+    "mse_callista:noscip-cached": {
+      "wall_s": 0.62,
+      "peak_rss_bytes": 21512192,
+      "load_start": 2.23,
+      "load_end": 2.23
+    },
+    "mse_callista:noscip-fresh": {
+      "wall_s": 0.61,
+      "peak_rss_bytes": 23822336,
+      "load_start": 2.23,
+      "load_end": 2.23
+    },
+    "mse_fernandoabcampos:noscip-cached": {
+      "wall_s": 0.59,
+      "peak_rss_bytes": 18300928,
+      "load_start": 2.23,
+      "load_end": 2.23
+    },
+    "mse_fernandoabcampos:noscip-fresh": {
+      "wall_s": 0.6,
+      "peak_rss_bytes": 19988480,
+      "load_start": 2.23,
+      "load_end": 2.23
+    },
+    "mse_jferrater:noscip-cached": {
+      "wall_s": 0.62,
+      "peak_rss_bytes": 19169280,
+      "load_start": 2.23,
+      "load_end": 2.13
+    },
+    "mse_jferrater:noscip-fresh": {
+      "wall_s": 0.63,
+      "peak_rss_bytes": 20824064,
+      "load_start": 2.23,
+      "load_end": 2.23
+    },
+    "mse_koushikkothagal:noscip-cached": {
+      "wall_s": 0.58,
+      "peak_rss_bytes": 17678336,
+      "load_start": 2.13,
+      "load_end": 2.13
+    },
+    "mse_koushikkothagal:noscip-fresh": {
+      "wall_s": 0.58,
+      "peak_rss_bytes": 19333120,
+      "load_start": 2.13,
+      "load_end": 2.13
+    },
+    "mse_mdeket:noscip-cached": {
+      "wall_s": 0.61,
+      "peak_rss_bytes": 22691840,
+      "load_start": 2.13,
+      "load_end": 2.13
+    },
+    "mse_mdeket:noscip-fresh": {
+      "wall_s": 0.62,
+      "peak_rss_bytes": 24657920,
+      "load_start": 2.13,
+      "load_end": 2.13
+    },
+    "mse_mudigal:noscip-cached": {
+      "wall_s": 0.65,
+      "peak_rss_bytes": 34455552,
+      "load_start": 2.13,
+      "load_end": 2.13
+    },
+    "mse_mudigal:noscip-fresh": {
+      "wall_s": 0.69,
+      "peak_rss_bytes": 42385408,
+      "load_start": 2.13,
+      "load_end": 2.13
+    },
+    "mse_piggymetrics:noscip-cached": {
+      "wall_s": 0.76,
+      "peak_rss_bytes": 39813120,
+      "load_start": 2.04,
+      "load_end": 2.04
+    },
+    "mse_piggymetrics:noscip-fresh": {
+      "wall_s": 0.88,
+      "peak_rss_bytes": 72679424,
+      "load_start": 2.04,
+      "load_end": 2.04
+    },
+    "mse_piomin:noscip-cached": {
+      "wall_s": 0.6,
+      "peak_rss_bytes": 20250624,
+      "load_start": 2.13,
+      "load_end": 2.04
+    },
+    "mse_piomin:noscip-fresh": {
+      "wall_s": 0.59,
+      "peak_rss_bytes": 22003712,
+      "load_start": 2.13,
+      "load_end": 2.13
+    },
+    "mse_rohitghatol:noscip-cached": {
+      "wall_s": 0.64,
+      "peak_rss_bytes": 36192256,
+      "load_start": 2.04,
+      "load_end": 2.04
+    },
+    "mse_rohitghatol:noscip-fresh": {
+      "wall_s": 0.81,
+      "peak_rss_bytes": 57081856,
+      "load_start": 2.04,
+      "load_end": 2.04
+    },
+    "mse_shabbirdwd53:noscip-cached": {
+      "wall_s": 0.6,
+      "peak_rss_bytes": 18251776,
+      "load_start": 2.04,
+      "load_end": 2.04
+    },
+    "mse_shabbirdwd53:noscip-fresh": {
+      "wall_s": 0.59,
+      "peak_rss_bytes": 19824640,
+      "load_start": 2.04,
+      "load_end": 2.04
+    },
+    "mse_yidongnan:noscip-cached": {
+      "wall_s": 0.6,
+      "peak_rss_bytes": 18169856,
+      "load_start": 2.12,
+      "load_end": 2.12
+    },
+    "mse_yidongnan:noscip-fresh": {
+      "wall_s": 0.58,
+      "peak_rss_bytes": 19791872,
+      "load_start": 2.04,
+      "load_end": 2.12
+    },
+    "nestjs_realworld:noscip-cached": {
+      "wall_s": 0.37,
+      "peak_rss_bytes": 21151744,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "nestjs_realworld:noscip-fresh": {
+      "wall_s": 0.4,
+      "peak_rss_bytes": 29523968,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "nestjs_realworld:scip": {
+      "wall_s": 0.48,
+      "peak_rss_bytes": 31326208,
+      "load_start": 3.66,
+      "load_end": 3.66
+    },
+    "spring_boot_microservices:noscip-cached": {
+      "wall_s": 0.37,
+      "peak_rss_bytes": 30638080,
+      "load_start": 3.67,
+      "load_end": 3.67
+    },
+    "spring_boot_microservices:noscip-fresh": {
+      "wall_s": 0.32,
+      "peak_rss_bytes": 34816000,
+      "load_start": 3.64,
+      "load_end": 3.67
+    },
+    "spring_boot_microservices:scip": {
+      "wall_s": 0.43,
+      "peak_rss_bytes": 31522816,
+      "load_start": 3.67,
+      "load_end": 3.67
+    }
+  }
+}

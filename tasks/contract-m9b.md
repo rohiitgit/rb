@@ -1,6 +1,6 @@
 # M9b contract: cross-module SCIP, Go receivers, folded SQL, Spring Data REST (2026-10-16)
 
-**Status:** contract written 2026-10-16 (amendment 0 before the build) from `tasks/plan-m9.md` §2–§4 "M9b", `tasks/bench-findings.md` B1, B9, B10, B12 (part b), and M9a's hand-over of B13b. Every root cause below was re-read in the code at branch `m9` (`2b5e956` plus M9a's uncommitted P5). Not yet implemented. Commits go on branch `m9`, after M9a closes.
+**Status:** implemented; evaluator pass 1 pending. The contract was written 2026-10-16 (amendment 0 before the build) from `tasks/plan-m9.md` §2–§4 "M9b", `tasks/bench-findings.md` B1, B9, B10, B12 (part b), and M9a's hand-over of B13b. Every root cause below was re-read in the code at branch `m9` (`2b5e956` plus M9a's uncommitted P5). Commits go on branch `m9`.
 
 **Evidence limits at planning time.** The mattermost dumps (`mattermost.{noscip,scip}.jsonl`) were deleted from `var/bench/out/a038653b8478/` on 2026-10-16 03:19, and the raw SCIP indexes live only in `rb.scip_index` (`migrations/0004_scip_index.sql`), which could not be read while the Docker suite ran. So the mattermost numbers below come from the M8 findings, `mattermost.scip.status`, the scoreboard and scans of the pinned repository. Where a number needs the index, P0 measures it first.
 
@@ -292,6 +292,136 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - `SELECT name, checkout FROM rb.repo` is identical before and after (`repo-diff-p5.txt` is empty), and equal to M9b's starting snapshot.
   - Batteries, run after the last fmt and after the suite: m9b 28/28, m9a 31/31, m8b 29/29 KILLED; none STALE or INVALID.
 
+**Amendment 6 (2026-10-16, P6).** The bench run, the jferrater adjudication and the gate. Logs are in `var/m9b/logs/`.
+- **Binary (C7).** `var/m9b/bin/rb`, sha256 `3fc098445243a4ed9a4079bb6586f7574894a4b94ca5ebc092a68e9d60fc850a`, built from HEAD `3b83d68` with `crates/` and `migrations/` clean. A scratch index prints `"pipeline": "m9b-1"` (`c7-pipeline.txt`). The build's own log is empty (`p5-build.log`, 0 bytes). So the build was re-checked after the run: at `3b83d68`, with 0 changed lines under `crates/` and `migrations/`, `cargo build --release -p rb-cli` finds `target/release/rb` up to date, and its sha256 equals the binary's (`c7-rebuild.txt`).
+- **Run.** Outputs in `var/bench/out/3fc098445243/`, `failures: 0`, and all 27 `noscip` fresh/cached pairs identical (`bench-run.log`). Base and head each have 38 manifest dumps (27 `noscip`, 11 `scip`) and 119 PyCG cases, none missing or empty (`base-check.txt`). `SELECT name, checkout FROM rb.repo` is identical before and after (`repo-{before,after}-p6.txt`).
+- **Adjudication (D9).** `rb-bench review` printed 17 side-blind statements for mse_jferrater. A blind adjudicator judged all 17 TRUE against the pinned checkout (`3ad20b8`) and the Spring Data REST 2.5.5 reference. 2.5.5 is the version the project's Spring Boot 1.4.2 parent (`pom.xml:14`) brings. One deviation from D9: the adjudicator wrote TRUE/FALSE verdicts, not ADD and REMOVE lines. The entries were derived from the verdicts with `bench/adjudicate.py`'s rules (`var/m9b/scripts/adjudicate_m9b.py`, output `adjudicate.txt`): 12 ADD, 0 REMOVE. The other 5 TRUE statements are the model's own entries. The 12 are 5 item resources and 7 search resources. The prediction said "up to 10 more gold". Plan correction 9 had counted 11 (6 search resources), and amendment 4 measured 7, hence 12.
+  - **Citations.** 90 citations in 17 verdicts: 84 OK, 6 MISMATCH, 0 UNRESOLVED. All 6 hold on reading. 5 cite a whole `application.yml` for an absence of base path or context path, confirmed by a `grep` with no match. 1 cites the external config repository line, which reads as stated (`citations-jfer.txt`).
+  - **Transcript.** 19 tool calls. The only project path outside the checkout is the adjudicator's own output directory, and `gold.txt` and `statements.txt` were never opened (`adjudicator-audit.txt`). Inputs, verdicts, notes and transcript are in `var/bench/labels/msecend-m9b/`.
+- **Base re-score (D9).** `var/m9b/m9a-rescored.json` differs from `bench/scoreboard/m9a.json` in 3 leaves: the microSecEnD key hash (`913d7028…` → `e5626bf3…`) and the jferrater endpoints `gold` and `fn`, both 5 → 17 (`base-rescore-diff.txt`). `var/m9b/m9a-rescored-perf.json` is `cmp`-identical to `m9a-perf.json`.
+- **Invariant (C8).** C2 7,568 rows, C3 28, C4 117, META 0, unclassified 0. No added or changed row is `exact`. The same script run on M8 → M9a, whose rows come from other mechanisms, gives 1,866 unclassified rows (`invariant-control.txt`), so the bucket rules do reject foreign rows.
+- **B9's bare-name defect did make edges.** The root-cause list says of it: "No such edge exists in the four Go dumps we have." Those four did not include mattermost, whose dumps were gone at planning time. On mattermost, D5 removed 41 ambiguous `CALLS` (31 `noscip`, 10 `scip`) and took a candidate from 40 more, which became heuristic (30 and 10; `invariant.txt`). In the gate this is `fp ambiguous 19 → 0`, `tp ambiguous 56 → 36` and `ambiguous_sites 70 → 46`.
+- **mattermost SQL.** D6 folds 2 sites in each mode, one each in `sqlstore/access_control_policy_store.go` and `sqlstore/user_access_token_store.go`. They add no `QUERIES`: the only C3 rows on mattermost are the 2 `sql_folded` diagnostics per mode.
+- **Gate (C9).** Without `--accept`, `compare` prints 3 REGRESSION lines (`compare-noaccept.txt`). With `bench/accept-m9b.tsv` it exits 0 with 2 accepted cells (`compare.txt`):
+  - jferrater `service_flows` `found_out_of_scope{not_in_model} 0 → 2`. FoodTrayService's two Feign clients now `CONSUMES` the new search endpoints `/items/search/findByItemCode` and `/prices/search/findByItemCode`. The model has both flows but marks foodtray_service infrastructural, as with M9a's piggymetrics line.
+  - mattermost `scip` `calls` `fp heuristic 6,128 → 6,141` and `found_out_of_scope{not_covered} 21,644 → 22,872`. The fp change is 14 new and 1 gone (`agreement-diff.txt`). The 14 are new `CALLS` to methods declared in another file than their receiver type, and each receiver reads right in source (`fp-new-sources.txt`). Server's scip-go index has no occurrence on any of their 15 call tokens (`fp-occurrences.txt`). 11 of the 14 go into server/public, which amendment 1 explains: dependency members carry no occurrence. 3 go to `App#GetClusterId` in server's own module (`audit.go:109`, `command_mobile_logs.go:48`, `web/context.go:67`). Amendment 1 does not explain those, and the accept line's B1 reason covers only the 11. The one occurrence on each of the 3 lines is the `model` qualifier of the map key. Why scip-go records none on `GetClusterId` there is not classified. The fp that left is the self-call `App#NewPluginAPI` at `plugin.go:164`, now bound to the function and a tp. `not_covered` is +1,240 new heuristic `CALLS` with an end in a file SCIP does not cover, and -12 removed ambiguous candidates.
+- **Perf (C10).** One warning: mattermost `scip` peak RSS 2,259,025,920 → 2,662,825,984 B (1.18×). Re-measured once under amendment 0's rule as an A/B, 3 alternating runs per mode, load 1.92 to 4.70 (`perf-ab.txt`). `scip` medians, M9a / M9b: wall 19.18 / 19.26 s (1.004×), CPU 12.20 / 12.21 s (1.001×), RSS 2,712,600,576 / 2,643,787,776 B (0.975×). `noscip`: wall 1.026×, CPU 0.993×, RSS 0.991×. The M9a binary itself peaks at 2,680,389,632 to 2,715,222,016 B, so the base's recorded 2,259,025,920 B was a low reading. The warning is noise.
+- **C6 withdrawn.** Its code was P4's `rb-store/src/query.rs` change, and P4 was not built (amendment 1). `rb status` still counts every `scip` `CALLS` row as an exact call. On the bench the count is right either way: all 37,031 `scip` `CALLS` rows of the 11 SCIP dumps are `exact` (`c6-scip-certainty.txt`). The change moves to M9c, whose C10 carries it.
+
 ## Result
 
-Not yet built.
+**Commits (branch `m9`):** `7a82313` contract (with M9a's todo), `d445940` amendment 0, `18a49a6` P0, `5a310aa` P1, `77f694d` M9c contract, `6f41d33` P2, `193e4ec` P3, `3b83d68` P5, then `M9b P6/P7: bench gate passes, records`. P4 was not built (amendment 1).
+
+**Binary of record (C7):** `var/m9b/bin/rb`, sha256 `3fc098445243a4ed9a4079bb6586f7574894a4b94ca5ebc092a68e9d60fc850a`, built from `3b83d68be43e68aacd689c50c182459c34549e0a` with `crates/` and `migrations/` clean (`var/m9b/logs/c7-rebuild.txt`). `PIPELINE` `m9b-1` (`c7-pipeline.txt`). Bench outputs: `var/bench/out/3fc098445243/`, `failures: 0`, all 27 `noscip` fresh/cached pairs identical (`bench-run.log`).
+
+**Claims.**
+
+| # | Met | Evidence |
+|---|---|---|
+| C1 | met | `var/m9b/probe-scip.txt`, written with `bench/probe/scip_cross.py` (`18a49a6`). server's index has 104,594 occurrences into server/public, all at `v0.4.3`, all namespace occurrences; none reaches the `defined` test. `external 0` holds because a dependency's members carry no occurrence in any of the 13 scip-go indexes. B13b's sources and a control are recorded (amendment 1). |
+| C2 | met | `go_methods_in_sibling_files_are_members` and `gin_method_value_handlers_bind_across_files` green (`test.log`). Probe: 12 heuristic `HANDLED_BY`, 1 `route_handler_unresolved` (`swaggerFiles.Handler`; `p1v-probe.txt`). Invariant C2: 7,568 rows, 0 new `exact`. |
+| C3 | met | `sprintf_sql_folds_package_constants` green (`test.log`). Probe: 12 sites in 10 functions fold, 21 heuristic `QUERIES`, 0 from the 2 `Update` functions (`p2-probe.txt`, amendment 3). Invariant C3: 28 rows (hk_todo 24, mattermost 2 per mode). |
+| C4 | met | `spring_data_rest_repositories_expose_endpoints` and `data_rest_endpoints_are_synthetic` green (`test.log`). Probe: 37 endpoints, all `synthetic` (`p3-probe.txt`, amendment 4). Invariant C4: 117 rows, all on mse_jferrater. |
+| C5 | withdrawn | D4 failed (amendment 1); B1 moved to M9c. |
+| C6 | withdrawn | Part of P4, not built (amendment 6). All 37,031 `scip` `CALLS` rows on the bench are `exact` (`c6-scip-certainty.txt`); the change is M9c's C10. |
+| C7 | met | HEAD, sha256 and `PIPELINE` above. |
+| C8 | met | 157 dumps compared (27 `noscip`, 11 `scip`, 119 PyCG cases), all non-empty; 0 unclassified (`invariant.txt`). |
+| C9 | met | `compare` exits 0 with 2 accepted cells, each classified against the edge-set diff (amendment 6). Two scorings: `var/m9b/score/m9b-second{,-perf}.json` are `cmp`-identical to the committed `m9b{,-perf}.json`. |
+| C10 | met | The warm run wrote its outputs from 16:28:23 to 16:31:05, under 20 min. Scoring took 1.51 s and 1.34 s (`score1.txt`, `score2.txt`), under 30 s. One perf warning, re-measured as noise (amendment 6). |
+| C11 | met | m261–m278 and m285–m294: 28 of 28 KILLED (`p5-mutants-m9b.log`); m9a 31 of 31 (`p5-mutants-m9a.log`); m8b 29 of 29 (`p5-mutants-m8b.log`); none STALE or INVALID. m279–m284 were dropped with P4. |
+| C12 | met | B13b's probe record is in `tasks/bench-findings.md`. The fix is in M9c's contract (`77f694d`). |
+
+**Invariant (C8, `var/m9b/logs/invariant.txt`).** Base `2e36cd607eab`, head `3fc098445243`. 119 of 119 PyCG cases identical. Buckets: C2 7,568, C3 28, C4 117, META 0, unclassified 0; new `exact` rows 0. Differing dumps: microservices_demo `noscip` (C2 31), mattermost `noscip` (C2 6,843, C3 2) and `scip` (C2 662, C3 2), mse_jferrater (C4 117), hk_todo (C2 32, C3 24). Every other dump is byte-identical. The control run (M8 → M9a) gives 1,866 unclassified.
+
+**Cells, measured beside predicted.** 10 of the 314 cells changed; 304 are identical (`cells-diff.txt`).
+
+| Cell (`bench:target:mode:class`) | Base (re-scored m9a) | Predicted | Measured | Claim |
+|---|---|---|---|---|
+| `handkey:hk_todo:noscip:handler_binding` (and `handkey_raw`) | tp 0, fn 13 | tp heuristic 12, fn 1 | tp heuristic 0 → 12, fn 13 → 1 | C2 |
+| `handkey:hk_todo:noscip:table_queries` (and `handkey_raw`) | tp 0, fn 26 | tp heuristic 21, fn 5 | tp heuristic 0 → 21, fn 26 → 5, no fp | C3 |
+| `handkey:hk_todo:noscip:table_ops` (and `handkey_raw`) | tp 0, fn 26 | tp heuristic 21, fn 5 | tp heuristic 0 → 21, fn 26 → 5 | C3 |
+| `microsecend:mse_jferrater:noscip:endpoints` | gold 17, tp 0, fn 17 | tp synthetic 5, fn 0, up to 10 more gold | tp synthetic 0 → 17, fn 17 → 0 (12 more gold) | C4 |
+| `microsecend:mse_jferrater:noscip:service_flows` | found_out_of_scope 0 | identical | found_out_of_scope{not_in_model} 0 → 2 (accepted) | C4, not predicted |
+| `scip:mattermost:noscip:calls` (B1 side) | gold 33,312, tp 16,155, fp 6,147, fn 17,157 | unchanged by B1 (amendment 1) | gold 33,312 unchanged | C5 withdrawn |
+| `scip:mattermost:noscip:calls` (Tier B side) | as above | tp rise; fp may rise; classified | tp heuristic 16,099 → 20,604, tp ambiguous 56 → 36, fp heuristic 6,128 → 6,141 (accepted), fp ambiguous 19 → 0, fn 17,157 → 12,672, found_out_of_scope{not_covered} 21,644 → 22,872 (accepted), ambiguous sites and hits 70 → 46 | C2 |
+| `scip:mattermost:noscip:calls_file_scope` | gold 978 | possible rise (C5) | unchanged | C5 withdrawn |
+| `scip:microservices_demo:noscip:calls` | tp heuristic 181, fn 27 | about 27 more tp | tp heuristic 181 → 208, fn 27 → 0 | C2 |
+| all other cells | | identical | identical | |
+
+**Gate (`var/m9b/logs/compare.txt`).** `rb-bench compare var/m9b/m9a-rescored.json bench/scoreboard/m9b.json --accept bench/accept-m9b.tsv --perf` printed (the accept reasons are elided here; they are in `bench/accept-m9b.tsv`):
+
+```
+changed handkey:hk_todo:noscip:handler_binding: tp heuristic 0 → 12
+changed handkey:hk_todo:noscip:handler_binding: fn 13 → 1
+changed handkey:hk_todo:noscip:table_ops: tp heuristic 0 → 21
+changed handkey:hk_todo:noscip:table_ops: fn 26 → 5
+changed handkey:hk_todo:noscip:table_queries: tp heuristic 0 → 21
+changed handkey:hk_todo:noscip:table_queries: fn 26 → 5
+changed handkey_raw:hk_todo:noscip:handler_binding: tp heuristic 0 → 12
+changed handkey_raw:hk_todo:noscip:handler_binding: fn 13 → 1
+changed handkey_raw:hk_todo:noscip:table_ops: tp heuristic 0 → 21
+changed handkey_raw:hk_todo:noscip:table_ops: fn 26 → 5
+changed handkey_raw:hk_todo:noscip:table_queries: tp heuristic 0 → 21
+changed handkey_raw:hk_todo:noscip:table_queries: fn 26 → 5
+changed microsecend:mse_jferrater:noscip:endpoints: tp synthetic 0 → 17
+changed microsecend:mse_jferrater:noscip:endpoints: fn 17 → 0
+changed microsecend:mse_jferrater:noscip:service_flows: found_out_of_scope{not_in_model} 0 → 2
+accepted microsecend:mse_jferrater:noscip:service_flows: found_out_of_scope{not_in_model} 0 → 2 (…)
+changed scip:mattermost:noscip:calls: tp ambiguous 56 → 36
+changed scip:mattermost:noscip:calls: tp heuristic 16099 → 20604
+changed scip:mattermost:noscip:calls: fp ambiguous 19 → 0
+changed scip:mattermost:noscip:calls: fp heuristic 6128 → 6141
+changed scip:mattermost:noscip:calls: fn 17157 → 12672
+changed scip:mattermost:noscip:calls: found_out_of_scope{not_covered} 21644 → 22872
+changed scip:mattermost:noscip:calls: ambiguous_sites 70 → 46
+changed scip:mattermost:noscip:calls: ambiguous_hits 70 → 46
+accepted scip:mattermost:noscip:calls: fp heuristic 6128 → 6141 (…)
+accepted scip:mattermost:noscip:calls: found_out_of_scope{not_covered} 21644 → 22872 (…)
+changed scip:microservices_demo:noscip:calls: tp heuristic 181 → 208
+changed scip:microservices_demo:noscip:calls: fn 27 → 0
+warning: perf mattermost:scip: peak RSS 2259025920 → 2662825984 bytes (over 1.15×)
+exit=0
+```
+
+The aggregates follow in the log. The perf warning is re-measured in amendment 6.
+
+**Aggregates (from `compare.txt`).**
+- handkey handler_binding: R 66.7 % → 97.4 %, P 100.0 % (handkey_raw the same).
+- handkey table_queries: P 75.0 % → 84.9 %, R 44.4 % → 83.3 %. table_ops: P 42.9 % → 58.4 %, R 44.4 % → 83.3 % (handkey_raw the same).
+- microsecend endpoints: R 77.0 % → 100.0 %, P 100.0 %. The base's 77.0 % is 57 of 74 after the 12 ADD; M9a's own figure was 91.9 % (57 of 62).
+- scip calls agreement: P 74.3 % → 78.4 %, R 49.7 % → 62.4 %.
+- Every other aggregate is unchanged, among them microsecend service_flows (R 42.9 %) and scip calls_file_scope (P 99.7 %, R 96.6 %).
+
+**Certainty table (`rb-bench render --certainty`; `var/m9b/logs/certainty-m9a-rescored.txt`, `certainty-m9b.txt`).**
+
+| Label | m9a (re-scored) | m9b | Predicted |
+|---|---|---|---|
+| `exact` | 100.0 % of 126 | 100.0 % of 126 | no `exact` fp rise |
+| `synthetic` | 73.3 % of 30 | 83.0 % of 47 | the jferrater endpoints `synthetic` |
+| `heuristic` | 99.2 % of 120; agreement 74.7 % of 24,179 | 99.3 % of 153; agreement 78.6 % of 28,724 | B9 and B10 rows `heuristic` |
+| `ambiguous` | site hit 100.0 % of 1 site, 50.0 % of 2 edges; agreement site hit 100.0 % of 71 sites, 75.0 % of 76 edges | independent unchanged; agreement site hit 100.0 % of 47 sites, 100.0 % of 37 edges | not stated |
+| `dispatch` | not stored | not stored | |
+
+The 17 new `synthetic` edges are the jferrater endpoints, all right. The 33 new `heuristic` ones are hk_todo's 12 handler bindings and 21 `table_queries`.
+
+**Sample families (`sample-missing.txt`).** No redraw, as predicted: the drawn list is identical in both runs (`var/m9b/sample/drawn-m9{a,b}.txt`, 1,245 lines each).
+
+| Family | m9a | m9b | Wilson 95 % (m9b) | Without a verdict |
+|---|---|---|---|---|
+| manifest | 60 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| orm | 9 / 9 | 9 / 9 | 70.1–100.0 % | 0 |
+| routes | 60 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| scip | 60 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| sql | 59 / 60 | 59 / 60 | 91.1–99.7 % | 0 |
+
+**Perf (`bench/scoreboard/m9b-perf.json` against `m9a-perf.json`).**
+
+| mattermost | m9a wall | m9b wall | m9a peak RSS | m9b peak RSS |
+|---|---|---|---|---|
+| `noscip-fresh` | 39.35 s | 20.89 s | 2,041,479,168 B | 2,075,607,040 B |
+| `noscip-cached` | 15.72 s | 14.47 s | 1,729,855,488 B | 1,863,598,080 B |
+| `scip` | 19.05 s | 18.43 s | 2,259,025,920 B | 2,662,825,984 B |
+
+M9a's `noscip-fresh` wall is its r2 reading under a load of 4–6 (M9a amendment 3). The `scip` RSS warning is noise by the A/B in amendment 6.
+
+**Verification (P5, `var/m9b/logs/`).** Real-Docker suite: 1,135 passed, 0 failed, 0 ignored, 0 `skipping:` (`test.log`, `test-sum.txt`, exit 0). fmt and clippy CLEAN (`p5-fmt-clippy.log`). Mutants as in C11. `SELECT name, checkout FROM rb.repo` identical before and after P5 (`repo-diff-p5.txt` empty) and P6 (`repo-{before,after}-p6.txt`).

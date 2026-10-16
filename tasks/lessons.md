@@ -618,3 +618,11 @@
 ## 2026-10-16: a spot check is a file, or it did not happen
 - **Mistake (caught by M9a evaluator pass 1, E4):** the Result said "18 citations were spot-checked", and the disk figures came from tool output, but no list, command or output was kept.
 - **Rule:** Every audit is a script with a logged output (`var/m9a/scripts/check_citations.py` → `logs/citations.txt`, with a shifted-line control that shows the check can fail). A number seen only in a session's tool output is written to a log, with its source, before it goes into a record.
+
+## 2026-10-16: an "ended" session can still be running
+- **Mistake:** during M9b a second orchestrator resumed agents of a session reported as ended, while that session was still running. Two orchestrators then drove the same work.
+- **Rule:** Before resuming agents of an earlier session, run `ps` and look for another `claude` process on the same session id. Resume only when none is running.
+
+## 2026-10-16: "the defect produces no edges" is a claim about every target
+- **Mistake:** M9b's contract said B9's bare-name defect made no edge "in the four Go dumps we have". mattermost's dumps were missing at planning time, and on mattermost the fix removed 41 ambiguous `CALLS` and took a candidate from 40 more (contract-m9b amendment 6).
+- **Rule:** A claim that a defect produces no edges is checked on every target's dump, not on the ones at hand. If a dump is missing, the claim says so and P0 checks it before the build.

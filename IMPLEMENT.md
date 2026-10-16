@@ -840,3 +840,26 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - Re-close: binary `2e36cd60…`, dumps identical by row to the first run, scoreboard cells unchanged, `compare` exit 0, perf warnings re-measured without persisting.
 - **Status:** closed 2026-10-16 on evaluator pass 2 (`tasks/eval-m9a-pass2.md`) VERDICT PASS (5 notes; N1 and N2 carried to M9b P5).
 
+## M9b Recall from the M8 benchmark: implemented 2026-10-16
+
+- **Discussed and decided:** the contract (`tasks/contract-m9b.md`, C1–C12, amendments 0–6) checked the plan against the code first, with ten plan corrections. Among them: B10 can reach 21 of 26, not 26, because the `Update` functions build `SET %s` at run time; B12b's resources include ones the model does not list, which need an adjudication. P0 read the raw scip-go indexes before any B1 code and found no member occurrence of server/public in server's index, so B1 moved to M9c (D4; C5 and C6 withdrawn, P4 not built).
+- **Built:**
+  - B9: Go methods declared outside their receiver type's file are its members, and never bare package-level names (`resolve.rs`).
+  - B10: `fmt.Sprintf` SQL folds package `const` strings (`sql_folded`).
+  - B12b: Spring Data REST repositories expose `synthetic` endpoints (`data_rest_base_unread`).
+  - N1: the remote context-path trim is pinned by a test. N2: the mutant runner refuses filters that select wall-clock tests.
+  - `PIPELINE` `m9b-1`. The P0 probe `bench/probe/scip_cross.py` records B1 and B13b from the raw index.
+- **Files:** `crates/rb-frameworks/src/routes.rs`, `crates/rb-indexer/src/{lib,resolve,routes,sql}.rs`, `bench/probe/scip_cross.py`, `bench/mutants/{run.py,timing_tests.py,timing_tests.txt,m9a.json,m9b.json}`, `bench/keys/microsecend/mse_jferrater.md`, `bench/scoreboard/m9b{,-perf}.json`, `bench/accept-m9b.tsv`, `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
+- **Results:**
+  - hk_todo `handler_binding` 0 → 12 of 13, `table_queries` and `table_ops` 0 → 21 of 26 each, all `heuristic`.
+  - mse_jferrater endpoints 0 → 17 of 17 after a blind adjudication added 12 entries; microSecEnD endpoints R 77.0 % → 100.0 % on the re-scored base.
+  - scip calls agreement P 74.3 % → 78.4 %, R 49.7 % → 62.4 %.
+  - 10 of 314 cells changed; `compare` exits 0 with 2 accepted cells. Invariant: 0 unclassified rows over 157 dumps, 0 new `exact`.
+  - `exact` 100.0 % of 126, unchanged; `synthetic` 83.0 % of 47.
+- **Verification:**
+  - Mutants m9b 28/28, m9a 31/31, m8b 29/29 KILLED.
+  - Real-Docker 1,135/0/0.
+  - fmt and clippy clean; `rb.repo` unchanged.
+  - Two scorings `cmp`-identical.
+  - One perf warning (mattermost `scip` RSS 1.18×), re-measured A/B as noise.
+- **Status:** implemented, evaluator pending.
