@@ -138,7 +138,8 @@ use serde_json::{Value, json};
 /// `m9a-1` `exact` precision: test-file routes are not endpoints (B7), spec-only
 /// endpoints are `synthetic` (B8), literal `"{id}"` paths (B12a), Go method sources take
 /// no interface bypass (B13), native config server context paths (B14).
-pub const PIPELINE: &str = "m9a-1";
+/// `m9a-2` an empty remote context path clears a lower one (M9a evaluator pass 1, E3).
+pub const PIPELINE: &str = "m9a-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -826,8 +827,9 @@ const CONTEXT_PATH_KEY: &str = "server.servlet.context-path";
 /// `src/main/resources/<dir>/` (`file:` and placeholder locations are not read). A config
 /// client takes `server.servlet.context-path` from the unconditional documents of
 /// `application.*` and then `<spring.application.name>.*` there, in location order
-/// (`.properties` above YAML in one location), all above its local files. Each application is
-/// counted; several such servers apply nothing.
+/// (`.properties` above YAML in one location), all above its local files. The highest value
+/// found wins, and an empty one clears the context path (Spring's root context). Each
+/// application is counted; several such servers apply nothing.
 fn config_server_context_paths(
     config: &BTreeMap<&str, String>,
     spring: &SpringConfig,
@@ -902,9 +904,8 @@ fn config_server_context_paths(
                     } else {
                         select_yaml_documents(text, &BTreeSet::new()).0
                     };
-                    let value = entries.get(CONTEXT_PATH_KEY).map_or("", |v| v.trim());
-                    if !value.is_empty() {
-                        found = Some((file, value.to_owned()));
+                    if let Some(value) = entries.get(CONTEXT_PATH_KEY) {
+                        found = Some((file, value.trim().to_owned()));
                     }
                 }
             }
@@ -918,7 +919,13 @@ fn config_server_context_paths(
             span: None,
             detail: json!({ "service": client, "file": file, "context_path": value }),
         });
-        context_paths.insert(client.clone(), value);
+        // The highest value wins even when empty: Spring serves an empty context path at
+        // the root, so it clears a lower one, as for local files (evaluator pass 1, E3).
+        if value.is_empty() {
+            context_paths.remove(client);
+        } else {
+            context_paths.insert(client.clone(), value);
+        }
     }
     diagnostics
 }
@@ -3157,17 +3164,28 @@ mod tests {
     fn config_server_shared_files_set_client_context_paths() {
         let controller = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass C { @GetMapping(\"/x\") String x() { return \"\"; } }\n";
         let facts = rb_syntax::extract(rb_syntax::Language::Java, controller.as_bytes()).unwrap();
-        // Each top directory is a service with a `pom.xml` and the controller; returns its
-        // `EXPOSES` targets with their certainty and the `config_server_*` diagnostics.
+        // Each top directory is a service with a `pom.xml` and the controller (files under
+        // `src/` belong to a project at the repository root); returns its `EXPOSES` targets
+        // with their certainty and the `config_server_*` diagnostics.
         let run = |config: &[(&str, &str)]| -> (Vec<String>, Vec<String>) {
             let dirs: BTreeSet<&str> = config
                 .iter()
-                .map(|(p, _)| p.split('/').next().unwrap())
+                .map(|(p, _)| match p.split('/').next().unwrap() {
+                    "src" => boundaries::ROOT_DIR,
+                    d => d,
+                })
                 .collect();
-            let poms: Vec<String> = dirs.iter().map(|d| format!("{d}/pom.xml")).collect();
+            let under = |d: &str, rest: &str| {
+                if d == boundaries::ROOT_DIR {
+                    rest.to_owned()
+                } else {
+                    format!("{d}/{rest}")
+                }
+            };
+            let poms: Vec<String> = dirs.iter().map(|d| under(d, "pom.xml")).collect();
             let java: Vec<String> = dirs
                 .iter()
-                .map(|d| format!("{d}/src/main/java/p/C.java"))
+                .map(|d| under(d, "src/main/java/p/C.java"))
                 .collect();
             let paths = config.iter().map(|(p, _)| *p);
             let manifest = Manifest {
@@ -3219,20 +3237,32 @@ mod tests {
                 "spring:\n  application:\n    name: {name}\n  cloud:\n    config:\n      uri: http://config:8888\n"
             )
         };
-        let native = "spring:\n  cloud:\n    config:\n      server:\n        native:\n          search-locations: classpath:/shared, file:/extra, classpath:/{application}\n  profiles:\n     active: native\n";
-        let (acct, notes, stats) = (
-            client("acct-service"),
-            client("notes-service"),
-            client("stats-service"),
+        // The server is itself a named config client (`fail-fast`), so only the "other than
+        // the server" rule keeps the shared `application.yml` off its route. Its locations
+        // carry a trailing `/`, padding, and a second `classpath:` location last.
+        let native = "spring:\n  application:\n    name: config-service\n  cloud:\n    config:\n      fail-fast: true\n      server:\n        native:\n          search-locations: classpath:/shared/ , file:/extra,  classpath:/{application}, classpath:common\n  profiles:\n     active: native\n";
+        let names = [
+            "acct", "alpha", "beta", "eps", "gamma", "iota", "notes", "stats", "theta", "zeta",
+        ];
+        let clients: Vec<String> = names
+            .iter()
+            .map(|n| client(&format!("{n}-service")))
+            .collect();
+        let path = |text: &str| format!("server:\n  servlet:\n    context-path: {text}\n");
+        let (app, accounts, beta_yml, eps, gamma_shared, gamma_common, zeta) = (
+            path("/app"),
+            path("/accounts"),
+            path("/beta-yml"),
+            path("\"\""),
+            path("/gamma-shared"),
+            path("/gamma-common"),
+            path(""),
         );
         let shared = [
-            (
-                format!("config/{res}/shared/application.yml"),
-                "server:\n  servlet:\n    context-path: /app\n",
-            ),
+            (format!("config/{res}/shared/application.yml"), app.as_str()),
             (
                 format!("config/{res}/shared/acct-service.yml"),
-                "server:\n  servlet:\n    context-path: /accounts\n",
+                accounts.as_str(),
             ),
             // Not read: a `file:` location and a placeholder location.
             (
@@ -3243,47 +3273,184 @@ mod tests {
                 format!("config/{res}/{{application}}/notes-service.yml"),
                 "server:\n  servlet:\n    context-path: /from-placeholder\n",
             ),
+            // Only the unconditional documents are read, in YAML and in `.properties`.
+            (
+                format!("config/{res}/shared/alpha-service.yml"),
+                "server:\n  servlet:\n    context-path: /alpha\n---\nspring:\n  profiles: docker\nserver:\n  servlet:\n    context-path: /docker-alpha\n",
+            ),
+            (
+                format!("config/{res}/shared/iota-service.properties"),
+                "server.servlet.context-path=/iota\n#---\nspring.config.activate.on-profile=docker\nserver.servlet.context-path=/docker-iota\n",
+            ),
+            // In one location `.properties` beats YAML.
+            (
+                format!("config/{res}/shared/beta-service.yml"),
+                beta_yml.as_str(),
+            ),
+            (
+                format!("config/{res}/shared/beta-service.properties"),
+                "server.servlet.context-path=/beta-props\n",
+            ),
+            // A later location beats an earlier one.
+            (
+                format!("config/{res}/shared/gamma-service.yml"),
+                gamma_shared.as_str(),
+            ),
+            (
+                format!("config/{res}/common/gamma-service.yml"),
+                gamma_common.as_str(),
+            ),
+            // An empty remote value is the root context, over a local path (evaluator pass 1,
+            // E3) and over the shared `application.yml`; an absent key overrides nothing.
+            (format!("config/{res}/shared/eps-service.yml"), eps.as_str()),
+            (
+                format!("config/{res}/shared/zeta-service.yml"),
+                zeta.as_str(),
+            ),
+            (
+                format!("config/{res}/shared/theta-service.yml"),
+                "management:\n  port: 9000\n",
+            ),
         ];
         let mut files: Vec<(String, &str)> = vec![
             (format!("config/{res}/application.yml"), native),
             // The client's directory is not its name; its local context path ranks lowest.
-            (format!("account/{res}/bootstrap.yml"), &acct),
             (
                 format!("account/{res}/application.properties"),
                 "server.servlet.context-path=/local\n",
             ),
-            (format!("notes/{res}/bootstrap.yml"), &notes),
-            (format!("stats/{res}/bootstrap.yml"), &stats),
+            (
+                format!("eps/{res}/application.properties"),
+                "server.servlet.context-path=/local-eps\n",
+            ),
             // The same name without a config client.
             (
                 format!("other/{res}/application.properties"),
                 "spring.application.name=acct-service\n",
             ),
         ];
+        for (n, text) in names.iter().zip(&clients) {
+            let dir = if *n == "acct" { "account" } else { n };
+            files.push((format!("{dir}/{res}/bootstrap.yml"), text));
+        }
         files.extend(shared.iter().map(|(p, t)| (p.clone(), *t)));
         let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        let applied = |service: &str, file: &str, context_path: &str| {
+            format!(
+                r#"config_server_context_path {{"context_path":"{context_path}","file":"config/src/main/resources/{file}","service":"{service}"}}"#
+            )
+        };
         assert_eq!(
             run(&borrowed),
             (
                 vec![
                     "HTTP GET /accounts/x @account [synthetic]".to_owned(),
+                    "HTTP GET /alpha/x @alpha [synthetic]".to_owned(),
+                    "HTTP GET /beta-props/x @beta [synthetic]".to_owned(),
                     "HTTP GET /x @config [exact]".to_owned(),
+                    "HTTP GET /x @eps [exact]".to_owned(),
+                    "HTTP GET /gamma-common/x @gamma [synthetic]".to_owned(),
+                    "HTTP GET /iota/x @iota [synthetic]".to_owned(),
                     "HTTP GET /app/x @notes [synthetic]".to_owned(),
                     "HTTP GET /x @other [exact]".to_owned(),
                     "HTTP GET /app/x @stats [synthetic]".to_owned(),
+                    "HTTP GET /app/x @theta [synthetic]".to_owned(),
+                    "HTTP GET /x @zeta [exact]".to_owned(),
                 ],
                 vec![
-                    r#"config_server_context_path {"context_path":"/accounts","file":"config/src/main/resources/shared/acct-service.yml","service":"account"}"#.to_owned(),
-                    r#"config_server_context_path {"context_path":"/app","file":"config/src/main/resources/shared/application.yml","service":"notes"}"#.to_owned(),
-                    r#"config_server_context_path {"context_path":"/app","file":"config/src/main/resources/shared/application.yml","service":"stats"}"#.to_owned(),
+                    applied("account", "shared/acct-service.yml", "/accounts"),
+                    applied("alpha", "shared/alpha-service.yml", "/alpha"),
+                    applied("beta", "shared/beta-service.properties", "/beta-props"),
+                    applied("eps", "shared/eps-service.yml", ""),
+                    applied("gamma", "common/gamma-service.yml", "/gamma-common"),
+                    applied("iota", "shared/iota-service.properties", "/iota"),
+                    applied("notes", "shared/application.yml", "/app"),
+                    applied("stats", "shared/application.yml", "/app"),
+                    applied("theta", "shared/application.yml", "/app"),
+                    applied("zeta", "shared/zeta-service.yml", ""),
                 ],
+            )
+        );
+        let acct = clients[0].as_str();
+        // `searchLocations` (camelCase) in `.properties`, and a server at the repository root.
+        let camel = [
+            (
+                format!("config/{res}/application.properties"),
+                "spring.profiles.active=native\nspring.cloud.config.server.native.searchLocations=classpath:/shared\n",
+            ),
+            (format!("account/{res}/bootstrap.yml"), acct),
+            (shared[1].0.clone(), shared[1].1),
+        ];
+        let root = [
+            (
+                format!("{res}/application.yml"),
+                "spring:\n  profiles:\n    active: native\n  cloud:\n    config:\n      server:\n        native:\n          search-locations: classpath:/shared\n",
+            ),
+            (format!("account/{res}/bootstrap.yml"), acct),
+            (format!("{res}/shared/acct-service.yml"), shared[1].1),
+        ];
+        for (files, server, file) in [
+            (&camel, "@config", "config/src/main/resources/shared"),
+            (&root, "@.", "src/main/resources/shared"),
+        ] {
+            let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+            let mut exposes = vec![
+                "HTTP GET /accounts/x @account [synthetic]".to_owned(),
+                format!("HTTP GET /x {server} [exact]"),
+            ];
+            exposes.sort();
+            let (mut got, counted) = run(&borrowed);
+            got.sort();
+            assert_eq!(
+                (got, counted),
+                (
+                    exposes,
+                    vec![format!(
+                        r#"config_server_context_path {{"context_path":"/accounts","file":"{file}/acct-service.yml","service":"account"}}"#
+                    )],
+                ),
+                "{server}"
+            );
+        }
+        // Local files follow the same rule: Spring reads YAML null and `key=` as the empty
+        // string, the root context, so a higher-ranked empty value clears a lower path.
+        let (boot, quoted, kept) = (path("/boot"), path("\"\""), path("/kept"));
+        let local = [
+            (format!("lbase/{res}/application.yml"), kept.as_str()),
+            (format!("lyml/{res}/bootstrap.yml"), boot.as_str()),
+            (format!("lyml/{res}/application.yml"), quoted.as_str()),
+            (
+                format!("lprof/{res}/application.properties"),
+                "spring.profiles.active=dev\nserver.servlet.context-path=/base\n",
+            ),
+            (
+                format!("lprof/{res}/application-dev.properties"),
+                "server.servlet.context-path=\n",
+            ),
+            (
+                format!("lnull/{res}/application.properties"),
+                "spring.profiles.active=dev\nserver.servlet.context-path=/base\n",
+            ),
+            (format!("lnull/{res}/application-dev.yml"), zeta.as_str()),
+        ];
+        let borrowed: Vec<(&str, &str)> = local.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        assert_eq!(
+            run(&borrowed),
+            (
+                vec![
+                    "HTTP GET /kept/x @lbase [synthetic]".to_owned(),
+                    "HTTP GET /x @lnull [exact]".to_owned(),
+                    "HTTP GET /x @lprof [exact]".to_owned(),
+                    "HTTP GET /x @lyml [exact]".to_owned(),
+                ],
+                vec![],
             )
         );
         // A git backend serves nothing rb reads, even with native locations configured.
         let git = "spring:\n  cloud:\n    config:\n      server:\n        git:\n          uri: https://example.com/cfg\n        native:\n          search-locations: classpath:/shared\n  profiles:\n     active: git\n";
         let git_files = [
             (format!("config/{res}/application.yml"), git),
-            (format!("account/{res}/bootstrap.yml"), acct.as_str()),
+            (format!("account/{res}/bootstrap.yml"), acct),
             (shared[1].0.clone(), shared[1].1),
         ];
         let borrowed: Vec<(&str, &str)> = git_files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
@@ -3301,7 +3468,7 @@ mod tests {
         let two = [
             (format!("config/{res}/application.yml"), native),
             (format!("config2/{res}/application.yml"), native),
-            (format!("account/{res}/bootstrap.yml"), acct.as_str()),
+            (format!("account/{res}/bootstrap.yml"), acct),
             (shared[1].0.clone(), shared[1].1),
             (
                 format!("config2/{res}/shared/acct-service.yml"),

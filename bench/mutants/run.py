@@ -3,10 +3,13 @@
 Each spec is one exact text replacement in one file under crates/<crate>/src (`crate` defaults
 to rb-bench): apply it, check that the mutation landed, run the tests, restore the file byte for
 byte (checked by sha256). rb-bench runs `cargo test -q -p rb-bench`; any other crate runs
-`cargo test -q -p <crate> --lib [test]`, where `test` is the spec's optional filter. The verdict
-is KILLED only when a test failed (`test result: FAILED` or `panicked at` in the output),
-SURVIVED when the tests passed, and INVALID otherwise (a build error, or a mutation that did not
-land): an uncompilable mutant gives no verdict. A spec whose text no longer occurs exactly once
+`cargo test -q -p <crate> --lib <test>`, and its spec must name the `test` filter (INVALID
+otherwise). The verdict is SURVIVED when the tests passed. With a filter, KILLED needs a failing
+test whose name contains the filter (cargo's `---- <name> stdout ----`), so a flaky test
+elsewhere cannot score a kill (M9a evaluator pass 1, E2); an rb-bench spec without a filter is
+KILLED by any failing test (`test result: FAILED` or `panicked at`). Anything else is INVALID (a
+build error, failures only outside the filter, or a mutation that did not land): an
+uncompilable mutant gives no verdict. A spec whose text no longer occurs exactly once
 is reported as STALE (for example after `cargo fmt` reflows a line), never applied. Usage:
 python3 -I bench/mutants/run.py bench/mutants/m8a.json [id ...] [--jobs N]
 
@@ -28,6 +31,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import signal
 import subprocess
@@ -103,9 +107,26 @@ def save(specs_path, crates, results):
     )
 
 
+def verdict(returncode, out, test):
+    """SURVIVED, KILLED or INVALID from a test run's exit code and output, given its filter."""
+    if returncode == 0:
+        return "SURVIVED", ""
+    failed = re.findall(r"^---- (\S+) stdout ----$", out, re.M)
+    if test:
+        if any(test in name for name in failed):
+            return "KILLED", ""
+        if failed:
+            return "INVALID", f" (failures only outside the filter: {', '.join(failed)})"
+    elif "test result: FAILED" in out or "panicked at" in out:
+        return "KILLED", ""
+    return "INVALID", " (no failing test: build error?)"
+
+
 def one(workdir, targetdir, spec):
     """Apply one spec in workdir, test, restore. Returns (id, verdict, what)."""
     crate = crate_of(spec)
+    if crate != "rb-bench" and not spec.get("test"):
+        return (spec["id"], "INVALID", f"{spec['what']} (no test filter)")
     path = workdir / "crates" / crate / "src" / spec["file"]
     text = path.read_text()
     if text.count(spec["old"]) != 1:
@@ -113,7 +134,7 @@ def one(workdir, targetdir, spec):
     digest = hashlib.sha256(text.encode()).hexdigest()
     cmd = ["cargo", "test", "-q", "-p", crate]
     if crate != "rb-bench":
-        cmd += ["--lib"] + ([spec["test"]] if spec.get("test") else [])
+        cmd += ["--lib", spec["test"]]
     path.write_text(text.replace(spec["old"], spec["new"]))
     try:
         mutated = path.read_text()
@@ -124,12 +145,8 @@ def one(workdir, targetdir, spec):
     finally:
         path.write_text(text)
     assert hashlib.sha256(path.read_text().encode()).hexdigest() == digest
-    out = run.stdout + run.stderr
-    if run.returncode == 0:
-        return (spec["id"], "SURVIVED", spec["what"])
-    if "test result: FAILED" in out or "panicked at" in out:
-        return (spec["id"], "KILLED", spec["what"])
-    return (spec["id"], "INVALID", f"{spec['what']} (no failing test: build error?)")
+    result, note = verdict(run.returncode, run.stdout + run.stderr, spec.get("test"))
+    return (spec["id"], result, spec["what"] + note)
 
 
 def worktree(uid, i):

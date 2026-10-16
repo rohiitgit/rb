@@ -2039,7 +2039,8 @@ mod tests {
         let spring = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass C { @GetMapping(\"/a\") void a() {} }\n";
         let spring_test = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass Fake { @GetMapping(\"/fake\") void f() {} @GetMapping(Paths.X) void g() {} }\n";
         let app = "import express from \"express\";\nconst app = express();\napp.get(\"/health\", (req, res) => res.end());\n";
-        let app_spec = "import express from \"express\";\nconst app = express();\napp.post(\"/sign-up\", (req, res) => res.end());\n";
+        // Two routes in one test file: the diagnostic counts both.
+        let app_spec = "import express from \"express\";\nconst app = express();\napp.post(\"/sign-up\", (req, res) => res.end());\napp.get(\"/sign-in\", (req, res) => res.end());\n";
         let built = build(
             &[
                 ("svc/main.go", Language::Go, gin),
@@ -2082,7 +2083,7 @@ mod tests {
                     r#"{"routes":1}"#.to_owned()
                 ),
                 ("svc/main_test.go", r#"{"routes":1}"#.to_owned()),
-                ("web/src/app.spec.ts", r#"{"routes":1}"#.to_owned()),
+                ("web/src/app.spec.ts", r#"{"routes":2}"#.to_owned()),
             ]
         );
         assert!(

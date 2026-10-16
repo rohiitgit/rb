@@ -174,7 +174,9 @@ Notes that bite newcomers:
   (`search-locations: classpath:/shared`) applies to the client whose
   `spring.application.name` names the file (`account-service.yml`), or to
   every client through the shared `application.yml`. It is `synthetic`, and each
-  client gets a `config_server_context_path` diagnostic. Two such servers in
+  client gets a `config_server_context_path` diagnostic. The remote value
+  overrides local files, and an empty one (`context-path: ""`) puts the routes
+  back at the root, as Spring serves them. Two such servers in
   one repository apply nothing (`config_server_ambiguous`).
 - Go with SCIP: a type that satisfies an interface gets `IMPLEMENTS` to it from
   the type (`Card# → Payer#`). scip-go also links each method to the interface
@@ -312,10 +314,14 @@ part of the tree.)
   `var/bench/mutants-cache.json` and re-reports instantly while code and
   specs are unchanged. A spec names `file` under `crates/<crate>/src`;
   `crate` defaults to `rb-bench`, and any other crate runs
-  `cargo test -q -p <crate> --lib [test]`, where `test` is an optional name
-  filter (M9a's `bench/mutants/m9a.json` uses both). KILLED needs a failing
-  test in the output (`test result: FAILED` or `panicked at`). A build error,
-  or a mutation that leaves the file unchanged, is INVALID: it gives no
+  `cargo test -q -p <crate> --lib <test>`, and its spec must name the `test`
+  filter (M9a's `bench/mutants/m9a.json` uses both crates). With a filter,
+  KILLED needs a failing test whose name contains it (cargo's
+  `---- <name> stdout ----`), so a wall-clock test that flakes under load
+  cannot score a kill. An rb-bench spec without a filter is KILLED by any
+  failing test (`test result: FAILED` or `panicked at`). A build error, a
+  spec with no filter outside rb-bench, failures only outside the filter, or
+  a mutation that leaves the file unchanged, is INVALID: it gives no
   verdict, so rewrite the spec.
 - **Stress repros:** `tasks/stress-findings.md` lists each finding with its
   repro and what fixed it. Re-run the repros of the findings a change touches.

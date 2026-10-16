@@ -160,5 +160,122 @@
   "old": "format!(\"{ctx}/{route_path}\"),\n                            Certainty::Synthetic,",
   "new": "format!(\"{ctx}/{route_path}\"),\n                            Certainty::Exact,",
   "what": "context-path certainty exact"
+ },
+ {
+  "id": "m248",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "for ext in [\"yml\", \"yaml\", \"properties\"] {",
+  "new": "for ext in [\"properties\", \"yml\", \"yaml\"] {",
+  "what": "YAML beats .properties in one location (eval e02)"
+ },
+ {
+  "id": "m249",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "        if value.is_empty() {\n            context_paths.remove(client);",
+  "new": "        if false {\n            context_paths.remove(client);",
+  "what": "empty remote context path applied as a path (eval e03)"
+ },
+ {
+  "id": "m250",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "name.filter(|_| client != server)",
+  "new": "name.filter(|_| true)",
+  "what": "server not excluded from clients (eval e04)"
+ },
+ {
+  "id": "m251",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "for dir in &dirs {",
+  "new": "for dir in dirs.iter().rev() {",
+  "what": "earlier location beats later (eval e05)"
+ },
+ {
+  "id": "m252",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "        .map(str::trim)\n",
+  "new": "",
+  "what": "locations not trimmed (eval e06)"
+ },
+ {
+  "id": "m253",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "trim_matches('/')",
+  "new": "trim_start_matches('/')",
+  "what": "trailing slash kept on classpath dir (eval e07)"
+ },
+ {
+  "id": "m254",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "                    } else {\n                        select_yaml_documents(text, &BTreeSet::new()).0\n                    };",
+  "new": "                    } else {\n                        rb_frameworks::fold::yaml_entries(text)\n                    };",
+  "what": "remote YAML reads profile-gated documents (eval e08)"
+ },
+ {
+  "id": "m255",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "                            .filter(|d| !rb_frameworks::fold::conditional_document(d))\n",
+  "new": "                            .filter(|_| true)\n",
+  "what": "remote .properties reads profile-gated documents (eval e09)"
+ },
+ {
+  "id": "m256",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "[\"search-locations\", \"searchLocations\"]",
+  "new": "[\"search-locations\"]",
+  "what": "searchLocations camelCase not read (eval e10)"
+ },
+ {
+  "id": "m257",
+  "crate": "rb-indexer",
+  "test": "routes::tests::routes_in_test_files_are_not_endpoints",
+  "file": "routes.rs",
+  "old": "json!({ \"routes\": file.routes.len() })",
+  "new": "json!({ \"routes\": 1 })",
+  "what": "routes_in_test_code counts 1 always (eval e11)"
+ },
+ {
+  "id": "m258",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "\"src/main/resources\".to_owned()\n    } else {",
+  "new": "\"x/src/main/resources\".to_owned()\n    } else {",
+  "what": "root server resources path wrong (eval e12)"
+ },
+ {
+  "id": "m259",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "context_paths.remove(client);",
+  "new": "let _ = client;",
+  "what": "empty remote value does not clear a lower path (E3)"
+ },
+ {
+  "id": "m260",
+  "crate": "rb-indexer",
+  "test": "config_server_shared_files_set_client_context_paths",
+  "file": "lib.rs",
+  "old": "if let Some(value) = entries.get(CONTEXT_PATH_KEY) {",
+  "new": "if let Some(value) = entries.get(CONTEXT_PATH_KEY).or(Some(&String::new())) {",
+  "what": "absent key counts as an empty value"
  }
 ]
