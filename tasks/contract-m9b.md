@@ -1,6 +1,6 @@
 # M9b contract: cross-module SCIP, Go receivers, folded SQL, Spring Data REST (2026-10-16)
 
-**Status:** contract written 2026-10-16 from `tasks/plan-m9.md` §2–§4 "M9b", `tasks/bench-findings.md` B1, B9, B10, B12 (part b), and M9a's hand-over of B13b. Every root cause below was re-read in the code at branch `m9` (`2b5e956` plus M9a's uncommitted P5). Not yet implemented. Commits go on branch `m9`, after M9a closes.
+**Status:** contract written 2026-10-16 (amendment 0 before the build) from `tasks/plan-m9.md` §2–§4 "M9b", `tasks/bench-findings.md` B1, B9, B10, B12 (part b), and M9a's hand-over of B13b. Every root cause below was re-read in the code at branch `m9` (`2b5e956` plus M9a's uncommitted P5). Not yet implemented. Commits go on branch `m9`, after M9a closes.
 
 **Evidence limits at planning time.** The mattermost dumps (`mattermost.{noscip,scip}.jsonl`) were deleted from `var/bench/out/a038653b8478/` on 2026-10-16 03:19, and the raw SCIP indexes live only in `rb.scip_index` (`migrations/0004_scip_index.sql`), which could not be read while the Docker suite ran. So the mattermost numbers below come from the M8 findings, `mattermost.scip.status`, the scoreboard and scans of the pinned repository. Where a number needs the index, P0 measures it first.
 
@@ -246,6 +246,12 @@ If D4 fails, m266–m271 are dropped and the battery is m248–m265.
 ## Amendments
 
 Append each amendment after the previous one's last sentence (lesson of 2026-10-11).
+
+**Amendment 0 (2026-10-16, before the build; M9a closed at `b158555`).** M9a moved four of this contract's inputs.
+- **Mutant ids.** M9a's battery took m230–m260 (amendment 3 there). Every M9b id shifts by 13: the table's m248–m271 read **m261–m284** (m248 → m261, …, m271 → m284), and the D4-fail battery is m261–m278. `bench/mutants/run.py` now requires a `test` filter outside rb-bench, and a kill must come from a failing test that matches it (M9a E2).
+- **Base.** The M9a run of record is `var/bench/out/2e36cd607eab/` (binary `2e36cd60…`, HEAD `624da45`, `PIPELINE` `m9a-2`), scored as `bench/scoreboard/m9a.json` and `m9a-perf.json`. C7 reads `m9a-2` → `m9b-1`. Before P0's re-score, check that every dump of that run exists (M9a lesson: base dumps can vanish).
+- **Carried from M9a pass 2.** P5 also adds (N1) a test pinning that a remote context-path value is trimmed, with a mutant, and (N2) a runner rule: a spec whose filter selects a known wall-clock test (`stay_fast`, and every `#[test]` whose name the usage guide lists as timing-based) is INVALID, with the usage guide updated. Both are in `bench/mutants/m9b.json`.
+- **Perf rule (M9a N4).** A perf warning is re-measured as an A/B of the base and M9b binaries alternating under the same load, until the difference is classified as noise (CPU time within 1.1×, medians within the limit) or as a regression, which blocks the close. Every re-measure is logged and disclosed.
 
 ## Result
 
