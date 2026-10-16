@@ -12,7 +12,7 @@
 | B9 | A Go method declared in another file than its receiver type is no member of that type. | hk_todo `handler_binding` 0 of 13 |
 | B10 | `fmt.Sprintf("… FROM %s …", todoListsTable)` with a package `const` gives no `QUERIES`. | hk_todo `table_queries` 0/26, `table_ops` 0/26 |
 | B12b | `@RepositoryRestResource` repositories serve endpoints rb never emits. | mse_jferrater endpoints 0 of 5 |
-| B13b | scip-go relates 5 test-suite types to interfaces they do not implement. | 264 `IMPLEMENTS` on mattermost (M9a C4) |
+| B13b | scip-go relates 5 test-suite types to interfaces they do not implement. | 277 `IMPLEMENTS` on mattermost, 264 of them from the 4 types in `_test.go` files (M9a amendment 2) |
 
 ## Root causes, verified (file:line at `2b5e956`)
 

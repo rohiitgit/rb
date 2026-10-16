@@ -261,7 +261,8 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - mse_callista runs 2–3: M8 0.26 and 0.24 s, M9a 0.29 and 0.23 s.
   - hk_polls runs 1–3: M8 0.30, 0.30, 0.30 s, M9a 0.29, 0.28, 0.32 s.
   - CPU time is 0.05–0.12 s on both sides. M9a's first mse_callista run took 1,036.59 s wall on 0.07 s CPU; the machine slept during it, so it is not rb's time.
-  - The warning did not persist on re-measure, so under the NFR rule it does not block. The A/B covers 3 of the 14 warned targets; the other 11 show a similar step (0.20–0.33 s) in the bench run and were not re-measured one by one.
+  - The other 11 warned targets were re-measured the same way afterwards (`var/m9a/scripts/perf_ab2.sh`, `var/m9a/logs/perf-ab2.txt`, 66 runs, all exit 0). Mean walls, M8 vs M9a: anilallewar 0.47 / 0.44 s, fernandoabcampos 0.22 / 0.20, jferrater 0.22 / 0.22, koushikkothagal 0.22 / 0.21, mdeket 0.26 / 0.26, mudigal 0.33 / 0.33, piggymetrics 0.55 / 0.59 (1.07×, the one target that now reads config-server files), piomin 0.31 / 0.31, rohitghatol 0.51 / 0.50, shabbirdwd53 0.36 / 0.33, yidongnan 0.31 / 0.31.
+  - None of the 14 warnings persisted on re-measure, so under the NFR rule they do not block.
 - **Predicted vs measured, where they differ.**
   - `handkey:hk_todo:noscip:handler_binding` (and `handkey_raw`): `found_out_of_scope{test} 1 → 0` was not predicted. The base's `HANDLED_BY` from `GET /identity` to `TestHandler_userIdentity()` (`middleware_test.go`) was already out of scope as `test`. C1 removes the endpoint, so its binding goes with it.
   - `microsecend:mse_{anilallewar,rohitghatol}:noscip:service_flows` are unchanged, against "possible: tp +1".
