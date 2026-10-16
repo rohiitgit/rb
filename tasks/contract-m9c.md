@@ -694,6 +694,70 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Mutants.** m304–m309 KILLED (`mutants.log`). The whole file, m300–m309, was re-run on the P2 tree: 10 KILLED (`mutants-full.log`).
 - **Deviation.** Four `lib.rs` edits went out in one parallel block, against the one-edit-per-message rule. Each one was grepped and found landed (5 of 5) before anything ran.
 
+**P3 note (2026-10-17, phase P3, Go resolution; base `00a177c`).** Logs in `var/m9c/logs/p3/`, scripts in `var/m9c/p3/` (`python3 -I`, read-only).
+- **Built** (`resolve.rs` only).
+  - D4, Go only:
+    - **Call result.** An untyped binding with `init: Call` takes the result types of the functions and methods its chain's last link resolves to, found through a per-file table of call references by name span. The chain is memoised per (file, chain), and a callee's result per definition. A `calling` guard bounds recursion at `MAX_TYPE_DEPTH`.
+    - **Call segment.** A Go qualifier is split at depth 0 of `()[]{}`, outside string and rune literals, and each segment is trimmed. `name(…)` steps to the result types of the members named `name`, or of a module's functions. At the head it steps to those of the callables a bare call `name()` resolves to there. Any other bracketed segment stops the walk. Other languages keep `split('.')`.
+    - **Alias.** `resolve_type` replaces a definition carrying `alias_of` by the resolution of its target (`*` and type arguments stripped) in the alias's file, while the name is still in progress.
+    - **Embedding.** `members` walks a Go type's embedded types breadth-first after its own and sibling-file methods. `step` does the same for fields (`promoted_field`). A per-struct table holds the embedded member bindings. `supertypes()` and `IMPLEMENTS` never see them.
+    - **Package var.** A table maps (package key, name) to Go top-level, non-member, non-parameter bindings.
+  - D6: a `forms` set is cleared before each reference and read only when the reference resolved. Memoised resolutions replay the forms they used. The diagnostic carries all 11 keys, and only a file with a non-zero form gets one. D2's branch counts `default_import`.
+- **Readings of D4** (where the contract's text leaves a choice):
+  - Result elements are types as written. Named results (`(u *User, err error)`) and `(T, *model.AppError)` are refused. On mattermost `server/`, one-line headers return `(T, error)` 3,101 times and `(T, *AppError)` 1,050 times (`mm-result-shapes.txt`). That second shape is the lever if D4 is ever widened.
+  - A head call segment uses the bare-call rule, so a local func variable of that name gives nothing.
+  - "With a type" for a package var means a declared or literal type (P2). A call-initialised package var is not typed this way.
+  - The package-var lookup needs a value position and comes after the file's imports. Legal Go cannot declare a name in both blocks, so the order only matters for broken code.
+  - An own field, typed or not, blocks promotion of a deeper one. The shallowest depth that declares the field ends the walk.
+  - A method declared on an alias name in the alias's own file (P2 note) is not a member of the target. This is unchanged and not handled.
+  - The P2 var-literal typing is a fact, not a D6 form, so gin's 4 `appG.Response` edges count in no key.
+- **Tests, red first** (`red.log`): `go_call_results_and_segments_type_receivers`, `go_type_aliases_resolve_to_their_target`, `go_embedded_types_promote_members`, `go_package_vars_of_sibling_files_type_names`, `tier_b_forms_count_each_form`. All 5 failed on their assertions before any code.
+  - **One existing test failed during the build**, and the code was fixed, not the test. `except_bodies_class_bodies_and_signatures_do_not_capture_names`: `var cb func(c *Ctx)` put the parameter `c` in the package-var table ahead of the import alias `c`. Parameters are now excluded, and the lookup moved after the imports. No existing test assertion changed.
+  - **m318 strengthening.** In Go, adding embedded types to `supertypes()` changes no edge: `implements()` skips Go types, which declare no supertypes, and `members` reaches the same types either way. So the embedding test gains an index-level row: `embedded_types(Top) = [Base]` as a positive control, and `direct_supertypes(Top)` (read by DI) empty. A small `with_index` helper builds the index for it.
+- **Verify.**
+  - `cargo test -p rb-indexer --lib`: 371 passed (366 + 5), `resolve` and `routes` among them; the gin binding tests pass (`unit-indexer.log`).
+  - fmt and clippy exit 0. e2e not run (P6). Every Go or TS fixture file that resolves through a form gains a `tier_b_forms` diagnostic row, so P6 should expect golden changes.
+- **Probes** (`target/debug/rb`, `--no-scip`; dumps `probe-{gca,gin}.jsonl`, `probe-calls-diff.txt`, `probe-rows-diff.txt`, `probe-score.txt`).
+  - go_clean_arch adds 12 `CALLS` pairs and go_gin_example 9, all `heuristic`, none removed: the 21 predicted.
+    - go_clean_arch: the 12 constructor results.
+    - gin: the 4 `appG.Response` (P2 var literal), 2 call results (`GetQrCodeExt`, `Generate`), and 3 through `*ArticlePoster` (`CheckMergedImage`, `OpenMergedImage`, `a.Qr.Encode`).
+  - The only other rows that differ are 5 new `tier_b_forms` rows and the call counts of 6 `unresolved_references` rows. `tier_b_forms` reads: go_clean_arch `return_type` 10 + 6 + 1; gin `return_type` 2 and `embedded` 3.
+  - Scored as P1 did: HEAD's release `rb-bench` (sha256 `e9dea089…`) on a symlinked copy of the M9b record with the probe dumps swapped in. 2 of 314 cells differ:
+
+    | Cell | M9b (base) | Predicted | Measured (P3 probe) |
+    |---|---|---|---|
+    | `scip:go_clean_arch:noscip:calls` | tp 37, fn 12 | tp 49, fn 0 | tp 49 (heuristic), fp 0, fn 0 |
+    | `scip:go_gin_example:noscip:calls` | tp 152, fn 9 | tp 161, fn 0 | tp 161 (heuristic), fp 0, fn 0 |
+- **mattermost estimate** (`target/release/rb` built from this tree, sha256 `da00c759…`; `probe-mm-*.txt`).
+  - **Control.** The M9b binary (`var/m9b/bin/rb`, sha256 `36ed5ea4…`), run the same way just before, reproduces the record's `mattermost.noscip.jsonl` byte for byte (`probe-mmb-control.txt`). So the swap measures only the code change (P1–P3 together; the TS part is P1's).
+  - **Risk, flagged.** The record's `scip` dump comes from the degraded image (amendment 2). Its gold lacks every call the broken type check dropped, so the S0 row below over-counts fp. S1 and S2 re-run P0b's emulation on the probe dump (`mm_classify.py`, which reproduces amendment 2's S0/S1/S2 exactly on the base). They are emulations, not the bench.
+
+    | `scip:mattermost:noscip:calls` | M9b (base) | Predicted (amendment 2) | Measured (P3 probe) |
+    |---|---|---|---|
+    | S0, scored against the record | gold 33,312, tp 20,640, fp 6,141, fn 12,672 | fn falls by ≤ 11,546 (Go bound) | tp 32,271, fp 8,328, fn 1,041 |
+    | S2, fixed image + D8′ (emulated) | gold 41,878, tp 26,591, fp 190, fn 15,287 | fn falls by ≤ 11,546 + part of 2,615; fp ≈ 190 + wrong Tier B edges | tp 40,397, fp 202, fn 1,481 |
+    | `found_out_of_scope{not_covered}` | 22,872 | rises | 40,021 |
+    | `calls_file_scope` | tp 332, fp 1, fn 6 | not emulated | tp 332, fp 1, fn 6 (`not_covered` 2,855 → 3,620) |
+
+  - **S0.** 11,626 fn recovered (Go 11,596, TS/JS 30, the latter P1's), none lost. Go recovers 11,596, which is 50 more than the 11,546 bound. The bound is a classifier count: it covers only misses whose every flag is one of the five forms, and the classifier leaves some misses unplaced (amendment 1: package vars 109, or 889 with the 780 it could not place). 2,183 fp added, all Go: 2,102 at sites where the record's scip dump has no call on the line, 81 where it has one on the line but not at the token. That is the degraded image's footprint, not wrong bindings: under S2 only 12 remain.
+  - **The 12 S2 fp** (`probe-mm-s2-fp.txt`, `probe-mm-s2-skew.txt`) all call a server/public method the in-repo tree defines and `v0.4.3` lacks (`IsChannelAttributesRequiredEnabled`, `AIRecapsEnabled`, `HealthFinding#PreSave`/`IsMuted`, `ImportedUsersPosture#IsValid`, …). This is version skew (M9d), not a wrong Tier B binding.
+  - fn left: 1,041 under S0 (Go 979, TS/JS 62).
+  - **D6 totals** over 1,128 files: `return_type` 33,816, `call_segment` 32,786, `type_alias` 7,119, `embedded` 2,930, `default_import` 1,329, `package_var` 1,068.
+  - **Perf (not the NFR gate).** Same machine, minutes apart, `--no-scip --no-cache`:
+
+    | | wall | user | peak RSS | instructions |
+    |---|---|---|---|---|
+    | M9b binary | 22.37 s | 37.81 s | 1.848 GB | 449.1e9 |
+    | This tree (P1–P3) | 27.58 s | 39.83 s | 1.866 GB | 461.0e9 |
+
+    Wall 1.23×, user 1.05×, RSS 1.01×, instructions 1.026×. The record's 111 s and 0.96 GB do not reproduce under today's conditions for the M9b binary itself. P7's NFR check must therefore be the contract's A/B, not a comparison with the record's meta.
+- **Mutants.** m310–m322 KILLED, and m303 re-anchored on its new line (`let found = self.named(f, None, exported, want);`) KILLED (`mutants.log`). The whole file, m300–m322, re-run on this tree: 23 KILLED (`mutants-full.log`). None touches a DB write path.
+- **Safety.**
+  - `SELECT * FROM rb.repo ORDER BY 1` is identical before, after the Go probes and after mattermost (`repo-{before,after-probe,after-mm}.txt`, 4 rows).
+  - Probe repositories `t_m9c_gca`, `t_m9c_gin`, `t_m9c_mm` and the control `t_m9c_mmb` were each deleted with their AGE graph; `t_m9c_*` left: 0. No e2e ran.
+  - Disk: 16 GiB free at the start, 14 GiB at the end.
+- **Deviation.** Two `Index::new` edits went out in one parallel block, against the one-edit-per-message rule. Both were grepped and found landed (6 of 6 markers) before anything ran.
+
 ## Result
 
 Not yet built.

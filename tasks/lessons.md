@@ -646,3 +646,7 @@
 ## 2026-10-16: probe repositories outside `t_*` while a suite may run
 - **Context (M9b evaluator pass 2, N4):** the e2e harness's start-up clean-up deletes every `t_*` repository (`crates/rb-cli/tests/common/mod.rs`). An evaluator's `t_eval2_*` fixtures vanished when the suite started.
 - **Rule:** Name probes that must outlive a test run `bench_*` (removed by `bench/cleanup.sh`) or finish them before the suite starts. Never give a user repository a `t_` name.
+
+## 2026-10-17: an invariant that no edge observes needs an assertion on the structure itself
+- **Context (M9c P3, m318):** "embedding never enters `supertypes()`" could not be killed through edges. Go types declare no supertypes, so `implements()` skips them, and `members` reached the same embedded types either way. A mutant adding embeds to `supertypes()` changed no edge and would have survived an edge-only test.
+- **Rule:** When a mutant targets an invariant on an internal structure that other stages read (DI's `direct_supertypes`, RTA), assert the structure directly in the unit test. Pair it with a positive row that shows the input is seen (`embedded_types(Top) = [Base]`), so the empty answer is not vacuous.

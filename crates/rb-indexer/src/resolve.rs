@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rb_model::{
     Attrs, Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
-    Provenance,
+    Provenance, Span,
 };
-use rb_syntax::{Binding, DefKind, Definition, FileFacts, Language, RefKind};
+use rb_syntax::{Binding, DefKind, Definition, FileFacts, Init, Language, RefKind};
 use serde_json::json;
 
 use crate::modules::{Modules, dir};
@@ -40,7 +40,9 @@ pub(crate) fn add_edges(
             None => NodeKey::new(NodeKind::File, path),
         };
         let (mut calls, mut types, mut external) = (0u64, 0u64, 0u64);
+        let mut forms: BTreeMap<&str, u64> = BTreeMap::new();
         for r in &facts.references {
+            index.forms.borrow_mut().clear();
             let at = Evidence {
                 path: path.to_owned(),
                 span: r.span,
@@ -95,6 +97,10 @@ pub(crate) fn add_edges(
                 }
                 continue;
             }
+            // Each new form the resolved reference used counts once (contract M9c D6).
+            for &form in index.forms.borrow().iter() {
+                *forms.entry(form).or_default() += 1;
+            }
             edges.record_all(source(r.enclosing), &found, index, &at);
         }
         if calls + types + external > 0 {
@@ -108,6 +114,18 @@ pub(crate) fn add_edges(
                     "external": external,
                     "language": language.as_str(),
                 }),
+            });
+        }
+        if !forms.is_empty() {
+            let detail: serde_json::Map<String, serde_json::Value> = TIER_B_FORMS
+                .iter()
+                .map(|&k| ((*k).to_owned(), json!(forms.get(k).copied().unwrap_or(0))))
+                .collect();
+            diagnostics.push(Diagnostic {
+                kind: "tier_b_forms".into(),
+                path: Some(path.to_owned()),
+                span: None,
+                detail: detail.into(),
             });
         }
         index.implements(path, facts, &mut edges);
@@ -262,10 +280,47 @@ pub(crate) struct Index<'a> {
     /// Some`), by (the method's package key, receiver type name), then by method name (contract
     /// M9b D5). They are members of that type and never package-level names.
     go_methods: GoMethods<'a>,
+    /// Go: call references by the span of their name, per file, so a binding initialised by a
+    /// call finds the reference at its chain's last link (contract M9c D4).
+    call_refs: BTreeMap<&'a str, BTreeMap<Span, usize>>,
+    /// Go: top-level non-member bindings by package key, then by name, with their files
+    /// (contract M9c D4, package vars).
+    package_vars: PackageVars<'a>,
+    /// Go: the embedded member bindings of each struct (contract M9c D4). Never supertypes.
+    embeds: BTreeMap<Sym<'a>, Vec<&'a Binding>>,
+    /// The result types of a Go callable, with the forms resolving them used (memoised).
+    results: RefCell<Memo<'a, Sym<'a>>>,
+    /// The result types of a Go call chain's last link, by (file, chain index) (memoised).
+    chain_results: RefCell<Memo<'a, (&'a str, usize)>>,
+    /// Call chains being resolved, so a chain that needs itself finds nothing.
+    calling: RefCell<BTreeSet<(&'a str, usize)>>,
+    /// The new Tier B forms (contract M9c D6) the reference being resolved has used.
+    forms: RefCell<BTreeSet<&'static str>>,
 }
 
 /// [`Index::go_methods`]: (package key, receiver type name) → method name → definitions.
 type GoMethods<'a> = BTreeMap<((&'a str, &'a str), &'a str), BTreeMap<&'a str, Vec<Sym<'a>>>>;
+
+/// [`Index::package_vars`]: package key → name → (file, binding).
+type PackageVars<'a> = BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<(&'a str, &'a Binding)>>>;
+
+/// Memoised types, with the [`TIER_B_FORMS`] their resolution used, replayed on a hit.
+type Memo<'a, K> = BTreeMap<K, (Vec<Sym<'a>>, BTreeSet<&'static str>)>;
+
+/// The keys of the `tier_b_forms` diagnostic (contract M9c D6).
+const TIER_B_FORMS: [&str; 11] = [
+    "return_type",
+    "call_segment",
+    "type_alias",
+    "embedded",
+    "package_var",
+    "default_import",
+    "super_call",
+    "star_import",
+    "reexport",
+    "module_variable",
+    "inherited_init",
+];
 
 /// The declarations of one name in one file, sorted by the start of their extent. Extents are
 /// nested or disjoint (scopes are), so `parent` links each declaration to the nearest enclosing
@@ -383,6 +438,114 @@ fn is_callable(kind: DefKind) -> bool {
     matches!(kind, DefKind::Function | DefKind::Method | DefKind::Class)
 }
 
+/// `s` split at each `sep` outside brackets and string or rune literals, each part trimmed
+/// (contract M9c D4): `a.Keep(cfg.Size(x.y)).Run` at `.` is `a`, `Keep(cfg.Size(x.y))`, `Run`.
+fn split_top(s: &str, sep: u8) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let (mut out, mut depth, mut start, mut i) = (Vec::new(), 0usize, 0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'"' | b'\'' | b'`' => i = literal_end(bytes, i),
+            c if c == sep && depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(s[start.min(s.len())..].trim());
+    out
+}
+
+/// A Go qualifier's segments (contract M9c D4): split at `.` at bracket depth 0.
+fn split_qualifier(q: &str) -> Vec<&str> {
+    split_top(q, b'.')
+}
+
+/// The index of the quote closing the literal opened at `open` (`"…"` and `'…'` with escapes,
+/// a raw `` `…` `` without), or the length when it never closes.
+fn literal_end(bytes: &[u8], open: usize) -> usize {
+    let quote = bytes[open];
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if quote != b'`' => i += 1,
+            c if c == quote => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// The callee of a Go call segment `name(…)`: an identifier and one argument list that closes
+/// the segment; `None` for any other segment (`m[k]`, `f(a)(b)`, `(T)`, `F[T](x)`).
+fn call_segment(seg: &str) -> Option<&str> {
+    let open = seg.find('(')?;
+    let name = &seg[..open];
+    if !is_identifier(name) {
+        return None;
+    }
+    let bytes = seg.as_bytes();
+    let (mut depth, mut i) = (0usize, open);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return (i == bytes.len() - 1).then_some(name);
+                }
+            }
+            b'"' | b'\'' | b'`' => i = literal_end(bytes, i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// An ASCII identifier (Go names outside ASCII are left unresolved).
+fn is_identifier(s: &str) -> bool {
+    s.bytes().next().is_some_and(|c| !c.is_ascii_digit())
+        && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+/// The type a Go result names when it is usable (contract M9c D4): one named type, or the first
+/// of a list of two whose second is `error`, `*` stripped; `None` for anything else (`(T, U)`,
+/// three results, named results, `[]T`).
+fn go_result_type(result: &str) -> Option<&str> {
+    let result = result.trim();
+    let one = match result.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        Some(list) => match split_top(list, b',').as_slice() {
+            [one] => *one,
+            [first, "error"] => *first,
+            _ => return None,
+        },
+        None => result,
+    };
+    go_named_type(one)
+}
+
+/// A named Go type as written, `*` and type arguments stripped (`*store.Store[T]` is
+/// `store.Store`); `None` for any other type (`[]T`, `map[K]V`, `func()`, `struct{}`).
+fn go_named_type(t: &str) -> Option<&str> {
+    let t = t.trim().trim_start_matches('*').trim_start();
+    let t = match t.find('[') {
+        Some(i) if i > 0 && t.ends_with(']') => &t[..i],
+        Some(_) => return None,
+        None => t,
+    };
+    let named = match t.split_once('.') {
+        Some((package, name)) => is_identifier(package) && is_identifier(name),
+        None => is_identifier(t),
+    };
+    named.then_some(t)
+}
+
 impl<'a> Index<'a> {
     /// Exact manifest resolution for bare specifiers (contract M6c S4).
     /// Default (no manifests) resolves nothing, as before.
@@ -422,7 +585,34 @@ impl<'a> Index<'a> {
         let mut fields: BTreeMap<&str, BTreeMap<(usize, &str), Vec<&Binding>>> = BTreeMap::new();
         let mut packages: BTreeMap<(&str, &str), BTreeMap<&str, Vec<Sym>>> = BTreeMap::new();
         let mut go_methods: GoMethods = BTreeMap::new();
+        let mut call_refs: BTreeMap<&str, BTreeMap<Span, usize>> = BTreeMap::new();
+        let mut package_vars: PackageVars = BTreeMap::new();
+        let mut embeds: BTreeMap<Sym, Vec<&Binding>> = BTreeMap::new();
         for (&path, (language, facts)) in files {
+            if *language == Language::Go {
+                let refs = call_refs.entry(path).or_default();
+                for (i, r) in facts.references.iter().enumerate() {
+                    if r.kind == RefKind::Call {
+                        refs.insert(r.span, i);
+                    }
+                }
+                for b in facts.bindings.iter().filter(|b| b.member && b.embedded) {
+                    if let Some(t) = b.scope {
+                        embeds.entry((path, t)).or_default().push(b);
+                    }
+                }
+                if let Some(key) = package_key(path, *language, facts) {
+                    let vars = package_vars.entry(key).or_default();
+                    // A top-level function type's parameters (`var cb func(c *Ctx)`) are no vars.
+                    for b in facts
+                        .bindings
+                        .iter()
+                        .filter(|b| !b.member && b.scope.is_none() && b.parameter.is_none())
+                    {
+                        vars.entry(b.name.as_str()).or_default().push((path, b));
+                    }
+                }
+            }
             let (l, f) = (
                 raw_locals.entry(path).or_default(),
                 fields.entry(path).or_default(),
@@ -503,6 +693,13 @@ impl<'a> Index<'a> {
             fields,
             packages,
             go_methods,
+            call_refs,
+            package_vars,
+            embeds,
+            results: RefCell::new(BTreeMap::new()),
+            chain_results: RefCell::new(BTreeMap::new()),
+            calling: RefCell::new(BTreeSet::new()),
+            forms: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -724,7 +921,27 @@ impl<'a> Index<'a> {
                 return Vec::new();
             }
         }
-        let found = dedup(self.resolve_type_unguarded(path, scope, name));
+        let found = self.resolve_type_unguarded(path, scope, name);
+        // Go `type A = B` stands for what `B` names in the alias's file (contract M9c D4),
+        // resolved while this name is still in progress, so `A = B; B = A` finds nothing.
+        let found = dedup(
+            found
+                .into_iter()
+                .flat_map(|t| {
+                    let def = self.def(t);
+                    let Some(target) = def.alias_of.as_deref() else {
+                        return vec![t];
+                    };
+                    let types = go_named_type(target)
+                        .map(|n| self.resolve_type(t.0, def.parent, n))
+                        .unwrap_or_default();
+                    if !types.is_empty() {
+                        self.note("type_alias");
+                    }
+                    types
+                })
+                .collect(),
+        );
         self.resolving.borrow_mut().remove(&key);
         found
     }
@@ -938,7 +1155,11 @@ impl<'a> Index<'a> {
                             // (contract M9c D2); a target without one gives nothing.
                             for &f in targets {
                                 if let Some(exported) = self.facts(f).default_export.as_deref() {
-                                    out.extend(self.named(f, None, exported, want));
+                                    let found = self.named(f, None, exported, want);
+                                    if !found.is_empty() {
+                                        self.note("default_import");
+                                    }
+                                    out.extend(found);
                                 }
                             }
                         }
@@ -991,10 +1212,12 @@ impl<'a> Index<'a> {
 
     /// Members named `name` of `t`, else of its nearest supertypes that have one (breadth-first,
     /// each type once, at most [`MAX_INHERITANCE_DEPTH`] levels).
+    /// Go has no supertypes: the next levels are the embedded types (contract M9c D4), and a
+    /// tie at one depth gives every candidate.
     fn members(&self, t: Sym<'a>, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
         let mut seen = BTreeSet::from([t]);
         let mut level = vec![t];
-        for _ in 0..MAX_INHERITANCE_DEPTH {
+        for depth in 0..MAX_INHERITANCE_DEPTH {
             let found: Vec<Sym<'a>> = level
                 .iter()
                 .flat_map(|&c| {
@@ -1004,11 +1227,18 @@ impl<'a> Index<'a> {
                 })
                 .collect();
             if !found.is_empty() {
+                if depth > 0 && self.language(t.0) == Language::Go {
+                    self.note("embedded");
+                }
                 return found;
             }
             level = level
                 .iter()
-                .flat_map(|&c| self.supertypes(c))
+                .flat_map(|&c| {
+                    let mut next = self.supertypes(c);
+                    next.extend(self.embedded_types(c));
+                    next
+                })
                 .filter(|s| seen.insert(*s))
                 .collect();
             if level.is_empty() {
@@ -1054,6 +1284,145 @@ impl<'a> Index<'a> {
             .collect();
         self.supers.borrow_mut().insert(t, found.clone());
         found
+    }
+
+    /// Records that the reference being resolved used `form` (contract M9c D6).
+    fn note(&self, form: &'static str) {
+        debug_assert!(TIER_B_FORMS.contains(&form), "{form}");
+        self.forms.borrow_mut().insert(form);
+    }
+
+    /// `compute`'s types, memoised in `memo` under `key` with the forms it used, which a hit
+    /// records again, so a memoised resolution counts its forms like a fresh one.
+    fn memoised<K: Ord + Copy>(
+        &self,
+        memo: &RefCell<Memo<'a, K>>,
+        key: K,
+        compute: impl FnOnce() -> Vec<Sym<'a>>,
+    ) -> Vec<Sym<'a>> {
+        let hit = memo.borrow().get(&key).cloned();
+        if let Some((types, forms)) = hit {
+            self.forms.borrow_mut().extend(forms);
+            return types;
+        }
+        let outer = self.forms.take();
+        let types = compute();
+        let used = self.forms.replace(outer);
+        self.forms.borrow_mut().extend(used.iter().copied());
+        memo.borrow_mut().insert(key, (types.clone(), used));
+        types
+    }
+
+    /// The types Go struct `t` embeds (contract M9c D4): never supertypes, never `IMPLEMENTS`.
+    fn embedded_types(&self, t: Sym<'a>) -> Vec<Sym<'a>> {
+        self.embeds
+            .get(&t)
+            .into_iter()
+            .flatten()
+            .filter(|b| !b.type_name.is_empty())
+            .flat_map(|b| self.resolve_type(t.0, b.scope, &b.type_name))
+            .collect()
+    }
+
+    /// The types a binding of `path` stands for: its declared type, else (Go) the result type of
+    /// the call that initialises it (contract M9c D4).
+    fn binding_types(&self, path: &'a str, b: &'a Binding) -> Vec<Sym<'a>> {
+        if !b.type_name.is_empty() {
+            return self.resolve_type(path, b.scope, &b.type_name);
+        }
+        let Some(Init::Call { chain }) = b.init else {
+            return Vec::new();
+        };
+        if self.language(path) != Language::Go {
+            return Vec::new();
+        }
+        let types = self.memoised(&self.chain_results, (path, chain), || {
+            self.chain_result(path, chain)
+        });
+        if !types.is_empty() {
+            self.note("return_type");
+        }
+        types
+    }
+
+    /// The result types of the callables the reference at chain `chain`'s last link resolves to.
+    fn chain_result(&self, path: &'a str, chain: usize) -> Vec<Sym<'a>> {
+        let facts = self.facts(path);
+        let Some(link) = facts.chains.get(chain).and_then(|c| c.links.last()) else {
+            return Vec::new();
+        };
+        let Some(&i) = self
+            .call_refs
+            .get(path)
+            .and_then(|refs| refs.get(&link.span))
+        else {
+            return Vec::new();
+        };
+        {
+            let mut calling = self.calling.borrow_mut();
+            if calling.len() >= MAX_TYPE_DEPTH || !calling.insert((path, chain)) {
+                return Vec::new();
+            }
+        }
+        let r = &facts.references[i];
+        let callees = self.call(
+            path,
+            r.enclosing,
+            &r.name,
+            r.qualifier.as_deref(),
+            Some(r.span),
+        );
+        self.calling.borrow_mut().remove(&(path, chain));
+        self.results_of(callees)
+    }
+
+    /// The result types of the functions and methods among `callees`.
+    fn results_of(&self, callees: impl IntoIterator<Item = (EdgeKind, Sym<'a>)>) -> Vec<Sym<'a>> {
+        dedup(
+            callees
+                .into_iter()
+                .filter(|&(kind, s)| {
+                    kind == EdgeKind::Calls
+                        && matches!(self.def(s).kind, DefKind::Function | DefKind::Method)
+                })
+                .flat_map(|(_, s)| self.result_types(s))
+                .collect(),
+        )
+    }
+
+    /// The type a Go callable returns (contract M9c D4): one named type, or the first of two
+    /// results whose second is `error`, resolved in the callable's file. Memoised.
+    fn result_types(&self, s: Sym<'a>) -> Vec<Sym<'a>> {
+        self.memoised(&self.results, s, || {
+            let def = self.def(s);
+            def.return_type
+                .as_deref()
+                .and_then(go_result_type)
+                .map(|t| self.resolve_type(s.0, def.parent, t))
+                .unwrap_or_default()
+        })
+    }
+
+    /// The package-level var `name` of `path`'s Go package (contract M9c D4): the package must
+    /// declare the name exactly once, of any kind, as a var with a type, and a non-test file
+    /// never sees a test file's var.
+    fn package_var(&self, path: &'a str, name: &str) -> Option<(&'a str, &'a Binding)> {
+        let (language, facts) = self.files[path];
+        if language != Language::Go {
+            return None;
+        }
+        let key = package_key(path, language, facts)?;
+        let vars = self.package_vars.get(&key)?.get(name)?;
+        let defs = self
+            .packages
+            .get(&key)
+            .and_then(|table| table.get(name))
+            .map_or(0, Vec::len);
+        let [(file, b)] = vars.as_slice() else {
+            return None;
+        };
+        let hidden = file.ends_with("_test.go") && !path.ends_with("_test.go");
+        (defs == 0 && !b.type_name.is_empty() && !hidden).then_some((*file, *b))
     }
 
     /// The declaration `name` refers to at position `at` in `path`: the innermost local whose
@@ -1134,12 +1503,45 @@ impl<'a> Index<'a> {
         q: &str,
         at: Option<rb_model::Span>,
     ) -> Option<Container<'a>> {
-        let segments: Vec<&str> = q.split('.').collect();
+        // Go splits at bracket depth 0, so `a.B(x.y).C` is three segments (contract M9c D4).
+        let go = self.language(path) == Language::Go;
+        let segments: Vec<&str> = if go {
+            split_qualifier(q)
+        } else {
+            q.split('.').collect()
+        };
         let (mut target, consumed) = self.first_segment(path, scope, &segments, at)?;
         for seg in &segments[consumed..] {
-            target = self.step(target, seg)?;
+            target = if go && seg.contains(['(', '[', '{']) {
+                // A call steps to its result; any other bracketed segment stops the walk.
+                self.call_step(target, call_segment(seg)?)?
+            } else {
+                self.step(target, seg)?
+            };
         }
         Some(target)
+    }
+
+    /// The container a Go call segment `name(…)` stands for: the result types of the members
+    /// named `name` of the current types, or of a module's top-level functions (contract M9c
+    /// D4).
+    fn call_step(&self, target: Container<'a>, name: &str) -> Option<Container<'a>> {
+        let callees: Vec<Sym<'a>> = match target {
+            Container::Types(ts) => ts
+                .into_iter()
+                .flat_map(|t| self.members(t, name, is_callable))
+                .collect(),
+            Container::Module(files) => files
+                .into_iter()
+                .flat_map(|f| self.named(f, None, name, is_callable))
+                .collect(),
+        };
+        let types = self.results_of(callees.into_iter().map(|s| (EdgeKind::Calls, s)));
+        if types.is_empty() {
+            return None;
+        }
+        self.note("call_segment");
+        Some(Container::Types(types))
     }
 
     fn first_segment(
@@ -1161,12 +1563,20 @@ impl<'a> Index<'a> {
             }
             _ => {}
         }
-        // A variable: its declared type, or nothing. Never a same-named type or module.
-        if let Some(b) = self.binding(path, scope, s0, at) {
-            if b.type_name.is_empty() {
+        // Go: a call at the head (`Setup(t).App`) stands for its callees' result types (contract
+        // M9c D4); any other bracketed head stops the walk.
+        if language == Language::Go && s0.contains(['(', '[', '{']) {
+            let types = self.results_of(self.call(path, scope, call_segment(s0)?, None, at));
+            if types.is_empty() {
                 return None;
             }
-            let types = self.resolve_type(path, b.scope, &b.type_name);
+            self.note("call_segment");
+            return Some((Container::Types(types), 1));
+        }
+        // A variable: its declared type (Go: else its initialising call's result), or nothing.
+        // Never a same-named type or module.
+        if let Some(b) = self.binding(path, scope, s0, at) {
+            let types = self.binding_types(path, b);
             return (!types.is_empty()).then_some((Container::Types(types), 1));
         }
         let imports = self.facts(path).imports.iter().zip(&self.imports[path]);
@@ -1225,6 +1635,18 @@ impl<'a> Index<'a> {
                 }
             }
         }
+        // Go: a var any file of the package declares (contract M9c D4), after the file's
+        // imports; a variable too, so its type or nothing.
+        if at.is_some()
+            && let Some((file, b)) = self.package_var(path, s0)
+        {
+            let types = self.resolve_type(file, b.scope, &b.type_name);
+            if types.is_empty() {
+                return None;
+            }
+            self.note("package_var");
+            return Some((Container::Types(types), 1));
+        }
         let types = self.resolve_type(path, scope, s0);
         if !types.is_empty() {
             return Some((Container::Types(types), 1));
@@ -1242,15 +1664,18 @@ impl<'a> Index<'a> {
             Container::Types(ts) => ts
                 .into_iter()
                 .flat_map(|t| {
-                    let fields = self.fields[t.0]
-                        .get(&(t.1, seg))
+                    let declared = self.fields[t.0].get(&(t.1, seg));
+                    let mut own: Vec<Sym<'a>> = declared
                         .into_iter()
                         .flatten()
                         .filter(|b| !b.type_name.is_empty())
-                        .flat_map(|b| self.resolve_type(t.0, Some(t.1), &b.type_name));
-                    fields
-                        .chain(self.named(t.0, Some(t.1), seg, is_type))
-                        .collect::<Vec<_>>()
+                        .flat_map(|b| self.resolve_type(t.0, Some(t.1), &b.type_name))
+                        .collect();
+                    own.extend(self.named(t.0, Some(t.1), seg, is_type));
+                    if declared.is_none() && own.is_empty() {
+                        own = self.promoted_field(t, seg);
+                    }
+                    own
                 })
                 .collect(),
             Container::Module(files) => files
@@ -1261,6 +1686,52 @@ impl<'a> Index<'a> {
         // Deduplicated, so repeated bindings or declarations never multiply along a chain.
         let found = dedup(found);
         (!found.is_empty()).then_some(Container::Types(found))
+    }
+
+    /// The types of the field `seg` that Go struct `t` promotes from the structs it embeds
+    /// (contract M9c D4): breadth-first, the shallowest depth declaring the field wins, and a
+    /// tie at that depth gives every candidate. Empty for any other language.
+    fn promoted_field(&self, t: Sym<'a>, seg: &str) -> Vec<Sym<'a>> {
+        let mut seen = BTreeSet::from([t]);
+        let mut level: Vec<Sym<'a>> = self
+            .embedded_types(t)
+            .into_iter()
+            .filter(|s| seen.insert(*s))
+            .collect();
+        for _ in 0..MAX_INHERITANCE_DEPTH {
+            if level.is_empty() {
+                break;
+            }
+            let declared: Vec<(Sym<'a>, &'a Binding)> = level
+                .iter()
+                .flat_map(|&c| {
+                    self.fields[c.0]
+                        .get(&(c.1, seg))
+                        .into_iter()
+                        .flatten()
+                        .map(move |b| (c, *b))
+                })
+                .collect();
+            if !declared.is_empty() {
+                let types = dedup(
+                    declared
+                        .into_iter()
+                        .filter(|(_, b)| !b.type_name.is_empty())
+                        .flat_map(|(c, b)| self.resolve_type(c.0, Some(c.1), &b.type_name))
+                        .collect(),
+                );
+                if !types.is_empty() {
+                    self.note("embedded");
+                }
+                return types;
+            }
+            level = level
+                .iter()
+                .flat_map(|&c| self.embedded_types(c))
+                .filter(|s| seen.insert(*s))
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Candidates of a call reference, each with the edge it gives. Shared
@@ -1496,6 +1967,31 @@ mod tests {
             graph: b.finish().unwrap(),
             diagnostics,
         }
+    }
+
+    /// Runs `f` on the index of `files` (no Go modules, no manifests), for assertions on the
+    /// index itself rather than on its edges.
+    fn with_index(files: &[(&str, Language, &str)], f: impl FnOnce(&Index<'_>)) {
+        let facts: Vec<(String, Language, FileFacts)> = files
+            .iter()
+            .map(|(p, l, src)| {
+                (
+                    (*p).to_owned(),
+                    *l,
+                    rb_syntax::extract(*l, src.as_bytes()).unwrap(),
+                )
+            })
+            .collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
+            .iter()
+            .map(|(p, l, f)| (p.as_str(), (*l, f)))
+            .collect();
+        let keys: BTreeMap<&str, Vec<String>> = by_path
+            .iter()
+            .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+            .collect();
+        let go = BTreeMap::new();
+        f(&Index::new(&by_path, &go, &keys));
     }
 
     /// `src -> dst [certainty]` (plus `(n)` candidates) for edges of `kind`, keys shortened to
@@ -2036,6 +2532,411 @@ func (s *Server) helper() {}
             [
                 "use:run(). -> m:H#M(). [heuristic]",
                 "use:run(). -> z_test:H#T(). [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M9c C5 (D4, call results and call segments, Go only): a local initialised by a
+    /// call takes the callee's result type, `T` or `(T, error)` with `*` stripped; `(T, U)` and
+    /// three results give none; several callees give several candidates. A qualifier is split
+    /// at bracket depth 0, so `a.Keep(cfg.Size(x.y))` is two segments, and a call segment steps
+    /// to the result of a member, a module's function, or (at the head) a callable of the
+    /// levels. A bracketed segment that is not a call (`repo[0]`) stops the walk.
+    #[test]
+    fn go_call_results_and_segments_type_receivers() {
+        let built = build(
+            &[
+                (
+                    "svc/svc.go",
+                    GO,
+                    "package svc
+type Service struct {
+\trepo *Repo
+}
+type Repo struct{}
+type Box struct{}
+func New() *Service { return nil }
+func NewE() (*Service, error) { return nil, nil }
+func NewPair() (*Service, *Repo) { return nil, nil }
+func NewThree() (*Service, *Repo, error) { return nil, nil, nil }
+func (s *Service) Srv() *Service { return s }
+func (s *Service) Keep(n int) Box { return Box{} }
+func (s *Service) Run() {}
+func (r *Repo) Get() {}
+func (b Box) Save() {}
+func head() {
+\tNew().Srv().Run()
+}
+",
+                ),
+                (
+                    "use/use.go",
+                    GO,
+                    "package use
+import \"example.com/app/svc\"
+func f1() {
+\ta := svc.New()
+\ta.Run()
+}
+func f2() {
+\tb, err := svc.NewE()
+\tb.Run()
+}
+func f3() {
+\tc, d := svc.NewPair()
+\tc.Run()
+}
+func f4() {
+\te := svc.NewThree()
+\te.Run()
+}
+func f5(cfg Config) {
+\ta := svc.New()
+\ta.Keep(cfg.Size(x.y)).Save()
+}
+func f6() {
+\tsvc.New().Srv().Run()
+}
+func f7() {
+\ta := svc.New()
+\ta.repo[0].Get()
+}
+",
+                ),
+                (
+                    "multi/a.go",
+                    GO,
+                    "package multi\ntype A struct{}\nfunc (a *A) Hi() {}\nfunc Make() *A { return nil }\n",
+                ),
+                (
+                    "multi/b.go",
+                    GO,
+                    "package multi\ntype B struct{}\nfunc (b *B) Hi() {}\nfunc Make() *B { return nil }\n",
+                ),
+                (
+                    "multi/m.go",
+                    GO,
+                    "package multi\nfunc g() {\n\tm := Make()\n\tm.Hi()\n}\n",
+                ),
+            ],
+            &[("", "example.com/app")],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "m:g(). -> a:A#Hi(). [ambiguous] (2)",
+                "m:g(). -> a:Make(). [ambiguous] (2)",
+                "m:g(). -> b:B#Hi(). [ambiguous] (2)",
+                "m:g(). -> b:Make(). [ambiguous] (2)",
+                "svc:head(). -> svc:New(). [heuristic]",
+                "svc:head(). -> svc:Service#Run(). [heuristic]",
+                "svc:head(). -> svc:Service#Srv(). [heuristic]",
+                "use:f1(). -> svc:New(). [heuristic]",
+                "use:f1(). -> svc:Service#Run(). [heuristic]",
+                "use:f2(). -> svc:NewE(). [heuristic]",
+                "use:f2(). -> svc:Service#Run(). [heuristic]",
+                "use:f3(). -> svc:NewPair(). [heuristic]",
+                "use:f4(). -> svc:NewThree(). [heuristic]",
+                "use:f5(). -> svc:Box#Save(). [heuristic]",
+                "use:f5(). -> svc:New(). [heuristic]",
+                "use:f5(). -> svc:Service#Keep(). [heuristic]",
+                "use:f6(). -> svc:New(). [heuristic]",
+                "use:f6(). -> svc:Service#Run(). [heuristic]",
+                "use:f6(). -> svc:Service#Srv(). [heuristic]",
+                "use:f7(). -> svc:New(). [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M9c C5 (D4, aliases): `type A = B` resolves to what `B` resolves to in the
+    /// alias's file, through a chain of aliases, a pointer target and a sibling file; a cycle
+    /// (`A = B; B = A`) resolves to nothing. Type references land on the target as calls do.
+    #[test]
+    fn go_type_aliases_resolve_to_their_target() {
+        let built = build(
+            &[
+                (
+                    "web/ctx.go",
+                    GO,
+                    "package web\ntype Context struct{}\nfunc (c *Context) JSON() {}\n",
+                ),
+                (
+                    "api/handlers.go",
+                    GO,
+                    "package api
+import \"example.com/app/web\"
+type Context = web.Context
+type Ctx2 = Context
+type P = *web.Context
+type A = B
+type B = A
+func h1(c *Context) { c.JSON() }
+func h2(c *Ctx2) { c.JSON() }
+func h3(c P) { c.JSON() }
+func h4(c *A) { c.JSON() }
+",
+                ),
+                (
+                    "api/other.go",
+                    GO,
+                    "package api\nfunc h5(c Context) { c.JSON() }\n",
+                ),
+            ],
+            &[("", "example.com/app")],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "handlers:h1(). -> ctx:Context#JSON(). [heuristic]",
+                "handlers:h2(). -> ctx:Context#JSON(). [heuristic]",
+                "handlers:h3(). -> ctx:Context#JSON(). [heuristic]",
+                "other:h5(). -> ctx:Context#JSON(). [heuristic]",
+            ]
+        );
+        let functions: Vec<String> = edges(&built, EdgeKind::References)
+            .into_iter()
+            .filter(|e| e.contains(":h"))
+            .collect();
+        assert_eq!(
+            functions,
+            [
+                "handlers:h1(). -> ctx:Context# [heuristic]",
+                "handlers:h2(). -> ctx:Context# [heuristic]",
+                "handlers:h3(). -> ctx:Context# [heuristic]",
+                "other:h5(). -> ctx:Context# [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M9c C5 (D4, embedding): a member the type and its sibling-file methods lack is
+    /// searched in the embedded types breadth-first; the shallower depth wins, a tie at one
+    /// depth is ambiguous, promoted fields walk the same way, and embedding never makes an
+    /// `IMPLEMENTS` edge.
+    #[test]
+    fn go_embedded_types_promote_members() {
+        let built = build(
+            &[
+                (
+                    "p/types.go",
+                    GO,
+                    "package p
+type Logger struct{}
+func (l *Logger) Write() {}
+type Base struct {
+\tLog *Logger
+}
+func (b *Base) Hello() {}
+func (b *Base) Both() {}
+type Mid struct {
+\t*Base
+}
+func (m *Mid) Name() {}
+type Other struct{}
+func (o *Other) Both() {}
+func (o *Other) Name() {}
+type Top struct {
+\t*Mid
+\tOther
+}
+func (t *Top) Own() {}
+",
+                ),
+                ("p/more.go", GO, "package p\nfunc (b *Base) Later() {}\n"),
+                (
+                    "p/use.go",
+                    GO,
+                    "package p
+func own(t *Top) { t.Own() }
+func deep(t *Top) { t.Hello() }
+func tie(t *Top) { t.Name() }
+func near(t *Top) { t.Both() }
+func field(m *Mid) { m.Log.Write() }
+func explicit(t *Top) { t.Mid.Name() }
+func later(t *Top) { t.Later() }
+",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "use:deep(). -> types:Base#Hello(). [heuristic]",
+                "use:explicit(). -> types:Mid#Name(). [heuristic]",
+                "use:field(). -> types:Logger#Write(). [heuristic]",
+                "use:later(). -> more:Base#Later(). [heuristic]",
+                "use:near(). -> types:Other#Both(). [heuristic]",
+                "use:own(). -> types:Top#Own(). [heuristic]",
+                "use:tie(). -> types:Mid#Name(). [ambiguous] (2)",
+                "use:tie(). -> types:Other#Name(). [ambiguous] (2)",
+            ]
+        );
+        assert_eq!(edges(&built, EdgeKind::Implements), Vec::<String>::new());
+        // Embedding never enters `supertypes()`, which DI reads through `direct_supertypes`;
+        // the embedded type is seen, as an embed.
+        let src = "package p\ntype Base struct{}\ntype Top struct {\n\t*Base\n}\n";
+        with_index(&[("p/t.go", GO, src)], |index| {
+            let top = ("p/t.go", 1);
+            assert_eq!(index.def(top).name, "Top");
+            assert_eq!(index.embedded_types(top), [("p/t.go", 0)]);
+            assert_eq!(index.direct_supertypes(top), Vec::<Sym>::new());
+        });
+    }
+
+    /// Contract M9c C5 (D4, package vars): a qualifier head with no local binding is a
+    /// package-level var of a sibling file when the package declares that name exactly once
+    /// (any kind), the var has a type, and a non-test file is not reading a test file's var. A
+    /// local of the same name shadows it; another directory never sees it.
+    #[test]
+    fn go_package_vars_of_sibling_files_type_names() {
+        let built = build(
+            &[
+                (
+                    "svc/helper.go",
+                    GO,
+                    "package svc
+type Helper struct{}
+func (h *Helper) Setup() {}
+type Other struct{}
+var shared *Helper
+var twice *Helper
+var mixed *Helper
+",
+                ),
+                (
+                    "svc/d.go",
+                    GO,
+                    "package svc\nvar twice *Helper\nfunc mixed() {}\n",
+                ),
+                (
+                    "svc/main_test.go",
+                    GO,
+                    "package svc\nvar mainHelper *Helper\n",
+                ),
+                (
+                    "svc/a_test.go",
+                    GO,
+                    "package svc
+func TestA() { mainHelper.Setup() }
+func TestB() {
+\tmainHelper := Other{}
+\tmainHelper.Setup()
+}
+func TestC() { shared.Setup() }
+",
+                ),
+                (
+                    "svc/b.go",
+                    GO,
+                    "package svc
+func run() { mainHelper.Setup() }
+func run2() { shared.Setup() }
+func run3() { twice.Setup() }
+func run4() { mixed.Setup() }
+",
+                ),
+                (
+                    "other/x.go",
+                    GO,
+                    "package other\nfunc o() { shared.Setup() }\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "a_test:TestA(). -> helper:Helper#Setup(). [heuristic]",
+                "a_test:TestC(). -> helper:Helper#Setup(). [heuristic]",
+                "b:run2(). -> helper:Helper#Setup(). [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M9c C7 (D6): one `tier_b_forms` diagnostic per file that resolved a reference
+    /// through a new form, every key present; a reference counts each form it used once (two
+    /// call segments in one qualifier count once), an unresolved reference counts nothing, and a
+    /// file that used no form has no diagnostic.
+    #[test]
+    fn tier_b_forms_count_each_form() {
+        let built = build(
+            &[
+                (
+                    "svc/svc.go",
+                    GO,
+                    "package svc\ntype Service struct{}\nfunc New() *Service { return nil }\nfunc (s *Service) Srv() *Service { return s }\nfunc (s *Service) Run() {}\n",
+                ),
+                (
+                    "use/use.go",
+                    GO,
+                    "package use
+import \"example.com/app/svc\"
+type Alias = svc.Service
+type Wrap struct {
+\t*svc.Service
+}
+func f(s *svc.Service, al *Alias, w *Wrap) {
+\ta := svc.New()
+\ta.Run()
+\ts.Srv().Srv().Run()
+\tal.Run()
+\tw.Run()
+\tglobal.Run()
+\ta.Missing()
+}
+",
+                ),
+                (
+                    "use/vars.go",
+                    GO,
+                    "package use\nimport \"example.com/app/svc\"\nvar global *svc.Service\n",
+                ),
+                (
+                    "use/plain.go",
+                    GO,
+                    "package use\nimport \"example.com/app/svc\"\nfunc p(s *svc.Service) { s.Run() }\n",
+                ),
+                ("web/m.ts", TS, "export default function g() {}\n"),
+                (
+                    "web/u.ts",
+                    TS,
+                    "import f from './m';\nfunction run() { f(); f(); }\n",
+                ),
+            ],
+            &[("", "example.com/app")],
+        );
+        let forms: Vec<(String, serde_json::Value)> = built
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "tier_b_forms")
+            .map(|d| (d.path.clone().unwrap_or_default(), d.detail.clone()))
+            .collect();
+        let zero = json!({
+            "return_type": 0, "call_segment": 0, "type_alias": 0, "embedded": 0,
+            "package_var": 0, "default_import": 0, "super_call": 0, "star_import": 0,
+            "reexport": 0, "module_variable": 0, "inherited_init": 0,
+        });
+        let with = |pairs: &[(&str, u64)]| {
+            let mut v = zero.clone();
+            for (k, n) in pairs {
+                v[*k] = json!(n);
+            }
+            v
+        };
+        assert_eq!(
+            forms,
+            [
+                (
+                    "use/use.go".to_owned(),
+                    with(&[
+                        ("return_type", 1),
+                        ("call_segment", 2),
+                        ("type_alias", 2),
+                        ("embedded", 1),
+                        ("package_var", 1),
+                    ])
+                ),
+                ("web/u.ts".to_owned(), with(&[("default_import", 2)])),
             ]
         );
     }

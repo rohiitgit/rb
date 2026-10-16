@@ -31,8 +31,8 @@
   "crate": "rb-indexer",
   "test": "resolve::tests::default_imports_resolve_to_the_default_export",
   "file": "resolve.rs",
-  "old": "                                    out.extend(self.named(f, None, exported, want));\n",
-  "new": "                                    out.extend(self.named(f, None, name, want));\n",
+  "old": "                                    let found = self.named(f, None, exported, want);\n",
+  "new": "                                    let found = self.named(f, None, name, want);\n",
   "what": "default import resolved by its local name"
  },
  {
@@ -88,5 +88,122 @@
   "old": "(raise_statement . [(identifier) @name (attribute attribute: (identifier) @name)]) @reference.call\n",
   "new": "(raise_statement [(identifier) @name (attribute attribute: (identifier) @name)]) @reference.call\n",
   "what": "raise query without the `.` anchor"
+ },
+ {
+  "id": "m310",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_call_results_and_segments_type_receivers",
+  "file": "resolve.rs",
+  "old": "        let Some(Init::Call { chain }) = b.init else {\n",
+  "new": "        let Some(Init::Call { chain }) = b.init.clone().filter(|_| false) else {\n",
+  "what": "call-initialised bindings stay untyped"
+ },
+ {
+  "id": "m311",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_call_results_and_segments_type_receivers",
+  "file": "resolve.rs",
+  "old": "            [first, \"error\"] => *first,\n",
+  "new": "            [first, _] => *first,\n",
+  "what": "`(T, U)` with `U` not `error` accepted"
+ },
+ {
+  "id": "m312",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_call_results_and_segments_type_receivers",
+  "file": "resolve.rs",
+  "old": "                self.call_step(target, call_segment(seg)?)?\n",
+  "new": "                return None\n",
+  "what": "call segment stops the walk"
+ },
+ {
+  "id": "m313",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_call_results_and_segments_type_receivers",
+  "file": "resolve.rs",
+  "old": "            split_qualifier(q)\n",
+  "new": "            q.split('.').map(str::trim).collect()\n",
+  "what": "qualifier split ignores brackets"
+ },
+ {
+  "id": "m314",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_type_aliases_resolve_to_their_target",
+  "file": "resolve.rs",
+  "old": "                    let Some(target) = def.alias_of.as_deref() else {\n",
+  "new": "                    let Some(target) = def.alias_of.as_deref().filter(|_| false) else {\n",
+  "what": "`alias_of` not followed"
+ },
+ {
+  "id": "m315",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_embedded_types_promote_members",
+  "file": "resolve.rs",
+  "old": "                    next.extend(self.embedded_types(c));\n",
+  "new": "                    next.extend(self.embedded_types(c).into_iter().filter(|_| false));\n",
+  "what": "embedded bindings not searched"
+ },
+ {
+  "id": "m316",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_embedded_types_promote_members",
+  "file": "resolve.rs",
+  "old": "            if !found.is_empty() {\n                if depth > 0 && self.language(t.0) == Language::Go {\n",
+  "new": "            if !found.is_empty() && level.iter().all(|&c| self.embedded_types(c).is_empty()) {\n                if depth > 0 && self.language(t.0) == Language::Go {\n",
+  "what": "deeper embed wins over shallower"
+ },
+ {
+  "id": "m317",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_embedded_types_promote_members",
+  "file": "resolve.rs",
+  "old": "                    self.note(\"embedded\");\n                }\n                return found;\n",
+  "new": "                    self.note(\"embedded\");\n                }\n                return found.into_iter().take(1).collect();\n",
+  "what": "same-depth tie keeps the first"
+ },
+ {
+  "id": "m318",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_embedded_types_promote_members",
+  "file": "resolve.rs",
+  "old": "            .flat_map(|s| self.resolve_type(t.0, def.parent, &s.name))\n            .filter(|&s| s != t)\n",
+  "new": "            .flat_map(|s| self.resolve_type(t.0, def.parent, &s.name))\n            .chain(self.embedded_types(t))\n            .filter(|&s| s != t)\n",
+  "what": "embedded types added to `supertypes`"
+ },
+ {
+  "id": "m319",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_package_vars_of_sibling_files_type_names",
+  "file": "resolve.rs",
+  "old": "            && let Some((file, b)) = self.package_var(path, s0)\n",
+  "new": "            && let Some((file, b)) = self.package_var(path, s0).filter(|_| false)\n",
+  "what": "package var table not consulted"
+ },
+ {
+  "id": "m320",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_package_vars_of_sibling_files_type_names",
+  "file": "resolve.rs",
+  "old": "        let hidden = file.ends_with(\"_test.go\") && !path.ends_with(\"_test.go\");\n",
+  "new": "        let hidden = false;\n",
+  "what": "test-file var visible to non-test files"
+ },
+ {
+  "id": "m321",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_package_vars_of_sibling_files_type_names",
+  "file": "resolve.rs",
+  "old": "        let [(file, b)] = vars.as_slice() else {\n",
+  "new": "        let Some((file, b)) = vars.first() else {\n",
+  "what": "two declarations: first wins"
+ },
+ {
+  "id": "m322",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::tier_b_forms_count_each_form",
+  "file": "resolve.rs",
+  "old": "            for &form in index.forms.borrow().iter() {\n",
+  "new": "            for &form in index.forms.borrow().iter().filter(|f| **f != \"call_segment\") {\n",
+  "what": "`tier_b_forms` skips `call_segment`"
  }
 ]
