@@ -821,6 +821,40 @@ fn spring_config(
 
 const CONTEXT_PATH_KEY: &str = "server.servlet.context-path";
 
+/// Build dependencies that make a service serve Spring Data REST (contract M9b D7).
+const DATA_REST_DEPENDENCIES: &[&str] =
+    &["spring-boot-starter-data-rest", "spring-data-rest-webmvc"];
+/// The keys of Spring Data REST's base path, in Spring's relaxed binding forms.
+const DATA_REST_BASE_PATH_KEYS: &[&str] =
+    &["spring.data.rest.base-path", "spring.data.rest.basePath"];
+
+/// Services whose build file names Spring Data REST (contract M9b D7), each with the base path
+/// its read configuration sets (without slashes; `None` when unset or blank).
+fn data_rest_services(
+    config: &BTreeMap<&str, String>,
+    spring: &SpringConfig,
+    service_of: &dyn Fn(&str) -> String,
+) -> BTreeMap<String, Option<String>> {
+    config
+        .iter()
+        .filter(|(path, text)| {
+            config_file(path) == Some(ConfigFile::Build)
+                && DATA_REST_DEPENDENCIES.iter().any(|d| text.contains(d))
+        })
+        .map(|(path, _)| {
+            let service = service_of(path);
+            let base = spring.properties.get(&service).and_then(|p| {
+                DATA_REST_BASE_PATH_KEYS
+                    .iter()
+                    .find_map(|k| p.get(*k))
+                    .map(|v| v.trim().trim_matches('/').to_owned())
+                    .filter(|v| !v.is_empty())
+            });
+            (service, base)
+        })
+        .collect()
+}
+
 /// Context paths a native Spring Cloud Config server sets for its clients (contract M9a D4).
 /// The server is the one service whose effective configuration activates the `native` profile
 /// and lists `search-locations`; each `classpath:` location is the server's
@@ -1247,6 +1281,7 @@ pub fn assemble(
         &considered,
     );
     diagnostics.push(rta::apply(&mut b, &proof, &content.facts, &keys));
+    let data_rest = data_rest_services(&content.config, &spring, &service_of);
     let (route_diagnostics, endpoints) = routes::add_endpoints(
         &mut b,
         &routes::Inputs {
@@ -1258,6 +1293,7 @@ pub fn assemble(
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &spring.unread,
+            data_rest: &data_rest,
             specs: &content.specs,
             has_project: &has_project,
         },

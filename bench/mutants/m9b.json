@@ -99,6 +99,69 @@
   "what": "fmt qualifier check removed"
  },
  {
+  "id": "m272",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "        .find(|d| is_annotation(facts, d, SPRING_DATA_REST, \"RepositoryRestResource\"))\n",
+  "new": "        .find(|d| simple(&d.name) == \"RepositoryRestResource\")\n",
+  "what": "import check on the annotation removed"
+ },
+ {
+  "id": "m273",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    let Some(path) = literal_path(d).filter(|_| exported(d)) else {\n",
+  "new": "    let Some(path) = literal_path(d) else {\n",
+  "what": "exported = false ignored"
+ },
+ {
+  "id": "m274",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    (arg.literal && arg.items.is_empty() && !path.is_empty()).then(|| path.to_owned())\n",
+  "new": "    (arg.items.is_empty() && !path.is_empty()).then(|| path.to_owned())\n",
+  "what": "non-literal path accepted"
+ },
+ {
+  "id": "m275",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    let crud = bases.iter().any(|b| CRUD_BASES.contains(b));\n",
+  "new": "    let crud = true;\n",
+  "what": "item resources for a bare Repository base"
+ },
+ {
+  "id": "m276",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    if CRUD_METHODS.contains(&name) {\n",
+  "new": "    if false {\n",
+  "what": "CRUD-named finders emitted"
+ },
+ {
+  "id": "m277",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                            Certainty::Synthetic\n                        };\n",
+  "new": "                            Certainty::Exact\n                        };\n",
+  "what": "data-rest certainty Synthetic -> Exact"
+ },
+ {
+  "id": "m278",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                        let Some(base) = inputs.data_rest.get(&service) else {\n                            continue;\n                        };\n",
+  "new": "                        let base = inputs.data_rest.get(&service).unwrap_or(&None);\n",
+  "what": "data-rest dependency gate removed"
+ },
+ {
   "id": "m285",
   "crate": "rb-indexer",
   "test": "resolve::tests::go_methods_in_sibling_files_are_members",
@@ -124,5 +187,59 @@
   "old": "                let test_file = rb_model::is_test_path(path);\n",
   "new": "                let test_file = false;\n",
   "what": "test-file constants enter the table (amendment 3)"
+ },
+ {
+  "id": "m288",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "            Some(r) if !exported(r) => continue,\n",
+  "new": "            Some(r) if false => continue,\n",
+  "what": "method @RestResource(exported = false) ignored (amendment 4)"
+ },
+ {
+  "id": "m289",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "                    Some(p) => p,\n",
+  "new": "                    Some(_) => method.name.clone(),\n",
+  "what": "method @RestResource(path) ignored (amendment 4)"
+ },
+ {
+  "id": "m290",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    let collection = bases.iter().any(|b| *b != \"Repository\");\n",
+  "new": "    let collection = true;\n",
+  "what": "collection resource for a bare Repository base (amendment 4)"
+ },
+ {
+  "id": "m291",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                        let certainty = if configured.contains(&service) {\n",
+  "new": "                        let certainty = if false {\n",
+  "what": "RepositoryRestConfigurer cap removed (amendment 4)"
+ },
+ {
+  "id": "m292",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    (qualified || imported).then_some(base)\n",
+  "new": "    Some(base)\n",
+  "what": "repository base import check removed (amendment 4)"
+ },
+ {
+  "id": "m293",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                            Some(base) => format!(\"/{base}{route_path}\"),\n",
+  "new": "                            Some(_) => route_path.to_owned(),\n",
+  "what": "base path ignored (amendment 4)"
  }
 ]

@@ -44,6 +44,9 @@ pub(crate) struct Inputs<'a, 'r> {
     /// Services with Spring configuration M4a does not read (`config_unread`, evaluator pass 1,
     /// P7): their endpoints' deployed prefix may be missing.
     pub config_unread: &'a BTreeSet<String>,
+    /// Services whose build file names Spring Data REST (contract M9b D7), each with its
+    /// `spring.data.rest.base-path` when one is set; others get no data-rest endpoint.
+    pub data_rest: &'a BTreeMap<String, Option<String>>,
     /// OpenAPI/Swagger and `.proto` texts by path (contract M6f S3).
     pub specs: &'a BTreeMap<&'a str, String>,
     /// Whether a path lies in any project (a spec outside all projects stays endpoint-less).
@@ -508,6 +511,25 @@ pub(crate) fn add_endpoints(
     // Paths written as names fold across files, as client URLs do (contract M7c S1).
     let consts = Constants::new(inputs.files, inputs.index);
     let mut folder = rb_frameworks::fold::Folder::new(&consts);
+    // Services with a `RepositoryRestConfigurer`, which can move Spring Data REST's base path
+    // in code (contract M9b D7): their data-rest endpoints are capped, counted once.
+    let configured: BTreeSet<String> = inputs
+        .files
+        .iter()
+        .filter(|(_, (language, facts))| {
+            *language == Language::Java
+                && facts.definitions.iter().any(|d| {
+                    d.supertypes.iter().any(|s| {
+                        matches!(
+                            s.name.rsplit('.').next(),
+                            Some("RepositoryRestConfigurer" | "RepositoryRestConfigurerAdapter")
+                        )
+                    })
+                })
+        })
+        .map(|(path, _)| (inputs.service_of)(path))
+        .collect();
+    let mut base_unread: BTreeSet<String> = BTreeSet::new();
     for (&path, file) in inputs.routes {
         for d in &file.diagnostics {
             diagnostics.push(diag(d.kind, path, d.span, json!({ "detail": d.detail })));
@@ -553,6 +575,34 @@ pub(crate) fn add_endpoints(
             let mut paths: Vec<(String, Certainty, Option<String>, Vec<Evidence>)> = Vec::new();
             match r.base {
                 RouteBase::Root => match inputs.context_paths.get(&service) {
+                    // Contract M9b D7: Spring Data REST resources exist only where the build
+                    // names it, under the context and base paths, and are never `exact`.
+                    ctx if r.framework == Framework::SpringDataRest => {
+                        let Some(base) = inputs.data_rest.get(&service) else {
+                            continue;
+                        };
+                        let mut full = match base {
+                            Some(base) => format!("/{base}{route_path}"),
+                            None => route_path.to_owned(),
+                        };
+                        if let Some(ctx) = ctx {
+                            full = format!("{ctx}/{full}");
+                        }
+                        let certainty = if configured.contains(&service) {
+                            if base_unread.insert(service.clone()) {
+                                diagnostics.push(Diagnostic {
+                                    kind: "data_rest_base_unread".to_owned(),
+                                    path: Some(path.to_owned()),
+                                    span: None,
+                                    detail: json!({ "service": service }),
+                                });
+                            }
+                            Certainty::Heuristic
+                        } else {
+                            Certainty::Synthetic
+                        };
+                        paths.push((full, certainty, None, Vec::new()));
+                    }
                     Some(ctx) if r.framework == rb_frameworks::routes::Framework::Spring => {
                         paths.push((
                             format!("{ctx}/{route_path}"),
@@ -1215,6 +1265,9 @@ mod tests {
         );
     }
 
+    /// No service depends on Spring Data REST.
+    static NO_DATA_REST: BTreeMap<String, Option<String>> = BTreeMap::new();
+
     struct Built {
         graph: Graph,
         diagnostics: Vec<Diagnostic>,
@@ -1246,7 +1299,14 @@ mod tests {
             .iter()
             .map(|(p, t)| ((*p).to_owned(), (*t).to_owned()))
             .collect();
-        build_from(&facts, &specs, context_paths, &BTreeMap::new(), &[])
+        build_from(
+            &facts,
+            &specs,
+            context_paths,
+            &BTreeMap::new(),
+            &[],
+            &NO_DATA_REST,
+        )
     }
 
     fn build_from(
@@ -1255,6 +1315,7 @@ mod tests {
         context_paths: &[(&str, &str)],
         exact: &BTreeMap<(&str, Span), String>,
         config_unread: &[&str],
+        data_rest: &BTreeMap<String, Option<String>>,
     ) -> Built {
         let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
             .iter()
@@ -1330,6 +1391,7 @@ mod tests {
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &config_unread,
+            data_rest,
             specs: &spec_texts,
             has_project: &has_project,
         };
@@ -1773,6 +1835,7 @@ mod tests {
                 service_of: &service_of,
                 context_paths: &context,
                 config_unread: &unread,
+                data_rest: &NO_DATA_REST,
                 specs: &BTreeMap::new(),
                 has_project: &|_: &str| true,
             };
@@ -1834,6 +1897,7 @@ mod tests {
             service_of: &service_of,
             context_paths: &context,
             config_unread: &unread,
+            data_rest: &NO_DATA_REST,
             specs: &BTreeMap::new(),
             has_project: &|_: &str| true,
         };
@@ -1923,6 +1987,87 @@ mod tests {
             .find(|e| e.kind == EdgeKind::HandledBy && e.evidence.len() == 2)
             .expect("a's two registrations are one edge with two evidence rows");
         assert!(a.attrs.is_empty());
+    }
+
+    /// Contract M9b D7 (B12b): Spring Data REST resources are endpoints only in a service whose
+    /// build names Spring Data REST, always `synthetic` (`heuristic` beside a
+    /// `RepositoryRestConfigurer`, counted once), under the context path and the base path.
+    #[test]
+    fn data_rest_endpoints_are_synthetic() {
+        const IMPORTS: &str = "package p;\nimport org.springframework.data.repository.*;\nimport org.springframework.data.rest.core.annotation.RepositoryRestResource;\n";
+        let repo = |path: &str, base: &str, finder: &str| {
+            format!(
+                "{IMPORTS}@RepositoryRestResource(path = \"{path}\")\npublic interface R extends {base}<A, Long> {{\n    A {finder}(String v);\n}}\n"
+            )
+        };
+        let files = [
+            ("acct/src/A.java", repo("accounts", "CrudRepository", "findByEmail")),
+            // The same repository in a service without the dependency.
+            ("plain/src/P.java", repo("plain", "CrudRepository", "findByEmail")),
+            ("based/src/B.java", repo("things", "Repository", "findByName")),
+            ("conf/src/C.java", repo("confs", "PagingAndSortingRepository", "count")),
+            (
+                "conf/src/Cfg.java",
+                "package p;\nimport org.springframework.data.rest.webmvc.config.RepositoryRestConfigurer;\nclass Cfg implements RepositoryRestConfigurer {}\n".to_owned(),
+            ),
+        ];
+        let facts: Vec<(String, Language, FileFacts)> = files
+            .iter()
+            .map(|(p, src)| {
+                let f = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+                ((*p).to_owned(), Language::Java, f)
+            })
+            .collect();
+        let data_rest: BTreeMap<String, Option<String>> = [
+            ("acct".to_owned(), None),
+            ("based".to_owned(), Some("api".to_owned())),
+            ("conf".to_owned(), None),
+        ]
+        .into();
+        let built = build_from(
+            &facts,
+            &[],
+            &[("based", "/svc")],
+            &BTreeMap::new(),
+            &[],
+            &data_rest,
+        );
+        let mut exposes: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("EXPOSES"))
+            .collect();
+        exposes.sort();
+        assert_eq!(
+            exposes,
+            [
+                "EXPOSES acct -> HTTP DELETE /accounts/{} @acct [synthetic]",
+                "EXPOSES acct -> HTTP GET /accounts @acct [synthetic]",
+                "EXPOSES acct -> HTTP GET /accounts/search/findByEmail @acct [synthetic]",
+                "EXPOSES acct -> HTTP GET /accounts/{} @acct [synthetic]",
+                "EXPOSES acct -> HTTP PATCH /accounts/{} @acct [synthetic]",
+                "EXPOSES acct -> HTTP POST /accounts @acct [synthetic]",
+                "EXPOSES acct -> HTTP PUT /accounts/{} @acct [synthetic]",
+                "EXPOSES based -> HTTP GET /svc/api/things/search/findByName @based [synthetic]",
+                "EXPOSES conf -> HTTP GET /confs @conf [heuristic]",
+            ]
+        );
+        let handled: Vec<String> = edges(&built)
+            .into_iter()
+            .filter(|e| e.starts_with("HANDLED_BY"))
+            .collect();
+        assert!(
+            handled.contains(&"HANDLED_BY HTTP GET /accounts/search/findByEmail @acct -> rb-heuristic . . . `acct/src/A.java`/R#findByEmail(). [synthetic]".to_owned()),
+            "{handled:?}"
+        );
+        assert!(
+            handled.iter().all(|e| !e.ends_with("[exact]")),
+            "{handled:?}"
+        );
+        let unread: Vec<String> = diagnostics(&built)
+            .into_iter()
+            .filter(|d| d.starts_with("data_rest_base_unread"))
+            .collect();
+        assert_eq!(unread, [r#"data_rest_base_unread {"service":"conf"}"#]);
     }
 
     /// Contract M9b C2 (B9): a gin handler written as a method value of the receiver binds to
@@ -2044,6 +2189,7 @@ mod tests {
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &config_unread,
+            data_rest: &NO_DATA_REST,
             specs: &BTreeMap::new(),
             has_project: &|_: &str| true,
         };
@@ -2443,6 +2589,7 @@ mod tests {
                 service_of: &service_of,
                 context_paths: &context_paths,
                 config_unread: &config_unread,
+                data_rest: &NO_DATA_REST,
                 specs: &BTreeMap::new(),
                 has_project: &|_: &str| true,
             };
@@ -2526,7 +2673,14 @@ mod tests {
             )
         })
         .collect();
-        let built = build_from(&facts, &[], &[], &BTreeMap::new(), &["stats"]);
+        let built = build_from(
+            &facts,
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &["stats"],
+            &NO_DATA_REST,
+        );
         let attrs = |key: &str| {
             built
                 .graph
@@ -2601,7 +2755,7 @@ mod tests {
         let col = (start - app[..start].rfind('\n').unwrap() - 1) as i32;
         let handler = rb_syntax::symbol_keys("svc/handlers.ts", &facts[1].2)[0].clone();
         let certainty = |exact: &BTreeMap<(&str, Span), String>| {
-            let built = build_from(&facts, &[], &[], exact, &[]);
+            let built = build_from(&facts, &[], &[], exact, &[], &NO_DATA_REST);
             let g = &built.graph;
             let e = g
                 .edges()
