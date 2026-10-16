@@ -10,7 +10,9 @@ elsewhere cannot score a kill (M9a evaluator pass 1, E2); an rb-bench spec witho
 KILLED by any failing test (`test result: FAILED` or `panicked at`). Anything else is INVALID (a
 build error, failures only outside the filter, or a mutation that did not land): an
 uncompilable mutant gives no verdict. A spec whose text no longer occurs exactly once
-is reported as STALE (for example after `cargo fmt` reflows a line), never applied. Usage:
+is reported as STALE (for example after `cargo fmt` reflows a line), never applied. A spec whose
+filter selects a wall-clock test listed in `bench/mutants/timing_tests.txt` is INVALID before
+anything runs: such a test can fail under the battery's own load (contract M9b N2). Usage:
 python3 -I bench/mutants/run.py bench/mutants/m8a.json [id ...] [--jobs N]
 
 `--jobs N` runs specs in parallel, each in its own detached git worktree with its own
@@ -39,6 +41,27 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CACHE = ROOT / "var" / "bench" / "mutants-cache.json"
+TIMING = ROOT / "bench" / "mutants" / "timing_tests.txt"
+
+
+def timing_tests():
+    """`(crate, test name)` of every wall-clock test (`bench/mutants/timing_tests.py` writes it)."""
+    out = set()
+    for line in TIMING.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            crate, name = line.split()[:2]
+            out.add((crate, name))
+    return out
+
+
+def selects_timing(spec, timing):
+    """The listed wall-clock tests a spec's filter may select. cargo runs every test whose path
+    contains the filter; the list keeps names only, so a filter selects a test when its last
+    `::` segment occurs in the name (an over-approximation: it can only refuse more), and no
+    filter selects every test of the crate."""
+    crate, test = crate_of(spec), spec.get("test")
+    tail = test.rsplit("::", 1)[-1] if test else None
+    return sorted(n for c, n in timing if c == crate and (tail is None or tail in n))
 
 
 def _term(signum, _frame):
@@ -127,6 +150,9 @@ def one(workdir, targetdir, spec):
     crate = crate_of(spec)
     if crate != "rb-bench" and not spec.get("test"):
         return (spec["id"], "INVALID", f"{spec['what']} (no test filter)")
+    timed = selects_timing(spec, timing_tests())
+    if timed:
+        return (spec["id"], "INVALID", f"{spec['what']} (filter selects wall-clock tests: {', '.join(timed)})")
     path = workdir / "crates" / crate / "src" / spec["file"]
     text = path.read_text()
     if text.count(spec["old"]) != 1:

@@ -210,10 +210,10 @@ adds compiler-grade `exact` edges where a build can run in a container.
 
 | Language | Parsed | `exact` via SCIP | HTTP routes | HTTP / RPC clients | Dependency injection | Data access |
 |---|---|---|---|---|---|---|
-| **Java** | yes | scip-java (Maven, Gradle) | Spring MVC (class × method prefixes, context path; OpenAPI interfaces handled by implementors) | RestTemplate, WebClient, RestClient, Feign, gRPC stubs, OpenAPI-generated clients | Spring (stereotypes, `@Bean`, qualifiers, Lombok), Guice, Dagger, Spring XML | JPA + Spring Data (mappings, derived and `@Query` methods, JPQL), MyBatis XML mappers, SQL in strings |
+| **Java** | yes | scip-java (Maven, Gradle) | Spring MVC (class × method prefixes, context path; OpenAPI interfaces handled by implementors), Spring Data REST (`@RepositoryRestResource` with a literal `path`, `synthetic`) | RestTemplate, WebClient, RestClient, Feign, gRPC stubs, OpenAPI-generated clients | Spring (stereotypes, `@Bean`, qualifiers, Lombok), Guice, Dagger, Spring XML | JPA + Spring Data (mappings, derived and `@Query` methods, JPQL), MyBatis XML mappers, SQL in strings |
 | **TypeScript / JavaScript** | yes (TS, TSX, JS) | scip-typescript (npm, pnpm, Yarn) | Express (routers, mounts, constant paths, `require('express')()`; paths matched case-insensitively, as Express does, unless the router mentions `caseSensitive` or the app sets `case sensitive routing`: any value counts, since the value is not read) | fetch, axios (incl. shared default-exported instances), HTTP client wrappers, gRPC stubs, OpenAPI-generated clients | NestJS (providers, constructor points, tokens) | Prisma (models and queries), TypeORM (models only), SQL in strings |
 | **Python** | yes | scip-python | FastAPI (decorators, `APIRouter` prefixes, `include_router` across modules) | requests, httpx | none | SQLAlchemy and Django models (mappings, not queries), SQL in strings |
-| **Go** | yes | scip-go | gin (incl. groups passed as parameters), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings |
+| **Go** | yes | scip-go | gin (incl. groups passed as parameters, method-value handlers declared in other files), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings, incl. `fmt.Sprintf` with package-constant table names |
 | **Kotlin** | yes | scip-java (Gradle) | none | none | `beans { }` DSL (function and top-level `val` forms) | SQL in strings |
 | **C#** | yes (`heuristic` only) | none | none | none | .NET DI (`Add*`/`TryAdd*`/keyed, minimal hosting, implicit and global usings, implementation owners, constructor and `[Inject]` points) | SQL in strings |
 
@@ -314,7 +314,7 @@ troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 | `fixtures/` | 18 golden fixture repos (see the testing guide for the catalog) |
 | `tasks/`, `docs/`, `var/` | contracts, evaluations, lessons; design doc; per-milestone scripts/logs/evidence (gitignored scratch) |
 
-**Status: M0–M9a (M9a closed 2026-10-16; M9b next).** M0–M6l built the tool (foundations → structure → syntax →
+**Status: M0–M9a (M9a closed 2026-10-16; M9b in progress).** M0–M6l built the tool (foundations → structure → syntax →
 SQL/ORM → resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules
 breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7j fixed
 what a stress campaign over 18 fixtures and 13 public repositories found
@@ -326,6 +326,8 @@ case, spec-only routes, bounded hub answers, one index per repository,
 streamed caches). M8a–M8b added an accuracy benchmark with answer keys
 (`bench/`, `tasks/bench-findings.md`). M9a fixes the wrong `exact` edges
 it found (test-file routes, spec-only routes, literal-brace Spring paths,
-Go method `IMPLEMENTS`, config-server context paths) and is under
-evaluation. Detail per milestone: `CHANGELOG.md`,
+Go method `IMPLEMENTS`, config-server context paths). M9b adds recall it
+found missing: Go methods declared outside their type's file, `fmt.Sprintf`
+SQL with package constants, Spring Data REST endpoints; cross-module SCIP
+calls moved to M9c. Detail per milestone: `CHANGELOG.md`,
 `IMPLEMENT.md`, contracts in `tasks/`.

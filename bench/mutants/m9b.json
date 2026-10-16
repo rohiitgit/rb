@@ -241,5 +241,14 @@
   "old": "                            Some(base) => format!(\"/{base}{route_path}\"),\n",
   "new": "                            Some(_) => route_path.to_owned(),\n",
   "what": "base path ignored (amendment 4)"
+ },
+ {
+  "id": "m294",
+  "crate": "rb-indexer",
+  "test": "tests::config_server_context_path_values_are_trimmed",
+  "file": "lib.rs",
+  "old": "                        found = Some((file, value.trim().to_owned()));\n",
+  "new": "                        found = Some((file, value.to_owned()));\n",
+  "what": "remote context-path value not trimmed (N1; M9a pass 2's v03)"
  }
 ]

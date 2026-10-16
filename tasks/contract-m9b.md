@@ -279,6 +279,19 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Where each check lives.** The pack (rb-frameworks) emits `Framework::SpringDataRest` facts (endpoint attribute `frameworks: ["spring-data-rest"]`). The indexer gates them on the service's build file naming `spring-boot-starter-data-rest` or `spring-data-rest-webmvc` (m278). It prefixes the context path and `spring.data.rest.base-path`/`basePath` from the configuration already read (**m293**), and labels the endpoints `synthetic` (m277). A service with a definition whose supertype is `RepositoryRestConfigurer` (or `…Adapter`) caps them at `heuristic`, with one `data_rest_base_unread` per service (**m291**). `HANDLED_BY` is capped by the path certainty as before, so it is `synthetic` as well.
 - **Probe numbers** (`var/m9b/logs/p3-probe.txt`). 37 endpoints: 5 × 6 collection and item resources, plus **7** search resources, not the "6" of plan correction 9 (accounts 3, items 2, prices 1, stores 1; `CustomerRepository.findById` is a CRUD name). All 37 are `synthetic`, with 37 `synthetic` `HANDLED_BY`. All 37 carry `prefix_maybe_incomplete`, because each service has `config_unread` (bootstrap and YAML) under today's rule. FoodTray's two Feign calls now `CONSUMES` `/items/search/findByItemCode` and `/prices/search/findByItemCode` (heuristic).
 
+**Amendment 5 (2026-10-16, P5).** The code is closed. Logs are in `var/m9b/logs/`.
+- **`PIPELINE`** is `m9b-1`. No golden embeds it.
+- **N1.** `config_server_context_path_values_are_trimmed` (lib) pins that a remote value is trimmed: a quoted `" /acct "` becomes `/acct`, and a whitespace-only `"   "` clears a local path. **m294** is M9a pass 2's v03 (`value.to_owned()`) and is KILLED.
+- **N2.** `bench/mutants/timing_tests.py` writes the one list, `bench/mutants/timing_tests.txt`. A test is listed when an assertion (up to its `;`) reads the clock (`.elapsed()`, `Instant`) or bounds a duration (`<`/`>` with `elapsed` or `Duration`), or when its name holds `stay_fast`. It lists 17 tests in 7 crates. 8 more only print a duration and are recorded as comments. Two first-pass hits were false positives and are excluded by that rule: a stored `elapsed_ms` compared across runs (`projects.rs`) and a configured `Duration` (`orchestrate.rs`).
+- **N2 in the runner.** `bench/mutants/run.py` reports a spec whose filter selects a listed test as INVALID, before mutating anything. A filter selects a test when its last `::` segment occurs in the name; a spec without a filter selects its whole crate. On a scratch spec (`var/m9b/logs/n2-{before,after}.log`), the filters `stay_fast` and `resolve::tests::field_chains` were SURVIVED before the change and INVALID after it. A control filter stayed SURVIVED. No spec of `m8b.json`, `m9a.json` or `m9b.json` selects a listed test.
+- **Docs.** Design §5.4 (D5), §7 (D6) and §10.1 (D7), plus the §13 row "M9b, in progress". The usage guide gets the data-rest, `sql_folded` and Go-method entries and the N2 runner rule (§5.4). README: the Java and Go rows and the status line.
+- **m253 re-anchored.** M9a's m253 anchored on the bare text `trim_matches('/')`. P3's `data_rest_services` added a second occurrence, so the spec went STALE. It now anchors on its own line (`.map(|d| match d.trim_matches('/') {`) with the same mutation.
+- **Verification.**
+  - `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`: CLEAN.
+  - The real-Docker suite (usage guide §5.2, `test.log`) exited 0. Summed by awk over 26 `test result` lines: 1,135 passed, 0 failed, 0 ignored, and `grep -c 'skipping:'` is 0.
+  - `SELECT name, checkout FROM rb.repo` is identical before and after (`repo-diff-p5.txt` is empty), and equal to M9b's starting snapshot.
+  - Batteries, run after the last fmt and after the suite: m9b 28/28, m9a 31/31, m8b 29/29 KILLED; none STALE or INVALID.
+
 ## Result
 
 Not yet built.

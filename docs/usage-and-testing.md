@@ -178,6 +178,25 @@ Notes that bite newcomers:
   overrides local files, and an empty one (`context-path: ""`) puts the routes
   back at the root, as Spring serves them. Two such servers in
   one repository apply nothing (`config_server_ambiguous`).
+- A Spring Data repository annotated `@RepositoryRestResource(path = "accounts")`
+  in a service whose build file names `spring-boot-starter-data-rest` exposes
+  Spring Data REST's resources as `synthetic` endpoints: `GET`/`POST /accounts`,
+  `GET|PUT|PATCH|DELETE /accounts/{id}` (CRUD bases), and
+  `GET /accounts/search/findByEmail` per query method. The context path and
+  `spring.data.rest.base-path` prefix them. A `RepositoryRestConfigurer` in the
+  service, which can move the base path in code, caps them at `heuristic`
+  and adds one `data_rest_base_unread` diagnostic `{service}`. Unannotated
+  repositories and default paths are not read.
+- Go SQL built with `fmt.Sprintf("SELECT … FROM %s", usersTable)` is parsed with
+  the package constant folded in, when `usersTable` is a string `const`
+  declared once in the package (any file but tests) and nothing shadows it.
+  Only `%s`, `%v` and `%%` fold; anything else leaves the string as written.
+  The edges stay `heuristic`, and each file with a folded call gets one
+  `sql_folded` diagnostic `{sites, constants}`.
+- A Go method declared in another file than its type (`func (h *Handler)
+  signUp` in `auth.go`, `type Handler` in `handler.go`) is a member of the
+  type: `h.signUp()` and a gin handler `r.POST("/x", h.signUp)` resolve to it.
+  It is never a package-level name, so a bare `signUp()` does not.
 - Go with SCIP: a type that satisfies an interface gets `IMPLEMENTS` to it from
   the type (`Card# → Payer#`). scip-go also links each method to the interface
   method; that link gives no edge, since the interface method has no node, and
@@ -322,7 +341,15 @@ part of the tree.)
   failing test (`test result: FAILED` or `panicked at`). A build error, a
   spec with no filter outside rb-bench, failures only outside the filter, or
   a mutation that leaves the file unchanged, is INVALID: it gives no
-  verdict, so rewrite the spec.
+  verdict, so rewrite the spec. So is a spec whose filter selects a
+  wall-clock test, before anything runs: such a test can fail under the
+  battery's own load (M9b N2). The list lives in one place,
+  `bench/mutants/timing_tests.txt`, written by
+  `python3 -I bench/mutants/timing_tests.py`: every test whose assertion reads
+  the clock (`.elapsed()`, `Instant`) or bounds a duration, or whose name
+  contains `stay_fast` (17 at M9b). Re-run it after adding a timing test. A
+  filter selects a listed test when its last `::` segment occurs in the
+  test's name.
 - **Stress repros:** `tasks/stress-findings.md` lists each finding with its
   repro and what fixed it. Re-run the repros of the findings a change touches.
 

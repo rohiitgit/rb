@@ -211,8 +211,8 @@
   "crate": "rb-indexer",
   "test": "config_server_shared_files_set_client_context_paths",
   "file": "lib.rs",
-  "old": "trim_matches('/')",
-  "new": "trim_start_matches('/')",
+  "old": ".map(|d| match d.trim_matches('/') {",
+  "new": ".map(|d| match d.trim_start_matches('/') {",
   "what": "trailing slash kept on classpath dir (eval e07)"
  },
  {

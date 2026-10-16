@@ -139,7 +139,10 @@ use serde_json::{Value, json};
 /// endpoints are `synthetic` (B8), literal `"{id}"` paths (B12a), Go method sources take
 /// no interface bypass (B13), native config server context paths (B14).
 /// `m9a-2` an empty remote context path clears a lower one (M9a evaluator pass 1, E3).
-pub const PIPELINE: &str = "m9a-2";
+/// `m9b-1` Go methods declared outside their receiver type's file are its members and no
+/// package-level names (B9); `fmt.Sprintf` SQL folds package constants (B10); Spring Data REST
+/// repositories expose `synthetic` endpoints (B12b).
+pub const PIPELINE: &str = "m9b-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -3199,6 +3202,64 @@ mod tests {
         let root = g.nodes().iter().find(|n| n.key == ".").unwrap();
         assert_eq!(root.attrs["role"], "unassigned");
         assert_eq!(root.name, "(unassigned)");
+    }
+
+    /// Contract M9b N1 (M9a pass 2): a config server's context-path value is trimmed, so a
+    /// padded quoted value is its path and a whitespace-only one is empty and clears a local
+    /// context path, as for local files.
+    #[test]
+    fn config_server_context_path_values_are_trimmed() {
+        let shared = "config/src/main/resources/shared";
+        let config: BTreeMap<&str, String> = [
+            (
+                "config/src/main/resources/shared/acct-service.yml",
+                "server:\n  servlet:\n    context-path: \" /acct \"\n".to_owned(),
+            ),
+            (
+                "config/src/main/resources/shared/blank-service.yml",
+                "server:\n  servlet:\n    context-path: \"   \"\n".to_owned(),
+            ),
+        ]
+        .into();
+        let props = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let spring = SpringConfig {
+            properties: [
+                (
+                    "config".to_owned(),
+                    props(&[
+                        (ACTIVE_PROFILES_KEY, "native"),
+                        (
+                            "spring.cloud.config.server.native.search-locations",
+                            "classpath:/shared/",
+                        ),
+                    ]),
+                ),
+                (
+                    "acct".to_owned(),
+                    props(&[("spring.application.name", "acct-service")]),
+                ),
+                (
+                    "blank".to_owned(),
+                    props(&[("spring.application.name", "blank-service")]),
+                ),
+            ]
+            .into(),
+            clients: ["acct".to_owned(), "blank".to_owned()].into(),
+            ..SpringConfig::default()
+        };
+        assert!(config.keys().all(|k| k.starts_with(shared)));
+        let mut context_paths: BTreeMap<String, String> =
+            [("blank".to_owned(), "/local".to_owned())].into();
+        config_server_context_paths(&config, &spring, &mut context_paths);
+        assert_eq!(
+            context_paths,
+            BTreeMap::from([("acct".to_owned(), "/acct".to_owned())])
+        );
     }
 
     /// Contract M9a D4 (bench B14): a native config server's shared files set its clients'
