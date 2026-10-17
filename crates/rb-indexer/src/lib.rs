@@ -147,7 +147,11 @@ use serde_json::{Value, json};
 /// star imports, re-exports, module variables, `raise` and inherited `__init__` (B5); the
 /// `tier_b_forms` diagnostic; scip-go references into another job's module join its
 /// definitions as `synthetic` (`scip_cross_project`; B1).
-pub const PIPELINE: &str = "m9c-1";
+/// `m9c-2` M9c evaluator pass 1: a Go result named by a type parameter types nothing, a
+/// `select` receive declares its names (E1); Python's MRO is C3 for inherited `__init__` and
+/// `super()`, and the later of a named and a star import wins (E2); a tsconfig BOM and
+/// `"baseUrl": "."` (E4); a scip-go call whose callee is a type is a `REFERENCES` (E5).
+pub const PIPELINE: &str = "m9c-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -3798,6 +3802,8 @@ mod tests {
     /// job defines without anchoring it, or does not define, is `unanchored`; a namespace
     /// occurrence is never handed back; two jobs with the module path are `ambiguous`, with no
     /// edge. One `scip_cross_project` diagnostic per (from root, to root) counts each.
+    /// Amendment 3 (E3): a symbol under another manager is never handed back, and a failed job
+    /// is no candidate.
     #[test]
     fn external_references_join_another_projects_definitions() {
         const SRV: &str = "example.com/mm/server/v8";
@@ -3814,11 +3820,14 @@ mod tests {
             "\tother.F()\n",
             "\tmodel.Hidden()\n",
             "\tmodel.Gone()\n",
+            "\tmodel.Npm()\n",
+            "\tmodel.Kind(\"x\")\n",
             "\tmodel()\n",
             "}\n",
         ));
-        let public =
-            go("package model\n\nfunc NewId() {}\n\ntype User struct{}\n\nfunc Hidden() {}\n");
+        let public = go(
+            "package model\n\nfunc NewId() {}\n\ntype User struct{}\n\nfunc Hidden() {}\n\nfunc Npm() {}\n\ntype Kind string\n",
+        );
         let tools = go("package tools\n\nfunc Tool() {}\n");
         // The positive control: the references the rows below rely on are facts.
         let refs: BTreeSet<(&str, rb_syntax::RefKind)> = server
@@ -3834,6 +3843,8 @@ mod tests {
             ("F", rb_syntax::RefKind::Call),
             ("Hidden", rb_syntax::RefKind::Call),
             ("Gone", rb_syntax::RefKind::Call),
+            ("Npm", rb_syntax::RefKind::Call),
+            ("Kind", rb_syntax::RefKind::Call),
             ("model", rb_syntax::RefKind::Call),
         ] {
             assert!(refs.contains(&(name, kind)), "{name}: {refs:?}");
@@ -3843,16 +3854,20 @@ mod tests {
         let run = format!("scip-go gomod {SRV} . `{SRV}/app`/Run().");
         let server_sym = |name: &str| match name {
             "Run" => run.clone(),
-            "User" => external("User#"),
+            // `model.Kind("x")` converts to a type: a reference, never a call (amendment 3).
+            "User" | "Kind" => external(&format!("{name}#")),
             "Getenv" => "scip-go gomod github.com/golang/go/src go1.23 os/Getenv().".into(),
             "Do" => "scip-go gomod github.com/acme/dep v1.2.0 `github.com/acme/dep`/Do().".into(),
             "F" => "scip-go gomod example.com/nobody v0.1.0 `example.com/nobody`/F().".into(),
+            // The module path of an ok job under another manager: not a Go module, never handed
+            // back (amendment 3, E3).
+            "Npm" => format!("scip-go npm {PUB} v0.4.3 `{PUB}/model`/Npm()."),
             // A namespace symbol whose descriptor names the token.
             "model" => format!("scip-go gomod {PUB} v0.4.3 model/"),
             other => external(&format!("{other}().")),
         };
         let public_sym = |name: &str| match name {
-            "User" => own_public("User#"),
+            "User" | "Kind" => own_public(&format!("{name}#")),
             other => own_public(&format!("{other}().")),
         };
         // `Hidden().` is defined, but at the `package` keyword, where no Tree-sitter definition
@@ -3867,9 +3882,17 @@ mod tests {
             doc
         };
         let tools_sym = |name: &str| format!("scip-go gomod {TOOLS} . `{TOOLS}`/{name}().");
-        let assemble_with = |copy: bool| {
+        // A second job declaring `PUB`: none, ok, or failed (amendment 3, E3: only an ok job is
+        // a candidate).
+        #[derive(Clone, Copy, PartialEq)]
+        enum Dup {
+            None,
+            Ok,
+            Failed,
+        }
+        let assemble_with = |copy: Dup| {
             let mut roots = vec![("server", SRV), ("public", PUB), ("tools", TOOLS)];
-            if copy {
+            if copy != Dup::None {
                 roots.push(("copy", PUB));
             }
             let mut facts = BTreeMap::from([
@@ -3890,13 +3913,14 @@ mod tests {
                     vec![document_for("t.go", &tools, &tools_sym)],
                 ),
             ];
-            if copy {
+            if copy != Dup::None {
                 facts.insert("copy/model/m.go", (rb_syntax::Language::Go, &public));
-                scip.push(ok_project(
-                    "copy",
-                    "scip-go",
-                    vec![public_doc("model/m.go")],
-                ));
+                let mut project = ok_project("copy", "scip-go", vec![public_doc("model/m.go")]);
+                if copy == Dup::Failed {
+                    project.status = rb_scip::RunStatus::Failed(rb_scip::Phase::Index);
+                    project.index = None;
+                }
+                scip.push(project);
             }
             let manifest = Manifest {
                 commit_sha: "c".repeat(40),
@@ -3949,11 +3973,18 @@ mod tests {
             out.sort_by_key(|(path, detail)| (path.clone(), detail.to_string()));
             out
         };
-        let (g, diagnostics) = assemble_with(false);
+        let (g, diagnostics) = assemble_with(Dup::None);
+        let alone = (scip_edges(&g), cross(&diagnostics));
         assert_eq!(
             scip_edges(&g),
             [
-                // public's own reference at its type's name, exact as before.
+                // public's own references at its types' names, exact as before.
+                (
+                    own_public("Kind#"),
+                    EdgeKind::References,
+                    own_public("Kind#"),
+                    Certainty::Exact,
+                ),
                 (
                     own_public("User#"),
                     EdgeKind::References,
@@ -3969,6 +4000,12 @@ mod tests {
                 (
                     run.clone(),
                     EdgeKind::References,
+                    own_public("Kind#"),
+                    Certainty::Synthetic,
+                ),
+                (
+                    run.clone(),
+                    EdgeKind::References,
                     own_public("User#"),
                     Certainty::Synthetic,
                 ),
@@ -3978,17 +4015,20 @@ mod tests {
             cross(&diagnostics),
             [(
                 Some("server".to_owned()),
-                json!({"to": "public", "synthetic": 2, "ambiguous": 0, "unanchored": 2}),
+                json!({"to": "public", "synthetic": 3, "ambiguous": 0, "unanchored": 2}),
             )]
         );
-        // `references_external` keeps its meaning: all eight are still counted there.
+        // `references_external` keeps its meaning: all ten are still counted there.
         let external_count = diagnostics
             .iter()
             .find(|d| d.kind == "scip_status" && d.path.as_deref() == Some("server"))
             .map(|d| d.detail["coverage"]["references_external"].clone());
-        assert_eq!(external_count, Some(json!(8)));
-        // A second job with the module path: no edge, and each candidate pair counts it.
-        let (g, diagnostics) = assemble_with(true);
+        assert_eq!(external_count, Some(json!(10)));
+        // A failed second job with the module path is no candidate: the joins stand as alone.
+        let (g, diagnostics) = assemble_with(Dup::Failed);
+        assert_eq!((scip_edges(&g), cross(&diagnostics)), alone);
+        // An ok second job with the module path: no edge, and each candidate pair counts it.
+        let (g, diagnostics) = assemble_with(Dup::Ok);
         assert!(
             scip_edges(&g)
                 .iter()
@@ -4001,11 +4041,11 @@ mod tests {
             [
                 (
                     Some("server".to_owned()),
-                    json!({"to": "copy", "synthetic": 0, "ambiguous": 4, "unanchored": 0}),
+                    json!({"to": "copy", "synthetic": 0, "ambiguous": 5, "unanchored": 0}),
                 ),
                 (
                     Some("server".to_owned()),
-                    json!({"to": "public", "synthetic": 0, "ambiguous": 4, "unanchored": 0}),
+                    json!({"to": "public", "synthetic": 0, "ambiguous": 5, "unanchored": 0}),
                 ),
             ]
         );

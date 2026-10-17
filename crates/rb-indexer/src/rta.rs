@@ -395,18 +395,14 @@ impl AliasMaps {
     }
 }
 
-/// Joins a manifest-relative path onto a repo-relative dir.
+/// Joins a manifest-relative path onto a repo-relative dir, without `.` or empty segments
+/// (`"baseUrl": "."` names the dir itself; contract M9c amendment 3, E4). `..` is kept.
 fn join_dir(dir: &str, path: &str) -> String {
-    let path = path.trim_start_matches("./");
-    if dir.is_empty() {
-        path.trim_end_matches('/').to_owned()
-    } else {
-        format!(
-            "{}/{}",
-            dir.trim_end_matches('/'),
-            path.trim_end_matches('/')
-        )
-    }
+    dir.split('/')
+        .chain(path.split('/'))
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Splits a pattern with at most one `*` against text: the matched middle, or
@@ -1382,6 +1378,19 @@ mod tests {
                     "frontend/tsconfig.json",
                     r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}"#,
                 ),
+                // Amendment 3 (E4): a leading BOM, and the canonical `"baseUrl": "."`.
+                (
+                    "bom/tsconfig.json",
+                    "\u{feff}{\"compilerOptions\": {\"paths\": {\"@/*\": [\"./src/*\"]}}}",
+                ),
+                (
+                    "dot/tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"], "~/*": ["./lib/./x/*"]}}}"#,
+                ),
+                (
+                    "tsconfig.json",
+                    r##"{"compilerOptions": {"baseUrl": ".", "paths": {"#/*": ["src/*"]}}}"##,
+                ),
                 (
                     "web/package.json",
                     "{ \"name\": \"@acme/p\", \"main\": \"./index.js\", }",
@@ -1406,6 +1415,23 @@ mod tests {
         );
         assert_eq!(maps.resolve("frontend/src/a.ts", "@/utils/helper"), None);
         assert_eq!(maps.resolve("web/src/a.ts", "@acme/p"), None);
+        assert_eq!(
+            maps.resolve("bom/src/a.ts", "@/utils/helper"),
+            Some("bom/src/utils/helper".to_owned())
+        );
+        // `.` segments are no path: `dot/./src/…` was a path no probe finds.
+        assert_eq!(
+            maps.resolve("dot/src/a.ts", "@/utils/helper"),
+            Some("dot/src/utils/helper".to_owned())
+        );
+        assert_eq!(
+            maps.resolve("dot/src/a.ts", "~/y"),
+            Some("dot/lib/x/y".to_owned())
+        );
+        assert_eq!(
+            maps.resolve("src/a.ts", "#/util/x"),
+            Some("src/util/x".to_owned())
+        );
     }
 
     /// Invariant 9: alias resolution grows linearly (counted, 4× → ≤ 5×).

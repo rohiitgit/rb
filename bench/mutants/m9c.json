@@ -22,9 +22,9 @@
   "crate": "rb-indexer",
   "test": "resolve::tests::default_imports_resolve_to_the_default_export",
   "file": "resolve.rs",
-  "old": "                    for n in import.names.iter().filter(|n| n.local == name) {\n",
-  "new": "                    for n in import.names.iter().filter(|n| n.local == name && n.name != \"default\") {\n",
-  "what": "default import names skipped again"
+  "old": "                    for n in import.names.iter().filter(|n| n.local == name) {\n                        if n.name != \"default\" {\n",
+  "new": "                    for n in import.names.iter().filter(|n| n.local == name && n.name != \"default\") {\n                        if n.name != \"default\" {\n",
+  "what": "default import names skipped again (re-anchored, amendment 3)"
  },
  {
   "id": "m303",
@@ -220,45 +220,45 @@
   "crate": "rb-indexer",
   "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
   "file": "resolve.rs",
-  "old": "                let types = self.supertypes(class);\n                if !types.is_empty() {\n                    self.note(\"super_call\");\n",
-  "new": "                let types = vec![class];\n                if !types.is_empty() {\n                    self.note(\"super_call\");\n",
-  "what": "`super()` resolves to the enclosing class"
+  "old": "        let tail: Vec<Sym<'a>> = self.python_mro(class).into_iter().skip(1).collect();\n",
+  "new": "        let tail: Vec<Sym<'a>> = self.python_mro(class).into_iter().skip(0).collect();\n",
+  "what": "`super()` resolves to the enclosing class (re-anchored on python_super, amendment 3)"
  },
  {
   "id": "m325",
   "crate": "rb-indexer",
   "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
   "file": "resolve.rs",
-  "old": "        if self.language(path) == Language::Python {\n            let found = self.imported(path, name, want, true);\n",
-  "new": "        if self.language(path) == Language::Python && false {\n            let found = self.imported(path, name, want, true);\n",
-  "what": "star import ignored"
+  "old": "        if import.wildcard {\n            if name.starts_with('_') {\n",
+  "new": "        if import.wildcard {\n            if true {\n",
+  "what": "star import ignored (re-anchored, amendment 3)"
  },
  {
   "id": "m326",
   "crate": "rb-indexer",
   "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
   "file": "resolve.rs",
-  "old": "                    if !name.starts_with('_') {\n                        for &f in targets.iter().filter(|&&f| !self.defines_all(f)) {\n",
-  "new": "                    if true {\n                        for &f in targets.iter().filter(|&&f| !self.defines_all(f)) {\n",
-  "what": "`_` names exported by a star import"
+  "old": "            if name.starts_with('_') {\n                return Vec::new();\n            }\n            return targets\n",
+  "new": "            if false {\n                return Vec::new();\n            }\n            return targets\n",
+  "what": "`_` names exported by a star import (re-anchored, amendment 3)"
  },
  {
   "id": "m327",
   "crate": "rb-indexer",
   "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
   "file": "resolve.rs",
-  "old": "                        for &f in targets.iter().filter(|&&f| !self.defines_all(f)) {\n",
-  "new": "                        for &f in targets.iter() {\n",
-  "what": "`__all__` targets not skipped"
+  "old": "                .filter(|&&f| !self.defines_all(f))\n                .flat_map(|&f| self.python_exported(f, name, want, true))\n",
+  "new": "                .filter(|_| true)\n                .flat_map(|&f| self.python_exported(f, name, want, true))\n",
+  "what": "`__all__` targets not skipped (re-anchored, amendment 3)"
  },
  {
   "id": "m328",
   "crate": "rb-indexer",
   "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
   "file": "resolve.rs",
-  "old": "        if depth >= Self::MAX_REEXPORT_DEPTH {\n",
-  "new": "        if depth >= Self::MAX_REEXPORT_DEPTH || depth == 0 {\n",
-  "what": "re-exports not followed"
+  "old": "        if depth < Self::MAX_REEXPORT_DEPTH {\n",
+  "new": "        if depth < Self::MAX_REEXPORT_DEPTH && depth > 0 {\n",
+  "what": "re-exports not followed (re-anchored, amendment 3)"
  },
  {
   "id": "m329",
@@ -340,5 +340,167 @@
   "old": "        self.0.borrow_mut().insert(symbol.to_owned(), forms);\n",
   "new": "        drop(forms);\n",
   "what": "name memo never stores: every question parses its symbol again (P7b)"
+ },
+ {
+  "id": "m342",
+  "crate": "rb-syntax",
+  "test": "tests::go_type_parameters_are_facts",
+  "file": "decorations.rs",
+  "old": "    if language == Language::Go {\n        return go_type_params(def, source);\n    }\n",
+  "new": "",
+  "what": "Go type parameters not recorded (E1)"
+ },
+ {
+  "id": "m343",
+  "crate": "rb-syntax",
+  "test": "tests::go_type_parameters_are_facts",
+  "file": "decorations.rs",
+  "old": "    if def.kind() != \"method_declaration\" {\n        return Vec::new();\n    }\n",
+  "new": "    if def.kind() == def.kind() {\n        return Vec::new();\n    }\n",
+  "what": "a method's receiver type arguments not read (E1)"
+ },
+ {
+  "id": "m344",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_call_results_and_segments_type_receivers",
+  "file": "resolve.rs",
+  "old": "                .filter(|t| !def.type_params.iter().any(|p| p == t))\n",
+  "new": "",
+  "what": "a Go result named by a type parameter types a same-named package type (E1)"
+ },
+ {
+  "id": "m345",
+  "crate": "rb-syntax",
+  "test": "bindings::tests::go_ranges_multi_assignment_type_switches_and_closures",
+  "file": "bindings.rs",
+  "old": "            let declares = node.children(&mut c).any(|n| n.kind() == \":=\");\n",
+  "new": "            let declares = node.children(&mut c).any(|n| n.kind() != \":=\");\n",
+  "what": "`case v = <-ch` (an assignment) declares too (E1)"
+ },
+ {
+  "id": "m346",
+  "crate": "rb-syntax",
+  "test": "bindings::tests::go_ranges_multi_assignment_type_switches_and_closures",
+  "file": "bindings.rs",
+  "old": "        \"receive_statement\" => {\n",
+  "new": "        \"receive_statement_\" => {\n",
+  "what": "a select receive declares nothing (E1)"
+ },
+ {
+  "id": "m347",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_raise_and_inherited_init_construct",
+  "file": "resolve.rs",
+  "old": "        if self.language(t.0) == Language::Python {\n            return self\n                .python_mro(t)\n",
+  "new": "        if self.language(t.0) == Language::Kotlin {\n            return self\n                .python_mro(t)\n",
+  "what": "Python members breadth-first again, not by MRO (E2)"
+ },
+ {
+  "id": "m348",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_raise_and_inherited_init_construct",
+  "file": "resolve.rs",
+  "old": "            Some(mro) if whole => mro,\n",
+  "new": "            Some(mro) if whole && false => mro,\n",
+  "what": "C3 merge replaced by left-first depth-first (E2)"
+ },
+ {
+  "id": "m349",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "            (Some(\"super()\"), _) if self.language(path) == Language::Python => {\n",
+  "new": "            (Some(\"super()\"), _) if self.language(path) == Language::Kotlin => {\n",
+  "what": "super() through every direct supertype again, not the MRO's next class (N4)"
+ },
+ {
+  "id": "m350",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "            if !found.is_empty() && best.as_ref().is_none_or(|(s, ..)| start > *s) {\n",
+  "new": "            if !found.is_empty() && best.as_ref().is_none() {\n",
+  "what": "module level: the first binding statement wins, not the last (E2)"
+ },
+ {
+  "id": "m351",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "                if best.as_ref().is_some_and(|(s, _)| start <= *s) {\n",
+  "new": "                if best.is_some() {\n",
+  "what": "re-export owners: the first statement wins, not the last (E2)"
+ },
+ {
+  "id": "m352",
+  "crate": "rb-scip",
+  "test": "jobs::tests::tsconfig_jsonc_resolves_aliases",
+  "file": "jobs.rs",
+  "old": "    let text = strip_json_comments(text.strip_prefix('\\u{feff}').unwrap_or(text));\n",
+  "new": "    let text = strip_json_comments(text);\n",
+  "what": "a tsconfig's leading BOM kept (E4)"
+ },
+ {
+  "id": "m353",
+  "crate": "rb-indexer",
+  "test": "rta::tests::tsconfig_jsonc_resolves_aliases",
+  "file": "rta.rs",
+  "old": "        .filter(|s| !s.is_empty() && *s != \".\")\n",
+  "new": "        .filter(|s| !s.is_empty())\n",
+  "what": "join_dir keeps `.` segments (`\"baseUrl\": \".\"`) (E4)"
+ },
+ {
+  "id": "m354",
+  "crate": "rb-indexer",
+  "test": "scip::tests::go_conversions_to_types_are_references_not_calls",
+  "file": "scip.rs",
+  "old": "                && converts()\n",
+  "new": "                && false\n",
+  "what": "a scip-go call to a type stays CALLS (E5)"
+ },
+ {
+  "id": "m355",
+  "crate": "rb-indexer",
+  "test": "scip::tests::go_conversions_to_types_are_references_not_calls",
+  "file": "scip.rs",
+  "old": "                symbol.ends_with('#')\n                    || locals[di]",
+  "new": "                symbol.ends_with('#')\n                    || false && locals[di]",
+  "what": "a conversion to a local type stays CALLS (E5)"
+ },
+ {
+  "id": "m356",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_call_results_and_segments_type_receivers",
+  "file": "resolve.rs",
+  "old": "            b')' | b']' | b'}' => depth = depth.saturating_sub(1),\n            b'\"' | b'\\'' | b'`' => i = literal_end(bytes, i),\n",
+  "new": "            b')' | b']' | b'}' => depth = depth.saturating_sub(1),\n            b'\"' | b'\\'' | b'`' => {}\n",
+  "what": "split_top no longer skips string/rune literals (a bracket inside a string unbalances the split) (evaluator pass 1 e1, E3)"
+ },
+ {
+  "id": "m357",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_call_results_and_segments_type_receivers",
+  "file": "resolve.rs",
+  "old": "                    return (i == bytes.len() - 1).then_some(name);\n",
+  "new": "                    return Some(name);\n",
+  "what": "call_segment accepts f(a)(b) and f(a).x as a call to f (evaluator pass 1 e2, E3)"
+ },
+ {
+  "id": "m358",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::default_imports_resolve_to_the_default_export",
+  "file": "resolve.rs",
+  "old": "                            language,\n                            Language::TypeScript | Language::Tsx | Language::JavaScript\n",
+  "new": "                            language,\n                            Language::TypeScript | Language::Tsx\n",
+  "what": "D2 default imports no longer resolve in JavaScript files (evaluator pass 1 e4, E3)"
+ },
+ {
+  "id": "m359",
+  "crate": "rb-indexer",
+  "test": "tests::external_references_join_another_projects_definitions",
+  "file": "lib.rs",
+  "old": "            p.indexer == \"scip-go\"\n                && matches!((&p.status, &p.index), (rb_scip::RunStatus::Ok, Some(_)))\n",
+  "new": "            p.indexer == \"scip-go\"\n                && true\n",
+  "what": "D8' candidate jobs include failed scip-go jobs (a failed duplicate makes every join ambiguous) (evaluator pass 1 e8, E3)"
  }
 ]

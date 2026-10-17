@@ -45,7 +45,8 @@ Environment set in the image:
 
 ## Self-test
 
-The build ends with an offline self-test: scip-go indexes a module whose `main` calls
+The build ends with a self-test that needs no network (`docker build` runs it with the build's
+network all the same): scip-go indexes a module whose `main` calls
 `os.Getenv`, and the build fails unless the index holds the symbol
 `scip-go gomod github.com/golang/go/src <go version> os/Getenv().`. An x/tools that cannot read
 the toolchain's export data writes no such symbol (`rb-scip-go:0.2.7` fails the same test), so

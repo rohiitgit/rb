@@ -211,11 +211,17 @@ Notes that bite newcomers:
   seen by test files only). Embedding never makes `IMPLEMENTS`.
 - TypeScript `paths` are read from `tsconfig.json` files with comments and
   trailing commas, and `import f from './m'` resolves to what `m` exports as
-  default. Python resolves `super().m()`, names from `from m import *` (not
-  `_` names, and not from a module that defines `__all__`), names a package's
-  `__init__.py` only re-imports, an imported module-level instance
-  (`smth = Smth()` then `smth.f()`), `raise A` as a construction of `A`, and a
-  subclass constructor call that reaches an inherited `__init__`.
+  default (a leading byte order mark and `"baseUrl": "."` are read as `tsc`
+  reads them). Python resolves `super().m()` (the next class with an `m` in
+  the class's method resolution order, C3 as Python computes it), names from
+  `from m import *` (not `_` names, and not from a module that defines
+  `__all__`; of a star import, a named import and a definition of one name,
+  the later statement wins), names a package's `__init__.py` only re-imports,
+  an imported module-level instance (`smth = Smth()` then `smth.f()`), `raise
+  A` as a construction of `A`, and a subclass constructor call that reaches an
+  inherited `__init__` (the first in the MRO). A Go call result named by one
+  of the function's type parameters (`func Id[T any](x T) T`) types nothing,
+  and `case v := <-ch:` declares `v` for its case.
   All these edges are `heuristic`. Each file that used one of these forms gets one
   `tier_b_forms` diagnostic counting the references per form: `return_type`,
   `call_segment`, `type_alias`, `embedded`, `package_var`, `default_import`,
@@ -232,6 +238,12 @@ Notes that bite newcomers:
   has no definition node for the name, for example a name the required
   version has and the in-repo code does not. `rb status`'s
   `exact calls (scip)` counts `exact` calls only, so these are not in it.
+  These joined edges enter the bench's SCIP agreement reference like every
+  `scip` call; a seeded 60-edge sample of them was judged blind once
+  (`bench/samples/synthetic-d8.tsv`, not read by `rb-bench`).
+- Go with SCIP: a call whose callee is a type (`model.ChannelType(s)`, a
+  conversion: Go has no constructors) is a `REFERENCES` edge to the type,
+  within one module or across modules, never `CALLS`.
 - Go with SCIP: a type that satisfies an interface gets `IMPLEMENTS` to it from
   the type (`Card# → Payer#`). scip-go also links each method to the interface
   method; that link gives no edge, since the interface method has no node, and
@@ -429,6 +441,11 @@ cargo run -q -p rb-bench -- compare bench/scoreboard/m8a.json bench/scoreboard/m
   `sql`, `orm`, `routes`, `manifest`) by the M3b rule, and judges' verdicts
   live in `bench/samples/exact.tsv` (keyed by rb's edge identity and pin, so
   they carry over); the gate fails while a drawn edge lacks a verdict.
+  Judges are told to assume each edge false and see only the edge list and the
+  pinned checkout. For a Go `IMPLEMENTS`, the prompt states scip-go's
+  convention: `T` implements `I` when the method set of `T` or of `*T`
+  satisfies `I` (M9c amendment 3; the template is in
+  `bench/probe/m9c_synthetic_sample.py`).
   Verdicts are appended, never edited. Adding any changes the
   `exact:verdicts` key hash, so `compare` against the previous close exits 2.
   Re-score the base first: run `rb-bench score` with HEAD's `rb-bench` over

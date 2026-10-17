@@ -1528,6 +1528,22 @@ fn go<'t>(node: Node<'t>, source: &[u8], out: &mut Vec<RawBinding<'t>>) {
                 }
             }
         }
+        // `case v, ok := <-ch:` declares its names for the case (contract M9c amendment 3,
+        // E1); `case v = <-ch:` assigns.
+        "receive_statement" => {
+            let mut c = node.walk();
+            let declares = node.children(&mut c).any(|n| n.kind() == ":=");
+            if let (true, Some(left)) = (declares, node.child_by_field_name("left")) {
+                let mut lc = left.walk();
+                let names: Vec<Node<'t>> = left
+                    .named_children(&mut lc)
+                    .filter(|n| n.kind() == "identifier")
+                    .collect();
+                for n in names {
+                    push(out, Some(n), None, false, node, node, source);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1847,7 +1863,9 @@ func f() {
 
     #[test]
     fn go_ranges_multi_assignment_type_switches_and_closures() {
-        let src = "package p\nfunc f() {\n  for _, user := range users { }\n  a, client := g()\n  x, y := Thing{}, Thing{}\n  switch v := x.(type) { case int: }\n  go func(c int) { c := c.Copy() }()\n  if v, ok := m[k]; ok { }\n}\n";
+        // A `select` receive declares with `:=` (contract M9c amendment 3, E1); `o = <-ch`
+        // assigns and a send declares nothing.
+        let src = "package p\nfunc f() {\n  for _, user := range users { }\n  a, client := g()\n  x, y := Thing{}, Thing{}\n  switch v := x.(type) { case int: }\n  go func(c int) { c := c.Copy() }()\n  if v, ok := m[k]; ok { }\n  select {\n  case cfg := <-ch:\n  case n, ok2 := <-ch:\n  case o = <-ch:\n  case ch <- 1:\n  }\n}\n";
         assert_eq!(
             bound(Language::Go, src),
             [
@@ -1861,7 +1879,10 @@ func f() {
                 "c: ? in f",
                 "c: ? in f",
                 "v: ? in f",
-                "ok: ? in f"
+                "ok: ? in f",
+                "cfg: ? in f",
+                "n: ? in f",
+                "ok2: ? in f"
             ]
         );
     }

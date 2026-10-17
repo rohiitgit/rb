@@ -264,6 +264,9 @@ pub(crate) struct Index<'a> {
     imports: BTreeMap<&'a str, Vec<Vec<&'a str>>>,
     /// Resolved direct supertypes of a type (memoised; resolving them never needs members).
     supers: RefCell<BTreeMap<Sym<'a>, Vec<Sym<'a>>>>,
+    /// Python: each class's method resolution order, once computed without a cut (contract M9c
+    /// amendment 3).
+    mros: RefCell<BTreeMap<Sym<'a>, Vec<Sym<'a>>>>,
     /// Type resolutions in progress. Bindings can make them cyclic (`session =
     /// session.Session()`): a resolution already in progress finds nothing.
     resolving: RefCell<BTreeSet<(&'a str, Option<usize>, String)>>,
@@ -546,6 +549,33 @@ fn go_named_type(t: &str) -> Option<&str> {
     named.then_some(t)
 }
 
+/// Where a Python top-level name comes from: (module, the name there, reached through a star
+/// import).
+type Owner<'a> = (&'a str, String, bool);
+
+/// C3's merge (contract M9c amendment 3, E2): `head`, then repeatedly the first head of `seqs`
+/// that is in no sequence's tail, taken off every sequence it heads; `None` when no head
+/// qualifies (an inconsistent hierarchy).
+fn c3_merge<T: Copy + PartialEq>(head: T, mut seqs: Vec<Vec<T>>) -> Option<Vec<T>> {
+    let mut out = vec![head];
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            return Some(out);
+        }
+        let next = seqs
+            .iter()
+            .map(|s| s[0])
+            .find(|h| !seqs.iter().any(|s| s[1..].contains(h)))?;
+        out.push(next);
+        for s in &mut seqs {
+            if s[0] == next {
+                s.remove(0);
+            }
+        }
+    }
+}
+
 impl<'a> Index<'a> {
     /// Exact manifest resolution for bare specifiers (contract M6c S4).
     /// Default (no manifests) resolves nothing, as before.
@@ -678,6 +708,7 @@ impl<'a> Index<'a> {
             scopes,
             imports,
             supers: RefCell::new(BTreeMap::new()),
+            mros: RefCell::new(BTreeMap::new()),
             resolving: RefCell::new(BTreeSet::new()),
             defs_by_name,
             locals: raw_locals
@@ -1014,17 +1045,25 @@ impl<'a> Index<'a> {
                 return (found, TypeLevel::Local);
             }
         }
-        let found = self.named(path, None, name, want);
-        if !found.is_empty() {
-            return (found, TypeLevel::Local);
+        // Python: the module-level statement that binds the name last (contract M9c D5,
+        // amendment 3).
+        if language == Language::Python {
+            if let Some(hit) = self.python_module_level(path, name, want) {
+                return hit;
+            }
+        } else {
+            let found = self.named(path, None, name, want);
+            if !found.is_empty() {
+                return (found, TypeLevel::Local);
+            }
+            // Java (JLS §6.4.1): single-type imports shadow the package, which shadows
+            // on-demand (wildcard) imports. Elsewhere imports come before the package.
+            let found = self.imported(path, name, want, false);
+            if !found.is_empty() {
+                return (found, TypeLevel::Import);
+            }
         }
-        // Java (JLS §6.4.1): single-type imports shadow the package, which shadows on-demand
-        // (wildcard) imports. Elsewhere imports come before the package.
-        let found = self.imported(path, name, want, false);
-        if !found.is_empty() {
-            return (found, TypeLevel::Import);
-        }
-        if self.language(path) == Language::Java {
+        if language == Language::Java {
             let found = self.same_package(path, name, want);
             if !found.is_empty() {
                 return (found, TypeLevel::SamePackage);
@@ -1034,13 +1073,6 @@ impl<'a> Index<'a> {
                 return (found, TypeLevel::ImportOnDemand);
             }
             return (Vec::new(), TypeLevel::Miss);
-        }
-        // Python: star imports after own definitions and named imports (contract M9c D5).
-        if self.language(path) == Language::Python {
-            let found = self.imported(path, name, want, true);
-            if !found.is_empty() {
-                return (found, TypeLevel::ImportOnDemand);
-            }
         }
         let found = self.same_package(path, name, want);
         if !found.is_empty() {
@@ -1121,12 +1153,7 @@ impl<'a> Index<'a> {
             if language == Language::Java && import.wildcard != on_demand {
                 continue;
             }
-            // Python: star imports are a level of their own, after named imports (contract M9c
-            // D5).
-            if language == Language::Python && import.wildcard != on_demand {
-                continue;
-            }
-            if !matches!(language, Language::Java | Language::Python) && on_demand {
+            if language != Language::Java && on_demand {
                 continue;
             }
             match language {
@@ -1155,23 +1182,9 @@ impl<'a> Index<'a> {
                             .flat_map(|(m, _)| self.named(f, Some(m), name, want))
                     }));
                 }
-                // `from m import *` brings `m`'s top-level names not starting with `_`, unless `m`
-                // lists its own in `__all__` (contract M9c D5).
-                Language::Python if import.wildcard => {
-                    if !name.starts_with('_') {
-                        for &f in targets.iter().filter(|&&f| !self.defines_all(f)) {
-                            out.extend(self.python_exported(f, name, want, true));
-                        }
-                    }
-                }
                 _ => {
                     for n in import.names.iter().filter(|n| n.local == name) {
-                        if language == Language::Python {
-                            // A name the target only imports is followed (contract M9c D5).
-                            for &f in targets {
-                                out.extend(self.python_exported(f, &n.name, want, false));
-                            }
-                        } else if n.name != "default" {
+                        if n.name != "default" {
                             out.extend(top(&n.name));
                         } else if matches!(
                             language,
@@ -1194,6 +1207,79 @@ impl<'a> Index<'a> {
             }
         }
         out
+    }
+
+    /// Python `name` at module level in `path` (contract M9c D5, amendment 3, E2): of the
+    /// file's own top-level definitions of the name, each named import of it and each star
+    /// import that brings it, the statement that starts last wins, as Python rebinds the name
+    /// in source order. Only candidates that resolve compete; the winner's forms are counted.
+    fn python_module_level(
+        &self,
+        path: &'a str,
+        name: &str,
+        want: fn(DefKind) -> bool,
+    ) -> Option<(Vec<Sym<'a>>, TypeLevel)> {
+        type Candidate<'a> = ((i32, i32), Vec<Sym<'a>>, TypeLevel, BTreeSet<&'static str>);
+        let mut best: Option<Candidate<'a>> = None;
+        let mut offer = |start: (i32, i32), found: Vec<Sym<'a>>, level, forms| {
+            if !found.is_empty() && best.as_ref().is_none_or(|(s, ..)| start > *s) {
+                best = Some((start, found, level, forms));
+            }
+        };
+        let own = self.named(path, None, name, want);
+        if let Some(start) = own
+            .iter()
+            .map(|&s| (self.def(s).span[0], self.def(s).span[1]))
+            .max()
+        {
+            offer(start, own, TypeLevel::Local, BTreeSet::new());
+        }
+        for (import, targets) in self.facts(path).imports.iter().zip(&self.imports[path]) {
+            let outer = self.forms.take();
+            let found = self.python_import_brings(import, targets, name, want);
+            let forms = self.forms.replace(outer);
+            let level = if import.wildcard {
+                TypeLevel::ImportOnDemand
+            } else {
+                TypeLevel::Import
+            };
+            offer((import.span[0], import.span[1]), found, level, forms);
+        }
+        let (_, found, level, forms) = best?;
+        self.forms.borrow_mut().extend(forms);
+        Some((found, level))
+    }
+
+    /// What one Python import statement binds `name` to (contract M9c D5): a named import of
+    /// it, followed through the target's re-exports; `from m import *` brings `m`'s top-level
+    /// names not starting with `_`, unless `m` lists its own in `__all__`.
+    fn python_import_brings(
+        &self,
+        import: &rb_syntax::Import,
+        targets: &[&'a str],
+        name: &str,
+        want: fn(DefKind) -> bool,
+    ) -> Vec<Sym<'a>> {
+        if import.wildcard {
+            if name.starts_with('_') {
+                return Vec::new();
+            }
+            return targets
+                .iter()
+                .filter(|&&f| !self.defines_all(f))
+                .flat_map(|&f| self.python_exported(f, name, want, true))
+                .collect();
+        }
+        import
+            .names
+            .iter()
+            .filter(|n| n.local == name)
+            .flat_map(|n| {
+                targets
+                    .iter()
+                    .flat_map(|&f| self.python_exported(f, &n.name, want, false))
+            })
+            .collect()
     }
 
     fn same_package(&self, path: &'a str, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
@@ -1239,8 +1325,17 @@ impl<'a> Index<'a> {
     /// Members named `name` of `t`, else of its nearest supertypes that have one (breadth-first,
     /// each type once, at most [`MAX_INHERITANCE_DEPTH`] levels).
     /// Go has no supertypes: the next levels are the embedded types (contract M9c D4), and a
-    /// tie at one depth gives every candidate.
+    /// tie at one depth gives every candidate. Python walks the class's MRO instead, the first
+    /// class that has one winning (contract M9c amendment 3, E2).
     fn members(&self, t: Sym<'a>, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
+        if self.language(t.0) == Language::Python {
+            return self
+                .python_mro(t)
+                .into_iter()
+                .map(|c| self.named(c.0, Some(c.1), name, want))
+                .find(|own| !own.is_empty())
+                .unwrap_or_default();
+        }
         let mut seen = BTreeSet::from([t]);
         let mut level = vec![t];
         for depth in 0..MAX_INHERITANCE_DEPTH {
@@ -1310,6 +1405,74 @@ impl<'a> Index<'a> {
             .collect();
         self.supers.borrow_mut().insert(t, found.clone());
         found
+    }
+
+    /// Python's method resolution order of `class`, `class` first (contract M9c amendment 3,
+    /// E2): the C3 linearisation over its resolved bases, in the order written (a base that
+    /// resolves to several classes contributes each). A hierarchy C3 cannot merge (Python
+    /// refuses to create the class), a cycle, or one deeper than [`MAX_INHERITANCE_DEPTH`]
+    /// falls back to left-first depth-first order, each class once.
+    fn python_mro(&self, class: Sym<'a>) -> Vec<Sym<'a>> {
+        self.mro_at(class, 0, &mut BTreeSet::new()).0
+    }
+
+    /// [`Self::python_mro`] at `depth`, with whether it is whole (no cycle or depth cut below),
+    /// which is when it is memoised.
+    fn mro_at(
+        &self,
+        c: Sym<'a>,
+        depth: usize,
+        visiting: &mut BTreeSet<Sym<'a>>,
+    ) -> (Vec<Sym<'a>>, bool) {
+        if let Some(known) = self.mros.borrow().get(&c) {
+            return (known.clone(), true);
+        }
+        let bases = self.supertypes(c);
+        if bases.is_empty() {
+            return (vec![c], true);
+        }
+        if depth >= MAX_INHERITANCE_DEPTH || !visiting.insert(c) {
+            return (vec![c], false);
+        }
+        let mut whole = true;
+        let mut seqs: Vec<Vec<Sym<'a>>> = Vec::new();
+        for &b in &bases {
+            let (mro, w) = self.mro_at(b, depth + 1, visiting);
+            whole &= w;
+            seqs.push(mro);
+        }
+        visiting.remove(&c);
+        seqs.push(bases);
+        let mro = match c3_merge(c, seqs) {
+            Some(mro) if whole => mro,
+            _ => {
+                whole = false;
+                let mut out = Vec::new();
+                self.depth_first(c, 0, &mut BTreeSet::new(), &mut out);
+                out
+            }
+        };
+        if whole {
+            self.mros.borrow_mut().insert(c, mro.clone());
+        }
+        (mro, whole)
+    }
+
+    /// `c` and its supertypes, left-first depth-first, each once (the MRO's fallback).
+    fn depth_first(
+        &self,
+        c: Sym<'a>,
+        depth: usize,
+        seen: &mut BTreeSet<Sym<'a>>,
+        out: &mut Vec<Sym<'a>>,
+    ) {
+        if depth > MAX_INHERITANCE_DEPTH || !seen.insert(c) {
+            return;
+        }
+        out.push(c);
+        for b in self.supertypes(c) {
+            self.depth_first(b, depth + 1, seen, out);
+        }
     }
 
     /// Records that the reference being resolved used `form` (contract M9c D6).
@@ -1417,13 +1580,15 @@ impl<'a> Index<'a> {
     }
 
     /// The type a Go callable returns (contract M9c D4): one named type, or the first of two
-    /// results whose second is `error`, resolved in the callable's file. Memoised.
+    /// results whose second is `error`, resolved in the callable's file. A result named by one
+    /// of the callable's type parameters is none (amendment 3, E1). Memoised.
     fn result_types(&self, s: Sym<'a>) -> Vec<Sym<'a>> {
         self.memoised(&self.results, s, || {
             let def = self.def(s);
             def.return_type
                 .as_deref()
                 .and_then(go_result_type)
+                .filter(|t| !def.type_params.iter().any(|p| p == t))
                 .map(|t| self.resolve_type(s.0, def.parent, t))
                 .unwrap_or_default()
         })
@@ -1473,16 +1638,18 @@ impl<'a> Index<'a> {
     }
 
     /// Whether Python module `f` lists its public names in a top-level `__all__`, which a star
-    /// import then skips (contract M9c D5: the list itself is not read).
+    /// import then skips (contract M9c D5: the list itself is not read). A module-level
+    /// `__all__ = …` is both a constant definition and a binding, so the binding decides; a
+    /// `def` or `class __all__` would make the star import itself fail (amendment 3, E3: e5).
     fn defines_all(&self, f: &str) -> bool {
-        self.scopes[f].top.contains_key("__all__") || !self.top_bindings(f, "__all__").is_empty()
+        !self.top_bindings(f, "__all__").is_empty()
     }
 
-    /// Where the top-level name `name` of Python module `f` comes from (contract M9c D5): `f`,
-    /// when it defines or binds the name at top level; else wherever `f`'s named imports of the
-    /// name lead, and only when they lead nowhere its star imports, at most
-    /// [`Self::MAX_REEXPORT_DEPTH`] imports deep, each (module, name) once. As (module, the name
-    /// there, reached through a star import).
+    /// Where the top-level name `name` of Python module `f` comes from (contract M9c D5): of
+    /// `f`'s own top-level definition or binding of the name, its named imports of it and its
+    /// star imports, the last statement that leads somewhere (amendment 3), followed at most
+    /// [`Self::MAX_REEXPORT_DEPTH`] imports deep, each (module, name) once along a path. As
+    /// (module, the name there, reached through a star import).
     fn owners(&self, f: &'a str, name: &str) -> Vec<(&'a str, String, bool)> {
         let mut out = Vec::new();
         self.owners_from(f, name, 0, false, &mut BTreeSet::new(), &mut out);
@@ -1501,29 +1668,50 @@ impl<'a> Index<'a> {
         if !seen.insert((f, name.to_owned())) {
             return;
         }
-        if self.scopes[f].top.contains_key(name) || !self.top_bindings(f, name).is_empty() {
-            out.push((f, name.to_owned(), star));
-            return;
-        }
-        if depth >= Self::MAX_REEXPORT_DEPTH {
-            return;
-        }
-        let before = out.len();
-        let imports = self.facts(f).imports.iter().zip(&self.imports[f]);
-        for (import, targets) in imports.clone() {
-            for n in import.names.iter().filter(|n| n.local == name) {
-                for &t in targets {
-                    self.owners_from(t, &n.name, depth + 1, star, seen, out);
+        // Of `f`'s own top-level definitions and bindings of the name, its named imports of it
+        // and its star imports that lead somewhere, the statement that starts last wins
+        // (amendment 3, E2).
+        let defs = &self.facts(f).definitions;
+        let own = self.scopes[f]
+            .top
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|&d| defs[d].span)
+            .chain(self.top_bindings(f, name).into_iter().map(|b| b.span))
+            .map(|s| (s[0], s[1]))
+            .max();
+        let mut best: Option<((i32, i32), Vec<Owner<'a>>)> =
+            own.map(|start| (start, vec![(f, name.to_owned(), star)]));
+        if depth < Self::MAX_REEXPORT_DEPTH {
+            for (import, targets) in self.facts(f).imports.iter().zip(&self.imports[f]) {
+                let start = (import.span[0], import.span[1]);
+                if best.as_ref().is_some_and(|(s, _)| start <= *s) {
+                    continue;
+                }
+                let mut found = Vec::new();
+                if import.wildcard {
+                    if !name.starts_with('_') {
+                        for &t in targets.iter().filter(|&&t| !self.defines_all(t)) {
+                            let mut seen = seen.clone();
+                            self.owners_from(t, name, depth + 1, true, &mut seen, &mut found);
+                        }
+                    }
+                } else {
+                    for n in import.names.iter().filter(|n| n.local == name) {
+                        for &t in targets {
+                            let mut seen = seen.clone();
+                            self.owners_from(t, &n.name, depth + 1, star, &mut seen, &mut found);
+                        }
+                    }
+                }
+                if !found.is_empty() {
+                    best = Some((start, found));
                 }
             }
         }
-        if out.len() > before || name.starts_with('_') {
-            return;
-        }
-        for (_, targets) in imports.filter(|(import, _)| import.wildcard) {
-            for &t in targets.iter().filter(|&&t| !self.defines_all(t)) {
-                self.owners_from(t, name, depth + 1, true, seen, out);
-            }
+        if let Some((_, found)) = best {
+            out.extend(found);
         }
     }
 
@@ -1943,6 +2131,9 @@ impl<'a> Index<'a> {
         let found = match (qualifier, variable) {
             (None, Some(b)) => self.defines(path, name, b).into_iter().collect(),
             (None, None) => self.levels(path, scope, name, is_callable, true).0,
+            (Some("super()"), _) if self.language(path) == Language::Python => {
+                self.python_super(path, scope, name)
+            }
             (Some(q), _) => match self.container(path, scope, q, at) {
                 Some(Container::Types(ts)) => ts
                     .into_iter()
@@ -1970,11 +2161,28 @@ impl<'a> Index<'a> {
             .collect()
     }
 
+    /// Python `super().name(…)`: the first class after the enclosing one in its MRO that has
+    /// `name` (contract M9c amendment 3, N4); counted as `super_call` when that class has a
+    /// base, as D5's `super()` arm counts it.
+    fn python_super(&self, path: &'a str, scope: Option<usize>, name: &str) -> Vec<Sym<'a>> {
+        let Some(class) = self.enclosing_type(path, scope) else {
+            return Vec::new();
+        };
+        let tail: Vec<Sym<'a>> = self.python_mro(class).into_iter().skip(1).collect();
+        if !tail.is_empty() {
+            self.note("super_call");
+        }
+        tail.into_iter()
+            .map(|c| self.named(c.0, Some(c.1), name, is_callable))
+            .find(|own| !own.is_empty())
+            .unwrap_or_default()
+    }
+
     fn constructor(&self, class: Sym<'a>) -> Option<Sym<'a>> {
         let name = match self.language(class.0) {
             Language::Java => self.def(class).name.as_str(),
-            // Python inherits `__init__`: the class's own, else the nearest supertype's,
-            // breadth-first, the leftmost of a tie (contract M9c D5).
+            // Python inherits `__init__`: the first in the class's MRO (contract M9c D5,
+            // amendment 3).
             Language::Python => {
                 let init = self
                     .members(class, "__init__", |k| {
@@ -2581,6 +2789,17 @@ export function run() {
                     "export default function named() {}\nexport function local() {}\n",
                 ),
                 ("src/o.ts", TS, "export function h() {}\n"),
+                // JavaScript too (D2 names TS/JS; amendment 3, E3).
+                (
+                    "web/main.js",
+                    Language::JavaScript,
+                    "import g from './p'\nexport function go() {\n  g()\n}\n",
+                ),
+                (
+                    "web/p.js",
+                    Language::JavaScript,
+                    "export default function shown() {}\n",
+                ),
             ],
             &[],
         );
@@ -2589,6 +2808,7 @@ export function run() {
             [
                 "app:run(). -> m:f(). [heuristic]",
                 "app:run(). -> n:named(). [heuristic]",
+                "main:go(). -> p:shown(). [heuristic]",
             ]
         );
     }
@@ -2763,10 +2983,52 @@ func NewThree() (*Service, *Repo, error) { return nil, nil, nil }
 func (s *Service) Srv() *Service { return s }
 func (s *Service) Keep(n int) Box { return Box{} }
 func (s *Service) Run() {}
+func (s *Service) Named(n string) *Service { return s }
 func (r *Repo) Get() {}
 func (b Box) Save() {}
+type List []*Repo
+func (l List) Get() {}
+func GetList() List { return nil }
 func head() {
 \tNew().Srv().Run()
+}
+",
+                ),
+                // Contract M9c amendment 3 (E1): a result named by a type parameter (the
+                // function's own, or one the receiver names) is no named type, even beside a
+                // package type of that name; a named result still is.
+                (
+                    "gen/gen.go",
+                    GO,
+                    "package gen
+type T struct{}
+func (t T) Foo() {}
+type V struct{}
+func (v V) Foo() {}
+type A struct{}
+func (a A) Foo() {}
+type E struct{}
+func (e E) Foo() {}
+type Box[E any] struct{ v E }
+func (b *Box[E]) Get() E { return b.v }
+func Id[T any](x T) T { return x }
+func Ptr[V any](v V) *V { return &v }
+func Named() T { return T{} }
+func g1() {
+\tt := Id(A{})
+\tt.Foo()
+}
+func g2() {
+\tp := Ptr(A{})
+\tp.Foo()
+}
+func g3(b *Box[A]) {
+\te := b.Get()
+\te.Foo()
+}
+func g4() {
+\tn := Named()
+\tn.Foo()
 }
 ",
                 ),
@@ -2802,6 +3064,17 @@ func f7() {
 \ta := svc.New()
 \ta.repo[0].Get()
 }
+func f8() {
+\ta := svc.New()
+\ta.Named(\"(\").Srv().Run()
+}
+func f9() {
+\ta := svc.New()
+\ta.Named(\").\").Run()
+}
+func f10() {
+\tsvc.GetList()[0].Get()
+}
 ",
                 ),
                 (
@@ -2825,6 +3098,11 @@ func f7() {
         assert_eq!(
             edges(&built, EdgeKind::Calls),
             [
+                "gen:g1(). -> gen:Id(). [heuristic]",
+                "gen:g2(). -> gen:Ptr(). [heuristic]",
+                "gen:g3(). -> gen:Box#Get(). [heuristic]",
+                "gen:g4(). -> gen:Named(). [heuristic]",
+                "gen:g4(). -> gen:T#Foo(). [heuristic]",
                 "m:g(). -> a:A#Hi(). [ambiguous] (2)",
                 "m:g(). -> a:Make(). [ambiguous] (2)",
                 "m:g(). -> b:B#Hi(). [ambiguous] (2)",
@@ -2834,6 +3112,8 @@ func f7() {
                 "svc:head(). -> svc:Service#Srv(). [heuristic]",
                 "use:f1(). -> svc:New(). [heuristic]",
                 "use:f1(). -> svc:Service#Run(). [heuristic]",
+                // `GetList()[0]` indexes a result: no call segment, so no `List#Get` (E3).
+                "use:f10(). -> svc:GetList(). [heuristic]",
                 "use:f2(). -> svc:NewE(). [heuristic]",
                 "use:f2(). -> svc:Service#Run(). [heuristic]",
                 "use:f3(). -> svc:NewPair(). [heuristic]",
@@ -2845,6 +3125,14 @@ func f7() {
                 "use:f6(). -> svc:Service#Run(). [heuristic]",
                 "use:f6(). -> svc:Service#Srv(). [heuristic]",
                 "use:f7(). -> svc:New(). [heuristic]",
+                // A bracket inside a string argument is text, at either split (E3).
+                "use:f8(). -> svc:New(). [heuristic]",
+                "use:f8(). -> svc:Service#Named(). [heuristic]",
+                "use:f8(). -> svc:Service#Run(). [heuristic]",
+                "use:f8(). -> svc:Service#Srv(). [heuristic]",
+                "use:f9(). -> svc:New(). [heuristic]",
+                "use:f9(). -> svc:Service#Named(). [heuristic]",
+                "use:f9(). -> svc:Service#Run(). [heuristic]",
             ]
         );
     }
@@ -3041,6 +3329,31 @@ func run4() { mixed.Setup() }
                     GO,
                     "package other\nfunc o() { shared.Setup() }\n",
                 ),
+                // A `select` receive declares its names (contract M9c amendment 3, E1): they
+                // shadow the package var, as `:=` does anywhere else.
+                (
+                    "svc/sel.go",
+                    GO,
+                    "package svc
+type Cfg struct{}
+func (c *Cfg) Load() {}
+var cfg *Cfg
+func sel(ch chan *Helper) {
+\tselect {
+\tcase cfg := <-ch:
+\t\tcfg.Load()
+\t}
+}
+func sel2(ch chan *Helper) {
+\tselect {
+\tcase cfg, ok := <-ch:
+\t\t_ = ok
+\t\tcfg.Load()
+\t}
+}
+func usesVar() { cfg.Load() }
+",
+                ),
             ],
             &[],
         );
@@ -3050,6 +3363,7 @@ func run4() { mixed.Setup() }
                 "a_test:TestA(). -> helper:Helper#Setup(). [heuristic]",
                 "a_test:TestC(). -> helper:Helper#Setup(). [heuristic]",
                 "b:run2(). -> helper:Helper#Setup(). [heuristic]",
+                "sel:usesVar(). -> sel:Cfg#Load(). [heuristic]",
             ]
         );
     }
@@ -3187,7 +3501,68 @@ class C(B):
         super().__init__()
     def other(self):
         super(C, self).run()
+
+class SB:
+    def m(self):
+        pass
+
+class SC:
+    def m(self):
+        pass
+
+class SD(SB, SC):
+    def m(self):
+        super().m()
+
+class SE(SB):
+    pass
+
+class SF(SE, SC):
+    def m(self):
+        super().m()
+
+class SG(SB):
+    helper = SC()
+
+class SH(SG):
+    def m(self):
+        super().helper.m()
 ",
+                ),
+                // Contract M9c amendment 3 (E2): the later of a named and a star import of one
+                // name wins, as Python binds it, also in a module that re-exports it.
+                ("pkg/mod_n.py", PY, "def f():\n    pass\n"),
+                (
+                    "pkg/mod_m.py",
+                    PY,
+                    "def f():\n    pass\n\ndef g():\n    pass\n",
+                ),
+                (
+                    "pkg/star_after_named.py",
+                    PY,
+                    "from pkg.mod_n import f\nfrom pkg.mod_m import *\n\ndef use():\n    f()\n",
+                ),
+                (
+                    "pkg/star_after_def.py",
+                    PY,
+                    "def g():\n    pass\n\nfrom pkg.mod_m import *\n\ndef use():\n    g()\n",
+                ),
+                (
+                    "pkg/named_after_star.py",
+                    PY,
+                    "from pkg.mod_m import *\nfrom pkg.mod_n import f\n\ndef use():\n    f()\n",
+                ),
+                (
+                    "reorder/__init__.py",
+                    PY,
+                    "from .ra import h\nfrom .rb import *\n",
+                ),
+                ("reorder/ra.py", PY, "def h():\n    pass\n"),
+                ("reorder/rb.py", PY, "def h():\n    pass\n"),
+                (
+                    "app/main2.py",
+                    PY,
+                    "from reorder import h\n\ndef run2():\n    h()\n",
                 ),
                 ("pkg/__init__.py", PY, ""),
                 (
@@ -3284,9 +3659,13 @@ def call2():
             edges(&built, EdgeKind::Calls),
             [
                 "client:call(). -> impl:Smth#func(). [heuristic]",
+                "main2:run2(). -> rb:h(). [heuristic]",
                 "main:run(). -> __init__:func(). [heuristic]",
                 "main:run(). -> deeper:g(). [heuristic]",
                 "main:run(). -> mod:func2(). [heuristic]",
+                "named_after_star:use(). -> mod_n:f(). [heuristic]",
+                "star_after_def:use(). -> mod_m:g(). [heuristic]",
+                "star_after_named:use(). -> mod_m:f(). [heuristic]",
                 "star_user:use(). -> other:func3(). [heuristic]",
                 "star_user:use(). -> star_user:func2(). [heuristic]",
                 "star_user:use(). -> stars:Klass#m(). [heuristic]",
@@ -3294,6 +3673,11 @@ def call2():
                 "sup:B#__init__(). -> sup:A#__init__(). [heuristic]",
                 "sup:B#__init__(). -> sup:A#run(). [heuristic]",
                 "sup:C#__init__(). -> sup:B#__init__(). [heuristic]",
+                // `super()` is the next class of the MRO with the member (amendment 3, N4).
+                "sup:SD#m(). -> sup:SB#m(). [heuristic]",
+                "sup:SF#m(). -> sup:SB#m(). [heuristic]",
+                // A longer chain walks from the supertypes' class attributes, as before.
+                "sup:SH#m(). -> sup:SC#m(). [heuristic]",
             ]
         );
         assert_eq!(
@@ -3307,7 +3691,19 @@ def call2():
                     "app/main.py".to_owned(),
                     vec![("reexport".into(), 2), ("star_import".into(), 1)]
                 ),
-                ("m/sup.py".to_owned(), vec![("super_call".into(), 3)]),
+                (
+                    "app/main2.py".to_owned(),
+                    vec![("reexport".into(), 1), ("star_import".into(), 1)]
+                ),
+                ("m/sup.py".to_owned(), vec![("super_call".into(), 6)]),
+                (
+                    "pkg/star_after_def.py".to_owned(),
+                    vec![("star_import".into(), 1)]
+                ),
+                (
+                    "pkg/star_after_named.py".to_owned(),
+                    vec![("star_import".into(), 1)]
+                ),
                 (
                     "pkg/star_user.py".to_owned(),
                     vec![("star_import".into(), 2)]
@@ -3387,6 +3783,30 @@ class G(N, E):
 class F(E, A):
     pass
 
+class P(A):
+    pass
+
+class Q:
+    def __init__(self):
+        pass
+
+class R(P, Q):
+    pass
+
+class X:
+    def __init__(self):
+        pass
+
+class Y(X):
+    pass
+
+class Z(X):
+    def __init__(self):
+        pass
+
+class W(Y, Z):
+    pass
+
 def basic():
     B()
 
@@ -3398,6 +3818,12 @@ def two():
 
 def tie():
     F()
+
+def left():
+    R()
+
+def diamond():
+    W()
 ",
                 ),
             ],
@@ -3407,6 +3833,9 @@ def tie():
             edges(&built, EdgeKind::Calls),
             [
                 "m:basic(). -> m:A#__init__(). [heuristic]",
+                // C3 (amendment 3, E2): R's MRO is R, P, A, Q; W's is W, Y, Z, X.
+                "m:diamond(). -> m:Z#__init__(). [heuristic]",
+                "m:left(). -> m:A#__init__(). [heuristic]",
                 "m:same(). -> m:A#__init__(). [heuristic]",
                 "m:tie(). -> m:E#__init__(). [heuristic]",
                 "m:two(). -> m:E#__init__(). [heuristic]",
@@ -3417,7 +3846,7 @@ def tie():
         );
         assert_eq!(
             forms_used(&built),
-            [("mro/m.py".to_owned(), vec![("inherited_init".into(), 4)])]
+            [("mro/m.py".to_owned(), vec![("inherited_init".into(), 6)])]
         );
         // Java: `constructor` reads the class's own constructor only; a subclass without one
         // has none (Tree-sitter tags `new Sub()` as a class reference, so no edge reaches it).

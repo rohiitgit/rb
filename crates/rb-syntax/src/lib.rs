@@ -170,7 +170,9 @@ pub struct Definition {
     /// Python class bodies: `NAME = 'string'` assignments (e.g. `__tablename__`), in order.
     #[serde(default)]
     pub class_constants: Vec<ClassConstant>,
-    /// Declared type parameters (`BaseRepo<T, ID>` → `T`, `ID`), for Java and TypeScript.
+    /// Declared type parameters (`BaseRepo<T, ID>` → `T`, `ID`), for Java and TypeScript; for
+    /// Go a function's or type's own, and the type arguments a method's receiver names
+    /// (contract M9c amendment 3).
     #[serde(default)]
     pub type_params: Vec<String>,
     /// The declared return type as written, type arguments included: a Java method's (`void`
@@ -1632,6 +1634,42 @@ type Service struct {
                 .iter()
                 .filter(|b| !b.member)
                 .all(|b| !b.embedded)
+        );
+    }
+
+    /// Contract M9c amendment 3 (E1): Go type parameters are facts, as for Java and TypeScript:
+    /// a generic function's own, the type arguments a method's receiver names, a generic type's
+    /// own. A result named by one is not a named type, so the resolver refuses it.
+    #[test]
+    fn go_type_parameters_are_facts() {
+        let src = "package p
+func Id[T any](x T) T { return x }
+func Pair[K comparable, V any, W any](k K) V { var v V; return v }
+func (b *Box[E]) Get() E { var e E; return e }
+func (m Map[K, V]) Keys() []K { return nil }
+func (b Box2) Plain() T { return T{} }
+func Plain() T { return T{} }
+type Box[E any] struct{ v E }
+type T struct{}
+";
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        let params: Vec<String> = facts
+            .definitions
+            .iter()
+            .map(|d| format!("{} [{}]", d.name, d.type_params.join(", ")))
+            .collect();
+        assert_eq!(
+            params,
+            [
+                "Id [T]",
+                "Pair [K, V, W]",
+                "Get [E]",
+                "Keys [K, V]",
+                "Plain []",
+                "Plain []",
+                "Box [E]",
+                "T []",
+            ]
         );
     }
 

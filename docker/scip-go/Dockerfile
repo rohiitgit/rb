@@ -9,7 +9,9 @@
 # pinned by sha256, and a self-test fails the build if scip-go cannot type an import.
 #
 # Base: Ubuntu 24.04, pinned by digest. The Go toolchain tarball is checksum-verified.
-# No apt layer beyond ca-certificates, curl and git.
+# No apt layer beyond ca-certificates, curl and git. Those three are not version-pinned: the
+# Ubuntu archive drops a superseded version, so an exact pin would break the next build, and
+# what they fetch is checked by commit or sha256 (snapshot.ubuntu.com would pin them; not done).
 FROM ubuntu:24.04@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7
 
 ARG GO_VERSION=1.27.2
@@ -62,7 +64,8 @@ RUN set -eux; \
     go version -m /usr/local/bin/scip-go | grep -E "^\s+dep\s+golang.org/x/tools\s+${XTOOLS_VERSION}\s"; \
     rm -rf /tmp/scip-go /tmp/gocache /tmp/gomod
 
-# Self-test, offline: scip-go must type a standard-library call. With an x/tools that cannot
+# Self-test (it needs no network: a standard-library-only module; `docker build` still gives
+# the step the build's network): scip-go must type a standard-library call. With an x/tools that cannot
 # read the toolchain's export data, `os` loads empty and no occurrence of
 # `scip-go gomod github.com/golang/go/src <go version> os/Getenv().` is written (the control:
 # rb-scip-go:0.2.7 writes none; var/m9c/logs/p0b/selftest-control.txt).

@@ -889,11 +889,12 @@ pub fn strip_json_comments(text: &str) -> String {
     out
 }
 
-/// `text` read as JSONC, as `tsc` reads a `tsconfig.json` (contract M9c D1):
-/// [`strip_json_comments`], then each `,` outside strings followed only by whitespace before
-/// `}` or `]` is dropped, then strict JSON. `None` when that is not JSON.
+/// `text` read as JSONC, as `tsc` reads a `tsconfig.json` (contract M9c D1): a leading UTF-8
+/// byte order mark dropped (amendment 3, E4), [`strip_json_comments`], then each `,` outside
+/// strings followed only by whitespace before `}` or `]` is dropped, then strict JSON. `None`
+/// when that is not JSON.
 pub fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
-    let text = strip_json_comments(text);
+    let text = strip_json_comments(text.strip_prefix('\u{feff}').unwrap_or(text));
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut start = 0;
@@ -2269,6 +2270,11 @@ mod tests {
         let strict = r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}, "n": [1, 2]}"#;
         assert_eq!(
             parse_jsonc(strict),
+            serde_json::from_str::<serde_json::Value>(strict).ok()
+        );
+        // A leading UTF-8 byte order mark is not text, as `tsc` reads it (amendment 3, E4).
+        assert_eq!(
+            parse_jsonc(&format!("\u{feff}{strict}")),
             serde_json::from_str::<serde_json::Value>(strict).ok()
         );
         for broken in [

@@ -569,6 +569,28 @@ pub(crate) fn join_handing_back(
                 continue;
             };
             let symbol = o.symbol.as_str();
+            // Go has no constructors: a call whose callee is a type (a global type symbol, or a
+            // local one bound to a type definition) converts to it, a reference to the type
+            // (contract M9c amendment 3).
+            let converts = || {
+                symbol.ends_with('#')
+                    || locals[di].get(symbol).is_some_and(|&i| {
+                        matches!(
+                            facts.definitions[i].kind,
+                            rb_syntax::DefKind::Class
+                                | rb_syntax::DefKind::Interface
+                                | rb_syntax::DefKind::Type
+                        )
+                    })
+            };
+            let kind = if kind == EdgeKind::Calls
+                && files[path.as_str()].0 == Language::Go
+                && converts()
+            {
+                EdgeKind::References
+            } else {
+                kind
+            };
             if symbol.starts_with("local ") {
                 // A local symbol bound to a definition of this document (amendment 54) is an
                 // exact target with that definition's heuristic key.
@@ -3358,6 +3380,87 @@ mod tests {
             ])
             .0
             .is_empty()
+        );
+    }
+
+    /// Contract M9c amendment 3 (E5's FALSE verdict): Go has no constructors, so a call whose
+    /// callee is a type (`Kind("a")`, a global type symbol, or a local one bound to a type
+    /// definition) is a conversion: a `REFERENCES` edge to the type, never `CALLS`. A method
+    /// called on the converted value is still a call.
+    #[test]
+    fn go_conversions_to_types_are_references_not_calls() {
+        let src = "package main\ntype Kind string\nfunc (k Kind) Ok() bool {\n\treturn true\n}\nfunc Make() Kind {\n\treturn Kind(\"a\")\n}\nfunc use() {\n\t_ = Kind(\"x\").Ok()\n\t_ = Make()\n}\nfunc loc() {\n\ttype L int\n\t_ = L(1)\n}\n";
+        let facts = rb_syntax::extract(Language::Go, src.as_bytes()).unwrap();
+        let at = |token: &str, n: usize| {
+            let start = src.match_indices(token).nth(n).unwrap().0;
+            let pos = |byte: usize| {
+                let before = &src[..byte];
+                let row = before.matches('\n').count() as i32;
+                let col = (byte - before.rfind('\n').map_or(0, |i| i + 1)) as i32;
+                (row, col)
+            };
+            let (a, b) = (pos(start), pos(start + token.len()));
+            [a.0, a.1, b.0, b.1]
+        };
+        let sym = |s: &str| format!("scip-go gomod example.com/shop . `example.com/shop`/{s}");
+        let occ = |span: Span, symbol: String, roles: i32| Occurrence {
+            span,
+            symbol,
+            roles,
+            enclosing: None,
+        };
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "main.go".into(),
+                occurrences: vec![
+                    occ(at("Kind", 0), sym("Kind#"), 1),
+                    occ(at("Ok", 0), sym("Kind#Ok()."), 1),
+                    occ(at("Make", 0), sym("Make()."), 1),
+                    occ(at("Kind", 3), sym("Kind#"), 0),
+                    occ(at("use", 0), sym("use()."), 1),
+                    occ(at("Kind", 4), sym("Kind#"), 0),
+                    occ(at("Ok", 1), sym("Kind#Ok()."), 0),
+                    occ(at("Make", 1), sym("Make()."), 0),
+                    occ(at("loc", 0), sym("loc()."), 1),
+                    occ(at("L", 0), "local 0".into(), 1),
+                    occ(at("L", 1), "local 0".into(), 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files = BTreeMap::from([("main.go", (Language::Go, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([("main.go", rb_syntax::symbol_keys("main.go", &facts))]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::Go],
+            &rb_scip::TsScopes::build([]),
+        );
+        let mut lines: Vec<String> = edge_lines(&joined)
+            .into_iter()
+            .filter(|l| l.contains(" Calls ") || l.contains(" References "))
+            .map(|l| l.replace("scip-go gomod example.com/shop . `example.com/shop`/", ""))
+            .collect();
+        lines.sort();
+        let local = keys["main.go"][facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "L")
+            .unwrap()]
+        .clone();
+        assert_eq!(
+            lines,
+            [
+                "Make(). References Kind#".to_owned(),
+                format!("loc(). References {local}"),
+                "use(). Calls Kind#Ok().".to_owned(),
+                "use(). Calls Make().".to_owned(),
+                "use(). References Kind#".to_owned(),
+            ]
         );
     }
 
