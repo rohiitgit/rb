@@ -34,6 +34,20 @@ pub(crate) struct Joined {
     /// of that package; sorted by file, then site.
     pub packages: Vec<PackageUse>,
     pub coverage: Coverage,
+    /// References counted `references_external` that are handed back for the cross-project
+    /// join (contract M9c D8′, [`join_handing_back`]); in the order the join met them.
+    pub external: Vec<External>,
+}
+
+/// A reference handed back for the cross-project join (contract M9c D8′): an external
+/// `gomod` symbol of a module another scip-go job's `go.mod` declares. Its source and kind are
+/// those the edge would have had if this index had defined the symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct External {
+    pub src: Source,
+    pub kind: EdgeKind,
+    pub symbol: String,
+    pub at: Evidence,
 }
 
 /// A file's first use of a symbol from a package the index does not define.
@@ -175,7 +189,8 @@ type Doc<'a> = (
 /// Joins `index` (paths relative to `root`) with the facts of the files the project owns, keyed
 /// by repo path, whose heuristic keys are `keys[path]`; `languages` are the ones the indexer
 /// covers ([`indexed_languages`]); `ts_scopes` partitions `files_without_document` by tsconfig
-/// membership without moving any edge (contract M6e S10).
+/// membership without moving any edge (contract M6e S10). Hands nothing back.
+#[cfg(test)]
 pub(crate) fn join(
     index: &ScipIndex,
     root: &str,
@@ -183,6 +198,29 @@ pub(crate) fn join(
     keys: &BTreeMap<&str, Vec<String>>,
     languages: &[Language],
     ts_scopes: &rb_scip::TsScopes,
+) -> Joined {
+    join_handing_back(
+        index,
+        root,
+        files,
+        keys,
+        languages,
+        ts_scopes,
+        &BTreeSet::new(),
+    )
+}
+
+/// [`join`], also handing back each reference counted `references_external` whose symbol
+/// [`hands_back`] to one of `modules`: the `go.mod` module paths of the other ok scip-go jobs
+/// (contract M9c D8′; empty for any other indexer). `references_external` keeps its meaning.
+pub(crate) fn join_handing_back(
+    index: &ScipIndex,
+    root: &str,
+    files: &BTreeMap<&str, (Language, &FileFacts)>,
+    keys: &BTreeMap<&str, Vec<String>>,
+    languages: &[Language],
+    ts_scopes: &rb_scip::TsScopes,
+    modules: &BTreeSet<&str>,
 ) -> Joined {
     let repo_path = |doc: &str| {
         if root.is_empty() {
@@ -551,6 +589,17 @@ pub(crate) fn join(
                     out.coverage.references_undocumented += 1;
                 } else {
                     out.coverage.references_external += 1;
+                    if hands_back(symbol, modules) {
+                        out.external.push(External {
+                            src: source(r.enclosing),
+                            kind,
+                            symbol: symbol.to_owned(),
+                            at: Evidence {
+                                path: path.clone(),
+                                span: r.span,
+                            },
+                        });
+                    }
                 }
                 continue;
             }
@@ -734,6 +783,48 @@ pub(crate) fn join(
     out.edges.dedup();
     out.packages.sort();
     out
+}
+
+/// Whether an external reference's `symbol` is handed back for the cross-project join
+/// (contract M9c D8′): its manager is `gomod`, its package name is one of `modules`, and it is
+/// not a namespace (`` …`pkg/path`/ ``, an import path or a package qualifier), which names a
+/// package, not a definition.
+fn hands_back(symbol: &str, modules: &BTreeSet<&str>) -> bool {
+    !symbol.ends_with('/')
+        && unversioned(symbol)
+            .is_some_and(|(manager, name, _)| manager == "gomod" && modules.contains(name))
+}
+
+/// The cross-project join's key for a global symbol (contract M9c D8′): `(manager, package
+/// name, descriptors)` as written, the scheme and the version dropped. Within the four fields
+/// before the descriptors a space is escaped as two (SCIP's symbol grammar). `None` for a local
+/// symbol and for a string with fewer fields.
+pub(crate) fn unversioned(symbol: &str) -> Option<(&str, &str, &str)> {
+    if symbol.starts_with("local ") {
+        return None;
+    }
+    let bytes = symbol.as_bytes();
+    let mut at = [0; 4];
+    let (mut found, mut i) = (0, 0);
+    while found < at.len() && i < bytes.len() {
+        if bytes[i] == b' ' {
+            if bytes.get(i + 1) == Some(&b' ') {
+                i += 2;
+                continue;
+            }
+            at[found] = i;
+            found += 1;
+        }
+        i += 1;
+    }
+    if found < at.len() {
+        return None;
+    }
+    Some((
+        &symbol[at[0] + 1..at[1]],
+        &symbol[at[1] + 1..at[2]],
+        &symbol[at[3] + 1..],
+    ))
 }
 
 /// The project definition an accepted document's reference occurrence at `span` names, when the

@@ -1073,6 +1073,21 @@ pub fn assemble(
     // `tsconfig*.json` scopes for partitioning `files_without_document` (contract M6e S10).
     let ts_scopes =
         rb_scip::TsScopes::build(content.manifests.iter().map(|(p, t)| (*p, t.as_str())));
+    // Contract M9c D8′: each ok scip-go job's root and `go.mod` module path, and the references
+    // each scip-go job hands back for the cross-project join after the loop.
+    let go_jobs: Vec<(&str, &str)> = content
+        .scip
+        .iter()
+        .filter(|p| {
+            p.indexer == "scip-go"
+                && matches!((&p.status, &p.index), (rb_scip::RunStatus::Ok, Some(_)))
+        })
+        .filter_map(|p| {
+            let module = content.go_modules.get(&p.root)?;
+            Some((p.root.as_str(), module.as_str()))
+        })
+        .collect();
+    let mut handed_back: Vec<(&str, Vec<scip::External>)> = Vec::new();
     for project in &content.scip {
         let files: BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)> = content
             .facts
@@ -1082,14 +1097,29 @@ pub fn assemble(
             .collect();
         let coverage = match (&project.status, &project.index) {
             (rb_scip::RunStatus::Ok, Some(index)) => {
-                let joined = scip::join(
+                // The other ok scip-go jobs' module paths (a job sharing this one's module path
+                // included: its references to it are this index's own package, never external).
+                let modules: BTreeSet<&str> = if project.indexer == "scip-go" {
+                    go_jobs
+                        .iter()
+                        .filter(|&&(root, _)| root != project.root)
+                        .map(|&(_, module)| module)
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
+                let mut joined = scip::join_handing_back(
                     index,
                     &project.root,
                     &files,
                     &keys,
                     scip::indexed_languages(project.indexer),
                     &ts_scopes,
+                    &modules,
                 );
+                if !joined.external.is_empty() {
+                    handed_back.push((project.root.as_str(), std::mem::take(&mut joined.external)));
+                }
                 for (path, routes) in &file_routes {
                     for r in &routes.routes {
                         if let rb_frameworks::routes::Handler::Name { text, span } = &r.handler {
@@ -1135,6 +1165,11 @@ pub fn assemble(
         };
         diagnostics.push(scip_status(project, coverage.as_ref()));
     }
+    let roots: Vec<&str> = content.scip.iter().map(|p| p.root.as_str()).collect();
+    let (cross_edges, cross_diagnostics) =
+        join_across_projects(&go_jobs, &handed_back, &keys, &roots);
+    drop(handed_back);
+    diagnostics.extend(cross_diagnostics);
     for ((service, key), (package, at)) in packages {
         let node = NodeKey::new(NodeKind::Package, key);
         b.add_node(
@@ -1180,7 +1215,12 @@ pub fn assemble(
             &go_consts,
         )?);
     }
-    for e in scip_edges {
+    // Each index's own edges are exact; the cross-project joins are synthetic (contract M9c D8′).
+    let scip_edges = scip_edges
+        .into_iter()
+        .map(|e| (e, Certainty::Exact))
+        .chain(cross_edges.into_iter().map(|e| (e, Certainty::Synthetic)));
+    for (e, certainty) in scip_edges {
         let src = match e.src {
             scip::Source::Symbol(key) => NodeKey::new(NodeKind::Symbol, key),
             scip::Source::File => NodeKey::new(NodeKind::File, e.at.path.clone()),
@@ -1196,7 +1236,7 @@ pub fn assemble(
                 kind,
                 NodeKey::new(NodeKind::Symbol, e.dst),
                 Provenance::Scip,
-                Certainty::Exact,
+                certainty,
             )
             .evidence(e.at),
         )?;
@@ -1463,6 +1503,101 @@ pub fn assemble(
         },
     ));
     Ok((b.finish()?, diagnostics))
+}
+
+/// The cross-project join after the job loop (contract M9c D8′). Each reference a scip-go job
+/// handed back (`handed_back`: from root, references) names a package another ok scip-go job's
+/// `go.mod` declares (`go_jobs`: root, module path). When exactly one other job has that module
+/// path, the reference joins that job's anchored definition of the same symbol with the version
+/// dropped ([`scip::unversioned`]). The type checker resolved the name against the version the
+/// module requires (`v0.4.3` from the module cache), while the target is the in-repo definition
+/// (version `.`), so the edge is `synthetic`, never `exact`. A symbol that job defines without
+/// anchoring it, or does not define, is `unanchored`. Two or more jobs with the module path make
+/// it `ambiguous`, counted against each of them, with no edge. One `scip_cross_project`
+/// diagnostic per (from root, to root) with a count; `keys` are the final symbol keys, `roots`
+/// every job's root (a file's owner is its deepest one).
+fn join_across_projects(
+    go_jobs: &[(&str, &str)],
+    handed_back: &[(&str, Vec<scip::External>)],
+    keys: &BTreeMap<&str, Vec<String>>,
+    roots: &[&str],
+) -> (Vec<scip::ScipEdge>, Vec<Diagnostic>) {
+    #[derive(Default)]
+    struct Counts {
+        synthetic: usize,
+        ambiguous: usize,
+        unanchored: usize,
+    }
+    let mut counts: BTreeMap<(&str, &str), Counts> = BTreeMap::new();
+    // Per target root, its anchored symbols by join key, built on first use from the keys of
+    // the files it owns (a heuristic key's manager `.` never matches `gomod`).
+    let mut anchored: BTreeMap<&str, BTreeMap<(&str, &str, &str), &str>> = BTreeMap::new();
+    let mut edges = Vec::new();
+    for &(from, ref refs) in handed_back {
+        for r in refs {
+            let Some(key) = scip::unversioned(&r.symbol) else {
+                continue;
+            };
+            let candidates: Vec<&str> = go_jobs
+                .iter()
+                .filter(|&&(root, module)| root != from && module == key.1)
+                .map(|&(root, _)| root)
+                .collect();
+            let to = match candidates[..] {
+                [to] => to,
+                _ => {
+                    for to in candidates {
+                        counts.entry((from, to)).or_default().ambiguous += 1;
+                    }
+                    continue;
+                }
+            };
+            let symbols = anchored.entry(to).or_insert_with(|| {
+                keys.iter()
+                    .filter(|(path, _)| {
+                        projects::owner_root(path, roots.iter().copied()) == Some(to)
+                    })
+                    .flat_map(|(_, file_keys)| file_keys)
+                    .filter_map(|k| scip::unversioned(k).map(|u| (u, k.as_str())))
+                    .collect()
+            });
+            let n = counts.entry((from, to)).or_default();
+            match symbols.get(&key) {
+                Some(dst) => {
+                    n.synthetic += 1;
+                    edges.push(scip::ScipEdge {
+                        src: r.src.clone(),
+                        kind: r.kind,
+                        dst: (*dst).to_owned(),
+                        at: r.at.clone(),
+                    });
+                }
+                None => n.unanchored += 1,
+            }
+        }
+    }
+    let label = |root: &str| {
+        if root.is_empty() {
+            boundaries::ROOT_DIR.to_owned()
+        } else {
+            root.to_owned()
+        }
+    };
+    let diagnostics = counts
+        .into_iter()
+        .map(|((from, to), n)| Diagnostic {
+            kind: "scip_cross_project".into(),
+            path: Some(label(from)),
+            span: None,
+            detail: json!({
+                "to": label(to),
+                "synthetic": n.synthetic,
+                "ambiguous": n.ambiguous,
+                "unanchored": n.unanchored,
+            }),
+        })
+        .collect();
+    (edges, diagnostics)
 }
 
 /// One `scip_status` diagnostic per job (contract M3b S9). Its detail is a function of the
@@ -3648,6 +3783,226 @@ mod tests {
                 ],
                 vec![r#"config_server_ambiguous {"servers":["config","config2"]}"#.to_owned()],
             )
+        );
+    }
+
+    /// Contract M9c amendment 2, D8′ (C9′): a scip-go reference counted `references_external`
+    /// whose package is another ok scip-go job's `go.mod` module joins that job's definition of
+    /// the same symbol with the version dropped, as a `scip` edge of certainty `synthetic`.
+    /// A stdlib, a dependency and an unknown module's reference do not join; a symbol the other
+    /// job defines without anchoring it, or does not define, is `unanchored`; a namespace
+    /// occurrence is never handed back; two jobs with the module path are `ambiguous`, with no
+    /// edge. One `scip_cross_project` diagnostic per (from root, to root) counts each.
+    #[test]
+    fn external_references_join_another_projects_definitions() {
+        const SRV: &str = "example.com/mm/server/v8";
+        const PUB: &str = "example.com/mm/server/public";
+        const TOOLS: &str = "example.com/mm/tools";
+        let go = |src: &str| rb_syntax::extract(rb_syntax::Language::Go, src.as_bytes()).unwrap();
+        let server = go(concat!(
+            "package app\n\n",
+            "func Run() {\n",
+            "\tmodel.NewId()\n",
+            "\tvar u model.User\n",
+            "\tos.Getenv(\"HOME\")\n",
+            "\tdep.Do()\n",
+            "\tother.F()\n",
+            "\tmodel.Hidden()\n",
+            "\tmodel.Gone()\n",
+            "\tmodel()\n",
+            "}\n",
+        ));
+        let public =
+            go("package model\n\nfunc NewId() {}\n\ntype User struct{}\n\nfunc Hidden() {}\n");
+        let tools = go("package tools\n\nfunc Tool() {}\n");
+        // The positive control: the references the rows below rely on are facts.
+        let refs: BTreeSet<(&str, rb_syntax::RefKind)> = server
+            .references
+            .iter()
+            .map(|r| (r.name.as_str(), r.kind))
+            .collect();
+        for (name, kind) in [
+            ("NewId", rb_syntax::RefKind::Call),
+            ("User", rb_syntax::RefKind::Type),
+            ("Getenv", rb_syntax::RefKind::Call),
+            ("Do", rb_syntax::RefKind::Call),
+            ("F", rb_syntax::RefKind::Call),
+            ("Hidden", rb_syntax::RefKind::Call),
+            ("Gone", rb_syntax::RefKind::Call),
+            ("model", rb_syntax::RefKind::Call),
+        ] {
+            assert!(refs.contains(&(name, kind)), "{name}: {refs:?}");
+        }
+        let external = |d: &str| format!("scip-go gomod {PUB} v0.4.3 `{PUB}/model`/{d}");
+        let own_public = |d: &str| format!("scip-go gomod {PUB} . `{PUB}/model`/{d}");
+        let run = format!("scip-go gomod {SRV} . `{SRV}/app`/Run().");
+        let server_sym = |name: &str| match name {
+            "Run" => run.clone(),
+            "User" => external("User#"),
+            "Getenv" => "scip-go gomod github.com/golang/go/src go1.23 os/Getenv().".into(),
+            "Do" => "scip-go gomod github.com/acme/dep v1.2.0 `github.com/acme/dep`/Do().".into(),
+            "F" => "scip-go gomod example.com/nobody v0.1.0 `example.com/nobody`/F().".into(),
+            // A namespace symbol whose descriptor names the token.
+            "model" => format!("scip-go gomod {PUB} v0.4.3 model/"),
+            other => external(&format!("{other}().")),
+        };
+        let public_sym = |name: &str| match name {
+            "User" => own_public("User#"),
+            other => own_public(&format!("{other}().")),
+        };
+        // `Hidden().` is defined, but at the `package` keyword, where no Tree-sitter definition
+        // is: no node is anchored to it.
+        let public_doc = |root_relative: &str| {
+            let mut doc = document_for(root_relative, &public, &public_sym);
+            for o in &mut doc.occurrences {
+                if o.symbol == own_public("Hidden().") {
+                    o.span = [0, 0, 0, 7];
+                }
+            }
+            doc
+        };
+        let tools_sym = |name: &str| format!("scip-go gomod {TOOLS} . `{TOOLS}`/{name}().");
+        let assemble_with = |copy: bool| {
+            let mut roots = vec![("server", SRV), ("public", PUB), ("tools", TOOLS)];
+            if copy {
+                roots.push(("copy", PUB));
+            }
+            let mut facts = BTreeMap::from([
+                ("server/app/a.go", (rb_syntax::Language::Go, &server)),
+                ("public/model/m.go", (rb_syntax::Language::Go, &public)),
+                ("tools/t.go", (rb_syntax::Language::Go, &tools)),
+            ]);
+            let mut scip = vec![
+                ok_project(
+                    "server",
+                    "scip-go",
+                    vec![document_for("app/a.go", &server, &server_sym)],
+                ),
+                ok_project("public", "scip-go", vec![public_doc("model/m.go")]),
+                ok_project(
+                    "tools",
+                    "scip-go",
+                    vec![document_for("t.go", &tools, &tools_sym)],
+                ),
+            ];
+            if copy {
+                facts.insert("copy/model/m.go", (rb_syntax::Language::Go, &public));
+                scip.push(ok_project(
+                    "copy",
+                    "scip-go",
+                    vec![public_doc("model/m.go")],
+                ));
+            }
+            let manifest = Manifest {
+                commit_sha: "c".repeat(40),
+                files: roots
+                    .iter()
+                    .map(|(root, _)| format!("{root}/go.mod"))
+                    .chain(facts.keys().map(|p| (*p).to_owned()))
+                    .map(|p| entry(&p))
+                    .collect(),
+                skipped: vec![],
+            };
+            let boundaries = Boundaries::new(
+                roots
+                    .iter()
+                    .map(|(root, _)| project(root, &format!("{root}/go.mod")))
+                    .collect(),
+                vec![],
+            );
+            let content = Content {
+                facts,
+                go_modules: roots
+                    .iter()
+                    .map(|(root, module)| ((*root).to_owned(), (*module).to_owned()))
+                    .collect(),
+                scip,
+                ..Content::default()
+            };
+            assemble(&manifest, None, &boundaries, &content).unwrap()
+        };
+        let scip_edges = |g: &Graph| -> Vec<(String, EdgeKind, String, Certainty)> {
+            let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+            let mut out: Vec<(String, EdgeKind, String, Certainty)> = g
+                .edges()
+                .iter()
+                .filter(|e| {
+                    e.provenance == Provenance::Scip
+                        && matches!(e.kind, EdgeKind::Calls | EdgeKind::References)
+                })
+                .map(|e| (key(e.src), e.kind, key(e.dst), e.certainty))
+                .collect();
+            out.sort();
+            out
+        };
+        let cross = |diagnostics: &[Diagnostic]| -> Vec<(Option<String>, Value)> {
+            let mut out: Vec<(Option<String>, Value)> = diagnostics
+                .iter()
+                .filter(|d| d.kind == "scip_cross_project")
+                .map(|d| (d.path.clone(), d.detail.clone()))
+                .collect();
+            out.sort_by_key(|(path, detail)| (path.clone(), detail.to_string()));
+            out
+        };
+        let (g, diagnostics) = assemble_with(false);
+        assert_eq!(
+            scip_edges(&g),
+            [
+                // public's own reference at its type's name, exact as before.
+                (
+                    own_public("User#"),
+                    EdgeKind::References,
+                    own_public("User#"),
+                    Certainty::Exact,
+                ),
+                (
+                    run.clone(),
+                    EdgeKind::Calls,
+                    own_public("NewId()."),
+                    Certainty::Synthetic,
+                ),
+                (
+                    run.clone(),
+                    EdgeKind::References,
+                    own_public("User#"),
+                    Certainty::Synthetic,
+                ),
+            ]
+        );
+        assert_eq!(
+            cross(&diagnostics),
+            [(
+                Some("server".to_owned()),
+                json!({"to": "public", "synthetic": 2, "ambiguous": 0, "unanchored": 2}),
+            )]
+        );
+        // `references_external` keeps its meaning: all eight are still counted there.
+        let external_count = diagnostics
+            .iter()
+            .find(|d| d.kind == "scip_status" && d.path.as_deref() == Some("server"))
+            .map(|d| d.detail["coverage"]["references_external"].clone());
+        assert_eq!(external_count, Some(json!(8)));
+        // A second job with the module path: no edge, and each candidate pair counts it.
+        let (g, diagnostics) = assemble_with(true);
+        assert!(
+            scip_edges(&g)
+                .iter()
+                .all(|(.., certainty)| *certainty != Certainty::Synthetic),
+            "{:?}",
+            scip_edges(&g)
+        );
+        assert_eq!(
+            cross(&diagnostics),
+            [
+                (
+                    Some("server".to_owned()),
+                    json!({"to": "copy", "synthetic": 0, "ambiguous": 4, "unanchored": 0}),
+                ),
+                (
+                    Some("server".to_owned()),
+                    json!({"to": "public", "synthetic": 0, "ambiguous": 4, "unanchored": 0}),
+                ),
+            ]
         );
     }
 }

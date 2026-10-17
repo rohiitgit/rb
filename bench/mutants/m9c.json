@@ -277,5 +277,59 @@
   "old": "                    .members(class, \"__init__\", |k| {\n",
   "new": "                    .named(class.0, Some(class.1), \"__init__\", |k| {\n",
   "what": "`constructor` looks only in the class"
+ },
+ {
+  "id": "m334",
+  "crate": "rb-indexer",
+  "test": "tests::external_references_join_another_projects_definitions",
+  "file": "scip.rs",
+  "old": "                    if hands_back(symbol, modules) {\n",
+  "new": "                    if false && hands_back(symbol, modules) {\n",
+  "what": "external reference not handed back"
+ },
+ {
+  "id": "m335",
+  "crate": "rb-indexer",
+  "test": "tests::external_references_join_another_projects_definitions",
+  "file": "lib.rs",
+  "old": "                .filter(|&&(root, module)| root != from && module == key.1)\n",
+  "new": "                .filter(|&&(root, _module)| root != from)\n",
+  "what": "module-path check removed"
+ },
+ {
+  "id": "m336",
+  "crate": "rb-indexer",
+  "test": "tests::external_references_join_another_projects_definitions",
+  "file": "lib.rs",
+  "old": "        .chain(cross_edges.into_iter().map(|e| (e, Certainty::Synthetic)));\n",
+  "new": "        .chain(cross_edges.into_iter().map(|e| (e, Certainty::Exact)));\n",
+  "what": "joined edge labelled `Exact`"
+ },
+ {
+  "id": "m337",
+  "crate": "rb-indexer",
+  "test": "tests::external_references_join_another_projects_definitions",
+  "file": "lib.rs",
+  "old": "                [to] => to,\n",
+  "new": "                [to, ..] => to,\n",
+  "what": "two defining jobs: first wins"
+ },
+ {
+  "id": "m338",
+  "crate": "rb-store",
+  "test": "db_tests::scip_status_counts_exact_certainty_only",
+  "file": "query.rs",
+  "old": "                       AND certainty = $2)\",\n",
+  "new": "                       AND certainty <= $2)\",\n",
+  "what": "`exact calls` counts every `scip` row (read-side; ScratchDb)"
+ },
+ {
+  "id": "m340",
+  "crate": "rb-indexer",
+  "test": "tests::external_references_join_another_projects_definitions",
+  "file": "scip.rs",
+  "old": "        &symbol[at[3] + 1..],\n",
+  "new": "        &symbol[at[2] + 1..],\n",
+  "what": "version kept in the lookup key"
  }
 ]

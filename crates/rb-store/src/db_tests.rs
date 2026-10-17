@@ -1592,3 +1592,68 @@ fn cached_facts_stream_the_rows_load_returns() {
         .unwrap_err();
     assert_eq!(err.to_string(), "stop");
 }
+
+/// Contract M9c C10: `rb status`'s `exact calls (scip)` counts `scip` `CALLS` rows of certainty
+/// `exact` only. A `synthetic` `scip` call (a D8′ cross-project join), a heuristic call and an
+/// exact `scip` `REFERENCES` row are not exact calls. On a scratch database: the query is
+/// read-side, but the snapshot it reads is published here.
+#[test]
+fn scip_status_counts_exact_certainty_only() {
+    let Some(db) = db() else { return };
+    let scratch = ScratchDb::create(&db.url, "scipcalls");
+    let mut store = Store::connect(&scratch.url).unwrap();
+    let file = NodeKey::new(NodeKind::File, "src/a.go".to_owned());
+    let sym = |name: &str| NodeKey::new(NodeKind::Symbol, format!("sym {name}"));
+    let mut b = GraphBuilder::new();
+    b.add_node(file.clone(), "a.go", Default::default())
+        .unwrap();
+    for name in ["a", "b", "c", "d"] {
+        b.add_node(sym(name), name, Default::default()).unwrap();
+    }
+    let at = |line: i32| Evidence {
+        path: "src/a.go".into(),
+        span: [line, 0, line, 1],
+    };
+    for (dst, kind, provenance, certainty, line) in [
+        ("b", EdgeKind::Calls, Provenance::Scip, Certainty::Exact, 1),
+        (
+            "c",
+            EdgeKind::Calls,
+            Provenance::Scip,
+            Certainty::Synthetic,
+            2,
+        ),
+        (
+            "d",
+            EdgeKind::Calls,
+            Provenance::Heuristic,
+            Certainty::Heuristic,
+            3,
+        ),
+        (
+            "b",
+            EdgeKind::References,
+            Provenance::Scip,
+            Certainty::Exact,
+            4,
+        ),
+    ] {
+        b.add_edge(
+            NewEdge::new(sym("a"), kind, sym(dst), provenance, certainty).evidence(at(line)),
+        )
+        .unwrap();
+    }
+    let graph = b.finish().unwrap();
+    let published = store
+        .publish_snapshot(
+            &repo_name("scipcalls"),
+            &"c".repeat(40),
+            &json!({}),
+            &graph,
+            &[],
+            &load_dir(),
+        )
+        .unwrap();
+    let coverage = store.resolution_coverage(published.snapshot.id).unwrap();
+    assert_eq!(coverage.exact_calls, 1);
+}
