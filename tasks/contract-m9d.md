@@ -134,6 +134,8 @@ flowchart LR
 
 **NFRs.**
 - mattermost `noscip-fresh` wall ≤ 1.25× and peak RSS ≤ 1.15× the M9c run of record, with M9c's A/B re-measure rule (CPU within 1.1×, ABBA, `instructions retired`; lesson of 2026-10-16). Predicted unchanged: no noscip path changes.
+  - (Noted by M9c amendment 3, E6.) The M9c run of record is r2, `var/bench/out/3b94ded449f8/` with `bench/scoreboard/m9c-perf.json` from it: mattermost walls 26.10 / 16.63 / 20.34 s (`noscip-fresh` / `noscip-cached` / `scip`), checked against a standalone timing of the same binary on a quiet host (22.72 / 16.43 / 20.18 s). r1's walls (69.55 / 74.60 / 71.81 s, `f340b267d529`) were host-inflated and are not the base.
+  - (Noted by M9c amendment 3, N2.) With a local `replace` onto the defining root, scip-go type-checks against the in-repo tree, yet D8′ labels the join `synthetic` (it never reads `go.mod`'s replaces). Whether such joins, and `go.work` ones, become `exact` is part of M9d's `go.work` question; the M9c evaluator's `go_d8` fixture (`var/m9c/eval1/fx/go_d8`) is a ready row.
 - Scoring ≤ 30 s; two scorings `cmp`-identical; warm full bench ≤ 20 min (M9b r2 warm: 14 min 3 s, 18:30:22–18:44:25).
 - `rb check` on `topo-packs` ≤ 100 ms per rule at load ≥ 4 (C10's timing log, not a unit test).
 - server's scip-go under go.work: `memory.peak` < 4 GiB with 0 `oom_kill`; wall reported A/B against the no-go.work run under the same load (measured 167 s vs M9c's 94 s at different loads).

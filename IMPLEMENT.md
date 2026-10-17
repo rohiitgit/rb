@@ -896,7 +896,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - P7b: a per-join memo so the SCIP join parses each distinct symbol once (`NameForms`, `NameMemo`); output unchanged.
 - **Files:** `crates/rb-scip/src/{jobs,lib,symbol}.rs`, `crates/rb-indexer/src/{lib,resolve,rta,scip}.rs`, `crates/rb-syntax/src/{lib,bindings,decorations,queries,keys}.rs`, `crates/rb-store/src/{query,db_tests}.rs`, `crates/rb-cli/src/doctor.rs`, `crates/rb-cli/tests/golden/{go-chi-sqlx,polyglot-monorepo}/scip-status.txt`, `docker/scip-go/{Dockerfile,README.md}`, `bench/probe/m9c_forms.py`, `bench/mutants/m9c.json`, `bench/samples/exact.tsv`, `bench/scoreboard/m9c{,-perf}.json`, `bench/accept-m9c.tsv`, `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
 - **Results** (binary `f340b267…06c9` from `55592a1`, run `var/bench/out/f340b267d529/`):
-  - scip `calls` agreement P 78.4 % → 99.5 %, R 62.4 % → 96.3 %; mattermost gold 33,312 → 43,840, fp 6,141 → 203, fn 12,672 → 1,659. 23,186 `synthetic` cross-module scip edges.
+  - scip `calls` agreement P 78.4 % → 99.5 %, R 62.4 % → 96.3 %; mattermost gold 33,312 → 43,840, fp 6,141 → 203, fn 12,672 → 1,659. 23,186 `synthetic` cross-module scip edges. The precision gain is the gold growing: the `synthetic` joins are scip gold, 5,944 of the 6,141 base fp became tp through them, and against `exact` gold alone P reads 78.2 % (amendment 3, E5).
   - bookcars `calls` R 62.5 % → 99.6 % (fn 694 → 8); go_clean_arch and go_gin_example 100 %; PyCG `calls` 12 → 14 of 48, `calls_file_scope` 94 → 105 of 186.
   - 17 of 314 cells changed; `compare` exits 0 with 6 accepted lines over 5 cells. Invariant: 0 unclassified rows over 157 dumps; no Tier B edge `exact`.
   - `exact` 100.0 % of 126; the `scip` sample's 54 redrawn edges all TRUE.
@@ -906,4 +906,13 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - fmt and clippy clean; `rb.repo` unchanged; two scorings `cmp`-identical.
   - Perf: mattermost `noscip-fresh` A/B noise (CPU 1.010×); SCIP mode 1.297× CPU at P7, 0.975× after P7b's memo.
 - **Open, carried to M9d:** version skew (185 of the 203 mattermost fp; every D8′ join `synthetic`), `(T, *model.AppError)` results, the `scip` crate parser's remaining `Debug` cost, and the 4,092 interface-method references no server/public definition anchors.
-- **Status:** built, evaluator pending.
+- **Evaluator pass 1 (`tasks/eval-m9c-pass1.md`: PASS, 0 blocking, 6 should-fix, 6 notes; contract amendment 3; code `e58f6ee`, `PIPELINE` `m9c-2`):**
+  - E1: a Go result named by a type parameter types nothing (Go facts record type parameters); `select` receives declare their names.
+  - E2: Python member lookup and inherited `__init__` follow the C3 MRO; `super().m()` is the MRO's next class (N4); the later of a definition, named import and star import wins.
+  - E3: tests for the evaluator's surviving mutants; e1, e2, e4, e8 adopted as m356–m359; e5 equivalent, its redundant check removed.
+  - E4: tsconfig BOM and `"baseUrl": "."`.
+  - E5: 60 seeded D8′ `synthetic` `CALLS` judged blind, 59 TRUE (`bench/samples/synthetic-d8.tsv`); the FALSE class (a Go conversion labelled `CALLS`, 77 rows) is now `REFERENCES`. Against `exact` gold alone the scip `calls` agreement P is 78.2 %.
+  - E6: r2 benched on a quiet host; mattermost walls 26.10 / 16.63 / 20.34 s, within 1.15× of a standalone timing; M9d's base.
+  - r2: binary `3b94ded4…9db6`, run `var/bench/out/3b94ded449f8/`, 156 rows changed against r1 (154 conversions, 2 PyCG), 0 unclassified; 53 redrawn `exact` edges, 53 TRUE; `compare` exit 0; RSS A/B noise.
+  - Verification: real-Docker 1,156/0/0; mutants m9c 56/56, m9b 39/39, m9a 31/31, m8b 29/29 KILLED.
+- **Status:** built; evaluator pass 1 answered and re-closed; pass 2 pending.

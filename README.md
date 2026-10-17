@@ -314,7 +314,7 @@ troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 | `fixtures/` | 18 golden fixture repos (see the testing guide for the catalog) |
 | `tasks/`, `docs/`, `var/` | contracts, evaluations, lessons; design doc; per-milestone scripts/logs/evidence (gitignored scratch) |
 
-**Status: M0–M9c (M9a and M9b closed 2026-10-16; M9c built 2026-10-17, evaluator pass 1 pending).** M0–M6l built the tool (foundations → structure → syntax →
+**Status: M0–M9c (M9a and M9b closed 2026-10-16; M9c built 2026-10-17, evaluator pass 1 answered, pass 2 pending).** M0–M6l built the tool (foundations → structure → syntax →
 SQL/ORM → resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules
 breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7j fixed
 what a stress campaign over 18 fixtures and 13 public repositories found
@@ -329,5 +329,10 @@ it found (test-file routes, spec-only routes, literal-brace Spring paths,
 Go method `IMPLEMENTS`, config-server context paths). M9b adds recall it
 found missing: Go methods declared outside their type's file, `fmt.Sprintf`
 SQL with package constants, Spring Data REST endpoints; cross-module SCIP
-calls moved to M9c. Detail per milestone: `CHANGELOG.md`,
+calls moved to M9c. M9c fixes the scip-go image (it had loaded no imported
+package since it was built), adds Tier B recall for Go receivers, TypeScript
+tsconfig `paths` and default imports, and Python `super()`, star imports and
+the MRO, and joins calls between a repository's Go modules as `synthetic`
+`scip` edges (their gain in SCIP agreement precision is the reference
+gaining those joins; recall rose from 62 % to 96 %). Detail per milestone: `CHANGELOG.md`,
 `IMPLEMENT.md`, contracts in `tasks/`.

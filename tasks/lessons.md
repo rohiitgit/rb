@@ -678,3 +678,19 @@
 ## 2026-10-17: a residue is labelled by a split of its rows, not by its largest part
 - **Mistake (found in M9c P8 and by M9d's contract):** amendment 2 called 4,092 server → server/public member references "skew"; they are references to 133 interface-method symbols that server/public's index defines none for. M9c's accept line called the 190 remaining mattermost fp "version-skew calls"; 18 of them are `docs/site` and e2e-tests calls (`var/m9c/logs/p8/fp-split.txt`).
 - **Rule:** Before a record names what a residue is, split its rows by a recorded rule (area, language, symbol kind) and log the split. A label covers only the rows it was checked on; the rest are named as unclassified or by their own split.
+
+## 2026-10-17: a precision headline says how much of it is the reference changing
+- **Mistake (caught by M9c evaluator pass 1, E5):** M9c's records quoted scip `calls` agreement P 78.4 % → 99.5 % without saying that D8′'s own `synthetic` joins had entered the gold. 5,944 of the 6,141 base fp became tp that way; against `exact` gold alone P was 78.2 %. No judged sample covered the new gold either; when one was drawn, it found a wrong-edge class (a Go type conversion labelled `CALLS`) in the very edges that defined it.
+- **Rule:** When a change adds edges that the benchmark's reference also takes in, score the cell with and without them and quote both, and judge a seeded sample of the new reference edges before reporting the gain.
+
+## 2026-10-17: "as the language does" is tested on the case where the shortcut differs
+- **Mistake (caught by M9c evaluator pass 1, E2):** the inherited `__init__` walked supertypes breadth-first and the note called it "Python's MRO at one level". `class R(P, Q)` with `P(A)` takes `A.__init__` in Python and `Q.__init__` breadth-first, and the PyCG cases had no inherited left base to show it. Likewise a star import "after named imports" ignored that Python rebinds in source order.
+- **Rule:** When an implementation approximates a language rule, write the smallest input where the approximation and the rule disagree (a left base that inherits, a later statement that rebinds), and see it fail before calling the approximation the rule.
+
+## 2026-10-17: a refactor moves the mutants' anchors; re-run the battery before trusting it
+- **Context (M9c pass 1):** moving Python star imports into `python_module_level` left 5 of M9c's specs STALE and 2 SURVIVED (the `super().m()` path no longer passed through the arm they mutated). The battery caught it only because it was re-run on the changed tree.
+- **Rule:** After any refactor of code that existing mutants target, re-run that battery before the commit, and re-anchor each STALE or newly surviving spec on the line its behaviour moved to, with the same mutation, recording which ones moved.
+
+## 2026-10-17: a bench's walls become a base only after a standalone timing agrees
+- **Mistake (caught by M9c evaluator pass 1, E6):** M9c's run of record had mattermost walls about 3× the same binary's standalone timing (autovacuum after probe deletes), and M9d's wall limit was set against them, so a wall regression up to about 3.6× could not have warned.
+- **Rule:** Before a run's perf file becomes a later milestone's base, check the host (load, memory, `pg_stat_activity`, `pg_stat_progress_vacuum`, `n_dead_tup`) and time the same binary standalone on the largest target; if any wall disagrees by more than 1.3×, re-run the bench.
