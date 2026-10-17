@@ -63,7 +63,7 @@ None of the 8 is a fetch timeout, an OOM or the disk budget. Every fetch that ra
   | fixed image + go.work server index | **42,126** | **26,763** | **18** | **15,363** | 0.999 | 0.635 |
 
   Under go.work every cross-job pair joins by an equal symbol string (8,814 pairs; 0 need the version dropped). The 172 skew fp become tp. Noscip edges are the M9b record's, so B2's effect (M9c P3) is not in these numbers **[M9c]**.
-- **rb's view of these references** (HEAD). A symbol the job does not define is `references_undocumented` only if its package is one of the job's own (`scip.rs:336`, comparing manager, name and version), else `references_external` (`scip.rs:553`). So server/public symbols with version `.` stay external, and M9c's D8′ hands them back (uncommitted P5) **[M9c]**.
+- **rb's view of these references** (HEAD). A symbol the job does not define is `references_undocumented` only if its package is one of the job's own (`scip.rs:376` at `8e91884`, `:336` at `15371eb`; comparing manager, name and version), else `references_external` (`scip.rs:621` at `8e91884`, `:553` at `15371eb`). So server/public symbols with version `.` stay external, and M9c's D8′ hands them back (uncommitted P5) **[M9c]**.
 - **Package nodes.** The M9b `scip` dump holds 30 `scip` `DEPENDS_ON` into `go/github.com/mattermost/mattermost/server/public@v0.4.3`; the `noscip` dump holds 0. Under go.work the version is empty, so these would move to a new `…server/public@?` node unless D9 applies.
 
 **Health.** M9c amendment 2 measured, across every bench scip-go job: 119,977 invalid locals in server on the old image, 1,541 on the fixed one (skew), 0 in every other job. This probe adds 13,234 for the cache-only workspace, 0 under the fetched go.work and 0 in sharedchannel-test. scip-go writes nothing about load errors and exits 0. `go list -e` sees the workspace's missing module but not the skew (0 errors without go.work, 1,541 invalid locals), so the index content is the signal, as M9c concluded. rb's decoder drops `SymbolInformation.signature_documentation` (`decode.rs:659`), so nothing reads it today.
@@ -180,7 +180,7 @@ Disk: about 0.5 GiB of host caches, plus about 1.3 GiB for the JDK 25 image in D
 - **D7 (planner reads go.mod).** `jobs()`'s reader is asked for each Go root's `go.mod` too (today `package.json` and workspace `yarn.lock` only), so D5 and D6 are decided in the plan and covered by the input hash through the exported `go.mod`.
 - **D8 (D8′ certainty, delta on M9c) [M9c].** In M9c's post-loop join, an edge is `exact` when the handed-back symbol string is byte-equal to the defining job's definition symbol, and `synthetic` otherwise. `scip_cross_project` gains `exact` beside `{synthetic, ambiguous, unanchored}`. `rb status`'s `exact calls (scip)` (M9c C10) counts them.
 - **D9 (in-repo modules are not packages).** A scip-go reference whose package name is another ok scip-go job's module path and whose version is empty creates no `Package` node and no `scip` `DEPENDS_ON`; it is joined (D8). A reference at a real version (`v0.4.3`, with no go.work) keeps today's package. That matches the `noscip` dump, which holds 0 such edges.
-- **D10 (scip-go health).** For an index whose tool is `scip-go`, the decoder counts local symbols, and those whose signature text contains `invalid type` (go/types' spelling). The job's coverage records `locals_invalid_type` and `locals`, written only when the first is non-zero, as `lombok_removed` is (`lib.rs:1530`). The status line appends `, N of M locals typed invalid`. No threshold: every healthy bench index measures 0.
+- **D10 (scip-go health).** For an index whose tool is `scip-go`, the decoder counts local symbols, and those whose signature text contains `invalid type` (go/types' spelling). The job's coverage records `locals_invalid_type` and `locals`, written only when the first is non-zero, as `lombok_removed` is (`lib.rs:1677` at `8e91884`, `:1530` at `15371eb`). The status line appends `, N of M locals typed invalid`. No threshold: every healthy bench index measures 0.
 - **D11 (`cypher()` JIT).** `SET LOCAL jit = off` joins `statement_timeout` and the role in `cypher()` (`rb-store/src/lib.rs:1632`), built by one helper that the test also calls. This covers `rb check`, `rb cypher` and the API's Cypher route; relational queries are unchanged.
 - **D12 (JDK 25) [P0-gated].**
   - `docker/scip-java/Dockerfile` takes `ARG BASE` (default: today's Temurin 21 digest), so `rb-scip-java:0.13.1` rebuilds byte-for-byte as before.
@@ -424,6 +424,154 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - `eclipse-temurin:25-jdk` (pulled for the probe) was removed, along with every `m9d-probe-*` container and network. No existing image was touched.
   - No `rb.scip_index` row was written: no rb index ran with SCIP on.
   - No commit, no `cargo` run, no edit outside this file and `var/m9d/plan/`.
+
+**Amendment 1 (2026-10-18, P0; M9c closed at `8e91884`).** P0's record is `var/m9d/logs/p0/`. The probe is `bench/probe/m9d_probe.py` (`python3 -I`, read-only; output `logs/p0/probe-citations-record.txt`, `probe.txt`). The Docker probe scripts, the D12 and D13 drafts and the content checker are in `var/m9d/p0/{scripts,docker,gradle}/`. Every probe ran in Docker, one at a time, behind an egress proxy built as rb builds it (`scripts/lib.sh`, the planner's `proxy_fetch.sh` config), or under `--network none`. Each probe used APFS clones of the bench caches, and the clones were deleted afterwards.
+- **Disk and record.**
+  - At the start: `du -sh target` 5.8 GiB, `df -h .` 17 GiB free. `docker system df` fails on this host ("rw layer snapshot not found" for `d9bdd04301c9`, a container that is not rb's), so the Docker VM was read through a throwaway container's `df /`: 166 GiB available. The host's free space is the binding floor. It never fell below 13 GiB, and it was 18 GiB at the end (`disk-start.txt`).
+  - M9c's record `var/bench/out/6cd5baaa8d1f/` holds 157 dumps (38 targets, 119 PyCG cases), 0 of them empty, and 11 `.scip.status` files.
+  - Re-scored with HEAD's release `rb-bench`, it is `cmp`-identical to `bench/scoreboard/m9c.json` and `m9c-perf.json`; the control against `m9b.json` differs (`rescore.txt`). `cargo build --release -p rb-bench` recompiled the binary (sha256 `e9dea089…`, where M9c's Result names `82839c81…`). The scoreboards are identical, so only the binary's bytes differ.
+- **Citations.** The planner's 42 checks hold 37 of 42 at `8e91884`. Five moved: rb-indexer `lib.rs` 145 → 157 (`PIPELINE` `m9c-3`), 1500 → 1647 (coverage), 1530 → 1677 (`lombok_removed`), and `scip.rs` 336 → 376 (`own_packages`), 553 → 621 (`references_external`). The body now cites both lines. The updated list adds the contract's 5 unchecked citations and M9c's sites below: 74 of 74 hold, and the +7 control fails 74 of 74.
+- **M9c's close, re-read** (`8e91884`).
+  - **D8′'s join is `join_across_projects`** (`lib.rs:1531`), called after the job loop (`lib.rs:1182`) on the references each scip-go job hands back (`scip.rs:623`, through `hands_back`, `scip.rs:827`, keyed by `unversioned`, `scip.rs:837`). Its certainty is fixed in one place: `.chain(cross_edges…map(|e| (e, Certainty::Synthetic)))` (`lib.rs:1234`). The counts are at `lib.rs:1579` (`synthetic`) and `:1587` (`unanchored`), and the diagnostic at `:1601`. D8 changes those three sites: the edge carries its certainty out of the join, `exact` when `r.symbol == *dst`.
+  - **D9's `Package` code** is the per-document "Packages" loop (`scip.rs:651–679`): every occurrence of a symbol the index does not define, unless it is in `own_packages` (`scip.rs:664`). Those become `PackageUse`s, which `lib.rs:1185` turns into `Package` nodes and `scip` `DEPENDS_ON`. A handed-back reference also passes through this loop, so D9 goes there, with the job's `modules` set (already passed to `join_handing_back`, `scip.rs:217`).
+  - **D10's coverage keys** are the always-written block (`lib.rs:1647`, which since M9c includes `references_unanchored`, `:1657`) and the non-zero block (`lib.rs:1677`), where `locals_invalid_type` and `locals` go.
+- **B4 at M9c's close.** M9c's record has the same 34 jobs as M9b's, with the same 8 failed jobs (same status and phase) and the same absent Python roots. sharedchannel-test was re-run on the fixed image (row `f420b550…`, 2026-10-17 08:13, `failed`/`fetch`, 718 ms) and failed with the same `reading /server/public/go.mod` error (`sharedchannel-row.txt`, read `READ ONLY`).
+- **go.work emulation re-run** (`probe.txt`).
+  - **Inputs.** The 13 scip-go indexes M9c's record joined (`var/m9c/p7/idx`, exported `READ ONLY` from `rb.scip_index` under the fixed image, `record-go-rows.txt`) are each IDENTICAL, as multisets, to M9c P0b's `idx-new`. The emulation's inputs are therefore the record's.
+  - **On M9b's record** it reproduces every planned number: S0 33,312 / 20,640 / 6,141 / 12,672; S2 41,878 / 26,591 / 190 / 15,287; go.work 42,126 / 26,763 / 18 / 15,363; 4,092 and 4,093 interface-method references (133 and 134 symbols); 1,541 and 0 invalid locals.
+  - **The cache-only index is gone.** The planner's cache-only index (`mattermost-server-gowork.scip`) no longer exists, so its column (13,234) is not re-measured.
+
+  | `scip:mattermost:noscip:calls` (gold, tp, fp, fn) | value | step |
+  |---|---|---|
+  | A: M9b's record, emulated fixed image + D8′ (planned S2) | 41,878 / 26,591 / 190 / 15,287 | |
+  | X1: A's gold, M9c's noscip edges | 41,878 / 40,397 / 202 / 1,481 | A → X1: tp +13,806, fp +12: M9c's Tier B (B2, B3, B5) |
+  | X2: M9c's gold, M9b's noscip edges | 43,771 / 27,762 / 191 / 16,009 | A → X2: gold +1,893: rb's join against the emulation, IMG, D3-doc, conversions now `REFERENCES` |
+  | B: M9c's record, as scored (equals `m9c.json`'s cell) | 43,771 / 42,181 / 203 / 1,590 | |
+  | **C: M9c's record + the go.work server index** | **44,024 / 42,366 / 18 / 1,658** | **B → C, go.work alone: gold +253, tp +185, fp −185, fn +68** |
+
+  - **Why the go.work delta differs from the plan's.** The plan's go.work delta was gold +248, tp +172, fp −172, fn +76 on M9b's edges. On M9c's record, M9c's Tier B already finds more of the newly joined pairs, so 13 more of them are tp and fewer are fn. The 185 fp that go.work removes are exactly M9c's 185 version-skew calls. The 18 left are the `docs/site` and e2e-tests calls (M9c P8 `fp-split.txt`).
+  - Under go.work the 10,097 D8′ pairs leave the gold as cross-job joins and re-enter as own-symbol pairs (byte-equal), plus 253 new ones.
+- **D8, D9, D10 bases** (`probe.txt`, sections `d8`, `measure`).
+  - **D8.** Each of M9c's 23,180 `synthetic` scip edges (`CALLS` 10,098, `REFERENCES` 13,082) has, under go.work, a reference at its evidence span whose symbol is byte-equal to its target: 23,180 of 23,180. M9c's `scip_cross_project` row is server → server/public: `synthetic` 44,269, `ambiguous` 0, `unanchored` 16,366.
+  - **D9.** M9c's `scip` dump holds 30 `DEPENDS_ON` into `go/github.com/mattermost/mattermost/server/public@v0.4.3`, as M9b's did.
+  - **D10.** Locals typed `invalid type`: 1,541 of 202,391 in server, 0 in each of the 12 other record indexes, and 0 of 202,391 under go.work.
+- **Probe (a): go.work A/B on server** (`a-gowork.txt`, `a-content.txt`; `rb-scip-go:0.2.7-xtools0.50.0`, cpus 2, memory 4g).
+  - **Module cache** (clone of `bench_mattermost_scip/gomod`): 1,195,156 KiB, 41,416 files, 274 module directories.
+    - Fetch A, rb today (`GOFLAGS=-mod=mod go mod download`): 1 s, no growth.
+    - Fetch B (`go work init . ./public`, `GOFLAGS` empty, `go mod download`): rc 0, 150 s, through `proxy.golang.org` and `storage.googleapis.com` only, 0 refused. The cache grew to **2,971,120 KiB (+1.69 GiB)**, 114,215 files, 580 module directories. In workspace mode `go mod download` fetches the whole workspace module graph.
+  - **Index, ABBA, `--network none`.** Loads 2.58–6.70 over the four runs.
+
+    | Run | Wall | CPU (cgroup) | `memory.peak` |
+    |---|---|---|---|
+    | A1 (no go.work) | 101 s | 182.3 s | 3,804,770,304 B |
+    | B1 (go.work) | 146 s | 272.3 s | 3,863,781,376 B |
+    | B2 (go.work) | 145 s | 271.0 s | 3,859,456,000 B |
+    | A2 (no go.work) | 99 s | 179.5 s | 3,875,983,360 B |
+
+    go.work costs 1.46× wall and 1.50× CPU. `memory.events` shows 0 `max`, 0 `oom`, 0 `oom_kill` in all four runs.
+  - **Content.** The A index is IDENTICAL to the record's server index, and the B index to the planner's go.work index (0 invalid locals).
+  - **(a2), added because of the growth** (`a2-golist.txt`, `a2-content.txt`). A narrower workspace fetch, `go list -e -deps -test ./... ./public/...` under the same `go.work`, took 11 s and grew the cache by **54,160 KiB** (1,029 files, 1 module directory).
+    - The offline index that followed found 0 package errors (`go list -e`) and was **IDENTICAL** to B's (scip-go rc 0, 143 s).
+    - Its `memory.peak` read 4,294,967,296 B, which equals the 4 GiB limit; this run did not read `memory.events`.
+- **Probe (b): spring_boot_microservices on JDK 25** (`b-build.txt`, `b-base-tools.txt`, `b-build2.txt`, `b-spring.txt`, `b-spring2.txt`, `b-spring3.txt`, `b-control.txt`, `b-content.txt`, `b-scip-java-index.log`).
+  - **Draft 1 fails.** The D12 draft as planned (`ARG BASE` on `docker/scip-java/Dockerfile`, `BASE=eclipse-temurin:25-jdk@sha256:2d5d5e9b…`, the index digest, Ubuntu 26.04, 25.0.4.1) does not build: that base has neither `curl` nor `wget` (exit 127 at the Maven download).
+  - **Draft 2 builds** (`Dockerfile.jdk25`): it copies `/opt/maven`, `/opt/gradle` and `/usr/local/bin/scip-java` from `rb-scip-java:0.13.1` onto the JDK 25 base. It built in 7 s to 1,091,022,554 B, and `mvn`, `scip-java` and the Gradle launcher have the same sha256 as in 0.13.1. `rb-scip-java:0.13.1` was not rebuilt; its ID is still `f9612a94…`.
+  - **Fetch**, rb's Maven recipe behind the proxy, m2 cloned from the bench (393,428 KiB): `go-offline` rc 0 in 49 s and 48 s, `clean verify -DskipTests` rc 0 in 17 s. **`repo.spring.io:443` was refused twice and is not fatal.** m2 grew by 67 MiB (to 460,384 and 461,856 KiB).
+  - **Index without a targetroot: no index.** Under `--network none` the build passes (`BUILD SUCCESS`, 111 files compiled with `release 25`, 12 s), but scip-java writes no `index.scip`, so rb would record `(no index.scip was produced)`.
+    - **Cause.** scip-java's Maven targetroot defaults to `target/scip-targetroot` under the source root. The root pom is an aggregator that is not its modules' parent (they inherit `spring-boot-starter-parent`), so the reactor builds it last, and its `clean` deletes `/sources/target`, the targetroot included, before scip-java collects it.
+    - **Control.** A two-class project with `release 25` indexes (1,718 B) with maven-compiler-plugin at the default, 3.13.0, 3.14.0 and 3.15.0, so neither the JDK nor the plugin version is the cause.
+  - **With `--targetroot /scip-targetroot`** (outside `/sources`), the same index phase is rc 0 in 13 s, writes 1,002,030 B with 111 documents for 111 tracked `.java` files, and peaks at 716 MB, with 0 OOM.
+- **Probe (c): adservice, D13's hook** (`c-gradle.txt`, `c-gradle2.txt`, `c-gradle3.txt`, `c-content.txt`). Recipe: `rb-scip-java:0.13.1`, rb's Gradle recipe, the init script mounted read-only and passed as `--init-script` to both fetch runs and to the Gradle arguments of the index.
+  - **Script.** It resolves the project's `protobufToolsLocator_*` configurations and sets 0755 with `Files.setPosixFilePermissions` on each `*.exe` under `GRADLE_USER_HOME`, without asking `canExecute()`.
+  - **Controls without a script** fail warm (bench Gradle home cloned, both tools 0644) and cold (empty home) at `:generateProto` with `error: 13 (Permission denied)`.
+
+  | Scenario | Fetch 1 | Fetch 2 | Index | Gradle home growth |
+  |---|---|---|---|---|
+  | `whenReady`, warm | 5 s | 9 s | rc 0, 10 s, 4,239,341 B | +6 MiB |
+  | `whenReady`, cold | 23 s | 19 s | rc 0, 11 s, 4,239,341 B | 59,300 KiB |
+  | `beforeTask`, warm | 5 s | 10 s | rc 0, 11 s, 4,239,341 B | +6 MiB |
+  | `beforeTask`, cold | 21 s | 32 s | rc 0, 11 s, 4,239,341 B | 61,364 KiB |
+
+  - **Hook behaviour.** In both phases, `whenReady` fires once per build and `beforeTask` once per `GenerateProtoTask` (twice, main and test). Both tools end 0755.
+  - **Index content.** 12 documents: the 2 tracked `.java` files and 10 generated under `build/generated/`, with 0 invalid locals.
+  - **Harness fault.** `c-gradle.txt`'s two `beforeTask` scenarios first failed in the harness: Docker Desktop refused to mount a probe directory deleted and recreated at once (`error while creating mount source path`), so no proxy ran. They were re-run with a fresh path per scenario (`c-gradle2.txt`). rb names each run's directories by instance (`orchestrate.rs:365`) and is not exposed to this.
+- **Probe (d): the 4 microservices_demo Python roots** (`d-python.txt`, `d-python2.txt`, `d-content.txt`). Recipe: D2's recipe on the pinned scip-python image (linux/amd64, Alpine), a fresh pip cache per root; the index in a new container, `--project-name <segment> --project-version .`.
+
+  | Root | `.py` | Pins | Fetch | Index (as rb) |
+  |---|---|---|---|---|
+  | emailservice | 5 | 35 | rc 0, 28 s, 14 MB | rc 0, 4 s, 141,910 B |
+  | loadgenerator | 1 | 39 | **rc 1**, 22 s (psutil: no `gcc`), 20 MB | rc 0, 2 s, 8,842 B |
+  | recommendationservice | 5 | 31 | rc 0, 14 s, 14 MB | rc 0, 4 s, 149,308 B |
+  | shoppingassistantservice | 1 | 79 | **rc 1**, 26 s (numpy's meson build), 32 MB | rc 0, 3 s, 12,844 B |
+
+  - **Planner's `--hash` note.** shoppingassistantservice has 0 `--hash` lines (a `uv pip compile` file with `# via` comments), so that note is withdrawn. The first run of 3 roots hit the same Docker Desktop mount fault and was re-run (`d-python2.txt`).
+  - **New finding: rb's pip environment never reaches the index.** The pip fetch installs into the fetch container's own site-packages, and only `/root/.cache/pip` persists.
+    - The rb-shaped indexes name only the project and `python-stdlib` (2 packages).
+    - The control, which fetches and indexes in one container, names 14 (emailservice) and 12 (recommendationservice) packages (`grpcio`, `protobuf`, `opentelemetry-*`, …).
+    - For the 2 roots whose fetch failed, rb-shaped and control indexes are identical.
+    - So a Requirements job's index already equals D4's fallback index. This holds since M6d, for `Requirements` and `None` alike (M6d's record: "scip-python emits no third-party `py/` rows"). Poetry's virtualenv lives under the mounted `/root/.cache/pypoetry`; whether scip-python finds it is unmeasured.
+- **Verdicts.**
+  - **D12: built.** Two changes:
+    - **The image** is `docker/scip-java/Dockerfile.jdk25` (draft 2: `ARG BASE` defaulting to the measured `eclipse-temurin:25-jdk@sha256:2d5d5e9b…`, tools copied from `rb-scip-java:0.13.1`). `docker/scip-java/Dockerfile` is not edited, so the JDK 21 image, its ID and every cached Java row are untouched. P6's "rebuild-check the default" becomes: `rb-scip-java:0.13.1`'s ID unchanged, and the three tool checksums equal across both images.
+    - **D12b (new).** Every Maven index phase passes `--targetroot /scip-targetroot`, a container path outside `/sources`. `RECIPE_JAVA` `m5-egress-1` → `m9d-java-1`, so every Maven job re-runs once. Predicted: every other Maven index (e2e fixtures) byte-identical, because the targetroot is not in the index. The spring index gains 111 documents.
+    - The mechanism does not depend on the JDK, so D12b applies to JDK 21 jobs too.
+    - P6 keeps m388–m390 and adds **m393** (`--targetroot` dropped from the Maven index arguments; filter `maven_index_phase_writes_the_targetroot_outside_the_sources`, orchestrate) with that unit (C11).
+  - **D13: built**, with **`whenReady`**: it fires once, before any task of the build, in both phases, warm and cold. `beforeTask` works too, but it runs once per proto task. m391 stays.
+  - No phase is dropped and no mutant is retired.
+- **D5 amended: the workspace fetch is `go list -deps -test` over `.` and each `use` directory (`./... ./public/...`), not `go mod download`.** Measured: the same index byte for byte, 11 s against 150 s, and +53 MiB of module cache against +1.69 GiB.
+  - The probe ran `go list` with `-e`; rb runs it without, so a missing module fails the fetch, as `go mod download` does. P4's server probe checks that this exits 0.
+  - C5's test asserts the argument list. **m374** keeps its meaning. **m394** (new): a workspace job's fetch is `go mod download`. Filter `workspace_jobs_write_go_work_and_clear_goflags`.
+- **Re-based [M9c] predictions** (planned → on M9c's record).
+  - **D14's base:** `var/m9d/m9c-rescored.json` (and `-perf.json`), `cmp`-identical to `m9c.json`.
+  - **`scip:mattermost:noscip:calls`.**
+    - Planned: relative to the emulated S2, gold +248, tp +172, fp 190 → 18, fn +76.
+    - Now: gold **43,771 → 44,024** (+253), tp **42,181 → 42,366** (+185), fp **203 → 18**, fn **1,590 → 1,658** (+68), plus sharedchannel-test's own pairs (NEWIDX).
+    - Gate: fn rises, so one accept line (WORK); fp falls and needs none.
+  - **D8.**
+    - Planned: about 8,800 pairs.
+    - Now: all **23,180** of M9c's `synthetic` scip edges become `exact` (`CALLS` 10,098, `REFERENCES` 13,082). `scip_cross_project` server → server/public: `synthetic` 44,269 → 0, `exact` ≥ 44,269, `unanchored` measured at P9 (16,366 at M9c, of which the 4,093 interface-method references stay).
+  - **`rb status` mattermost `exact calls (scip)`:** 34,647 → **≥ 44,745** (+10,098 from D8, plus `CALLS` go.work types anew).
+  - **`exact` sample.**
+    - Planned: draws move.
+    - Now: the `scip` family's mattermost stratum grows by about 23,180 edges, so nearly all 60 strides move. Budget for re-judging up to 60 edges.
+  - **D9:** the 30 `DEPENDS_ON` into `…server/public@v0.4.3` and their `Package` node leave (WORK).
+  - **HEALTH bucket:** empty, as planned: 0 invalid locals in every index under go.work (measured on the probe index).
+  - **Perf NFRs:** unchanged (base: the pass-2 run, N6).
+- **Re-based budgets.**
+  - **mattermost `server`:**
+    - Fetch: 11 s with D5's `go list` (150 s with `go mod download`).
+    - Index: 145 s against 100 s without go.work at the same loads.
+    - `memory.peak`: 3.86 GB, with 0 OOM over 2 runs, and once at the limit (a2, `memory.events` not read).
+    - Cache: +53 MiB.
+  - **spring_boot_microservices:** fetch 48 s + 17 s, index 13 s, m2 +67 MiB, image 1.09 GB in Docker.
+  - **adservice:** fetch about 14 s warm and 42–53 s cold, index 10–11 s, Gradle home +6 MiB.
+  - **The 4 Python roots:** fetch 14–28 s (2 ok, 2 failed → D4 fallback), index 2–4 s, pip 14–32 MB each.
+  - P0's measured cache additions sum to about 0.2 GiB (53 + 67 + 6 MiB, plus 80 MB of pip caches), within the planned 0.5 GiB. The JDK 25 image adds 1.09 GB in Docker's disk, below the planned 1.3 GiB. The 8 GiB floor holds.
+- **New risks.**
+  1. **The go.work fetch would have cost 1.69 GiB** of module cache per run of server (D5 amended above). Any later workspace job meets the same choice.
+  2. **server under go.work peaks at 3.86–4.29 GB of a 4 GiB cgroup.** `memory.peak` includes page cache, and 0 OOM was read where events were read. The NFR line "memory.peak < 4 GiB with 0 `oom_kill`" becomes "0 `oom_kill` and 0 `oom`, with `memory.peak` reported", and P4's probe logs `memory.events`. An OOM there is a stop: the budget is a design question, not a P4 fix.
+  3. **pip environments never reach scip-python's index phase** (probe (d)). D2's fetch only proves installability and warms the pip cache. The fix (install to a mounted `--target` with `PYTHONPATH`) changes every Python index and is Out of scope for M9d.
+  4. **D12's release reader sees only in-repo properties.** spring_boot is caught through the root pom's `maven.compiler.release=${java.version}`, while its modules set only `java.version` and get the release from `spring-boot-starter-parent`, outside the job. A repository without such a root property stays on JDK 21 and fails as before. This is recorded, not chased.
+  5. **D13's script knows the protobuf plugin's locator configurations only.** Other plugins' native tools are not covered.
+  6. **This host's `docker system df` fails** on a foreign container's missing snapshot. Disk checks read the host `df` and a throwaway container's `df /`.
+- **Added item: e2e SCIP caches leak** (`logs/p0/cache-leak.txt`).
+  - **Root cause, verified.** Go's module cache is read-only (directories 0555, files 0444). `Cleanup::drop` (`crates/rb-cli/tests/common/mod.rs:197`) calls `std::fs::remove_dir_all` on `var/scip/cache/<repo>`, which fails with EACCES on such a tree, and discards the error (`let _ =`). Reproduced with `std::fs::remove_dir_all` on a Go-shaped tree: `Err(PermissionDenied)`, tree still present.
+  - **Second path.** The start-up clean-up (`remove_leftover_test_repositories`, `mod.rs:53`) deletes the rows of a killed run's `t_*` repositories but never their caches.
+  - **Paths that do not fail.** rb itself deletes no package cache: the only removals on SCIP paths are the per-run export and egress directories (`orchestrate.rs:461–462`, `:991`), which hold no module cache. `bench/cleanup.sh` deletes rows and graphs only; the `bench_*_scip` caches persist by design (4.2 GiB now). `e2e.rs:4428` unwraps its removal of an npm cache, which is writable.
+  - Hence the 65 `t_*` directories (7.9 GiB).
+  - **Fix, in P1 (new D15, claim C18), so that every later phase's e2e runs stop leaking:**
+    - `rb_scip::remove_cache_tree(path)` in `crates/rb-scip/src/orchestrate.rs` gives each directory owner write permission, then removes the tree.
+    - `Cleanup::drop` uses it and prints any error with the path.
+    - The start-up clean-up also removes `var/scip/cache/<name>` for each leftover `t_*` repository.
+    - Test first: unit `cache_trees_with_read_only_modules_are_removed` (rb-scip), a 0555 directory holding a 0444 file, plus a plain tree. It fails on plain `remove_dir_all`.
+    - **m392**: the permission pass dropped. Filter `cache_trees_with_read_only_modules_are_removed`. P1's files become `crates/rb-store/src/lib.rs`, `db_tests.rs`, `crates/rb-scip/src/orchestrate.rs` and `crates/rb-cli/tests/common/mod.rs`.
+    - Verify: after P1's e2e runs, `ls var/scip/cache | grep -c '^t_'` is 0.
+- **Mutant ids.** m360–m394: m392 (D15), m393 (D12b), m394 (D5's fetch). None retired. The closing bar reads "m360–m394".
+- **Safety.**
+  - `SELECT * FROM rb.repo ORDER BY 1` is identical before and after (`repo-before.txt`, `repo-after.txt`, 4 rows), and no `t_m9d_*` or `bench_*` repository was created.
+  - No rb index ran, so no `rb.scip_index` row was written.
+  - Images: the probe image `rb-scip-java:probe-m9d-jdk25` and the base it pulled (`eclipse-temurin@sha256:2d5d5e9b…`, absent before) were removed. 0 `m9d` containers and 0 `m9d` networks remain. No other image was touched (`cleanup.txt`).
+  - No change in `crates/` or `docker/*/Dockerfile`; the bench caches were only cloned. Python probes read downloaded sources only inside containers.
 
 ## Result
 
