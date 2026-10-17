@@ -1838,6 +1838,8 @@ fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value
     });
     if *scip == rb_indexer::ScipMode::On {
         tools["scip_java"] = images.identity(rb_scip::jobs::Indexer::ScipJava).into();
+        // Contract M9d D12: the JDK 25 scip-java image, for Maven releases above 21.
+        tools["scip_java25"] = images.java25_identity().into();
         tools["scip_typescript"] = images
             .identity(rb_scip::jobs::Indexer::ScipTypescript)
             .into();
@@ -3576,17 +3578,20 @@ mod tests {
     fn tool_versions_record_image_identities_when_scip_is_on() {
         let images = rb_scip::Images {
             java: Err("absent".into()),
+            java25: Err("absent".into()),
             go: Err("absent".into()),
             proxy: Ok("sha256:proxy".into()),
         };
         let on = tool_versions(&rb_indexer::ScipMode::On, &images);
         assert_eq!(on["scip"], "on");
         assert_eq!(on["scip_java"], "absent");
+        assert_eq!(on["scip_java25"], "absent");
         assert_eq!(on["scip_typescript"], rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE);
         assert_eq!(on["scip_go"], "absent");
         assert_eq!(on["scip_python"], rb_scip::jobs::SCIP_PYTHON_IMAGE);
         let present = rb_scip::Images {
             java: Ok("sha256:abc".into()),
+            java25: Ok("sha256:abc".into()),
             go: Ok("sha256:abc".into()),
             proxy: Ok("sha256:proxy".into()),
         };
@@ -3597,6 +3602,14 @@ mod tests {
         assert_eq!(
             tool_versions(&rb_indexer::ScipMode::On, &present)["scip_go"],
             "sha256:abc"
+        );
+        let jdk25 = rb_scip::Images {
+            java25: Ok("sha256:jdk25".into()),
+            ..present.clone()
+        };
+        assert_eq!(
+            tool_versions(&rb_indexer::ScipMode::On, &jdk25)["scip_java25"],
+            "sha256:jdk25"
         );
         assert_eq!(on["pipeline"], rb_indexer::PIPELINE);
         let off = tool_versions(&rb_indexer::ScipMode::Off, &rb_scip::Images::unresolved());

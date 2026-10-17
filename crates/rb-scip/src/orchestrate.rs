@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crate::egress::{CLIENT_CONFIG_AT, Egress, PROXY_IMAGE};
 use crate::jobs::{
-    Fetch, Indexer, Job, NodeLock, PythonLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE, SCIP_PYTHON_IMAGE,
-    SCIP_TYPESCRIPT_IMAGE,
+    Fetch, Indexer, Jdk, Job, NodeLock, PythonLock, SCIP_GO_IMAGE, SCIP_JAVA_IMAGE,
+    SCIP_JAVA25_IMAGE, SCIP_PYTHON_IMAGE, SCIP_TYPESCRIPT_IMAGE,
 };
 use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
 
@@ -18,8 +18,10 @@ use crate::runner::{ContainerRun, Network, Outcome, ProxySpec, Runner};
 /// recipe is then a cache miss, never served as "cached". `m5-egress-1`: the fetch phase behind
 /// the egress proxy, per-repository dependency caches and the Develocity/Gradle Enterprise
 /// build caches off in both Maven phases (contract M5 S21, S22). Unchanged by M6a, so cached
-/// Java indexes stay valid (a unit pins the key of a fixed input).
-pub const RECIPE_JAVA: &str = "m5-egress-1";
+/// Java indexes stay valid (a unit pins the key of a fixed input). `m9d-java-1`: the index
+/// phase writes scip-java's targetroot outside the sources (contract M9d D12b), so every
+/// Maven job re-runs once.
+pub const RECIPE_JAVA: &str = "m9d-java-1";
 
 /// scip-typescript's recipe (contract M6a D8), bumped like [`RECIPE_JAVA`]. `m6a-ts-1`:
 /// workspace roots fetch and index their members (D5, D6) and exports are repository-shaped
@@ -264,11 +266,13 @@ impl Default for Budget {
     }
 }
 
-/// The image reference a job uses: scip-typescript's registry digest, scip-java's local tag.
+/// The image reference a job uses: scip-typescript's registry digest, scip-java's local tag
+/// for the JDK its release needs (contract M9d D12; the JDK 25 one for a release above 25,
+/// which [`Images::for_job`] refuses).
 pub fn image_for(job: &Job) -> &'static str {
     match job.indexer {
         Indexer::ScipTypescript => SCIP_TYPESCRIPT_IMAGE,
-        Indexer::ScipJava => SCIP_JAVA_IMAGE,
+        Indexer::ScipJava => crate::jobs::jdk(job).map_or(SCIP_JAVA25_IMAGE, Jdk::image),
         Indexer::ScipGo => SCIP_GO_IMAGE,
         Indexer::ScipPython => SCIP_PYTHON_IMAGE,
     }
@@ -285,6 +289,9 @@ pub struct Images {
     /// scip-typescript needs no field: its jobs run by, cache under and are identified by the
     /// pinned digest reference (Docker pulls it when absent; contract M3b amendment 48).
     pub java: Result<String, String>,
+    /// scip-java on JDK 25 (contract M9d D12): like `java`, for the Maven jobs whose release
+    /// is above 21.
+    pub java25: Result<String, String>,
     /// scip-go: like scip-java, a locally built image identified by ID.
     pub go: Result<String, String>,
     /// The egress proxy image (contract M5 S21): its ID, or the reason every job is
@@ -298,6 +305,12 @@ impl Images {
             java: runner.image_id(SCIP_JAVA_IMAGE).ok_or_else(|| {
                 format!(
                     "scip-java: image {SCIP_JAVA_IMAGE} is not available locally; build it as \
+                     docker/scip-java/README.md describes"
+                )
+            }),
+            java25: runner.image_id(SCIP_JAVA25_IMAGE).ok_or_else(|| {
+                format!(
+                    "scip-java: image {SCIP_JAVA25_IMAGE} is not available locally; build it as \
                      docker/scip-java/README.md describes"
                 )
             }),
@@ -322,6 +335,9 @@ impl Images {
             java: Err(format!(
                 "scip-java: image {SCIP_JAVA_IMAGE} was not looked up"
             )),
+            java25: Err(format!(
+                "scip-java: image {SCIP_JAVA25_IMAGE} was not looked up"
+            )),
             go: Err(format!("scip-go: image {SCIP_GO_IMAGE} was not looked up")),
             proxy: Err(format!(
                 "egress proxy: image {PROXY_IMAGE} was not looked up"
@@ -330,17 +346,31 @@ impl Images {
     }
 
     /// The image `job` runs in and its index is cached under: the digest reference itself for
-    /// a pinned image, the image ID for the locally built scip-java one. `Err` is the reason
-    /// the job is `unsupported`: the indexer image, or the egress proxy image, is absent.
+    /// a pinned image, the image ID for the locally built scip-java one (on the JDK the job's
+    /// release needs, contract M9d D12). `Err` is the reason the job is `unsupported`: the
+    /// indexer image, or the egress proxy image, is absent, or the release is above 25.
     pub fn for_job(&self, job: &Job) -> Result<String, String> {
         let image = match job.indexer {
             Indexer::ScipTypescript => Ok(SCIP_TYPESCRIPT_IMAGE.to_owned()),
             Indexer::ScipPython => Ok(SCIP_PYTHON_IMAGE.to_owned()),
-            Indexer::ScipJava => self.java.clone(),
+            Indexer::ScipJava => match crate::jobs::jdk(job) {
+                Ok(Jdk::Jdk21) => self.java.clone(),
+                Ok(Jdk::Jdk25) => self.java25.clone(),
+                Err(release) => Err(format!(
+                    "scip-java: the poms declare Java release {release}; the newest scip-java \
+                     image runs JDK 25"
+                )),
+            },
             Indexer::ScipGo => self.go.clone(),
         }?;
         self.proxy.as_ref().map_err(Clone::clone)?;
         Ok(image)
+    }
+
+    /// The JDK 25 scip-java image's identity (contract M9d D12), recorded beside
+    /// [`Images::identity`]'s: its image ID, or `absent`.
+    pub fn java25_identity(&self) -> &str {
+        self.java25.as_deref().unwrap_or("absent")
     }
 
     /// The identity recorded per indexer: the digest reference of a pinned image, the image ID
@@ -798,6 +828,13 @@ fn typescript_runs(
     Ok((vec![fetch], index))
 }
 
+/// Where scip-java's Maven index phase collects its SemanticDB files (contract M9d D12b,
+/// amendment 1): a container path outside the `/sources` mount. The default,
+/// `target/scip-targetroot` under the sources, is deleted by an aggregator root's `clean` when
+/// the reactor builds that root last (its modules inherit another parent), so no `index.scip`
+/// was written (spring_boot_microservices; measured with and without it in P0).
+const MAVEN_TARGETROOT: &str = "/scip-targetroot";
+
 /// The fetch and index invocations for a scip-java Maven job (docker/scip-java/README.md,
 /// verified on the Java fixture). The fetch phase resolves plugins and dependencies into the
 /// repository's Maven cache (`go-offline`) and then does one online build, so that the
@@ -806,7 +843,8 @@ fn typescript_runs(
 /// Maven logs to stdout by default; `MAVEN_OPTS` moves its logger to stderr so a failed build's
 /// `[ERROR]` lines reach the stderr tail. scip-java prefers a repository's own `./mvnw` when
 /// `access(X_OK)` says it is executable, which Docker Desktop's mounts say of every file, so
-/// [`export`] leaves the wrapper out and the image's `mvn` is always the one used.
+/// [`export`] leaves the wrapper out and the image's `mvn` is always the one used. The index
+/// phase passes `--targetroot` [`MAVEN_TARGETROOT`], outside the mount (contract M9d D12b).
 fn java_runs(
     image: &str,
     work_dir: &Path,
@@ -868,6 +906,8 @@ fn java_runs(
             "index",
             "--build-tool",
             "Maven",
+            "--targetroot",
+            MAVEN_TARGETROOT,
             "--",
             "--batch-mode",
             "--offline",
@@ -1384,6 +1424,7 @@ mod tests {
             unpinned: lockfile == NodeLock::None,
             workspace: Vec::new(),
             replace_targets: Vec::new(),
+            java_release: None,
         }
     }
 
@@ -1396,6 +1437,7 @@ mod tests {
             unpinned: false,
             workspace: Vec::new(),
             replace_targets: Vec::new(),
+            java_release: None,
         }
     }
 
@@ -1465,6 +1507,7 @@ mod tests {
             unpinned: false,
             workspace: Vec::new(),
             replace_targets: Vec::new(),
+            java_release: None,
         }
     }
 
@@ -1477,6 +1520,7 @@ mod tests {
             unpinned: lockfile != PythonLock::Poetry,
             workspace: Vec::new(),
             replace_targets: Vec::new(),
+            java_release: None,
         }
     }
 
@@ -2429,6 +2473,8 @@ mod tests {
                 "index",
                 "--build-tool",
                 "Maven",
+                "--targetroot",
+                "/scip-targetroot",
                 "--",
                 "--batch-mode",
                 "--offline",
@@ -2667,6 +2713,46 @@ mod tests {
         );
     }
 
+    /// Contract M9d D12b (amendment 1): every Maven index phase passes `--targetroot
+    /// /scip-targetroot` to scip-java, before `--`, at a container path outside the `/sources`
+    /// mount. Its default, `target/scip-targetroot` under the sources, is deleted by an
+    /// aggregator root's `clean` when the reactor builds that root last (spring_boot_microservices
+    /// wrote no index). The Java recipe is `m9d-java-1`, so every Maven job re-runs once; the
+    /// Gradle index is unchanged.
+    #[test]
+    fn maven_index_phase_writes_the_targetroot_outside_the_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["w", "g", "c"] {
+            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        }
+        let (_, index) = java_runs(
+            JAVA_ID,
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+        )
+        .unwrap();
+        let dash = index.args.iter().position(|a| a == "--").unwrap();
+        let at = index.args[..dash].iter().position(|a| a == "--targetroot");
+        let targetroot = at.map(|at| index.args[at + 1].as_str());
+        assert_eq!(targetroot, Some("/scip-targetroot"), "{:?}", index.args);
+        assert!(!Path::new("/scip-targetroot").starts_with(&index.mount_at));
+        assert_eq!(index.mount_at, "/sources");
+        let (_, gradle) = gradle_runs(
+            "sha256:java",
+            &tmp.path().join("g"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+        )
+        .unwrap();
+        assert!(
+            !gradle.args.iter().any(|a| a == "--targetroot"),
+            "{:?}",
+            gradle.args
+        );
+        assert_eq!(RECIPE_JAVA, "m9d-java-1");
+    }
+
     #[test]
     fn gradle_job_resolves_builds_then_indexes_offline() {
         let lines = argv_lines(&java_job(Fetch::Gradle), "sha256:java", &Budget::default());
@@ -2892,7 +2978,7 @@ mod tests {
     /// `--`, in the job's (sorted) order; the recipes are per indexer.
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
-        assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m9d-ts-1"));
+        assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m9d-java-1", "m9d-ts-1"));
         assert_eq!(RECIPE_PY, "m9d-py-1");
         assert_eq!(RECIPE_GRADLE, "m6e-gradle-1");
         assert_eq!(
@@ -2940,6 +3026,7 @@ mod tests {
                 unpinned: false,
                 workspace: Vec::new(),
                 replace_targets: Vec::new(),
+                java_release: None,
             };
             let fake = Fake::new(false, false);
             run_job(
@@ -3028,7 +3115,7 @@ mod tests {
         let expected: Vec<String> = [
             "run --rm --name <name> --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -v <work>-egress/client:/rb-egress:ro -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err {PROXY} sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 mvn -B -q -s /rb-egress/settings.xml org.apache.maven.plugins:maven-dependency-plugin:3.11.0:go-offline {OFF}",
             "run --rm --name <name> --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -v <work>-egress/client:/rb-egress:ro -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err {PROXY} sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 mvn -B -q -s /rb-egress/settings.xml clean verify -DskipTests {OFF}",
-            "run --rm --name <name> --network none --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 scip-java index --build-tool Maven -- --batch-mode --offline clean verify -DskipTests {OFF}",
+            "run --rm --name <name> --network none --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 scip-java index --build-tool Maven --targetroot /scip-targetroot -- --batch-mode --offline clean verify -DskipTests {OFF}",
             "run --rm --name <name> --platform linux/amd64 --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -v <work>-egress/client:/rb-egress:ro -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false -e npm_config_replace_registry_host=always -e npm_config_engine_strict=false {PROXY} --entrypoint /usr/local/bin/actual-npm sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 ci --no-audit --no-fund --loglevel=error --ignore-scripts --logs-max=0",
             "run --rm --name <name> --platform linux/amd64 --network none --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 index --output index.scip --no-progress-bar -- . sub",
         ]
@@ -3065,7 +3152,7 @@ mod tests {
             assert!(line.ends_with(" -T 4"), "{line}");
             assert!(line.contains(" --cpus 8 --memory 6g "), "{line}");
         }
-        assert_eq!(recipe(&java_job(Fetch::Maven), &threaded), "m5-egress-1+T4");
+        assert_eq!(recipe(&java_job(Fetch::Maven), &threaded), "m9d-java-1+T4");
         assert_eq!(
             recipe(&java_job(Fetch::Maven), &Budget::default()),
             RECIPE_JAVA

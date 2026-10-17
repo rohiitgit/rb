@@ -10,6 +10,38 @@ use serde::{Deserialize, Serialize};
 /// the cache key uses its image ID, resolved at run time by [`crate::Runner::image_id`]; when the
 /// image is absent the job is `unsupported` and nothing builds it implicitly.
 pub const SCIP_JAVA_IMAGE: &str = "rb-scip-java:0.13.1";
+/// The scip-java image on JDK 25 (contract M9d D12): built locally from
+/// `docker/scip-java/Dockerfile.jdk25`, with the same Maven, Gradle and scip-java files as
+/// [`SCIP_JAVA_IMAGE`]. A Maven job whose poms declare a release above 21 runs on it.
+pub const SCIP_JAVA25_IMAGE: &str = "rb-scip-java:0.13.1-jdk25";
+
+/// The JDK of the scip-java image a job runs on (contract M9d D12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Jdk {
+    Jdk21,
+    Jdk25,
+}
+
+impl Jdk {
+    /// The image's reference.
+    pub fn image(self) -> &'static str {
+        match self {
+            Jdk::Jdk21 => SCIP_JAVA_IMAGE,
+            Jdk::Jdk25 => SCIP_JAVA25_IMAGE,
+        }
+    }
+}
+
+/// The JDK a scip-java job needs (contract M9d D12): JDK 25 for a Maven job whose release is
+/// above 21, JDK 21 otherwise (a Gradle job has no release). `Err` with the release when it is
+/// above 25, which neither image compiles.
+pub fn jdk(job: &Job) -> Result<Jdk, u32> {
+    match job.java_release {
+        Some(release) if release > 25 => Err(release),
+        Some(release) if release > 21 => Ok(Jdk::Jdk25),
+        _ => Ok(Jdk::Jdk21),
+    }
+}
 /// The scip-go image: built locally from `docker/scip-go` (no published image
 /// is suitable). Like scip-java, a local image has no registry digest, so the
 /// cache key uses its image ID, resolved at run time; when absent the job is
@@ -110,6 +142,10 @@ pub struct Job {
     /// exported, one leaving it makes the job `unsupported`. Non-empty: the export is
     /// repository-shaped and the container starts in the root. Empty for every other job.
     pub replace_targets: Vec<String>,
+    /// scip-java Maven (contract M9d D12): the highest Java release the job's poms declare,
+    /// which picks its image. `None` for a Maven job that declares none, and for every other
+    /// job (a Gradle job always runs on the JDK 21 image).
+    pub java_release: Option<u32>,
 }
 
 /// A workspace root whose members are not grouped into its job (contract M6a D5), and why:
@@ -136,7 +172,8 @@ pub struct Plan {
 
 /// The jobs for a commit, from its sorted file list; `read` gives a file's bytes (`None` when
 /// it cannot be read) and is asked only for `package.json` files, workspace roots'
-/// `yarn.lock` and Go roots' `go.mod` (contract M9d D7). Maven and Gradle roots are the outermost `pom.xml` / Gradle build files (a
+/// `yarn.lock`, Go roots' `go.mod` (contract M9d D7) and the `pom.xml` files under Maven roots
+/// (D12). Maven and Gradle roots are the outermost `pom.xml` / Gradle build files (a
 /// reactor or multi-project build runs once). TypeScript roots are package roots (a directory
 /// with `package.json`), each indexing every `tsconfig.json` directory whose nearest package
 /// root it is; a nested package root starts its own job, except a workspace member (contract
@@ -194,6 +231,12 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
         .cloned()
         .collect();
     for (root, fetch) in outermost {
+        // Contract M9d D12: a Maven job's release picks its image; a Gradle job has none.
+        let java_release = if fetch == Fetch::Maven {
+            maven_release(&root, &files, read)
+        } else {
+            None
+        };
         out.push(Job {
             root,
             indexer: Indexer::ScipJava,
@@ -202,6 +245,7 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             unpinned: false,
             workspace: Vec::new(),
             replace_targets: Vec::new(),
+            java_release,
         });
     }
 
@@ -241,6 +285,7 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             unpinned: lockfile == NodeLock::None,
             workspace: Vec::new(),
             replace_targets: Vec::new(),
+            java_release: None,
         });
     }
     // Go: every go.mod directory is a job. Contract M9d D7: each root's go.mod is read, so its
@@ -276,6 +321,7 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             unpinned: !has(&join(root, "go.sum")),
             workspace,
             replace_targets,
+            java_release: None,
         });
     }
     // Python: every pyproject.toml/setup.py directory is a job (contract M6d
@@ -314,6 +360,7 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             unpinned: lockfile != PythonLock::Poetry,
             workspace: Vec::new(),
             replace_targets: Vec::new(),
+            java_release: None,
         });
     }
     out.sort_by(|a, b| (a.root.as_str(), a.indexer).cmp(&(b.root.as_str(), b.indexer)));
@@ -798,6 +845,211 @@ fn resolves_under(root: &str, target: &str) -> bool {
     }
     let dir = at.join("/");
     dir == root || is_under(&dir, root)
+}
+
+/// The highest Java release the `pom.xml` files under the Maven root `root` declare (contract
+/// M9d D12), each read by [`pom_release`]; `None` when none declares one. A parent pom outside
+/// the job (a `spring-boot-starter-parent`) is not visible: a release it derives from a
+/// module's `java.version` is not seen (amendment 1, risk 4).
+fn maven_release(
+    root: &str,
+    files: &[&str],
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Option<u32> {
+    let poms: BTreeMap<&str, Pom> = files
+        .iter()
+        .copied()
+        .filter(|f| f.rsplit('/').next() == Some("pom.xml"))
+        .filter(|f| dir(f) == root || is_under(dir(f), root))
+        .filter_map(|f| Some((f, Pom::read(&String::from_utf8_lossy(&read(f)?)))))
+        .collect();
+    poms.keys()
+        .filter_map(|path| pom_release(path, &poms))
+        .max()
+}
+
+/// What the release reader takes from one `pom.xml` (contract M9d D12).
+#[derive(Debug, Default)]
+struct Pom {
+    /// The project's own `artifactId`.
+    artifact_id: Option<String>,
+    /// The `<parent>` element's `artifactId`, and its `relativePath`: `../pom.xml` when absent,
+    /// `None` when empty (Maven then looks the parent up in the repositories only).
+    parent: Option<(Option<String>, Option<String>)>,
+    /// The project's `<properties>` (not a profile's), in document order.
+    properties: Vec<(String, String)>,
+    /// The `release`, `source` and `target` values of the compiler plugin's configurations
+    /// (the plugin's own and its executions').
+    compiler: Vec<String>,
+}
+
+impl Pom {
+    /// Reads the elements [`Pom`] holds from `xml`, outside comments; anything else is skipped.
+    fn read(xml: &str) -> Pom {
+        let mut pom = Pom::default();
+        let mut stack: Vec<&str> = Vec::new();
+        let (mut parent, mut parent_artifact, mut relative) = (false, None, None);
+        // Per open `<plugin>`: its artifactId and its configuration values.
+        let mut plugins: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        let mut rest = xml;
+        while let Some(open) = rest.find('<') {
+            let text = rest[..open].trim();
+            if !text.is_empty() {
+                let text = text.to_owned();
+                match stack.as_slice() {
+                    ["project", "artifactId"] => pom.artifact_id = Some(text),
+                    ["project", "parent", "artifactId"] => parent_artifact = Some(text),
+                    ["project", "parent", "relativePath"] => relative = Some(Some(text)),
+                    ["project", "properties", name] => {
+                        pom.properties.push(((*name).to_owned(), text))
+                    }
+                    [.., "plugin", "artifactId"] => {
+                        if let Some(plugin) = plugins.last_mut() {
+                            plugin.0 = Some(text);
+                        }
+                    }
+                    [.., "configuration", "release" | "source" | "target"] => {
+                        if let Some(plugin) = plugins.last_mut() {
+                            plugin.1.push(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &rest[open..];
+            if let Some(comment) = rest.strip_prefix("<!--") {
+                rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
+                continue;
+            }
+            let Some(close) = rest.find('>') else {
+                break;
+            };
+            let tag = &rest[1..close];
+            rest = &rest[close + 1..];
+            if tag.starts_with('?') || tag.starts_with('!') {
+                continue;
+            }
+            if let Some(name) = tag.strip_prefix('/') {
+                let name = name.trim();
+                if name == "plugin"
+                    && let Some((Some(artifact), values)) = plugins.pop()
+                    && artifact == "maven-compiler-plugin"
+                {
+                    pom.compiler.extend(values);
+                }
+                if let Some(at) = stack.iter().rposition(|open| *open == name) {
+                    stack.truncate(at);
+                }
+                continue;
+            }
+            let name = tag
+                .trim_end_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let in_parent = stack.as_slice() == ["project", "parent"];
+            if in_parent && name == "relativePath" {
+                relative = Some(None);
+            }
+            if tag.ends_with('/') {
+                continue;
+            }
+            parent |= stack.as_slice() == ["project"] && name == "parent";
+            if name == "plugin" {
+                plugins.push((None, Vec::new()));
+            }
+            stack.push(name);
+        }
+        if parent {
+            let relative = relative.unwrap_or_else(|| Some("../pom.xml".to_owned()));
+            pom.parent = Some((parent_artifact, relative));
+        }
+        pom
+    }
+}
+
+/// The pom at `path` that the pom's `<parent>` names inside `poms`: its `relativePath` (a
+/// directory gets `pom.xml`) resolved from the pom's directory, if that pom's `artifactId` is
+/// the one `<parent>` names, as Maven checks before it looks in the repositories.
+fn parent_pom(path: &str, pom: &Pom, poms: &BTreeMap<&str, Pom>) -> Option<String> {
+    let (artifact, relative) = pom.parent.as_ref()?;
+    let mut at: Vec<&str> = dir(path).split('/').filter(|s| !s.is_empty()).collect();
+    for segment in relative.as_deref()?.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                at.pop()?;
+            }
+            name => at.push(name),
+        }
+    }
+    let mut target = at.join("/");
+    if !target.ends_with(".xml") {
+        target = join(&target, "pom.xml");
+    }
+    let candidate = poms.get(target.as_str())?;
+    (artifact.is_none() || *artifact == candidate.artifact_id).then_some(target)
+}
+
+/// One pom's release (contract M9d D12): the highest of `maven.compiler.release`, `source` and
+/// `target` and the compiler plugin's `release`, `source` and `target`, read over the pom and
+/// its parent chain inside the job as Maven inherits them (a child's property over its
+/// ancestors', every ancestor's plugin configuration), with a whole `${name}` value resolved
+/// through those properties. `java.version` counts only through them. `1.8` is release 8;
+/// an unresolved or non-numeric value counts as none.
+fn pom_release(path: &str, poms: &BTreeMap<&str, Pom>) -> Option<u32> {
+    // The pom and its ancestors, nearest first; a cycle ends the chain.
+    let mut chain: Vec<&Pom> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut at = Some(path.to_owned());
+    while let Some(p) = at.take() {
+        let Some(pom) = poms.get(p.as_str()) else {
+            break;
+        };
+        if !seen.insert(p.clone()) {
+            break;
+        }
+        chain.push(pom);
+        at = parent_pom(&p, pom, poms);
+    }
+    let mut properties: BTreeMap<&str, &str> = BTreeMap::new();
+    for pom in chain.iter().rev() {
+        for (name, value) in &pom.properties {
+            properties.insert(name, value);
+        }
+    }
+    let resolve = |value: &str| -> String {
+        let mut value = value.to_owned();
+        // A bounded chain of `${a}` → `${b}` → value.
+        for _ in 0..8 {
+            let Some(name) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+                break;
+            };
+            match properties.get(name) {
+                Some(v) => value = (*v).to_owned(),
+                None => break,
+            }
+        }
+        value
+    };
+    let number = |value: String| -> Option<u32> {
+        let value = value.trim();
+        value.strip_prefix("1.").unwrap_or(value).parse().ok()
+    };
+    [
+        "maven.compiler.release",
+        "maven.compiler.source",
+        "maven.compiler.target",
+    ]
+    .iter()
+    .filter_map(|name| properties.get(name).copied())
+    .chain(
+        chain
+            .iter()
+            .flat_map(|pom| pom.compiler.iter().map(String::as_str)),
+    )
+    .filter_map(|value| number(resolve(value)))
+    .max()
 }
 
 /// The source encoding a Maven build declares when it is not UTF-8 (contract M3b amendment
@@ -1530,6 +1782,9 @@ mod tests {
                 if !j.replace_targets.is_empty() {
                     s.push_str(&format!(" replace[{}]", j.replace_targets.join(",")));
                 }
+                if let Some(release) = j.java_release {
+                    s.push_str(&format!(" release[{release}]"));
+                }
                 s
             })
             .collect();
@@ -1556,6 +1811,160 @@ mod tests {
                 "scip-java legacy gradle",
                 "scip-java tools gradle",
             ]
+        );
+    }
+
+    /// Contract M9d D12 (C11): a Maven job's release is the highest its poms declare, read from
+    /// `maven.compiler.release`, `source` or `target` and the compiler plugin's configuration,
+    /// `${…}` resolved through the pom's properties and its parent chain inside the job;
+    /// `java.version` counts only through them. Above 21 the job takes the JDK 25 image; above
+    /// 25, or with that image absent, it is unsupported. A Gradle job stays on JDK 21.
+    #[test]
+    fn maven_release_above_21_takes_the_jdk25_image() {
+        let pom =
+            |body: &str| format!("<project><modelVersion>4.0.0</modelVersion>{body}</project>");
+        let app = |properties: &str| {
+            pom(&format!(
+                "<artifactId>app</artifactId><properties>{properties}</properties>"
+            ))
+        };
+        let plan = |contents: &[(&str, &str)]| -> Vec<String> {
+            let files: Vec<&str> = contents.iter().map(|(path, _)| *path).collect();
+            workspace_summary(&files, contents).0
+        };
+        let release = |n: &str| format!("<maven.compiler.release>{n}</maven.compiler.release>");
+        // A literal; `${java.version}` through the pom's own properties; `java.version` alone.
+        assert_eq!(
+            plan(&[("pom.xml", &app(&release("25")))]),
+            ["scip-java  maven release[25]"]
+        );
+        assert_eq!(
+            plan(&[(
+                "pom.xml",
+                &app(&format!(
+                    "<java.version>25</java.version>{}",
+                    release("${java.version}")
+                ))
+            )]),
+            ["scip-java  maven release[25]"]
+        );
+        assert_eq!(
+            plan(&[("pom.xml", &app("<java.version>25</java.version>"))]),
+            ["scip-java  maven"]
+        );
+        // `source` and `target`, `1.8` being release 8: the highest counts.
+        assert_eq!(
+            plan(&[(
+                "pom.xml",
+                &app("<maven.compiler.source>1.8</maven.compiler.source>\
+                     <maven.compiler.target>11</maven.compiler.target>")
+            )]),
+            ["scip-java  maven release[11]"]
+        );
+        // The compiler plugin's `<release>`, resolved; another plugin's is not the compiler's.
+        let plugins = pom(
+            "<artifactId>app</artifactId><properties><jdk>22</jdk></properties><build><plugins>\
+             <plugin><artifactId>maven-compiler-plugin</artifactId>\
+             <configuration><release>${jdk}</release></configuration></plugin>\
+             <plugin><artifactId>maven-enforcer-plugin</artifactId>\
+             <configuration><release>99</release></configuration></plugin>\
+             </plugins></build>",
+        );
+        assert_eq!(
+            plan(&[("pom.xml", &plugins)]),
+            ["scip-java  maven release[22]"]
+        );
+        // The parent chain inside the job: `api` inherits the root's `${java.version}` release
+        // with its own `java.version`. `web`'s parent is outside the job (`<relativePath/>`),
+        // and `svc`'s `../pom.xml` is not its parent (another artifactId): neither inherits.
+        let root = pom(&format!(
+            "<artifactId>parent</artifactId><properties><java.version>17</java.version>{}\
+             </properties>",
+            release("${java.version}")
+        ));
+        let module = |parent: &str, relative: &str| {
+            pom(&format!(
+                "<parent><artifactId>{parent}</artifactId>{relative}</parent>\
+                 <artifactId>m</artifactId><properties><java.version>24</java.version></properties>"
+            ))
+        };
+        assert_eq!(
+            plan(&[("api/pom.xml", &module("parent", "")), ("pom.xml", &root),]),
+            ["scip-java  maven release[24]"]
+        );
+        assert_eq!(
+            plan(&[
+                ("pom.xml", &root),
+                ("svc/pom.xml", &module("spring-boot-starter-parent", "")),
+                ("web/pom.xml", &module("parent", "<relativePath/>")),
+            ]),
+            ["scip-java  maven release[17]"]
+        );
+        // A Gradle build never takes a release, even over a Maven build inside it.
+        assert_eq!(
+            plan(&[
+                ("tools/settings.gradle", ""),
+                ("tools/sub/pom.xml", &app(&release("25"))),
+            ]),
+            [
+                "scip-java tools gradle",
+                "scip-java tools/sub maven release[25]"
+            ]
+        );
+
+        // The image follows the release.
+        use crate::orchestrate::{Images, image_for};
+        let maven = |java_release: Option<u32>| Job {
+            root: String::new(),
+            indexer: Indexer::ScipJava,
+            fetch: Fetch::Maven,
+            projects: Vec::new(),
+            unpinned: false,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
+            java_release,
+        };
+        let gradle = Job {
+            fetch: Fetch::Gradle,
+            ..maven(None)
+        };
+        for (job, image) in [
+            (maven(Some(25)), SCIP_JAVA25_IMAGE),
+            (maven(Some(22)), SCIP_JAVA25_IMAGE),
+            (maven(Some(21)), SCIP_JAVA_IMAGE),
+            (maven(None), SCIP_JAVA_IMAGE),
+            (gradle.clone(), SCIP_JAVA_IMAGE),
+        ] {
+            assert_eq!(image_for(&job), image, "{job:?}");
+        }
+        let images = Images {
+            java: Ok("sha256:jdk21".into()),
+            java25: Ok("sha256:jdk25".into()),
+            go: Err("absent".into()),
+            proxy: Ok("sha256:proxy".into()),
+        };
+        assert_eq!(
+            images.for_job(&maven(Some(25))).as_deref(),
+            Ok("sha256:jdk25")
+        );
+        assert_eq!(
+            images.for_job(&maven(Some(21))).as_deref(),
+            Ok("sha256:jdk21")
+        );
+        assert_eq!(images.for_job(&gradle).as_deref(), Ok("sha256:jdk21"));
+        let above = images.for_job(&maven(Some(26))).unwrap_err();
+        assert!(above.contains("release 26"), "{above}");
+        let absent = Images {
+            java25: Err(format!(
+                "scip-java: image {SCIP_JAVA25_IMAGE} is not available"
+            )),
+            ..images.clone()
+        };
+        let reason = absent.for_job(&maven(Some(25))).unwrap_err();
+        assert!(reason.contains(SCIP_JAVA25_IMAGE), "{reason}");
+        assert_eq!(
+            absent.for_job(&maven(Some(21))).as_deref(),
+            Ok("sha256:jdk21")
         );
     }
 

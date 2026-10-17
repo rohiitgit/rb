@@ -173,8 +173,8 @@ pub(crate) fn run_projects(
         .iter()
         .map(|f| (f.path.as_str(), f.blob_sha.as_str()))
         .collect();
-    // The manifest reader of D5: `package.json` files and workspace roots' `yarn.lock`, and
-    // Go roots' `go.mod` (contract M9d D7).
+    // The manifest reader of D5: `package.json` files and workspace roots' `yarn.lock`, Go
+    // roots' `go.mod` (contract M9d D7) and the `pom.xml` files under Maven roots (D12).
     let read_path = |path: &str| blobs.get(path).and_then(|blob| read_blob(blob).ok());
     let plan = rb_scip::jobs(&paths, &read_path);
     let mut out = Vec::new();
@@ -1352,6 +1352,7 @@ mod tests {
             unpinned: false,
             workspace: Vec::new(),
             replace_targets: Vec::new(),
+            java_release: None,
         }
     }
 
@@ -1516,6 +1517,7 @@ mod tests {
             unpinned: false,
             workspace: Vec::new(),
             replace_targets: replace_targets.iter().map(|t| (*t).to_owned()).collect(),
+            java_release: None,
         }
     }
 

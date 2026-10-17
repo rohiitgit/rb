@@ -825,6 +825,68 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Process.** Each message carried one `Edit` call, or one scripted edit of one file that asserted every hunk matched once (scip.rs three times, decode.rs, lib.rs and the mutant specs once each).
 - **`rb.repo`** is identical before and after (`repo-before.txt`, `repo-after.txt`; the user's 4 rows, the same as P4's baseline).
 
+**P6 note (2026-10-18; D12, D12b).** Logs in `var/m9d/logs/p6/`, scripts in `var/m9d/p6/scripts/`. Binary `var/m9d/bin/rb.p6` (debug, the P6 tree, sha256 `d7a06221…`).
+- **Red first.** Before any behaviour changed, `Job::java_release` (`None` everywhere), `SCIP_JAVA25_IMAGE` and `Images::java25` (looked up, used by nothing) were added, so that the tests compiled. Three tests then failed, each on its assertion:
+  - `maven_release_above_21_takes_the_jdk25_image` (jobs): `["scip-java  maven"]` where `["scip-java  maven release[25]"]` was expected (`c11-jobs-red.txt`).
+  - `maven_index_phase_writes_the_targetroot_outside_the_sources` (orchestrate): `--targetroot` `None` where `Some("/scip-targetroot")` was expected (`c11-targetroot-red.txt`). Its first two runs failed on setup (the work and cache directories did not exist), so the test creates them; only the third run is the red evidence.
+  - `doctor::tests::rows_follow_their_facts`: `IMAGES` without `rb-scip-java:0.13.1-jdk25` (`c11-doctor-red.txt`).
+- **Design.**
+  - **Planner (D12).** For a Maven root, `jobs()` reads every `pom.xml` at or under the root through its reader. Each pom's release is the highest of `maven.compiler.release`, `source` and `target` and the `maven-compiler-plugin` configuration's `release`, `source` and `target` (its own and its executions'). These are read over the pom and its parent chain inside the job as Maven inherits them: a child's property over its ancestors', every ancestor's plugin configuration. A whole `${name}` value is resolved through those properties, bounded at 8 steps. `1.8` is release 8. The job's `java_release` is the highest over its poms. A Gradle root never gets one.
+  - **Parent chain.** `<parent>`'s `relativePath` (default `../pom.xml`; a directory gets `pom.xml`; empty means outside), resolved from the pom's directory and accepted only when that pom's `artifactId` is the one `<parent>` names, as Maven checks before it looks in the repositories. Profile properties are not read.
+  - **Image choice.** `jobs::jdk(job)` returns JDK 25 above 21, JDK 21 otherwise, and `Err(release)` above 25. `image_for` and `Images::for_job` follow it. Above 25 the job is `unsupported` (`the poms declare Java release N; the newest scip-java image runs JDK 25`), and so it is when the JDK 25 image is absent (its lookup reason).
+  - **D12b.** `java_runs` passes `--targetroot /scip-targetroot` before `--` in the index phase, for both images. `RECIPE_JAVA` is `m9d-java-1`. The Gradle runs are unchanged.
+  - **Doctor.** `rb doctor` checks 6 images, both scip-java ones among them.
+- **Image** (`image-build.txt`, `scripts/build_jdk25.sh`).
+  - `docker/scip-java/Dockerfile.jdk25` is P0's draft 2 with production comments: `ARG BASE=eclipse-temurin:25-jdk@sha256:2d5d5e9b…`, with Maven, Gradle and scip-java copied from `rb-scip-java:0.13.1`. `docker/scip-java/Dockerfile` is not edited.
+  - `rb-scip-java:0.13.1-jdk25` built in 6 s: ID `sha256:9e1396344c970a2a814629e9654586a7cb042027f19add4d30a9a3aa563ff676`, 1,091,022,554 B, arm64 (P0's draft built to the same size). It runs Temurin 25.0.4.1, Maven 3.9.16 and Gradle 8.14.6.
+  - **Base.** The pinned Temurin 25 base was pulled again, by digest, by BuildKit: P0 had removed it. No `eclipse-temurin` tag was created.
+  - **Tools.** `mvn` (`f9381d0c…`), `scip-java` (`a694cae1…`) and `gradle-launcher-8.14.6.jar` (`7f8e1ade…`) have the same sha256 in both images, and so do digests over every file of `/opt/maven` (96 files) and `/opt/gradle` (316): `TOOLS IDENTICAL`. The control, each image's own `javac`, differs.
+  - `rb-scip-java:0.13.1` is `sha256:f9612a94…` before and after. No other image was touched.
+- **Deviations, each with its reason.**
+  1. **Three files outside P6's list, each forced by a change in it.**
+     - `crates/rb-scip/src/hash.rs`: `the_java_key_is_pinned_across_the_recipe_split` pins `RECIPE_JAVA` and the key of a fixed input. Both moved with D12b: `c1fd98fd…` → `4e2b943d…`, the new value as printed by the failing test (`hash-key-new.txt`).
+     - `crates/rb-indexer/src/projects.rs`: two test `Job` literals gain `java_release: None` (shape only). The reader's comment now names the poms.
+     - `crates/rb-cli/src/main.rs`: its test's two `Images` literals gain `java25` (shape only). Also, `tool_versions` records `scip_java25` (the JDK 25 image's ID, or `absent`), with test rows. M6d S1's rule is that a rebuilt image is never served as "up to date", and the JDK 25 image is one more image. An absent image already forces a rebuild through `unsupported` (amendment 44). Every SCIP-on snapshot's `tool_versions` gains the key, so each repository indexes once more on its next run, as P8's `PIPELINE` bump does anyway.
+  2. **The compiler plugin's `source` and `target` are read too.** D12 names `maven.compiler.release`, `source` or `target`, and the plugin's `<release>`. The plugin's `<source>`/`<target>` set the same javac flags as those properties, so they are read on the same footing. Another plugin's `<release>` (a test row: `maven-enforcer-plugin`'s 99) is not.
+  3. **The parent check uses `artifactId`.** D12 says "the parent chain inside the job". Without the check, a module whose parent is outside (a `spring-boot-starter-parent`) but which omits `<relativePath/>` would inherit an aggregator's properties at `../pom.xml`, which Maven does not do. The test has that row (`svc`).
+  4. **Disk.** After the image build, free space was 9.8 GiB, under the 10 GiB floor, so `target/` was cleaned (`cargo clean`: 21.0 GiB; `cargo-clean.txt`) and rebuilt.
+  5. **D12b's "byte-identical" prediction holds for content, not for bytes** (`java-rows-after-e2e.txt`, `java-rows-compare.txt`, `java-rows-control.txt`, `scripts/java_rows_compare.py`).
+     - The e2e run wrote 6 `ok` rows on the JDK 21 image. 3 are byte-equal to an older row of the same document set. 2 are not, although documents, occurrences and symbols are equal, as multisets, to every older row of their set. The last is the Kotlin Gradle fixture's, whose older row it replaced.
+     - **Control.** The two older 83,173 B rows (`b40600aa…`, 2026-10-11; `e2fdcebe…`, 2026-10-17) already differ from each other byte-wise. scip-java's output order was not stable from run to run before P6.
+  6. **Probe harness faults.**
+     - `probe_sb.sh`'s export mixed psql's `BEGIN`/`COMMIT` into the base64 stream, and the first re-export used `COPY`, which escapes `encode()`'s line breaks. The index was re-exported with a plain `SELECT` in a read-only session (`sb-content.txt`).
+     - `cleanup.sh` first ran `rb gc` without `RB_DATABASE_URL`, so the default port was refused. The gc was re-run with it set, and the script was fixed (`sb-cleanup.txt`).
+  7. **P6's "rebuild-check the default"** is amendment 1's check: `rb-scip-java:0.13.1`'s ID is unchanged, and the tools are equal across both images.
+- **Old values pinned by tests**, grepped (`m5-egress-1`, `build-tool Maven`, `pinned images present`, `c1fd98fd`; `old-values-grep.txt`) and updated:
+  - `a_workspace_job_fetches_at_its_root_and_indexes_every_member`: `RECIPE_JAVA` `m5-egress-1` → `m9d-java-1`.
+  - `maven_threads_change_the_java_runs_and_their_recipe_only`: `m5-egress-1+T4` → `m9d-java-1+T4`.
+  - `default_budget_argv_is_cfa8ab9s`: the Maven index line gains `--targetroot /scip-targetroot` before `--`, and nothing else moves.
+  - `maven_jobs_fetch_online_then_index_offline_in_the_local_image`: its index argv gains the same two arguments.
+  - `the_java_key_is_pinned_across_the_recipe_split` (hash.rs): the recipe and the key, as above.
+  - `doctor::tests::rows_follow_their_facts`: a new row for `6 pinned images present`; no test pinned `5`.
+  - No golden holds a recipe, a Maven argv or the doctor's image count. `bench/probe/m9d_probe.py:158` is a P0 record and was not edited.
+- **Unit suites** (`units.txt`, `rb-indexer-lib.txt`, after the last code edit): `cargo test -p rb-scip` 94 passed; `-p rb-cli --bin rb` 49; `-p rb-indexer --lib projects` 18; `-p rb-indexer --lib` 385. fmt and clippy (`--workspace --all-targets -D warnings`) are clean (`fmt.txt`, `clippy.txt`).
+- **Probe `t_m9d_sb`** (`sb-probe.txt`, `sb-content.txt`, `sb-cleanup.txt`; `scripts/probe_sb.sh`). spring_boot_microservices `5899a530`, `--scip-timeout-secs 3600`, with the package cache an APFS clone of `bench_spring_boot_microservices_scip`, as P0 probe (b) started from it.
+
+  | | Predicted (amendment 1) | Measured |
+  |---|---|---|
+  | status | `scip-java ok` | `scip: . scip-java ok 36.2s`; row `7b3662b1…` `ok`, no phase, image `sha256:9e1396344c97…` (JDK 25) |
+  | documents | 111 (for 111 tracked `.java` files) | **111**, 8,023 occurrences (P0: 111 and 8,023); by module order-service 51, catalog-service 19, notification-service 19, bookstore-webapp 19, api-gateway 3, as P0 |
+  | index | 1,002,030 B | 1,002,030 B |
+  | time | fetch 48 s + 17 s, index 13 s | 36.2 s for the job (fetch and index together), 38.5 s for `rb index`, at load 4.1–6.2 |
+  | m2 | +67 MiB | 393,428 → 460,436 KiB (+65.4 MiB) |
+  | `exact calls (scip)` | | 179 (`definitions matched 373/373`) |
+  | `repo.spring.io` refusal | not fatal | not observable: an `ok` row keeps no proxy refusals |
+
+  Clean-up: the repository, its graph (`rb_t_m9d_sb_43267`) and its cache (450 MB, `chmod -R u+w`, then `rm -rf`) were deleted. The two egress networks were removed with `rb gc --prefix t_m9d_ --egress`. After it: 0 rows, 0 graphs, 0 caches, 0 containers, 0 networks. The exported index is kept in `var/m9d/p6/idx/` (gitignored).
+- **Java e2e** (`e2e-java.txt`, `scripts/e2e_java.sh`; run after the probe was deleted). Every `fn scip_*` test passed, 15 of 15, in 821.6 s at load 3.5–4.5, single-threaded. Those include `scip_java_spring_jpa`, `scip_java_lombok`, `scip_java_gradle_catalog`, `scip_kotlin_gradle`, `scip_polyglot_monorepo`, `scip_image_identity_is_part_of_the_tool_configuration` and `scip_unfinished_jobs_are_not_up_to_date`. Then `java_spring_jpa`, `kotlin_gradle_tier_b` and `doctor_reports_each_check` passed, 3 of 3.
+  - Goldens are unchanged: no bless, and 0 changes under `crates/rb-cli/tests` and `fixtures` before and after.
+  - 0 `t_` caches before and after.
+  - The one `failed` row written is the deliberate `broken` fixture's (`com.acme:nope`), as in P5's run.
+- **Mutants** (`mutants-p6.txt`): m388, m389, m390 and m393 KILLED, and the tree was restored.
+- **Process.** Each message carried one `Edit` call, or one scripted edit of one file that asserted every hunk matched once. The scaffold's scripted edit of orchestrate.rs inserted `java_release: None` twice in one literal (one replace pattern was a suffix of the other). A one-line `Edit` removed the duplicate before anything compiled.
+- **`rb.repo`** is identical before and after (`repo-before.txt`, `repo-after.txt`; the user's 4 rows).
+
 ## Result
 
 Not yet built.

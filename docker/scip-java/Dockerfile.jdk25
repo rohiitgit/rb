@@ -1,0 +1,28 @@
+# scip-java on JDK 25 (contract M9d D12; see README.md, "JDK 25 image").
+#
+# A Maven job whose poms declare a Java release above 21 runs on this image; every other
+# scip-java job runs on rb-scip-java:0.13.1 (Dockerfile). The JDK 25 base pinned below ships
+# neither curl nor wget, so Maven, Gradle and scip-java are not downloaded again: they are
+# copied as files from rb-scip-java:0.13.1, which must be built first. The tools are then
+# byte-for-byte the ones that image verified against its checksums, and building this image
+# leaves that image, its ID and every cached Java index untouched.
+#
+# Base: Eclipse Temurin JDK 25 (25.0.4.1) on Ubuntu 26.04, pinned by index digest.
+ARG BASE=eclipse-temurin:25-jdk@sha256:2d5d5e9b533342a565907c84f47a2ec298c40cde7b13a3ca85d4950fa456a641
+FROM rb-scip-java:0.13.1 AS tools
+FROM ${BASE}
+
+COPY --from=tools /opt/maven /opt/maven
+COPY --from=tools /opt/gradle /opt/gradle
+COPY --from=tools /usr/local/bin/scip-java /usr/local/bin/scip-java
+
+# The same environment as rb-scip-java:0.13.1 (Dockerfile).
+ENV MAVEN_HOME=/opt/maven \
+    GRADLE_HOME=/opt/gradle \
+    PATH=/opt/gradle/bin:/opt/maven/bin:${PATH} \
+    # Applies to every JVM started in the container (Maven, javac, the launcher).
+    JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=80.0 -XX:+UseContainerSupport" \
+    # Honoured by the coursier launcher only; mirrors the official scip-java image.
+    JAVA_OPTS="--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED"
+
+WORKDIR /sources

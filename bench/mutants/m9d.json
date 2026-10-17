@@ -287,5 +287,41 @@
   "old": "    if !(workspace && matches!(attempt.status, RunStatus::Failed(_))) {\n",
   "new": "    if !(workspace && matches!(attempt.status, RunStatus::Failed(_) | RunStatus::Timeout { .. })) {\n",
   "what": "a re-run after a workspace timeout too (D5b)"
+ },
+ {
+  "id": "m388",
+  "crate": "rb-scip",
+  "test": "jobs::tests::maven_release_above_21_takes_the_jdk25_image",
+  "file": "jobs.rs",
+  "old": "        Some(release) if release > 21 => Ok(Jdk::Jdk25),\n",
+  "new": "        Some(release) if release > 21 => Ok(Jdk::Jdk21),\n",
+  "what": "release above 21 keeps the JDK 21 image (D12)"
+ },
+ {
+  "id": "m389",
+  "crate": "rb-scip",
+  "test": "jobs::tests::maven_release_above_21_takes_the_jdk25_image",
+  "file": "jobs.rs",
+  "old": "            match properties.get(name) {\n",
+  "new": "            match None::<&&str> {\n",
+  "what": "`${java.version}` not resolved: no `${…}` resolves through the properties (D12)"
+ },
+ {
+  "id": "m390",
+  "crate": "rb-scip",
+  "test": "jobs::tests::maven_release_above_21_takes_the_jdk25_image",
+  "file": "jobs.rs",
+  "old": "        let java_release = if fetch == Fetch::Maven {\n",
+  "new": "        let java_release = if true {\n",
+  "what": "a Gradle job takes the JDK 25 image: its root's poms are read too (D12)"
+ },
+ {
+  "id": "m393",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::maven_index_phase_writes_the_targetroot_outside_the_sources",
+  "file": "orchestrate.rs",
+  "old": "            \"--targetroot\",\n            MAVEN_TARGETROOT,\n",
+  "new": "",
+  "what": "`--targetroot` dropped from the Maven index arguments (D12b)"
  }
 ]
