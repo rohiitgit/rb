@@ -316,6 +316,15 @@
   "what": "a Gradle job takes the JDK 25 image: its root's poms are read too (D12)"
  },
  {
+  "id": "m391",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::gradle_runs_mark_tool_artifacts_executable",
+  "file": "orchestrate.rs",
+  "old": "            .chain(flags.iter())\n            .chain(init.iter())\n",
+  "new": "            .chain(flags.iter())\n",
+  "what": "init script missing from the fetch phase: the fetches run without `--init-script` (D13)"
+ },
+ {
   "id": "m393",
   "crate": "rb-scip",
   "test": "orchestrate::tests::maven_index_phase_writes_the_targetroot_outside_the_sources",

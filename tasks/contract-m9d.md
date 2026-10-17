@@ -887,6 +887,49 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Process.** Each message carried one `Edit` call, or one scripted edit of one file that asserted every hunk matched once. The scaffold's scripted edit of orchestrate.rs inserted `java_release: None` twice in one literal (one replace pattern was a suffix of the other). A one-line `Edit` removed the duplicate before anything compiled.
 - **`rb.repo`** is identical before and after (`repo-before.txt`, `repo-after.txt`; the user's 4 rows).
 
+**P7 note (2026-10-18; D13).** Logs in `var/m9d/logs/p7/`, scripts in `var/m9d/p7/scripts/`. Binary `var/m9d/bin/rb.p7` (debug, the P7 tree, sha256 `e6c02491…`).
+- **Red first.** Before any behaviour changed, the test `Fake` was given an `inits` record (the script at `/rb-gradle/exec-bits.gradle` each run saw while it ran), so that the test compiled. `gradle_runs_mark_tool_artifacts_executable` then failed on its first assertion: run 0's read-only mounts held `/rb-egress` only (`c12-red.txt`).
+- **Design.**
+  - `gradle_runs` writes `GRADLE_INIT_SCRIPT` to `<run>-egress/gradle/exec-bits.gradle`, the run's own side directory, which `run_once` already removes after every run. It mounts that directory read-only at `/rb-gradle` in all three runs.
+  - The two fetches run `gradle <flags> --init-script /rb-gradle/exec-bits.gradle <tasks>`. The index passes the same two arguments after `--` and the flags, so scip-java hands them to Gradle. This is P0's order.
+  - The script is P0's measured `whenReady` draft, with its draft header replaced by one comment line. Once the task graph is ready, it resolves each `GenerateProtoTask` project's `protobufToolsLocator_*` configurations and sets `rwxr-xr-x` with `Files.setPosixFilePermissions` on every resolved `*.exe` under `GRADLE_USER_HOME`. It never asks `canExecute`.
+  - `RECIPE_GRADLE` is `m9d-gradle-1`. Maven runs are unchanged.
+  - The stale `Fetch::Gradle` doc (`jobs.rs`) now describes the fetch and the init script.
+- **Deviations, each with its reason.**
+  1. **The test `Fake` reads `settings.xml` only from mounts other than `/rb-gradle`.** Before, it read `settings.xml` from every read-only mount and failed without one, and a Gradle fetch now has two mounts. Every other mount is read as before, failure included.
+  2. **Where the script lives is P7's choice.** D13 says "a read-only init script", not where. The run's side directory needs no new clean-up. The C12 test asserts that only the package cache is left after a run.
+  3. **The Gradle e2e suites are the whole SCIP set again,** as in P6: every `fn scip_*` test, which includes `scip_java_gradle_catalog` and `scip_kotlin_gradle`, then `kotlin_gradle_tier_b`, `java_spring_jpa` and `doctor_reports_each_check`.
+  4. **`docker/scip-java/README.md` does not describe the Gradle runs** (it never did), so it is unchanged. The design and usage notes are P8's.
+- **Old values pinned by tests**, grepped (`m6e-gradle-1`, `RECIPE_GRADLE`, the Gradle fetch lines, `not verified yet`; `old-values-grep.txt`) and updated:
+  - `a_workspace_job_fetches_at_its_root_and_indexes_every_member`: `RECIPE_GRADLE` `m6e-gradle-1` → `m9d-gradle-1`.
+  - `gradle_job_resolves_builds_then_indexes_offline`: both fetch lines gain `--init-script /rb-gradle/exec-bits.gradle` between the flags and the tasks. Its index assertions hold unchanged.
+  - `maven_index_phase_writes_the_targetroot_outside_the_sources` (P6): `gradle_runs` takes the script's directory (a signature change, not a value).
+  - No golden holds a Gradle recipe or argv.
+- **Unit suites** (`units-final.txt`, after the last edit): `cargo test -p rb-scip` 95 passed; `-p rb-cli --bin rb` 49; `-p rb-indexer --lib projects` 18. fmt and clippy (`--workspace --all-targets -D warnings`) are clean (`fmt.txt`, `clippy.txt`).
+- **Probe `t_m9d_ms`** (`ms-probe.txt`, `ms-cleanup.txt`; `scripts/probe_ms.sh`). microservices_demo `38e7348e`, `--scip-timeout-secs 3600`, with the package cache an APFS clone of `bench_microservices_demo_scip`, as P0 probe (c) warm started from it, both tool artifacts at 0644. `rb index` took 121.7 s at load 2.5–4.1.
+
+  | Job | Predicted (amendment 1, P0 probes (c), (d)) | Measured |
+  |---|---|---|
+  | `src/adservice` scip-java (Gradle) | `ok`; fetch about 14 s warm, index 10–11 s; 4,239,341 B, 12 documents (2 tracked, 10 generated) | **`scip-java ok` 25.3 s**; row `4e6c3a1f…` on `rb-scip-java:0.13.1`; **4,239,341 B, 12 documents** (`src` 2, `build` 10), 51,890 occurrences; `definitions matched 21/21` |
+  | adservice tool artifacts | 0644 → 0755 | `protoc-4.36.1-linux-aarch_64.exe` and `protoc-gen-grpc-java-1.84.0-linux-aarch_64.exe`: `-rw-r--r--` before, `-rwxr-xr-x` after |
+  | adservice Gradle home | +6 MiB | 52,464 → 57,912 KiB (+5.3 MiB) |
+  | `src/emailservice` scip-python | `ok`, 141,910 B | `ok unpinned` 25.1 s, 141,910 B |
+  | `src/recommendationservice` scip-python | `ok`, 149,308 B | `ok unpinned` 10.9 s, 149,308 B |
+  | `src/loadgenerator` scip-python | fetch rc 1 → D4: `ok (environment not installed: fetch failed)`, 8,842 B | `ok unpinned … (environment not installed: fetch failed)` 25.6 s; row `ok`/`fetch`, 8,842 B |
+  | `src/shoppingassistantservice` scip-python | as loadgenerator, 12,844 B | `ok unpinned … (environment not installed: fetch failed)` 31.5 s; row `ok`/`fetch`, 12,844 B |
+  | `src/checkoutservice`, `frontend`, `productcatalogservice`, `shippingservice` scip-go | cache hits (`RECIPE_GO` unchanged) | `scip-go ok (cached)`, all 4 |
+
+  - All 9 jobs are `ok`. The repository has no other SCIP job: `currencyservice` and `paymentservice` are JavaScript-only, and the C# and PHP targets have no indexer (Out of scope).
+  - `exact calls (scip)`: 242.
+  - Clean-up: the repository, its graph (`rb_t_m9d_ms_43335`) and its cache (1.3 GB, `chmod -R u+w`, then `rm -rf`) were deleted. The two egress networks were removed with `rb gc --prefix t_m9d_ --egress`. After it: 0 rows, 0 graphs, 0 caches, 0 containers, 0 networks.
+- **SCIP and Gradle e2e** (`e2e-gradle.txt`; `var/m9d/p6/scripts/e2e_java.sh`; run after the probe was deleted). Every `fn scip_*` test passed, 15 of 15, in 699.4 s at load 3.2–4.1, single-threaded. Then `java_spring_jpa`, `kotlin_gradle_tier_b` and `doctor_reports_each_check` passed, 3 of 3.
+  - Goldens are unchanged: no bless, and 0 changes under `crates/rb-cli/tests` and `fixtures` before and after.
+  - 0 `t_` caches before and after.
+  - The two Gradle fixture rows written under `m9d-gradle-1` (`a7fb91d0…`, 3 documents; `a38c54d8…`, the Kotlin fixture) are byte-equal to older rows of the same document sets. Every other row written matches its older rows in documents, occurrences and symbols (`java-rows-compare.txt`; P6 note, deviation 5).
+- **Mutants** (`mutants-p7.txt`, `mutants-m9d-battery.txt`): m391 KILLED. The whole m9d battery, m360–m396 with m387 on a `ScratchDb` (`RB_TEST_DATABASE_URL` set), is **37 of 37 KILLED**. 0 scratch databases are left before and after, and the tree was restored.
+- **Process.** Each message carried one `Edit` call, or one scripted edit of one file that asserted every hunk matched once.
+- **`rb.repo`** is identical before and after, and to P6's baseline (`repo-before.txt`, `repo-after.txt`; the user's 4 rows). No `t_*` row, `t_*` cache, egress network or `rb-` container is left (`leftovers.txt`).
+
 ## Result
 
 Not yet built.

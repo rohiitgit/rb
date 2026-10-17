@@ -82,7 +82,9 @@ impl Indexer {
 pub enum Fetch {
     /// `mvn dependency:go-offline` and an online build with the image's Maven.
     Maven,
-    /// A Gradle dependency resolution (not verified yet: such jobs are `unsupported`).
+    /// `gradle dependencies` and an online build with the image's Gradle (contract M6e S2),
+    /// both phases with rb's init script marking the protobuf plugin's tool artifacts
+    /// executable (contract M9d D13).
     Gradle,
     /// `npm ci`, `yarn install --frozen-lockfile` or `pnpm install --frozen-lockfile`.
     Npm { lockfile: NodeLock },

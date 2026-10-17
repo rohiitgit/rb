@@ -54,8 +54,10 @@ pub const RECIPE_PY: &str = "m9d-py-1";
 /// scip-java's Gradle recipe (contract M6e S2): dependency resolution plus one
 /// online build in the fetch phase, then `scip-java index --build-tool Gradle`
 /// offline. Bumped like [`RECIPE_JAVA`]. Separate from it because the fetch
-/// commands differ: a Maven-fetched index must never serve a Gradle job.
-pub const RECIPE_GRADLE: &str = "m6e-gradle-1";
+/// commands differ: a Maven-fetched index must never serve a Gradle job. `m9d-gradle-1`:
+/// both phases run rb's init script, which marks the protobuf plugin's tool artifacts
+/// executable (contract M9d D13).
+pub const RECIPE_GRADLE: &str = "m9d-gradle-1";
 
 /// The recipe a job's cache key carries: scip-java's gains `+T<n>` when its Maven builds run
 /// with `n` > 1 threads (contract M6a D9), so no cached index crosses thread settings; the
@@ -502,9 +504,13 @@ fn run_once(
     let result = (|| -> anyhow::Result<ScipRun> {
         let (mut fetches, mut index) = match job.indexer {
             Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
-            Indexer::ScipJava if job.fetch == Fetch::Gradle => {
-                gradle_runs(image, work_dir, cache_dir, budget)?
-            }
+            Indexer::ScipJava if job.fetch == Fetch::Gradle => gradle_runs(
+                image,
+                work_dir,
+                cache_dir,
+                &egress_dir.join("gradle"),
+                budget,
+            )?,
             Indexer::ScipJava => java_runs(image, work_dir, cache_dir, budget)?,
             Indexer::ScipGo => go_runs(job, image, work_dir, cache_dir, budget)?,
             Indexer::ScipPython => python_runs(job, image, work_dir, cache_dir, budget)?,
@@ -925,6 +931,38 @@ fn java_runs(
     Ok((fetches, index))
 }
 
+/// Where every Gradle run of a scip-java job finds rb's init script (contract M9d D13), mounted
+/// read-only.
+const GRADLE_INIT_AT: &str = "/rb-gradle";
+
+/// rb's Gradle init script (contract M9d D13; P0's measured `whenReady` draft). The protobuf
+/// plugin downloads `protoc` and its plugins into `GRADLE_USER_HOME` with mode 0644, then runs
+/// them only when `File.canExecute()` says no; on Docker Desktop's bind mounts it says yes for
+/// root while `execve` fails EACCES (microservices_demo `adservice`: `error: 13`). So, once the
+/// task graph is ready, before any task runs, the script resolves each project's
+/// `protobufToolsLocator_*` configurations and sets 0755 on every resolved `*.exe` under
+/// `GRADLE_USER_HOME`, without asking. A build without the plugin has no such configuration
+/// and is untouched; other plugins' native tools are not covered (amendment 1, risk 5).
+const GRADLE_INIT_SCRIPT: &str = r#"// rb (contract M9d D13): mark the protobuf plugin's tool artifacts executable.
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
+def rbMarkExec = { Project p ->
+  def home = p.gradle.gradleUserHomeDir.toPath().toRealPath()
+  p.configurations.findAll { it.name.startsWith('protobufToolsLocator_') }.each { c ->
+    c.resolve().findAll { it.name.endsWith('.exe') }.each { f ->
+      def path = f.toPath().toRealPath()
+      if (path.startsWith(home)) {
+        Files.setPosixFilePermissions(path, PosixFilePermissions.fromString('rwxr-xr-x'))
+        println "rb-exec-bits: ${p.path} ${c.name} ${home.relativize(path)}"
+      }
+    }
+  }
+}
+gradle.taskGraph.whenReady { graph ->
+  graph.allTasks.findAll { it.class.name.contains('GenerateProtoTask') }*.project.unique().each { rbMarkExec(it) }
+}
+"#;
+
 /// The fetch and index invocations for a scip-java Gradle job (docker/scip-java/README.md).
 /// The fetch phase resolves dependencies (`dependencies`) and then does one online build, so
 /// that the index phase can run the same build with `--offline` under `--network none`.
@@ -934,15 +972,23 @@ fn java_runs(
 /// forces compilation to run, so javac with the SemanticDB plugin always emits (a cache hit
 /// would skip it, the spring-retry lesson of contract M3b amendment 47). The repository's
 /// wrapper stays unexported ([`export`]), so the image's `gradle` is always the one used.
+/// Every run gets [`GRADLE_INIT_SCRIPT`], written to `init_dir` (the run's own side directory,
+/// removed with it) and mounted read-only at [`GRADLE_INIT_AT`] (contract M9d D13).
 fn gradle_runs(
     image: &str,
     work_dir: &Path,
     cache_dir: &Path,
+    init_dir: &Path,
     budget: &Budget,
 ) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
     let workdir = crate::runner::absolute(work_dir)?;
     let gradle_home = crate::runner::absolute(cache_dir)?.join("gradle");
     std::fs::create_dir_all(&gradle_home)?;
+    std::fs::create_dir_all(init_dir)?;
+    std::fs::write(init_dir.join("exec-bits.gradle"), GRADLE_INIT_SCRIPT)?;
+    let init_dir = crate::runner::absolute(init_dir)?;
+    let init_script = format!("{GRADLE_INIT_AT}/exec-bits.gradle");
+    let init = ["--init-script", init_script.as_str()];
     let base = ContainerRun {
         name: None,
         image: image.into(),
@@ -951,7 +997,7 @@ fn gradle_runs(
         mount_at: "/sources".into(),
         cwd: String::new(),
         caches: vec![(gradle_home, "/root/.gradle".into())],
-        readonly: Vec::new(),
+        readonly: vec![(init_dir, GRADLE_INIT_AT.into())],
         // Explicit (the default is also `/root/.gradle` for root): the fetch
         // must never write where another repository's reads.
         env: vec![("GRADLE_USER_HOME".into(), "/root/.gradle".into())],
@@ -972,6 +1018,7 @@ fn gradle_runs(
         args: ["gradle"]
             .iter()
             .chain(flags.iter())
+            .chain(init.iter())
             .chain(tasks.iter())
             .map(|s| (*s).to_owned())
             .collect(),
@@ -994,11 +1041,10 @@ fn gradle_runs(
             "--console=plain",
             "--no-daemon",
             "--no-build-cache",
-            "clean",
-            "compileJava",
-            "compileTestJava",
         ]
         .iter()
+        .chain(init.iter())
+        .chain(["clean", "compileJava", "compileTestJava"].iter())
         .map(|s| (*s).to_owned())
         .collect(),
         ..base
@@ -1317,8 +1363,11 @@ mod tests {
         /// What a stopped proxy logged.
         proxy_log: String,
         proxy_image: bool,
-        /// `<mount> <settings.xml>` per read-only mount a run saw, read while it ran.
+        /// `<mount> <settings.xml>` per read-only mount holding one that a run saw, read while
+        /// it ran.
         settings: RefCell<Vec<String>>,
+        /// Per run, the Gradle init script mounted at `/rb-gradle`, read while it ran.
+        inits: RefCell<Vec<Option<String>>>,
         /// Per run, the text of `go.work` in the directory it started in, read while it ran.
         go_works: RefCell<Vec<Option<String>>>,
         /// Outcomes the next runs take, in order, before `fail_fetch`/`fail_index` apply; an
@@ -1339,6 +1388,7 @@ mod tests {
                 proxy_log: String::new(),
                 proxy_image: true,
                 settings: RefCell::new(Vec::new()),
+                inits: RefCell::new(Vec::new()),
                 go_works: RefCell::new(Vec::new()),
                 script: RefCell::new(std::collections::VecDeque::new()),
             }
@@ -1350,12 +1400,18 @@ mod tests {
     impl Runner for Fake {
         fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
             self.runs.borrow_mut().push(run.clone());
+            let mut init = None;
             for (host, inside) in &run.readonly {
+                if inside == "/rb-gradle" {
+                    init = std::fs::read_to_string(host.join("exec-bits.gradle")).ok();
+                    continue;
+                }
                 let settings = std::fs::read_to_string(host.join("settings.xml"))?;
                 self.settings
                     .borrow_mut()
                     .push(format!("{inside} {settings}"));
             }
+            self.inits.borrow_mut().push(init);
             self.go_works
                 .borrow_mut()
                 .push(std::fs::read_to_string(run.host_cwd().join("go.work")).ok());
@@ -2742,6 +2798,7 @@ mod tests {
             "sha256:java",
             &tmp.path().join("g"),
             &tmp.path().join("c"),
+            &tmp.path().join("i"),
             &Budget::default(),
         )
         .unwrap();
@@ -2761,7 +2818,7 @@ mod tests {
             lines[0].contains("--network rb-scip-fetch")
                 && lines[0].contains("-v <work>-egress/client:/rb-egress:ro")
                 && lines[0].contains(
-                    "gradle --console=plain --quiet --no-daemon --no-build-cache dependencies"
+                    "gradle --console=plain --quiet --no-daemon --no-build-cache --init-script /rb-gradle/exec-bits.gradle dependencies"
                 )
                 && lines[0].contains("/root/.gradle")
                 && lines[0].contains("-e GRADLE_USER_HOME=/root/.gradle")
@@ -2772,7 +2829,7 @@ mod tests {
         assert!(
             lines[1].contains("--network rb-scip-fetch")
                 && lines[1].contains(
-                    "gradle --console=plain --quiet --no-daemon --no-build-cache clean compileJava compileTestJava"
+                    "gradle --console=plain --quiet --no-daemon --no-build-cache --init-script /rb-gradle/exec-bits.gradle clean compileJava compileTestJava"
                 )
                 && lines[1].contains("/root/.gradle"),
             "{}",
@@ -2786,6 +2843,79 @@ mod tests {
             "{}",
             lines[2]
         );
+    }
+
+    /// Contract M9d D13 (C12): both Gradle phases, the two fetches and the index, run with rb's
+    /// init script, mounted read-only at `/rb-gradle` and passed as `--init-script` (after
+    /// `--` in the index, where scip-java hands it to Gradle). The script, once the task graph
+    /// is ready (`whenReady`, P0's measured hook), resolves the protobuf plugin's
+    /// `protobufToolsLocator_*` configurations and sets 0755 on each `*.exe` under
+    /// `GRADLE_USER_HOME` with `Files.setPosixFilePermissions`, without asking `canExecute`
+    /// (which Docker Desktop's bind mounts answer yes for root while `execve` fails). The
+    /// Gradle recipe is `m9d-gradle-1`; the run leaves nothing beside the cache.
+    #[test]
+    fn gradle_runs_mark_tool_artifacts_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(false, false);
+        let run = run_job(
+            &java_job(Fetch::Gradle),
+            "sha256:java",
+            &files(),
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(run.status, RunStatus::Ok);
+        let runs = fake.runs.borrow();
+        assert_eq!(runs.len(), 3);
+        let flag = [
+            "--init-script".to_owned(),
+            "/rb-gradle/exec-bits.gradle".to_owned(),
+        ];
+        for (k, r) in runs.iter().enumerate() {
+            assert!(
+                r.readonly.iter().any(|(_, inside)| inside == "/rb-gradle"),
+                "run {k}: {:?}",
+                r.readonly
+            );
+            let at = r.args.windows(2).position(|w| w == flag);
+            assert!(at.is_some(), "run {k}: {:?}", r.args);
+            if r.network == Network::None {
+                let dash = r.args.iter().position(|a| a == "--").unwrap();
+                assert!(at.unwrap() > dash, "{:?}", r.args);
+            }
+        }
+        let inits = fake.inits.borrow();
+        assert_eq!(inits.len(), 3);
+        for (k, text) in inits.iter().enumerate() {
+            let text = text
+                .as_deref()
+                .unwrap_or_else(|| panic!("run {k} saw no init script"));
+            for needle in [
+                "gradle.taskGraph.whenReady",
+                "protobufToolsLocator_",
+                "endsWith('.exe')",
+                "gradleUserHomeDir",
+                "Files.setPosixFilePermissions",
+                "rwxr-xr-x",
+            ] {
+                assert!(text.contains(needle), "run {k}: {needle}\n{text}");
+            }
+            let code: Vec<&str> = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
+            assert!(!code.iter().any(|l| l.contains("canExecute")), "{text}");
+        }
+        let left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["c"], "the run's export and side files are removed");
+        assert_eq!(RECIPE_GRADLE, "m9d-gradle-1");
     }
 
     #[test]
@@ -2980,7 +3110,7 @@ mod tests {
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m9d-java-1", "m9d-ts-1"));
         assert_eq!(RECIPE_PY, "m9d-py-1");
-        assert_eq!(RECIPE_GRADLE, "m6e-gradle-1");
+        assert_eq!(RECIPE_GRADLE, "m9d-gradle-1");
         assert_eq!(
             recipe(&java_job(Fetch::Maven), &Budget::default()),
             RECIPE_JAVA
