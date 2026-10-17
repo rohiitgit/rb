@@ -18,7 +18,7 @@
   - Invariant over 157 dumps: B1 23,187, IMG 455, B2 42,784, B3 8,896, B5 118, RTA 20, DIAG 8,787 rows, 0 unclassified; no Tier B edge `exact`.
   - Of the 203 mattermost fp, 185 are version skew (server compiles against `server/public v0.4.3`), M9d's.
 - **Perf:** mattermost `noscip-fresh` A/B against M9b: CPU 1.010×, wall 1.059×, RSS 1.056×, noise. SCIP mode 0.975× CPU after P7b. Five small-target wall warnings re-measured A/B: noise.
-- **Verification:** real-Docker 1,153/0/0 at P6; rb-indexer 375 and rb-scip 82 at P7b; fmt and clippy clean; mutants m9c 38/38, m9b 39/39, m9a 31/31, m8b 29/29 KILLED; two scorings `cmp`-identical; `rb.repo` unchanged.
+- **Verification:** real-Docker 1,154/0/0 (0 `skipping:`) on the final code, after P7b (`var/m9c/logs/p8/test-full-post-p7b.log`; 1,153/0/0 at P6); fmt and clippy clean; mutants m9c 38/38, m9b 39/39, m9a 31/31, m8b 29/29 KILLED, all four on the final code; two scorings `cmp`-identical; `rb.repo` unchanged.
 - **Files:**
   - **Code:** `crates/rb-scip/src/{jobs,lib,symbol}.rs`, `crates/rb-indexer/src/{lib,resolve,rta,scip}.rs`, `crates/rb-syntax/src/{lib,bindings,decorations,queries,keys}.rs`, `crates/rb-store/src/{query,db_tests}.rs`, `crates/rb-cli/src/doctor.rs`, `docker/scip-go/{Dockerfile,README.md}`, goldens `crates/rb-cli/tests/golden/{go-chi-sqlx,polyglot-monorepo}/scip-status.txt`.
   - **Bench:** `bench/probe/m9c_forms.py`, `bench/mutants/m9c.json`, `bench/samples/exact.tsv`, `bench/scoreboard/m9c{,-perf}.json`, `bench/accept-m9c.tsv`.

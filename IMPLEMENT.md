@@ -901,8 +901,8 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - 17 of 314 cells changed; `compare` exits 0 with 6 accepted lines over 5 cells. Invariant: 0 unclassified rows over 157 dumps; no Tier B edge `exact`.
   - `exact` 100.0 % of 126; the `scip` sample's 54 redrawn edges all TRUE.
 - **Verification:**
-  - Mutants m9c 38/38 (m300–m330, m334–m338, m340, m341), m9b 39/39, m9a 31/31, m8b 29/29 KILLED.
-  - Real-Docker 1,153/0/0 at P6; rb-indexer 375 and rb-scip 82 at P7b.
+  - Mutants m9c 38/38 (m300–m330, m334–m338, m340, m341), m9b 39/39, m9a 31/31, m8b 29/29 KILLED, all four re-run on the final code after P7b.
+  - Real-Docker 1,154/0/0 (0 `skipping:`) on the final code after P7b; 1,153/0/0 at P6.
   - fmt and clippy clean; `rb.repo` unchanged; two scorings `cmp`-identical.
   - Perf: mattermost `noscip-fresh` A/B noise (CPU 1.010×); SCIP mode 1.297× CPU at P7, 0.975× after P7b's memo.
 - **Open, carried to M9d:** version skew (185 of the 203 mattermost fp; every D8′ join `synthetic`), `(T, *model.AppError)` results, the `scip` crate parser's remaining `Debug` cost, and the 4,092 interface-method references no server/public definition anchors.

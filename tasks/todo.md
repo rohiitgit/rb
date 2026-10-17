@@ -1227,7 +1227,7 @@ Contract: `tasks/contract-m9c.md` (5 plan corrections; amendments 1–2; notes P
 - [x] P6: `PIPELINE` `m9c-1`, design and usage docs; real-Docker 1,153/0/0; batteries m9c 37, m9b 39, m9a 31, m8b 29 KILLED.
 - [x] P7: binary `930271d4…` from `139dd21`, 0 failures; invariant 0 unclassified; 54 redrawn `scip` edges judged blind, 54 TRUE; score ×2 `cmp`; `compare` exit 0 with 6 accepted lines over 5 cells; `noscip-fresh` A/B noise; SCIP mode OVER-CPU (1.297×).
 - [x] P7b: cause (per-occurrence symbol parse in the join), memo fix `55592a1`, m341 KILLED (m9c 38/38); binary `f340b267…` re-benched (run 2 after an autovacuum re-run), 157 dumps identical, `compare` exit 0; SCIP-mode A/B 0.975× CPU, noise.
-- [x] P8: records done; evaluator pass 1 pending.
+- [x] P8: records done; real-Docker 1,154/0/0 after P7b (0 `skipping:`); batteries m9c 38, m9b 39, m9a 31, m8b 29 KILLED on the final code; evaluator pass 1 pending.
 - [ ] Evaluator pass 1.
 - [ ] Evaluator pass 2 (verification only).
 - **Open items carried to M9d (`tasks/contract-m9d.md`):** version skew (185 of the 203 mattermost fp, every D8′ join `synthetic`); `(T, *model.AppError)` results (1,050 headers on mattermost `server/`); the `scip` crate parser's remaining `Debug` cost on distinct strings; the 4,092 interface-method references (M9d plan correction 3). M9b's `unowned_table_writes` timeout is M9d's D11 (LLVM JIT, not the `LIMIT`).
