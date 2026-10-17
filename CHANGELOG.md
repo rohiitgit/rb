@@ -1,5 +1,16 @@
 # Changelog
 
+## [2026-10-17 23:00] (wall clock) M9c: evaluator pass 2 answered, closed
+- `tasks/eval-m9c-pass2.md`: VERDICT PASS, 0 blocking, 3 should-fix, 6 notes. Answered in contract amendment 4. Code `15831b0`, `PIPELINE` `m9c-3`.
+- **S2 (Python MRO):** pass 1's MRO memoised a class only when C3 succeeded, so a hierarchy C3 cannot merge (an inconsistent order, a cycle) was recomputed by every class above it: a 28-layer lattice of diamonds took 164.49 s and a 40-layer one did not finish. The fallback is now memoised per class too, and reaching the 64-level cap ends the walk without being memoised: 0.17 s and 0.21 s. Output is unchanged below 64 levels; past them a class's MRO no longer depends on which classes were looked up first. A structural test counts MRO computations (4,096 → 24 at 12 layers).
+- **N1 (Go):** a parameter or local declared with a type parameter (`func Use[T any](x T)`, `var e E` in a method of `Box[E]`) no longer types a same-named package type. Struct fields and signature `REFERENCES` naming one are recorded as residue.
+- **N3:** a test row pins the conversion rule to Go; the evaluator's x7 is killed. Its x10 is killed by the new rows on the pre-fix code; re-anchored on the new code, it and three more S2 mutants are killed. No mutant id was added; m348 was re-anchored.
+- **S1:** rows S41–S60 of `bench/samples/synthetic-d8.tsv` carried the evidence of the row before (a zsh array read from index 0). Rebuilt from the judge's own array; `bench/probe/sample_evidence_check.py` checks that each row's evidence names its edge (60 of 60; it flags exactly those 20 rows before the fix). Verdicts unchanged: 59 TRUE.
+- **S3, N4:** stale P7b-run numbers corrected across the records; binaries (`rb.r1`–`rb.r3`, `rb`) and runs are named once in the Result. N2, N5 recorded; N6 noted in M9d's NFRs.
+- **Scoreboard** (`bench/scoreboard/m9c.json`, binary `6cd5baaa…f5a8` from `15831b0`; run `var/bench/out/6cd5baaa8d1f/`): all 157 dumps byte-identical to the pass-1 run, so every cell is as before; two scorings `cmp`-identical; `compare` exits 0 with the same 45 changed and 6 accepted lines. The three mattermost peak-RSS warnings A/B against M9b: noise (CPU 1.010 / 1.059 / 0.986).
+- **Verification:** real-Docker 1,157/0/0 (0 `skipping:`); batteries m9c 56/56, m9b 39/39, m9a 31/31, m8b 29/29 KILLED; fmt and clippy clean; `rb.repo` unchanged.
+- **Status:** M9c closed.
+
 ## [2026-10-17 20:45] (wall clock) M9c: evaluator pass 1 answered, re-closed
 - `tasks/eval-m9c-pass1.md`: VERDICT PASS, 0 blocking, 6 should-fix, 6 notes. Answered in contract amendment 3. Code `e58f6ee`, `PIPELINE` `m9c-2`.
 - **E1 (Go):** a call result named by one of the callable's type parameters (`func Id[T any](x T) T`) no longer types a package type `T`; Go facts now record type parameters. A `select` case's `v := <-ch` declares `v`, so it shadows a package var.

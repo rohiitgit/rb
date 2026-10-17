@@ -878,7 +878,7 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - N1: a fully qualified configurer (return type and supertype) caps; the evaluator's x1 is KILLED. N2, N3: records corrected ("E4"; "17 of 18"). N4: `t_*` probes are deleted by the e2e start-up clean-up (lesson).
 - **Status:** closed 2026-10-16 on evaluator pass 2 (`tasks/eval-m9b-pass2.md`) VERDICT PASS (0 blocking; 3 should-fix and 4 notes answered in amendment 8).
 
-## M9c Tier B call recall, the scip-go image, cross-module scip-go joins: built 2026-10-17
+## M9c Tier B call recall, the scip-go image, cross-module scip-go joins: closed 2026-10-17
 
 - **Discussed and decided:** the contract (`tasks/contract-m9c.md`, C1–C16, amendments 1–2 and phase notes PI–P7b) checked the plan against the code first. B3's cause is strict JSON parsing of tsconfig `paths`, not namespace imports. B2's misses are five syntactic forms (call results, call segments, aliases, embedding, package vars), not single-implementer interfaces (0 measured misses). B5 adds inherited `__init__`. P0 found the 3 `App#GetClusterId` fp came from scip-go recording no occurrence where an imported package failed to load, and P0b traced that to rb's image.
 - **The scip-go image, root cause (amendment 2, PI):**
@@ -895,14 +895,14 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - P6: `PIPELINE` `m9c-1`; design notes §5.2–§5.4; usage guide.
   - P7b: a per-join memo so the SCIP join parses each distinct symbol once (`NameForms`, `NameMemo`); output unchanged.
 - **Files:** `crates/rb-scip/src/{jobs,lib,symbol}.rs`, `crates/rb-indexer/src/{lib,resolve,rta,scip}.rs`, `crates/rb-syntax/src/{lib,bindings,decorations,queries,keys}.rs`, `crates/rb-store/src/{query,db_tests}.rs`, `crates/rb-cli/src/doctor.rs`, `crates/rb-cli/tests/golden/{go-chi-sqlx,polyglot-monorepo}/scip-status.txt`, `docker/scip-go/{Dockerfile,README.md}`, `bench/probe/m9c_forms.py`, `bench/mutants/m9c.json`, `bench/samples/exact.tsv`, `bench/scoreboard/m9c{,-perf}.json`, `bench/accept-m9c.tsv`, `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
-- **Results** (binary `f340b267…06c9` from `55592a1`, run `var/bench/out/f340b267d529/`):
-  - scip `calls` agreement P 78.4 % → 99.5 %, R 62.4 % → 96.3 %; mattermost gold 33,312 → 43,840, fp 6,141 → 203, fn 12,672 → 1,659. 23,186 `synthetic` cross-module scip edges. The precision gain is the gold growing: the `synthetic` joins are scip gold, 5,944 of the 6,141 base fp became tp through them, and against `exact` gold alone P reads 78.2 % (amendment 3, E5).
+- **Results** (the P7b run: binary `rb.r2`, `f340b267…06c9` from `55592a1`, run `var/bench/out/f340b267d529/`; the pass-1 and pass-2 runs' numbers follow each P7b number where they differ):
+  - scip `calls` agreement P 78.4 % → 99.5 %, R 62.4 % → 96.3 % (pass 1 and 2: 96.5 %); mattermost gold 33,312 → 43,840 (43,771), fp 6,141 → 203, fn 12,672 → 1,659 (1,590). 23,186 `synthetic` cross-module scip edges (23,180). The precision gain is the gold growing: the `synthetic` joins are scip gold, 5,944 of the 6,141 base fp became tp through them, and against `exact` gold alone P reads 78.2 % (amendment 3, E5).
   - bookcars `calls` R 62.5 % → 99.6 % (fn 694 → 8); go_clean_arch and go_gin_example 100 %; PyCG `calls` 12 → 14 of 48, `calls_file_scope` 94 → 105 of 186.
   - 17 of 314 cells changed; `compare` exits 0 with 6 accepted lines over 5 cells. Invariant: 0 unclassified rows over 157 dumps; no Tier B edge `exact`.
   - `exact` 100.0 % of 126; the `scip` sample's 54 redrawn edges all TRUE.
 - **Verification:**
-  - Mutants m9c 38/38 (m300–m330, m334–m338, m340, m341), m9b 39/39, m9a 31/31, m8b 29/29 KILLED, all four re-run on the final code after P7b.
-  - Real-Docker 1,154/0/0 (0 `skipping:`) on the final code after P7b; 1,153/0/0 at P6.
+  - Mutants m9c 38/38 (m300–m330, m334–m338, m340, m341), m9b 39/39, m9a 31/31, m8b 29/29 KILLED, all four re-run on P7b's code (pass 1 and pass 2 re-ran them on theirs, below).
+  - Real-Docker 1,154/0/0 (0 `skipping:`) on P7b's code; 1,153/0/0 at P6 (pass 1 and pass 2, below).
   - fmt and clippy clean; `rb.repo` unchanged; two scorings `cmp`-identical.
   - Perf: mattermost `noscip-fresh` A/B noise (CPU 1.010×); SCIP mode 1.297× CPU at P7, 0.975× after P7b's memo.
 - **Open, carried to M9d:** version skew (185 of the 203 mattermost fp; every D8′ join `synthetic`), `(T, *model.AppError)` results, the `scip` crate parser's remaining `Debug` cost, and the 4,092 interface-method references no server/public definition anchors.
@@ -912,7 +912,13 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - E3: tests for the evaluator's surviving mutants; e1, e2, e4, e8 adopted as m356–m359; e5 equivalent, its redundant check removed.
   - E4: tsconfig BOM and `"baseUrl": "."`.
   - E5: 60 seeded D8′ `synthetic` `CALLS` judged blind, 59 TRUE (`bench/samples/synthetic-d8.tsv`); the FALSE class (a Go conversion labelled `CALLS`, 77 rows) is now `REFERENCES`. Against `exact` gold alone the scip `calls` agreement P is 78.2 %.
-  - E6: r2 benched on a quiet host; mattermost walls 26.10 / 16.63 / 20.34 s, within 1.15× of a standalone timing; M9d's base.
-  - r2: binary `3b94ded4…9db6`, run `var/bench/out/3b94ded449f8/`, 156 rows changed against r1 (154 conversions, 2 PyCG), 0 unclassified; 53 redrawn `exact` edges, 53 TRUE; `compare` exit 0; RSS A/B noise.
+  - E6: the pass-1 run (`rb.r3`, `3b94ded449f8`) benched on a quiet host; mattermost walls 26.10 / 16.63 / 20.34 s, within 1.15× of a standalone timing; M9d's base.
+  - The pass-1 run: binary `rb.r3`, `3b94ded4…9db6`, run `var/bench/out/3b94ded449f8/`, 156 rows changed against the P7b run (154 conversions, 2 PyCG), 0 unclassified; 53 redrawn `exact` edges, 53 TRUE; `compare` exit 0; RSS A/B noise.
   - Verification: real-Docker 1,156/0/0; mutants m9c 56/56, m9b 39/39, m9a 31/31, m8b 29/29 KILLED.
-- **Status:** built; evaluator pass 1 answered and re-closed; pass 2 pending.
+- **Evaluator pass 2 (`tasks/eval-m9c-pass2.md`: PASS, 0 blocking, 3 should-fix, 6 notes; contract amendment 4; code `15831b0`, `PIPELINE` `m9c-3`):**
+  - S2: each Python class's MRO, C3's or the fallback, is memoised per class; reaching the 64-level cap ends the walk and is not memoised. A 28-layer unmergeable lattice took 164.49 s on `rb.r3` and takes 0.17 s; 40 layers did not finish in 625 s and takes 0.21 s. Output unchanged below 64 levels; past them the MRO no longer depends on lookup order. Test counts MRO computations (4,096 → 24 at 12 layers), red first; x10 KILLED on the pre-fix code by its rows, re-anchored x10r and p2a–p2c KILLED; m348 re-anchored.
+  - N1: a Go parameter or local typed by a type parameter types nothing (red first; p2d KILLED); struct fields and signature `REFERENCES` stay residue. N3: a scip-python row keeps class calls `CALLS`; x7 KILLED.
+  - S1: `synthetic-d8.tsv` S41–S60 evidence realigned from the judge's own array (a zsh array read from 0); `bench/probe/sample_evidence_check.py` checks evidence names its edge (60/60 after, 20 flagged before, control 58/59). S3/N4: stale P7b-run facts corrected; binaries `rb.r1`–`rb.r3` and runs named once in the Result.
+  - Binary of record `rb` `6cd5baaa…f5a8` from `15831b0`; the pass-2 run `var/bench/out/6cd5baaa8d1f/`: 0 failures, all 157 dumps byte-identical to the pass-1 run; scoreboard equal but for sha and commit; `compare` exit 0, same 45 changed and 6 accepted lines; the three mattermost RSS warnings A/B noise (CPU 1.010 / 1.059 / 0.986).
+  - Verification: real-Docker 1,157/0/0 (0 `skipping:`); mutants m9c 56/56, m9b 39/39, m9a 31/31, m8b 29/29 KILLED; fmt and clippy clean.
+- **Status:** **closed 2026-10-17** (evaluator passes 1 and 2 answered, amendments 3 and 4).

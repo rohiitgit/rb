@@ -694,3 +694,23 @@
 ## 2026-10-17: a bench's walls become a base only after a standalone timing agrees
 - **Mistake (caught by M9c evaluator pass 1, E6):** M9c's run of record had mattermost walls about 3× the same binary's standalone timing (autovacuum after probe deletes), and M9d's wall limit was set against them, so a wall regression up to about 3.6× could not have warned.
 - **Rule:** Before a run's perf file becomes a later milestone's base, check the host (load, memory, `pg_stat_activity`, `pg_stat_progress_vacuum`, `n_dead_tup`) and time the same binary standalone on the largest target; if any wall disagrees by more than 1.3×, re-run the bench.
+
+## 2026-10-17: zsh arrays start at 1; write paired data files in Python
+- **Mistake (caught by M9c evaluator pass 2, S1):** a judge wrote its verdict file with `"${ev[$i]}"` in a loop from `i=0`. zsh arrays are 1-based, so row k got the evidence of row k-1: S41 had none, S42–S60 carried their predecessor's, and S60's was lost. The citation check passed, because it tests that a `file:line` exists, not that it belongs to the edge, and amendment 3 said "No verdict rests on a wrong line".
+- **Rule:** Write any file that pairs rows with values (verdicts, evidence, labels) in Python, with an assertion that each value belongs to its row, never with a shell loop over an array. An evidence audit checks that each row's evidence names its own edge (`bench/probe/sample_evidence_check.py`), with a control that shifts the evidence by one row and must fail.
+
+## 2026-10-17: memoise every outcome that depends on the node alone, and keep the walk's state out of the memo
+- **Mistake (caught by M9c evaluator pass 2, S2):** the Python MRO memoised only a whole C3 result. A class whose bases could not be merged (an inconsistent order or a cycle) was recomputed by every class above it, so a 28-layer lattice of diamonds took 165 s and a 40-layer one did not finish; a valid lattice deeper than the 64-level cap was exponential too. And because the cap was applied per lookup while the memo was per class, a class's MRO past 64 levels depended on which classes had been looked up first.
+- **Rule:** In a recursion over a graph whose nodes can be shared, memoise every outcome that is a function of the node alone, failures included. Anything that depends on the walk (depth, the path) stays out of the memo and ends the walk. Test it by counting computations on a wide lattice, not by timing it. Before claiming "output unchanged", list what the old result depended on besides the input (here: lookup order), and say where the new code differs.
+
+## 2026-10-17: name each binary and each run once
+- **Mistake (M9c evaluator pass 2, N4):** "r1" meant P7's binary (`rb.r1`) in one place and P7b's run in another, and "r2" meant P7b's binary file and pass 1's run.
+- **Rule:** Name binaries by their file (`rb.r1`, `rb.r2`, …) and runs by the phase that made them ("the P7b run"), define both once in the Result, and never reuse a label for another thing. A log directory named before the rule keeps its name, and the Result says what it holds.
+
+## 2026-10-17: an alarm on `/usr/bin/time` does not stop the process it times
+- **Mistake (M9c pass 2):** `perl -e 'alarm 300; exec …' /usr/bin/time rb index …` killed `time` at 300 s, but `rb` kept running orphaned, at 98 % CPU, for 10 minutes into the quiet check before the bench.
+- **Rule:** Cap a probe by killing its process group (or `rb` itself), and check `ps` for the timed command before any quiet-host check.
+
+## 2026-10-17: the one-edit rule slips when two edits look like one change
+- **Mistake (M9c pass 2):** two Edit calls went out in one message twice: a struct field with its initialiser, and two sentences of one design note. Both were grepped and found landed before anything ran.
+- **Rule:** Before sending a message with an Edit, count its tool calls: one. A field and its initialiser, or two sentences of one note, are two edits and two messages.
