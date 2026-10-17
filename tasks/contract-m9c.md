@@ -851,6 +851,29 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - The SCIP e2e is green over three logs, not one, because of the Maven 429s.
   - `bench/mutants/m9c.json`, P6's file, gains the P5 specs here, as P1–P4 added theirs.
 
+**P6 note (2026-10-17, phase P6, close the code; base `8ef33be`).** Logs in `var/m9c/logs/p6/`.
+- **Built.**
+  - `PIPELINE` `m9b-2` → `m9c-1` (C11), with its history line. It is changed before every verify run below. Only `rb-cli` reads it, through the constant.
+  - `bench/mutants/m9c.json` holds the 37 specs of C15: m300–m330, m334–m338 and m340. m331–m333 and m339 are retired.
+  - Design doc:
+    - §5.2: the scip-go image's export-data pairing and the self-test (PI).
+    - §5.3: D8′'s `synthetic` join, and D7's withdrawal, with its `relationships_unverified` counter never built.
+    - §5.4: the Go forms (D3, D4) and `tier_b_forms` (D6), then the TS and Python forms (D1, D2, D5).
+    - No milestone row: that is P8's.
+  - Usage guide §4: the Go Tier B forms; TS JSONC `paths` and default imports; the Python forms; `tier_b_forms` with its 11 keys; the cross-module scip-go join with `scip_cross_project` and `exact calls (scip)`. It never named `relationships_unverified`, so nothing was dropped. The rb-store test count is now 84. Names checked against the code: `tier_b_forms` (`resolve.rs:125`, `TIER_B_FORMS`) and `scip_cross_project` (`lib.rs`, `join_across_projects`).
+  - README: the Go row's SCIP column says calls between the repository's own Go modules are `synthetic`. The status line is P8's.
+- **e2e goldens: no change.** P3 expected `tier_b_forms` rows on fixtures. The full e2e run on this tree (`e2e-failfirst.log`, after `cargo build -p rb-cli`; the debug binary carries `m9c-1`) passed 52/52 with no bless. The goldens hold diagnostic rows (51 `unresolved_references`, 22 `scip_status`, …) and none of kind `tier_b_forms` or `scip_cross_project`. Since every dump is compared to its golden, no fixture file resolves a reference through a new form, and no fixture has two Go modules. Nothing to classify. The forms' rows are shown on real targets: P3's go_clean_arch and gin probes, and P5's mattermost.
+- **Verify.**
+  - `cargo fmt --all --check` exit 0 (`fmt.log`) and `cargo clippy --workspace --all-targets -- -D warnings` exit 0 (`clippy.log`).
+  - Usage guide §5.2's full run in one invocation: `cargo test --workspace --no-fail-fast -- --test-threads=1`, real Docker (`test-full.log`). 1,153 passed, 0 failed, 0 ignored, exit 0, `grep -c 'skipping:'` = 0. That includes e2e 52, api 1, rb-store 84, rb-server 12 and rb-indexer 374.
+  - Every test in `bench/mutants/timing_tests.txt`, `check_gates` and `a_checkout_is_its_repository_whatever_its_name` passed in that same run (load about 3.7), so no low-load re-run was needed. No scip-java fetch failed in it.
+  - `SELECT name, checkout FROM rb.repo` is identical before the e2e, after the full run and after the batteries (`repo-name-checkout-{before,after-suite,after}.txt`). So is `SELECT * FROM rb.repo ORDER BY 1` (`repo-{before,after}.txt`; 4 rows).
+- **Batteries**, after the last fmt, `--jobs 1`, with `RB_TEST_DATABASE_URL` (`battery-*.log`; none served from the cache, since no log has a `cached:` line): m9c 37/37, m9b 39/39, m9a 31/31 and m8b 29/29 KILLED. None STALE or INVALID. The runner restored `crates/` byte for byte: `git diff crates` is the `PIPELINE` hunk only.
+- **Safety.** No probe repository in P6, and no `t_m9d_*` row before either suite. No DB write path is mutated: m338 is a `SELECT`, on a `ScratchDb`.
+- **Deviations.**
+  - `tasks/lessons.md` (not in P6's file list) gains the 2026-10-17 lesson on registry 429s replayed as cached failures, as the global instructions ask.
+  - P3's predicted golden change did not occur (above).
+
 ## Result
 
 Not yet built.

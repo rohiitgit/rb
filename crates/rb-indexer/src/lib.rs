@@ -142,7 +142,12 @@ use serde_json::{Value, json};
 /// `m9b-1` Go methods declared outside their receiver type's file are its members and no
 /// package-level names (B9); `fmt.Sprintf` SQL folds package constants (B10); Spring Data REST
 /// repositories expose `synthetic` endpoints (B12b).
-pub const PIPELINE: &str = "m9b-2";
+/// `m9c-1` Tier B recall: JSONC tsconfig `paths` and TS default imports (B3); Go call
+/// results, call segments, aliases, embedded fields and package vars (B2); Python `super()`,
+/// star imports, re-exports, module variables, `raise` and inherited `__init__` (B5); the
+/// `tier_b_forms` diagnostic; scip-go references into another job's module join its
+/// definitions as `synthetic` (`scip_cross_project`; B1).
+pub const PIPELINE: &str = "m9c-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

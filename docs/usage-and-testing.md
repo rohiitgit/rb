@@ -202,6 +202,36 @@ Notes that bite newcomers:
   signUp` in `auth.go`, `type Handler` in `handler.go`) is a member of the
   type: `h.signUp()` and a gin handler `r.POST("/x", h.signUp)` resolve to it.
   It is never a package-level name, so a bare `signUp()` does not.
+- Without SCIP, Go receivers are also typed by a constructor's result
+  (`u := article.NewService(…)` then `u.Fetch()`; results `T` or `(T, error)`),
+  by calls inside a qualifier (`th.App.Srv().Store()`), through type aliases
+  (`type Context = web.Context`), through embedded structs
+  (`ArticlePosterBg{ *ArticlePoster }` promotes `ArticlePoster`'s methods) and
+  through a package-level var declared in a sibling file (a test file's var is
+  seen by test files only). Embedding never makes `IMPLEMENTS`.
+- TypeScript `paths` are read from `tsconfig.json` files with comments and
+  trailing commas, and `import f from './m'` resolves to what `m` exports as
+  default. Python resolves `super().m()`, names from `from m import *` (not
+  `_` names, and not from a module that defines `__all__`), names a package's
+  `__init__.py` only re-imports, an imported module-level instance
+  (`smth = Smth()` then `smth.f()`), `raise A` as a construction of `A`, and a
+  subclass constructor call that reaches an inherited `__init__`.
+  All these edges are `heuristic`. Each file that used one of these forms gets one
+  `tier_b_forms` diagnostic counting the references per form: `return_type`,
+  `call_segment`, `type_alias`, `embedded`, `package_var`, `default_import`,
+  `super_call`, `star_import`, `reexport`, `module_variable`, `inherited_init`.
+- Go with SCIP across modules of one repository (each `go.mod` is its own
+  scip-go job): a call from one module into another module of the repository
+  (`model.NewId()` from `server` into `server/public`) links to that module's
+  own definition with provenance `scip` and certainty `synthetic`, not `exact`.
+  The compiler resolved the name against the version the caller's `go.mod`
+  requires from the module cache, which can differ from the in-repo code.
+  Each (from module, to module) pair gets one `scip_cross_project` diagnostic
+  `{to, synthetic, ambiguous, unanchored}`. `ambiguous` means two modules
+  declare the same module path (no edge). `unanchored` means the target module
+  has no definition node for the name, for example a name the required
+  version has and the in-repo code does not. `rb status`'s
+  `exact calls (scip)` counts `exact` calls only, so these are not in it.
 - Go with SCIP: a type that satisfies an interface gets `IMPLEMENTS` to it from
   the type (`Card# → Payer#`). scip-go also links each method to the interface
   method; that link gives no edge, since the interface method has no node, and
@@ -258,7 +288,7 @@ is not a pass**. Always set it:
 
 ```sh
 export RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb
-cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (83 tests)
+cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (84 tests)
 cargo test -p rb-server -- --nocapture  # serve binding, limits, parity (12 tests)
 cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (52 tests)
 cargo test -p rb-cli --test api     # CLI↔HTTP identity over 150 parameter sets (1 test)
