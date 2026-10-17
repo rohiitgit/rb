@@ -23,8 +23,9 @@ pub const RECIPE_JAVA: &str = "m5-egress-1";
 
 /// scip-typescript's recipe (contract M6a D8), bumped like [`RECIPE_JAVA`]. `m6a-ts-1`:
 /// workspace roots fetch and index their members (D5, D6) and exports are repository-shaped
-/// (D7).
-pub const RECIPE_TS: &str = "m6a-ts-1";
+/// (D7). `m9d-ts-1`: npm fetches rewrite lockfile registry hosts and ignore `engine-strict`
+/// (contract M9d D1).
+pub const RECIPE_TS: &str = "m9d-ts-1";
 
 /// scip-go's recipe (contract M6d S1/S3): `go mod download`, then `scip-go`
 /// offline. Bumped like [`RECIPE_JAVA`].
@@ -637,11 +638,34 @@ fn typescript_runs(
             anyhow::bail!("a Go/Python fetch on a TypeScript job")
         }
     };
-    let fetch = ContainerRun {
+    let mut fetch = ContainerRun {
         entrypoint: Some(entrypoint.into()),
         args,
         ..base.clone()
     };
+    // npm fetches only (contract M9d D1). A lockfile may resolve from a mirror outside the
+    // allow-list (nestjs_realworld: 194 entries from `npm.styque.de`, each with the same
+    // integrity on `registry.npmjs.org`): `replace-registry-host=always` fetches every tarball
+    // from the configured registry by the same path, and the lockfile's integrity still checks
+    // it. `engine-strict=false` stops a project `.npmrc` from refusing the image's node and npm
+    // (mattermost webapp). Environment variables beat a project `.npmrc`. Yarn and pnpm runs,
+    // and the index phase, are unchanged.
+    const NPM_FETCH_ENV: &[(&str, &str)] = &[
+        ("npm_config_replace_registry_host", "always"),
+        ("npm_config_engine_strict", "false"),
+    ];
+    if matches!(
+        job.fetch,
+        Fetch::Npm {
+            lockfile: NodeLock::PackageLock | NodeLock::None
+        }
+    ) {
+        fetch.env.extend(
+            NPM_FETCH_ENV
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        );
+    }
     // Projects follow `--`, so a directory named like an option (`--help`) is a project.
     let mut index_args: Vec<String> =
         ["index", "--output", "index.scip", "--no-progress-bar", "--"]
@@ -1974,13 +1998,70 @@ mod tests {
         }
     }
 
+    /// Contract M9d D1 (C2): an npm fetch rewrites a lockfile's registry host to the configured
+    /// registry (nestjs_realworld resolves 194 entries from a mirror outside the allow-list) and
+    /// ignores a project `.npmrc`'s `engine-strict` (mattermost webapp), through environment
+    /// variables, which beat the project's `.npmrc`. Yarn and pnpm runs, and every index
+    /// phase, keep today's environment. The recipe is bumped, so every cached TypeScript row
+    /// re-runs once.
+    #[test]
+    fn npm_fetches_rewrite_registry_hosts_and_ignore_engines() {
+        assert_eq!(RECIPE_TS, "m9d-ts-1");
+        let settings: [(String, String); 2] = [
+            ("npm_config_replace_registry_host".into(), "always".into()),
+            ("npm_config_engine_strict".into(), "false".into()),
+        ];
+        let today: Vec<(String, String)> = vec![
+            ("NODE_OPTIONS".into(), "--max-old-space-size=4096".into()),
+            ("npm_config_update_notifier".into(), "false".into()),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        for (lockfile, npm) in [
+            (NodeLock::PackageLock, true),
+            (NodeLock::None, true),
+            (NodeLock::Yarn, false),
+            (NodeLock::Pnpm, false),
+        ] {
+            let job = ts_job(lockfile);
+            assert_eq!(recipe(&job, &Budget::default()), RECIPE_TS, "{lockfile:?}");
+            let fake = Fake::new(false, false);
+            run_job(
+                &job,
+                SCIP_TYPESCRIPT_IMAGE,
+                &files(),
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &Egress::default(),
+                &fake,
+            )
+            .unwrap();
+            let runs = fake.runs.borrow();
+            assert_eq!(runs.len(), 2, "{lockfile:?}");
+            let (fetch, index) = (&runs[0], &runs[1]);
+            for s in &settings {
+                assert_eq!(fetch.env.contains(s), npm, "{lockfile:?}: {:?}", fetch.env);
+            }
+            // Apart from the two settings, every fetch starts with today's environment (the
+            // egress proxy's variables follow it).
+            let rest: Vec<(String, String)> = fetch
+                .env
+                .iter()
+                .filter(|e| !settings.contains(e))
+                .cloned()
+                .collect();
+            assert_eq!(rest[..today.len()], today[..], "{lockfile:?}");
+            assert_eq!(index.env, today, "{lockfile:?}");
+        }
+    }
+
     /// Contract M6a D6, D8: a grouped workspace job fetches at its root with today's
     /// commands (`npm ci` for `package-lock.json`, `yarn install --frozen-lockfile` for
     /// `yarn.lock`, scripts off) and indexes every member's `tsconfig.json` directory after
     /// `--`, in the job's (sorted) order; the recipes are per indexer.
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
-        assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m6a-ts-1"));
+        assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m9d-ts-1"));
         assert_eq!(RECIPE_PY, "m6d-py-4");
         assert_eq!(RECIPE_GRADLE, "m6e-gradle-1");
         assert_eq!(
@@ -2093,7 +2174,9 @@ mod tests {
     /// Contract M6a D9, S12: at the default budget every phase's full argument line is the one
     /// `cfa8ab9`'s code built (recorded from it: the Java runs and a TypeScript root job, whose
     /// construction differs since only in `cwd`, empty for both), so default runs and their
-    /// cache keys are unchanged.
+    /// cache keys are unchanged. Since M9d D1 the npm fetch also carries
+    /// `npm_config_replace_registry_host=always` and `npm_config_engine_strict=false` (and
+    /// `RECIPE_TS` moved, so cached TypeScript rows re-run once); every other line is as recorded.
     #[test]
     fn default_budget_argv_is_cfa8ab9s() {
         let proxy = [
@@ -2113,7 +2196,7 @@ mod tests {
             "run --rm --name <name> --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -v <work>-egress/client:/rb-egress:ro -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err {PROXY} sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 mvn -B -q -s /rb-egress/settings.xml org.apache.maven.plugins:maven-dependency-plugin:3.11.0:go-offline {OFF}",
             "run --rm --name <name> --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -v <work>-egress/client:/rb-egress:ro -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err {PROXY} sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 mvn -B -q -s /rb-egress/settings.xml clean verify -DskipTests {OFF}",
             "run --rm --name <name> --network none --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 scip-java index --build-tool Maven -- --batch-mode --offline clean verify -DskipTests {OFF}",
-            "run --rm --name <name> --platform linux/amd64 --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -v <work>-egress/client:/rb-egress:ro -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false {PROXY} --entrypoint /usr/local/bin/actual-npm sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 ci --no-audit --no-fund --loglevel=error --ignore-scripts --logs-max=0",
+            "run --rm --name <name> --platform linux/amd64 --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -v <work>-egress/client:/rb-egress:ro -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false -e npm_config_replace_registry_host=always -e npm_config_engine_strict=false {PROXY} --entrypoint /usr/local/bin/actual-npm sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 ci --no-audit --no-fund --loglevel=error --ignore-scripts --logs-max=0",
             "run --rm --name <name> --platform linux/amd64 --network none --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 index --output index.scip --no-progress-bar -- . sub",
         ]
         .iter()

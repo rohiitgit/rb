@@ -594,6 +594,38 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Mutants** (`mutants-p1.txt`): m387 KILLED (ScratchDb; `cypher_session` is called only by `cypher()`'s read-only transaction), m392 KILLED.
 - `rb.repo` identical before and after (`repo-before.txt`, `repo-after.txt`); `t_m9d_chk` was deleted at the end of each A/B run.
 
+**P2 note (2026-10-18; D1).** Logs in `var/m9d/logs/p2/`. Binary `var/m9d/bin/rb.p2` (debug, the P2 tree, sha256 `0501d5cf…`).
+- **D1 applies to npm fetches only** (`package-lock.json` and no lockfile), not to every scip-typescript fetch as D1's first sentence reads. `base.env` is shared by the yarn and pnpm fetches and by the index phase, and C2 requires yarn and pnpm runs unchanged. The two settings are appended to the npm fetch's environment. Yarn and pnpm runs and every index phase keep today's environment, and the test asserts it.
+- **C2.** `npm_fetches_rewrite_registry_hosts_and_ignore_engines` failed first on `RECIPE_TS` (`m6a-ts-1`; `c2-red.txt`). After the bump, it failed on the missing setting. One test fix came before D1 was written: its yarn branch had compared the whole fetch environment, but `run_job` appends the egress proxy's variables to every fetch, so it now checks each setting and today's leading entries.
+- **Old values pinned by tests**, grepped and updated:
+  - `a_workspace_job_fetches_at_its_root_and_indexes_every_member`: `RECIPE_TS` `m6a-ts-1` → `m9d-ts-1`.
+  - `default_budget_argv_is_cfa8ab9s`: the npm fetch line gains `-e npm_config_replace_registry_host=always -e npm_config_engine_strict=false` after `npm_config_update_notifier`, and nothing else moves (`argv-diff.txt`, with a control that must differ).
+  - No golden holds a recipe.
+- **Probe `t_m9d_nest`** (`nest-probe.txt`, `nest-row.txt`, `nest-cleanup.txt`; bench budget `--scip-timeout-secs 3600`, cold npm cache).
+
+  | | Predicted | Measured |
+  |---|---|---|
+  | status | failed → ok | `scip-typescript ok` (row `e276e6ea…`, `ok`) |
+  | fetch + index | 150 s + 2 s | 363.6 s together (load 2.3 at the start, 8.3 at the end) |
+  | index | about 275 KB | 274,729 B |
+  | `exact calls (scip)` | at most 30 call sites | 30 |
+  | npm cache | 93 MB | 97 MB |
+
+  - Refused hosts are not observable here: an `ok` row keeps no tail.
+  - The repository, its graph and its cache (after `chmod -R u+w`) were deleted. The two egress networks the probe created were removed with `rb gc --prefix t_m9d_ --egress`.
+- **TS e2e** (`e2e-ts.txt`): `scip_ts_express_prisma`, `scip_ts_workspaces`, `scip_ts_pnpm_yarn`, `scip_polyglot_monorepo` and `scip_contract_packs` passed, 5 of 5, in 1,614 s at load 5.3–8.8.
+  - Goldens are unchanged: no bless, and no golden file is modified.
+  - Since the bump, 10 `ok` rows and 1 `failed` row were written. The failed row is the deliberate `@acme/shared` 404, with its tail unchanged.
+  - 0 `t_` caches after the run.
+- **Rows invalidated by the recipe bump** (`ts-rows-invalidated.txt`, read `READ ONLY`): every scip-typescript row written before P2 is keyed on `m6a-ts-1`, 94 in all (89 `ok` with 113 MB of indexes, 5 `failed`). Every TypeScript job (npm, yarn and pnpm alike) re-runs once on its next index:
+  - the bench's TS jobs (bookcars ×9, express, mattermost's TS jobs, nestjs);
+  - the e2e fixtures;
+  - the user's `alvorabackend` TS job, whose cached `EBADENGINE` failure will no longer replay (its outcome under D1 is unmeasured; the repository was not touched).
+
+  The old rows stay in the table, unreachable.
+- **Mutants** (`mutants-p2.txt`): m360, m361 and m362 KILLED. m387 and m392 were re-run in the same battery: KILLED.
+- `rb.repo` identical to P1's baseline (`repo-after.txt`). No `rb-egress` container or `rb-scip` network is left.
+
 ## Result
 
 Not yet built.

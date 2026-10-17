@@ -1,5 +1,32 @@
 [
  {
+  "id": "m360",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
+  "file": "orchestrate.rs",
+  "old": "        (\"npm_config_replace_registry_host\", \"always\"),\n",
+  "new": "        // replace_registry_host dropped\n",
+  "what": "`replace_registry_host` setting dropped"
+ },
+ {
+  "id": "m361",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
+  "file": "orchestrate.rs",
+  "old": "        (\"npm_config_engine_strict\", \"false\"),\n",
+  "new": "        // engine_strict dropped\n",
+  "what": "`engine_strict` setting dropped"
+ },
+ {
+  "id": "m362",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
+  "file": "orchestrate.rs",
+  "old": "pub const RECIPE_TS: &str = \"m9d-ts-1\";\n",
+  "new": "pub const RECIPE_TS: &str = \"m6a-ts-1\";\n",
+  "what": "`RECIPE_TS` left at `m6a-ts-1`"
+ },
+ {
   "id": "m387",
   "crate": "rb-store",
   "test": "db_tests::cypher_runs_without_jit",
