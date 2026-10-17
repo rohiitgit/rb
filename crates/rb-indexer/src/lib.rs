@@ -1687,12 +1687,13 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
         }
     }
     // An index without its environment keeps the failed fetch's tail: why the environment is
-    // missing (contract M9d D4).
+    // missing (contract M9d D4); one without its workspace keeps the workspace run's (D5b).
     if matches!(
         p.status,
         rb_scip::RunStatus::Failed(_)
             | rb_scip::RunStatus::Timeout { .. }
             | rb_scip::RunStatus::OkWithoutEnvironment
+            | rb_scip::RunStatus::OkWithoutWorkspace
     ) && !p.stderr_tail.is_empty()
     {
         detail["stderr_tail"] = p.stderr_tail.as_str().into();
@@ -2802,6 +2803,22 @@ mod tests {
         assert_eq!(d.detail["image"], plain.detail["image"]);
         assert!(d.detail.get("reason").is_none(), "{}", d.detail);
         assert_eq!(d.detail["stderr_tail"], "ChefBuildError: pyyaml (6.0)");
+    }
+
+    /// Contract M9d D5b (amendment 2): a scip-go index made without its workspace, after the
+    /// workspace run failed, records `ok`, the `index` phase and the workspace run's tail (why
+    /// the workspace failed), and no reason.
+    #[test]
+    fn scip_status_records_an_index_without_its_workspace() {
+        let mut project = ok_project("server", "scip-go", vec![]);
+        project.stderr_tail = "Killed".into();
+        project.status =
+            rb_scip::RunStatus::from_cached("ok", Some("index")).expect("D5b's cached pair");
+        let d = scip_status(&project, None);
+        assert_eq!(d.detail["status"], "ok");
+        assert_eq!(d.detail["phase"], "index");
+        assert!(d.detail.get("reason").is_none(), "{}", d.detail);
+        assert_eq!(d.detail["stderr_tail"], "Killed");
     }
 
     /// Contract M6a D3, D7: a job's exported link targets (top level, any status) and the

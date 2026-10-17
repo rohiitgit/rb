@@ -1386,22 +1386,20 @@ fn phase_detail(phase: &str, budget_secs: Option<u64>) -> String {
     }
 }
 
-/// After an `ok` status whose fetch failed: the index was made without the environment
-/// (contract M9d D4).
-const WITHOUT_ENVIRONMENT: &str = " (environment not installed: fetch failed)";
-
 /// What `rb index` prints after a job's status: the phase of a timeout or failure, else the
-/// reason a job did not run, else nothing; an index without its environment says so.
+/// reason a job did not run, else nothing; an index without its environment (contract M9d
+/// D4) or without its workspace (D5b) says so.
 fn status_detail(status: &rb_scip::RunStatus) -> String {
     match status {
         rb_scip::RunStatus::Timeout { phase, budget_secs } => {
             phase_detail(phase.as_str(), Some(*budget_secs))
         }
         rb_scip::RunStatus::Failed(phase) => phase_detail(phase.as_str(), None),
-        rb_scip::RunStatus::OkWithoutEnvironment => WITHOUT_ENVIRONMENT.to_owned(),
-        other => other
-            .reason()
-            .map_or_else(String::new, |reason| format!(": {reason}")),
+        other => match (other.note(), other.reason()) {
+            (Some(note), _) => format!(" ({note})"),
+            (None, Some(reason)) => format!(": {reason}"),
+            (None, None) => String::new(),
+        },
     }
 }
 
@@ -1520,10 +1518,17 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
     }
     // A timeout's stored `reason` is rendered from its phase and budget, so the detail is
     // printed once, as `rb index` prints it (contract M3b amendment 50); a failure prints its
-    // phase (amendment 56). An `ok` job with a phase made its index without the environment
-    // after a failed fetch (contract M9d D4).
+    // phase (amendment 56). An `ok` job with a phase made a degraded index: without the
+    // environment after a failed fetch (contract M9d D4), or without the workspace after a
+    // failed workspace run (D5b); the stored pair names the variant, which names the text.
     match d.detail["phase"].as_str() {
-        Some(_) if d.detail["status"] == "ok" => line.push_str(WITHOUT_ENVIRONMENT),
+        Some(phase) if d.detail["status"] == "ok" => {
+            if let Some(note) =
+                rb_scip::RunStatus::from_cached("ok", Some(phase)).and_then(|s| s.note())
+            {
+                let _ = write!(line, " ({note})");
+            }
+        }
         Some(phase) => line.push_str(&phase_detail(phase, d.detail["budget_secs"].as_u64())),
         None => {
             if let Some(reason) = d.detail["reason"].as_str() {
@@ -4027,6 +4032,32 @@ mod tests {
             " (environment not installed: fetch failed)"
         );
         assert_eq!(status_detail(&rb_scip::RunStatus::Ok), "");
+    }
+
+    /// Contract M9d D5b (amendment 2): a scip-go index made without its workspace after a
+    /// failed workspace run is `ok` with phase `index`, and both lines say so, never as a
+    /// failed phase and never as D4's text.
+    #[test]
+    fn scip_status_line_prints_an_index_without_its_workspace() {
+        let line = scip_status_line(&rb_model::Diagnostic {
+            kind: "scip_status".into(),
+            path: Some("server".into()),
+            span: None,
+            detail: json!({
+                "indexer": "scip-go", "status": "ok", "unpinned": false,
+                "image": "sha256:1", "phase": "index", "stderr_tail": "Killed",
+            }),
+        });
+        assert_eq!(
+            line,
+            "scip: server scip-go ok (workspace failed: indexed without go.work)"
+        );
+        let fallback =
+            rb_scip::RunStatus::from_cached("ok", Some("index")).expect("D5b's cached pair");
+        assert_eq!(
+            status_detail(&fallback),
+            " (workspace failed: indexed without go.work)"
+        );
     }
 
     /// Contract M5 S22: each repository's package caches live in a directory of its own, so

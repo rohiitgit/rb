@@ -106,5 +106,113 @@
   "old": "            let python = job.indexer == Indexer::ScipPython;\n",
   "new": "            let python = true;\n",
   "what": "fallback for a non-Python job"
+ },
+ {
+  "id": "m370",
+  "crate": "rb-scip",
+  "test": "jobs::tests::go_jobs_requiring_in_repo_modules_get_a_workspace",
+  "file": "jobs.rs",
+  "old": "                let required = module.requires.contains(path);\n",
+  "new": "                let required = false;\n",
+  "what": "no `workspace` for a required in-repo module"
+ },
+ {
+  "id": "m371",
+  "crate": "rb-scip",
+  "test": "jobs::tests::go_jobs_requiring_in_repo_modules_get_a_workspace",
+  "file": "jobs.rs",
+  "old": "                let replaced = module.replaces.iter().any(|(m, _)| m == path);\n",
+  "new": "                let replaced = false;\n",
+  "what": "a replaced in-repo module also put in `workspace`"
+ },
+ {
+  "id": "m372",
+  "crate": "rb-scip",
+  "test": "jobs::tests::go_jobs_requiring_in_repo_modules_get_a_workspace",
+  "file": "jobs.rs",
+  "old": "        .filter(|(dir, _)| is_under(dir, root))\n",
+  "new": "        .filter(|(dir, _)| is_under(dir, \"\"))\n",
+  "what": "a module outside the root put in `workspace`"
+ },
+ {
+  "id": "m373",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "        env.push((\"GOFLAGS\".into(), String::new()));\n",
+  "new": "        env.push((\"GOFLAGS\".into(), \"-mod=mod\".into()));\n",
+  "what": "`GOFLAGS=-mod=mod` kept in a workspace job"
+ },
+ {
+  "id": "m374",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "        args: fetch_args,\n",
+  "new": "        args: fetch_args, env: [base.env.clone(), vec![(\"GOWORK\".into(), \"off\".into())]].concat(),\n",
+  "what": "the fetch runs outside the workspace (`GOWORK=off`): `go.work` serves the index phase only"
+ },
+ {
+  "id": "m375",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "            RECIPE_GO_WORK.to_owned()\n",
+  "new": "            RECIPE_GO.to_owned()\n",
+  "what": "a workspace job keeps `RECIPE_GO`"
+ },
+ {
+  "id": "m394",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "        fetch_args = workspace_fetch(&job.workspace);\n",
+  "new": "        fetch_args = [\"go\", \"mod\", \"download\"].map(String::from).to_vec();\n",
+  "what": "a workspace job's fetch is `go mod download`"
+ },
+ {
+  "id": "m376",
+  "crate": "rb-indexer",
+  "test": "projects::tests::go_replace_targets_inside_the_repository_are_exported",
+  "file": "projects.rs",
+  "old": "                dirs.extend(dir);\n",
+  "new": "                let _ = dir;\n",
+  "what": "replace targets not exported"
+ },
+ {
+  "id": "m377",
+  "crate": "rb-indexer",
+  "test": "projects::tests::go_replace_targets_inside_the_repository_are_exported",
+  "file": "projects.rs",
+  "old": "                        let repository_shaped = !job.replace_targets.is_empty();\n",
+  "new": "                        let repository_shaped = true;\n",
+  "what": "a plain Go job exported repository-shaped"
+ },
+ {
+  "id": "m378",
+  "crate": "rb-indexer",
+  "test": "projects::tests::go_replace_targets_outside_are_unsupported",
+  "file": "projects.rs",
+  "old": "                    resolve_link(&job.root, target).map_err(|_| REPLACE_OUTSIDE.to_owned())?;\n",
+  "new": "                    resolve_link(&job.root, target).unwrap_or(None);\n",
+  "what": "a target outside the repository accepted"
+ },
+ {
+  "id": "m395",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_workspace_run_reindexes_without_go_work",
+  "file": "orchestrate.rs",
+  "old": "    if !(workspace && matches!(attempt.status, RunStatus::Failed(_))) {\n",
+  "new": "    if true {\n",
+  "what": "no re-run after a workspace failure (D5b)"
+ },
+ {
+  "id": "m396",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_workspace_run_reindexes_without_go_work",
+  "file": "orchestrate.rs",
+  "old": "    if !(workspace && matches!(attempt.status, RunStatus::Failed(_))) {\n",
+  "new": "    if !(workspace && matches!(attempt.status, RunStatus::Failed(_) | RunStatus::Timeout { .. })) {\n",
+  "what": "a re-run after a workspace timeout too (D5b)"
  }
 ]

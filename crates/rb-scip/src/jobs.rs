@@ -99,6 +99,17 @@ pub struct Job {
     pub projects: Vec<String>,
     /// The fetch step cannot be pinned (no lockfile), so the index is not reproducible.
     pub unpinned: bool,
+    /// scip-go (contract M9d D5): the directories under `root` (relative to it, sorted) of the
+    /// other `go.mod` files whose module paths the root's `go.mod` requires without a
+    /// `replace`. Non-empty: rb writes a `go.work` that uses `.` and each of them, and both
+    /// phases run in workspace mode. Empty for every other job.
+    pub workspace: Vec<String>,
+    /// scip-go (contract M9d D6): the root's `go.mod` `replace` targets that are local
+    /// directories outside `root`, as written (`../../server/public`), sorted and distinct.
+    /// `projects::job_files` resolves them against the root: one inside the repository is
+    /// exported, one leaving it makes the job `unsupported`. Non-empty: the export is
+    /// repository-shaped and the container starts in the root. Empty for every other job.
+    pub replace_targets: Vec<String>,
 }
 
 /// A workspace root whose members are not grouped into its job (contract M6a D5), and why:
@@ -124,8 +135,8 @@ pub struct Plan {
 }
 
 /// The jobs for a commit, from its sorted file list; `read` gives a file's bytes (`None` when
-/// it cannot be read) and is asked only for `package.json` files and workspace roots'
-/// `yarn.lock`. Maven and Gradle roots are the outermost `pom.xml` / Gradle build files (a
+/// it cannot be read) and is asked only for `package.json` files, workspace roots'
+/// `yarn.lock` and Go roots' `go.mod` (contract M9d D7). Maven and Gradle roots are the outermost `pom.xml` / Gradle build files (a
 /// reactor or multi-project build runs once). TypeScript roots are package roots (a directory
 /// with `package.json`), each indexing every `tsconfig.json` directory whose nearest package
 /// root it is; a nested package root starts its own job, except a workspace member (contract
@@ -189,6 +200,8 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             fetch,
             projects: Vec::new(),
             unpinned: false,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
         });
     }
 
@@ -226,19 +239,43 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             fetch: Fetch::Npm { lockfile },
             projects,
             unpinned: lockfile == NodeLock::None,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
         });
     }
-    // Go: every go.mod directory builds independently (workspaces are M6e).
+    // Go: every go.mod directory is a job. Contract M9d D7: each root's go.mod is read, so its
+    // workspace (D5) and its replace targets outside the root (D6) are decided here, and the
+    // input hash covers them through the exported go.mod files. A root holding its own
+    // go.work is left as it is (out of scope); an unreadable go.mod plans as before.
     let mut go_roots = dirs_with("go.mod");
     go_roots.sort();
     go_roots.dedup();
-    for root in go_roots {
+    let go_mods: BTreeMap<&str, GoMod> = go_roots
+        .iter()
+        .filter_map(|root| {
+            let text = read(&join(root, "go.mod"))?;
+            Some((root.as_str(), go_mod(&String::from_utf8_lossy(&text))))
+        })
+        .collect();
+    for root in &go_roots {
+        let (workspace, replace_targets) = match go_mods.get(root.as_str()) {
+            Some(module) if has(&join(root, "go.work")) => {
+                (Vec::new(), go_replace_targets(root, module))
+            }
+            Some(module) => (
+                go_workspace(root, module, &go_mods),
+                go_replace_targets(root, module),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         out.push(Job {
             root: root.clone(),
             indexer: Indexer::ScipGo,
             fetch: Fetch::Go,
             projects: Vec::new(),
-            unpinned: !has(&join(&root, "go.sum")),
+            unpinned: !has(&join(root, "go.sum")),
+            workspace,
+            replace_targets,
         });
     }
     // Python: every pyproject.toml/setup.py directory is a job (contract M6d
@@ -275,6 +312,8 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             fetch: Fetch::Python { lockfile },
             projects: Vec::new(),
             unpinned: lockfile != PythonLock::Poetry,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
         });
     }
     out.sort_by(|a, b| (a.root.as_str(), a.indexer).cmp(&(b.root.as_str(), b.indexer)));
@@ -612,6 +651,153 @@ fn relative(dir: &str, root: &str) -> String {
     } else {
         dir[root.len() + 1..].to_owned()
     }
+}
+
+/// What the Go planner (contract M9d D5–D7) and the `go.work` writer read from a `go.mod`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct GoMod {
+    /// The `module` path.
+    pub(crate) module: Option<String>,
+    /// The `go` line's version.
+    pub(crate) go: Option<String>,
+    /// Every `require`d module path, direct or `// indirect`.
+    pub(crate) requires: BTreeSet<String>,
+    /// Every `replace`: the replaced module path, and the target as written (a module path,
+    /// or a local directory).
+    pub(crate) replaces: Vec<(String, String)>,
+}
+
+/// Reads a `go.mod`'s `module`, `go`, `require` and `replace` directives, single-line and in
+/// blocks; comments and every other directive are ignored, quotes around paths dropped.
+pub(crate) fn go_mod(text: &str) -> GoMod {
+    let mut out = GoMod::default();
+    let mut block: Option<&str> = None;
+    for line in text.lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        let (directive, rest) = match block {
+            Some(_) if code == ")" => {
+                block = None;
+                continue;
+            }
+            Some(directive) => (directive, code),
+            None => {
+                let (directive, rest) = code.split_once(char::is_whitespace).unwrap_or((code, ""));
+                let rest = rest.trim();
+                if rest == "(" {
+                    block = Some(directive);
+                    continue;
+                }
+                (directive, rest)
+            }
+        };
+        let unquote = |s: &str| s.trim_matches('"').to_owned();
+        let first = rest.split_whitespace().next().map(unquote);
+        match directive {
+            "module" => out.module = first,
+            "go" => out.go = first,
+            "require" => out.requires.extend(first),
+            "replace" => {
+                if let Some((from, to)) = rest.split_once("=>")
+                    && let (Some(module), Some(target)) =
+                        (from.split_whitespace().next(), to.split_whitespace().next())
+                {
+                    out.replaces.push((unquote(module), unquote(target)));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A `go` line's version as a key in Go's order: numerically by release (`1.26.10` above
+/// `1.26.9`, `1.21` above `1.9`), a language version (`1.21`) below its pre-releases
+/// (`1.21rc1`), which sort below its first release (`1.21.0`).
+pub(crate) fn go_version_key(version: &str) -> (Vec<u64>, bool, &str) {
+    let split = version
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(version.len());
+    let (release, pre) = version.split_at(split);
+    let numbers = release
+        .split('.')
+        .filter(|n| !n.is_empty())
+        .map(|n| n.parse().unwrap_or(0))
+        .collect();
+    (numbers, !pre.is_empty(), pre)
+}
+
+/// Contract M9d D5: the directories under `root` (relative to it, sorted) of the other
+/// `go.mod` files whose module path `module` requires with no `replace` of that path. A
+/// directory inside `vendor` holds a vendored copy, and one Go ignores (`testdata`, a name
+/// starting `.` or `_`) is no module of the build: neither is a workspace module.
+fn go_workspace(root: &str, module: &GoMod, modules: &BTreeMap<&str, GoMod>) -> Vec<String> {
+    let ignored = |rel: &str| {
+        rel.split('/').any(|segment| {
+            matches!(segment, "vendor" | "testdata")
+                || segment.starts_with('.')
+                || segment.starts_with('_')
+        })
+    };
+    modules
+        .iter()
+        .filter(|(dir, _)| is_under(dir, root))
+        .filter(|(dir, _)| !ignored(&relative(dir, root)))
+        .filter(|(_, other)| {
+            other.module.as_ref().is_some_and(|path| {
+                let required = module.requires.contains(path);
+                let replaced = module.replaces.iter().any(|(m, _)| m == path);
+                required && !replaced
+            })
+        })
+        .map(|(dir, _)| relative(dir, root))
+        .collect()
+}
+
+/// Contract M9d D6: `module`'s `replace` targets that are local directories (Go's rule: `.`,
+/// `..`, or a path starting `./`, `../` or `/`) and do not resolve, lexically, to `root` or
+/// below it; as written, sorted and distinct. A target leaving the repository is kept, for
+/// `projects::job_files` to refuse.
+fn go_replace_targets(root: &str, module: &GoMod) -> Vec<String> {
+    let local = |t: &str| {
+        t == "." || t == ".." || t.starts_with("./") || t.starts_with("../") || t.starts_with('/')
+    };
+    let targets: BTreeSet<&String> = module
+        .replaces
+        .iter()
+        .map(|(_, target)| target)
+        .filter(|target| local(target) && !resolves_under(root, target))
+        .collect();
+    targets.into_iter().cloned().collect()
+}
+
+/// Whether the relative directory `target`, read from `root`, resolves lexically (`.` and
+/// `..` folded, nothing on disk followed) to `root` or below it. An absolute path, or one
+/// that leaves the repository, does not.
+fn resolves_under(root: &str, target: &str) -> bool {
+    if target.starts_with('/') {
+        return false;
+    }
+    let mut at: Vec<&str> = if root.is_empty() {
+        Vec::new()
+    } else {
+        root.split('/').collect()
+    };
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if at.pop().is_none() {
+                    return false;
+                }
+            }
+            name => at.push(name),
+        }
+    }
+    let dir = at.join("/");
+    dir == root || is_under(&dir, root)
 }
 
 /// The source encoding a Maven build declares when it is not UTF-8 (contract M3b amendment
@@ -1338,6 +1524,12 @@ mod tests {
                 if !members.is_empty() {
                     s.push_str(&format!(" {{{members}}}"));
                 }
+                if !j.workspace.is_empty() {
+                    s.push_str(&format!(" work[{}]", j.workspace.join(",")));
+                }
+                if !j.replace_targets.is_empty() {
+                    s.push_str(&format!(" replace[{}]", j.replace_targets.join(",")));
+                }
                 s
             })
             .collect();
@@ -1378,6 +1570,130 @@ mod tests {
                 "scip-go  go",
                 "scip-go lib go unpinned",
                 "scip-go tools go unpinned"
+            ]
+        );
+    }
+
+    /// Contract M9d D5, D6, D7 (C5): the planner reads each Go root's `go.mod`. A root whose
+    /// `go.mod` requires, with no `replace`, the module of another `go.mod` under it gets a
+    /// workspace of those directories, sorted (mattermost `server`: `public`). A required
+    /// in-repo module that is also replaced (by a directory or by another module), a module
+    /// outside the root, and a root with its own `go.work` get none. A `replace` onto a local
+    /// directory outside the root is a replace target, as written, whether or not it stays in
+    /// the repository (`projects::job_files` decides that); one inside the root, or onto
+    /// another module, is not. A `go.mod` that cannot be read plans as before. A vendored
+    /// module's `go.mod` (go_gin_example commits `vendor/` with six) and one in a directory Go
+    /// ignores (`testdata`, a name starting `.` or `_`) are not workspace modules.
+    #[test]
+    fn go_jobs_requiring_in_repo_modules_get_a_workspace() {
+        let files = [
+            "server/go.mod",
+            "server/go.sum",
+            "server/public/go.mod",
+            "server/public/go.sum",
+            "multi/go.mod",
+            "multi/z/go.mod",
+            "multi/a/go.mod",
+            "svc/go.mod",
+            "svc/lib/go.mod",
+            "fork/go.mod",
+            "fork/lib/go.mod",
+            "tools/x/go.mod",
+            "tools/sct/go.mod",
+            "tools/esc/go.mod",
+            "ws/go.mod",
+            "ws/go.work",
+            "ws/sub/go.mod",
+            "unread/go.mod",
+            "unread/sub/go.mod",
+            "vend/go.mod",
+            "vend/vendor/example.com/x/go.mod",
+            "vend/testdata/mod/go.mod",
+            "vend/_tools/go.mod",
+            "vend/.cache/go.mod",
+            "vend/ok/go.mod",
+        ];
+        let contents = [
+            (
+                "server/go.mod",
+                "module github.com/m/m/server/v8\n\ngo 1.26.7\n\nrequire (\n\tgithub.com/m/m/server/public v0.4.3\n\tgithub.com/other/x v1.0.0 // indirect\n)\n\nreplace github.com/vmihailenco/msgpack/v5 => github.com/m/msgpack/v5 v5.0.0\n",
+            ),
+            (
+                "server/public/go.mod",
+                "module github.com/m/m/server/public\n\ngo 1.26.7\n",
+            ),
+            (
+                "multi/go.mod",
+                "module example.com/multi\n\nrequire example.com/multi/z v0.1.0\nrequire \"example.com/multi/a\" v0.1.0\n",
+            ),
+            ("multi/z/go.mod", "module example.com/multi/z\n"),
+            ("multi/a/go.mod", "module \"example.com/multi/a\" // a\n"),
+            (
+                "svc/go.mod",
+                "module example.com/svc\n\nrequire example.com/svc/lib v0.1.0\n\nreplace example.com/svc/lib => ./lib\n",
+            ),
+            ("svc/lib/go.mod", "module example.com/svc/lib\n"),
+            (
+                "fork/go.mod",
+                "module example.com/fork\n\nrequire example.com/fork/lib v0.1.0\n\nreplace (\n\texample.com/fork/lib v0.1.0 => example.com/other/lib v0.2.0\n)\n",
+            ),
+            ("fork/lib/go.mod", "module example.com/fork/lib\n"),
+            (
+                "tools/x/go.mod",
+                "module example.com/x\n\nrequire github.com/m/m/server/public v0.4.0\n",
+            ),
+            (
+                "tools/sct/go.mod",
+                "module github.com/m/m/tools/sct\n\ngo 1.26.7\n\nrequire github.com/m/m/server/public v0.4.0\n\nreplace github.com/m/m/server/public => ../../server/public\n",
+            ),
+            (
+                "tools/esc/go.mod",
+                "module example.com/esc\n\nreplace (\n\texample.com/a => ../../../../a\n\texample.com/b v1.0.0 => /opt/b\n\texample.com/c => ./c\n\texample.com/a => ../../../../a\n)\n",
+            ),
+            (
+                "ws/go.mod",
+                "module example.com/ws\n\nrequire example.com/ws/sub v0.1.0\n",
+            ),
+            ("ws/sub/go.mod", "module example.com/ws/sub\n"),
+            ("unread/sub/go.mod", "module example.com/unread/sub\n"),
+            (
+                "vend/go.mod",
+                "module example.com/vend\n\nrequire (\n\texample.com/x v1.0.0\n\texample.com/vend/fixture v0.0.0\n\texample.com/vend/tools v0.0.0\n\texample.com/vend/cache v0.0.0\n\texample.com/vend/ok v0.0.0\n)\n",
+            ),
+            ("vend/vendor/example.com/x/go.mod", "module example.com/x\n"),
+            (
+                "vend/testdata/mod/go.mod",
+                "module example.com/vend/fixture\n",
+            ),
+            ("vend/_tools/go.mod", "module example.com/vend/tools\n"),
+            ("vend/.cache/go.mod", "module example.com/vend/cache\n"),
+            ("vend/ok/go.mod", "module example.com/vend/ok\n"),
+        ];
+        assert_eq!(
+            workspace_summary(&files, &contents).0,
+            [
+                "scip-go fork go unpinned",
+                "scip-go fork/lib go unpinned",
+                "scip-go multi go unpinned work[a,z]",
+                "scip-go multi/a go unpinned",
+                "scip-go multi/z go unpinned",
+                "scip-go server go work[public]",
+                "scip-go server/public go",
+                "scip-go svc go unpinned",
+                "scip-go svc/lib go unpinned",
+                "scip-go tools/esc go unpinned replace[../../../../a,/opt/b]",
+                "scip-go tools/sct go unpinned replace[../../server/public]",
+                "scip-go tools/x go unpinned",
+                "scip-go unread go unpinned",
+                "scip-go unread/sub go unpinned",
+                "scip-go vend go unpinned work[ok]",
+                "scip-go vend/.cache go unpinned",
+                "scip-go vend/_tools go unpinned",
+                "scip-go vend/ok go unpinned",
+                "scip-go vend/testdata/mod go unpinned",
+                "scip-go vend/vendor/example.com/x go unpinned",
+                "scip-go ws go unpinned",
+                "scip-go ws/sub go unpinned",
             ]
         );
     }

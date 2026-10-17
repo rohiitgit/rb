@@ -31,6 +31,12 @@ pub const RECIPE_TS: &str = "m9d-ts-1";
 /// offline. Bumped like [`RECIPE_JAVA`].
 pub const RECIPE_GO: &str = "m6d-go-1";
 
+/// scip-go's recipe for a job with a workspace or a replace target outside its root
+/// (contract M9d D5, D6): a `go.work` written by rb with `GOFLAGS` empty and a `go list -deps
+/// -test` fetch, or a repository-shaped export starting in the root. Jobs with neither keep
+/// [`RECIPE_GO`], their layout and their cache rows.
+pub const RECIPE_GO_WORK: &str = "m9d-go-1";
+
 /// scip-python's recipe (contract M6d S2/S4): environment resolution, then
 /// `scip-python index` offline. Bumped like [`RECIPE_JAVA`]. `m6d-py-2`:
 /// the fetch installs lockfile-driven environments (S4; `m6d-py-1`
@@ -60,6 +66,9 @@ pub fn recipe(job: &Job, budget: &Budget) -> String {
             format!("{RECIPE_JAVA}+T{}", budget.maven_threads)
         }
         (Indexer::ScipJava, _) => RECIPE_JAVA.to_owned(),
+        (Indexer::ScipGo, _) if !job.workspace.is_empty() || !job.replace_targets.is_empty() => {
+            RECIPE_GO_WORK.to_owned()
+        }
         (Indexer::ScipGo, _) => RECIPE_GO.to_owned(),
         (Indexer::ScipPython, _) => RECIPE_PY.to_owned(),
         (Indexer::ScipTypescript, _) => RECIPE_TS.to_owned(),
@@ -85,6 +94,12 @@ pub enum RunStatus {
     /// third-party names stay unresolved. Stored as `ok` with phase `fetch`; `stderr_tail` is
     /// the fetch's.
     OkWithoutEnvironment,
+    /// A scip-go workspace job (contract M9d D5) whose workspace run failed (a phase exited
+    /// non-zero, or no index was written) and whose re-run as a plain job wrote an index
+    /// (contract M9d D5b, amendment 2): the index is the plain one, as without the workspace.
+    /// Stored as `ok` with phase `index` (the workspace's index is the part missing);
+    /// `stderr_tail` is the workspace run's.
+    OkWithoutWorkspace,
     /// The fetch or index phase failed (contract M3b amendment 56: which one is recorded, as
     /// for a timeout; an index that was not produced or could not be decoded is the index
     /// phase's); `stderr_tail` says why.
@@ -136,7 +151,7 @@ impl RunStatus {
     /// The value stored in `rb.scip_index.status` and reported per project.
     pub fn as_str(&self) -> &'static str {
         match self {
-            RunStatus::Ok | RunStatus::OkWithoutEnvironment => "ok",
+            RunStatus::Ok | RunStatus::OkWithoutEnvironment | RunStatus::OkWithoutWorkspace => "ok",
             RunStatus::Failed(_) => "failed",
             RunStatus::Timeout { .. } => "timeout",
             RunStatus::Unsupported(_) => "unsupported",
@@ -145,9 +160,13 @@ impl RunStatus {
         }
     }
 
-    /// Whether the job wrote an index: `ok`, with its environment or without it (D4).
+    /// Whether the job wrote an index: `ok`, with its environment or without it (D4), or
+    /// without its workspace (D5b).
     pub fn is_ok(&self) -> bool {
-        matches!(self, RunStatus::Ok | RunStatus::OkWithoutEnvironment)
+        matches!(
+            self,
+            RunStatus::Ok | RunStatus::OkWithoutEnvironment | RunStatus::OkWithoutWorkspace
+        )
     }
 
     /// Whether this outcome is written to the index cache: only a finished run of the project's
@@ -157,24 +176,27 @@ impl RunStatus {
         self.is_ok() || matches!(self, RunStatus::Failed(_))
     }
 
-    /// The phase a `failed` or `timeout` job stopped in, and the `fetch` phase that failed
-    /// before an index without the environment (D4).
+    /// The phase a `failed` or `timeout` job stopped in; the `fetch` phase that failed before
+    /// an index without the environment (D4); the `index` phase for an index without the
+    /// workspace (D5b).
     pub fn phase(&self) -> Option<Phase> {
         match self {
             RunStatus::Failed(phase) | RunStatus::Timeout { phase, .. } => Some(*phase),
             RunStatus::OkWithoutEnvironment => Some(Phase::Fetch),
+            RunStatus::OkWithoutWorkspace => Some(Phase::Index),
             _ => None,
         }
     }
 
     /// The status a cache row recorded: `ok` (in the `fetch` phase: an index without the
-    /// environment, D4), or `failed` with its phase. `None` for any other value (a `timeout`,
-    /// a `failed` without a phase written by an older binary, an `ok` in the `index` phase),
-    /// which the caller treats as a miss.
+    /// environment, D4; in the `index` phase: an index without the workspace, D5b), or
+    /// `failed` with its phase. `None` for any other value (a `timeout`, a `failed` without a
+    /// phase written by an older binary), which the caller treats as a miss.
     pub fn from_cached(status: &str, phase: Option<&str>) -> Option<RunStatus> {
         match (status, phase) {
             ("ok", None) => Some(RunStatus::Ok),
             ("ok", Some("fetch")) => Some(RunStatus::OkWithoutEnvironment),
+            ("ok", Some("index")) => Some(RunStatus::OkWithoutWorkspace),
             ("failed", phase) => phase.and_then(Phase::parse).map(RunStatus::Failed),
             _ => None,
         }
@@ -190,7 +212,21 @@ impl RunStatus {
                 "{} phase over its {budget_secs} s budget",
                 phase.as_str()
             )),
-            RunStatus::Ok | RunStatus::OkWithoutEnvironment | RunStatus::Failed(_) => None,
+            RunStatus::Ok
+            | RunStatus::OkWithoutEnvironment
+            | RunStatus::OkWithoutWorkspace
+            | RunStatus::Failed(_) => None,
+        }
+    }
+
+    /// What an `ok` job's status line appends when its index is degraded: made without the
+    /// environment after a failed fetch (contract M9d D4), or without the workspace after a
+    /// failed workspace run (D5b).
+    pub fn note(&self) -> Option<&'static str> {
+        match self {
+            RunStatus::OkWithoutEnvironment => Some("environment not installed: fetch failed"),
+            RunStatus::OkWithoutWorkspace => Some("workspace failed: indexed without go.work"),
+            _ => None,
         }
     }
 }
@@ -330,8 +366,56 @@ impl Images {
 /// M3b amendment 22) and a run over its budget can be killed by name (amendment 18). The fetch
 /// phase runs behind its own egress proxy, `rb-egress-<that name>`, allowing `egress`'s hosts
 /// (contract M5 S21); its configuration lives in `<that directory>-egress` while it runs.
+///
+/// A scip-go workspace job (contract M9d D5) whose workspace run failed, a phase exiting
+/// non-zero (137: an OOM kill) or no index written, runs again exactly as a plain job: a fresh
+/// export without `go.work`, `GOFLAGS=-mod=mod`, `go mod download` (D5b, amendment 2). An
+/// index from that re-run is [`RunStatus::OkWithoutWorkspace`] with the workspace run's tail;
+/// a re-run that fails gives its own outcome. A timeout or a docker client failure in the
+/// workspace run is returned as such (as D4), and a job with a replace target outside its root
+/// (D6) is not re-run: a plain run cannot resolve the replace.
 #[allow(clippy::too_many_arguments)]
 pub fn run_job(
+    job: &Job,
+    image: &str,
+    files: &[(String, Vec<u8>)],
+    work_dir: &Path,
+    cache_dir: &Path,
+    budget: &Budget,
+    egress: &Egress,
+    runner: &dyn Runner,
+) -> anyhow::Result<ScipRun> {
+    let started = std::time::Instant::now();
+    let run = |job: &Job| {
+        run_once(
+            job, image, files, work_dir, cache_dir, budget, egress, runner,
+        )
+    };
+    let attempt = run(job)?;
+    let workspace = !job.workspace.is_empty() && job.replace_targets.is_empty();
+    if !(workspace && matches!(attempt.status, RunStatus::Failed(_))) {
+        return Ok(attempt);
+    }
+    let rerun = run(&Job {
+        workspace: Vec::new(),
+        ..job.clone()
+    })?;
+    let elapsed = started.elapsed();
+    Ok(match rerun.status {
+        // The workspace run's tail says why the workspace failed.
+        RunStatus::Ok => ScipRun {
+            status: RunStatus::OkWithoutWorkspace,
+            stderr_tail: attempt.stderr_tail,
+            elapsed,
+            ..rerun
+        },
+        _ => ScipRun { elapsed, ..rerun },
+    })
+}
+
+/// One run of `job` as [`run_job`] describes it, without D5b's re-run.
+#[allow(clippy::too_many_arguments)]
+fn run_once(
     job: &Job,
     image: &str,
     files: &[(String, Vec<u8>)],
@@ -392,7 +476,7 @@ pub fn run_job(
                 gradle_runs(image, work_dir, cache_dir, budget)?
             }
             Indexer::ScipJava => java_runs(image, work_dir, cache_dir, budget)?,
-            Indexer::ScipGo => go_runs(image, work_dir, cache_dir, budget)?,
+            Indexer::ScipGo => go_runs(job, image, work_dir, cache_dir, budget)?,
             Indexer::ScipPython => python_runs(job, image, work_dir, cache_dir, budget)?,
         };
         for fetch in &mut fetches {
@@ -885,7 +969,16 @@ fn gradle_runs(
 /// The fetch phase downloads the module graph into the repository's Go module
 /// cache (`go mod download`); the index phase runs `scip-go` offline
 /// (contract M6d S1; proxy settings and lockfile discipline harden in S3/S4).
+///
+/// Contract M9d D6: a job with a replace target outside its root has a repository-shaped
+/// export and starts in its root, so the relative replace resolves. D5: a job with a
+/// workspace gets rb's `go.work` in its root, written here, before either phase runs; both
+/// phases run in workspace mode (`GOFLAGS` empty, since workspace mode refuses `-mod=mod`, and
+/// `GOWORK` naming the file), and the fetch is `go list -deps -test` over `.` and each
+/// workspace directory (amendment 1: it fetches what the workspace's packages load, where `go
+/// mod download` fetches the whole workspace module graph, +1.69 GiB on mattermost `server`).
 fn go_runs(
+    job: &Job,
     image: &str,
     work_dir: &Path,
     cache_dir: &Path,
@@ -894,28 +987,47 @@ fn go_runs(
     let workdir = crate::runner::absolute(work_dir)?;
     let gomod = crate::runner::absolute(cache_dir)?.join("gomod");
     std::fs::create_dir_all(&gomod)?;
+    let cwd = if job.replace_targets.is_empty() {
+        String::new()
+    } else {
+        job.root.clone()
+    };
+    // Contract M6d S3: the checksum database lives outside the allow-list, so verification is
+    // off; `go.sum` still verifies the modules it pins. The proxy is pinned (no `,direct` git
+    // fallback outside the allow-list; S11: it would only fail closed, slowly). The toolchain is
+    // pinned too (evaluator pass 1, E1-5): a newer-toolchain repo fails closed instead of
+    // downloading one from outside the list.
+    let mut env: Vec<(String, String)> = vec![
+        ("GOSUMDB".into(), "off".into()),
+        ("GOPROXY".into(), "https://proxy.golang.org".into()),
+        ("GOTOOLCHAIN".into(), "local".into()),
+    ];
+    let mut fetch_args = ["go", "mod", "download"].map(String::from).to_vec();
+    if job.workspace.is_empty() {
+        env.push(("GOFLAGS".into(), "-mod=mod".into()));
+    } else {
+        let root = workdir.join(&cwd);
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("go.work"), go_work(&root, &job.workspace))?;
+        env.push(("GOFLAGS".into(), String::new()));
+        let at = if cwd.is_empty() {
+            "/sources/go.work".to_owned()
+        } else {
+            format!("/sources/{cwd}/go.work")
+        };
+        env.push(("GOWORK".into(), at));
+        fetch_args = workspace_fetch(&job.workspace);
+    }
     let base = ContainerRun {
         name: None,
         image: image.into(),
         platform: None,
         workdir,
         mount_at: "/sources".into(),
-        cwd: String::new(),
+        cwd,
         caches: vec![(gomod, "/root/go/pkg/mod".into())],
         readonly: Vec::new(),
-        // Contract M6d S3: the checksum database lives outside the
-        // allow-list, so verification is off; `go.sum` still verifies the
-        // modules it pins. `GOFLAGS=-mod=mod` rides from the image. The
-        // proxy is pinned (no `,direct` git fallback outside the
-        // allow-list; S11: it would only fail closed, slowly). The toolchain
-        // is pinned too (evaluator pass 1, E1-5): a newer-toolchain repo
-        // fails closed instead of downloading one from outside the list.
-        env: vec![
-            ("GOSUMDB".into(), "off".into()),
-            ("GOPROXY".into(), "https://proxy.golang.org".into()),
-            ("GOTOOLCHAIN".into(), "local".into()),
-            ("GOFLAGS".into(), "-mod=mod".into()),
-        ],
+        env,
         network: Network::Fetch,
         cpus: budget.cpus,
         memory: budget.memory.clone(),
@@ -923,8 +1035,10 @@ fn go_runs(
         entrypoint: None,
         args: Vec::new(),
     };
-    let mut fetch = base.clone();
-    fetch.args = ["go", "mod", "download"].map(String::from).to_vec();
+    let fetch = ContainerRun {
+        args: fetch_args,
+        ..base.clone()
+    };
     let index = ContainerRun {
         network: Network::None,
         timeout: budget.index_timeout,
@@ -932,6 +1046,36 @@ fn go_runs(
         ..base
     };
     Ok((vec![fetch], index))
+}
+
+/// The `go.work` rb writes in a workspace job's root `root` (contract M9d D5): `go` with the
+/// highest `go` line of the root's and each directory's `go.mod` in the export (Go's version
+/// order; none when no module declares one), then `use` with `.` and each directory, as `go
+/// work init` formats it. Written by rb, not by `go work init`, whose `go` line follows the
+/// toolchain.
+fn go_work(root: &Path, workspace: &[String]) -> String {
+    let version = std::iter::once(".")
+        .chain(workspace.iter().map(String::as_str))
+        .filter_map(|dir| std::fs::read(root.join(dir).join("go.mod")).ok())
+        .filter_map(|text| crate::jobs::go_mod(&String::from_utf8_lossy(&text)).go)
+        .max_by(|a, b| crate::jobs::go_version_key(a).cmp(&crate::jobs::go_version_key(b)));
+    let mut text = version.map_or_else(String::new, |v| format!("go {v}\n\n"));
+    text.push_str("use (\n\t.\n");
+    for dir in workspace {
+        text.push_str(&format!("\t./{dir}\n"));
+    }
+    text.push_str(")\n");
+    text
+}
+
+/// A workspace job's fetch (contract M9d D5, amendment 1): `go list -deps -test` over `.` and
+/// each workspace directory, without `-e`, so a module that cannot be fetched fails the fetch.
+fn workspace_fetch(workspace: &[String]) -> Vec<String> {
+    ["go", "list", "-deps", "-test", "./..."]
+        .map(String::from)
+        .into_iter()
+        .chain(workspace.iter().map(|dir| format!("./{dir}/...")))
+        .collect()
 }
 
 /// The fetch and index invocations for a scip-python job (contract M6d S4).
@@ -1135,6 +1279,11 @@ mod tests {
         proxy_image: bool,
         /// `<mount> <settings.xml>` per read-only mount a run saw, read while it ran.
         settings: RefCell<Vec<String>>,
+        /// Per run, the text of `go.work` in the directory it started in, read while it ran.
+        go_works: RefCell<Vec<Option<String>>>,
+        /// Outcomes the next runs take, in order, before `fail_fetch`/`fail_index` apply; an
+        /// index run writes its `index.scip` when the flag is set.
+        script: RefCell<std::collections::VecDeque<(Outcome, bool)>>,
     }
 
     impl Fake {
@@ -1150,6 +1299,8 @@ mod tests {
                 proxy_log: String::new(),
                 proxy_image: true,
                 settings: RefCell::new(Vec::new()),
+                go_works: RefCell::new(Vec::new()),
+                script: RefCell::new(std::collections::VecDeque::new()),
             }
         }
     }
@@ -1165,7 +1316,16 @@ mod tests {
                     .borrow_mut()
                     .push(format!("{inside} {settings}"));
             }
+            self.go_works
+                .borrow_mut()
+                .push(std::fs::read_to_string(run.host_cwd().join("go.work")).ok());
             let is_index = run.network == Network::None;
+            if let Some((outcome, writes)) = self.script.borrow_mut().pop_front() {
+                if is_index && writes {
+                    std::fs::write(run.host_cwd().join("index.scip"), b"fake-index")?;
+                }
+                return Ok(outcome);
+            }
             if !is_index && let Some(outcome) = &self.fetch_outcome {
                 return match outcome {
                     Ok(o) => Ok(o.clone()),
@@ -1222,6 +1382,8 @@ mod tests {
             fetch: Fetch::Npm { lockfile },
             projects: vec![".".into(), "sub".into()],
             unpinned: lockfile == NodeLock::None,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
         }
     }
 
@@ -1232,6 +1394,8 @@ mod tests {
             fetch,
             projects: Vec::new(),
             unpinned: false,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
         }
     }
 
@@ -1299,6 +1463,8 @@ mod tests {
             fetch: Fetch::Go,
             projects: Vec::new(),
             unpinned: false,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
         }
     }
 
@@ -1309,6 +1475,8 @@ mod tests {
             fetch: Fetch::Python { lockfile },
             projects: Vec::new(),
             unpinned: lockfile != PythonLock::Poetry,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
         }
     }
 
@@ -1339,6 +1507,379 @@ mod tests {
             "{}",
             lines[1]
         );
+    }
+
+    /// A Go module at the export's root (`go 1.26.10`) requiring the in-repo module under
+    /// `public/` (`go 1.26.9`, with a `toolchain` line).
+    fn go_files() -> Vec<(String, Vec<u8>)> {
+        [
+            (
+                "go.mod",
+                "module example.com/server\n\ngo 1.26.10\n\nrequire example.com/server/public v0.4.3\n",
+            ),
+            (
+                "public/go.mod",
+                "module example.com/server/public\n\ngo 1.26.9\n\ntoolchain go1.27.2\n",
+            ),
+            ("main.go", "package main\n"),
+        ]
+        .map(|(p, t)| (p.to_owned(), t.as_bytes().to_vec()))
+        .to_vec()
+    }
+
+    /// mattermost `server`'s shape (contract M9d D5).
+    fn workspace_job() -> Job {
+        Job {
+            workspace: vec!["public".into()],
+            ..go_job()
+        }
+    }
+
+    /// Every value `run` sets for the environment variable `key`, in order.
+    fn env_of<'a>(run: &'a ContainerRun, key: &str) -> Vec<&'a str> {
+        run.env
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    /// The `go.work` rb writes for [`workspace_job`] over [`go_files`]: the highest `go` line
+    /// of the modules (numerically, `1.26.10` above `1.26.9`), then `.` and each directory.
+    const GO_WORK: &str = "go 1.26.10\n\nuse (\n\t.\n\t./public\n)\n";
+
+    /// Contract M9d D5 (C5): a workspace job writes `<root>/go.work` (deterministic text: the
+    /// highest `go` line, then `use` with `.` and each workspace directory, sorted) before the
+    /// fetch, so both phases see it; both run with `GOFLAGS` empty (workspace mode refuses
+    /// `-mod=mod`) and `GOWORK` naming that file; the fetch is `go list -deps -test` over `.`
+    /// and each directory (amendment 1); the recipe is `RECIPE_GO_WORK`. A plain job keeps
+    /// today's runs and `RECIPE_GO`. A D6 job (a replace target outside the root) starts in
+    /// its root of a repository-shaped export and, without a workspace, keeps `-mod=mod` and
+    /// `go mod download`.
+    #[test]
+    fn workspace_jobs_write_go_work_and_clear_goflags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = |job: &Job, files: &[(String, Vec<u8>)], fake: &Fake| {
+            run_job(
+                job,
+                "sha256:go",
+                files,
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &Egress::default(),
+                fake,
+            )
+            .unwrap()
+        };
+        let fake = Fake::new(false, false);
+        let ran = run(&workspace_job(), &go_files(), &fake);
+        assert_eq!(ran.status, RunStatus::Ok);
+        {
+            let runs = fake.runs.borrow();
+            assert_eq!(runs.len(), 2);
+            assert_eq!(runs[0].network, Network::Fetch);
+            assert_eq!(runs[1].network, Network::None);
+            assert_eq!(
+                *fake.go_works.borrow(),
+                [Some(GO_WORK.to_owned()), Some(GO_WORK.to_owned())],
+                "both phases see the go.work"
+            );
+            assert_eq!(
+                runs[0].args,
+                ["go", "list", "-deps", "-test", "./...", "./public/..."]
+            );
+            assert_eq!(runs[1].args, ["scip-go"]);
+            for r in runs.iter() {
+                assert_eq!(r.cwd, "", "root-relative, as before");
+                assert_eq!(env_of(r, "GOFLAGS"), [""], "{:?}", r.env);
+                assert_eq!(env_of(r, "GOWORK"), ["/sources/go.work"], "{:?}", r.env);
+                for (k, v) in [
+                    ("GOSUMDB", "off"),
+                    ("GOPROXY", "https://proxy.golang.org"),
+                    ("GOTOOLCHAIN", "local"),
+                ] {
+                    assert_eq!(env_of(r, k), [v], "{:?}", r.env);
+                }
+            }
+        }
+        assert_eq!(recipe(&workspace_job(), &Budget::default()), RECIPE_GO_WORK);
+        assert_ne!(RECIPE_GO_WORK, RECIPE_GO);
+
+        // A plain job: today's runs, no go.work, `RECIPE_GO`.
+        let fake = Fake::new(false, false);
+        run(&go_job(), &go_files(), &fake);
+        {
+            let runs = fake.runs.borrow();
+            assert_eq!(runs[0].args, ["go", "mod", "download"]);
+            for r in runs.iter() {
+                assert_eq!(env_of(r, "GOFLAGS"), ["-mod=mod"]);
+                assert!(env_of(r, "GOWORK").is_empty(), "{:?}", r.env);
+            }
+            assert_eq!(*fake.go_works.borrow(), [None, None]);
+        }
+        assert_eq!(recipe(&go_job(), &Budget::default()), RECIPE_GO);
+
+        // Several directories, sorted; the go line is compared numerically (`1.21` above
+        // `1.9`), and a module without one adds none.
+        let files: Vec<(String, Vec<u8>)> = [
+            ("go.mod", "module example.com/m\n\ngo 1.21\n"),
+            ("a/go.mod", "module example.com/m/a\n"),
+            ("z/y/go.mod", "module example.com/m/z/y\n\ngo 1.9\n"),
+        ]
+        .map(|(p, t)| (p.to_owned(), t.as_bytes().to_vec()))
+        .to_vec();
+        let job = Job {
+            workspace: vec!["a".into(), "z/y".into()],
+            ..go_job()
+        };
+        let fake = Fake::new(false, false);
+        run(&job, &files, &fake);
+        assert_eq!(
+            fake.go_works.borrow()[0].as_deref(),
+            Some("go 1.21\n\nuse (\n\t.\n\t./a\n\t./z/y\n)\n")
+        );
+        assert_eq!(
+            fake.runs.borrow()[0].args,
+            [
+                "go",
+                "list",
+                "-deps",
+                "-test",
+                "./...",
+                "./a/...",
+                "./z/y/..."
+            ]
+        );
+
+        // D6: repository-shaped, the container in the root; no workspace keeps `-mod=mod`.
+        let files: Vec<(String, Vec<u8>)> = [
+            ("tools/sct/go.mod", "module example.com/sct\n\ngo 1.26.7\n"),
+            (
+                "tools/sct/sub/go.mod",
+                "module example.com/sct/sub\n\ngo 1.26.7\n",
+            ),
+            ("server/public/go.mod", "module example.com/public\n"),
+        ]
+        .map(|(p, t)| (p.to_owned(), t.as_bytes().to_vec()))
+        .to_vec();
+        let replaced = Job {
+            root: "tools/sct".into(),
+            replace_targets: vec!["../../server/public".into()],
+            ..go_job()
+        };
+        let fake = Fake::new(false, false);
+        run(&replaced, &files, &fake);
+        {
+            let runs = fake.runs.borrow();
+            assert_eq!(runs[0].args, ["go", "mod", "download"]);
+            for r in runs.iter() {
+                assert_eq!(r.cwd, "tools/sct");
+                assert_eq!(env_of(r, "GOFLAGS"), ["-mod=mod"]);
+                assert!(env_of(r, "GOWORK").is_empty(), "{:?}", r.env);
+            }
+            assert_eq!(*fake.go_works.borrow(), [None, None]);
+        }
+        assert_eq!(recipe(&replaced, &Budget::default()), RECIPE_GO_WORK);
+        // D5 with D6: the go.work is written in the root.
+        let both = Job {
+            workspace: vec!["sub".into()],
+            ..replaced
+        };
+        let fake = Fake::new(false, false);
+        run(&both, &files, &fake);
+        let runs = fake.runs.borrow();
+        assert_eq!(
+            fake.go_works.borrow()[0].as_deref(),
+            Some("go 1.26.7\n\nuse (\n\t.\n\t./sub\n)\n")
+        );
+        assert_eq!(
+            runs[0].args,
+            ["go", "list", "-deps", "-test", "./...", "./sub/..."]
+        );
+        for r in runs.iter() {
+            assert_eq!(r.cwd, "tools/sct");
+            assert_eq!(env_of(r, "GOFLAGS"), [""]);
+            assert_eq!(env_of(r, "GOWORK"), ["/sources/tools/sct/go.work"]);
+        }
+    }
+
+    /// Contract M9d D5b (amendment 2, C5b): a workspace run whose fetch or index exits non-zero
+    /// (137: an OOM kill), or that writes no index, is run again exactly as a plain job (a
+    /// fresh export without go.work, `GOFLAGS=-mod=mod`, `go mod download`). An index from the
+    /// re-run makes the job `ok`, stored with phase `index`, with the workspace run's tail; the
+    /// pair round-trips through [`RunStatus::from_cached`] to the variant whose `note()` is the
+    /// status suffix. A re-run that fails gives its own failure. A timeout or a docker client
+    /// failure in the workspace run is not re-run (as D4), and neither is a D6 job (a plain run
+    /// cannot resolve its replace) nor a plain job.
+    #[test]
+    fn a_failed_workspace_run_reindexes_without_go_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = |exit_code: Option<i32>, timed_out: bool, tail: &str| Outcome {
+            exit_code,
+            timed_out,
+            stderr_tail: tail.into(),
+            elapsed: Duration::from_millis(1),
+        };
+        let ok = || (outcome(Some(0), false, ""), true);
+        let scripted = |steps: Vec<(Outcome, bool)>| {
+            let fake = Fake::new(false, false);
+            *fake.script.borrow_mut() = steps.into();
+            fake
+        };
+        let run = |job: &Job, fake: &Fake| {
+            run_job(
+                job,
+                "sha256:go",
+                &go_files(),
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &Egress::default(),
+                fake,
+            )
+            .unwrap()
+        };
+        // Runs `from..` are the plain re-run; the runs before it saw the go.work.
+        let plain_rerun = |fake: &Fake, from: usize| {
+            let runs = fake.runs.borrow();
+            assert_eq!(runs.len(), from + 2);
+            assert_eq!(runs[from].args, ["go", "mod", "download"]);
+            assert_eq!(runs[from + 1].args, ["scip-go"]);
+            for r in &runs[from..] {
+                assert_eq!(env_of(r, "GOFLAGS"), ["-mod=mod"]);
+                assert!(env_of(r, "GOWORK").is_empty(), "{:?}", r.env);
+                assert_eq!(r.cwd, "");
+            }
+            assert_ne!(
+                runs[from].workdir, runs[0].workdir,
+                "the re-run has an export of its own"
+            );
+            let works = fake.go_works.borrow();
+            assert!(works[..from].iter().all(|w| w.as_deref() == Some(GO_WORK)));
+            assert!(
+                works[from..].iter().all(Option::is_none),
+                "the re-run sees no go.work"
+            );
+        };
+        let suffix = Some("workspace failed: indexed without go.work");
+
+        // The workspace fetch fails: re-run plain.
+        let fake = scripted(vec![
+            (
+                outcome(Some(1), false, "go: example.com/x@v1: not found"),
+                false,
+            ),
+            ok(),
+            ok(),
+        ]);
+        let ran = run(&workspace_job(), &fake);
+        assert_eq!(
+            (ran.status.as_str(), ran.status.phase()),
+            ("ok", Some(Phase::Index))
+        );
+        assert!(ran.status.is_ok() && ran.status.is_cacheable());
+        assert_ne!(ran.status, RunStatus::Ok);
+        assert_ne!(ran.status, RunStatus::OkWithoutEnvironment);
+        assert_eq!(ran.status.reason(), None);
+        assert_eq!(ran.status.note(), suffix);
+        assert_eq!(ran.index.as_deref(), Some(&b"fake-index"[..]));
+        assert_eq!(
+            ran.stderr_tail, "go: example.com/x@v1: not found",
+            "the workspace run's tail"
+        );
+        plain_rerun(&fake, 1);
+        // The cached pair round-trips to the variant and its suffix, apart from D4's.
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("index")),
+            Some(ran.status.clone())
+        );
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("index")).and_then(|s| s.note()),
+            suffix
+        );
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("fetch")).and_then(|s| s.note()),
+            Some("environment not installed: fetch failed")
+        );
+        assert_eq!(RunStatus::Ok.note(), None);
+
+        // The workspace index is killed (137) or writes no index: re-run plain.
+        for (index, tail) in [
+            ((outcome(Some(137), false, "Killed"), false), "Killed"),
+            (
+                (outcome(Some(0), false, "done"), false),
+                "done\n(no index.scip was produced)",
+            ),
+        ] {
+            let fake = scripted(vec![ok(), index, ok(), ok()]);
+            let ran = run(&workspace_job(), &fake);
+            assert_eq!(ran.status.note(), suffix, "{tail}");
+            assert_eq!(ran.status.phase(), Some(Phase::Index));
+            assert_eq!(ran.index.as_deref(), Some(&b"fake-index"[..]));
+            assert_eq!(ran.stderr_tail, tail);
+            plain_rerun(&fake, 2);
+        }
+
+        // The re-run fails too: its own failure is the job's.
+        let fake = scripted(vec![
+            ok(),
+            (outcome(Some(137), false, "Killed"), false),
+            ok(),
+            (outcome(Some(2), false, "plain boom"), false),
+        ]);
+        let ran = run(&workspace_job(), &fake);
+        assert_eq!(ran.status, RunStatus::Failed(Phase::Index));
+        assert_eq!(ran.stderr_tail, "plain boom");
+        assert!(ran.index.is_none());
+        plain_rerun(&fake, 2);
+
+        // A timeout or a docker client failure in the workspace run is not re-run.
+        for (steps, status) in [
+            (
+                vec![(outcome(None, true, "slow"), false)],
+                RunStatus::Timeout {
+                    phase: Phase::Fetch,
+                    budget_secs: 600,
+                },
+            ),
+            (
+                vec![ok(), (outcome(None, true, "slow"), false)],
+                RunStatus::Timeout {
+                    phase: Phase::Index,
+                    budget_secs: 900,
+                },
+            ),
+            (
+                vec![ok(), (outcome(Some(125), false, "docker: refused"), false)],
+                RunStatus::Environment("docker: refused".into()),
+            ),
+        ] {
+            let n = steps.len();
+            let fake = scripted(steps);
+            let ran = run(&workspace_job(), &fake);
+            assert_eq!(ran.status, status);
+            assert!(ran.index.is_none());
+            assert_eq!(fake.runs.borrow().len(), n, "no re-run after {status:?}");
+        }
+
+        // A D6 job, with or without a workspace, and a plain job are not re-run.
+        for job in [
+            Job {
+                replace_targets: vec!["../x".into()],
+                ..workspace_job()
+            },
+            Job {
+                replace_targets: vec!["../x".into()],
+                ..go_job()
+            },
+            go_job(),
+        ] {
+            let fake = scripted(vec![ok(), (outcome(Some(137), false, "Killed"), false)]);
+            let ran = run(&job, &fake);
+            assert_eq!(ran.status, RunStatus::Failed(Phase::Index), "{job:?}");
+            assert_eq!(fake.runs.borrow().len(), 2, "{job:?}");
+        }
     }
 
     /// Contract M6d S4: a Python job's fetch resolves its environment behind
@@ -1566,13 +2107,16 @@ mod tests {
             assert_eq!(runs[1].args[..2], ["scip-python", "index"]);
         }
         // The cache row round-trips; an ordinary `ok` row stays `Ok`, and `ok` in the index
-        // phase is written by no binary (a miss).
+        // phase is D5b's, not D4's (amendment 2; before it, a miss).
         assert_eq!(
             RunStatus::from_cached("ok", Some("fetch")),
             Some(fallback.status.clone())
         );
         assert_eq!(RunStatus::from_cached("ok", None), Some(RunStatus::Ok));
-        assert_eq!(RunStatus::from_cached("ok", Some("index")), None);
+        assert_ne!(
+            RunStatus::from_cached("ok", Some("index")),
+            Some(fallback.status.clone())
+        );
 
         // The index fails too: the fetch's failure, as before D4.
         let fake = Fake::new(true, true);
@@ -2394,6 +2938,8 @@ mod tests {
                 fetch: Fetch::Npm { lockfile },
                 projects: vec!["packages/app".into(), "packages/core".into()],
                 unpinned: false,
+                workspace: Vec::new(),
+                replace_targets: Vec::new(),
             };
             let fake = Fake::new(false, false);
             run_job(

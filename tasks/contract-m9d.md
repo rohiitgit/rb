@@ -684,6 +684,96 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - Each pair was re-read or grepped and found landed before anything ran. The lesson of 2026-10-17 already covers this, so no new rule is added.
 - **`rb.repo`** is identical before, after the probes, and at the end (`repo-before.txt`, `repo-after-probes.txt`, `repo-after.txt`; 4 rows).
 
+**Amendment 2 (2026-10-18, before P4's code; new D5b, the workspace fallback).**
+- **Why.** server under go.work peaks at 3.86–4.29 GB of its 4 GiB cgroup (amendment 1, risk 2), and amendment 1 calls an OOM there "a stop". But an OOM, or any other failure the workspace causes, must never cost the user the server index that M9c already produces without go.work.
+- **D5b (workspace fallback).** A D5 job's workspace run (`RECIPE_GO_WORK`, through D5) can fail in either of two ways:
+  - its fetch or index phase exits non-zero, for example with exit code 137 (an OOM kill);
+  - it writes no index (`(no index.scip was produced)`).
+
+  In either case `run_job` runs the job again exactly as a plain `RECIPE_GO` job runs: a fresh export with no `go.work`, `GOFLAGS=-mod=mod`, `go mod download`, the root-relative layout.
+  - **Exceptions, as D4's:** a timeout, or a docker client failure (exit 125–127, or a client that does not start), in the workspace run is returned as such and is not re-run.
+  - **The re-run writes an index:** the job is `ok`, and its status line appends `(workspace failed: indexed without go.work)`. The index is the re-run's. The stored tail is the workspace run's, which says why the workspace failed. The elapsed time covers both runs. The row is cached under the job's own key (`RECIPE_GO_WORK`), so it replays until the job's inputs or recipe change.
+  - **The re-run fails as well:** its own outcome (`failed`, `timeout` or `environment`) is the job's result.
+- **Representation.** `RunStatus` gains `OkWithoutWorkspace`, stored as `status = 'ok', phase = 'index'`.
+  - **Why `index`.** D4's `ok`/`fetch` says that the fetch's product, the environment, is missing. D5b's `ok`/`index` says that the workspace's index is missing and the plain index stands in. The phase CHECK (`migrations/0005_scip_index_phase.sql`) allows only `fetch` and `index`, and no binary has written `ok`/`index` (P3 made it a miss). So no existing row changes meaning, and `from_cached` maps each pair to exactly one variant: `ok`/none to `Ok`, `ok`/`fetch` to D4, `ok`/`index` to D5b. Which phase of the workspace run failed is in the stored tail.
+  - **Rejected: storing the workspace run's failed phase.** A failed workspace fetch would then be stored as `ok`/`fetch`, which `from_cached` cannot tell from D4 without the indexer.
+  - **The suffix text lives with the variant.** `RunStatus::note()` gives D4's and D5b's suffix texts. `rb index` prints it after the status. `rb status` prints it for the variant `from_cached` gives the diagnostic's `status` and `phase`, so the stored pair, the variant and the line round-trip in one place.
+  - **Visibility, as D4's.** `rb index` and `rb status` print the suffix. The `scip_status` diagnostic records `phase: index` and the workspace run's `stderr_tail`. This adds `crates/rb-indexer/src/lib.rs` and `crates/rb-cli/src/main.rs` to P4's files.
+- **D6 jobs.** The fallback does not apply to a job with a replace target outside its root (D6), whether or not it also has a workspace. A plain run cannot resolve a relative replace: sharedchannel-test's plain fetch fails on `reading /server/public/go.mod` (B4 row 5), so the re-run could only fail again.
+- **Claim C5b (new).**
+  - Unit `a_failed_workspace_run_reindexes_without_go_work` (orchestrate) covers three things:
+    - the rule: a failed workspace fetch, an index exiting 137 and a missing index are each re-run plain, the re-run seeing no `go.work`, `GOFLAGS=-mod=mod` and `go mod download`, giving `ok`/`index` with the workspace run's tail; a re-run that fails gives its own failure; a D6 job and a plain job are not re-run;
+    - the exceptions: a workspace timeout or docker client failure is not re-run;
+    - the status-suffix round trip: `from_cached("ok", Some("index"))` gives the variant, whose `note()` is the suffix.
+  - The `scip_status` diagnostic (lib) and the status line (main) each get a row.
+- **Risk 2 amended.** An OOM in P4's server probe is still reported plainly, and it still fails the claim that server indexes under go.work. With D5b it no longer costs the index, and the probe shows whether D5b's plain index stood in.
+- **Mutants.** **m395**: no re-run after a workspace failure. **m396**: a re-run after a workspace timeout too. Both use the filter `a_failed_workspace_run_reindexes_without_go_work`. The closing bar reads "m360–m396".
+
+**P4 note (2026-10-18; D5–D7, D5b).** Logs in `var/m9d/logs/p4/`, scripts in `var/m9d/p4/scripts/`. Binary `var/m9d/bin/rb.p4` (debug, the P4 tree, sha256 `3fe4c23b…`).
+- **Red first.** Before any behaviour changed, the `Job` fields (`workspace`, `replace_targets`, empty everywhere), `RECIPE_GO_WORK` and a `note()` holding D4's text alone were added, so that the tests compiled. Seven tests then failed, each on its assertion:
+  - `go_jobs_requiring_in_repo_modules_get_a_workspace`: no `work[…]` and no `replace[…]` in the plan (`c5-c5b-scip-red.txt`).
+  - `workspace_jobs_write_go_work_and_clear_goflags`: `go.work` seen as `[None, None]`.
+  - `a_failed_workspace_run_reindexes_without_go_work`: `("failed", Some(Fetch))` where `("ok", Some(Index))` was expected.
+  - `go_replace_targets_inside_the_repository_are_exported`: `link_targets` 0 where 1 was expected (`c6-indexer-red.txt`).
+  - `go_replace_targets_outside_are_unsupported`: `None` where the reason was expected.
+  - `scip_status_records_an_index_without_its_workspace` (lib): `expect("D5b's cached pair")`, because `from_cached("ok", Some("index"))` was a miss.
+  - `scip_status_line_prints_an_index_without_its_workspace` (main): D4's text, `ok (environment not installed: fetch failed)` (`d5b-cli-red.txt`).
+- **Design.**
+  - **Planner (D5, D7).** A Go root's `go.mod` is read through the planner's reader. Its workspace holds the directories under the root of the other `go.mod` files whose module path the root requires, `// indirect` included, with no `replace` of that path. A root that holds its own `go.work` gets no workspace.
+  - **Replace targets (D6).** These are `replace` targets that are local directories by Go's rule (`.`, `..`, `./`, `../`, `/`) and do not resolve lexically to the root or below it. They are kept as written. `projects::job_files` resolves them with the link resolver: one inside the repository exports its tracked files, and one leaving it gives `replace target outside the repository`.
+  - **Runs.** `go_runs` writes `<root>/go.work` into the export before either phase runs. Both phases then run with `GOFLAGS` empty and `GOWORK` set to that file, and the fetch is `go list -deps -test ./... ./<dir>/...`. A job with replace targets starts in its root of a repository-shaped export. A job with neither keeps today's argv, layout and `RECIPE_GO`; `go_job_runs_download_then_scip_go` is unchanged and passes.
+  - **D5b.** `run_job` wraps `run_once`.
+- **Deviations, each with its reason.**
+  1. **`lib.rs` and `main.rs` are P4 files** (amendment 2). `rb status` and `rb index` print D4's and D5b's text through `RunStatus::note()`. `main.rs` lost its `WITHOUT_ENVIRONMENT` constant, and D4's lines are unchanged (its tests pass as they were).
+  2. **`GOWORK` is set in both phases of a workspace job.** D5 does not name it. With it, each phase's workspace is part of its argv, and it gives m374 a one-line mutation: the export, and with it the `go.work`, is shared by both phases, so "written only for the index phase" is mutated as the fetch running with `GOWORK=off`, which has the same effect.
+  3. **Vendored and ignored directories are no workspace modules.** D5 did not say this. `bench_go_plan.py`, a check of every bench repository's `go.mod` files that is independent of the Rust code, found that go_gin_example commits `vendor/` with six vendored `go.mod` files, all of which its root requires. The first planner would have given that root a six-module workspace, against D5's "nothing else" on the bench.
+     - A row for `vendor`, `testdata`, `.x` and `_x` failed first (`c5-vendor-red.txt`), and then the rule was added.
+     - Re-run, the check reaches only mattermost `server` (`public`) and `tools/sharedchannel-test` (`../../server/public`) (`bench-go-plan.txt`).
+  4. **An absolute replace target is unsupported, like one leaving the repository.** D6 speaks only of relative paths. An absolute directory on the indexing host is never in the export, so such a fetch fails today.
+  5. **Replace targets count as `link_targets`.** sharedchannel-test's line reads `scip-go ok, 1 link targets`, so its `scip_status` row gains that key (bucket NEWIDX). The key already means "directories outside the root whose files the job exported".
+  6. **The `go` line is omitted when no module declares one.** A module path declared by two `go.mod` files under one root is not de-duplicated: Go would refuse that `go.work`, and D5b's re-run would stand in.
+  7. **D5b's elapsed time covers both runs**, as D4's does.
+- **Old values pinned by tests**, grepped (`RECIPE_GO`, `m6d-go-1`, `go mod download`, `GOFLAGS`, `environment not installed`, `Some("index")`) and updated:
+  - `a_failed_python_fetch_indexes_without_the_environment`: `from_cached("ok", Some("index"))` was `None` (a miss). It is now asserted to differ from D4's variant (amendment 2).
+  - No golden holds a Go recipe, a Go argv or `GOFLAGS`, and no other test changed.
+- **Unit suites.**
+  - fmt and clippy (`--workspace --all-targets -D warnings`) are clean (`fmt.txt`, `clippy.txt`).
+  - `cargo test -p rb-scip`: 91 passed.
+  - `-p rb-indexer --lib projects`: 18 passed. `-p rb-indexer --lib`: 382 passed, at load 2.9–3.2.
+  - `-p rb-cli --bin rb`: 48 passed.
+- **Go e2e** (`e2e-go.txt`): `scip_go_chi_sqlx` (the only `fn scip_go…`) and `scip_polyglot_monorepo` (its `services/billing` Go job) passed, 2 of 2, in 182.7 s at load 4.1–4.5.
+  - Goldens are unchanged: no bless and no fixture modified. Neither fixture `go.mod` requires an in-repo module or has a replace.
+  - 0 `t_` caches before and after.
+- **Probe `bench_m9d_mm`** (`mm-probe.txt`, `mm-memwatch.txt`, `mm-server-phases.txt`, `mm-measure.txt`, `mm-same-index.txt`).
+  - **Setup.** `probe.sh` runs as `bench/run.sh`'s scip mode does: `--force --scip-timeout-secs 3600`, at mattermost `b2ce71db`. The package caches started as an APFS clone of `bench_mattermost_scip`, the bench's warm caches. `memwatch.zsh` read each scip-go container's `memory.peak` and `memory.events` from inside it once a second, as P0's scripts read them.
+
+  | | Predicted (amendment 1) | Measured |
+  |---|---|---|
+  | server status | `ok` under the workspace | `scip-go ok`, no D5b suffix; row `480e3ee4…` `ok`, no phase |
+  | server fetch | `go list`, rc 0, 11 s | `go list -deps -test ./... ./public/...` with `GOWORK=/sources/go.work`, `GOFLAGS` empty; sampled from 21:34:27 to 21:34:41 (about 15 s), rc 0 (else D5b would have run), peak 450 MB |
+  | server index | 145 s (P0, against 100 s without go.work) | sampled from 21:34:43 to 21:37:40, row at 21:37:43 (about 180 s) |
+  | server wall, job (fetch + index) | | 196.9 s against M9c's server row 119.0 s (`ad9e1f9a…`, `m9c-server-row.txt`): 1.65× at load 5.2–7.8, not an A/B |
+  | server `memory.peak` | 3.86 GB, 0 OOM | **3,921,051,648 B**, last sample 3 s before the row |
+  | server `memory.events` | 0 `oom`, 0 `oom_kill` | `low 0 high 0 max 0 oom 0 oom_kill 0 oom_group_kill 0` in every sample |
+  | server index content | 0 invalid locals | 177,066,985 B, 1,830 documents, **0 of 202,391** locals `invalid type` (control: M9c's record index, 1,541), 391,694 server/public references at version `.` (control: 384,650 at `v0.4.3`); **IDENTICAL** in occurrences and symbols to P0's go.work index (control: M9c's differs) |
+  | module cache | +53 MiB | +54,160 KiB (1,195,156 → 1,249,316 KiB), P0 a2's figure |
+  | sharedchannel-test | `ok`, 16 s, 194 KB, 0 of 242 invalid | `scip-go ok, 1 link targets` in 18.5 s, 194,524 B, 0 of 242 invalid, 295 server/public references at `.`, peak 1.06 GB |
+  | other Go jobs | cache hits | 6 `ok (cached)` (unchanged recipe and inputs) |
+
+  - **D5b did not fire.** server indexed under the workspace with 0 OOM events, so no plain re-run was needed or made.
+  - **Harness fault.** The `docker events` stream (`mm-docker-events.txt`) is empty: its `image=` filter named the tag, while rb runs containers by image ID. The memory evidence is memwatch's. The exit status follows from the `ok` row.
+  - **Observed, not P4's (D1, P2).** webapp's and cypress's fetch tails now read `git … ls-remote ssh://git@registry.npmjs.org/…`. `replace-registry-host=always` also rewrote the `git+ssh` GitHub host. They stayed failed, as D1 predicted, but the tail is not "the git-dependency refusal" as worded. This is recorded for P9's RECIPE bucket and P10.
+  - **Clean-up** (`mm-cleanup.txt`).
+    - `bench/cleanup.sh 'bench\_m9d\_mm'` left 0 rows and 0 graphs.
+    - `rb gc --prefix bench_m9d_ --egress` removed `rb-scip-fetch` and `rb-scip-egress`, which this phase's runs created (0 before P4). 0 networks and 0 `rb-egress` or `rb-scip` containers are left.
+    - The probe's package cache `var/scip/cache/bench_m9d_mm` (2.1 GB by `du`, an APFS clone plus the 53 MiB of growth) is kept, because P4's deletion rules do not cover it.
+- **Mutants** (`mutants-p4.txt`, `mutants-p4-m372.txt`, `mutants-m9d-battery.txt`).
+  - m370–m378, m394, m395 and m396 are KILLED.
+  - **m372** was INVALID first: its mutation `*dir != root` did not compile. It was re-specified as `is_under(dir, "")`, which puts every module outside the root in, and is KILLED.
+  - The whole m9d battery is 24 of 24 KILLED, with m387 on a `ScratchDb`. No scratch database is left.
+- **Process.** One message carried three `Edit` calls to `orchestrate.rs` (the test `Fake`'s fields, its constructor and its `run`). All three were grepped and found landed before anything compiled. Multi-hunk changes otherwise went in as one scripted edit per file and message, each asserting that every hunk matched once.
+- **`rb.repo`** is identical before and after (`repo-before.txt`, `repo-after.txt`; 4 rows).
+
 ## Result
 
 Not yet built.
