@@ -198,6 +198,79 @@
   "what": "a target outside the repository accepted"
  },
  {
+  "id": "m379",
+  "crate": "rb-indexer",
+  "test": "tests::byte_equal_cross_project_symbols_join_exact",
+  "file": "lib.rs",
+  "old": "                    let exact = r.symbol == *dst;\n",
+  "new": "                    let exact = false;\n",
+  "what": "equal symbols joined `synthetic` (D8)"
+ },
+ {
+  "id": "m380",
+  "crate": "rb-indexer",
+  "test": "tests::byte_equal_cross_project_symbols_join_exact",
+  "file": "lib.rs",
+  "old": "                    let exact = r.symbol == *dst;\n",
+  "new": "                    let exact = scip::unversioned(&r.symbol) == scip::unversioned(dst);\n",
+  "what": "unequal versions joined `exact` (D8: compared without the version)"
+ },
+ {
+  "id": "m381",
+  "crate": "rb-indexer",
+  "test": "scip::tests::in_repo_modules_are_not_packages",
+  "file": "scip.rs",
+  "old": "                if package.as_ref().is_some_and(|p| in_repo_module(p, modules)) {\n",
+  "new": "                if false {\n",
+  "what": "`.`-version in-repo reference creates a `Package` (D9)"
+ },
+ {
+  "id": "m382",
+  "crate": "rb-indexer",
+  "test": "scip::tests::in_repo_modules_are_not_packages",
+  "file": "scip.rs",
+  "old": "    let declared = modules.contains(package.name.as_str());\n",
+  "new": "    let declared = true;\n",
+  "what": "every `.`-version package dropped, third-party too (D9)"
+ },
+ {
+  "id": "m383",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_invalid_locals_are_counted",
+  "file": "decode.rs",
+  "old": "                locals_invalid_type += usize::from(invalid_type(s));\n",
+  "new": "                locals_invalid_type += 0;\n",
+  "what": "invalid locals not counted (D10)"
+ },
+ {
+  "id": "m384",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_invalid_locals_are_counted",
+  "file": "decode.rs",
+  "old": "    let scip_go = tool == \"scip-go\";\n",
+  "new": "    let scip_go = true;\n",
+  "what": "counted for any indexer (D10)"
+ },
+ {
+  "id": "m385",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_invalid_locals_are_counted",
+  "file": "decode.rs",
+  "old": "                .filter(|s| s.symbol.starts_with(\"local \"))\n",
+  "new": "                .filter(|_| true)\n",
+  "what": "non-local symbols counted (D10)"
+ },
+ {
+  "id": "m386",
+  "crate": "rb-cli",
+  "bin": "rb",
+  "test": "tests::scip_status_line_prints_invalid_locals",
+  "file": "main.rs",
+  "old": "        if n(\"locals_invalid_type\") > 0 {\n",
+  "new": "        if false {\n",
+  "what": "status line omits the count (D10)"
+ },
+ {
   "id": "m395",
   "crate": "rb-scip",
   "test": "orchestrate::tests::a_failed_workspace_run_reindexes_without_go_work",

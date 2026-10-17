@@ -161,7 +161,9 @@ def one(workdir, targetdir, spec):
     digest = hashlib.sha256(text.encode()).hexdigest()
     cmd = ["cargo", "test", "-q", "-p", crate]
     if crate != "rb-bench":
-        cmd += ["--lib", spec["test"]]
+        # A crate with no library (rb-cli) names its binary target: `"bin": "rb"` (M9d P5).
+        target = ["--bin", spec["bin"]] if spec.get("bin") else ["--lib"]
+        cmd += target + [spec["test"]]
     path.write_text(text.replace(spec["old"], spec["new"]))
     try:
         mutated = path.read_text()

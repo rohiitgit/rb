@@ -774,6 +774,57 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Process.** One message carried three `Edit` calls to `orchestrate.rs` (the test `Fake`'s fields, its constructor and its `run`). All three were grepped and found landed before anything compiled. Multi-hunk changes otherwise went in as one scripted edit per file and message, each asserting that every hunk matched once.
 - **`rb.repo`** is identical before and after (`repo-before.txt`, `repo-after.txt`; 4 rows).
 
+**P5 note (2026-10-18; D8–D10).** Logs in `var/m9d/logs/p5/`, scripts in `var/m9d/p5/scripts/`. Binary `var/m9d/bin/rb.p5` (debug, the P5 tree, sha256 `b05d9881…`).
+- **Red first.** The two count fields (`ScipIndex::{locals, locals_invalid_type}`, `Coverage::{locals_invalid_type, locals}`) were added at 0 first, so that every test compiled against today's behaviour. Five tests then failed, each on its assertion:
+  - `scip_go_invalid_locals_are_counted` (decode): `(0, 0)` where `(1, 3)` was expected (`c9-decode-red.txt`).
+  - `byte_equal_cross_project_symbols_join_exact` (lib): all three joins `Synthetic`, where the two byte-equal ones were expected `Exact` (`c7-c8-c9-indexer-red.txt`).
+  - `in_repo_modules_are_not_packages` (scip): a `go/…server/public@` (empty version) `PackageUse` first in the list. The hand-back control before it passed.
+  - `invalid_locals_are_written_only_when_non_zero` (lib): coverage `(0, 0)` where `(1, 2)` was expected.
+  - `scip_status_line_prints_invalid_locals` (main): the line without the suffix (`c9-cli-red.txt`).
+- **Design.**
+  - **D8.** `join_across_projects` returns each edge with its certainty: `exact` when `r.symbol == *dst`, else `synthetic`. The call site chains these edges as they come. `scip_cross_project` gains `exact`. `exact calls (scip)` needed no change: its query counts `scip` `CALLS` of certainty `exact`.
+  - **D9.** In the per-document packages loop, a package whose manager is `go`, whose version is empty and whose name is in the job's `modules` (the other ok scip-go jobs' module paths, the set D8′ already hands back to) is skipped. Its namespace occurrences are skipped too, so the import does not bring the node back.
+  - **D10.** The decoder counts, for tool name `scip-go`, each `SymbolInformation` whose symbol starts with `local `, and those whose `signature_documentation.text` contains `invalid type`. It counts over the documents as written, before duplicates merge, as P0's `invalid_locals` does. The join copies both counts into the coverage. `scip_status` writes both keys only when `locals_invalid_type > 0`. `rb status` appends `, N of M locals typed invalid` at the end of the line.
+- **Deviations, each with its reason.**
+  1. **`bench/mutants/run.py` is changed, a file outside P5's list.** rb-cli has no library target, and the runner always ran `cargo test -p <crate> --lib <filter>`, so m386 could not run. A spec may now name `"bin": "rb"`, which runs `--bin rb` in place of `--lib`. Every other spec runs as before.
+  2. **The probe adds a control run.** mattermost was indexed as `bench_m9d_mm` twice, one run after the other: first with `rb.p4` (no D8, D9 or D10), then with `rb.p5`. Both snapshots were measured, so every P5 number below has a same-commit, same-index base, and every zero has a control that is not zero.
+  3. **`measure.sql` first counted `Package` nodes under the wrong kind** (`'Package'`; the stored kind is `package`), so `mm-probe.txt`'s package-node rows read 0 for both runs. They were re-measured read-only on both kept snapshots (`mm-packages.txt`), and the script was then corrected. The DEPENDS_ON rows in `mm-probe.txt` were right.
+  4. **A throwaway test** decoded two real server indexes with the P5 decoder, as a control for D10's zeros at scale (`d10-real-index-control.txt`). It was added `#[ignore]` and removed at once. `decode.rs`'s diff is the same before and after.
+  5. **m380's mutation** compares the two symbols with the version dropped (`scip::unversioned(…) == scip::unversioned(…)`), which is the shortcut "unequal versions joined `exact`" names, rather than a constant `true`.
+  6. **The decode unit counts 1 of 3**: a third local, without signature documentation, sits in a second document, so the count is shown to run over every document. The status-line row prints `1 of 2`, as C9 words it.
+  7. **C7's test also asserts D9 at the graph.** Only `go/…/server/public@v0.4.3` is a `Package` node. This tests the wiring from the join to `Package` nodes, which C8's unit (on `join_handing_back`) does not reach.
+  8. **The records still say "synthetic only".** `docs/repository-brain-design.md:275` describes the join as `synthetic`, never `exact`, with `{to, synthetic, ambiguous, unanchored}`, and `docs/usage-and-testing.md:236` describes the diagnostic. Both are P8's files (its D8 design note), so they are not edited here.
+  9. **`rb.p5`'s sha256 differs from a later rebuild of the same tree** (`d94dab90…`, `rb.p5-rebuild.txt`). Between the two builds, the only edits under `crates/` were the throwaway test (`#[cfg(test)]`, outside the binary) and its removal; the mutant runs restored every file by sha256. That this is debug-build relink nondeterminism is not verified. P9's binary of record is built from the commit.
+- **Old values pinned by tests**, grepped (`scip_cross_project`, `"synthetic"`, `locals_invalid_type`, `locals typed invalid`, `go/…@` package keys; `old-values-grep.txt`) and updated:
+  - `external_references_join_another_projects_definitions`: its three `scip_cross_project` rows gain `"exact": 0`. Every join there is at `v0.4.3`, so every certainty stays `synthetic`.
+  - Two exhaustive `Coverage` literals in scip.rs tests gain the two new fields at 0, a change of shape, not of value.
+  - No golden holds `scip_cross_project` or a D10 key. Both Go fixtures have a single scip-go job, so `modules` is empty and D9 cannot move a fixture package.
+- **Unit suites** (`units-final.txt`, after the last edit): `-p rb-scip --lib decode` 18 passed; `-p rb-scip --lib` 92; `-p rb-indexer --lib scip` 73; `-p rb-indexer --lib` 385; `-p rb-cli --bin rb` 49. fmt and clippy (`--workspace --all-targets -D warnings`) are clean (`fmt-final.txt`, `clippy-final.txt`).
+- **SCIP e2e** (`e2e-scip.txt`, `scripts/e2e_scip.sh`): every `fn scip_*` test, 15 of 15, passed in 654 s at load 4.7–5.8, single-threaded.
+  - Goldens unchanged: no bless, and no file under `crates/rb-cli/tests` or `fixtures/` is modified.
+  - 0 `t_` caches before and after.
+- **Probe `bench_m9d_mm`** (`mm-probe.txt`, `mm-packages.txt`, `scripts/probe.sh`, `scripts/measure.sql`). mattermost `b2ce71db`, over P4's kept package cache, run as P4 ran it (`--force --scip-timeout-secs 3600`).
+  - All 13 jobs were cache hits in both runs: 0 `rb.scip_index` rows were written and the module cache did not grow. Walls were 88.5 s (`rb.p4`) and 89.4 s (`rb.p5`).
+
+  | | Predicted | Control (`rb.p4`, snapshot 43265) | Measured (`rb.p5`, snapshot 43266) |
+  |---|---|---|---|
+  | `scip_cross_project` server → server/public | `exact` > 0 (≥ 44,269), `synthetic` 0 | `synthetic` 45,478, `unanchored` 16,558 | **`exact` 45,478, `synthetic` 0**, `ambiguous` 0, `unanchored` 16,558 |
+  | `scip_cross_project` sharedchannel-test → server/public | (NEWIDX) | `synthetic` 90, `unanchored` 54 | `exact` 90, `synthetic` 0, `unanchored` 54 |
+  | `scip` edges `synthetic` (`CALLS` / `REFERENCES`) | amendment 1: 23,180 at M9c (10,098 / 13,082) become `exact` | 10,384 / 13,489 | **0 / 0** |
+  | `exact calls (scip)` | M9c 34,647 → ≥ 44,745 | 34,709 | **45,093** (+10,384, the control's `synthetic` `CALLS`) |
+  | `scip` `REFERENCES` `exact` | | 18,784 | 32,273 (+13,489) |
+  | `scip` DEPENDS_ON into `…server/public@*` | the 30 into `@v0.4.3` leave (M9c) | 31 into `@?` (30 server services, as at M9c, and sharedchannel-test) | **0** |
+  | `scip` DEPENDS_ON, all | | 249 | 218 (−31; else identical: 31 rows only in the control, 0 only in P5) |
+  | `package` nodes | the `server/public` node leaves | 457, of which `go/…@?`: `server/public`, `vmihailenco/msgpack/v5` | 456: `server/public@?` gone; `msgpack/v5@?` (third-party, no version) stays, as D9 means |
+  | graph | | 58,475 nodes, 199,587 edges | 58,474 nodes, 199,556 edges |
+  | D10 status lines | no suffix (every index 0) | — | 0 lines with `locals typed invalid`; neither key in any of the 8 scip-go jobs' coverage |
+
+  - **D10 control at scale** (`d10-real-index-control.txt`, the P5 decoder, release build): M9c's record server index (`ad9e1f9a…`) reads 1,541 of 202,391 locals typed invalid, and P4's go.work index (`480e3ee4…`, the row the probe served from the cache) reads 0 of 202,391. Both equal P0's and P4's Python counts.
+  - **Clean-up** (`mm-cleanup.txt`): `bench/cleanup.sh 'bench\_m9d\_mm'` left 0 rows and 0 graphs. `rb gc --prefix bench_m9d_ --egress` found nothing: 0 networks before, after and at the end, and 0 `rb-egress`/`rb-scip` containers. The package cache `var/scip/cache/bench_m9d_mm` is kept for P9 or the close to decide.
+- **Mutants** (`mutants-p5.txt`, `mutants-m9d-battery.txt`): m379–m386 KILLED. The whole m9d battery is 32 of 32 KILLED, with m387 on a `ScratchDb` (`RB_TEST_DATABASE_URL` set). No `t_store_db_*` database is left, and the tree was restored.
+- **Process.** Each message carried one `Edit` call, or one scripted edit of one file that asserted every hunk matched once (scip.rs three times, decode.rs, lib.rs and the mutant specs once each).
+- **`rb.repo`** is identical before and after (`repo-before.txt`, `repo-after.txt`; the user's 4 rows, the same as P4's baseline).
+
 ## Result
 
 Not yet built.

@@ -177,6 +177,11 @@ pub(crate) struct Coverage {
     /// (scip-typescript indexing a link target's sources through the link; contract M6a D7):
     /// ignored, the link target's own job owning its files.
     pub documents_outside_root: usize,
+    /// scip-go only (contract M9d D10): the index's locals typed `invalid type` and all its
+    /// locals, as the decoder counted them ([`rb_scip::ScipIndex::locals`]); a load failure
+    /// scip-go otherwise hides behind exit code 0.
+    pub locals_invalid_type: usize,
+    pub locals: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -397,6 +402,9 @@ pub(crate) fn join_handing_back(
         })
         .count();
     out.coverage.tsconfig_unread = ts_scopes.unread_under(root);
+    // Contract M9d D10: the decoder's counts of the index's locals, for the job's status.
+    out.coverage.locals_invalid_type = index.locals_invalid_type;
+    out.coverage.locals = index.locals;
     let mut locals: Vec<BTreeMap<&str, usize>> = Vec::with_capacity(docs.len());
     for ((path, ..), anchors) in docs.iter().zip(anchors_kept) {
         out.coverage.definitions_total += anchors.total;
@@ -664,6 +672,11 @@ pub(crate) fn join_handing_back(
                 if own_packages.contains(package) {
                     continue;
                 }
+                // Contract M9d D9: another ok scip-go job's module read from the in-repo tree
+                // is joined across projects (D8), not a dependency.
+                if package.as_ref().is_some_and(|p| in_repo_module(p, modules)) {
+                    continue;
+                }
                 if let Some(package) = package
                     && !first.contains_key(package)
                 {
@@ -818,6 +831,16 @@ pub(crate) fn join_handing_back(
     out.edges.dedup();
     out.packages.sort();
     out
+}
+
+/// Whether `package` is the module of another ok scip-go job (`modules`, as for [`hands_back`])
+/// at an empty version (contract M9d D9): the type checker read that job's in-repo tree (under
+/// a `go.work`), so the module is no dependency of this one. A real version (`v0.4.3`, from the
+/// module cache) and a module no job declares (a third-party module replaced by a directory
+/// outside every job) stay packages.
+fn in_repo_module(package: &rb_scip::Package, modules: &BTreeSet<&str>) -> bool {
+    let declared = modules.contains(package.name.as_str());
+    package.manager == "go" && package.version.is_empty() && declared
 }
 
 /// Whether an external reference's `symbol` is handed back for the cross-project join
@@ -1758,6 +1781,8 @@ mod tests {
                 lombok_removed: 0,
                 documents_lombok: 0,
                 documents_outside_root: 0,
+                locals_invalid_type: 0,
+                locals: 0,
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -1848,6 +1873,109 @@ mod tests {
                     version: "2.0.0".into(),
                 },
             }]
+        );
+    }
+
+    /// Contract M9d D9 (C8): a scip-go reference into another ok scip-go job's module at an
+    /// empty version (`.`: the type checker read the in-repo tree, under a `go.work`) is no
+    /// package, its namespace occurrence neither: it is joined (D8). The same module at a real
+    /// version (`v0.4.3`, from the module cache) keeps its package, and so does a third-party
+    /// module at `.` (replaced by a directory outside every job). With no module handed back,
+    /// the in-repo reference is a package as before.
+    #[test]
+    fn in_repo_modules_are_not_packages() {
+        const PUB: &str = "example.com/mm/server/public";
+        let src = "package app\n\nfunc Run() {\n\tmodel.NewId()\n\tmodel.Old()\n\tdep.Do()\n}\n";
+        let facts = rb_syntax::extract(Language::Go, src.as_bytes()).unwrap();
+        let path = "server/app/a.go";
+        let at = |token: &str| -> Span {
+            let line = src.lines().position(|l| l.contains(token)).unwrap();
+            let col = src.lines().nth(line).unwrap().find(token).unwrap();
+            let (line, col) = (line as i32, col as i32);
+            [line, col, line, col + token.len() as i32]
+        };
+        let occ = |span: Span, symbol: &str, roles: i32| Occurrence {
+            span,
+            symbol: symbol.into(),
+            roles,
+            enclosing: None,
+        };
+        let qualifier = {
+            let s = at("model.NewId");
+            [s[0], s[1], s[2], s[1] + "model".len() as i32]
+        };
+        let in_repo = |d: &str| format!("scip-go gomod {PUB} . `{PUB}/model`/{d}");
+        let cached = format!("scip-go gomod {PUB} v0.4.3 `{PUB}/model`/Old().");
+        let third_party = "scip-go gomod github.com/acme/dep . `github.com/acme/dep`/Do().";
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "app/a.go".into(),
+                occurrences: vec![
+                    occ(
+                        at("Run"),
+                        "scip-go gomod example.com/mm/server/v8 . `example.com/mm/server/v8/app`/Run().",
+                        1,
+                    ),
+                    // The package qualifier `model`: a namespace of the in-repo module.
+                    occ(qualifier, &in_repo(""), 0),
+                    occ(at("NewId"), &in_repo("NewId()."), 0),
+                    occ(at("Old"), &cached, 0),
+                    occ(at("Do"), third_party, 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files = BTreeMap::from([(path, (Language::Go, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined_with = |modules: &BTreeSet<&str>| {
+            join_handing_back(
+                &index,
+                "server",
+                &files,
+                &keys,
+                &[Language::Go],
+                &rb_scip::TsScopes::build([]),
+                modules,
+            )
+        };
+        let package_use = |span: Span, name: &str, version: &str| PackageUse {
+            at: Evidence {
+                path: path.into(),
+                span,
+            },
+            package: rb_scip::Package {
+                manager: "go".into(),
+                name: name.into(),
+                version: version.into(),
+            },
+        };
+        let joined = joined_with(&BTreeSet::from([PUB]));
+        // The positive control: the in-repo reference is seen, and handed back to the join.
+        assert_eq!(
+            joined
+                .external
+                .iter()
+                .map(|e| e.symbol.as_str())
+                .collect::<Vec<_>>(),
+            [in_repo("NewId()."), cached.clone()]
+        );
+        assert_eq!(
+            joined.packages,
+            [
+                package_use(at("Old"), PUB, "v0.4.3"),
+                package_use(at("Do"), "github.com/acme/dep", ""),
+            ]
+        );
+        // No other ok job declares the module: its references are a package, as before D9.
+        assert_eq!(
+            joined_with(&BTreeSet::new()).packages,
+            [
+                package_use(qualifier, PUB, ""),
+                package_use(at("Old"), PUB, "v0.4.3"),
+                package_use(at("Do"), "github.com/acme/dep", ""),
+            ]
         );
     }
 
@@ -3770,6 +3898,8 @@ mod tests {
                 lombok_removed: 0,
                 documents_lombok: 0,
                 documents_outside_root: 0,
+                locals_invalid_type: 0,
+                locals: 0,
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();

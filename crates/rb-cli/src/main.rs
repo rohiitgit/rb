@@ -1649,6 +1649,16 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         if n("definitions_local") > 0 {
             let _ = write!(line, ", {} local definitions", n("definitions_local"));
         }
+        // A scip-go index whose packages did not all load (contract M9d D10): scip-go exits 0,
+        // and its locals typed `invalid type` are the only sign. Only when there are any.
+        if n("locals_invalid_type") > 0 {
+            let _ = write!(
+                line,
+                ", {} of {} locals typed invalid",
+                n("locals_invalid_type"),
+                n("locals")
+            );
+        }
     }
     line
 }
@@ -4057,6 +4067,40 @@ mod tests {
         assert_eq!(
             status_detail(&fallback),
             " (workspace failed: indexed without go.work)"
+        );
+    }
+
+    /// Contract M9d D10 (C9): a scip-go index with locals typed `invalid type` says how many,
+    /// of how many, at the end of its line; one without the keys (every healthy index) says
+    /// nothing.
+    #[test]
+    fn scip_status_line_prints_invalid_locals() {
+        let line = |coverage: serde_json::Value| {
+            scip_status_line(&rb_model::Diagnostic {
+                kind: "scip_status".into(),
+                path: Some("server".into()),
+                span: None,
+                detail: json!({
+                    "indexer": "scip-go", "status": "ok", "unpinned": false,
+                    "image": "sha256:1", "coverage": coverage,
+                }),
+            })
+        };
+        let degraded = line(json!({
+            "definitions_matched": 2, "definitions_total": 2, "relationships_dropped": 0,
+            "locals_invalid_type": 1, "locals": 2,
+        }));
+        assert!(
+            degraded.ends_with(
+                ", relationships dropped 0 (0 in project, 0 anonymous), 1 of 2 locals typed invalid"
+            ),
+            "{degraded}"
+        );
+        let healthy = line(json!({"definitions_matched": 2, "definitions_total": 2}));
+        assert!(!healthy.contains("locals typed invalid"), "{healthy}");
+        assert!(
+            healthy.ends_with(", relationships dropped 0 (0 in project, 0 anonymous)"),
+            "{healthy}"
         );
     }
 

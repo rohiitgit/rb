@@ -1225,11 +1225,12 @@ pub fn assemble(
             &go_consts,
         )?);
     }
-    // Each index's own edges are exact; the cross-project joins are synthetic (contract M9c D8′).
+    // Each index's own edges are exact; a cross-project join carries its own certainty:
+    // `exact` for a byte-equal symbol, else `synthetic` (contracts M9c D8′, M9d D8).
     let scip_edges = scip_edges
         .into_iter()
         .map(|e| (e, Certainty::Exact))
-        .chain(cross_edges.into_iter().map(|e| (e, Certainty::Synthetic)));
+        .chain(cross_edges);
     for (e, certainty) in scip_edges {
         let src = match e.src {
             scip::Source::Symbol(key) => NodeKey::new(NodeKind::Symbol, key),
@@ -1519,9 +1520,11 @@ pub fn assemble(
 /// handed back (`handed_back`: from root, references) names a package another ok scip-go job's
 /// `go.mod` declares (`go_jobs`: root, module path). When exactly one other job has that module
 /// path, the reference joins that job's anchored definition of the same symbol with the version
-/// dropped ([`scip::unversioned`]). The type checker resolved the name against the version the
-/// module requires (`v0.4.3` from the module cache), while the target is the in-repo definition
-/// (version `.`), so the edge is `synthetic`, never `exact`. A symbol that job defines without
+/// dropped ([`scip::unversioned`]). When the reference's symbol string is byte-equal to that
+/// definition's, version included, the type checker read the in-repo tree (under a `go.work`,
+/// contract M9d D5), and the edge is `exact` (M9d D8). Otherwise it resolved the name against the
+/// version the module requires (`v0.4.3` from the module cache) while the target is the in-repo
+/// definition (version `.`), and the edge is `synthetic` (M9c). A symbol that job defines without
 /// anchoring it, or does not define, is `unanchored`. Two or more jobs with the module path make
 /// it `ambiguous`, counted against each of them, with no edge. One `scip_cross_project`
 /// diagnostic per (from root, to root) with a count; `keys` are the final symbol keys, `roots`
@@ -1531,9 +1534,10 @@ fn join_across_projects(
     handed_back: &[(&str, Vec<scip::External>)],
     keys: &BTreeMap<&str, Vec<String>>,
     roots: &[&str],
-) -> (Vec<scip::ScipEdge>, Vec<Diagnostic>) {
+) -> (Vec<(scip::ScipEdge, Certainty)>, Vec<Diagnostic>) {
     #[derive(Default)]
     struct Counts {
+        exact: usize,
         synthetic: usize,
         ambiguous: usize,
         unanchored: usize,
@@ -1574,13 +1578,24 @@ fn join_across_projects(
             let n = counts.entry((from, to)).or_default();
             match symbols.get(&key) {
                 Some(dst) => {
-                    n.synthetic += 1;
-                    edges.push(scip::ScipEdge {
-                        src: r.src.clone(),
-                        kind: r.kind,
-                        dst: (*dst).to_owned(),
-                        at: r.at.clone(),
-                    });
+                    // Contract M9d D8: the same string, version included, is the same symbol.
+                    let exact = r.symbol == *dst;
+                    let certainty = if exact {
+                        n.exact += 1;
+                        Certainty::Exact
+                    } else {
+                        n.synthetic += 1;
+                        Certainty::Synthetic
+                    };
+                    edges.push((
+                        scip::ScipEdge {
+                            src: r.src.clone(),
+                            kind: r.kind,
+                            dst: (*dst).to_owned(),
+                            at: r.at.clone(),
+                        },
+                        certainty,
+                    ));
                 }
                 None => n.unanchored += 1,
             }
@@ -1601,6 +1616,7 @@ fn join_across_projects(
             span: None,
             detail: json!({
                 "to": label(to),
+                "exact": n.exact,
                 "synthetic": n.synthetic,
                 "ambiguous": n.ambiguous,
                 "unanchored": n.unanchored,
@@ -1684,6 +1700,12 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             if n > 0 {
                 detail["coverage"][key] = n.into();
             }
+        }
+        // Contract M9d D10: a scip-go index's locals, both counts, only when some local is
+        // typed `invalid type`, so a healthy index dumps as before M9d.
+        if c.locals_invalid_type > 0 {
+            detail["coverage"]["locals_invalid_type"] = c.locals_invalid_type.into();
+            detail["coverage"]["locals"] = c.locals.into();
         }
     }
     // An index without its environment keeps the failed fetch's tail: why the environment is
@@ -2890,6 +2912,51 @@ mod tests {
         );
     }
 
+    /// Contract M9d D10 (C9): the join carries the decoder's counts of a scip-go index's locals
+    /// into the coverage, and `locals_invalid_type` and `locals` are written only when the
+    /// first is non-zero, so a healthy index dumps as before M9d.
+    #[test]
+    fn invalid_locals_are_written_only_when_non_zero() {
+        let index = rb_scip::ScipIndex {
+            locals: 2,
+            locals_invalid_type: 1,
+            ..Default::default()
+        };
+        let joined = scip::join(
+            &index,
+            "server",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[rb_syntax::Language::Go],
+            &rb_scip::TsScopes::build([]),
+        );
+        assert_eq!(
+            (joined.coverage.locals_invalid_type, joined.coverage.locals),
+            (1, 2)
+        );
+        let project = ok_project("server", "scip-go", vec![]);
+        let d = scip_status(&project, Some(&joined.coverage));
+        assert_eq!(d.detail["coverage"]["locals_invalid_type"], 1);
+        assert_eq!(d.detail["coverage"]["locals"], 2);
+        let plain = scip::Coverage::default();
+        let mut without = d.detail["coverage"].as_object().unwrap().clone();
+        without.remove("locals_invalid_type");
+        without.remove("locals");
+        assert_eq!(
+            serde_json::Value::Object(without),
+            scip_status(&project, Some(&plain)).detail["coverage"]
+        );
+        // Every local typed: neither key, however many locals.
+        let healthy = scip::Coverage {
+            locals: 202_391,
+            ..Default::default()
+        };
+        assert_eq!(
+            scip_status(&project, Some(&healthy)).detail["coverage"],
+            scip_status(&project, Some(&plain)).detail["coverage"]
+        );
+    }
+
     /// Contract M4a amendment 16 (evaluator pass 6, V2): a Feign client key in any settings
     /// file (a config server's shared file too) caps every Feign site; other Feign keys and
     /// other files do not.
@@ -4060,7 +4127,7 @@ mod tests {
             cross(&diagnostics),
             [(
                 Some("server".to_owned()),
-                json!({"to": "public", "synthetic": 3, "ambiguous": 0, "unanchored": 2}),
+                json!({"to": "public", "exact": 0, "synthetic": 3, "ambiguous": 0, "unanchored": 2}),
             )]
         );
         // `references_external` keeps its meaning: all ten are still counted there.
@@ -4086,13 +4153,126 @@ mod tests {
             [
                 (
                     Some("server".to_owned()),
-                    json!({"to": "copy", "synthetic": 0, "ambiguous": 5, "unanchored": 0}),
+                    json!({"to": "copy", "exact": 0, "synthetic": 0, "ambiguous": 5, "unanchored": 0}),
                 ),
                 (
                     Some("server".to_owned()),
-                    json!({"to": "public", "synthetic": 0, "ambiguous": 5, "unanchored": 0}),
+                    json!({"to": "public", "exact": 0, "synthetic": 0, "ambiguous": 5, "unanchored": 0}),
                 ),
             ]
         );
+    }
+
+    /// Contract M9d D8 (C7): a handed-back reference whose symbol string is byte-equal to the
+    /// defining job's definition (version `.`: the type checker read the in-repo tree, under a
+    /// `go.work`) joins it `exact`; one at the module cache's version (`v0.4.3` against `.`)
+    /// joins it `synthetic`, as M9c built it. The `scip_cross_project` diagnostic counts each.
+    /// D9 at the graph: the in-repo module at `.` is no `Package`, the cached version still is.
+    #[test]
+    fn byte_equal_cross_project_symbols_join_exact() {
+        const SRV: &str = "example.com/mm/server/v8";
+        const PUB: &str = "example.com/mm/server/public";
+        let go = |src: &str| rb_syntax::extract(rb_syntax::Language::Go, src.as_bytes()).unwrap();
+        let server = go(concat!(
+            "package app\n\n",
+            "func Run() {\n",
+            "\tmodel.NewId()\n",
+            "\tmodel.Old()\n",
+            "\tvar u model.User\n",
+            "}\n",
+        ));
+        let public =
+            go("package model\n\nfunc NewId() {}\n\nfunc Old() {}\n\ntype User struct{}\n");
+        let own_public = |d: &str| format!("scip-go gomod {PUB} . `{PUB}/model`/{d}");
+        let run = format!("scip-go gomod {SRV} . `{SRV}/app`/Run().");
+        let server_sym = |name: &str| match name {
+            "Run" => run.clone(),
+            // Resolved against the module cache: the version differs from the definition's.
+            "Old" => format!("scip-go gomod {PUB} v0.4.3 `{PUB}/model`/Old()."),
+            "User" => own_public("User#"),
+            other => own_public(&format!("{other}().")),
+        };
+        let public_sym = |name: &str| match name {
+            "User" => own_public("User#"),
+            other => own_public(&format!("{other}().")),
+        };
+        let roots = [("server", SRV), ("public", PUB)];
+        let facts = BTreeMap::from([
+            ("server/app/a.go", (rb_syntax::Language::Go, &server)),
+            ("public/model/m.go", (rb_syntax::Language::Go, &public)),
+        ]);
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: roots
+                .iter()
+                .map(|(root, _)| format!("{root}/go.mod"))
+                .chain(facts.keys().map(|p| (*p).to_owned()))
+                .map(|p| entry(&p))
+                .collect(),
+            skipped: vec![],
+        };
+        let boundaries = Boundaries::new(
+            roots
+                .iter()
+                .map(|(root, _)| project(root, &format!("{root}/go.mod")))
+                .collect(),
+            vec![],
+        );
+        let content = Content {
+            facts,
+            go_modules: roots
+                .iter()
+                .map(|(root, module)| ((*root).to_owned(), (*module).to_owned()))
+                .collect(),
+            scip: vec![
+                ok_project(
+                    "server",
+                    "scip-go",
+                    vec![document_for("app/a.go", &server, &server_sym)],
+                ),
+                ok_project(
+                    "public",
+                    "scip-go",
+                    vec![document_for("model/m.go", &public, &public_sym)],
+                ),
+            ],
+            ..Content::default()
+        };
+        let (g, diagnostics) = assemble(&manifest, None, &boundaries, &content).unwrap();
+        let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+        let mut from_run: Vec<(EdgeKind, String, Certainty)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.provenance == Provenance::Scip && key(e.src) == run)
+            .map(|e| (e.kind, key(e.dst), e.certainty))
+            .collect();
+        from_run.sort();
+        assert_eq!(
+            from_run,
+            [
+                (EdgeKind::Calls, own_public("NewId()."), Certainty::Exact),
+                (EdgeKind::Calls, own_public("Old()."), Certainty::Synthetic),
+                (EdgeKind::References, own_public("User#"), Certainty::Exact),
+            ]
+        );
+        let cross: Vec<(Option<String>, Value)> = diagnostics
+            .iter()
+            .filter(|d| d.kind == "scip_cross_project")
+            .map(|d| (d.path.clone(), d.detail.clone()))
+            .collect();
+        assert_eq!(
+            cross,
+            [(
+                Some("server".to_owned()),
+                json!({"to": "public", "exact": 2, "synthetic": 1, "ambiguous": 0, "unanchored": 0}),
+            )]
+        );
+        let packages: Vec<String> = g
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Package)
+            .map(|n| n.key.clone())
+            .collect();
+        assert_eq!(packages, [format!("go/{PUB}@v0.4.3")]);
     }
 }
