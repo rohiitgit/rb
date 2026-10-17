@@ -205,5 +205,77 @@
   "old": "            for &form in index.forms.borrow().iter() {\n",
   "new": "            for &form in index.forms.borrow().iter().filter(|f| **f != \"call_segment\") {\n",
   "what": "`tier_b_forms` skips `call_segment`"
+ },
+ {
+  "id": "m323",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "            \"super()\" if language == Language::Python => {\n",
+  "new": "            \"super()\" if language == Language::Python && false => {\n",
+  "what": "`super()` arm removed"
+ },
+ {
+  "id": "m324",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "                let types = self.supertypes(class);\n                if !types.is_empty() {\n                    self.note(\"super_call\");\n",
+  "new": "                let types = vec![class];\n                if !types.is_empty() {\n                    self.note(\"super_call\");\n",
+  "what": "`super()` resolves to the enclosing class"
+ },
+ {
+  "id": "m325",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "        if self.language(path) == Language::Python {\n            let found = self.imported(path, name, want, true);\n",
+  "new": "        if self.language(path) == Language::Python && false {\n            let found = self.imported(path, name, want, true);\n",
+  "what": "star import ignored"
+ },
+ {
+  "id": "m326",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "                    if !name.starts_with('_') {\n                        for &f in targets.iter().filter(|&&f| !self.defines_all(f)) {\n",
+  "new": "                    if true {\n                        for &f in targets.iter().filter(|&&f| !self.defines_all(f)) {\n",
+  "what": "`_` names exported by a star import"
+ },
+ {
+  "id": "m327",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "                        for &f in targets.iter().filter(|&&f| !self.defines_all(f)) {\n",
+  "new": "                        for &f in targets.iter() {\n",
+  "what": "`__all__` targets not skipped"
+ },
+ {
+  "id": "m328",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "        if depth >= Self::MAX_REEXPORT_DEPTH {\n",
+  "new": "        if depth >= Self::MAX_REEXPORT_DEPTH || depth == 0 {\n",
+  "what": "re-exports not followed"
+ },
+ {
+  "id": "m329",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_super_star_reexport_and_module_vars_resolve",
+  "file": "resolve.rs",
+  "old": "                    && let Some(types) = self.module_variable(targets, &n.name)\n",
+  "new": "                    && let Some(types) = self.module_variable(targets, &n.name).filter(|_| false)\n",
+  "what": "module variables not typed"
+ },
+ {
+  "id": "m330",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::python_raise_and_inherited_init_construct",
+  "file": "resolve.rs",
+  "old": "                    .members(class, \"__init__\", |k| {\n",
+  "new": "                    .named(class.0, Some(class.1), \"__init__\", |k| {\n",
+  "what": "`constructor` looks only in the class"
  }
 ]

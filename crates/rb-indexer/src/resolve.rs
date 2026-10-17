@@ -1035,6 +1035,13 @@ impl<'a> Index<'a> {
             }
             return (Vec::new(), TypeLevel::Miss);
         }
+        // Python: star imports after own definitions and named imports (contract M9c D5).
+        if self.language(path) == Language::Python {
+            let found = self.imported(path, name, want, true);
+            if !found.is_empty() {
+                return (found, TypeLevel::ImportOnDemand);
+            }
+        }
         let found = self.same_package(path, name, want);
         if !found.is_empty() {
             return (found, TypeLevel::SamePackage);
@@ -1114,7 +1121,12 @@ impl<'a> Index<'a> {
             if language == Language::Java && import.wildcard != on_demand {
                 continue;
             }
-            if language != Language::Java && on_demand {
+            // Python: star imports are a level of their own, after named imports (contract M9c
+            // D5).
+            if language == Language::Python && import.wildcard != on_demand {
+                continue;
+            }
+            if !matches!(language, Language::Java | Language::Python) && on_demand {
                 continue;
             }
             match language {
@@ -1143,9 +1155,23 @@ impl<'a> Index<'a> {
                             .flat_map(|(m, _)| self.named(f, Some(m), name, want))
                     }));
                 }
+                // `from m import *` brings `m`'s top-level names not starting with `_`, unless `m`
+                // lists its own in `__all__` (contract M9c D5).
+                Language::Python if import.wildcard => {
+                    if !name.starts_with('_') {
+                        for &f in targets.iter().filter(|&&f| !self.defines_all(f)) {
+                            out.extend(self.python_exported(f, name, want, true));
+                        }
+                    }
+                }
                 _ => {
                     for n in import.names.iter().filter(|n| n.local == name) {
-                        if n.name != "default" {
+                        if language == Language::Python {
+                            // A name the target only imports is followed (contract M9c D5).
+                            for &f in targets {
+                                out.extend(self.python_exported(f, &n.name, want, false));
+                            }
+                        } else if n.name != "default" {
                             out.extend(top(&n.name));
                         } else if matches!(
                             language,
@@ -1425,6 +1451,144 @@ impl<'a> Index<'a> {
         (defs == 0 && !b.type_name.is_empty() && !hidden).then_some((*file, *b))
     }
 
+    /// Python imports followed from a module to where a name is defined (contract M9c D5).
+    const MAX_REEXPORT_DEPTH: usize = 8;
+
+    /// The top-level, non-member bindings of `name` in `f`. A Python module-level `x = …` is
+    /// also a top-level `constant` definition, which is the binding's scope.
+    fn top_bindings(&self, f: &str, name: &str) -> Vec<&'a Binding> {
+        let defs = &self.facts(f).definitions;
+        self.locals
+            .get(f)
+            .and_then(|l| l.get(name))
+            .into_iter()
+            .flat_map(|l| l.bindings.iter().copied())
+            .filter(|b| {
+                b.scope.is_none_or(|d| {
+                    let d = &defs[d];
+                    d.parent.is_none() && d.kind == DefKind::Constant && d.name == name
+                })
+            })
+            .collect()
+    }
+
+    /// Whether Python module `f` lists its public names in a top-level `__all__`, which a star
+    /// import then skips (contract M9c D5: the list itself is not read).
+    fn defines_all(&self, f: &str) -> bool {
+        self.scopes[f].top.contains_key("__all__") || !self.top_bindings(f, "__all__").is_empty()
+    }
+
+    /// Where the top-level name `name` of Python module `f` comes from (contract M9c D5): `f`,
+    /// when it defines or binds the name at top level; else wherever `f`'s named imports of the
+    /// name lead, and only when they lead nowhere its star imports, at most
+    /// [`Self::MAX_REEXPORT_DEPTH`] imports deep, each (module, name) once. As (module, the name
+    /// there, reached through a star import).
+    fn owners(&self, f: &'a str, name: &str) -> Vec<(&'a str, String, bool)> {
+        let mut out = Vec::new();
+        self.owners_from(f, name, 0, false, &mut BTreeSet::new(), &mut out);
+        out
+    }
+
+    fn owners_from(
+        &self,
+        f: &'a str,
+        name: &str,
+        depth: usize,
+        star: bool,
+        seen: &mut BTreeSet<(&'a str, String)>,
+        out: &mut Vec<(&'a str, String, bool)>,
+    ) {
+        if !seen.insert((f, name.to_owned())) {
+            return;
+        }
+        if self.scopes[f].top.contains_key(name) || !self.top_bindings(f, name).is_empty() {
+            out.push((f, name.to_owned(), star));
+            return;
+        }
+        if depth >= Self::MAX_REEXPORT_DEPTH {
+            return;
+        }
+        let before = out.len();
+        let imports = self.facts(f).imports.iter().zip(&self.imports[f]);
+        for (import, targets) in imports.clone() {
+            for n in import.names.iter().filter(|n| n.local == name) {
+                for &t in targets {
+                    self.owners_from(t, &n.name, depth + 1, star, seen, out);
+                }
+            }
+        }
+        if out.len() > before || name.starts_with('_') {
+            return;
+        }
+        for (_, targets) in imports.filter(|(import, _)| import.wildcard) {
+            for &t in targets.iter().filter(|&&t| !self.defines_all(t)) {
+                self.owners_from(t, name, depth + 1, true, seen, out);
+            }
+        }
+    }
+
+    /// The definitions `want` accepts that the top-level name `name` of Python module `f`
+    /// stands for, through its re-exports (contract M9c D5); `star`: `f` is a star import's
+    /// target.
+    fn python_exported(
+        &self,
+        f: &'a str,
+        name: &str,
+        want: fn(DefKind) -> bool,
+        star: bool,
+    ) -> Vec<Sym<'a>> {
+        let mut out = Vec::new();
+        for (g, m, via_star) in self.owners(f, name) {
+            let found = self.named(g, None, &m, want);
+            if found.is_empty() {
+                continue;
+            }
+            if star || via_star {
+                self.note("star_import");
+            }
+            if g != f {
+                self.note("reexport");
+            }
+            out.extend(found);
+        }
+        out
+    }
+
+    /// The types an imported Python name stands for when it is a module-level variable where
+    /// the import leads (`smth = Smth()`; contract M9c D5): its only top-level binding there,
+    /// with a type.
+    fn module_variable(&self, targets: &[&'a str], name: &str) -> Option<Vec<Sym<'a>>> {
+        let (mut found, mut reexport, mut star) = (Vec::new(), false, false);
+        for &f in targets {
+            for (g, m, via_star) in self.owners(f, name) {
+                let bindings = self.top_bindings(g, &m);
+                if !bindings.is_empty() {
+                    reexport |= g != f;
+                    star |= via_star;
+                }
+                found.extend(bindings.into_iter().map(|b| (g, b)));
+            }
+        }
+        let [(g, b)] = found.as_slice() else {
+            return None;
+        };
+        if b.type_name.is_empty() {
+            return None;
+        }
+        let types = self.resolve_type(g, None, &b.type_name);
+        if types.is_empty() {
+            return None;
+        }
+        self.note("module_variable");
+        if reexport {
+            self.note("reexport");
+        }
+        if star {
+            self.note("star_import");
+        }
+        Some(types)
+    }
+
     /// The declaration `name` refers to at position `at` in `path`: the innermost local whose
     /// extent contains `at` (a class body's own names are not locals of its methods); else (Java)
     /// a field of an enclosing class. An untyped declaration still counts: it hides outer ones and
@@ -1561,6 +1725,16 @@ impl<'a> Index<'a> {
                 let class = self.enclosing_type(path, scope)?;
                 return Some((Container::Types(self.supertypes(class)), 1));
             }
+            // Python: exactly `super()` is `super`, the enclosing class's supertypes (contract
+            // M9c D5); `super(C, self)` is not.
+            "super()" if language == Language::Python => {
+                let class = self.enclosing_type(path, scope)?;
+                let types = self.supertypes(class);
+                if !types.is_empty() {
+                    self.note("super_call");
+                }
+                return Some((Container::Types(types), 1));
+            }
             _ => {}
         }
         // Go: a call at the head (`Setup(t).App`) stands for its callees' result types (contract
@@ -1606,10 +1780,18 @@ impl<'a> Index<'a> {
                 return Some((Container::Module(targets.clone()), 1));
             }
             for n in import.names.iter().filter(|n| n.local == s0) {
-                let mut types: Vec<Sym<'a>> = targets
-                    .iter()
-                    .flat_map(|&f| self.named(f, None, &n.name, is_type))
-                    .collect();
+                let mut types: Vec<Sym<'a>> = if language == Language::Python {
+                    // A class the target only imports is followed (contract M9c D5).
+                    targets
+                        .iter()
+                        .flat_map(|&f| self.python_exported(f, &n.name, is_type, false))
+                        .collect()
+                } else {
+                    targets
+                        .iter()
+                        .flat_map(|&f| self.named(f, None, &n.name, is_type))
+                        .collect()
+                };
                 if types.is_empty() && language == Language::Java {
                     let module: Vec<&str> = import.module.split('.').collect();
                     types = targets
@@ -1632,6 +1814,12 @@ impl<'a> Index<'a> {
                     .collect();
                 if !submodule.is_empty() {
                     return Some((Container::Module(submodule), 1));
+                }
+                // Python: the target's module-level variable (`smth = Smth()`; contract M9c D5).
+                if language == Language::Python
+                    && let Some(types) = self.module_variable(targets, &n.name)
+                {
+                    return Some((Container::Types(types), 1));
                 }
             }
         }
@@ -1785,7 +1973,20 @@ impl<'a> Index<'a> {
     fn constructor(&self, class: Sym<'a>) -> Option<Sym<'a>> {
         let name = match self.language(class.0) {
             Language::Java => self.def(class).name.as_str(),
-            Language::Python => "__init__",
+            // Python inherits `__init__`: the class's own, else the nearest supertype's,
+            // breadth-first, the leftmost of a tie (contract M9c D5).
+            Language::Python => {
+                let init = self
+                    .members(class, "__init__", |k| {
+                        matches!(k, DefKind::Method | DefKind::Function)
+                    })
+                    .into_iter()
+                    .next()?;
+                if (init.0, self.def(init).parent) != (class.0, Some(class.1)) {
+                    self.note("inherited_init");
+                }
+                return Some(init);
+            }
             Language::TypeScript | Language::Tsx | Language::JavaScript => "constructor",
             // Contract M6i S2: constructor dispatch lands with Tier B (Go precedent: none).
             Language::Go | Language::Kotlin | Language::CSharp => return None,
@@ -2939,6 +3140,313 @@ func f(s *svc.Service, al *Alias, w *Wrap) {
                 ("web/u.ts".to_owned(), with(&[("default_import", 2)])),
             ]
         );
+    }
+
+    /// `(path, detail)` of every `tier_b_forms` diagnostic, with only its non-zero keys.
+    fn forms_used(built: &Built) -> Vec<(String, Vec<(String, u64)>)> {
+        built
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "tier_b_forms")
+            .map(|d| {
+                let used = d.detail.as_object().unwrap().iter();
+                let used = used
+                    .filter_map(|(k, v)| v.as_u64().filter(|&n| n > 0).map(|n| (k.clone(), n)))
+                    .collect();
+                (d.path.clone().unwrap_or_default(), used)
+            })
+            .collect()
+    }
+
+    /// Contract M9c C6 (D5, Python only), the PyCG shapes and their refusals: exactly `super()`
+    /// stands for the enclosing class's supertypes (`super(C, self)` does not); `from m import *`
+    /// comes after own definitions and named imports, never brings `_` names, and skips a target
+    /// that defines `__all__`; a name an `__init__.py` only imports is followed to where it is
+    /// defined, renamed or through a star import, and a re-export cycle ends; an imported
+    /// module-level binding (`smth = Smth()`) types a qualifier when it is the only one.
+    #[test]
+    fn python_super_star_reexport_and_module_vars_resolve() {
+        let built = build(
+            &[
+                (
+                    "m/sup.py",
+                    PY,
+                    "class A:
+    def __init__(self):
+        pass
+    def run(self):
+        pass
+
+class B(A):
+    def __init__(self):
+        super().__init__()
+        super().run()
+
+class C(B):
+    def __init__(self):
+        super().__init__()
+    def other(self):
+        super(C, self).run()
+",
+                ),
+                ("pkg/__init__.py", PY, ""),
+                (
+                    "pkg/stars.py",
+                    PY,
+                    "def func1():\n    pass\n\ndef func2():\n    pass\n\ndef func3():\n    pass\n\ndef _hidden():\n    pass\n\nclass Klass:\n    def m(self):\n        pass\n",
+                ),
+                (
+                    "pkg/limited.py",
+                    PY,
+                    "__all__ = [\"shown\"]\n\ndef shown():\n    pass\n",
+                ),
+                ("pkg/other.py", PY, "def func3():\n    pass\n"),
+                (
+                    "pkg/star_user.py",
+                    PY,
+                    "from pkg.stars import *
+from pkg.limited import *
+from pkg.other import func3
+
+def func2():
+    pass
+
+def use():
+    func1()
+    func2()
+    func3()
+    _hidden()
+    shown()
+    Klass.m(None)
+",
+                ),
+                (
+                    "nested/__init__.py",
+                    PY,
+                    "from .mod import func2 as f2\nfrom .deep import *\n\ndef func():\n    pass\n",
+                ),
+                ("nested/mod.py", PY, "def func2():\n    pass\n"),
+                ("nested/deep.py", PY, "from .deeper import g\n"),
+                ("nested/deeper.py", PY, "def g():\n    pass\n"),
+                ("cyc/__init__.py", PY, ""),
+                ("cyc/a.py", PY, "from cyc.b import loop\n"),
+                ("cyc/b.py", PY, "from cyc.a import loop\n"),
+                (
+                    "app/main.py",
+                    PY,
+                    "from nested import func, f2, g
+from cyc.a import loop
+
+def run():
+    func()
+    f2()
+    g()
+    loop()
+",
+                ),
+                (
+                    "svc/__init__.py",
+                    PY,
+                    "from .impl import smth\nfrom .impl import twice\n",
+                ),
+                (
+                    "svc/impl.py",
+                    PY,
+                    "class Smth:
+    def func(self):
+        pass
+
+class Other:
+    def func(self):
+        pass
+
+smth = Smth()
+twice = Smth()
+twice = Other()
+",
+                ),
+                (
+                    "app/client.py",
+                    PY,
+                    "from svc import smth, twice
+
+def call():
+    smth.func()
+
+def call2():
+    twice.func()
+",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "client:call(). -> impl:Smth#func(). [heuristic]",
+                "main:run(). -> __init__:func(). [heuristic]",
+                "main:run(). -> deeper:g(). [heuristic]",
+                "main:run(). -> mod:func2(). [heuristic]",
+                "star_user:use(). -> other:func3(). [heuristic]",
+                "star_user:use(). -> star_user:func2(). [heuristic]",
+                "star_user:use(). -> stars:Klass#m(). [heuristic]",
+                "star_user:use(). -> stars:func1(). [heuristic]",
+                "sup:B#__init__(). -> sup:A#__init__(). [heuristic]",
+                "sup:B#__init__(). -> sup:A#run(). [heuristic]",
+                "sup:C#__init__(). -> sup:B#__init__(). [heuristic]",
+            ]
+        );
+        assert_eq!(
+            forms_used(&built),
+            [
+                (
+                    "app/client.py".to_owned(),
+                    vec![("module_variable".into(), 1), ("reexport".into(), 1)]
+                ),
+                (
+                    "app/main.py".to_owned(),
+                    vec![("reexport".into(), 2), ("star_import".into(), 1)]
+                ),
+                ("m/sup.py".to_owned(), vec![("super_call".into(), 3)]),
+                (
+                    "pkg/star_user.py".to_owned(),
+                    vec![("star_import".into(), 2)]
+                ),
+            ]
+        );
+    }
+
+    /// Contract M9c C6 (D5): Python instantiates a bare class it raises (`raise A`, `raise
+    /// Outer.B`), never the `from` cause; a class without its own `__init__` is constructed by
+    /// the nearest supertype's (breadth-first, the leftmost of a tie, as Python's MRO is at one
+    /// level). Java, whose own constructor is all `constructor` reads, is unchanged.
+    #[test]
+    fn python_raise_and_inherited_init_construct() {
+        let built = build(
+            &[
+                (
+                    "e/main.py",
+                    PY,
+                    "class A(Exception):
+    def __init__(self):
+        pass
+
+class Cause(Exception):
+    def __init__(self):
+        pass
+
+class Outer:
+    class B(Exception):
+        def __init__(self):
+            pass
+
+class Plain(Exception):
+    pass
+
+def f():
+    raise A
+
+def g():
+    raise Outer.B
+
+def h():
+    raise A from Cause
+
+def k():
+    raise Plain
+",
+                ),
+                (
+                    "mro/m.py",
+                    PY,
+                    "class A:
+    def __init__(self):
+        pass
+
+class B(A):
+    def func(self):
+        pass
+
+class C(A):
+    def func(self):
+        pass
+
+class D(B, C):
+    pass
+
+class E:
+    def __init__(self):
+        pass
+
+class N:
+    pass
+
+class G(N, E):
+    pass
+
+class F(E, A):
+    pass
+
+def basic():
+    B()
+
+def same():
+    D()
+
+def two():
+    G()
+
+def tie():
+    F()
+",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "m:basic(). -> m:A#__init__(). [heuristic]",
+                "m:same(). -> m:A#__init__(). [heuristic]",
+                "m:tie(). -> m:E#__init__(). [heuristic]",
+                "m:two(). -> m:E#__init__(). [heuristic]",
+                "main:f(). -> main:A#__init__(). [heuristic]",
+                "main:g(). -> main:Outer#B#__init__(). [heuristic]",
+                "main:h(). -> main:A#__init__(). [heuristic]",
+            ]
+        );
+        assert_eq!(
+            forms_used(&built),
+            [("mro/m.py".to_owned(), vec![("inherited_init".into(), 4)])]
+        );
+        // Java: `constructor` reads the class's own constructor only; a subclass without one
+        // has none (Tree-sitter tags `new Sub()` as a class reference, so no edge reaches it).
+        let java = [
+            (
+                "j/Base.java",
+                J,
+                "package j;\npublic class Base {\n  public Base() {}\n}\n",
+            ),
+            (
+                "j/Sub.java",
+                J,
+                "package j;\npublic class Sub extends Base {\n}\n",
+            ),
+            (
+                "p/k.py",
+                PY,
+                "class A:\n    def __init__(self):\n        pass\nclass B(A):\n    pass\n",
+            ),
+        ];
+        with_index(&java, |index| {
+            let ctor = |path: &'static str, class: usize| {
+                let found = index.constructor((path, class));
+                found.map(|s| index.key(s).rsplit('/').next().unwrap().to_owned())
+            };
+            assert_eq!(ctor("j/Base.java", 0), Some("Base#Base().".into()));
+            assert_eq!(ctor("j/Sub.java", 0), None);
+            assert_eq!(ctor("p/k.py", 2), Some("A#__init__().".into()));
+        });
     }
 
     #[test]

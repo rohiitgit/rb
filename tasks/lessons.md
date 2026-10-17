@@ -650,3 +650,7 @@
 ## 2026-10-17: an invariant that no edge observes needs an assertion on the structure itself
 - **Context (M9c P3, m318):** "embedding never enters `supertypes()`" could not be killed through edges. Go types declare no supertypes, so `implements()` skips them, and `members` reached the same embedded types either way. A mutant adding embeds to `supertypes()` changed no edge and would have survived an edge-only test.
 - **Rule:** When a mutant targets an invariant on an internal structure that other stages read (DI's `direct_supertypes`, RTA), assert the structure directly in the unit test. Pair it with a positive row that shows the input is seen (`embedded_types(Top) = [Base]`), so the empty answer is not vacuous.
+
+## 2026-10-17: a fact field means what the extractor makes it mean, per language
+- **Mistake (caught by the red test, M9c P4):** I wrote "a top-level binding" as `scope: None`. In Python a module-level `x = …` is also a top-level `constant` definition (tree-sitter-python's `tags.scm`), and the binding's scope is that definition. So `__all__` and `smth = Smth()` were invisible, and the test failed on the code, not the design.
+- **Rule:** Before keying resolution on a fact field (`scope`, `parent`, `kind`), print that field for one sample per language involved (a throwaway test, deleted at once), and write the per-language reading into the helper's doc comment.
