@@ -1386,14 +1386,19 @@ fn phase_detail(phase: &str, budget_secs: Option<u64>) -> String {
     }
 }
 
+/// After an `ok` status whose fetch failed: the index was made without the environment
+/// (contract M9d D4).
+const WITHOUT_ENVIRONMENT: &str = " (environment not installed: fetch failed)";
+
 /// What `rb index` prints after a job's status: the phase of a timeout or failure, else the
-/// reason a job did not run, else nothing.
+/// reason a job did not run, else nothing; an index without its environment says so.
 fn status_detail(status: &rb_scip::RunStatus) -> String {
     match status {
         rb_scip::RunStatus::Timeout { phase, budget_secs } => {
             phase_detail(phase.as_str(), Some(*budget_secs))
         }
         rb_scip::RunStatus::Failed(phase) => phase_detail(phase.as_str(), None),
+        rb_scip::RunStatus::OkWithoutEnvironment => WITHOUT_ENVIRONMENT.to_owned(),
         other => other
             .reason()
             .map_or_else(String::new, |reason| format!(": {reason}")),
@@ -1515,8 +1520,10 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
     }
     // A timeout's stored `reason` is rendered from its phase and budget, so the detail is
     // printed once, as `rb index` prints it (contract M3b amendment 50); a failure prints its
-    // phase (amendment 56).
+    // phase (amendment 56). An `ok` job with a phase made its index without the environment
+    // after a failed fetch (contract M9d D4).
     match d.detail["phase"].as_str() {
+        Some(_) if d.detail["status"] == "ok" => line.push_str(WITHOUT_ENVIRONMENT),
         Some(phase) => line.push_str(&phase_detail(phase, d.detail["budget_secs"].as_u64())),
         None => {
             if let Some(reason) = d.detail["reason"].as_str() {
@@ -3985,6 +3992,39 @@ mod tests {
                 "docker is not available".into()
             )),
             ": docker is not available"
+        );
+        assert_eq!(status_detail(&rb_scip::RunStatus::Ok), "");
+    }
+
+    /// Contract M9d D4 (C4): a scip-python index made without its environment after a failed
+    /// fetch is `ok` and says so on both lines, never as a failed phase; a plain `ok` prints
+    /// nothing.
+    #[test]
+    fn scip_status_line_prints_an_index_without_its_environment() {
+        let line = |unpinned: bool| {
+            scip_status_line(&rb_model::Diagnostic {
+                kind: "scip_status".into(),
+                path: Some(".".into()),
+                span: None,
+                detail: json!({
+                    "indexer": "scip-python", "status": "ok", "unpinned": unpinned,
+                    "image": "sha256:1", "phase": "fetch",
+                    "stderr_tail": "ChefBuildError: pyyaml (6.0)",
+                }),
+            })
+        };
+        assert_eq!(
+            line(false),
+            "scip: . scip-python ok (environment not installed: fetch failed)"
+        );
+        assert_eq!(
+            line(true),
+            "scip: . scip-python ok unpinned (environment not installed: fetch failed)"
+        );
+        let fallback = rb_scip::RunStatus::from_cached("ok", Some("fetch")).unwrap();
+        assert_eq!(
+            status_detail(&fallback),
+            " (environment not installed: fetch failed)"
         );
         assert_eq!(status_detail(&rb_scip::RunStatus::Ok), "");
     }

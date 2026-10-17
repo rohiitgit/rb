@@ -1090,10 +1090,7 @@ pub fn assemble(
     let go_jobs: Vec<(&str, &str)> = content
         .scip
         .iter()
-        .filter(|p| {
-            p.indexer == "scip-go"
-                && matches!((&p.status, &p.index), (rb_scip::RunStatus::Ok, Some(_)))
-        })
+        .filter(|p| p.indexer == "scip-go" && p.status.is_ok() && p.index.is_some())
         .filter_map(|p| {
             let module = content.go_modules.get(&p.root)?;
             Some((p.root.as_str(), module.as_str()))
@@ -1107,8 +1104,9 @@ pub fn assemble(
             .filter(|(path, _)| owner_of(path) == Some(project.root.as_str()))
             .map(|(path, (language, facts))| (*path, (*language, *facts)))
             .collect();
-        let coverage = match (&project.status, &project.index) {
-            (rb_scip::RunStatus::Ok, Some(index)) => {
+        // Either `ok`: with its environment, or without it (contract M9d D4).
+        let coverage = match (project.status.is_ok(), &project.index) {
+            (true, Some(index)) => {
                 // The other ok scip-go jobs' module paths (a job sharing this one's module path
                 // included: its references to it are this index's own package, never external).
                 let modules: BTreeSet<&str> = if project.indexer == "scip-go" {
@@ -1688,9 +1686,13 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
             }
         }
     }
+    // An index without its environment keeps the failed fetch's tail: why the environment is
+    // missing (contract M9d D4).
     if matches!(
         p.status,
-        rb_scip::RunStatus::Failed(_) | rb_scip::RunStatus::Timeout { .. }
+        rb_scip::RunStatus::Failed(_)
+            | rb_scip::RunStatus::Timeout { .. }
+            | rb_scip::RunStatus::OkWithoutEnvironment
     ) && !p.stderr_tail.is_empty()
     {
         detail["stderr_tail"] = p.stderr_tail.as_str().into();
@@ -2777,6 +2779,29 @@ mod tests {
         // The phase that failed is recorded, as for a timeout (contract M3b amendment 56).
         assert_eq!(d.detail["phase"], "fetch");
         assert!(d.detail.get("budget_secs").is_none(), "{}", d.detail);
+    }
+
+    /// Contract M9d D4 (C4): a scip-python index made without its environment records `ok`,
+    /// its image, the `fetch` phase and the fetch's tail (why the environment is missing); a
+    /// plain `ok` job records neither.
+    #[test]
+    fn scip_status_records_an_index_without_its_environment() {
+        let mut project = ok_project("", "scip-python", vec![]);
+        project.stderr_tail = "ChefBuildError: pyyaml (6.0)".into();
+        let plain = scip_status(&project, None);
+        assert!(plain.detail.get("phase").is_none(), "{}", plain.detail);
+        assert!(
+            plain.detail.get("stderr_tail").is_none(),
+            "{}",
+            plain.detail
+        );
+        project.status = rb_scip::RunStatus::from_cached("ok", Some("fetch")).unwrap();
+        let d = scip_status(&project, None);
+        assert_eq!(d.detail["status"], "ok");
+        assert_eq!(d.detail["phase"], "fetch");
+        assert_eq!(d.detail["image"], plain.detail["image"]);
+        assert!(d.detail.get("reason").is_none(), "{}", d.detail);
+        assert_eq!(d.detail["stderr_tail"], "ChefBuildError: pyyaml (6.0)");
     }
 
     /// Contract M6a D3, D7: a job's exported link targets (top level, any status) and the

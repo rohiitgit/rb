@@ -43,5 +43,68 @@
   "old": "        Ok(m) if m.is_dir() => writable(path)?,\n",
   "new": "        Ok(m) if m.is_dir() => {}\n",
   "what": "the permission pass dropped (plain remove_dir_all)"
+ },
+ {
+  "id": "m363",
+  "crate": "rb-scip",
+  "test": "jobs::tests::requirements_only_directories_are_python_roots",
+  "file": "jobs.rs",
+  "old": "        .chain(requirements_only.iter().cloned())\n",
+  "new": "        .chain(std::iter::empty::<String>())\n",
+  "what": "`requirements.txt` directories not roots"
+ },
+ {
+  "id": "m364",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::python_roots_without_pyproject_name_their_project",
+  "file": "orchestrate.rs",
+  "old": "    if !pyproject.is_file() {\n",
+  "new": "    if true {\n",
+  "what": "project flags passed with a `pyproject.toml` too"
+ },
+ {
+  "id": "m365",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::python_roots_without_pyproject_name_their_project",
+  "file": "orchestrate.rs",
+  "old": "    if !pyproject.is_file() {\n",
+  "new": "    if false {\n",
+  "what": "project flags never passed"
+ },
+ {
+  "id": "m366",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::poetry_errors_reach_the_tail",
+  "file": "orchestrate.rs",
+  "old": "            \"exec poetry install --no-root --no-interaction 1>&2\",\n",
+  "new": "            \"exec poetry install --no-root --no-interaction\",\n",
+  "what": "Poetry run without `1>&2`"
+ },
+ {
+  "id": "m367",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_python_fetch_indexes_without_the_environment",
+  "file": "orchestrate.rs",
+  "old": "            let python = job.indexer == Indexer::ScipPython;\n",
+  "new": "            let python = false;\n",
+  "what": "a failed Python fetch returns `failed` (no fallback)"
+ },
+ {
+  "id": "m368",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_python_fetch_indexes_without_the_environment",
+  "file": "orchestrate.rs",
+  "old": "            if !(python && failed.status == RunStatus::Failed(Phase::Fetch)) {\n",
+  "new": "            if !(python && failed.status.phase() == Some(Phase::Fetch)) {\n",
+  "what": "fallback also after a fetch timeout"
+ },
+ {
+  "id": "m369",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_python_fetch_indexes_without_the_environment",
+  "file": "orchestrate.rs",
+  "old": "            let python = job.indexer == Indexer::ScipPython;\n",
+  "new": "            let python = true;\n",
+  "what": "fallback for a non-Python job"
  }
 ]

@@ -15,7 +15,8 @@ pub struct ScipCacheEntry {
     /// by an older binary, is a miss.
     pub status: String,
     /// The phase a `failed` run stopped in (`fetch` or `index`; contract M3b amendment 56); a
-    /// `failed` row without one, written by an older binary, is a miss.
+    /// `failed` row without one, written by an older binary, is a miss. `fetch` on an `ok`
+    /// row: a scip-python index made without its environment (contract M9d D4).
     pub phase: Option<String>,
     /// `index.scip` bytes when `ok`.
     pub index: Option<Vec<u8>>,
@@ -290,7 +291,8 @@ pub(crate) fn run_projects(
         project.status = status;
         project.elapsed_ms = entry.elapsed_ms;
         project.stderr_tail = entry.stderr_tail;
-        if let (RunStatus::Ok, Some(bytes)) = (&project.status, &entry.index) {
+        // Either `ok`: with its environment, or without it (contract M9d D4).
+        if let (true, Some(bytes)) = (project.status.is_ok(), &entry.index) {
             let source_of = |doc: &str| {
                 let path = join_root(&job.root, doc);
                 blobs.get(path.as_str()).and_then(|b| read_blob(b).ok())
@@ -871,6 +873,102 @@ mod tests {
             .0;
         assert!(served[1].cached && served[1].status == RunStatus::Ok);
         assert_eq!(*retry.runs.borrow(), 2);
+    }
+
+    /// Contract M9d D4 (C4): a scip-python job whose fetch failed and whose index ran without
+    /// the environment is cached as `ok` in the `fetch` phase with the fetch's tail, its index
+    /// is decoded, and the row is served as the same status next time without a run.
+    #[test]
+    fn python_fallback_rows_round_trip() {
+        /// The fetch fails (Poetry's sdist build, as on fastapi_realworld); the index writes
+        /// a one-document index of `src/a.py`.
+        struct FetchFails {
+            runs: RefCell<usize>,
+            index: Vec<u8>,
+        }
+        impl Runner for FetchFails {
+            fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
+                *self.runs.borrow_mut() += 1;
+                let index = run.network == rb_scip::Network::None;
+                if index {
+                    std::fs::write(run.host_cwd().join("index.scip"), &self.index)?;
+                }
+                Ok(Outcome {
+                    exit_code: Some(i32::from(!index)),
+                    timed_out: false,
+                    stderr_tail: if index {
+                        String::new()
+                    } else {
+                        "ChefBuildError: pyyaml (6.0)".into()
+                    },
+                    elapsed: std::time::Duration::from_millis(7),
+                })
+            }
+            fn image_id(&self, image: &str) -> Option<String> {
+                (image == rb_scip::egress::PROXY_IMAGE).then(|| "sha256:proxy".to_owned())
+            }
+            fn start_proxy(&self, _: &rb_scip::ProxySpec) -> anyhow::Result<String> {
+                Ok("10.9.8.7".to_owned())
+            }
+            fn stop_proxy(&self, _: &str) -> String {
+                String::new()
+            }
+        }
+        let mut occurrence = field(1, &[0, 4, 5]);
+        occurrence.extend(field(2, b"scip-python python app 0.1.0 `src.a`/f()."));
+        occurrence.extend([3 << 3, 1]);
+        let mut document = field(1, b"src/a.py");
+        document.extend(field(2, &occurrence));
+        let fake = FetchFails {
+            runs: RefCell::new(0),
+            index: field(2, &document),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            entry("svc/pyproject.toml", "1"),
+            entry("svc/poetry.lock", "2"),
+            entry("svc/src/a.py", "3"),
+        ];
+        let read = |_: &str| Ok(b"def f(): pass\n".to_vec());
+        let mut cache = MemCache::default();
+        let opts = options(tmp.path(), &fake);
+        let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
+        assert_eq!(cold.len(), 1);
+        let p = &cold[0];
+        assert_eq!((p.root.as_str(), p.indexer), ("svc", "scip-python"));
+        assert_eq!(
+            (p.status.as_str(), p.status.phase()),
+            ("ok", Some(rb_scip::Phase::Fetch))
+        );
+        assert_eq!(p.stderr_tail, "ChefBuildError: pyyaml (6.0)");
+        assert!(!p.cached);
+        assert_eq!(
+            p.index.as_ref().map(|i| i.documents[0].path.as_str()),
+            Some("src/a.py"),
+            "the index is decoded"
+        );
+        assert_eq!(*fake.runs.borrow(), 2, "fetch and index");
+        assert_eq!(cache.puts, 1, "the fallback is cached");
+        let row = cache.rows.values().next().unwrap();
+        assert_eq!(
+            (
+                row.status.as_str(),
+                row.phase.as_deref(),
+                row.stderr_tail.as_str(),
+                row.index.is_some()
+            ),
+            ("ok", Some("fetch"), "ChefBuildError: pyyaml (6.0)", true)
+        );
+        let warm = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
+        assert_eq!(*fake.runs.borrow(), 2, "no container ran");
+        assert!(warm[0].cached);
+        assert_eq!(warm[0].status, cold[0].status);
+        assert_eq!(warm[0].stderr_tail, cold[0].stderr_tail);
+        assert_eq!(warm[0].index, cold[0].index);
     }
 
     /// A Maven job with the local image present runs (two fetch runs and the index) and is

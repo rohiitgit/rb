@@ -626,6 +626,64 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Mutants** (`mutants-p2.txt`): m360, m361 and m362 KILLED. m387 and m392 were re-run in the same battery: KILLED.
 - `rb.repo` identical to P1's baseline (`repo-after.txt`). No `rb-egress` container or `rb-scip` network is left.
 
+**P3 note (2026-10-18; D2–D4).** Logs in `var/m9d/logs/p3/`, scripts in `var/m9d/p3/scripts/`. Binary `var/m9d/bin/rb.p3` (debug, the P3 tree, sha256 `d4c9ecc3…`).
+- **C3, C4 red first.** Seven tests failed on their assertions before any code changed (`c3-c4-scip-red.txt`, `c4-indexer-red.txt`, `c4-cli-red.txt`), each for the reason it targets:
+  - `requirements_only_directories_are_python_roots`: 2 jobs where 5 were expected.
+  - `python_roots_without_pyproject_name_their_project`: index args `scip-python index` without the project flags.
+  - `poetry_errors_reach_the_tail`: the bare `poetry install …` argv.
+  - `a_failed_python_fetch_indexes_without_the_environment` and `python_fallback_rows_round_trip`: `("failed", Some(Fetch))` where `("ok", Some(Fetch))` was expected.
+  - `scip_status_records_an_index_without_its_environment` (lib): no `phase` key.
+  - `scip_status_line_prints_an_index_without_its_environment` (main): `ok (fetch phase)`.
+- **The red tests compile against HEAD's API.** They read the fallback through `as_str()`, `phase()` and `RunStatus::from_cached("ok", Some("fetch"))`, not through the new variant, so the red runs are assertion failures, not build errors.
+- **Design.**
+  - **D4 is a `RunStatus` variant, `OkWithoutEnvironment`.** It is stored as `ok` with phase `fetch`, and `RunStatus::is_ok()` covers both `ok` variants.
+  - **Every site that matched `RunStatus::Ok` now calls `is_ok()`.** These are the decode in `projects.rs`, and the scip-go module list and the coverage join in `lib.rs`. `grep -rn 'RunStatus::Ok\b' crates` finds, outside tests, only `RunStatus`'s own methods, `finished()` and D4's match on the index outcome.
+  - **`from_cached`.** `ok`/none gives `Ok`, and `ok`/`fetch` gives the fallback. `ok`/`index`, which no binary writes, is a miss.
+  - **D2's `pyproject.toml` test reads the export.** It checks `<export>/<root>/pyproject.toml` (the export is repository-shaped), so no `Job` field is added and the input hash already covers the file.
+- **Deviations, each with its reason.**
+  1. **`rb index` prints the elapsed time between the status and D4's suffix:** `scip: . scip-python ok 151.1s (environment not installed: fetch failed)`. That is where `(fetch phase)` goes today. `rb status` prints D4's text exactly.
+  2. **The `scip_status` diagnostic records `stderr_tail` for the fallback** as well as `phase: fetch`. FALLBACK's "(status suffix, phase)" did not name the tail, but an `ok` row with a phase and no reason would not show why the environment is missing. A plain `ok` row still records no tail, because its tail is the index phase's progress text.
+  3. **D4 does not say what happens when the index fails after a failed fetch.** In that case the job keeps the fetch's failure (`failed`/`fetch`, the fetch's tail), as before D4. An index timeout or a docker-client failure in that index phase is returned as such and is not cached. The test asserts the `failed` case.
+  4. **D2's "with `PythonLock::Requirements`" is applied literally.** A requirements-only root stays `Requirements` even beside a `poetry.lock`, because Poetry needs a `pyproject.toml`. The unit has a row for it.
+  5. **`pyproject.toml` test reflowed for its mutants.** rustfmt split the `pyproject.toml` test across lines, so it was rewritten as `let pyproject = …; if !pyproject.is_file()`, keeping m364 and m365 on one line.
+  6. **`bench/probe/m9d_probe.py:84` is a P0 record and was not edited.** It cites `RECIPE_PY` at `m6d-py-4`, and it reads `git show HEAD:` as P0 ran it (P2 had already moved its lines).
+- **Old values pinned by tests**, grepped (`m6d-py`, `RECIPE_PY`, `scip-python index`, `poetry install`, `(fetch phase)`) and updated:
+  - `a_workspace_job_fetches_at_its_root_and_indexes_every_member`: `RECIPE_PY` `m6d-py-4` → `m9d-py-1`.
+  - `python_jobs_fetch_lockfile_driven_environments_then_index_offline`: the index line now ends `scip-python index --project-name svc --project-version .`, because its `files()` export holds no `svc/pyproject.toml`. Its Poetry check (`contains("poetry install --no-root --no-interaction")`) still holds inside the `sh -c` text.
+  - No golden holds a recipe or a Python argv, and no other test was changed.
+- **Probes** (`fa-probe.txt`, `mb-probe.txt`; `probe.sh` as P2's: the bench checkout, `--force --scip-timeout-secs 3600`, cold caches; load 6–8).
+
+  | | Predicted | Measured |
+  |---|---|---|
+  | fastapi `t_m9d_fa` status | `ok (environment not installed: fetch failed)` | `rb status`: `scip: . scip-python ok (environment not installed: fetch failed), definitions matched 338/338 …` |
+  | fastapi row | `ok`, phase `fetch`, the Cython error in `stderr_tail` | `ok`/`fetch` (`80db828a…`), 2,458-character tail ending in `AttributeError: 'build_ext' object has no attribute 'cython_sources'` and Poetry's `ChefBuildError` note on pyyaml 6.0, which reaches the tail through D3 |
+  | fastapi time | fetch 9–13 s (fails) + index 11 s | 151.1 s together (emulated amd64, load 6–7) |
+  | fastapi index | 808 KB (planning's environment-less probe) | 807,852 B, the same byte count |
+  | fastapi `exact calls (scip)` | at most 335 call sites | 314 |
+  | fastapi caches | pip and Poetry 35 MB | 35 MB |
+  | microblog `t_m9d_mb` status | `scip-python ok unpinned` | `scip: . scip-python ok unpinned, definitions matched 194/194 …`; row `ok`, no phase (pip fetch rc 0) |
+  | microblog time | fetch 43 s + index about 10 s | 209.0 s together |
+  | microblog index | 263 KB with `--project-name microblog` | 253,630 B with `--project-name root` (D2 names the repository root `root`; not decomposed further) |
+  | microblog `exact calls (scip)` | at most 89 call sites | 74 |
+  | microblog cache | pip 28 MB | 28 MB |
+
+  Clean-up (`probe-cleanup.txt`): both repositories, their graphs (`rb_t_m9d_fa_43188`, `rb_t_m9d_mb_43189`) and their caches (`chmod -R u+w`, then `rm -rf`) were deleted. The two egress networks were removed with `rb gc --prefix t_m9d_ --egress`. After it: 0 rows, 0 graphs, 0 caches, 0 containers, 0 networks.
+- **Rows invalidated by the recipe bump** (`py-rows-invalidated.txt`, read `READ ONLY`). 19 scip-python rows predate P3: 18 `ok` (459 kB of indexes) and 1 `failed`/`fetch` (the bench's fastapi row). All are keyed on `m6d-py-4`, so every Python job re-runs once. Since P3 began: 1 `ok`/`fetch` (the fastapi probe) and 3 `ok` (microblog, and the e2e fixture's 2 roots).
+- **Python e2e** (`e2e-py.txt`; `scip_python_fastapi_sqlalchemy` is the only `fn scip_py…`): passed, 1 of 1, in 91 s.
+  - Goldens are unchanged: no bless, no fixture file modified, and both fixture roots have a `pyproject.toml`.
+  - Start-up removed 0 leftovers, and 0 `t_` caches were left after.
+- **Unit suites.**
+  - fmt and clippy (`--workspace --all-targets -D warnings`) clean (`clippy.txt`, `fmt-final.txt`).
+  - `cargo test -p rb-scip`: 88 passed (`rb-scip-tests.txt`).
+  - `-p rb-indexer --lib projects`: 16 passed.
+  - `-p rb-cli --bin rb`: 47 passed.
+  - `-p rb-indexer --lib`: 376 passed and 3 failed at load 8.2 (`rb-indexer-lib-tests.txt`). The 3 were the wall-clock tests `resolve::…stay_fast`, `stitch::…within_a_bound` and `di::many_beans_of_one_type_are_too_ambiguous`, all listed in `bench/mutants/timing_tests.txt` and in files P3 does not touch. Each passed alone at load 7.0–5.7 (`rb-indexer-timing-alone.txt`).
+- **Mutants** (`mutants-p3.txt`): m363–m369 KILLED. The whole m9d battery (`mutants-m9d-battery.txt`; m387 on a `ScratchDb`) is 12 of 12 KILLED, and the tree was restored.
+- **Process.**
+  - Three times, two `Edit` calls to one file went out in one message: orchestrate.rs twice and lib.rs once, on different hunks.
+  - Each pair was re-read or grepped and found landed before anything ran. The lesson of 2026-10-17 already covers this, so no new rule is added.
+- **`rb.repo`** is identical before, after the probes, and at the end (`repo-before.txt`, `repo-after-probes.txt`, `repo-after.txt`; 4 rows).
+
 ## Result
 
 Not yet built.

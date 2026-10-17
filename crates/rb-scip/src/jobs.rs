@@ -242,17 +242,27 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
         });
     }
     // Python: every pyproject.toml/setup.py directory is a job (contract M6d
-    // S2); the fetch installs from its lockfile (S4).
+    // S2); the fetch installs from its lockfile (S4). So is a directory with a
+    // requirements.txt and neither (contract M9d D2), which installs its pins.
+    let requirements_only: BTreeSet<String> = dirs_with("requirements.txt")
+        .into_iter()
+        .filter(|r| !has(&join(r, "pyproject.toml")) && !has(&join(r, "setup.py")))
+        .collect();
     let mut python_roots: Vec<String> = dirs_with("pyproject.toml")
         .into_iter()
         .chain(dirs_with("setup.py"))
+        .chain(requirements_only.iter().cloned())
         .collect();
     python_roots.sort();
     python_roots.dedup();
     for root in python_roots {
         // The strongest pin wins: a poetry.lock pins the whole tree, a
         // requirements.txt its pins only, anything else the project alone.
-        let lockfile = if has(&join(&root, "poetry.lock")) {
+        // Poetry needs a pyproject.toml, so a requirements-only root installs
+        // its pins whatever else it holds.
+        let lockfile = if requirements_only.contains(&root) {
+            PythonLock::Requirements
+        } else if has(&join(&root, "poetry.lock")) {
             PythonLock::Poetry
         } else if has(&join(&root, "requirements.txt")) {
             PythonLock::Requirements
@@ -1417,6 +1427,39 @@ mod tests {
                 "scip-python bare python(None) unpinned",
                 "scip-python libs python(Requirements) unpinned",
                 "scip-python tools python(None) unpinned",
+            ]
+        );
+    }
+
+    /// Contract M9d D2 (C3): a directory with a `requirements.txt` and neither a
+    /// `pyproject.toml` nor a `setup.py` is a Python root installing its pins (microblog's
+    /// root, microservices_demo's `src/*service`), at the repository root too. A
+    /// `requirements.txt` beside a `pyproject.toml` or a `setup.py` is that root's lockfile,
+    /// not a second job. A requirements-only root stays `Requirements` beside a `poetry.lock`
+    /// (Poetry needs a `pyproject.toml`).
+    #[test]
+    fn requirements_only_directories_are_python_roots() {
+        let files = [
+            "requirements.txt",
+            "app.py",
+            "src/emailservice/requirements.txt",
+            "src/emailservice/email_server.py",
+            "libs/pyproject.toml",
+            "libs/requirements.txt",
+            "tools/setup.py",
+            "tools/requirements.txt",
+            "legacy/requirements.txt",
+            "legacy/poetry.lock",
+            "docs/conf.py",
+        ];
+        assert_eq!(
+            summary(&files),
+            [
+                "scip-python  python(Requirements) unpinned",
+                "scip-python legacy python(Requirements) unpinned",
+                "scip-python libs python(Requirements) unpinned",
+                "scip-python src/emailservice python(Requirements) unpinned",
+                "scip-python tools python(Requirements) unpinned",
             ]
         );
     }

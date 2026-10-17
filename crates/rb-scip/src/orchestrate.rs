@@ -37,8 +37,11 @@ pub const RECIPE_GO: &str = "m6d-go-1";
 /// fetched nothing). `m6d-py-3`: pip ignores `requires-python` (S11 — the
 /// image's 3.10 predates some lockfiles' floors; versions stay pinned).
 /// `m6d-py-4`: pip reads with a 60 s socket timeout (phase 12 — the 15 s
-/// default trips on slow wheel reads through the emulated stack).
-pub const RECIPE_PY: &str = "m6d-py-4";
+/// default trips on slow wheel reads through the emulated stack). `m9d-py-1`:
+/// a root without a `pyproject.toml` names its project, Poetry's stdout reaches
+/// the tail, and a failed fetch is followed by an index without the
+/// environment (contract M9d D2–D4).
+pub const RECIPE_PY: &str = "m9d-py-1";
 
 /// scip-java's Gradle recipe (contract M6e S2): dependency resolution plus one
 /// online build in the fetch phase, then `scip-java index --build-tool Gradle`
@@ -77,6 +80,11 @@ const BUILD_CACHES_OFF: [&str; 4] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Ok,
+    /// A scip-python job whose fetch failed and whose index phase, run anyway without the
+    /// environment, wrote an index (contract M9d D4): the project's own code is indexed and
+    /// third-party names stay unresolved. Stored as `ok` with phase `fetch`; `stderr_tail` is
+    /// the fetch's.
+    OkWithoutEnvironment,
     /// The fetch or index phase failed (contract M3b amendment 56: which one is recorded, as
     /// for a timeout; an index that was not produced or could not be decoded is the index
     /// phase's); `stderr_tail` says why.
@@ -128,7 +136,7 @@ impl RunStatus {
     /// The value stored in `rb.scip_index.status` and reported per project.
     pub fn as_str(&self) -> &'static str {
         match self {
-            RunStatus::Ok => "ok",
+            RunStatus::Ok | RunStatus::OkWithoutEnvironment => "ok",
             RunStatus::Failed(_) => "failed",
             RunStatus::Timeout { .. } => "timeout",
             RunStatus::Unsupported(_) => "unsupported",
@@ -137,28 +145,37 @@ impl RunStatus {
         }
     }
 
+    /// Whether the job wrote an index: `ok`, with its environment or without it (D4).
+    pub fn is_ok(&self) -> bool {
+        matches!(self, RunStatus::Ok | RunStatus::OkWithoutEnvironment)
+    }
+
     /// Whether this outcome is written to the index cache: only a finished run of the project's
     /// own build (`ok` or `failed`). A timeout depends on the budget, and an unsupported or
     /// environment outcome on the host, so they are decided again on the next run.
     pub fn is_cacheable(&self) -> bool {
-        matches!(self, RunStatus::Ok | RunStatus::Failed(_))
+        self.is_ok() || matches!(self, RunStatus::Failed(_))
     }
 
-    /// The phase a `failed` or `timeout` job stopped in.
+    /// The phase a `failed` or `timeout` job stopped in, and the `fetch` phase that failed
+    /// before an index without the environment (D4).
     pub fn phase(&self) -> Option<Phase> {
         match self {
             RunStatus::Failed(phase) | RunStatus::Timeout { phase, .. } => Some(*phase),
+            RunStatus::OkWithoutEnvironment => Some(Phase::Fetch),
             _ => None,
         }
     }
 
-    /// The status a cache row recorded: `ok`, or `failed` with its phase. `None` for any other
-    /// value (a `timeout`, or a `failed` without a phase, written by an older binary), which
-    /// the caller treats as a miss.
+    /// The status a cache row recorded: `ok` (in the `fetch` phase: an index without the
+    /// environment, D4), or `failed` with its phase. `None` for any other value (a `timeout`,
+    /// a `failed` without a phase written by an older binary, an `ok` in the `index` phase),
+    /// which the caller treats as a miss.
     pub fn from_cached(status: &str, phase: Option<&str>) -> Option<RunStatus> {
-        match status {
-            "ok" => Some(RunStatus::Ok),
-            "failed" => phase.and_then(Phase::parse).map(RunStatus::Failed),
+        match (status, phase) {
+            ("ok", None) => Some(RunStatus::Ok),
+            ("ok", Some("fetch")) => Some(RunStatus::OkWithoutEnvironment),
+            ("failed", phase) => phase.and_then(Phase::parse).map(RunStatus::Failed),
             _ => None,
         }
     }
@@ -173,7 +190,7 @@ impl RunStatus {
                 "{} phase over its {budget_secs} s budget",
                 phase.as_str()
             )),
-            RunStatus::Ok | RunStatus::Failed(_) => None,
+            RunStatus::Ok | RunStatus::OkWithoutEnvironment | RunStatus::Failed(_) => None,
         }
     }
 }
@@ -427,6 +444,7 @@ pub fn run_job(
             Ok(None)
         })();
         let log = runner.stop_proxy(&proxy.name);
+        let mut fetch_failed = None;
         if let Some(mut failed) = fetched? {
             // What the proxy refused explains most failed fetches; the log's times are not
             // kept (they are no function of the commit).
@@ -440,7 +458,14 @@ pub fn run_job(
                 .trim()
                 .to_owned();
             }
-            return Ok(failed);
+            // Contract M9d D4: a scip-python job whose fetch failed indexes its own code
+            // without the environment. A fetch over its budget or refused by the docker
+            // client (`timeout`, `environment`) is decided again next run instead.
+            let python = job.indexer == Indexer::ScipPython;
+            if !(python && failed.status == RunStatus::Failed(Phase::Fetch)) {
+                return Ok(failed);
+            }
+            fetch_failed = Some(failed);
         }
         let outcome = match runner.run(&index) {
             Ok(outcome) => outcome,
@@ -451,13 +476,21 @@ pub fn run_job(
         } else {
             None
         };
-        Ok(finished(
-            &outcome,
-            index_bytes,
-            Phase::Index,
-            &index,
-            started,
-        ))
+        let indexed = finished(&outcome, index_bytes, Phase::Index, &index, started);
+        Ok(match (fetch_failed, &indexed.status) {
+            // An index without the environment keeps the fetch's tail (why it is missing);
+            // a failed index leaves the fetch's failure, as before D4.
+            (Some(failed), RunStatus::Ok) => ScipRun {
+                status: RunStatus::OkWithoutEnvironment,
+                stderr_tail: failed.stderr_tail,
+                ..indexed
+            },
+            (Some(failed), RunStatus::Failed(_)) => ScipRun {
+                elapsed: indexed.elapsed,
+                ..failed
+            },
+            _ => indexed,
+        })
     })();
     let _ = std::fs::remove_dir_all(work_dir);
     let _ = std::fs::remove_dir_all(&egress_dir);
@@ -959,7 +992,14 @@ fn python_runs(
         args: Vec::new(),
     };
     let args: Vec<String> = match lockfile {
-        PythonLock::Poetry => ["poetry", "install", "--no-root", "--no-interaction"].to_vec(),
+        // Contract M9d D3: Poetry 1.6.1 prints its errors on stdout, which the runner
+        // discards, so stdout joins stderr; `exec` keeps Poetry's exit code.
+        PythonLock::Poetry => [
+            "sh",
+            "-c",
+            "exec poetry install --no-root --no-interaction 1>&2",
+        ]
+        .to_vec(),
         // `--ignore-requires-python`: the image's interpreter (3.10) predates
         // some lockfiles' floors (S11: a `>=3.14` floor fails the fetch
         // otherwise); versions stay pinned, and what the older runtime cannot
@@ -991,10 +1031,21 @@ fn python_runs(
         args,
         ..base.clone()
     };
+    // Contract M9d D2: scip-python reads the project's name and version from the root's
+    // `pyproject.toml` and crashes on an undefined version without one (microblog), so such a
+    // root names its project: its last segment, `root` at the repository root. The export is
+    // repository-shaped, so the root's own file is `<export>/<root>/pyproject.toml`.
+    let mut index_args = ["scip-python", "index"].map(String::from).to_vec();
+    let pyproject = base.workdir.join(&job.root).join("pyproject.toml");
+    if !pyproject.is_file() {
+        let name = job.root.rsplit('/').next().filter(|s| !s.is_empty());
+        let name = name.unwrap_or("root");
+        index_args.extend(["--project-name", name, "--project-version", "."].map(String::from));
+    }
     let index = ContainerRun {
         network: Network::None,
         timeout: budget.index_timeout,
-        args: ["scip-python", "index"].map(String::from).to_vec(),
+        args: index_args,
         ..base
     };
     Ok((vec![fetch], index))
@@ -1329,14 +1380,250 @@ mod tests {
                 "{lockfile:?}: {}",
                 lines[0]
             );
+            // The export (`files()`) holds no `svc/pyproject.toml`, so the root names its
+            // project (contract M9d D2).
             assert!(
                 lines[1].contains("--network none")
                     && lines[1].contains("--platform linux/amd64")
                     && lines[1].contains("-v <work>:/src -w /src")
-                    && lines[1].ends_with("scip-python index"),
+                    && lines[1]
+                        .ends_with("scip-python index --project-name svc --project-version ."),
                 "{lockfile:?}: {}",
                 lines[1]
             );
+        }
+    }
+
+    /// Contract M9d D2 (C3): scip-python reads its project's name and version from a
+    /// `pyproject.toml`; without one it crashes on an undefined version (microblog, measured
+    /// in planning), so a root without one indexes with `--project-name <its last segment>`
+    /// (`root` at the repository root) and `--project-version .`. Only the root's own
+    /// `pyproject.toml` counts. A root with one keeps today's arguments.
+    #[test]
+    fn python_roots_without_pyproject_name_their_project() {
+        let index_args = |root: &str, files: &[&str]| -> Vec<String> {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = Fake::new(false, false);
+            let files: Vec<(String, Vec<u8>)> = files
+                .iter()
+                .map(|f| ((*f).to_owned(), Vec::new()))
+                .collect();
+            let job = Job {
+                root: root.into(),
+                ..python_job(PythonLock::Requirements)
+            };
+            let run = run_job(
+                &job,
+                "sha256:py",
+                &files,
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &Egress::default(),
+                &fake,
+            )
+            .unwrap();
+            assert_eq!(run.status, RunStatus::Ok, "{root}");
+            let runs = fake.runs.borrow();
+            assert_eq!(runs.len(), 2, "{root}");
+            runs[1].args.clone()
+        };
+        let named = |name: &str| {
+            [
+                "scip-python",
+                "index",
+                "--project-name",
+                name,
+                "--project-version",
+                ".",
+            ]
+            .map(String::from)
+            .to_vec()
+        };
+        assert_eq!(
+            index_args(
+                "src/emailservice",
+                &[
+                    "src/emailservice/requirements.txt",
+                    "src/emailservice/email_server.py"
+                ]
+            ),
+            named("emailservice")
+        );
+        assert_eq!(
+            index_args("", &["requirements.txt", "app.py"]),
+            named("root")
+        );
+        assert_eq!(
+            index_args("tools", &["tools/setup.py", "tools/requirements.txt"]),
+            named("tools"),
+            "a setup.py root has no pyproject.toml either"
+        );
+        assert_eq!(
+            index_args(
+                "svc",
+                &[
+                    "svc/requirements.txt",
+                    "pyproject.toml",
+                    "svc/lib/pyproject.toml"
+                ]
+            ),
+            named("svc"),
+            "another directory's pyproject.toml does not count"
+        );
+        assert_eq!(
+            index_args("svc", &["svc/pyproject.toml", "svc/requirements.txt"]),
+            ["scip-python", "index"]
+        );
+        assert_eq!(
+            index_args("", &["pyproject.toml", "app.py"]),
+            ["scip-python", "index"]
+        );
+    }
+
+    /// Contract M9d D3 (C4): Poetry 1.6.1 prints its errors on stdout, which the runner
+    /// discards (fastapi_realworld's stored tail held only `Creating virtualenv …`), so the
+    /// Poetry fetch runs under `sh -c` with stdout sent to stderr; `exec` keeps Poetry's exit
+    /// code. pip writes its errors to stderr already and runs as before.
+    #[test]
+    fn poetry_errors_reach_the_tail() {
+        let fetch_args = |lockfile: PythonLock| {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = Fake::new(false, false);
+            run_job(
+                &python_job(lockfile),
+                "sha256:py",
+                &files(),
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &Egress::default(),
+                &fake,
+            )
+            .unwrap();
+            let runs = fake.runs.borrow();
+            assert_eq!(runs[0].network, Network::Fetch);
+            assert_eq!(runs[0].entrypoint, None, "{lockfile:?}");
+            runs[0].args.clone()
+        };
+        assert_eq!(
+            fetch_args(PythonLock::Poetry),
+            [
+                "sh",
+                "-c",
+                "exec poetry install --no-root --no-interaction 1>&2"
+            ]
+        );
+        for lockfile in [PythonLock::Requirements, PythonLock::None] {
+            assert_eq!(fetch_args(lockfile)[0], "pip", "{lockfile:?}");
+        }
+    }
+
+    /// Contract M9d D4 (C4): when a scip-python job's fetch fails (fastapi_realworld: Poetry
+    /// cannot build pyyaml 6.0 on musl), the index phase runs anyway, offline, without the
+    /// environment. An index makes the job `ok` with phase `fetch` and the fetch's tail (with
+    /// the proxy's refusals); it is cached, and the row round-trips through
+    /// [`RunStatus::from_cached`]. A fetch timeout, a docker client failure, a failed index
+    /// after a failed fetch, and any other indexer's failed fetch keep today's outcome.
+    #[test]
+    fn a_failed_python_fetch_indexes_without_the_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = |job: &Job, fake: &Fake| {
+            run_job(
+                job,
+                "sha256:py",
+                &files(),
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &Egress::default(),
+                fake,
+            )
+            .unwrap()
+        };
+        let fake = Fake {
+            proxy_log: "Proxying refused on filtered url \"example.org:443\"".into(),
+            ..Fake::new(true, false)
+        };
+        let fallback = run(&python_job(PythonLock::Poetry), &fake);
+        assert_eq!(
+            (fallback.status.as_str(), fallback.status.phase()),
+            ("ok", Some(Phase::Fetch))
+        );
+        assert_ne!(fallback.status, RunStatus::Ok);
+        assert_eq!(fallback.status.reason(), None);
+        assert!(fallback.status.is_cacheable());
+        assert_eq!(fallback.index.as_deref(), Some(&b"fake-index"[..]));
+        assert_eq!(
+            fallback.stderr_tail, "boom\negress proxy refused: example.org:443",
+            "the fetch's tail"
+        );
+        {
+            let runs = fake.runs.borrow();
+            assert_eq!(runs.len(), 2, "the index ran after the failed fetch");
+            assert_eq!(runs[0].network, Network::Fetch);
+            assert_eq!(runs[1].network, Network::None);
+            assert_eq!(runs[1].args[..2], ["scip-python", "index"]);
+        }
+        // The cache row round-trips; an ordinary `ok` row stays `Ok`, and `ok` in the index
+        // phase is written by no binary (a miss).
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("fetch")),
+            Some(fallback.status.clone())
+        );
+        assert_eq!(RunStatus::from_cached("ok", None), Some(RunStatus::Ok));
+        assert_eq!(RunStatus::from_cached("ok", Some("index")), None);
+
+        // The index fails too: the fetch's failure, as before D4.
+        let fake = Fake::new(true, true);
+        let failed = run(&python_job(PythonLock::Requirements), &fake);
+        assert_eq!(failed.status, RunStatus::Failed(Phase::Fetch));
+        assert_eq!(failed.stderr_tail, "boom");
+        assert!(failed.index.is_none());
+        assert_eq!(fake.runs.borrow().len(), 2);
+
+        // A fetch over its budget, or refused by the docker client: nothing indexes.
+        let outcome = |exit_code: Option<i32>, timed_out: bool| Outcome {
+            exit_code,
+            timed_out,
+            stderr_tail: "docker: refused".into(),
+            elapsed: Duration::from_millis(1),
+        };
+        for (fetch_outcome, status) in [
+            (
+                outcome(None, true),
+                RunStatus::Timeout {
+                    phase: Phase::Fetch,
+                    budget_secs: 600,
+                },
+            ),
+            (
+                outcome(Some(125), false),
+                RunStatus::Environment("docker: refused".into()),
+            ),
+        ] {
+            let fake = Fake {
+                fetch_outcome: Some(Ok(fetch_outcome)),
+                ..Fake::new(false, false)
+            };
+            let run = run(&python_job(PythonLock::Poetry), &fake);
+            assert_eq!(run.status, status);
+            assert!(run.index.is_none());
+            assert_eq!(fake.runs.borrow().len(), 1, "no index after {status:?}");
+        }
+
+        // Any other indexer's failed fetch stops before indexing.
+        for job in [
+            ts_job(NodeLock::PackageLock),
+            go_job(),
+            java_job(Fetch::Maven),
+            java_job(Fetch::Gradle),
+        ] {
+            let fake = Fake::new(true, false);
+            let run = run(&job, &fake);
+            assert_eq!(run.status, RunStatus::Failed(Phase::Fetch), "{job:?}");
+            assert!(run.index.is_none(), "{job:?}");
+            assert_eq!(fake.runs.borrow().len(), 1, "{job:?}");
         }
     }
 
@@ -2062,7 +2349,7 @@ mod tests {
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m5-egress-1", "m9d-ts-1"));
-        assert_eq!(RECIPE_PY, "m6d-py-4");
+        assert_eq!(RECIPE_PY, "m9d-py-1");
         assert_eq!(RECIPE_GRADLE, "m6e-gradle-1");
         assert_eq!(
             recipe(&java_job(Fetch::Maven), &Budget::default()),
