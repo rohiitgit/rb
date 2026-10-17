@@ -221,7 +221,8 @@ Notes that bite newcomers:
   A` as a construction of `A`, and a subclass constructor call that reaches an
   inherited `__init__` (the first in the MRO). A Go call result named by one
   of the function's type parameters (`func Id[T any](x T) T`) types nothing,
-  and `case v := <-ch:` declares `v` for its case.
+  nor does a parameter or local declared with one (`x T`, `var e E`), and
+  `case v := <-ch:` declares `v` for its case.
   All these edges are `heuristic`. Each file that used one of these forms gets one
   `tier_b_forms` diagnostic counting the references per form: `return_type`,
   `call_segment`, `type_alias`, `embedded`, `package_var`, `default_import`,

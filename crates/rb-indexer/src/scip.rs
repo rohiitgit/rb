@@ -3462,6 +3462,30 @@ mod tests {
                 "use(). References Kind#".to_owned(),
             ]
         );
+        // Only Go (pass 2, N3): a Python call whose callee is a class constructs it, and
+        // stays a call.
+        let src = "class Kind:\n    pass\ndef make():\n    return Kind(\"a\")\n";
+        let facts = rb_syntax::extract(Language::Python, src.as_bytes()).unwrap();
+        let sym = |s: &str| format!("scip-python python shop 0.1 `shop.main`/{s}");
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "main.py".into(),
+                occurrences: vec![
+                    occ([0, 6, 0, 10], sym("Kind#"), 1),
+                    occ([2, 4, 2, 8], sym("make()."), 1),
+                    occ([3, 11, 3, 15], sym("Kind#"), 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let joined = join_facts(Language::Python, &[("main.py".into(), facts)], &index);
+        let lines: Vec<String> = edge_lines(&joined)
+            .into_iter()
+            .filter(|l| l.contains(" Calls ") || l.contains(" References "))
+            .map(|l| l.replace("scip-python python shop 0.1 `shop.main`/", ""))
+            .collect();
+        assert_eq!(lines, ["make(). Calls Kind#"]);
     }
 
     /// The heritage check is hostile-input defense: a holder that declares an

@@ -151,7 +151,10 @@ use serde_json::{Value, json};
 /// `select` receive declares its names (E1); Python's MRO is C3 for inherited `__init__` and
 /// `super()`, and the later of a named and a star import wins (E2); a tsconfig BOM and
 /// `"baseUrl": "."` (E4); a scip-go call whose callee is a type is a `REFERENCES` (E5).
-pub const PIPELINE: &str = "m9c-2";
+/// `m9c-3` M9c evaluator pass 2: a Go parameter or local typed by a type parameter types
+/// nothing (N1); each Python class's MRO, C3's or the fallback, is computed once and no longer
+/// depends on which classes were looked up first (S2; it differs only past 64 levels).
+pub const PIPELINE: &str = "m9c-3";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

@@ -264,9 +264,9 @@ pub(crate) struct Index<'a> {
     imports: BTreeMap<&'a str, Vec<Vec<&'a str>>>,
     /// Resolved direct supertypes of a type (memoised; resolving them never needs members).
     supers: RefCell<BTreeMap<Sym<'a>, Vec<Sym<'a>>>>,
-    /// Python: each class's method resolution order, once computed without a cut (contract M9c
-    /// amendment 3).
-    mros: RefCell<BTreeMap<Sym<'a>, Vec<Sym<'a>>>>,
+    /// Python: each class's method resolution order once computed, C3's or the fallback
+    /// (contract M9c amendment 3; pass 2, S2: the fallback too, so it is computed once).
+    mros: RefCell<BTreeMap<Sym<'a>, Mro<'a>>>,
     /// Type resolutions in progress. Bindings can make them cyclic (`session =
     /// session.Session()`): a resolution already in progress finds nothing.
     resolving: RefCell<BTreeSet<(&'a str, Option<usize>, String)>>,
@@ -299,6 +299,9 @@ pub(crate) struct Index<'a> {
     calling: RefCell<BTreeSet<(&'a str, usize)>>,
     /// The new Tier B forms (contract M9c D6) the reference being resolved has used.
     forms: RefCell<BTreeSet<&'static str>>,
+    /// Tests: how many times a class's MRO was computed rather than read (pass 2, S2).
+    #[cfg(test)]
+    mro_frames: std::cell::Cell<usize>,
 }
 
 /// [`Index::go_methods`]: (package key, receiver type name) → method name → definitions.
@@ -306,6 +309,18 @@ type GoMethods<'a> = BTreeMap<((&'a str, &'a str), &'a str), BTreeMap<&'a str, V
 
 /// [`Index::package_vars`]: package key → name → (file, binding).
 type PackageVars<'a> = BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<(&'a str, &'a Binding)>>>;
+
+/// A Python class's MRO as [`Index::mro_at`] finds it (contract M9c pass 2, S2).
+#[derive(Clone)]
+enum Mro<'a> {
+    /// C3's linearisation, and the height of the hierarchy (its longest chain of bases).
+    C3(Vec<Sym<'a>>, usize),
+    /// C3 gives none: an inconsistent order, a cycle, or more than [`MAX_INHERITANCE_DEPTH`]
+    /// levels. The fallback order once a lookup of the class itself has needed it.
+    Fallback(Option<Vec<Sym<'a>>>),
+    /// The walk reached the depth cap below: true of the lookup, not of the class.
+    Cut,
+}
 
 /// Memoised types, with the [`TIER_B_FORMS`] their resolution used, replayed on a hit.
 type Memo<'a, K> = BTreeMap<K, (Vec<Sym<'a>>, BTreeSet<&'static str>)>;
@@ -731,6 +746,8 @@ impl<'a> Index<'a> {
             chain_results: RefCell::new(BTreeMap::new()),
             calling: RefCell::new(BTreeSet::new()),
             forms: RefCell::new(BTreeSet::new()),
+            #[cfg(test)]
+            mro_frames: std::cell::Cell::new(0),
         }
     }
 
@@ -1411,51 +1428,72 @@ impl<'a> Index<'a> {
     /// E2): the C3 linearisation over its resolved bases, in the order written (a base that
     /// resolves to several classes contributes each). A hierarchy C3 cannot merge (Python
     /// refuses to create the class), a cycle, or one deeper than [`MAX_INHERITANCE_DEPTH`]
-    /// falls back to left-first depth-first order, each class once.
+    /// falls back to left-first depth-first order, each class once. Either is a function of
+    /// the class alone, computed once per class (pass 2, S2).
     fn python_mro(&self, class: Sym<'a>) -> Vec<Sym<'a>> {
-        self.mro_at(class, 0, &mut BTreeSet::new()).0
+        if let Some(Mro::Fallback(Some(order))) = self.mros.borrow().get(&class) {
+            return order.clone();
+        }
+        if let Mro::C3(order, _) = self.mro_at(class, 0, &mut BTreeSet::new()) {
+            return order;
+        }
+        let mut order = Vec::new();
+        self.depth_first(class, 0, &mut BTreeSet::new(), &mut order);
+        let known = Mro::Fallback(Some(order.clone()));
+        self.mros.borrow_mut().insert(class, known);
+        order
     }
 
-    /// [`Self::python_mro`] at `depth`, with whether it is whole (no cycle or depth cut below),
-    /// which is when it is memoised.
-    fn mro_at(
-        &self,
-        c: Sym<'a>,
-        depth: usize,
-        visiting: &mut BTreeSet<Sym<'a>>,
-    ) -> (Vec<Sym<'a>>, bool) {
+    /// The MRO of `c`, `depth` levels below the class looked up. C3 and the fallback are
+    /// memoised, since they depend on `c` alone: C3 needs every base's C3, a merge, and a
+    /// height within [`MAX_INHERITANCE_DEPTH`]. A fallback base does not stop the walk, so it
+    /// reaches the same classes in the same order as before (pass 2, S2). Reaching the cap
+    /// (`Cut`) says only that the class looked up is too deep: it is not memoised and ends the
+    /// walk, so one lookup computes at most one chain of classes it cut.
+    fn mro_at(&self, c: Sym<'a>, depth: usize, visiting: &mut BTreeSet<Sym<'a>>) -> Mro<'a> {
         if let Some(known) = self.mros.borrow().get(&c) {
-            return (known.clone(), true);
+            return known.clone();
         }
         let bases = self.supertypes(c);
         if bases.is_empty() {
-            return (vec![c], true);
+            return Mro::C3(vec![c], 0);
         }
-        if depth >= MAX_INHERITANCE_DEPTH || !visiting.insert(c) {
-            return (vec![c], false);
+        if depth >= MAX_INHERITANCE_DEPTH {
+            return Mro::Cut;
         }
-        let mut whole = true;
-        let mut seqs: Vec<Vec<Sym<'a>>> = Vec::new();
+        if !visiting.insert(c) {
+            // On the walk's own path: a cycle, which has no C3 for any class on it.
+            return Mro::Fallback(None);
+        }
+        #[cfg(test)]
+        self.mro_frames.set(self.mro_frames.get() + 1);
+        let (mut seqs, mut height, mut c3) = (Vec::new(), 0, true);
         for &b in &bases {
-            let (mro, w) = self.mro_at(b, depth + 1, visiting);
-            whole &= w;
-            seqs.push(mro);
+            match self.mro_at(b, depth + 1, visiting) {
+                Mro::C3(order, h) => {
+                    height = height.max(h + 1);
+                    seqs.push(order);
+                }
+                Mro::Fallback(_) => c3 = false,
+                Mro::Cut if depth > 0 => {
+                    visiting.remove(&c);
+                    return Mro::Cut;
+                }
+                // At the top, a cut below means more levels than the cap.
+                Mro::Cut => {
+                    c3 = false;
+                    break;
+                }
+            }
         }
         visiting.remove(&c);
         seqs.push(bases);
         let mro = match c3_merge(c, seqs) {
-            Some(mro) if whole => mro,
-            _ => {
-                whole = false;
-                let mut out = Vec::new();
-                self.depth_first(c, 0, &mut BTreeSet::new(), &mut out);
-                out
-            }
+            Some(order) if c3 && height <= MAX_INHERITANCE_DEPTH => Mro::C3(order, height),
+            _ => Mro::Fallback(None),
         };
-        if whole {
-            self.mros.borrow_mut().insert(c, mro.clone());
-        }
-        (mro, whole)
+        self.mros.borrow_mut().insert(c, mro.clone());
+        mro
     }
 
     /// `c` and its supertypes, left-first depth-first, each once (the MRO's fallback).
@@ -1514,9 +1552,19 @@ impl<'a> Index<'a> {
     }
 
     /// The types a binding of `path` stands for: its declared type, else (Go) the result type of
-    /// the call that initialises it (contract M9c D4).
+    /// the call that initialises it (contract M9c D4). A Go parameter or local declared with one
+    /// of its function's type parameters (a method's: those its receiver names) has none, even
+    /// beside a package type of that name (pass 2, N1).
     fn binding_types(&self, path: &'a str, b: &'a Binding) -> Vec<Sym<'a>> {
         if !b.type_name.is_empty() {
+            let type_param = b.scope.is_some_and(|s| {
+                self.facts(path).definitions[s]
+                    .type_params
+                    .contains(&b.type_name)
+            });
+            if type_param && self.language(path) == Language::Go {
+                return Vec::new();
+            }
             return self.resolve_type(path, b.scope, &b.type_name);
         }
         let Some(Init::Call { chain }) = b.init else {
@@ -3030,6 +3078,16 @@ func g4() {
 \tn := Named()
 \tn.Foo()
 }
+func Use[T any](x T) {
+\tx.Foo()
+}
+func (b *Box[E]) Each() {
+\tvar e E
+\te.Foo()
+}
+func Keep[T any](x T, a A) {
+\ta.Foo()
+}
 ",
                 ),
                 (
@@ -3098,6 +3156,10 @@ func f10() {
         assert_eq!(
             edges(&built, EdgeKind::Calls),
             [
+                // A parameter or local typed by a type parameter types nothing (pass 2, N1);
+                // `Use` and `Box#Each` reach no `T#Foo`/`E#Foo`. A concrete parameter beside
+                // one still types.
+                "gen:Keep(). -> gen:A#Foo(). [heuristic]",
                 "gen:g1(). -> gen:Id(). [heuristic]",
                 "gen:g2(). -> gen:Ptr(). [heuristic]",
                 "gen:g3(). -> gen:Box#Get(). [heuristic]",
@@ -3876,6 +3938,133 @@ def diamond():
             assert_eq!(ctor("j/Sub.java", 0), None);
             assert_eq!(ctor("p/k.py", 2), Some("A#__init__().".into()));
         });
+    }
+
+    /// Contract M9c pass 2, S2: a hierarchy C3 cannot linearise (an inconsistent order, a
+    /// cycle, more than [`MAX_INHERITANCE_DEPTH`] levels) takes its fallback order as before,
+    /// but each class's MRO is computed once, as a C3 one is, so a lattice costs its size and
+    /// not two to the power of its depth. A class's MRO never depends on which classes were
+    /// looked up before it.
+    #[test]
+    fn python_mro_is_computed_once_per_class_and_unmergeable_hierarchies_fall_back() {
+        // `layers` diamonds over `base`: `Lka` and `Lkb` both extend `L(k-1)a, L(k-1)b`, and
+        // layer 1 extends `first`.
+        let lattice = |base: &str, first: &str, layers: usize| {
+            let mut src = base.to_owned();
+            for k in 1..=layers {
+                let below = if k == 1 {
+                    first.to_owned()
+                } else {
+                    format!("L{}a, L{}b", k - 1, k - 1)
+                };
+                for side in ["a", "b"] {
+                    src.push_str(&format!("class L{k}{side}({below}):\n    pass\n"));
+                }
+            }
+            src.push_str(&format!("def make():\n    return L{layers}a()\n"));
+            src
+        };
+        let init = "    def __init__(self):\n        pass\n";
+        // `L1a(T0, T1)` with `T1(T0)`: Python raises TypeError. A cycle `T0(T1)`, `T1(T0)`.
+        let inconsistent = format!("class T0:\n{init}class T1(T0):\n    pass\n");
+        let cycle = format!("class T0(T1):\n{init}class T1(T0):\n    pass\n");
+        for (base, own) in [(&inconsistent, 0), (&cycle, 1)] {
+            for layers in [12, 40] {
+                let src = lattice(base, "T0, T1", layers);
+                with_index(&[("lat.py", PY, &src)], |index| {
+                    let class = |name: &str| {
+                        let defs = &index.facts("lat.py").definitions;
+                        ("lat.py", defs.iter().position(|d| d.name == name).unwrap())
+                    };
+                    let top = class(&format!("L{layers}a"));
+                    let mro = || -> Vec<String> {
+                        let order = index.python_mro(top);
+                        order
+                            .into_iter()
+                            .map(|s| index.def(s).name.clone())
+                            .collect()
+                    };
+                    // The fallback: left-first depth-first, each class once.
+                    let mut want: Vec<String> =
+                        (1..=layers).rev().map(|k| format!("L{k}a")).collect();
+                    want.extend(["T0".to_owned(), "T1".to_owned()]);
+                    want.extend((1..layers).map(|k| format!("L{k}b")));
+                    assert_eq!(mro(), want, "{layers} layers");
+                    // One computation per class with bases below the top: `L1a`-`Lna`,
+                    // `L1b`-`L(n-1)b`, `T1`, and `T0` when it is on the cycle.
+                    let once = 2 * layers + own;
+                    assert_eq!(index.mro_frames.get(), once, "{layers} layers");
+                    assert_eq!(mro(), want);
+                    assert_eq!(index.mro_frames.get(), once, "a second lookup reads it");
+                });
+            }
+            let built = build(&[("p/lat.py", PY, &lattice(base, "T0, T1", 40))], &[]);
+            assert_eq!(
+                edges(&built, EdgeKind::Calls),
+                ["lat:make(). -> lat:T0#__init__(). [heuristic]"]
+            );
+        }
+        // The evaluator's rows: an inconsistent order and a cycle keep their fallback.
+        let rows = "class X:\n{init}class Y(X):\n    pass\nclass Bad(X, Y):\n    pass\ndef bad():\n    return Bad()\nclass Cy1(Cy2):\n    pass\nclass Cy2(Cy1):\n{init}def cyc():\n    return Cy1()\n"
+            .replace("{init}", init);
+        assert_eq!(
+            edges(&build(&[("p/c3.py", PY, &rows)], &[]), EdgeKind::Calls),
+            [
+                "c3:bad(). -> c3:X#__init__(). [heuristic]",
+                "c3:cyc(). -> c3:Cy2#__init__(). [heuristic]",
+            ]
+        );
+        // A chain of 69 classes over a diamond (`W(Y, Z)`, `Y(X)`, `Z(X)`; C3 takes `Z`'s
+        // `__init__`, depth-first `X`'s). `Deep69` is deeper than the cap, so it falls back and
+        // finds none within it; `Deep6` is C3 whether or not `Deep69`'s lookup passed it first.
+        let mut chain = format!(
+            "class X:\n{init}class Y(X):\n    pass\nclass Z(X):\n{init}class W(Y, Z):\n    pass\nclass Deep1(W):\n    pass\n"
+        );
+        for k in 2..=69 {
+            chain.push_str(&format!("class Deep{k}(Deep{}):\n    pass\n", k - 1));
+        }
+        let far = "def far():\n    return Deep69()\n";
+        let near = "def near():\n    return Deep6()\n";
+        for order in [[far, near], [near, far]] {
+            let src = format!("{chain}{}{}", order[0], order[1]);
+            assert_eq!(
+                edges(&build(&[("p/deep.py", PY, &src)], &[]), EdgeKind::Calls),
+                ["deep:near(). -> deep:Z#__init__(). [heuristic]"],
+                "{}",
+                order[0].lines().next().unwrap()
+            );
+        }
+        // A valid lattice deeper than the cap: computed along one path to the cap, not
+        // exhaustively; it falls back, and `T0`'s `__init__` lies beyond the cap.
+        let valid = format!("class T0:\n{init}class T1(T0):\n    pass\n");
+        let src = lattice(&valid, "T1, T0", 70);
+        with_index(&[("lat.py", PY, &src)], |index| {
+            let defs = &index.facts("lat.py").definitions;
+            let top = (
+                "lat.py",
+                defs.iter().position(|d| d.name == "L70a").unwrap(),
+            );
+            assert!(
+                !index
+                    .python_mro(top)
+                    .iter()
+                    .any(|&s| index.def(s).name == "T0")
+            );
+            assert!(
+                index.mro_frames.get() <= defs.len(),
+                "{}",
+                index.mro_frames.get()
+            );
+        });
+        assert_eq!(
+            edges(&build(&[("p/lat.py", PY, &src)], &[]), EdgeKind::Calls),
+            Vec::<String>::new()
+        );
+        let src = lattice(&valid, "T1, T0", 40);
+        assert_eq!(
+            edges(&build(&[("p/lat.py", PY, &src)], &[]), EdgeKind::Calls),
+            ["lat:make(). -> lat:T0#__init__(). [heuristic]"]
+        );
     }
 
     #[test]

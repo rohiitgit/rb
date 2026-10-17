@@ -400,9 +400,9 @@
   "crate": "rb-indexer",
   "test": "resolve::tests::python_raise_and_inherited_init_construct",
   "file": "resolve.rs",
-  "old": "            Some(mro) if whole => mro,\n",
-  "new": "            Some(mro) if whole && false => mro,\n",
-  "what": "C3 merge replaced by left-first depth-first (E2)"
+  "old": "            Some(order) if c3 && height <= MAX_INHERITANCE_DEPTH => Mro::C3(order, height),\n",
+  "new": "            Some(order) if c3 && height <= MAX_INHERITANCE_DEPTH && false => Mro::C3(order, height),\n",
+  "what": "C3 merge replaced by left-first depth-first (E2; re-anchored on S2's mro_at, pass 2)"
  },
  {
   "id": "m349",
