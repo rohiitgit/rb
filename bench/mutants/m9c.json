@@ -331,5 +331,14 @@
   "old": "        &symbol[at[3] + 1..],\n",
   "new": "        &symbol[at[2] + 1..],\n",
   "what": "version kept in the lookup key"
+ },
+ {
+  "id": "m341",
+  "crate": "rb-indexer",
+  "test": "tests::the_name_memo_parses_each_symbol_once_and_judges_each_text",
+  "file": "scip.rs",
+  "old": "        self.0.borrow_mut().insert(symbol.to_owned(), forms);\n",
+  "new": "        drop(forms);\n",
+  "what": "name memo never stores: every question parses its symbol again (P7b)"
  }
 ]

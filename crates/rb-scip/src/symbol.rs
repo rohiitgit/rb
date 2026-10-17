@@ -24,33 +24,60 @@ pub fn last_descriptor_name(symbol: &str) -> Option<String> {
 /// `false` for local symbols and strings the grammar rejects. An import alias (a default
 /// import's local name) is the caller's to accept: it needs the file's imports.
 pub fn may_name(symbol: &str, text: &str) -> bool {
-    if scip::symbol::is_local_symbol(symbol) {
-        return false;
+    NameForms::of(symbol).is_some_and(|forms| forms.names(text))
+}
+
+/// What [`may_name`] reads from a global symbol, so that a caller asking about one symbol at
+/// many tokens parses it once (the `scip` crate's parser formats its own state once per
+/// descriptor, so a parse costs far more than the comparisons; contract M9c P7b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameForms {
+    /// The last descriptor's name.
+    last: String,
+    /// The name of the descriptor before it, if any.
+    owner: Option<String>,
+    /// Whether the last descriptor is a meta descriptor (`validate0:`).
+    meta: bool,
+}
+
+impl NameForms {
+    /// `None` for local symbols, strings the grammar rejects and symbols without descriptors,
+    /// none of which may name a token.
+    pub fn of(symbol: &str) -> Option<NameForms> {
+        if scip::symbol::is_local_symbol(symbol) {
+            return None;
+        }
+        let parsed = scip::symbol::parse_symbol(symbol).ok()?;
+        let mut descriptors = parsed.descriptors.iter().rev();
+        let last = descriptors.next()?;
+        Some(NameForms {
+            last: last.name.clone(),
+            owner: descriptors.next().map(|d| d.name.clone()),
+            meta: last.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Meta),
+        })
     }
-    let Ok(parsed) = scip::symbol::parse_symbol(symbol) else {
-        return false;
-    };
-    let mut descriptors = parsed.descriptors.iter().rev();
-    let Some(last) = descriptors.next() else {
-        return false;
-    };
-    let name = last.name.as_str();
-    if name == text {
-        return true;
+
+    /// Whether the symbol may stand at a token whose text is `text`, in the forms [`may_name`]
+    /// lists.
+    pub fn names(&self, text: &str) -> bool {
+        let name = self.last.as_str();
+        if name == text {
+            return true;
+        }
+        if matches!(name, "<init>" | "<constructor>") {
+            return self.owner.as_deref() == Some(text);
+        }
+        if let Some(accessed) = name
+            .strip_prefix("<get>")
+            .or_else(|| name.strip_prefix("<set>"))
+        {
+            return accessed == text;
+        }
+        self.meta
+            && name
+                .strip_prefix(text)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     }
-    if matches!(name, "<init>" | "<constructor>") {
-        return descriptors.next().is_some_and(|d| d.name == text);
-    }
-    if let Some(accessed) = name
-        .strip_prefix("<get>")
-        .or_else(|| name.strip_prefix("<set>"))
-    {
-        return accessed == text;
-    }
-    last.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Meta)
-        && name
-            .strip_prefix(text)
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The symbol of a global symbol's last type: the symbol cut after its last type descriptor
