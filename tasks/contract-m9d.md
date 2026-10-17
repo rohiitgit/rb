@@ -573,6 +573,27 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - Images: the probe image `rb-scip-java:probe-m9d-jdk25` and the base it pulled (`eclipse-temurin@sha256:2d5d5e9b…`, absent before) were removed. 0 `m9d` containers and 0 `m9d` networks remain. No other image was touched (`cleanup.txt`).
   - No change in `crates/` or `docker/*/Dockerfile`; the bench caches were only cloned. Python probes read downloaded sources only inside containers.
 
+**P1 note (2026-10-18; D11, D15).** Logs in `var/m9d/logs/p1/`. Binaries: `var/m9d/bin/rb.pre-p1` (debug, HEAD `c2ca543`, sha256 `04f5cc48…`) and `rb.p1` (debug, the P1 tree, `16248677…`).
+- **C10.** `cypher_runs_without_jit` failed first on the final assertion (`c10-red.txt`: 138 functions, JIT total 247 ms under `cypher()`'s settings), with its row and its control passing. It passed after D11.
+- **`rb check` A/B** (`check-ab-ambient.txt`, `check-ab-loaded.txt`; `scripts/check_ab.py`, ABAB, 5 runs per binary, same output from both).
+
+  | | Predicted | Measured |
+  |---|---|---|
+  | probe graph | 44 nodes, 52 edges (M9b binary) | 43 nodes, 51 edges (this binary) |
+  | plan cost | 1,044,383 | 1,044,446 |
+  | execution, jit off (variant C) | 1.6 ms | 1.2 ms (load 2.6), 0.9 ms (load 4.4) |
+  | JIT, jit on | 0.27–0.37 s at load 2.4–3.2 | 0.40 s (load 2.6), 0.32 s (load 4.4) |
+  | `rb check --rule unowned_table_writes`, median | ≤ 100 ms at load ≥ 4 (NFR) | 464 → **53 ms** at load 4.4–5.0 (4 busy loops); 349 → 40 ms at 2.5 |
+  | `rb check`, all three rules, median | | 469 → 64 ms at 4.4–5.0; 357 → 52 ms at 2.5 |
+
+  The pre-change walls are below M9b's 2.06–2.47 s at load 4.1–6.3; one ambient run of the old binary took 2,261 ms.
+- **Timing tests alone** (`e2e-alone.txt`). `check_gates` and `a_checkout_is_its_repository_whatever_its_name` passed at load 2.8–2.9. `check_gates` passed again at load 4.0–4.3 (`e2e-startup-removes-leak.txt`).
+- **D15 deviates from the amendment in one point: the start-up clean-up removes every `t_*` directory under `var/scip/cache`, not only those of leftover `t_*` repositories.** A failed `Cleanup` deletes the repository's rows first, so its cache is left with no row to find it by. The control shows it (`e2e-scip-go-cache-control.txt`): `scip_go_chi_sqlx` run with HEAD's harness left `t_scipgo_6009` (17 directories 0555, 86 files 0444) and no `t_` row. The next run's start-up, with P1's harness, removed it (`e2e-startup-removes-leak.txt`: "1 package caches", then 0). The `t_` prefix belongs to tests, as the start-up clean-up of rows already assumes.
+- **D15 tests.** The unit `cache_trees_with_read_only_modules_are_removed` failed first with `PermissionDenied` (`d15-unit-red.txt`). The harness test `e2e_clean_ups_remove_read_only_test_caches` (in `e2e.rs`, a fifth P1 file; no database or Docker) failed first at `Cleanup`'s half (`d15-e2e-red.txt`). Its start-up half failed under a temporary mutation of the `t_` filter (`d15-e2e-startup-control.txt`, file restored byte-identical). With P1's harness, `scip_go_chi_sqlx` leaves 0 `t_` caches (`e2e-scip-go-cache.txt`).
+- **rb's own removals, re-checked.** The Go module cache is mounted only from `<cache>/gomod` (`orchestrate.rs:838`). The per-run work and egress directories hold no package cache, and `age.rs:73` removes the AGE CSV directory. No rb code path removes a package cache.
+- **Mutants** (`mutants-p1.txt`): m387 KILLED (ScratchDb; `cypher_session` is called only by `cypher()`'s read-only transaction), m392 KILLED.
+- `rb.repo` identical before and after (`repo-before.txt`, `repo-after.txt`); `t_m9d_chk` was deleted at the end of each A/B run.
+
 ## Result
 
 Not yet built.

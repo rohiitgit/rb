@@ -4979,3 +4979,45 @@ fn doctor_is_bounded_against_a_silent_database() {
     assert!(text.starts_with("fail  database"), "{text}");
     assert!(text.contains("answered nothing within 10 s"), "{text}");
 }
+
+/// Contract M9d D15 (C18): the harness's clean-ups remove package caches that Go's read-only
+/// module cache (directories 0555, files 0444) filled. `Cleanup` removes a test's own caches
+/// and says whether any existed; the start-up clean-up removes every `t_*` cache a killed or
+/// failed clean-up left, and nothing else (`bench_*` caches persist by design).
+#[test]
+fn e2e_clean_ups_remove_read_only_test_caches() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let caches = tmp.path();
+    let go_shaped = |name: &str| {
+        let module = caches.join(name).join("gomod/github.com/x/y@v1.0.0");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("go.mod"), "module github.com/x/y\n").unwrap();
+        let ro = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        ro(&module.join("go.mod"), 0o444);
+        ro(&module, 0o555);
+        ro(module.parent().unwrap(), 0o555);
+    };
+
+    go_shaped("t_mine");
+    assert!(remove_repo_caches(caches, &["t_mine".to_owned()]));
+    assert!(
+        !caches.join("t_mine").exists(),
+        "Cleanup left a read-only cache"
+    );
+    assert!(!remove_repo_caches(caches, &["t_none".to_owned()]));
+
+    go_shaped("t_left");
+    std::fs::create_dir_all(caches.join("t_plain/npm")).unwrap();
+    go_shaped("bench_kept_scip");
+    assert_eq!(remove_test_caches(caches), 2);
+    let mut left: Vec<String> = std::fs::read_dir(caches)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["bench_kept_scip"]);
+    rb_scip::orchestrate::remove_cache_tree(&caches.join("bench_kept_scip")).unwrap();
+}

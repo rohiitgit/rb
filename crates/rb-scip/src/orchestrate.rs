@@ -1008,6 +1008,32 @@ fn export(files: &[(String, Vec<u8>)], dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Removes a package cache tree (`<work dir>/cache/<repo>`, contract M5 S22). Go's module
+/// cache is read-only (directories 0555, files 0444), and unlinking an entry needs write
+/// permission on its directory, so every directory first gets owner `rwx` (contract M9d D15);
+/// symbolic links are not followed. An absent path is not an error.
+pub fn remove_cache_tree(path: &Path) -> std::io::Result<()> {
+    fn writable(dir: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::symlink_metadata(dir)?.permissions().mode();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))?;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                writable(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(m) if m.is_dir() => writable(path)?,
+        Ok(_) => {}
+    }
+    std::fs::remove_dir_all(path)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -2342,5 +2368,56 @@ mod tests {
             .as_deref(),
             Some("index phase over its 900 s budget")
         );
+    }
+
+    /// Contract M9d D15 (C18): Go's module cache is read-only (directories 0555, files 0444),
+    /// so a plain `remove_dir_all` fails on it with `PermissionDenied` and the e2e caches
+    /// leaked. Such a tree is removed whole, as is a plain one; an absent path is no error; a
+    /// symbolic link inside the tree is removed without touching its target's modes.
+    #[test]
+    fn cache_trees_with_read_only_modules_are_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        mode(&outside, 0o555);
+
+        let go = tmp.path().join("t_go");
+        let module = go.join("gomod/github.com/x/y@v1.0.0");
+        std::fs::create_dir_all(module.join("sub")).unwrap();
+        std::fs::write(module.join("go.mod"), "module github.com/x/y\n").unwrap();
+        std::fs::write(module.join("sub/a.go"), "package sub\n").unwrap();
+        std::os::unix::fs::symlink(&outside, go.join("gomod/link")).unwrap();
+        for file in ["go.mod", "sub/a.go"] {
+            mode(&module.join(file), 0o444);
+        }
+        for dir in [
+            module.join("sub"),
+            module.clone(),
+            go.join("gomod/github.com/x"),
+        ] {
+            mode(&dir, 0o555);
+        }
+        assert!(
+            std::fs::write(module.join("new"), "").is_err(),
+            "the tree is read-only"
+        );
+        remove_cache_tree(&go).unwrap();
+        assert!(!go.exists());
+        assert!(outside.is_dir());
+        assert_eq!(mode_of(&outside), 0o555, "a link's target keeps its modes");
+
+        let plain = tmp.path().join("t_plain");
+        std::fs::create_dir_all(plain.join("a")).unwrap();
+        std::fs::write(plain.join("a/b.txt"), "x").unwrap();
+        remove_cache_tree(&plain).unwrap();
+        assert!(!plain.exists());
+
+        remove_cache_tree(&tmp.path().join("absent")).unwrap();
+        mode(&outside, 0o755);
     }
 }

@@ -1,0 +1,20 @@
+[
+ {
+  "id": "m387",
+  "crate": "rb-store",
+  "test": "db_tests::cypher_runs_without_jit",
+  "file": "lib.rs",
+  "old": "        \"SET LOCAL statement_timeout = {timeout_ms}; SET LOCAL jit = off; SET LOCAL ROLE rb_reader\"\n",
+  "new": "        \"SET LOCAL statement_timeout = {timeout_ms}; SET LOCAL ROLE rb_reader\"\n",
+  "what": "`jit = off` removed from the session (read-side; ScratchDb)"
+ },
+ {
+  "id": "m392",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::cache_trees_with_read_only_modules_are_removed",
+  "file": "orchestrate.rs",
+  "old": "        Ok(m) if m.is_dir() => writable(path)?,\n",
+  "new": "        Ok(m) if m.is_dir() => {}\n",
+  "what": "the permission pass dropped (plain remove_dir_all)"
+ }
+]
