@@ -670,3 +670,11 @@
 ## 2026-10-17: a diff that reports zero needs a control that must differ
 - **Mistake (caught, M9c P7b):** the scoreboard diff printed "0 differing leaves" because the script never called its own `walk`; `diff` showed two.
 - **Rule:** Every equality check gets a control in the same log that must fail: a known-different input that shows a non-zero count. Without it, a zero proves nothing.
+
+## 2026-10-17: an indexer that exits 0 can still have typed nothing
+- **Mistake (found in M9c P0/P0b):** rb's scip-go image paired Go 1.27.2, which writes export data version 5, with scip-go's x/tools v0.45.0, which reads up to version 4. No import loaded, scip-go swallowed the errors and exited 0, and for five days every Go index rb made came from that degraded type check (119,977 of server's 202,385 locals `invalid type`). M9b read the symptom (no member occurrence of another module) as scip-go's behaviour and moved B1 on.
+- **Rule:** An indexer image's build runs a self-test that asserts on output content (scip-go must write `os/Getenv().` for `os.Getenv(…)`), with a control logged against the previous image that must fail. When a toolchain is pinned, pin the libraries that read its output to versions that read it, and check one standard-library symbol in a fresh index before reading any zero as the tool's behaviour.
+
+## 2026-10-17: a residue is labelled by a split of its rows, not by its largest part
+- **Mistake (found in M9c P8 and by M9d's contract):** amendment 2 called 4,092 server → server/public member references "skew"; they are references to 133 interface-method symbols that server/public's index defines none for. M9c's accept line called the 190 remaining mattermost fp "version-skew calls"; 18 of them are `docs/site` and e2e-tests calls (`var/m9c/logs/p8/fp-split.txt`).
+- **Rule:** Before a record names what a residue is, split its rows by a recorded rule (area, language, symbol kind) and log the split. A label covers only the rows it was checked on; the rest are named as unclassified or by their own split.

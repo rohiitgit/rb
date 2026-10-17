@@ -1,6 +1,6 @@
 # M9c contract: Tier B call recall (Go, TS, Python), scip-go cross-module joins, unverified scip-go relationships (2026-10-16)
 
-**Status:** contract written 2026-10-16 from `tasks/plan-m9.md` §4 "M9c", `tasks/bench-findings.md` B2, B3, B5, B13b, and M9b's hand-over: B13b with P0's record, and B1 because M9b's D4 failed (`tasks/contract-m9b.md` amendment 1, `var/m9b/probe-scip.txt`). Not yet built. Commits go on branch `m9`, after M9b closes.
+**Status:** built; evaluator pass 1 pending. The contract was written 2026-10-16 from `tasks/plan-m9.md` §4 "M9c", `tasks/bench-findings.md` B2, B3, B5, B13b, and M9b's hand-over: B13b with P0's record, and B1 because M9b's D4 failed (`tasks/contract-m9b.md` amendment 1, `var/m9b/probe-scip.txt`). Commits go on branch `m9`, after M9b closes.
 
 **Evidence base.** File:line references are at `5a310aa` (M9b P1, B9 built). Only `crates/rb-indexer/src/resolve.rs` differs from `d445940` among the files cited. M9b P2 and P3 were in progress in the same tree when this was written, so P0 re-reads `resolve.rs` and `rb-indexer/src/lib.rs` at M9b's close commit before any edit. Counts come from the M9a run of record `var/bench/out/2e36cd607eab/` (dumps, before B9), the raw scip-go indexes in `var/m9b/idx/`, and read-only scans of the pinned repositories. The planner's scripts are in the session scratchpad (`agree.py`, `ts_classify.py`, `go_forms.py`, `b13b_rule.py`). P0 commits their equivalents and re-runs them on the M9b run of record, so every number below is re-based on M9b before code.
 
@@ -878,7 +878,7 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Binary and run (C11).** `var/m9c/bin/rb`, sha256 `930271d4…6ee7`, built from a clean `crates/` and `migrations/` at `139dd21` (`var/m9c/logs/build.log`), `PIPELINE` `m9c-1`. `target/release/rb-bench` (sha256 `82839c81…452b`) was built in the same step. `bench/run.sh` wrote `var/bench/out/930271d417de/` from 14:47 to 14:52: `failures: 0`, every `noscip` fresh/cached pair identical, 0 `bench_%` repositories left (`var/m9c/logs/bench-run.log`). The Go SCIP jobs were cold except mattermost's, whose 8 jobs P5's probe had already cached under the new image ID; so the run took 5 minutes.
 - **The other run directory.** `var/bench/out/a038653b8478/` is M8's run of record. It came from `var/m7j/bin/rb` (sha256 `a038653b…`, rb `e08efcb`; `doctor.txt` 2026-10-14 02:55) and is scored as `bench/scoreboard/m8a.json`/`m8b.json`. Its mattermost dumps were regenerated in M9a (contract M9a amendment 2). P7 did not use or touch it.
 - **Invariant C12** (`invariant.py` → `invariant.txt`).
-  - 157 dumps compared: 27 `noscip`, 11 `scip` and 119 PyCG cases, none empty. 27 target dumps and 104 PyCG cases are byte-identical by row.
+  - 157 dumps compared: 27 `noscip`, 11 `scip` and 119 PyCG cases, none empty. 26 target dumps (corrected in P8 from 27: `invariant.txt` lists 26 of 38 as identical) and 104 PyCG cases are byte-identical by row.
   - Buckets: B1 23,187; IMG 455; B2 42,784; B3j 8,253; B3d 460; B3s 183; B5 118; RTA 20; RDI 0; DIAG 8,787; META 0. **Unclassified 0.** No `noscip` row is in IMG.
   - The control (M9a → M9b, `invariant-control.txt`) leaves 7,709 rows unclassified, so the rules reject other mechanisms' rows.
   - B1: the 23,186 `synthetic` `scip` edges (`CALLS` 10,133, `REFERENCES` 13,053) carry 44,269 evidence spans, equal to `scip_cross_project` server → server/public `synthetic` 44,269 (`ambiguous` 0, `unanchored` 16,366, as P5 measured).
@@ -963,10 +963,6 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - The contract's bucket names are refined: B3 splits into B3j, B3d and B3s; "routes/DI" is RDI (0 rows); RTA covers `orphan_coverage` too. B2's D3-doc rows are code-caused scip rows, so they are B2, not IMG.
   - `var/m9c/m9b-rescored{,-perf}.json` are overwritten with the P7 re-score. P0's copies were `cmp`-identical to `m9b.json`.
 
-## Result
-
-Not yet built.
-
 **P7b note (2026-10-17, P7's scip-mode CPU over 1.10×: cause, fix, re-bench; base `660d92e`, fix `55592a1`).** Logs in `var/m9c/logs/p7b/`, scripts in `var/m9c/p7b/` (`zsh` or `python3 -I`; probe and A/B repositories `bench_*`, all removed).
 - **Cause, avoidable: one symbol parse per occurrence.** In the join, `parse_symbol` from the `scip` crate (0.10.0) formats the parser's whole state with `Debug` once per descriptor (`accept_one_descriptor`'s `format!("descriptor name: {:?} …", self)`), so one parse costs far more than a lookup. The join parsed a symbol at every occurrence:
   - `rb_scip::package` in the package loop, for each occurrence of a global symbol the index does not define;
@@ -1007,7 +1003,7 @@ Not yet built.
   - M9c's input growth is still there: decode, the larger index fetch and the 24 % more edges. The CPU the fix saved more than pays for it, because M9b's own join parsed per occurrence too. The comparison is binary against binary, as the rule states.
 - **Re-bench (C11).** `nohup bench/run.sh var/m9c/bin/rb` → `var/bench/out/f340b267d529/`, run twice.
   - **Run 1** (17:05–17:18): `failures: 0`; all 157 dumps identical. It ran during an autovacuum of `rb.edge`, which held 7,580,697 dead tuples, and `rb.edge_evidence`, which held 2,583,679. These came from deleting the A/B, profile and identity snapshots (`autovacuum.txt`). Every mattermost wall was 58–67 s, against 17–25 s in P7. Its log, meta files, score and compare are kept in `var/m9c/p7b/run1/`.
-  - **Run 2** (17:28–17:38, after the vacuum, `bench-run.log`) is the run of record.
+  - **Run 2** (17:28–17:41, after the vacuum, `bench-run.log`; the window is the first and last output file's mtime, `var/m9c/logs/p8/runs-perf.txt`, corrected in P8 from "17:28–17:38") is the run of record.
     - `failures: 0`, every `noscip` fresh/cached pair identical, 0 `bench_%` repositories left.
     - **All 157 dumps are byte-identical** to `var/bench/out/930271d417de/`: 27 target `noscip`, 11 `scip` and 119 PyCG. None is missing, empty or extra. All 11 `.scip.status` files are identical with the snapshot id and graph name masked (`dump_identity.sh` → `dump-identity.txt`).
     - Host walls were still slow (small targets about 2 s against P7's 0.4 s). `host_check.sh` (`host-check.txt`) ran hk_polls `noscip-fresh` with m9b, r1 and p7b interleaved. All three used 0.11–0.13 s of CPU and 1.34–1.40 G instructions, at walls of 1.2–4.0 s for any of them, so the extra wall is host/DB wait, not rb's work.
@@ -1024,3 +1020,212 @@ Not yet built.
       - instructions 0.997–1.002×.
     - All five are **noise**.
 - **Safety.** `rb.repo` before and after equals `var/m9c/logs/repo-before-bench.txt` (`repo-before.txt`, `repo-after.txt`). 0 `bench_%` and 0 `t_m9c_*` repositories are left. `worktrees/` and `bench/__pycache__/` were not touched, and no run under `var/bench/out/` was deleted; the first P7b run's files there were overwritten by the second, its evidence kept as above. Disk 15 GiB free at the end.
+
+## Result
+
+**Commits (branch `m9`):** `77f694d` contract (during M9b), `f5d80b0` P0 (amendment 1), `d73ab58` amendment 2, `6da3c99` PI, `6d71eb2` P1, `00a177c` P2, `72f42fc` P3, `15371eb` P4, `d692b71` M9d contract (planned during M9c), `8ef33be` P5, `139dd21` P6, `660d92e` P7, `55592a1` P7b fix, `22b1d3c` P7b re-bench, then `M9c P8: records`. D7 and C8 were withdrawn (amendment 2).
+
+**Binary of record (C11):** `var/m9c/bin/rb`, sha256 `f340b267d529c36ff8348e3ae67ead5b59fe761eca4915226767c76cc66406c9`, built from `55592a155102014b639947bdfa533fcf0b900598` with `crates/` and `migrations/` clean (`var/m9c/logs/p7b/build.log`). `PIPELINE` `m9c-1`, set at `139dd21`; P7b's fix changes no output and keeps it. `rb-bench` sha256 `82839c81…452b`. P7's binary (`930271d4…6ee7`, from `139dd21`, outputs `var/bench/out/930271d417de/`) is kept as `var/m9c/bin/rb.r1`. HEAD differs from `55592a1` only in records and scoreboards.
+
+**Run of record:** `var/bench/out/f340b267d529/` (P7b run 2, 17:28:16–17:41:24 by output mtimes, load 2.48–5.88 over every `.meta`; `var/m9c/logs/p8/runs-perf.txt`). `failures: 0`, all 27 `noscip` fresh/cached pairs identical, 0 `bench_%` repositories left (`var/m9c/logs/p7b/bench-run.log`). All 157 dumps are byte-identical to P7's run `930271d417de` and all 11 `.scip.status` files equal with the snapshot id and graph name masked (`p7b/dump-identity.txt`). So P7's invariant, sample and agreement diff hold for this run unchanged, and `bench/scoreboard/m9c.json` differs from P7's only in `rb.binary_sha256` and `rb.commit` (`p7b/score.txt`, control 48 leaves).
+
+**Claims.**
+
+| # | Met | Evidence |
+|---|---|---|
+| C1 | met | `var/m9c/probe-forms.txt` from `bench/probe/m9c_forms.py` (`f5d80b0`). The M9b record re-scores `cmp`-identical to `m9b.json` (`logs/p0-rescore.txt`). The probe reproduces 33 of the 35 M9a numbers quoted; the other 2 are B1 buckets, re-split by a recorded rule (amendment 1). |
+| C2 | met | `tsconfig_jsonc_resolves_aliases` (rta, and rb-scip `jobs` for m301) and `namespace_calls_behind_jsonc_paths_resolve`, red first (`logs/p1/red-*.log`). Bench: bookcars `calls` fn 694 → 8; invariant B3j 8,253 rows. |
+| C3 | met | `default_imports_resolve_to_the_default_export`, red first. Bench: invariant B3d 460 rows; 39 bookcars `calls` and 4 file-scope misses recovered. |
+| C4 | met | `go_results_aliases_and_embedded_fields_are_facts` and `go_var_specs_and_call_pairs_bind`, red first (`logs/p2/red.log`). `go_and_python_have_neither` (Go row `F: int []`) and `go_initialisers_and_constants` changed, each with its reason (P2 note). |
+| C5 | met | `go_call_results_and_segments_type_receivers`, `go_type_aliases_resolve_to_their_target`, `go_embedded_types_promote_members`, `go_package_vars_of_sibling_files_type_names`, red first (`logs/p3/red.log`). Bench: go_clean_arch 49 / 49, go_gin_example 161 / 161, and 11,601 of mattermost's 12,672 M9b misses become tp through B2 (`logs/p7/agreement-diff.txt`). |
+| C6 | met | `python_super_star_reexport_and_module_vars_resolve`, `python_raise_and_inherited_init_construct` (`logs/p4/red.log`) and `python_raise_is_a_call_reference` (`logs/p2/red.log`). Bench: PyCG `calls` tp 12 → 14, `calls_file_scope` tp 94 → 105. |
+| C7 | met | `tier_b_forms_count_each_form` (P3); the diagnostic carries the 11 keys of D6. |
+| C8 | withdrawn | D7 withdrawn with the image fix (amendment 2): on the fixed image it catches 0 false rows and drops 3 true ones. m331–m333 and m339 retired. |
+| C9′ | met | `external_references_join_another_projects_definitions`, red first (`logs/p5/red-indexer.log`). Bench: `scip_cross_project` server → server/public `synthetic` 44,269, `ambiguous` 0, `unanchored` 16,366; 23,186 `synthetic` scip edges (`CALLS` 10,133, `REFERENCES` 13,053). |
+| C10 | met | `scip_status_counts_exact_certainty_only` on a `ScratchDb`, red first (`logs/p5/red-store.log`). mattermost `exact calls (scip)` reads 34,689; it would read 44,822 with the synthetic `CALLS` rows (P5). |
+| C11 | met | `PIPELINE` `m9c-1`; the binary of record is built from a clean tree at the last code change, `55592a1` (above). |
+| C12 | met | 157 dumps, 0 unclassified (below). |
+| C13 | met | `compare` exits 0: 41 `changed` and 6 `accepted` lines over 5 cells, each accepted cell tied to the pair diff and its buckets; `exact` 100.0 % of 126 in both (below). |
+| C14 | met | `noscip-fresh` A/B noise (P7); SCIP mode noise after P7b's fix; the 5 small-target wall warnings noise (P7b A/B). Scoring 1.73 s and 1.67 s, two scorings `cmp`-identical (`p7b/score.txt`). The warm run wrote its outputs in 13 min (17:28:16–17:41:24), under 20 min. |
+| C15 | met | m9c: m300–m330, m334–m338, m340 and m341, 38 of 38 KILLED at `55592a1` (`p7b/battery-m9c.log`); m9b 39 of 39, m9a 31 of 31, m8b 29 of 29 KILLED at `139dd21` (`p6/battery-*.log`). None STALE or INVALID. |
+| C16 | met | The build's self-test passes and its control fails on `rb-scip-go:0.2.7` (`logs/pi/selftest-control.txt`). `scip_go_chi_sqlx` and `scip_polyglot_monorepo` pass after the bless; the 2 changed golden rows are classified per reference (`golden-diff.txt`, `ref-outcomes.txt`). The image control fails on the `scip:` line (`image-control.txt`). Image tag `rb-scip-go:0.2.7-xtools0.50.0`, ID `sha256:47eab865…`. |
+
+**Invariant (C12, `var/m9c/logs/p7/invariant.txt`).** Base `36ed5ea46ddf` (M9b), head `930271d417de` (P7), whose 157 dumps the run of record reproduces byte for byte. 157 dumps compared (27 `noscip`, 11 `scip`, 119 PyCG cases), every one non-empty; 26 of the 38 target dumps and 104 of the 119 PyCG cases are identical (P7's note said 27 target dumps; corrected there in P8).
+- Buckets: B1 23,187; IMG 455; B2 42,784; B3j 8,253; B3d 460; B3s 183; B5 118; RTA 20; RDI 0; DIAG 8,787; META 0. **Unclassified 0.** `noscip` rows in IMG: 0.
+- Rows added as `exact`: IMG 76 (`CALLS` +31 and `REFERENCES` +32 at spans only the new index names, plus `IMPLEMENTS` +7 and the new `DEPENDS_ON`) and B2 1,537 (1,507 scip rows from the 10 scip-go documents D3 lets rb accept, `D3-doc`, and 30 alias `DEFINED_IN`). No Tier B edge is `exact`.
+- Differing dumps: mattermost `noscip` 38,643 rows and `scip` 43,963; bookcars `noscip` 1,383; fastapi_realworld 71 per mode; hk_todo 25; go_clean_arch 21 (`noscip`) and 2 (`scip`); go_gin_example 17 and 3; microservices_demo `scip` 9; hk_polls 4; 15 PyCG cases.
+- The control (M9a → M9b, `invariant-control.txt`) leaves 7,709 rows unclassified, so the rules reject other mechanisms' rows.
+
+**Cells, measured beside predicted.** 17 of the 314 cells changed (10 PyCG cases, 7 `scip` cells); 297 are identical (`logs/p7/cells-diff.txt`; recomputed from the scoreboards in `var/m9c/logs/p8/cells.txt`). "Predicted" is amendment 2's last column, or amendment 1's where amendment 2 keeps it.
+
+| Cell (`bench:target:mode:class`) | M9b (base, re-scored) | Predicted | Measured | Claim |
+|---|---|---|---|---|
+| `scip:bookcars:noscip:calls` | tp 1,155, fp 0, fn 694, oos 6 | tp +600 to +686 heuristic; fn 8 to 94; fp possible | tp 1,841 (+686 heuristic: 647 B3j, 39 B3d), fp 0, fn 8 (R 62.5 % → 99.6 %); oos 7 (accepted, B3j) | C2, C3 |
+| `scip:bookcars:noscip:calls_file_scope` | tp 40, fp 0, fn 7, oos 205 | fn 5 | tp 47, fp 0, fn 0 (R 85.1 % → 100.0 %; 3 B3j, 4 B3d); oos 312 (accepted: 105 B3j, 2 B3d) | C2, C3 |
+| `scip:go_clean_arch:noscip:calls` | tp 37, fn 12 | tp 49, fn 0 | tp 49 (heuristic), fn 0 | C5 |
+| `scip:go_gin_example:noscip:calls` | tp 152, fn 9 | tp 161, fn 0 | tp 161 (heuristic), fn 0 | C4, C5 |
+| `scip:mattermost:noscip:calls` | gold 33,312, tp 20,640 (heuristic 20,604, ambiguous 36), fp 6,141, fn 12,672, oos 22,872 | after P5: gold 41,878, fp ≈ 190 (M9b's noscip edges); after P3, fn falls by up to 11,546 plus part of 2,615; fp ≈ 190 plus each wrong Tier B edge; oos rises | gold 43,840, tp 42,181 (heuristic 42,145, ambiguous 36), fp 203, fn 1,659 (P 77.1 % → 99.5 %, R 62.0 % → 96.2 %); oos 38,236 (accepted) | C5, C9′, C16 |
+| `scip:mattermost:noscip:calls_file_scope` | gold 978, tp 332, fp 1, fn 6, oos 2,855 | not emulated (≤ 1 pair from the image) | gold 982, tp 334, fp 0, fn 8 (accepted: 1 B1 join, 1 D3-doc pair); oos 3,619 (accepted) | C9′ |
+| `scip:fastapi_realworld:noscip:calls` | oos 190 | identical (not predicted) | oos 216 (accepted, B5: 26 `__init__` calls; SCIP covers no fastapi file) | C6 |
+| `pycg:*:calls` | tp 12, fp 1, fn 36 | tp 14 | tp 14, fp 1, fn 34 (`super_call` +2) | C6 |
+| `pycg:*:calls_file_scope` | tp 94, fp 1, fn 92 | tp 105 | tp 105, fp 1, fn 81 (the 9 named cases) | C6 |
+| `scip:microservices_demo`, `scip:express_ts_boilerplate` (`calls`) | | unchanged | unchanged | |
+| `exact` sample, `scip` | 60 / 60 | 60 / 60 after judging | 60 / 60; 54 redrawn, 54 TRUE | C16 |
+| `rb status` mattermost `exact calls (scip)` | 34,290 | about +31 | 34,689 (+399: 31 IMG, 368 D3-doc) | C10 |
+| all other cells | | identical | identical | |
+
+- **mattermost fp, 6,141 → 203** (`agreement-diff.txt`). Of the base fp, 5,944 became tp through B1's gold, 4 through IMG (the 3 `App#GetClusterId` and 1 test call) and 3 through B2 edges meeting B1 gold. 190 stay, and 13 are new: P3's 12 version-skew calls and import.go's `bulkImport → ImportedUsersPosture#IsValid`. By area (`var/m9c/logs/p8/fp-split.txt`): 185 are Go calls from server into server/public, the version-skew class (amendment 2's 172 plus the 13); 15 are `docs/site` `.mjs` calls and 3 are e2e-tests TS calls, which are not skew.
+- **mattermost fn, 12,672 → 1,659.** 11,601 base misses became tp through B2 and 30 through B3d (TS), leaving 1,041. New gold adds 618 misses: 586 B1 joins Tier B does not make, 27 IMG pairs and 5 D3-doc pairs.
+- **Gold, 33,312 → 43,840.** B1's joins enter the reference (`synthetic` edges are scip gold, not scored edges). 871 pairs Tier B already had moved from out of scope to tp through B1's gold, and 299 through D3-doc.
+
+**Gate (C13; `var/m9c/logs/p7b/compare.txt`, identical to P7's `logs/p7/compare.txt` in every `changed` and `accepted` line).** The command, exit 0:
+
+`target/release/rb-bench compare var/m9c/m9b-rescored.json bench/scoreboard/m9c.json --accept bench/accept-m9c.tsv --perf var/m9c/m9b-rescored-perf.json bench/scoreboard/m9c-perf.json`
+
+It printed (the accept reasons are elided here; they are in `bench/accept-m9c.tsv`):
+
+```
+changed pycg:exceptions/raise:noscip:calls_file_scope: tp heuristic 0 → 1
+changed pycg:exceptions/raise:noscip:calls_file_scope: fn 1 → 0
+changed pycg:exceptions/raise_attr:noscip:calls_file_scope: tp heuristic 0 → 1
+changed pycg:exceptions/raise_attr:noscip:calls_file_scope: fn 1 → 0
+changed pycg:imports/import_all:noscip:calls_file_scope: tp heuristic 0 → 2
+changed pycg:imports/import_all:noscip:calls_file_scope: fn 2 → 0
+changed pycg:imports/init_func_import:noscip:calls_file_scope: tp heuristic 1 → 2
+changed pycg:imports/init_func_import:noscip:calls_file_scope: fn 1 → 0
+changed pycg:imports/init_import:noscip:calls_file_scope: tp heuristic 0 → 1
+changed pycg:imports/init_import:noscip:calls_file_scope: fn 1 → 0
+changed pycg:imports/submodule_import_all:noscip:calls_file_scope: tp heuristic 0 → 2
+changed pycg:imports/submodule_import_all:noscip:calls_file_scope: fn 2 → 0
+changed pycg:mro/basic_init:noscip:calls_file_scope: tp heuristic 1 → 2
+changed pycg:mro/basic_init:noscip:calls_file_scope: fn 1 → 0
+changed pycg:mro/parents_same_superclass:noscip:calls_file_scope: tp heuristic 1 → 2
+changed pycg:mro/parents_same_superclass:noscip:calls_file_scope: fn 1 → 0
+changed pycg:mro/super_call:noscip:calls: tp heuristic 0 → 2
+changed pycg:mro/super_call:noscip:calls: fn 2 → 0
+changed pycg:mro/two_parents:noscip:calls_file_scope: tp heuristic 0 → 1
+changed pycg:mro/two_parents:noscip:calls_file_scope: fn 1 → 0
+changed scip:bookcars:noscip:calls: tp heuristic 1155 → 1841
+changed scip:bookcars:noscip:calls: fn 694 → 8
+changed scip:bookcars:noscip:calls: found_out_of_scope{not_covered} 6 → 7
+accepted scip:bookcars:noscip:calls: found_out_of_scope{not_covered} 6 → 7 (…)
+changed scip:bookcars:noscip:calls_file_scope: tp heuristic 40 → 47
+changed scip:bookcars:noscip:calls_file_scope: fn 7 → 0
+changed scip:bookcars:noscip:calls_file_scope: found_out_of_scope{not_covered} 205 → 312
+accepted scip:bookcars:noscip:calls_file_scope: found_out_of_scope{not_covered} 205 → 312 (…)
+changed scip:fastapi_realworld:noscip:calls: found_out_of_scope{not_covered} 190 → 216
+accepted scip:fastapi_realworld:noscip:calls: found_out_of_scope{not_covered} 190 → 216 (…)
+changed scip:go_clean_arch:noscip:calls: tp heuristic 37 → 49
+changed scip:go_clean_arch:noscip:calls: fn 12 → 0
+changed scip:go_gin_example:noscip:calls: tp heuristic 152 → 161
+changed scip:go_gin_example:noscip:calls: fn 9 → 0
+changed scip:mattermost:noscip:calls: gold 33312 → 43840
+changed scip:mattermost:noscip:calls: tp heuristic 20604 → 42145
+changed scip:mattermost:noscip:calls: fp heuristic 6141 → 203
+changed scip:mattermost:noscip:calls: fn 12672 → 1659
+changed scip:mattermost:noscip:calls: found_out_of_scope{not_covered} 22872 → 38236
+accepted scip:mattermost:noscip:calls: found_out_of_scope{not_covered} 22872 → 38236 (…)
+changed scip:mattermost:noscip:calls_file_scope: gold 978 → 982
+changed scip:mattermost:noscip:calls_file_scope: tp heuristic 332 → 334
+changed scip:mattermost:noscip:calls_file_scope: fp heuristic 1 → 0
+changed scip:mattermost:noscip:calls_file_scope: fn 6 → 8
+changed scip:mattermost:noscip:calls_file_scope: found_out_of_scope{not_covered} 2855 → 3619
+accepted scip:mattermost:noscip:calls_file_scope: fn 6 → 8 (…)
+accepted scip:mattermost:noscip:calls_file_scope: found_out_of_scope{not_covered} 2855 → 3619 (…)
+warning: perf laravel_realworld:noscip-fresh: wall 1.7 s → 2.1 s (over 1.25×)
+warning: perf mattermost:noscip-cached: peak RSS 1156808704 → 1925611520 bytes (over 1.15×)
+warning: perf mattermost:noscip-fresh: peak RSS 960151552 → 2035826688 bytes (over 1.15×)
+warning: perf mattermost:scip: peak RSS 1529020416 → 2874327040 bytes (over 1.15×)
+warning: perf mse_anilallewar:noscip-fresh: wall 3.8 s → 8.4 s (over 1.25×)
+warning: perf mse_callista:noscip-fresh: wall 3.1 s → 4.1 s (over 1.25×)
+exit=0
+```
+
+Without `--accept` it prints those 6 lines as REGRESSION and exits 1 (`logs/p7/compare-noaccept.txt`). The aggregates follow in the log:
+- scip `calls` agreement: P 78.4 % → 99.5 %, R 62.4 % → 96.3 %.
+- scip `calls_file_scope` agreement: P 99.7 % → 100.0 %, R 96.6 % → 97.9 %.
+- PyCG `calls`: P 92.3 % → 93.3 %, R 25.0 % → 29.2 %. `calls_file_scope`: P 98.9 % → 99.1 %, R 50.5 % → 56.5 %.
+- Every other aggregate is unchanged (handkey, handkey_raw, microsecend).
+
+**Accept lines (`bench/accept-m9c.tsv`: a header and 5 lines, one per cell; compare prints 6 `accepted` lines because the `calls_file_scope` line covers two metrics).**
+
+| Cell | Accepted | Buckets (from `agreement-diff.txt`) |
+|---|---|---|
+| `scip:bookcars:noscip:calls` | `found_out_of_scope{not_covered}` 6 → 7 | 1 B3j pair into an uncovered file; in scope 686 fn → tp |
+| `scip:bookcars:noscip:calls_file_scope` | `found_out_of_scope{not_covered}` 205 → 312 | 105 B3j, 2 B3d; in scope 7 fn → tp |
+| `scip:fastapi_realworld:noscip:calls` | `found_out_of_scope{not_covered}` 190 → 216 | 26 B5 `__init__` calls (gold 0) |
+| `scip:mattermost:noscip:calls` | `found_out_of_scope{not_covered}` 22,872 → 38,236 | +16,536 (B2 13,803, B3j 2,670, B3d 41, B3s 22), less 1,172 moved into scope (871 B1, 299 + 1 D3-doc to tp, 1 to fp) |
+| `scip:mattermost:noscip:calls_file_scope` | fn 6 → 8; `found_out_of_scope{not_covered}` 2,855 → 3,619 | fn: 1 B1 join, 1 D3-doc pair; oos: 675 B3j, 88 B3d, 2 B2, less 1 moved into scope |
+
+No `fn` line is needed for mattermost `calls`: fn fell to 1,659, below amendment 2's 12,672 threshold. The mattermost `calls` line's reason calls the 190 remaining base fp "version-skew calls"; 18 of them are `docs/site` and e2e-tests calls (above). The accept file is not edited, since `compare.txt` records its sha256.
+
+**Certainty table (`logs/p7/certainty-m9b-rescored.txt`, `certainty-m9c.txt`).**
+
+| Label | m9b (re-scored) | m9c | Predicted |
+|---|---|---|---|
+| `exact` | 100.0 % of 126 | 100.0 % of 126 | no `exact` fp rise |
+| `synthetic` | 83.0 % of 47 | 83.0 % of 47 | unchanged (D8′'s `synthetic` edges are scip gold, not scored) |
+| `heuristic` | 99.3 % of 153; agreement 78.6 % of 28,724 | 99.4 % of 166; agreement 99.5 % of 45,042 | Tier B rows `heuristic` |
+| `ambiguous` | site hit 100.0 % of 1 site, 50.0 % of 2 edges; agreement site hit 100.0 % of 47 sites, 100.0 % of 37 edges | unchanged | not stated |
+| `dispatch` | not stored | not stored | |
+
+**Sample (`logs/p7/sample-drawn.txt`, `sample-missing.txt`, `citations.txt`, `judge-audit.txt`).** The `scip` family redrew 54 edges, all in mattermost's stratum (`CALLS` 34, `REFERENCES` 18, `IMPLEMENTS` 2). Three blind judges, one per batch of 18, under the M9a prompt ("ASSUME EACH EDGE IS FALSE"), judged all 54 TRUE. The verdicts are appended to `bench/samples/exact.tsv` under `# M9c` (lines 334–387). Citations: 154 OK, 0 MISMATCH, 0 UNRESOLVED; the +7-line control gives 115 MISMATCH. Two conventions the judges flagged (a pointer-receiver `IMPLEMENTS`, closures counted in their enclosing function) are not FALSE.
+
+| Family | m9b | m9c | Wilson 95 % (m9c) | Without a verdict |
+|---|---|---|---|---|
+| manifest | 60 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| orm | 9 / 9 | 9 / 9 | 70.1–100.0 % | 0 |
+| routes | 60 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| scip | 60 / 60 | 60 / 60 (54 redrawn) | 94.0–100.0 % | 0 |
+| sql | 59 / 60 | 59 / 60 | 91.1–99.7 % | 0 |
+
+**Perf (C14).** The bench's own timings (mattermost; `var/m9c/m9b-rescored-perf.json`, P7's `git show 660d92e:bench/scoreboard/m9c-perf.json`, and the committed `bench/scoreboard/m9c-perf.json`; `var/m9c/logs/p8/runs-perf.txt`):
+
+| mattermost | m9b r2 wall | P7 (r1) wall | P7b wall | m9b r2 peak RSS | P7 (r1) peak RSS | P7b peak RSS | load (m9b / r1 / p7b, start–end) |
+|---|---|---|---|---|---|---|---|
+| `noscip-fresh` | 111.04 s | 24.51 s | 69.55 s | 960,151,552 B | 1,888,337,920 B | 2,035,826,688 B | 5.87–6.51 / 7.29–6.09 / 4.26–5.15 |
+| `noscip-cached` | 70.43 s | 16.85 s | 74.60 s | 1,156,808,704 B | 1,691,648,000 B | 1,925,611,520 B | 6.51–6.01 / 6.09–7.94 / 5.06–4.79 |
+| `scip` | 88.76 s | 25.22 s | 71.81 s | 1,529,020,416 B | 2,392,817,664 B | 2,874,327,040 B | 5.69–5.74 / 7.94–9.23 / 4.73–5.44 |
+
+Single bench runs do not reproduce under this host's conditions (P3 found that for the M9b binary itself), so the verdicts come from A/Bs of binary against binary, alternating ABBA, under the rule each summary prints first: noise iff median CPU ratio ≤ 1.10, median wall ratio ≤ 1.25 and median RSS ratio ≤ 1.15, with no exemption.
+
+| A/B (log) | mode | runs per side | load | wall m9b / m9c (ratio) | CPU s (ratio, 95 % CI) | peak RSS MB (ratio) | instructions G (ratio) | verdict |
+|---|---|---|---|---|---|---|---|---|
+| M9b vs P7 r1 (`p7/perf-ab7-summary.txt`) | `noscip-fresh` (the NFR cell) | 15 | 2.42–4.90 | 23.20 / 24.57 (1.059) | 39.89 / 40.30 (1.010, 1.000–1.028) | 1,979 / 2,090 (1.056) | 448.8 / 459.2 (1.023) | noise |
+| M9b vs P7 r1 | `noscip-cached` | 15 | 2.42–4.90 | 15.89 / 18.51 (1.165) | 9.42 / 10.05 (1.067, 1.060–1.075) | 1,725 / 1,823 (1.056) | 137.8 / 149.8 (1.088) | noise |
+| M9b vs P7 r1 | `scip` | 15 | 2.42–4.90 | 21.14 / 26.40 (1.249) | 12.40 / 16.08 (1.297, 1.287–1.306) | 2,378 / 2,508 (1.055) | 190.5 / 269.0 (1.412) | OVER-CPU, superseded by P7b |
+| M9b vs P7b (`p7b/perf-ab7b-summary.txt`) | `scip` | 15 | 3.13–5.17 | 19.81 / 21.02 (1.061) | 12.56 / 12.24 (0.975, 0.951–0.987) | 2,339 / 2,412 (1.031) | 190.5 / 172.0 (0.903) | noise |
+| M9b vs P7b (`p7b/perf-ab7c-summary.txt`) | `noscip-fresh` of hk_polls, laravel_realworld, mse_anilallewar, mse_callista, mse_fernandoabcampos | 10 each | 3.63–7.16 | ratios 0.965–1.082 | ratios 0.949–1.000 | ratios 1.005–1.021 | ratios 0.997–1.002 | noise, all five |
+
+- **The NFR holds** on the binary of record. P7b changes only the SCIP join (`scip.rs`) and rb-scip's symbol module, so mattermost's `noscip` modes were A/B'd with r1 and not again; the P7b binary's `noscip` dumps are byte-identical to r1's.
+- The 3 mattermost peak-RSS warnings in `compare.txt` compare against the M9b record's 960 MB–1.53 GB, which the M9b binary does not reproduce in the A/Bs (1,725–2,378 MB). Binary against binary, the RSS ratios are 1.031–1.056.
+- **SCIP mode** cost 1.297× CPU at P7. The cause was the `scip` crate's `parse_symbol`, which formats its parser state with `Debug` once per descriptor, called per occurrence: 740,623 occurrences of 10,557 distinct undefined symbols in the fixed server index (`p7b/symprobe.txt`). P7b's memo parses each distinct symbol once (`55592a1`), and the A/B reads 0.975×. Input growth stays (decode +35 %, the larger index fetch, 24 % more edges).
+- **Cold scip-go** (`logs/p7/scipgo-cold.txt`, P0b's job runner, 4g): server 111 s on the new image against 109 s on the old; `memory.peak` 3.40 GB against 4.29 GB; 0 OOM on both. server/public 30 s against 31 s. Index sizes 177.9 and 28.5 MB against 114.8 and 25.7 MB.
+
+**Verification.**
+- **Tests.** P6, at `139dd21`: `cargo test --workspace --no-fail-fast -- --test-threads=1`, real Docker, **1,153 passed, 0 failed, 0 ignored**, exit 0, `grep -c 'skipping:'` 0 (`logs/p6/test-full.log`), including e2e 52, rb-indexer 374, rb-store 84, rb-server 12 and api 1. P7b, at `55592a1`: rb-indexer 375 (P7b's memo test added) and rb-scip 82 passed (`logs/p7b/tests.log`). The full suite was not re-run at `55592a1`.
+- fmt and clippy (`-D warnings`) clean at P6 and at P7b (`logs/p6/{fmt,clippy}.log`, `logs/p7b/{fmt,clippy}.log`).
+- **Mutants.** 137 of 137 KILLED, none STALE or INVALID: m9c 38 at `55592a1`; m9b 39, m9a 31, m8b 29 at `139dd21`. The m9b, m9a and m8b batteries were not re-run after P7b. Of their 99 specs, 3 (m9a's m236–m238) mutate `scip.rs`, and each one's `old` text occurs exactly once at `55592a1`, as at `139dd21` (`var/m9c/logs/p8/anchors-p7b.txt`; a static check, not a run).
+- **Database.** `SELECT * FROM rb.repo ORDER BY 1` is identical before and after each phase that touched the database (P0–P7b notes), with one exception not made by M9c: during P4 a `t_m9d_chk` row appeared, made by the M9d planning probe in the same session (P4 note; M9d's `rb check` probe). `SELECT name, checkout FROM rb.repo` is identical across P6's suite and batteries. 0 `t_m9c_*` and 0 `bench_%` repositories left.
+
+**Notes: deviations and slips.** Those from a phase are also in its note; the dump count, the run window, the walls, the accept line and P8's own slip were found in P8.
+- **One-edit rule.** P2 (four `lib.rs` edits), P3 (two `Index::new` edits), P4 (three test-path edits) and P5 (two test edits) each sent several edits to one file in one message. Every marker was grepped and found landed before anything ran. P8 slipped twice too: two pairs of edits to this contract went out in one message each (the `## Result` move with the run-window fix, and the two "26 target dumps" fixes); all four were grepped and found landed.
+- **P7's identical-dump count** read "27 target dumps"; `invariant.txt` lists 26 of the 38 as identical (12 differ). Corrected in the P7 note.
+- **Maven 429 rescue (P5).** 8 of 15 SCIP e2e tests failed at a Maven or Gradle fetch on `429 Too Many Requests` from `repo.maven.apache.org`, and the failures were cached. Once the egress probe read 200, each cached row was overwritten with a `--no-cache --force` index of the fixture (`refresh_fixture_cache.sh`), and the 7 left passed. The SCIP e2e is green over three logs in P5; P6's full run is green in one.
+- **PI's e2e** was green over two logs: 2 `rb check` timeouts at load ~5 passed alone at load 2.4. P6's full run passed both.
+- **Profiler race (P7 → P7b).** P7's `scip_profile.sh` slept 0.3 s before attaching `sample`, so its m9b profile missed the first phase and `scan_unparsed`/`raw_scan` seemed to grow. P7b attached at launch: both are flat. A P7b attempt that started rb stopped and continued it was discarded (`exec` invalidates the task port).
+- **Autovacuum re-run (P7b).** Run 1 (17:05–17:18) ran while autovacuum cleared 7,580,697 dead `rb.edge` and 2,583,679 dead `rb.edge_evidence` tuples from deleted probe snapshots (`p7b/autovacuum.txt`); every mattermost wall was 58–67 s. Its dumps were identical. Run 2 is the run of record; run 1's evidence is in `var/m9c/p7b/run1/`.
+- **The run of record's walls are host-bound.** mattermost walls are 2.8–4.4× P7's at a lower load (above). `p7b/host-check.txt` timed m9b, r1 and p7b interleaved on hk_polls: 0.11–0.13 s CPU and 1.34–1.40 G instructions for each, at walls of 1.20–3.98 s for any of them. The walls were not re-measured on mattermost after run 2.
+- **Attribution corrected (P7).** P5 attributed the `exact calls (scip)` rise of +399 to IMG; the invariant splits it as 31 IMG and 368 D3-doc. D3-doc (10 scip-go documents accepted once D3 defines their type aliases) was not predicted.
+- **P3's predicted golden change did not occur** (P6): no fixture resolves through a new form.
+- **P7b's run window** read "17:28–17:38"; the outputs were written until 17:41:24. Corrected in the P7b note.
+- **The accept line's "190 version-skew calls"** includes 18 calls that are not skew (above). Recorded here; the file is not edited.
+- **Amendment 2's "4,092 members it no longer defines (skew)"** is corrected by the M9d contract (plan correction 3): they are references to 133 interface-method symbols that server/public's index defines no symbol for (`request.CTX#Session()` 1,300, `CTX#Logger()` 988, …), and go.work leaves 4,093. Amendment 2 is not edited, as M9d decides.
+- **`var/m9c/m9b-rescored{,-perf}.json`** were overwritten by P7's re-score; they differ from `m9b.json` only in `keys["exact:verdicts"]`.
+
+**Open items carried to M9d (`tasks/contract-m9d.md`).**
+- **Version skew.** server type-checks against `server/public v0.4.3` from the module cache. It leaves 1,541 invalid locals, 185 of mattermost's 203 `calls` fp (the other 18 are not skew), and every D8′ join `synthetic`. M9d's go.work emulation on M9b's noscip edges gives fp 18 and byte-equal joins.
+- **`(T, *model.AppError)` results.** D4 refuses them; mattermost `server/` has 1,050 one-line headers of that shape against 3,101 `(T, error)` (`logs/p3/mm-result-shapes.txt`). It is the lever if D4 is widened.
+- **The `scip` crate's parser** still pays its `Debug` formatting on each distinct string: 846 `parse_symbol` samples in p7b against 1,965 in m9b (`p7b/scip-profile-summary.txt`). Removing it means replacing the crate's parser, a dependency change, and M9b pays it too.
+- **The 4,092 interface-method references** that no server/public definition anchors (`unanchored` under D8′), per M9d's correction above.
+- Recorded, not fixed (Out of scope): cross-module `IMPLEMENTS` (352), single-implementer interface calls, `TsScopes` and `out_dir` on JSONC tsconfigs, TS `export *` barrels, Python data-flow forms.

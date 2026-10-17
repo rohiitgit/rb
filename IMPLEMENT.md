@@ -877,3 +877,33 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - S3: the three load-sensitive tests passed on a quieter host (try 3, `var/m9b/logs/r3/s3-try3.log`), and the full suite at `15baa12` is 1,136 passed, 0 failed, 0 skipped (`test-r3b.log`). The e2e statement timeout is `rb-store`'s `unowned_table_writes` query under a `LIMIT` (about 1.8 s on this host). The M9a binary hits it identically. Open item in `tasks/todo.md`.
   - N1: a fully qualified configurer (return type and supertype) caps; the evaluator's x1 is KILLED. N2, N3: records corrected ("E4"; "17 of 18"). N4: `t_*` probes are deleted by the e2e start-up clean-up (lesson).
 - **Status:** closed 2026-10-16 on evaluator pass 2 (`tasks/eval-m9b-pass2.md`) VERDICT PASS (0 blocking; 3 should-fix and 4 notes answered in amendment 8).
+
+## M9c Tier B call recall, the scip-go image, cross-module scip-go joins: built 2026-10-17
+
+- **Discussed and decided:** the contract (`tasks/contract-m9c.md`, C1–C16, amendments 1–2 and phase notes PI–P7b) checked the plan against the code first. B3's cause is strict JSON parsing of tsconfig `paths`, not namespace imports. B2's misses are five syntactic forms (call results, call segments, aliases, embedding, package vars), not single-implementer interfaces (0 measured misses). B5 adds inherited `__init__`. P0 found the 3 `App#GetClusterId` fp came from scip-go recording no occurrence where an imported package failed to load, and P0b traced that to rb's image.
+- **The scip-go image, root cause (amendment 2, PI):**
+  - `docker/scip-go/Dockerfile` built scip-go v0.2.7 with Go 1.27.2, whose compiler writes unified export data version 5 (`uirVersion = pkgbits.V5`, a 1.27.2 backport for golang/go#81188 and #81306). scip-go loads imports from export data through x/tools v0.45.0, whose decoder refuses anything above version 4.
+  - So go/types made every import, the standard library included, a fake package with no members. scip-go swallows package errors and exits 0. Since the image was created (M6d, `1f155c7`), every scip-go index rb made came from that degraded type check: 119,977 of server's 202,385 locals `invalid type`, no member occurrence of any dependency (M9b's "nothing to join"), and go/types' "assume implements" for invalid types (B13b's 322 false-or-unverifiable `IMPLEMENTS`).
+  - Fixed by building v0.2.7 against x/tools v0.50.0, the first release that reads version 5. `go.mod` and `go.sum` are pinned by sha256, `go build` runs `-mod=readonly`, `go version -m` must list x/tools v0.50.0, and a build-time self-test fails the build unless scip-go writes `os/Getenv().` for `os.Getenv(…)`; its control fails on the old image. Tag **`rb-scip-go:0.2.7-xtools0.50.0`** (`SCIP_GO_IMAGE`), image ID `sha256:47eab865…`; a new image ID misses every cached Go index. A newer scip-go (none released after v0.2.7) and a Go that writes ≤ V4 were rejected.
+  - D7 (a method-set check on scip-go type relationships) was withdrawn: on the fixed image it catches 0 false rows and drops 3 true ones. D8 became D8′, a symbol join, because imports now load and the references are `external`, not `unmatched`.
+- **Built:**
+  - PI: the image, the tag constant, a unit test tying the tag to the Dockerfile's pins, both READMEs; 2 e2e golden rows re-blessed (`external` up, `unmatched` down by the same).
+  - B3 (P1): `rb_scip::jobs::parse_jsonc` for tsconfig `paths` (`AliasMaps::build` only); TS/JS default imports through `default_export`.
+  - B2 (P2, P3): Go facts (`return_type`, `alias_of`, embedded member bindings, untyped `var_spec` literals, the `:=` call pair) and resolution through call results, call segments, aliases, embedding and package vars; `tier_b_forms` (D6).
+  - B5 (P2, P4): the `raise` query; `super()`, star imports, re-exports, module variables, inherited `__init__`.
+  - B1 (P5, D8′): external scip-go references into another ok job's `go.mod` module are joined after the job loop as `synthetic` `scip` edges; `scip_cross_project`; `exact calls (scip)` counts `exact` only.
+  - P6: `PIPELINE` `m9c-1`; design notes §5.2–§5.4; usage guide.
+  - P7b: a per-join memo so the SCIP join parses each distinct symbol once (`NameForms`, `NameMemo`); output unchanged.
+- **Files:** `crates/rb-scip/src/{jobs,lib,symbol}.rs`, `crates/rb-indexer/src/{lib,resolve,rta,scip}.rs`, `crates/rb-syntax/src/{lib,bindings,decorations,queries,keys}.rs`, `crates/rb-store/src/{query,db_tests}.rs`, `crates/rb-cli/src/doctor.rs`, `crates/rb-cli/tests/golden/{go-chi-sqlx,polyglot-monorepo}/scip-status.txt`, `docker/scip-go/{Dockerfile,README.md}`, `bench/probe/m9c_forms.py`, `bench/mutants/m9c.json`, `bench/samples/exact.tsv`, `bench/scoreboard/m9c{,-perf}.json`, `bench/accept-m9c.tsv`, `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
+- **Results** (binary `f340b267…06c9` from `55592a1`, run `var/bench/out/f340b267d529/`):
+  - scip `calls` agreement P 78.4 % → 99.5 %, R 62.4 % → 96.3 %; mattermost gold 33,312 → 43,840, fp 6,141 → 203, fn 12,672 → 1,659. 23,186 `synthetic` cross-module scip edges.
+  - bookcars `calls` R 62.5 % → 99.6 % (fn 694 → 8); go_clean_arch and go_gin_example 100 %; PyCG `calls` 12 → 14 of 48, `calls_file_scope` 94 → 105 of 186.
+  - 17 of 314 cells changed; `compare` exits 0 with 6 accepted lines over 5 cells. Invariant: 0 unclassified rows over 157 dumps; no Tier B edge `exact`.
+  - `exact` 100.0 % of 126; the `scip` sample's 54 redrawn edges all TRUE.
+- **Verification:**
+  - Mutants m9c 38/38 (m300–m330, m334–m338, m340, m341), m9b 39/39, m9a 31/31, m8b 29/29 KILLED.
+  - Real-Docker 1,153/0/0 at P6; rb-indexer 375 and rb-scip 82 at P7b.
+  - fmt and clippy clean; `rb.repo` unchanged; two scorings `cmp`-identical.
+  - Perf: mattermost `noscip-fresh` A/B noise (CPU 1.010×); SCIP mode 1.297× CPU at P7, 0.975× after P7b's memo.
+- **Open, carried to M9d:** version skew (185 of the 203 mattermost fp; every D8′ join `synthetic`), `(T, *model.AppError)` results, the `scip` crate parser's remaining `Debug` cost, and the 4,092 interface-method references no server/public definition anchors.
+- **Status:** built, evaluator pending.

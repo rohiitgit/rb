@@ -1208,3 +1208,33 @@ Contract: `tasks/contract-m9b.md` (10 plan corrections; amendments 0–8). Branc
 - Process: the adjudicator gave TRUE/FALSE, and ADD/REMOVE was derived with `adjudicate.py`'s rules. C6 had been P4's code and is withdrawn with it. 3 of the 14 accepted mattermost fp go to server's own `App#GetClusterId`, which the accept line's B1 reason does not explain.
 - Pass 1 found two wrong-or-missing rules on inputs the bench lacks (a named-type Go constant folded by its literal; a `@Bean` configurer not capping) and seven mutants that the tests did not bite. Its records findings stood: the ADD split was 5/2/5, and jferrater's 17 of 17 is 17 of 18 with the served `findById` search that neither rb nor the key has.
 - Pass 2 found no wrong rule. Its findings were about evidence: a perf verdict applied a looser rule than the one it cited (re-measured: noise, by CPU and by instructions retired), a table showed one run's numbers under another's name, and three tests failed only on a loaded host. The `rb check` timeout behind two of them is old `rb-store` code that the M9a binary hits too (open item above).
+
+---
+
+# M9c: Tier B call recall (Go, TS, Python), scip-go image, cross-module scip-go joins, started 2026-10-16
+
+Contract: `tasks/contract-m9c.md` (5 plan corrections; amendments 1–2; notes PI–P7b). Branch `m9`.
+
+- [x] Contract written (B1, B2, B3, B5, B13b; C1–C15; mutants from m300).
+- [x] P0: probe `bench/probe/m9c_forms.py`; base re-scored `cmp`-identical; 33 of 35 quoted numbers reproduced, B1's split corrected; D7 read per job (407 / 322); the `GetClusterId` fp traced to the scip-go image (amendment 1).
+- [x] P0b: image root cause verified (Go 1.27.2 export data V5, x/tools v0.45.0 reads V4); fix measured; D7 withdrawn, D8 → D8′, phase PI added (amendment 2).
+- [x] PI: `rb-scip-go:0.2.7-xtools0.50.0` with pinned modules and a build-time self-test; 2 golden rows re-blessed and classified; image control fails on the old tag.
+- [x] P1: B3, JSONC tsconfig `paths` and default imports; bookcars probe +801 `CALLS`; m300–m303 KILLED.
+- [x] P2: Go and Python facts (results, aliases, embedded fields, var literals, call pairs, `raise`); m304–m309 KILLED.
+- [x] P3: Go resolution through the five forms and `tier_b_forms`; go_clean_arch and gin probes +21 pairs; m310–m322 KILLED.
+- [x] P4: Python `super()`, star imports, re-exports, module variables, inherited `__init__`; PyCG probe exactly the 10 predicted cases; m323–m330 KILLED.
+- [x] P5: D8′ `synthetic` cross-project join, `exact calls (scip)` counts `exact` only; SCIP e2e green after a Maven 429 rescue; m334–m338, m340 KILLED.
+- [x] P6: `PIPELINE` `m9c-1`, design and usage docs; real-Docker 1,153/0/0; batteries m9c 37, m9b 39, m9a 31, m8b 29 KILLED.
+- [x] P7: binary `930271d4…` from `139dd21`, 0 failures; invariant 0 unclassified; 54 redrawn `scip` edges judged blind, 54 TRUE; score ×2 `cmp`; `compare` exit 0 with 6 accepted lines over 5 cells; `noscip-fresh` A/B noise; SCIP mode OVER-CPU (1.297×).
+- [x] P7b: cause (per-occurrence symbol parse in the join), memo fix `55592a1`, m341 KILLED (m9c 38/38); binary `f340b267…` re-benched (run 2 after an autovacuum re-run), 157 dumps identical, `compare` exit 0; SCIP-mode A/B 0.975× CPU, noise.
+- [x] P8: records done; evaluator pass 1 pending.
+- [ ] Evaluator pass 1.
+- [ ] Evaluator pass 2 (verification only).
+- **Open items carried to M9d (`tasks/contract-m9d.md`):** version skew (185 of the 203 mattermost fp, every D8′ join `synthetic`); `(T, *model.AppError)` results (1,050 headers on mattermost `server/`); the `scip` crate parser's remaining `Debug` cost on distinct strings; the 4,092 interface-method references (M9d plan correction 3). M9b's `unowned_table_writes` timeout is M9d's D11 (LLVM JIT, not the `LIMIT`).
+
+## Review (M9c)
+- Recall moved where B2, B3 and B5 said it was missing: mattermost scip `calls` fn 12,672 → 1,659 and fp 6,141 → 203; bookcars fn 694 → 8; go_clean_arch and gin 100 %; PyCG `calls` 12 → 14 of 48 and `calls_file_scope` 94 → 105 of 186. scip `calls` agreement P 78.4 % → 99.5 %, R 62.4 % → 96.3 %. No new Tier B edge is `exact`, and `exact` stays 100.0 % of 126.
+- The biggest finding was not in the plan: rb's scip-go image had loaded no imported package since it was built, silently. Reading one missing occurrence (`GetClusterId`) down to the export-data version found it. It explained B13b and M9b's empty B1 probe, made 5,947 of mattermost's 6,141 agreement fp joinable, and made D7 unnecessary. The build now fails on the same kind of break.
+- Predictions held where they were syntactic (bookcars at the upper bound, the 21 Go pairs, the 10 PyCG cases exactly). Two outcomes were not predicted: D3's alias definitions let rb accept 10 scip-go documents (368 of the +399 `exact calls (scip)` that P5 had put on the image), and `calls_file_scope` on bookcars beat its prediction by 5 through default imports.
+- Perf: the scip-go image made server's index 35 % larger, and the join's per-occurrence symbol parse turned that into 1.297× CPU. The fix makes SCIP mode cheaper than M9b's.
+- Process: the one-edit rule slipped in P2–P5 and in P8 (always caught by grep before anything ran). A late-attaching profiler and an autovacuum after probe deletes each cost a re-measure. Records slips caught in P8: "27 identical target dumps" (26), the run-of-record window (17:41, not 17:38), and the accept line's "190 version-skew" fp (172 skew, 18 not).

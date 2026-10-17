@@ -1,5 +1,31 @@
 # Changelog
 
+## [2026-10-17 17:59] (wall clock) M9c: Tier B call recall, scip-go image, cross-module scip-go joins
+- **scip-go image (PI, B13b's cause):** rb's image built scip-go 0.2.7 with Go 1.27.2, which writes export data version 5, against x/tools v0.45.0, which reads only up to version 4. Every import failed to load, silently (exit 0), so every scip-go index rb had made came from a degraded type check: 119,977 of server's 202,385 locals were `invalid type`. The image is now scip-go v0.2.7 on x/tools v0.50.0, tagged `rb-scip-go:0.2.7-xtools0.50.0`, with `go.mod`/`go.sum` pinned by sha256 and a build-time self-test that fails unless scip-go types `os.Getenv` (its control fails on the old image). The 322 scip-go `IMPLEMENTS` on mattermost that the degraded type check related (277 from `*Suite#` types, the judged-FALSE `ElasticsearchInterfaceTestSuite#` row among them) left with the image, so D7 is withdrawn (C8; `relationships_unverified` never built).
+- **Fixes** (contract `tasks/contract-m9c.md`):
+  - **B3 (TS):** tsconfig `paths` are read as JSONC (comments, trailing commas), and default imports resolve to the target's `export default`.
+  - **B2 (Go):** receivers typed through call results (`T` and `(T, error)`), call segments in a qualifier, type aliases, embedded structs (breadth-first, never `IMPLEMENTS`) and sibling-file package vars.
+  - **B5 (Python):** `super()`, star imports (with the `_` and `__all__` rules), re-exports, module variables, `raise A` and inherited `__init__`.
+  - **B1 (D8′):** a scip-go reference into another of the repository's Go modules joins that job's definition by symbol, version dropped, as a `synthetic` `scip` edge; `scip_cross_project` counts `synthetic`, `ambiguous` and `unanchored`, and `exact calls (scip)` counts `exact` only.
+  - Every reference resolved through a new form is counted in a per-file `tier_b_forms` diagnostic (11 keys). All new Tier B edges are `heuristic`. `PIPELINE` `m9c-1`.
+- **P7b (perf fix):** the SCIP join parsed a symbol at every occurrence, and the `scip` crate's parser formats its state with `Debug` per descriptor. A per-join memo parses each distinct symbol once; output unchanged. SCIP-mode CPU against M9b went 1.297× → 0.975×.
+- **Scoreboard** (`bench/scoreboard/m9c.json`, binary sha256 `f340b267…06c9` from `55592a1`, `PIPELINE` `m9c-1`; run `var/bench/out/f340b267d529/`):
+  - scip `calls` agreement P 78.4 % → 99.5 %, R 62.4 % → 96.3 %. mattermost gold 33,312 → 43,840, tp 20,640 → 42,181, fp 6,141 → 203, fn 12,672 → 1,659.
+  - bookcars `calls` tp 1,155 → 1,841, fn 694 → 8; go_clean_arch 49 of 49; go_gin_example 161 of 161.
+  - PyCG `calls` R 25.0 % → 29.2 % (14 of 48), `calls_file_scope` R 50.5 % → 56.5 % (105 of 186).
+  - 17 of 314 cells changed. `compare` against the re-scored M9b record exits 0 with 6 accepted lines over 5 cells, all pairs with an end in files SCIP does not cover, plus mattermost file-scope fn 6 → 8 (new gold).
+  - `exact` 100.0 % of 126, unchanged; the `scip` sample redrew 54 edges, judged blind: 54 TRUE, 60 of 60.
+  - Invariant over 157 dumps: B1 23,187, IMG 455, B2 42,784, B3 8,896, B5 118, RTA 20, DIAG 8,787 rows, 0 unclassified; no Tier B edge `exact`.
+  - Of the 203 mattermost fp, 185 are version skew (server compiles against `server/public v0.4.3`), M9d's.
+- **Perf:** mattermost `noscip-fresh` A/B against M9b: CPU 1.010×, wall 1.059×, RSS 1.056×, noise. SCIP mode 0.975× CPU after P7b. Five small-target wall warnings re-measured A/B: noise.
+- **Verification:** real-Docker 1,153/0/0 at P6; rb-indexer 375 and rb-scip 82 at P7b; fmt and clippy clean; mutants m9c 38/38, m9b 39/39, m9a 31/31, m8b 29/29 KILLED; two scorings `cmp`-identical; `rb.repo` unchanged.
+- **Files:**
+  - **Code:** `crates/rb-scip/src/{jobs,lib,symbol}.rs`, `crates/rb-indexer/src/{lib,resolve,rta,scip}.rs`, `crates/rb-syntax/src/{lib,bindings,decorations,queries,keys}.rs`, `crates/rb-store/src/{query,db_tests}.rs`, `crates/rb-cli/src/doctor.rs`, `docker/scip-go/{Dockerfile,README.md}`, goldens `crates/rb-cli/tests/golden/{go-chi-sqlx,polyglot-monorepo}/scip-status.txt`.
+  - **Bench:** `bench/probe/m9c_forms.py`, `bench/mutants/m9c.json`, `bench/samples/exact.tsv`, `bench/scoreboard/m9c{,-perf}.json`, `bench/accept-m9c.tsv`.
+  - **Docs:** `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
+  - **Records:** `tasks/{contract-m9c,contract-m9d,bench-findings,todo,lessons,plan-m9}.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+- **Status:** built; evaluator pass 1 pending.
+
 ## [2026-10-16 21:57] (wall clock) M9b closed: evaluator pass 2 PASS
 - `tasks/eval-m9b-pass2.md`: VERDICT PASS, 0 blocking, 3 should-fix, 4 notes. Answered in contract amendment 8.
 - **S1 (perf rule):** amendment 7 called all 24 `noscip-fresh` wall warnings noise, but six had a median CPU ratio of 1.105–1.303× on 3 runs, over amendment 0's 1.1×. The summary script had let a base CPU under 1 s pass on wall alone. Re-measured as an A/B of the M9a binary and r2, 20 runs per side, alternating ABBA (`var/m9b/scripts/perf_ab6.sh`): median CPU 0.932–1.097×, wall 0.944–1.029×, instructions retired 0.978–1.003×. All six are noise under the rule as written. Amendment 7's sentence is corrected, and both summary scripts print the rule they apply.
