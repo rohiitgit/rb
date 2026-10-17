@@ -966,3 +966,61 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 ## Result
 
 Not yet built.
+
+**P7b note (2026-10-17, P7's scip-mode CPU over 1.10×: cause, fix, re-bench; base `660d92e`, fix `55592a1`).** Logs in `var/m9c/logs/p7b/`, scripts in `var/m9c/p7b/` (`zsh` or `python3 -I`; probe and A/B repositories `bench_*`, all removed).
+- **Cause, avoidable: one symbol parse per occurrence.** In the join, `parse_symbol` from the `scip` crate (0.10.0) formats the parser's whole state with `Debug` once per descriptor (`accept_one_descriptor`'s `format!("descriptor name: {:?} …", self)`), so one parse costs far more than a lookup. The join parsed a symbol at every occurrence:
+  - `rb_scip::package` in the package loop, for each occurrence of a global symbol the index does not define;
+  - `rb_scip::package` again in the reference loop, for each external reference;
+  - `rb_scip::may_name` in `Naming::names_token`, for each reference with an occurrence.
+  - With imports loaded, server's index names undefined symbols at 740,623 occurrences, against 249,056 before. They are only 10,557 distinct strings, against 245 before (`symprobe.txt`, read-only over P7's exported indexes). Parsing every occurrence takes 2.55 s; parsing each distinct string once takes 0.05 s. M9b's join had the same pattern on smaller input (0.49 s).
+  - P7's profile split matches: `parse_symbol` is 3,892 of `join_handing_back`'s 4,522 samples. The input growth multiplied this avoidable cost; it did not create it.
+- **Cause of the non-join growth P7 listed.** Nothing to fix.
+  - **`scan_unparsed` +1,417 and `raw_scan` +860: an artefact of the profiler.** P7 slept 0.3 s before attaching `sample`, and its m9b profile has no `Repo::manifest` samples (its m9c profile has 582), so it missed the run's first phase. `scip_profile.sh` attaches at launch. Each of its three profiles has 575–638 `Repo::manifest` samples. They read `scan_unparsed` 2,458 / 2,463 / 2,463 and `raw_scan` 1,717 / 1,724 / 1,716 for m9b / r1 / p7b (`scip-profile-summary.txt`).
+    - Both functions are unchanged since M9b (`git diff e428d15 -- crates/rb-frameworks crates/rb-git crates/rb-indexer/src/syntax.rs` is empty). They run before the SCIP jobs and read the same 3,288 files in either mode. They did not grow in SCIP mode or any other.
+    - A first attempt (start rb stopped, attach, continue) sampled under a second, because `exec` invalidates the task port `sample` holds. It was discarded.
+  - **`assemble` +2,492** is the join, nested inside it (+2,226), plus `resolve::add_edges` +169.
+  - **Input-driven, kept.** These are the costs that remain once the join is fixed (samples m9b → p7b, `scip-profile-summary.txt`):
+    - `decode` 956 → 1,288 (+35 %): server's index grew from 114.8 to 177.9 MB (+55 %);
+    - `scip_index_get` 700 → 1,080: mostly waiting on the database for the larger blob (`kevent`);
+    - `add_edges` 980 → 1,176: 24 % more edges.
+- **Fix (`55592a1`, test-first; output unchanged, `PIPELINE` stays `m9c-1`).**
+  - rb-scip: `NameForms` (last descriptor, its owner, meta suffix) is what `may_name` reads, and `may_name` is now `NameForms::of(s).names(t)`. The existing table test pins every form.
+  - rb-indexer: `NameMemo` keeps one `NameForms` per distinct symbol for the whole join and is shared by every document's `Naming`. A per-join `HashMap<&str, Option<Package>>` serves both `package` call sites. In the package loop, `first.entry(p).or_insert(span)` became `contains_key`/`insert(p.clone())`, which keeps the first site.
+  - Test `the_name_memo_parses_each_symbol_once_and_judges_each_text`: the memo answers as `may_name` does when one symbol is asked about at a text it names and at one it does not, in both orders, and for a local and a malformed string; it holds one reading per distinct symbol.
+  - **New mutant m341** ("name memo never stores", KILLED by that test). C15's set is now m300–m330, m334–m338, m340 and m341.
+  - `cargo fmt --check` and clippy `-D warnings` are clean. rb-scip has 82 tests and rb-indexer 375, all passing. m9c battery 38/38 KILLED (`battery-m9c.log`, `--jobs 1`); `crates/` was restored byte for byte (sha256 checked).
+  - No DB write path is touched.
+  - Not fixed: the remaining parses are of distinct strings (`own_packages` over defined symbols, `last_descriptor_name` per definition, `NameForms::of` per distinct symbol: 846 `parse_symbol` samples in p7b against 1,965 in m9b). They still pay the `scip` crate's `Debug` formatting. Removing that would mean replacing the crate's parser, a dependency change outside this phase, and M9b pays it as well.
+- **Binary (C11).** `build.sh` built from a clean `crates/` and `migrations/` at `55592a1` (`build.log`). The new `var/m9c/bin/rb` has sha256 `f340b267d529…06c9`. P7's binary is kept as `var/m9c/bin/rb.r1` (`930271d4…6ee7`). `rb-bench` is unchanged (`82839c81…452b`).
+- **Output identity** (`identity.sh` → `identity.txt`). Both binaries indexed mattermost in SCIP mode in turn, as `bench_mattermost_scip`.
+  - The dumps are `cmp`-identical, each 263,508 rows (sha256 `ece7f9597d89…`), and identical to P7's record `var/bench/out/930271d417de/mattermost.scip.jsonl`.
+  - `rb status` differs only in the snapshot id and the graph name.
+  - One run each: CPU 16.94 s (r1) against 12.03 s (p7b).
+- **A/B, scip mode** (`perf_ab7b.sh`: P7's script, scip command only, 15 runs per side, ABBA → `perf-ab7b.txt`; P7's `perf_ab7_summary.py` → `perf-ab7b-summary.txt`; 30 runs, all exit 0, load 3.13–5.17, every run served 13 jobs from the cache):
+
+  | | wall m9b / m9c (ratio) | CPU (ratio, 95 % CI) | peak RSS MB (ratio) | instructions G (ratio) | verdict |
+  |---|---|---|---|---|---|
+  | P7 (r1) | 21.14 / 26.40 s (1.249) | 12.40 / 16.08 s (1.297, 1.287–1.306) | 2,378 / 2,508 (1.055) | 190.5 / 269.0 (1.412) | OVER-CPU |
+  | P7b | 19.81 / 21.02 s (1.061) | 12.56 / 12.24 s (0.975, 0.951–0.987) | 2,339 / 2,412 (1.031) | 190.5 / 172.0 (0.903) | **noise** |
+
+- **Classification.** Under the rule printed first in the summary (CPU ≤ 1.10, wall ≤ 1.25, RSS ≤ 1.15, no exemption), SCIP mode is **noise**. No confirmed regression remains, so the close is not blocked.
+  - M9c's input growth is still there: decode, the larger index fetch and the 24 % more edges. The CPU the fix saved more than pays for it, because M9b's own join parsed per occurrence too. The comparison is binary against binary, as the rule states.
+- **Re-bench (C11).** `nohup bench/run.sh var/m9c/bin/rb` → `var/bench/out/f340b267d529/`, run twice.
+  - **Run 1** (17:05–17:18): `failures: 0`; all 157 dumps identical. It ran during an autovacuum of `rb.edge`, which held 7,580,697 dead tuples, and `rb.edge_evidence`, which held 2,583,679. These came from deleting the A/B, profile and identity snapshots (`autovacuum.txt`). Every mattermost wall was 58–67 s, against 17–25 s in P7. Its log, meta files, score and compare are kept in `var/m9c/p7b/run1/`.
+  - **Run 2** (17:28–17:38, after the vacuum, `bench-run.log`) is the run of record.
+    - `failures: 0`, every `noscip` fresh/cached pair identical, 0 `bench_%` repositories left.
+    - **All 157 dumps are byte-identical** to `var/bench/out/930271d417de/`: 27 target `noscip`, 11 `scip` and 119 PyCG. None is missing, empty or extra. All 11 `.scip.status` files are identical with the snapshot id and graph name masked (`dump_identity.sh` → `dump-identity.txt`).
+    - Host walls were still slow (small targets about 2 s against P7's 0.4 s). `host_check.sh` (`host-check.txt`) ran hk_polls `noscip-fresh` with m9b, r1 and p7b interleaved. All three used 0.11–0.13 s of CPU and 1.34–1.40 G instructions, at walls of 1.2–4.0 s for any of them, so the extra wall is host/DB wait, not rb's work.
+  - **Scoring** (`score.sh` → `score.txt`): twice, 1.73 s and 1.67 s, `cmp`-identical, scoreboard and perf file both.
+    - `m9c.json` differs from P7's `bench/scoreboard/m9c.json` only in `rb.binary_sha256` and `rb.commit`: 2 leaves. A control diff against `m9b-rescored.json` shows 48, so the diff can fail.
+    - `bench/scoreboard/m9c.json` and `m9c-perf.json` are replaced with this scoring.
+  - **Gate C13** (`compare.txt`). Command: `target/release/rb-bench compare var/m9c/m9b-rescored.json bench/scoreboard/m9c.json --accept bench/accept-m9c.tsv --perf var/m9c/m9b-rescored-perf.json bench/scoreboard/m9c-perf.json`. It **exits 0**. Every line except the perf warnings is identical to P7's `compare.txt`, with the same 6 `accepted` lines.
+  - **Perf warnings (C14).** The three mattermost peak-RSS warnings are P7's, already classified by its A/B, and the scip RSS ratio above is 1.031.
+    - New wall warnings, all on `noscip-fresh`: laravel_realworld, mse_anilallewar and mse_callista in run 2; hk_polls, mse_callista and mse_fernandoabcampos in run 1. The fix cannot reach these cells: the join runs only in the SCIP job loop.
+    - Re-measured as an A/B of M9b against P7b on all five (`perf_ab7c.sh`, 10 runs per side, ABBA → `perf-ab7c.txt`; `perf_ab7c_summary.py` is P7's summary with its modes read from the log and its rule unchanged → `perf-ab7c-summary.txt`; 100 runs, all exit 0):
+      - wall 0.965–1.082×;
+      - CPU 0.949–1.000×;
+      - RSS 1.005–1.021×;
+      - instructions 0.997–1.002×.
+    - All five are **noise**.
+- **Safety.** `rb.repo` before and after equals `var/m9c/logs/repo-before-bench.txt` (`repo-before.txt`, `repo-after.txt`). 0 `bench_%` and 0 `t_m9c_*` repositories are left. `worktrees/` and `bench/__pycache__/` were not touched, and no run under `var/bench/out/` was deleted; the first P7b run's files there were overwritten by the second, its evidence kept as above. Disk 15 GiB free at the end.

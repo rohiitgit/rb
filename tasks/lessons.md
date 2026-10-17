@@ -658,3 +658,15 @@
 ## 2026-10-17: a fetch failure across many fixtures at once is the registry before it is the code
 - **Context (M9c P5):** 8 of 15 SCIP e2e tests failed in one run, every one at a Maven or Gradle fetch, while the change under test touched only scip-go. `rb.scip_index.stderr_tail` (read `READ ONLY`) showed `status code: 429, reason phrase: Too Many Requests` from `repo.maven.apache.org`, and the egress probe test read `allowed 429`. The failures were cached, so a plain re-run replayed `failed (cached)`.
 - **Rule:** When several container tests fail in the fetch phase together, read one `stderr_tail` and the egress probe line before touching code. A 429 is external: wait until the registry answers 200 through the proxy (the egress probe test alone is the check). Then overwrite each cached row with a `--no-cache --force` run of the fixture materialised as the harness does (tracked files at the repository root, one commit; `var/m9c/p5/refresh_fixture_cache.sh`). Delete those repositories and their `var/scip/cache/<repo>` (Go caches need `chmod -R u+w`), and re-run the failed tests. Report the suite as green over the logs it took.
+
+## 2026-10-17: a profile that attaches late misreads the early phases
+- **Mistake (M9c P7):** `scip_profile.sh` slept 0.3 s before attaching `sample`. The m9b profile missed the run's first phase (no `Repo::manifest` samples, against 582 in m9c's), so `scan_unparsed` and `raw_scan` seemed to grow by 1.4 s and 0.9 s in code that had not changed. P7b's profiles, attached at launch, read 2,458 / 2,463 / 2,463.
+- **Rule:** Attach the profiler at launch, and check each profile for completeness by the samples of the run's first phase before comparing any phase. Do not start a process stopped and continue it after `exec`: on macOS `exec` invalidates the task port that `sample` holds.
+
+## 2026-10-17: deleting probe snapshots puts autovacuum into the next timed run
+- **Mistake (M9c P7b):** the A/B, profile and identity probes deleted about 36 mattermost snapshots, which left 7.6M dead `rb.edge` tuples and 2.6M dead `rb.edge_evidence` tuples. Autovacuum ran through the bench that followed, and every mattermost wall was 2.7× P7's. The dumps were unaffected.
+- **Rule:** After deleting large probe repositories, wait until `pg_stat_activity` shows no `autovacuum:` on the graph tables, and log `n_dead_tup` before a timed run. When walls inflate in modes a change cannot reach, time the old binary interleaved with the new on one small target, and compare CPU and instructions retired, before reading anything into the walls.
+
+## 2026-10-17: a diff that reports zero needs a control that must differ
+- **Mistake (caught, M9c P7b):** the scoreboard diff printed "0 differing leaves" because the script never called its own `walk`; `diff` showed two.
+- **Rule:** Every equality check gets a control in the same log that must fail: a known-different input that shows a non-zero count. Without it, a zero proves nothing.
