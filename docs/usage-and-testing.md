@@ -65,8 +65,12 @@ via `check`:
   components required).
 - Docker, with context `desktop-linux` (Docker Desktop is the runtime of
   record: `DOCKER_CONTEXT=desktop-linux` or `docker context use
-  desktop-linux`). SCIP jobs need the four images (see README "SCIP
-  indexers"); `--no-scip` runs need no images.
+  desktop-linux`). SCIP jobs need the six images in README "Setup
+  reference" (four indexers, the second scip-java image on JDK 25, and the
+  egress proxy); `rb doctor` checks all six (`6 pinned images present`) and
+  names any that is absent. The JDK 25 image is built second, from the first:
+  `docker build -t rb-scip-java:0.13.1-jdk25 -f docker/scip-java/Dockerfile.jdk25 docker/scip-java`.
+  `--no-scip` runs need no images.
 - Disk: SCIP fetches are heavy (tens of GB for large repos); keep several GB
   free (`df -h /`).
 - Ports: Postgres 55432 by default (`RB_DB_PORT=55433` moves it; the machine
@@ -227,20 +231,81 @@ Notes that bite newcomers:
   `tier_b_forms` diagnostic counting the references per form: `return_type`,
   `call_segment`, `type_alias`, `embedded`, `package_var`, `default_import`,
   `super_call`, `star_import`, `reexport`, `module_variable`, `inherited_init`.
+- SCIP fetches and the `scip:` status lines (`rb index`, `rb status`):
+  - **npm** fetches (`package-lock.json`, or no lockfile) run with
+    `npm_config_replace_registry_host=always` and `npm_config_engine_strict=false`.
+    A lockfile resolved from a mirror (`https://npm.styque.de/…`) installs
+    from `registry.npmjs.org`, with every tarball still checked against the
+    lockfile's integrity, and an `engines` range newer than the image's Node
+    no longer stops the install. Yarn and pnpm fetches are unchanged. npm also
+    rewrites a `git+ssh` GitHub dependency's host
+    (`ssh://git@registry.npmjs.org/…`). Such a fetch fails, as git hosts always
+    did behind the allow-list.
+  - **Python.** A directory with `requirements.txt` and neither
+    `pyproject.toml` nor `setup.py` is a Python root, installed with pip. A
+    root without `pyproject.toml` indexes as
+    `--project-name <directory> --project-version .` (`root` at the repository
+    root). When a Python fetch fails (a pin that must build from source on the
+    image's musl, say), the index still runs, without the environment:
+    `scip-python ok (environment not installed: fetch failed)` (`rb index`
+    prints the time before the parenthesis). The row is cached as `ok` with
+    phase `fetch`, and the `scip_status` diagnostic keeps the fetch's
+    `stderr_tail`, Poetry's errors included. Third-party names are unresolved
+    either way: the index phase never sees a pip environment (contract M9d,
+    amendment 1, risk 3).
+  - **scip-go health.** scip-go exits 0 when packages fail to load. An index
+    with locals typed `invalid type` ends its line with
+    `, N of M locals typed invalid` (coverage keys `locals_invalid_type` and
+    `locals`, written only when N > 0). A healthy index prints nothing.
+  - **Java.** A Maven job whose poms declare a Java release above 21
+    (`maven.compiler.release`/`source`/`target` or the compiler plugin's,
+    `${…}` resolved through the poms in the build root) runs on
+    `rb-scip-java:0.13.1-jdk25`. Above 25 it is `unsupported`
+    (`scip-java: the poms declare Java release N; the newest scip-java image runs JDK 25`),
+    and so is it when that image is absent. Maven indexes write SemanticDB to
+    `--targetroot /scip-targetroot`, outside the sources, so an aggregator
+    root's `clean` cannot delete it. Gradle jobs stay on the JDK 21 image, and
+    a read-only init script sets the executable bit on the protobuf plugin's
+    `protoc` tool artifacts before any task runs: on Docker Desktop's bind
+    mount, Gradle believed a `0644` file executable, and `:generateProto`
+    failed with `error: 13`.
 - Go with SCIP across modules of one repository (each `go.mod` is its own
-  scip-go job): a call from one module into another module of the repository
-  (`model.NewId()` from `server` into `server/public`) links to that module's
-  own definition with provenance `scip` and certainty `synthetic`, not `exact`.
-  The compiler resolved the name against the version the caller's `go.mod`
-  requires from the module cache, which can differ from the in-repo code.
-  Each (from module, to module) pair gets one `scip_cross_project` diagnostic
-  `{to, synthetic, ambiguous, unanchored}`. `ambiguous` means two modules
-  declare the same module path (no edge). `unanchored` means the target module
-  has no definition node for the name, for example a name the required
-  version has and the in-repo code does not. `rb status`'s
-  `exact calls (scip)` counts `exact` calls only, so these are not in it.
-  These joined edges enter the bench's SCIP agreement reference like every
-  `scip` call; a seeded 60-edge sample of them was judged blind once
+  scip-go job). **Workspaces.** When a module's `go.mod` requires, with no
+  `replace`, the module path of another `go.mod` below its directory
+  (mattermost's `server` requires `server/public`), rb writes a `go.work`
+  (`use .` and each such directory) into the job's export, never into your
+  checkout, and runs both phases in workspace mode, so the compiler reads the
+  in-repo code rather than the required version from the module cache.
+  Vendored, `testdata`, `.x` and `_x` directories are never workspace modules,
+  and a module that commits its own `go.work` is left as it is. If the
+  workspace run fails (a non-zero exit such as an OOM kill, or no index), the
+  job is run again without `go.work` and its line reads
+  `scip-go ok (workspace failed: indexed without go.work)`; the stored tail says
+  why the workspace failed. A timeout or a Docker failure is not re-run.
+  **Replace targets.** A relative `replace` target inside the repository but
+  outside the module (`../../server/public`) is exported with the job (its line
+  counts it in `N link targets`); one leaving the repository, or an absolute
+  path, makes the job `unsupported` (`replace target outside the repository`).
+- Go with SCIP, the join across modules: a call from one module into another
+  module of the repository (`model.NewId()` from `server` into
+  `server/public`) links to that module's own definition with provenance
+  `scip`. It is `exact` when the reference's symbol equals the definition's
+  byte for byte, version included: under a workspace or a local `replace` the
+  compiler saw the in-repo code. It is `synthetic` otherwise: the compiler
+  resolved the name against a required version (`v0.4.3`) from the module
+  cache, which can differ from the in-repo code. Each (from module, to module)
+  pair gets one `scip_cross_project` diagnostic
+  `{to, exact, synthetic, ambiguous, unanchored}`. `ambiguous` means two
+  modules declare the same module path (no edge). `unanchored` means the
+  target module has no definition node for the name, for example a name the
+  required version has and the in-repo code does not, or an interface method
+  (scip-go defines no symbol for one). `rb status`'s `exact calls (scip)`
+  counts the `exact` joins and not the `synthetic` ones. A reference into
+  another module of the repository at no version is not an external package:
+  it adds no `Package` node and no `scip` `DEPENDS_ON`; one at a real version
+  (`…/server/public@v0.4.3`) still does. These joined edges enter the bench's
+  SCIP agreement reference like every `scip` call; M9c judged a seeded 60-edge
+  sample of them blind once, when they were all `synthetic`
   (`bench/samples/synthetic-d8.tsv`, not read by `rb-bench`).
 - Go with SCIP: a call whose callee is a type (`model.ChannelType(s)`, a
   conversion: Go has no constructors) is a `REFERENCES` edge to the type,
@@ -301,9 +366,9 @@ is not a pass**. Always set it:
 
 ```sh
 export RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb
-cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (84 tests)
+cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (85 tests)
 cargo test -p rb-server -- --nocapture  # serve binding, limits, parity (12 tests)
-cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (52 tests)
+cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (53 tests)
 cargo test -p rb-cli --test api     # CLI↔HTTP identity over 150 parameter sets (1 test)
 ```
 

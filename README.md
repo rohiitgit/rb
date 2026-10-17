@@ -213,7 +213,7 @@ adds compiler-grade `exact` edges where a build can run in a container.
 | **Java** | yes | scip-java (Maven, Gradle) | Spring MVC (class × method prefixes, context path; OpenAPI interfaces handled by implementors), Spring Data REST (`@RepositoryRestResource` with a literal `path`, `synthetic`) | RestTemplate, WebClient, RestClient, Feign, gRPC stubs, OpenAPI-generated clients | Spring (stereotypes, `@Bean`, qualifiers, Lombok), Guice, Dagger, Spring XML | JPA + Spring Data (mappings, derived and `@Query` methods, JPQL), MyBatis XML mappers, SQL in strings |
 | **TypeScript / JavaScript** | yes (TS, TSX, JS) | scip-typescript (npm, pnpm, Yarn) | Express (routers, mounts, constant paths, `require('express')()`; paths matched case-insensitively, as Express does, unless the router mentions `caseSensitive` or the app sets `case sensitive routing`: any value counts, since the value is not read) | fetch, axios (incl. shared default-exported instances), HTTP client wrappers, gRPC stubs, OpenAPI-generated clients | NestJS (providers, constructor points, tokens) | Prisma (models and queries), TypeORM (models only), SQL in strings |
 | **Python** | yes | scip-python | FastAPI (decorators, `APIRouter` prefixes, `include_router` across modules) | requests, httpx | none | SQLAlchemy and Django models (mappings, not queries), SQL in strings |
-| **Go** | yes | scip-go (calls between the repository's own Go modules are `synthetic`: the compiler saw the required version, not the in-repo code) | gin (incl. groups passed as parameters, method-value handlers declared in other files), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings, incl. `fmt.Sprintf` with package-constant table names |
+| **Go** | yes | scip-go (a module requiring another module of the repository is indexed under a generated `go.work`, so calls between them are `exact`; they are `synthetic` only where the compiler saw a required version, not the in-repo code) | gin (incl. groups passed as parameters, method-value handlers declared in other files), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings, incl. `fmt.Sprintf` with package-constant table names |
 | **Kotlin** | yes | scip-java (Gradle) | none | none | `beans { }` DSL (function and top-level `val` forms) | SQL in strings |
 | **C#** | yes (`heuristic` only) | none | none | none | .NET DI (`Add*`/`TryAdd*`/keyed, minimal hosting, implicit and global usings, implementation owners, constructor and `[Inject]` points) | SQL in strings |
 
@@ -270,6 +270,8 @@ SCIP images (only needed without `--no-scip`):
 
 ```sh
 docker build -t rb-scip-java:0.13.1 docker/scip-java
+# JDK 25, for Maven builds whose release is above 21; copies its tools from the image above
+docker build -t rb-scip-java:0.13.1-jdk25 -f docker/scip-java/Dockerfile.jdk25 docker/scip-java
 docker build -t rb-egress-proxy:1.11.3 docker/egress-proxy
 docker pull --platform linux/amd64 sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845
 docker build -t rb-scip-go:0.2.7-xtools0.50.0 docker/scip-go

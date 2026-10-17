@@ -301,9 +301,9 @@
   "crate": "rb-indexer",
   "test": "tests::external_references_join_another_projects_definitions",
   "file": "lib.rs",
-  "old": "        .chain(cross_edges.into_iter().map(|e| (e, Certainty::Synthetic)));\n",
-  "new": "        .chain(cross_edges.into_iter().map(|e| (e, Certainty::Exact)));\n",
-  "what": "joined edge labelled `Exact`"
+  "old": "                    let exact = r.symbol == *dst;\n",
+  "new": "                    let exact = true;\n",
+  "what": "joined edge labelled `Exact` (re-anchored in M9d P8: D8 computes the certainty in join_across_projects)"
  },
  {
   "id": "m337",
@@ -499,8 +499,8 @@
   "crate": "rb-indexer",
   "test": "tests::external_references_join_another_projects_definitions",
   "file": "lib.rs",
-  "old": "            p.indexer == \"scip-go\"\n                && matches!((&p.status, &p.index), (rb_scip::RunStatus::Ok, Some(_)))\n",
-  "new": "            p.indexer == \"scip-go\"\n                && true\n",
-  "what": "D8' candidate jobs include failed scip-go jobs (a failed duplicate makes every join ambiguous) (evaluator pass 1 e8, E3)"
+  "old": "        .filter(|p| p.indexer == \"scip-go\" && p.status.is_ok() && p.index.is_some())\n",
+  "new": "        .filter(|p| p.indexer == \"scip-go\")\n",
+  "what": "D8' candidate jobs include failed scip-go jobs (a failed duplicate makes every join ambiguous) (evaluator pass 1 e8, E3; re-anchored in M9d P8: M9d P3 made the status test `is_ok()`)"
  }
 ]

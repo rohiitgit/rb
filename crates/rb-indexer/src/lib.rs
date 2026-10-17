@@ -154,7 +154,15 @@ use serde_json::{Value, json};
 /// `m9c-3` M9c evaluator pass 2: a Go parameter or local typed by a type parameter types
 /// nothing (N1); each Python class's MRO, C3's or the fallback, is computed once and no longer
 /// depends on which classes were looked up first (S2; it differs only past 64 levels).
-pub const PIPELINE: &str = "m9c-3";
+/// `m9d-1` SCIP jobs that failed or never ran (B4): npm fetches rewrite lockfile registry hosts
+/// and ignore `engines` (D1); `requirements.txt` directories are Python roots, and a failed
+/// Python fetch indexes without its environment (D2–D4); a Go module requiring an in-repo module
+/// indexes under a generated `go.work`, plain if that fails, and in-repo `replace` targets are
+/// exported (D5–D7, D5b); byte-equal cross-module symbols join `exact`, and in-repo Go modules
+/// are no `Package` (D8, D9); scip-go's `invalid type` locals are counted (D10); Maven releases
+/// above 21 run on the JDK 25 image, the targetroot outside the sources (D12); Gradle marks
+/// protoc tools executable (D13).
+pub const PIPELINE: &str = "m9d-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

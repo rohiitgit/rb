@@ -397,6 +397,7 @@ No spec's filter may select a wall-clock test (`bench/mutants/timing_tests.txt`)
 - **Recorded, not fixed:**
   - kotlin_spring_realworld: scip-java 0.13.1's Maven path indexes javac output only, and its Gradle Kotlin path fails on Kotlin 2 (FIR `AbstractMethodError`). A Kotlin SemanticDB compiler plugin for Maven is not part of scip-java.
   - mattermost `webapp` and `e2e-tests/cypress`: `git+ssh` GitHub dependencies (3 in all) need `codeload.github.com` (and for the ssh fallback, `github.com` and ssh), which the allow-list refuses by design. A host can opt in with `RB_SCIP_REGISTRIES`, unmeasured. webapp's index (4,432 TS files, 2,017 packages, emulated amd64 under 4 GiB) is unmeasured against the budget.
+    - (Added in P8, a measured deviation from D1's prediction; `var/m9d/logs/p4/mm-probe.txt`, rows `26e4ac64…` and `8884ed1d…`.) `npm_config_replace_registry_host=always` rewrites every host in a resolved URL, the `git+ssh` GitHub ones included: cypress's and webapp's fetch tails read `git --no-replace-objects ls-remote ssh://git@registry.npmjs.org/larkox/js-client-oauth2.git` and `…/mattermost/react-bootstrap.git`, then `ssh: Could not resolve hostname registry.npmjs.org`. They are not the git-dependency refusal D1 predicted, but the outcome is the same: both stay `failed` (fetch). **Consequence:** a host that opts GitHub in through `RB_SCIP_REGISTRIES` would still see those git dependencies rewritten to `registry.npmjs.org` and refused, so for npm git dependencies D1 closes the opt-in path this item names. Whether npm still tries `codeload.github.com` first after the rewrite is not measured. **Narrower setting to try later:** npm's `replace-registry-host` also takes a hostname, and then rewrites only that host. Set to the lockfile's foreign registry host (`npm.styque.de` for nestjs, read from `resolved` URLs by the planner), it would leave GitHub hosts alone. It names one host per job, and no bench lockfile is known to mix two mirrors (not checked). D1's code is unchanged in M9d.
   - An environment fallback for scip-typescript (it would index webapp's own code without `node_modules`): the size above is unmeasured.
   - JavaScript-only packages (microservices_demo `currencyservice`, `paymentservice`; scip-typescript's `--infer-tsconfig`). C# and PHP targets: no indexer.
   - A committed `go.work` at a job root (0 on the bench): it would meet `GOFLAGS=-mod=mod` today.
@@ -929,6 +930,70 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 - **Mutants** (`mutants-p7.txt`, `mutants-m9d-battery.txt`): m391 KILLED. The whole m9d battery, m360–m396 with m387 on a `ScratchDb` (`RB_TEST_DATABASE_URL` set), is **37 of 37 KILLED**. 0 scratch databases are left before and after, and the tree was restored.
 - **Process.** Each message carried one `Edit` call, or one scripted edit of one file that asserted every hunk matched once.
 - **`rb.repo`** is identical before and after, and to P6's baseline (`repo-before.txt`, `repo-after.txt`; the user's 4 rows). No `t_*` row, `t_*` cache, egress network or `rb-` container is left (`leftovers.txt`).
+
+**P8 note (2026-10-18; close the code; base `437ced2`).** Logs in `var/m9d/logs/p8/`, scripts in `var/m9d/p8/scripts/`.
+- **Built.**
+  - **`PIPELINE` `m9c-3` → `m9d-1`** (C13), with its history line, changed before every verify run below (`suite-load.txt` shows the hunk in the tree the suite ran).
+    - Old value grepped first (`m9c-3`, `PIPELINE` over `crates`, `fixtures`, `bench`): only the constant holds it.
+    - `main.rs` reads it through the constant (`tool_versions`, and its test compares with the constant), and no golden holds it.
+    - `bench/probe/m9d_probe.py:120` cites it as a P0 record and was not edited.
+  - **`bench/mutants/m9d.json`** is unchanged. It already holds P1–P7's 37 specs: m360–m396, none retired.
+  - **Design doc.**
+    - §5.2: one M9d note for D1, D2/D3, D4, D5/D7, D5b, D6, D10, D12/D12b and D13, with each decision's reason, its rejected alternative and P2–P7's measurements.
+    - §5.3: a D8/D9 note with P5's mattermost numbers. M9c's join note, which P5 found stale (deviation 8; then at `:275`), now says that `synthetic` is superseded where the symbols are byte-equal, that the diagnostic gains `exact`, and that the go.work join is built.
+    - §8.4: a D11 note (the cost estimate, the JIT times, the session setting, P1's A/B and the two rejected fixes).
+    - No milestone row: that is P10's.
+  - **Usage guide.**
+    - §2: the six images, the JDK 25 build command, and `rb doctor`'s `6 pinned images present`. It said "the four images" before.
+    - §4, a new note on SCIP fetches and status lines:
+      - D1's npm settings and the git-host rewrite;
+      - D2–D4, with `scip-python ok (environment not installed: fetch failed)`;
+      - D10's `, N of M locals typed invalid`;
+      - D12/D12b and D13.
+    - The Go cross-module note (P5's stale text, then at `:236`) is split in two:
+      - workspaces, with `scip-go ok (workspace failed: indexed without go.work)`, and replace targets, with `unsupported (replace target outside the repository)`;
+      - the join, `exact` or `synthetic` with `{to, exact, synthetic, ambiguous, unanchored}`, and D9.
+    - §5.2's counts: rb-store 84 → 85, e2e 52 → 53, as this run measured them.
+  - **README.**
+    - The Go row's SCIP column said cross-module calls are `synthetic`. It now says `exact` under the generated `go.work`, and `synthetic` only against a required version.
+    - The JDK 25 image's build line.
+    - No other README statement is changed by D1–D15 (grepped: JDK, `pyproject`, `requirements`, `go.work`, `engines`, the image count, JIT).
+  - **Out of scope** gains the D1 finding below.
+- **D1 finding, a measured deviation from D1's prediction** (P4's `var/m9d/logs/p4/mm-probe.txt`, rows `26e4ac64…` and `8884ed1d…`).
+  - **What happened.** `npm_config_replace_registry_host=always` also rewrote mattermost `webapp`'s and `e2e-tests/cypress`'s `git+ssh` GitHub dependency host. Their fetch tails read `git … ls-remote ssh://git@registry.npmjs.org/…`, not the git-dependency refusal D1 predicted. The outcome is the same: both stay `failed` (fetch).
+  - **Consequence.** A host that opts GitHub in through `RB_SCIP_REGISTRIES` would still have those dependencies rewritten and refused.
+  - **Recorded** in Out of scope, beside the webapp/cypress item, with the narrower setting worth trying later: `replace-registry-host=<the lockfile's foreign registry host>`, which rewrites only that host.
+  - D1's code is not changed in P8.
+- **Verify.**
+  - **fmt and clippy.** `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` exit 0 (`fmt.txt`, `clippy.txt`). fmt was checked again at the batteries' start: rc 0 (`batteries-load.txt`). No code changed after that.
+  - **Usage guide §5.2's full run** (`scripts/full_suite.zsh`, `test.log`, `suite-load.txt`, `suite-totals.txt`, `suite-per-target.txt`).
+    - The guide's command, with its two variables: `cargo test --workspace --no-fail-fast -- --test-threads=1`, real Docker, 04:39:22–04:53:37.
+    - Load at the start 1.73 (5-minute 2.38), at the end 2.75 (3.11).
+    - **1,183 passed, 0 failed, 0 ignored**, exit 0, `grep -c 'skipping:'` = **0**.
+    - By target: e2e 53, api 1, rb-store 85, rb-server 12, rb-indexer 385, rb-scip 95, rb-cli `--bin rb` 49, rb-frameworks 205, rb-syntax 125, rb-bench 79, rb-git 29, rb-sql 27, rb-api 19, rb-model 19.
+    - Every test in `bench/mutants/timing_tests.txt`, `check_gates` and `a_checkout_is_its_repository_whatever_its_name` passed in this run (P1's verify step), so none needed a re-run alone.
+  - **What the run wrote** (`scip-rows-during-suite.txt`, read-only).
+    - 21 `rb.scip_index` rows: 19 `ok`, and 2 `failed`/`fetch`, which are the deliberate fixtures (`@acme/shared`'s npm 404, `com.acme:nope`'s Maven failure).
+    - The run took 14 min, against 654–822 s for the SCIP subset alone in P5–P7. How much of it was served from earlier cache rows is not decomposed.
+  - **Goldens unchanged.** No bless, and `git diff` under `crates/` holds the `PIPELINE` hunk only.
+  - **Leftovers.** After the suite: 0 `t_*` rows and 0 `t_` caches. After the batteries: 0 `t_*` scratch databases, 0 `rb-` containers, 0 `rb-scip` networks, no `/tmp/rbmut*`.
+  - **`rb.repo`.** `SELECT name, checkout FROM rb.repo` and `SELECT * FROM rb.repo ORDER BY 1` are identical before the suite, after it and after the batteries (`repo-name-checkout-{before,after-suite,after}.txt`, `repo-{before,after-suite,after}.txt`; the user's 4 rows). A control that must differ does.
+- **Batteries** (`battery-*.log`, `batteries-load.txt`; `scripts/batteries.zsh`).
+  - Run after the last fmt, one at a time, `--jobs 1`, with `RB_TEST_DATABASE_URL`, 04:54:08–05:02:32, load 2.37 → 3.82.
+  - **m8b 29/29, m9a 31/31, m9b 39/39, m9c 56/56, m9d 37/37 KILLED**: 192 of 192, none STALE, INVALID or SURVIVED.
+  - None was served from the cache (no log has a `cached:` line), and m387 ran on a `ScratchDb`.
+  - The runner restored `crates/`: `git diff crates` is the `PIPELINE` hunk only.
+  - m9c holds 56 specs: M9c P6 counted 37, and M9c's evaluator passes added m341–m359.
+- **Deviations, each with its reason.**
+  1. **Two m9c specs re-anchored, in `bench/mutants/m9c.json`, a file outside P8's list.**
+     - **How they were found.** A dry anchor check before the batteries (`anchors-dry.txt`; each spec's `old` text counted in its file) found m336 and m359 matching 0 times. P1–P7 ran only the m9d battery, so no run had seen them since M9d moved their lines. After the re-anchor, every one of the 192 specs matches exactly once (`anchors-dry-after.txt`).
+     - **m336** ("joined edge labelled `Exact`"). P5's D8 removed the `.chain(… Certainty::Synthetic)` line, and `join_across_projects` now decides the certainty. The spec is re-anchored as `let exact = r.symbol == *dst;` → `let exact = true;`, so every joined edge is `exact`, with the same filter. It differs from m379 (`false`) and m380 (the versions dropped).
+     - **m359** (failed scip-go jobs become join candidates). P3 replaced `matches!((&p.status, &p.index), (rb_scip::RunStatus::Ok, Some(_)))` with `p.status.is_ok() && p.index.is_some()` on the `go_jobs` filter line. The mutation keeps its meaning: the filter is `p.indexer == "scip-go"` alone.
+     - Both are KILLED, and each spec's `what` records its move.
+  2. **The suite's output is redirected to `test.log` rather than piped through `tee`,** so that the exit code is captured (zsh has no `PIPESTATUS`). The command and its variables are the guide's.
+  3. **P8's files also include the contract's Out of scope** (the D1 finding) **and `bench/mutants/m9c.json`.** `bench/mutants/m9d.json` needed no change.
+  4. **Process: one message carried two `Edit` calls.** Both went to `docs/repository-brain-design.md`, on two hunks of M9c's join note. Each was grepped and found landed (count 1) before anything else ran. The lesson of 2026-10-17 already covers this, so no new rule is added.
+- **Safety.** No probe repository was made in P8. No mutant touches a DB write path: m387 mutates the read-only `cypher()` session, and m9c's m338 is a `SELECT`, both on a `ScratchDb`. `var/scip/cache/bench_m9d_mm` is kept (P4, P5), and `worktrees/` and `bench/__pycache__/` were not touched. Disk was 16 GiB free at the start and 11 GiB at the end, so no `cargo clean` was needed.
 
 ## Result
 
