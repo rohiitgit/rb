@@ -7000,13 +7000,14 @@ mod tests {
         let (_, removed) = remove_lombok_generated(&doc, &mut lombok).unwrap();
         assert_eq!(removed, 3 * n);
         // Contract M9d P9b: one parse per distinct reference symbol, not per occurrence (the
-        // marker occurs n times).
+        // marker occurs n times); since P9c only those holding the Lombok package's bytes.
         let distinct: BTreeSet<&str> = doc
             .occurrences
             .iter()
-            .filter(|o| !o.is_definition())
+            .filter(|o| !o.is_definition() && o.symbol.contains(rb_scip::symbol::LOMBOK_PACKAGE))
             .map(|o| o.symbol.as_str())
             .collect();
+        assert_eq!(distinct.len(), 1);
         assert_eq!(lombok.parses(), distinct.len());
         rb_frameworks::work::take()
     }

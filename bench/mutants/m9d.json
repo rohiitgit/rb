@@ -341,5 +341,14 @@
   "old": "        let parses = &mut self.parses;\n",
   "new": "        self.seen.clear();\n        let parses = &mut self.parses;\n",
   "what": "the Lombok marker memo bypassed: every occurrence's symbol is parsed again (M9d P9b)"
+ },
+ {
+  "id": "m398",
+  "crate": "rb-scip",
+  "test": "symbol::tests::lombok_markers_skip_symbols_without_the_package_bytes",
+  "file": "symbol.rs",
+  "old": "        if !may_be_lombok_marker(symbol) {\n",
+  "new": "        if false {\n",
+  "what": "the byte pre-check bypassed: every symbol without the Lombok package's bytes is parsed (M9d P9c)"
  }
 ]

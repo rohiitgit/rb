@@ -404,6 +404,16 @@ No spec's filter may select a wall-clock test (`bench/mutants/timing_tests.txt`)
   - The 4,093 server → server/public interface-method references (`request.CTX#…`, `mlog.LoggerIFace#…`): server/public's scip-go index defines no symbol for interface methods, so D8′ counts them `unanchored`. Why scip-go 0.2.7 omits them is not measured.
   - Cross-project `IMPLEMENTS` (352 relationships; M9c Out of scope), unchanged by go.work.
   - Analysing the AGE label tables at publish (rejected for D11, see trade-offs).
+  - (Added in P9, measured follow-up; amendment 3.) **One parse per distinct symbol, shared across the join's readers.**
+    - Inside `rb_indexer::scip::join_handing_back`, `rb_scip::symbol::package`, `NameForms::of` and `last_descriptor_name` each parse every distinct symbol separately. Each is memoised per join since M9c P7b, but not shared with the others.
+    - On spring_boot_microservices (P9b binary, 10 profiles) they take 14.3 %, 11.9 % and 6.8 % of `index_commit` samples.
+    - spring's decode and join cost 6.6 µs per decoded occurrence, against 1.16 µs on mattermost's scip-go indexes, because its index has about 6 occurrences per distinct reference symbol (mattermost server about 47).
+    - Amendment 3 (iii) exempts work inside the join, so this is not fixed in M9d (`var/m9d/logs/p9/profile-shares3.txt`, `perf-verdict-run3.txt`).
+  - (Added in P9, measured finding for the next milestone; not fixed in M9d because the fix changes dumps.) **scip-go's columns are read as UTF-16.**
+    - scip-go 0.2.7 writes byte columns (go/token) and leaves `Document.position_encoding` unset (all 1,830 server documents). rb's decoder reads an unset encoding as UTF-16 for every tool except scip-java (`crates/rb-scip/src/decode.rs:200-211`).
+    - So on a line with a non-ASCII character before an occurrence, the span is shifted and misses its Tree-sitter site.
+    - Measured on the go.work index: 440 of 1.9M server occurrences (368 of them references), 44 in server/public and 0 in sharedchannel-test (`var/m9d/logs/p9/fp19-encoding.txt`).
+    - It explains the 19th mattermost fp. At `server/channels/app/plugin_access_control_test.go:299`, an em-dash in a string literal stands before `model.NewNoPolicyAccessDecision()`, so byte column 69 is read as UTF-16 column 69, which is byte 71 (byte 69 is UTF-16 column 67). No scip edge joins the occurrence, and the noscip CALLS stays fp, as it was at M9c.
 - **M9c's own scope** is unchanged. M9d builds on its D8′, C10, the IMG bucket and its record.
 
 ## Amendments
@@ -1046,6 +1056,29 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   - A dry anchor check of all five batteries found every spec's text exactly once (`anchors-dry.txt`).
   - `rb.repo` is identical before and after the e2e run (`repo-before.txt`).
 - **Process.** Each message carried one `Edit` call, or one scripted edit of one file that asserted each of its three hunks matched once (scip.rs, and the spec append to `m9d.json`).
+
+**P9c note (2026-10-18; approved after P9's second A/B round; base `73e2e62`).** Logs in `var/m9d/logs/p9c/`, scripts in `var/m9d/p9c/`.
+- **Why.** After P9b, spring_boot_microservices failed amendment 3 (iii) by 0.2 points. `remove_lombok_generated` took 10.2 % of `index_commit` samples over 10 profiles, nearly all of it `is_lombok_generated_marker` (9.9 %), parsing each of 1,298 distinct symbols, none of which is a marker (`var/m9d/logs/p9/perf-verdict-run3.txt`). P9c adds the byte pre-check only.
+- **Red first.** The unit `lombok_markers_skip_symbols_without_the_package_bytes` (symbol.rs) holds 6 symbols without the package's bytes, one of them a `lombok/Generated#` under another package, plus a local and an unparsable string. It asserts 0 parses for them, then 2 for the marker and Lombok's Getter. It failed first with `left: 6, right: 0` (`c-p9c-red.txt`) and passed after the change (`c-p9c-green.txt`).
+- **Design.**
+  - `pub const LOMBOK_PACKAGE` (`maven/org.projectlombok/lombok`) is now the one spelling of the package. The parse compares the parsed package name with it, and the pre-check `may_be_lombok_marker` looks for it with `symbol.contains(LOMBOK_PACKAGE)`.
+  - **Soundness.** SCIP's grammar escapes only spaces in a package name (by doubling them), so a name without spaces stands verbatim in the text. A symbol that lacks those bytes cannot parse to the marker.
+  - `is_lombok_generated_marker` is now the pre-check followed by the parse (`parsed_lombok_marker`, M6a's body unchanged but for the constant). `LombokMarkers::is_marker` returns `false` before its memo for a symbol without the bytes, so `parses()` counts only symbols that pass.
+- **Deviations, each with its reason.**
+  1. **Two P9b assertions pinned the old count and were updated.** P9b's unit `lombok_markers_parse_each_distinct_symbol_once` now expects one parse per distinct symbol that holds the bytes (2 of its 5). `rb_indexer::scip`'s `lombok_work_for` now asserts that exactly 1 distinct reference symbol holds them, and that it is parsed once.
+     - The second change is in `crates/rb-indexer/src/scip.rs` (test code only), a file outside P9c's list. The count it pinned is P9b's, and P9c changes it.
+  2. **Out of scope gains two measured items** (P9 below): the shared parse for `package`, `NameForms::of` and `last_descriptor_name`, and scip-go's unset `position_encoding`.
+- **Equivalence** (`equivalence.txt`; `var/m9d/p9c/p9c_equiv.rs`, P9b's harness, copied into `crates/rb-scip/tests/` for one run and removed).
+  - The old check is M6a's function body copied verbatim into the harness: a parse per occurrence, no pre-check, no memo. The new check is `LombokMarkers` with the pre-check, one per index.
+  - It ran over the 12 bench indexes exported in P9 and the 2 Lombok fixture indexes: **0 documents differ**, and the controls still remove 234 occurrences (16 marker spans) and 12 (1 span).
+  - Parses now equal the distinct reference symbols that hold the bytes: 11 and 2 in the fixtures, 0 in every bench index (spring 0 of 1,298, adservice 0 of 4,121).
+- **Mutant m398** (`bench/mutants/m9d.json`): `if !may_be_lombok_marker(symbol) {` becomes `if false {` in `is_marker`, which bypasses the pre-check. Filter `symbol::tests::lombok_markers_skip_symbols_without_the_package_bytes`.
+- **Verify.**
+  - fmt and clippy (`--workspace --all-targets -D warnings`) are clean.
+  - `cargo test -p rb-scip`: 97 passed. `-p rb-indexer --lib`: 385 passed (`units.txt`).
+  - Java SCIP e2e (`e2e-java.txt`, after `cargo build -p rb-cli`): every `fn scip_*` test passed, 15 of 15, in 677 s. Then `java_spring_jpa`, `kotlin_gradle_tier_b` and `doctor_reports_each_check` passed, 3 of 3. No change under `crates/rb-cli/tests` or `fixtures`, and 0 `t_` caches before and after.
+  - **m9d battery: 39 of 39 KILLED**, m397 and m398 included, with m387 on a `ScratchDb` and 0 scratch databases left (`battery-m9d.log`). Every spec of the five batteries matches its text exactly once (`anchors-dry.txt`).
+  - `rb.repo` is identical before and after the e2e run.
 
 ## Result
 

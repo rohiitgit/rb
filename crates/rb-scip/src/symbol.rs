@@ -126,8 +126,25 @@ impl Package {
 /// Whether `symbol` is Lombok's `@lombok.Generated` annotation type (contract M6a D1), the
 /// marker Lombok puts on every member it generates: package `maven/org.projectlombok/lombok` of
 /// any version, descriptors exactly the namespace `lombok/` and the type `Generated#`, read from
-/// the parsed symbol, never from its text.
+/// the parsed symbol, never from its text. A symbol whose text lacks [`LOMBOK_PACKAGE`] is
+/// answered without a parse ([`may_be_lombok_marker`]).
 pub fn is_lombok_generated_marker(symbol: &str) -> bool {
+    may_be_lombok_marker(symbol) && parsed_lombok_marker(symbol)
+}
+
+/// The package name of Lombok's marker, as scip-java writes it (contract M6a D1).
+pub const LOMBOK_PACKAGE: &str = "maven/org.projectlombok/lombok";
+
+/// The byte pre-check before the parse (contract M9d P9c): the marker's parsed package name is
+/// [`LOMBOK_PACKAGE`], and SCIP's grammar escapes only spaces in a package name (by doubling
+/// them), so a name without spaces stands verbatim in the symbol's text. A symbol whose text
+/// does not hold those bytes therefore cannot parse to the marker.
+fn may_be_lombok_marker(symbol: &str) -> bool {
+    symbol.contains(LOMBOK_PACKAGE)
+}
+
+/// [`is_lombok_generated_marker`] read from the parsed symbol, without the pre-check.
+fn parsed_lombok_marker(symbol: &str) -> bool {
     use scip::types::descriptor::Suffix;
     if scip::symbol::is_local_symbol(symbol) {
         return false;
@@ -138,7 +155,7 @@ pub fn is_lombok_generated_marker(symbol: &str) -> bool {
     let in_lombok = parsed
         .package
         .as_ref()
-        .is_some_and(|p| p.manager == "maven" && p.name == "maven/org.projectlombok/lombok");
+        .is_some_and(|p| p.manager == "maven" && p.name == LOMBOK_PACKAGE);
     let descriptors: Vec<(&str, Result<Suffix, i32>)> = parsed
         .descriptors
         .iter()
@@ -164,14 +181,17 @@ pub struct LombokMarkers<'a> {
 impl<'a> LombokMarkers<'a> {
     /// Whether `symbol` is the Lombok marker, as [`is_lombok_generated_marker`] answers.
     pub fn is_marker(&mut self, symbol: &'a str) -> bool {
+        if !may_be_lombok_marker(symbol) {
+            return false;
+        }
         let parses = &mut self.parses;
         *self.seen.entry(symbol).or_insert_with(|| {
             *parses += 1;
-            is_lombok_generated_marker(symbol)
+            parsed_lombok_marker(symbol)
         })
     }
 
-    /// How many symbols were parsed so far.
+    /// How many symbols were parsed so far (those that passed the byte pre-check, once each).
     pub fn parses(&self) -> usize {
         self.parses
     }
@@ -499,10 +519,39 @@ mod tests {
                 "{symbol}"
             );
         }
-        let distinct: std::collections::BTreeSet<&str> = occurrences.into_iter().collect();
+        // Since P9c, only the distinct symbols that pass the byte pre-check are parsed (here the
+        // marker and the Getter).
+        let distinct: std::collections::BTreeSet<&str> = occurrences
+            .into_iter()
+            .filter(|s| s.contains(LOMBOK_PACKAGE))
+            .collect();
         assert_eq!(memo.parses(), distinct.len());
         // Asked again, nothing more is parsed.
         assert!(memo.is_marker(marker) && !memo.is_marker(own));
         assert_eq!(memo.parses(), distinct.len());
+    }
+
+    /// Contract M9d P9c: a symbol whose text does not hold the Lombok package's bytes is not the
+    /// marker, and is answered without a parse; one that holds them is parsed (once).
+    #[test]
+    fn lombok_markers_skip_symbols_without_the_package_bytes() {
+        let without = [
+            "scip-java maven maven/com.acme/demo 1.0 p/Big#f().",
+            "scip-java maven maven/com.example/fake 1.0 lombok/Generated#",
+            "scip-java maven jdk 21 javax/annotation/processing/Generated#",
+            "scip-java maven . . lombok/Generated#",
+            "local 4",
+            "not a symbol",
+        ];
+        let mut memo = LombokMarkers::default();
+        for symbol in without {
+            assert!(!memo.is_marker(symbol), "{symbol}");
+            assert!(!is_lombok_generated_marker(symbol), "{symbol}");
+        }
+        assert_eq!(memo.parses(), 0);
+        let marker = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Generated#";
+        let getter = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Getter#";
+        assert!(memo.is_marker(marker) && !memo.is_marker(getter) && memo.is_marker(marker));
+        assert_eq!(memo.parses(), 2);
     }
 }
