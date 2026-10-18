@@ -332,5 +332,14 @@
   "old": "            \"--targetroot\",\n            MAVEN_TARGETROOT,\n",
   "new": "",
   "what": "`--targetroot` dropped from the Maven index arguments (D12b)"
+ },
+ {
+  "id": "m397",
+  "crate": "rb-scip",
+  "test": "symbol::tests::lombok_markers_parse_each_distinct_symbol_once",
+  "file": "symbol.rs",
+  "old": "        let parses = &mut self.parses;\n",
+  "new": "        self.seen.clear();\n        let parses = &mut self.parses;\n",
+  "what": "the Lombok marker memo bypassed: every occurrence's symbol is parsed again (M9d P9b)"
  }
 ]

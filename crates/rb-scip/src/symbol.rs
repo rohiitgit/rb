@@ -152,6 +152,31 @@ pub fn is_lombok_generated_marker(symbol: &str) -> bool {
             ]
 }
 
+/// [`is_lombok_generated_marker`] for every occurrence of one index (contract M9d P9b): the
+/// answer depends on the symbol string alone, and one parse costs far more than a lookup, so
+/// each distinct symbol is parsed once and its answer kept for the index's other occurrences.
+#[derive(Debug, Default)]
+pub struct LombokMarkers<'a> {
+    seen: std::collections::HashMap<&'a str, bool>,
+    parses: usize,
+}
+
+impl<'a> LombokMarkers<'a> {
+    /// Whether `symbol` is the Lombok marker, as [`is_lombok_generated_marker`] answers.
+    pub fn is_marker(&mut self, symbol: &'a str) -> bool {
+        let parses = &mut self.parses;
+        *self.seen.entry(symbol).or_insert_with(|| {
+            *parses += 1;
+            is_lombok_generated_marker(symbol)
+        })
+    }
+
+    /// How many symbols were parsed so far.
+    pub fn parses(&self) -> usize {
+        self.parses
+    }
+}
+
 /// The package of a global symbol; `None` for local symbols, strings the grammar rejects and
 /// symbols with no package (scip-java's namespace-only `scip-java maven . . org/springframework/`).
 /// scip-go reports module-resolved symbols under the manager `gomod`, which normalises to the
@@ -445,5 +470,39 @@ mod tests {
         for symbol in no {
             assert!(!is_lombok_generated_marker(symbol), "{symbol}");
         }
+    }
+
+    /// Contract M9d P9b: the marker check parses each distinct symbol once, however often it
+    /// occurs, and answers every occurrence as `is_lombok_generated_marker` does.
+    #[test]
+    fn lombok_markers_parse_each_distinct_symbol_once() {
+        let marker = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Generated#";
+        let getter = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Getter#";
+        let own = "scip-java maven maven/com.acme/demo 1.0 p/Big#f().";
+        let occurrences = [
+            marker,
+            own,
+            getter,
+            marker,
+            own,
+            "local 4",
+            marker,
+            own,
+            "not a symbol",
+            "local 4",
+        ];
+        let mut memo = LombokMarkers::default();
+        for symbol in occurrences {
+            assert_eq!(
+                memo.is_marker(symbol),
+                is_lombok_generated_marker(symbol),
+                "{symbol}"
+            );
+        }
+        let distinct: std::collections::BTreeSet<&str> = occurrences.into_iter().collect();
+        assert_eq!(memo.parses(), distinct.len());
+        // Asked again, nothing more is parsed.
+        assert!(memo.is_marker(marker) && !memo.is_marker(own));
+        assert_eq!(memo.parses(), distinct.len());
     }
 }

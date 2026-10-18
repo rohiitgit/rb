@@ -995,6 +995,58 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
   4. **Process: one message carried two `Edit` calls.** Both went to `docs/repository-brain-design.md`, on two hunks of M9c's join note. Each was grepped and found landed (count 1) before anything else ran. The lesson of 2026-10-17 already covers this, so no new rule is added.
 - **Safety.** No probe repository was made in P8. No mutant touches a DB write path: m387 mutates the read-only `cypher()` session, and m9c's m338 is a `SELECT`, both on a `ScratchDb`. `var/scip/cache/bench_m9d_mm` is kept (P4, P5), and `worktrees/` and `bench/__pycache__/` were not touched. Disk was 16 GiB free at the start and 11 GiB at the end, so no `cargo clean` was needed.
 
+**Amendment 3 (2026-10-18, after P9's first run; decisions on its two blockers).** P9's first run was benched with the binary `var/m9d/bin/rb` sha256 `698d8f75…` (built from `920e30e`; kept as `rb.p9a` from here on), giving the run `var/bench/out/698d8f75563a/`. `compare --accept --perf` exited 0, but P9 stopped on two items. Each is decided here, before any code.
+- **C14, bucket NOSCIP-D2.** C14's "0 `noscip` rows differ" is amended. A `noscip` dump may differ only by added `scip_status` diagnostic rows with status `skipped` ("SCIP disabled (--no-scip)") for roots that D2 newly plans. These rows move no scored cell.
+  - The run has 5, all in bucket NOSCIP-D2: `microblog.noscip.jsonl` root `.`, and `microservices_demo.noscip.jsonl` roots `src/emailservice`, `src/loadgenerator`, `src/recommendationservice` and `src/shoppingassistantservice` (`var/m9d/logs/invariant.txt`).
+  - Any other differing `noscip` row still fails C14.
+- **Perf rule, input growth.** A scip-mode over-limit verdict on a target is accepted as input-driven only if all three of these hold:
+  - (i) the target's extra work is entirely jobs in the NEWIDX or FALLBACK buckets, that is, indexes the base never decoded;
+  - (ii) the same-input control A/B (scip mode on targets whose SCIP inputs are identical for both binaries) reads noise;
+  - (iii) after P9b, the head profile of that target shows no avoidable per-occurrence or per-symbol work: no single rb function outside decode or join takes more than 10 % of `index_commit` samples while doing work a memo or a cheap pre-check would remove.
+  - rb-bench has no perf-accept mechanism: `compare_perf` only warns (`crates/rb-bench/src/compare.rs:345`), and accept lines name agreement cells. None is added in M9d. Each verdict is recorded in the P9 note, with its evidence, and carried into the Result.
+  - Also reported, not gated: each target's decode+join cost per decoded occurrence, against the same binary's rate on an established index (a bench scip-java or scip-python index already `ok` at M9c if one exists, otherwise mattermost's scip-go index; the note says which).
+- **Phase P9b (new), before the re-bench.** P9's first run profiled `rb_scip::symbol::is_lombok_generated_marker` (called by `rb_indexer::scip::remove_lombok_generated` for every non-definition occurrence of a scip-java document) at 92 of 277 `index_commit` samples on microservices_demo and 29 of 105 on spring_boot_microservices: one `scip::symbol::parse_symbol` per occurrence, the cost M9c P7b removed from the join.
+  - **Files:** `crates/rb-scip/src/symbol.rs`, `crates/rb-indexer/src/scip.rs`, `bench/mutants/m9d.json`, this contract (the P9b note); `crates/rb-scip/src/orchestrate.rs` only for the item below.
+  - **Fix:** the check avoids a parse per occurrence, by a memo per distinct symbol or by a cheap byte pre-check that rejects most symbols before any parse, whichever keeps the behaviour provably identical.
+  - **Tests first:** a unit test that counts parses (one per distinct symbol at most), and an equivalence check against the old function on a real scip-java index from `var/m9d/p9/idx/` (same output, set for set).
+  - **Mutant m397:** the memo or pre-check bypassed, killed by the counting test.
+  - **The fifth `docker image inspect`** (D12's `rb-scip-java:0.13.1-jdk25`, looked up by every SCIP-mode run). Its fixed cost is measured. If resolving that image only when a planned job needs it is a small change in a file P9b already touches, or in `orchestrate.rs`, it is made, with a test and mutant **m398**, and `rb doctor` still lists both images. Otherwise its cost is recorded and the lookup is left.
+  - **Verify:** fmt, clippy `-D warnings`, `cargo test -p rb-scip` and `-p rb-indexer --lib`, the Java SCIP e2e suites with goldens unchanged, and the whole m9d battery KILLED.
+  - **Commit:** "M9d P9b: lombok marker check without a per-occurrence symbol parse".
+- **Re-bench (P9, second run).**
+  - `var/m9d/bin/rb` is rebuilt from the P9b commit (C13), and the run is warm.
+  - Every dump must be byte-identical to `698d8f75563a`'s, or P9 stops and reports.
+  - Score twice, `cmp`, and `compare --accept --perf` exits 0.
+  - The perf A/B is re-run, 10 runs per side, ABBA: the M9c binary of record against the new binary on the two scip-mode cells and their `noscip` siblings; the same-input control; and `rb.p9a` against the new binary on the two cells, for the fix's own effect.
+  - The rule above then gives one verdict per cell. A cell that still fails it stops P9, and this amendment is not widened.
+- **The 19th mattermost fp** (`server/channels/app/plugin_access_control_test.go:299` → `model.NewNoPolicyAccessDecision`) was fp at M9c too, so it is not new. Its cause (the go.work index holds the occurrence, but no scip edge joins it) is explained in the P9 note within about 20 minutes of work, or recorded as open with what was checked.
+
+**P9b note (2026-10-18; amendment 3; base `920e30e`).** Logs in `var/m9d/logs/p9b/`, scripts in `var/m9d/p9b/`.
+- **Red first.** `rb_scip::symbol::LombokMarkers` was added first as a scaffold: its `is_marker` parsed on every call and counted the parse. The unit `lombok_markers_parse_each_distinct_symbol_once` (symbol.rs: 10 occurrences of 5 distinct symbols, a marker, a Lombok non-marker, an own symbol, a local and an unparsable string) then failed on its count, `left: 10, right: 5` (`c-p9b-red.txt`). It passed once `is_marker` kept each distinct symbol's answer (`c-p9b-green.txt`).
+- **Design.**
+  - `LombokMarkers<'a>` keeps a `HashMap<&str, bool>` and answers each distinct symbol string through `is_lombok_generated_marker`, once. The answer is a function of the string alone, so a memo returns what a fresh parse would.
+  - `rb_indexer::scip::remove_lombok_generated` takes the memo. `join` makes one per index, so a symbol is parsed once per index, not once per occurrence.
+  - The existing test `lombok_removal_grows_linearly` (through `lombok_work_for`) now also asserts one parse per distinct reference symbol of its document, on the code path the join calls.
+  - `is_lombok_generated_marker` is unchanged and still reads the parsed symbol, never its text (M6a D1). A byte pre-check was not chosen, because a memo needs no argument about the grammar's escapes.
+- **Equivalence on real indexes** (`equivalence.txt`; the throwaway integration test `var/m9d/p9b/p9b_equiv.rs`, copied into `crates/rb-scip/tests/` for one run and removed, so `crates/` holds no trace of it).
+  - Every index exported in P9 (`var/m9d/p9/idx/`) was checked, plus the two Lombok fixture indexes, exported `READ ONLY` from `rb.scip_index` (`aefd7f56…`, 83,173 B; `666937ba…`, 40,164 B), because no bench index holds a Lombok marker.
+  - Per document, the marker span set and the occurrences that `remove_lombok_generated`'s filter keeps are compared under the old per-occurrence check and under one memo for the whole index: **0 documents differ** over all 14 indexes.
+  - The positive controls remove 234 occurrences at 16 marker spans and 12 occurrences at 1 marker span.
+  - Parses equal the distinct reference symbols, for example adservice 51,890 occurrences and 4,121 parses, and mattermost server 1,918,253 occurrences and 40,466 parses.
+- **The fifth `docker image inspect` is left as it is, with its cost recorded.**
+  - **Measured** (`inspect-cost.txt`, 30 runs per image, alternating, load 1.3): one `docker image inspect --format {{.Id}}` takes a median of 23.6 ms wall and 10.0 ms child CPU, the same for both scip-java images.
+  - `Images::resolve` runs once per SCIP-mode `rb index` (`rb-cli` `main.rs:1204`). Its JDK 25 lookup is not only for job planning: `tool_versions` records the image's ID as `scip_java25` (P6 deviation 1), so that a rebuilt image is never served as up to date (M6d S1).
+  - Resolving it only when a planned job needs it would therefore change `tool_versions` in `main.rs`, a file outside P9b's list, and the up-to-date semantics with it. That is not the small change amendment 3 allows, so m398 is not used.
+- **Mutant m397** (`bench/mutants/m9d.json`): `self.seen.clear()` before every lookup bypasses the memo. Filter `symbol::tests::lombok_markers_parse_each_distinct_symbol_once`.
+- **Verify.**
+  - fmt and clippy (`--workspace --all-targets -D warnings`) are clean (`fmt.txt`, `clippy.txt`). rustfmt re-wrapped the test's array once before the check.
+  - `cargo test -p rb-scip`: 96 passed. `-p rb-indexer --lib`: 385 passed, at load 3.9–5.9 (`units.txt`).
+  - Java SCIP e2e (`e2e-java.txt`, `var/m9d/p9b/e2e_java.sh`, P6's script, run after `cargo build -p rb-cli`): every `fn scip_*` test passed, 15 of 15, in 703 s. Then `java_spring_jpa`, `kotlin_gradle_tier_b` and `doctor_reports_each_check` passed, 3 of 3. No file under `crates/rb-cli/tests` or `fixtures` changed, and 0 `t_` caches were left before or after.
+  - **m9d battery: 38 of 38 KILLED**, m397 included, with m387 on a `ScratchDb`, none served from the cache (`battery-m9d.log`). 0 scratch databases were left, and `crates/` was restored (`battery-load.txt`).
+  - A dry anchor check of all five batteries found every spec's text exactly once (`anchors-dry.txt`).
+  - `rb.repo` is identical before and after the e2e run (`repo-before.txt`).
+- **Process.** Each message carried one `Edit` call, or one scripted edit of one file that asserted each of its three hunks matched once (scip.rs, and the spec append to `m9d.json`).
+
 ## Result
 
 Not yet built.

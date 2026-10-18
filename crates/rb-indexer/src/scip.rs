@@ -238,14 +238,16 @@ pub(crate) fn join_handing_back(
     let mut out = Joined::default();
     // Contract M6a D1, D2: in a scip-java index, each document's Lombok-generated occurrences
     // are removed first, and every check below judges what remains, unchanged. A document
-    // without a marker is used as it is.
+    // without a marker is used as it is. Each distinct symbol is judged once for the whole index
+    // (contract M9d P9b).
+    let mut lombok = rb_scip::symbol::LombokMarkers::default();
     let without_lombok: Vec<Option<(rb_scip::Document, usize)>> = index
         .documents
         .iter()
         .map(|doc| {
             languages
                 .contains(&Language::Java)
-                .then(|| remove_lombok_generated(doc))
+                .then(|| remove_lombok_generated(doc, &mut lombok))
                 .flatten()
         })
         .collect();
@@ -1401,12 +1403,16 @@ fn leaves_root(path: &str) -> bool {
 /// token, so neither equals a marker span (an annotation, a declarator with its terminator, or
 /// `class … }`); a reference merely inside a marker span (an anonymous class in a field
 /// initializer) is kept. One pass collects the markers into a sorted set and one filters.
-fn remove_lombok_generated(doc: &rb_scip::Document) -> Option<(rb_scip::Document, usize)> {
+/// `lombok` keeps each distinct symbol's answer across the index's documents (contract M9d P9b).
+fn remove_lombok_generated<'a>(
+    doc: &'a rb_scip::Document,
+    lombok: &mut rb_scip::symbol::LombokMarkers<'a>,
+) -> Option<(rb_scip::Document, usize)> {
     rb_frameworks::work::tick(doc.occurrences.len());
     let markers: BTreeSet<Span> = doc
         .occurrences
         .iter()
-        .filter(|o| !o.is_definition() && rb_scip::symbol::is_lombok_generated_marker(&o.symbol))
+        .filter(|o| !o.is_definition() && lombok.is_marker(&o.symbol))
         .map(|o| o.span)
         .collect();
     if markers.is_empty() {
@@ -6990,8 +6996,18 @@ mod tests {
             ..Default::default()
         };
         rb_frameworks::work::take();
-        let (_, removed) = remove_lombok_generated(&doc).unwrap();
+        let mut lombok = rb_scip::symbol::LombokMarkers::default();
+        let (_, removed) = remove_lombok_generated(&doc, &mut lombok).unwrap();
         assert_eq!(removed, 3 * n);
+        // Contract M9d P9b: one parse per distinct reference symbol, not per occurrence (the
+        // marker occurs n times).
+        let distinct: BTreeSet<&str> = doc
+            .occurrences
+            .iter()
+            .filter(|o| !o.is_definition())
+            .map(|o| o.symbol.as_str())
+            .collect();
+        assert_eq!(lombok.parses(), distinct.len());
         rb_frameworks::work::take()
     }
 
