@@ -1,6 +1,6 @@
 # M9d contract: SCIP fetch and index failures (B4), Go workspaces for in-repo modules, scip-go health, `rb check` JIT (2026-10-17)
 
-**Status:** contract written 2026-10-17 from `tasks/plan-m9.md` §4 "M9d", the note under M9c, `tasks/contract-m9c.md` amendment 2 and the PI note (the `go.work` question, scip-go's silent degradation), and the open item in `tasks/todo.md` (M9b pass 2, S3: `unowned_table_writes`). Not yet built. M9d is built after M9c closes; commits go on branch `m9`.
+**Status:** contract written 2026-10-17 from `tasks/plan-m9.md` §4 "M9d", the note under M9c, `tasks/contract-m9c.md` amendment 2 and the PI note (the `go.work` question, scip-go's silent degradation), and the open item in `tasks/todo.md` (M9b pass 2, S3: `unowned_table_writes`). M9d is built after M9c closes; commits go on branch `m9`. **Built 2026-10-18** (amendments 1–3, notes P1–P9c; Result below); evaluator pass 1 pending.
 
 **Evidence base.** File:line references are at HEAD `15371eb` (M9c P4), checked by `var/m9d/plan/scripts/check_citations.py` (`logs/citations.txt`: 42 of 42 hold; the control, shifted 7 lines, fails 42 of 42). M9c P5 is uncommitted in `crates/rb-indexer/src/{lib.rs,scip.rs}`, `crates/rb-store/src/{query.rs,db_tests.rs}` while this is written, so citations into `lib.rs` and `scip.rs` are read from HEAD with `git show`, and P0 re-reads both at M9c's close. The run of record is M9b's `var/bench/out/36ed5ea46ddf/` (M9c has not benched yet). Every probe log, script and raw index is under `var/m9d/plan/{logs,scripts,idx}/` (gitignored). Probes ran in Docker only: `--network none`, or behind an egress proxy built like rb's (`scripts/proxy_fetch.sh`: `rb-egress-proxy:1.11.3`, the `REGISTRIES` filter, own `m9d-probe-*` names, removed after each run). Every prediction that depends on M9c's outcome is marked **[M9c]**.
 
@@ -1224,4 +1224,274 @@ Append each amendment after the previous one's last sentence (lesson of 2026-10-
 
 ## Result
 
-Not yet built.
+**Status:** built 2026-10-18; evaluator pass 1 pending. Records written in P10 (`var/m9d/logs/p10/` holds P10's own read-only trace checks, cited below where a number is not printed by an earlier phase's log).
+
+**Commits (branch `m9`):** `d692b71` contract (planned during M9c), `c2ca543` P0 (amendment 1), `08a352f` P1, `181c390` P2, `c4cfd26` P3, `635f724` P4 (with amendment 2), `371407d` P5, `2ab5ae4` P6, `437ced2` P7, `920e30e` P8, `73e2e62` P9b (with amendment 3), `559d41d` P9c, `b321e17` P9 (bench gate), then P10's two record commits. No decision was withdrawn and no mutant was retired.
+
+**Names** (lesson of 2026-10-17; the P9 note's names, used unchanged below). Binaries are named by their file in `var/m9d/bin/`, runs by the phase that made them.
+
+| Name | What |
+|---|---|
+| `rb` | **the binary of record**: `var/m9d/bin/rb`, sha256 `5d994f76699be1cc53f2594eeaa3dee4f91bd810368ce7defa0fb10ad78eb9f0`, release build from `559d41dbe1b2ef6d1cb4070dc9f1e58c95236415` (P9c, the last code change) with `crates/` and `migrations/` clean before and after, `PIPELINE` `m9d-1` (`var/m9d/logs/p9/build.log`) |
+| `rb.p9a` | `698d8f75…19a9`, from `920e30e` (P8) (`build-p9a.log`) |
+| `rb.p9b` | `83aa964e…f8f3`, from `73e2e62` (P9b) (`build-p9b.log`) |
+| `rb.pre-p1`, `rb.p1` … `rb.p7` | debug builds of each phase's tree, used only by that phase's probes (sha256 in each phase note) |
+| `rb-bench` | `var/m9d/bin/rb-bench`, `82839c81…452b`, the same bytes as M9c's |
+| cold run | `rb.p9a`, 05:09:33–05:16:08; outputs kept in `var/m9d/p9/cold/` |
+| first run | `rb.p9a` warm, 05:18:57–05:21:58, `var/bench/out/698d8f75563a/`; the invariant, the sample and the pair diffs were measured on it |
+| set-aside run | `rb.p9b`, 15:33:12 onwards, 4 min 53 s after the host woke (below); kept in `var/m9d/p9/run2-host-inflated/`, not used |
+| P9b run | `rb.p9b`, 15:38:48–15:41:46, `var/bench/out/83aa964e9692/` |
+| **record run** | `rb`, 16:08:44–16:11:41 by output mtimes (2 min 57 s), **`var/bench/out/5d994f76699b/`** |
+
+Log files named before these names keep theirs: in `var/m9d/logs/p9/`, `*-warm*` is the first run, `*-run2*` the set-aside run, `*-run3*` and `perf-verdict-run3.txt` the P9b run, `*-record*` the record run; a `-p9a` or `-p9b` suffix names the head binary of an A/B round, and no suffix means `rb`. `dump-identity-run2.txt` and `dump-identity-run3.txt` were both written at 15:42 and both compare the first run with the P9b run.
+
+**Binary of record (C13):** `rb`, above. **Run of record:** the record run, above: `failures: 0`, every `noscip` fresh/cached pair identical, 0 `bench_%` repositories left (`bench-record.log`), on a host checked first (`quiet-before-record.txt`: load 3.92 / 3.52 / 3.80, 47 % memory free, no autovacuum worker and no vacuum in progress, 0 dead tuples on `rb.edge`, `rb.edge_evidence` and `rb.node`, 0 `bench_%` or `t_%` repositories). **All 157 dumps are byte-identical to the first run's** (`dump-identity-record.txt`), and so are the cold run's (`dump-identity-cold-warm.txt`), the P9b run's (`dump-identity-run3.txt`) and the set-aside run's (`var/m9d/logs/p10/dump-identity-set-aside.txt`); the 11 `.scip.status` files are the same with snapshot ids masked. Control: M9c's run of record against the first run differs in 9 dumps (`dump-identity-control.txt`). So every number measured on the first run holds for the record run.
+
+**Claims.**
+
+| # | Met | Evidence |
+|---|---|---|
+| C1 | met | `var/m9d/logs/p0/` and amendment 1. M9c's record (157 dumps, 0 empty) re-scores `cmp`-identical to `m9c.json` and `m9c-perf.json`, control against `m9b.json` differs (`p0/rescore.txt`). `bench/probe/m9d_probe.py` reproduces every planned number on M9b's record (S0, S2, go.work, 4,092 / 4,093) before printing M9c's (`p0/probe.txt`). Citations 74 of 74 hold, the +7 control fails 74 of 74. Gated probes (a)–(d) logged; D12, D13 built, D5 amended to `go list -deps -test`. |
+| C2 | met | `npm_fetches_rewrite_registry_hosts_and_ignore_engines`, red first (`p2/c2-red.txt`). nestjs probe and bench: failed (fetch) → `scip-typescript ok`, 274,729 B, 30 `exact calls (scip)`. D1 applies to npm fetches only (P2 note). Its host rewrite also hits `git+ssh` GitHub hosts (P8's D1 finding). |
+| C3 | met | `requirements_only_directories_are_python_roots`, `python_roots_without_pyproject_name_their_project`, red first (`p3/c3-c4-scip-red.txt`). Bench: microblog and microservices_demo's 4 roots planned and `ok`. |
+| C4 | met | `poetry_errors_reach_the_tail`, `a_failed_python_fetch_indexes_without_the_environment`, `python_fallback_rows_round_trip`, the `scip_status` and status-line rows, red first (`p3/c3-c4-scip-red.txt`, `c4-indexer-red.txt`, `c4-cli-red.txt`). Bench: fastapi, loadgenerator and shoppingassistantservice `ok (environment not installed: fetch failed)`, row `ok`/`fetch` with the fetch's tail (Cython error for fastapi). |
+| C5 | met | `go_jobs_requiring_in_repo_modules_get_a_workspace`, `workspace_jobs_write_go_work_and_clear_goflags`, red first (`p4/c5-c5b-scip-red.txt`), plus the vendored-directory row (`c5-vendor-red.txt`). Bench: server `ok` under `go.work`, 0 of 202,391 locals invalid (`p4/mm-probe.txt`). |
+| C5b | met | `a_failed_workspace_run_reindexes_without_go_work`, the `scip_status` and status-line rows, red first (`p4/c5-c5b-scip-red.txt`, `d5b-cli-red.txt`). D5b did not fire on the bench: server indexed under the workspace with 0 OOM events. |
+| C6 | met | `go_replace_targets_inside_the_repository_are_exported`, `go_replace_targets_outside_are_unsupported`, red first (`p4/c6-indexer-red.txt`). Bench: sharedchannel-test failed (fetch) → `scip-go ok, 1 link targets`. |
+| C7 | met | `byte_equal_cross_project_symbols_join_exact`, red first (`p5/c7-c8-c9-indexer-red.txt`). Bench: all 23,180 of M9c's `synthetic` scip edges are `exact` (below); `scip_cross_project` server → server/public `exact` 45,478, `synthetic` 0. |
+| C8 | met | `in_repo_modules_are_not_packages`, red first. Bench: the `server/public@v0.4.3` `Package` node and its 30 `scip` `DEPENDS_ON` left (WORK); the third-party `msgpack/v5@?` node stays (`p5/mm-packages.txt`). |
+| C9 | met | `scip_go_invalid_locals_are_counted`, `invalid_locals_are_written_only_when_non_zero`, `scip_status_line_prints_invalid_locals`, red first (`p5/c9-decode-red.txt`, `c9-cli-red.txt`). Control at scale: M9c's server index reads 1,541 of 202,391, the go.work index 0 (`p5/d10-real-index-control.txt`). Bench: 0 status lines with `locals typed invalid`; HEALTH bucket 0. |
+| C10 | met | `cypher_runs_without_jit` on a `ScratchDb`, red first (`p1/c10-red.txt`: 138 functions, JIT 247 ms). `rb check` A/B on the record binary (`p9/check-ab.txt`, M9c's binary against `rb`, 5 runs each, load 4.37–4.74): `unowned_table_writes` median 480.8 → **24.9 ms**, all three rules 495.6 → 36.5 ms, JIT absent from `rb`'s plan, outputs identical. |
+| C11 | met | `maven_release_above_21_takes_the_jdk25_image`, `maven_index_phase_writes_the_targetroot_outside_the_sources`, the doctor row, red first (`p6/c11-*-red.txt`). Image `rb-scip-java:0.13.1-jdk25` (`sha256:9e139634…`), tools identical to `rb-scip-java:0.13.1`, whose ID is unchanged (`p6/image-build.txt`). Bench: spring_boot_microservices failed (fetch) → `scip-java ok`, 111 documents. |
+| C12 | met | `gradle_runs_mark_tool_artifacts_executable`, red first (`p7/c12-red.txt`). Bench: adservice failed (fetch) → `scip-java ok`, 4,239,341 B, 12 documents (`p7/ms-probe.txt`). |
+| C13 | met | `PIPELINE` `m9c-3` → `m9d-1` in P8, before the verify run; `rb` built from a clean tree at `559d41d` (above). |
+| C14 | met, as amended (amendment 3, NOSCIP-D2) | `var/m9d/logs/invariant.txt`: 157 dumps, 148 identical, 9 differing, **0 unclassified**; control 32,525 unclassified (`p9/invariant-control.txt`). The only `noscip` rows that differ are the 5 NOSCIP-D2 `skipped` rows. |
+| C15 | met | `compare` exits 0: 46 `changed`, 12 `accepted` lines over 6 cells, no `REGRESSION`, no unused accept line (`p9/compare.txt`); without `--accept` it prints 12 `REGRESSION` lines and exits 1 (`var/m9d/logs/p10/compare-noaccept-exit.txt`). No `exact` fp rise: 0 → 0 over 150 cells, `exact` tp 201 → 201 (`p9/exact-fp.txt`, `exact-fp-record.txt`). |
+| C16 | met, under amendment 3 | mattermost NFR within limits; the two scip-mode cells over the limits accepted as input-driven under amendment 3's three conditions; `rb check` ≤ 100 ms at load ≥ 4; scoring 1.84 s and 1.64 s, `cmp`-identical; warm bench 2 min 57 s; server under `go.work` 0 OOM (Perf, below). |
+| C17 | met for m9d on the final code; the four older batteries were last run at P8 | m9d **39 of 39 KILLED** (m360–m398) on the P9c tree, m387 on a `ScratchDb` (`p9c/battery-m9d.log`). m8b 29/29, m9a 31/31, m9b 39/39, m9c 56/56 KILLED at P8 on `920e30e`'s code (`p8/battery-*.log`; m336 and m359 re-anchored first). After P9b and P9c, which changed `rb-scip/src/symbol.rs` and `rb-indexer/src/scip.rs`, only an anchor check of all five batteries ran (`p9c/anchors-dry.txt`: every spec's text once). Specs in those two files: m9a m236–m238, m9c m334, m340, m341, m354, m355 (open item below). |
+| C18 | met | `cache_trees_with_read_only_modules_are_removed` and `e2e_clean_ups_remove_read_only_test_caches`, red first (`p1/d15-unit-red.txt`, `d15-e2e-red.txt`); m392 KILLED; 0 `t_` caches after every later e2e run (P2–P9c notes). |
+
+**Invariant (C14, `var/m9d/logs/invariant.txt`).** Base `var/bench/out/6cd5baaa8d1f/` (M9c's record), head the first run (= the record run). 157 dumps (27 `noscip`, 11 `scip`, 119 PyCG), none empty: 148 identical, 9 differing.
+- Buckets: **NEWIDX 8,717, WORK 23,855, FALLBACK 4, RECIPE 6, HEALTH 0, NOSCIP-D2 5, META 0, UNCLASSIFIED 0.** Rows added or changed to `exact`: NEWIDX 2,926, WORK 23,820.
+- Differing dumps: fastapi `scip` (NEWIDX 2,330, FALLBACK 2), kotlin `scip` (RECIPE 2), mattermost `scip` (removed 338, added 903, changed 23,180: WORK 23,855, NEWIDX 562, RECIPE 4), microblog `noscip` (NOSCIP-D2 1) and `scip` (NEWIDX 1,067), microservices_demo `noscip` (NOSCIP-D2 4) and `scip` (NEWIDX 1,270, FALLBACK 2), nestjs `scip` (NEWIDX 693), spring_boot `scip` (removed 1,348, added 1,447: NEWIDX).
+- **WORK** (rules w1–w4): 23,178 + 2 edges `synthetic` → `exact`, each evidence span holding the target symbol byte-equal in the new server index (2 also gained or lost a span); 640 added server edges, each gained span holding the target's occurrence in the new index only; the `server/public@v0.4.3` `Package` node and its 30 `DEPENDS_ON` (D9); server's `scip_status` and `scip_cross_project`. By kind, from the dumps (`var/m9d/logs/p10/mattermost-edge-deltas.txt`): `scip` `CALLS` `synthetic` 10,098 → 0 and `exact` 34,647 → 45,093 (+10,446 = 10,098 D8 + 248 WORK + 100 NEWIDX), `REFERENCES` `synthetic` 13,082 → 0 and `exact` 18,745 → 32,273.
+- **NEWIDX:** each new job's rows in its indexed documents (read from its exported raw index, `p9/export-idx.txt`), plus 8 Tier B rows outside them whose only change is an end re-keyed to the job's scip symbol (nestjs), fastapi's and microblog's `rta_coverage`/`orphan_coverage` totals, and sharedchannel-test's `scip_cross_project` (`exact` 90, `unanchored` 54) and `scip_status` (`link_targets`, P4 deviation 5).
+- **FALLBACK:** fastapi's base and new `scip_status` rows, and loadgenerator's and shoppingassistantservice's (`ok`, `phase: fetch`).
+- **RECIPE** (predicted empty; deviation): 3 `scip_status` pairs that differ only in `stderr_tail`: webapp and cypress (D1's host rewrite, P8's finding) and kotlin_spring_realworld ("(no index.scip was produced)" → scip-java's "No SCIP shards found", because D12b re-ran every Maven job).
+- **NOSCIP-D2:** the 5 `skipped` rows of the new Python roots in the `noscip` dumps.
+
+**Newly indexed targets: job status, M9c's run of record → the record run** (`.scip.status` in each run directory; `p9/job-status.txt` reads the same lines on the first run).
+
+| Target / root | Indexer | M9c | M9d | `exact calls (scip)` (target) |
+|---|---|---|---|---|
+| nestjs_realworld `.` | scip-typescript | failed (fetch phase) | ok | 0 → 30 |
+| fastapi_realworld `.` | scip-python | failed (fetch phase) | ok (environment not installed: fetch failed) | 0 → 314 |
+| microblog `.` | scip-python | no job | ok unpinned | 0 → 74 |
+| spring_boot_microservices `.` | scip-java (JDK 25) | failed (fetch phase) | ok | 0 → 179 |
+| microservices_demo `src/adservice` | scip-java (Gradle) | failed (fetch phase) | ok | 208 → 242 (target) |
+| microservices_demo `src/emailservice`, `src/recommendationservice` | scip-python | no job | ok unpinned | |
+| microservices_demo `src/loadgenerator`, `src/shoppingassistantservice` | scip-python | no job | ok unpinned (environment not installed: fetch failed) | |
+| mattermost `tools/sharedchannel-test` | scip-go | failed (fetch phase) | ok, 1 link targets | 34,647 → 45,093 (target) |
+| mattermost `server` | scip-go | ok | ok, under `go.work` | |
+| mattermost `webapp`, `e2e-tests/cypress` | scip-typescript | failed (fetch phase) | failed (fetch phase); tail moved (RECIPE) | |
+| kotlin_spring_realworld `.` | scip-java | failed (index phase) | failed (index phase); tail moved (RECIPE) | 0 → 0 |
+
+SCIP coverage of each newly scored target's `calls` cell (`var/m9d/logs/p10/cells-diff-fields.txt`): fastapi 0 → 72 of 72 files, microblog 0 → 34 of 34, nestjs 0 → 31 of 31, spring_boot 0 → 110 of 111, microservices_demo 21 → 35 of 49, mattermost 2,386 → 2,392 of 6,122.
+
+**Cells, measured beside predicted.** 12 of the 314 cells changed, 302 are identical (`var/m9d/logs/p10/cells-diff.txt`, with a self-compare control of 0). Two of the 12 changed only their `covered` count (mattermost and spring_boot `calls_file_scope`). Pair diff: `p9/agreement-diff.txt`; `agreement.py` (M9c's port) reproduces all 24 checked cells. "Predicted" is amendment 1's re-based value where it gave one, else the contract's.
+
+| Cell (`bench:target:mode:class`) | M9c (base, re-scored) | Predicted | Measured | Claim |
+|---|---|---|---|---|
+| `scip:mattermost:noscip:calls` | gold 43,771, tp 42,181 (heuristic 42,145, ambiguous 36), fp 203, fn 1,590; P 99.52 %, R 96.37 % | gold 44,024, tp 42,366, fp 18, fn 1,658, plus sharedchannel-test's pairs | gold **44,119**, tp **42,465**, fp **19**, fn **1,654**; P 99.96 %, R 96.25 %. WORK: 184 fp → tp, 64 new fn (gold +248, all server → server/public); NEWIDX: 100 sharedchannel-test pairs out of scope → tp | C5, C6, C7 |
+| `scip:mattermost:noscip:calls_file_scope` | gold 974, tp 334, fp 0, fn 0 | measured at P9 | unchanged but `covered` 2,386 → 2,392 files | C5 |
+| `scip:fastapi_realworld:noscip:calls` | gold 0 (vacuous), oos 216 | at most 335 call sites | gold 313: tp 169, fp 47, fn 144 (P 78.2 %, R 54.0 %) | C4 |
+| `scip:microblog:noscip:calls` | gold 0, oos 51 | at most 89 | gold 72: tp 49, fp 2, fn 23 (P 96.1 %, R 68.1 %) | C3 |
+| `scip:nestjs_realworld:noscip:calls` | gold 0, oos 29 | at most 30 | gold 29, all tp; no accept line needed | C2 |
+| `scip:spring_boot_microservices:noscip:calls` | gold 0, oos 191 | gold > 0 | gold 179: tp 167 (8 ambiguous), fp 17 (4 ambiguous), fn 12 (P 90.8 %, R 93.3 %) | C11 |
+| `scip:microservices_demo:noscip:calls` | gold 208, tp 208, fn 0 | gold rises, fn may rise, Go part unchanged | gold 234: tp 229, fp 1, fn 5; tp +21 (adservice 13, emailservice 4, loadgenerator 2, recommendationservice 2); no Go pair changed tag | C3, C12 |
+| `scip:microservices_demo:noscip:calls_file_scope` | gold 0 | not predicted by name | gold 8: tp 5, fp 2, fn 3 | C3 |
+| `calls_file_scope` of fastapi, microblog, nestjs | gold 0 | | gold 1, 2, 1, all tp | |
+| `scip:spring_boot_microservices:noscip:calls_file_scope` | gold 0, covered 0 of 111 | | gold 0; covered 110 of 111 | |
+| `rb status` mattermost `exact calls (scip)` | 34,647 | ≥ 44,745 | **45,093** (+10,098 D8, +248 WORK, +100 sharedchannel-test) | C7 |
+| `exact` sample, `scip` | 60 / 60 | re-judge up to 60 | 60 / 60; 55 drawn without a verdict, 55 TRUE | C7, C14 |
+| every `noscip` cell, handkey, microSecEnD, PyCG; bookcars, express, go_clean_arch, go_gin_example | | identical | identical | C14 |
+
+- **mattermost fp, 203 → 19.** The fall is the reference gaining pairs, not Tier B changing (lesson of 2026-10-17 on precision headlines): under `go.work` the D8′ join takes 248 new gold pairs, 184 of them M9c's version-skew fp, which become tp. The 19 left are M9c's 18 that are not skew (15 `docs/site` and 3 e2e-tests calls) and one server → server/public call, `plugin_access_control_test.go:299` → `model.NewNoPolicyAccessDecision`, fp at M9c too (deviation below; finding B15).
+- **mattermost fn, 1,590 → 1,654.** 64 new fn, all new gold pairs whose callees `v0.4.3` lacks (`AutoAddMode` 8, `AutoAddMembers` 7, …), which Tier B does not resolve either (accept line).
+- **New fp on the new cells** are all Tier B, none `exact`: an inherited `__init__` where scip-python joins the call to the class (fastapi 47, microblog 2, microservices_demo 1 + 2 file-scope); inherited Spring Data CRUD (`save` 10, `findAll` 3) resolved to the repository interface (B11's shape); 4 ambiguous overload candidates on spring.
+
+**Gate (C15; `var/m9d/logs/p9/compare.txt`, which opens with HEAD `559d41d`, the accept file's sha256 `b9946005…` and `rb-bench`'s).** The command, exit 0:
+
+`var/m9d/bin/rb-bench compare var/m9d/m9c-rescored.json bench/scoreboard/m9d.json --accept bench/accept-m9d.tsv --perf var/m9d/m9c-rescored-perf.json bench/scoreboard/m9d-perf.json`
+
+The base is D14's: M9c's run of record re-scored with this `rb-bench` against `exact.tsv` with the 55 M9d verdicts. It differs from P0's re-score (`var/m9d/m9c-rescored.p0.json`) in one leaf, `keys["exact:verdicts"]`, and its perf file is identical (`var/m9d/logs/p10/base-rescore.txt`). It printed (accept reasons elided; they are in `bench/accept-m9d.tsv`; the 14 unchanged aggregate lines left out):
+
+```
+changed scip:fastapi_realworld:noscip:calls: gold 0 → 313
+changed scip:fastapi_realworld:noscip:calls: tp heuristic 0 → 169
+changed scip:fastapi_realworld:noscip:calls: fp heuristic 0 → 47
+changed scip:fastapi_realworld:noscip:calls: fn 0 → 144
+changed scip:fastapi_realworld:noscip:calls: found_out_of_scope{not_covered} 216 → 0
+accepted scip:fastapi_realworld:noscip:calls: fp heuristic 0 → 47 (…)
+accepted scip:fastapi_realworld:noscip:calls: fn 0 → 144 (…)
+changed scip:fastapi_realworld:noscip:calls_file_scope: gold 0 → 1
+changed scip:fastapi_realworld:noscip:calls_file_scope: tp heuristic 0 → 1
+changed scip:fastapi_realworld:noscip:calls_file_scope: found_out_of_scope{not_covered} 1 → 0
+changed scip:mattermost:noscip:calls: gold 43771 → 44119
+changed scip:mattermost:noscip:calls: tp heuristic 42145 → 42429
+changed scip:mattermost:noscip:calls: fp heuristic 203 → 19
+changed scip:mattermost:noscip:calls: fn 1590 → 1654
+changed scip:mattermost:noscip:calls: found_out_of_scope{not_covered} 38236 → 38136
+accepted scip:mattermost:noscip:calls: fn 1590 → 1654 (…)
+changed scip:microblog:noscip:calls: gold 0 → 72
+changed scip:microblog:noscip:calls: tp heuristic 0 → 49
+changed scip:microblog:noscip:calls: fp heuristic 0 → 2
+changed scip:microblog:noscip:calls: fn 0 → 23
+changed scip:microblog:noscip:calls: found_out_of_scope{not_covered} 51 → 0
+accepted scip:microblog:noscip:calls: fp heuristic 0 → 2 (…)
+accepted scip:microblog:noscip:calls: fn 0 → 23 (…)
+changed scip:microblog:noscip:calls_file_scope: gold 0 → 2
+changed scip:microblog:noscip:calls_file_scope: tp heuristic 0 → 2
+changed scip:microblog:noscip:calls_file_scope: found_out_of_scope{not_covered} 2 → 0
+changed scip:microservices_demo:noscip:calls: gold 208 → 234
+changed scip:microservices_demo:noscip:calls: tp heuristic 208 → 229
+changed scip:microservices_demo:noscip:calls: fp heuristic 0 → 1
+changed scip:microservices_demo:noscip:calls: fn 0 → 5
+changed scip:microservices_demo:noscip:calls: found_out_of_scope{not_covered} 27 → 5
+accepted scip:microservices_demo:noscip:calls: fp heuristic 0 → 1 (…)
+accepted scip:microservices_demo:noscip:calls: fn 0 → 5 (…)
+changed scip:microservices_demo:noscip:calls_file_scope: gold 0 → 8
+changed scip:microservices_demo:noscip:calls_file_scope: tp heuristic 0 → 5
+changed scip:microservices_demo:noscip:calls_file_scope: fp heuristic 0 → 2
+changed scip:microservices_demo:noscip:calls_file_scope: fn 0 → 3
+changed scip:microservices_demo:noscip:calls_file_scope: found_out_of_scope{not_covered} 10 → 3
+accepted scip:microservices_demo:noscip:calls_file_scope: fp heuristic 0 → 2 (…)
+accepted scip:microservices_demo:noscip:calls_file_scope: fn 0 → 3 (…)
+changed scip:nestjs_realworld:noscip:calls: gold 0 → 29
+changed scip:nestjs_realworld:noscip:calls: tp heuristic 0 → 29
+changed scip:nestjs_realworld:noscip:calls: found_out_of_scope{not_covered} 29 → 0
+changed scip:nestjs_realworld:noscip:calls_file_scope: gold 0 → 1
+changed scip:nestjs_realworld:noscip:calls_file_scope: tp heuristic 0 → 1
+changed scip:nestjs_realworld:noscip:calls_file_scope: found_out_of_scope{not_covered} 2 → 1
+changed scip:spring_boot_microservices:noscip:calls: gold 0 → 179
+changed scip:spring_boot_microservices:noscip:calls: tp ambiguous 0 → 8
+changed scip:spring_boot_microservices:noscip:calls: tp heuristic 0 → 159
+changed scip:spring_boot_microservices:noscip:calls: fp ambiguous 0 → 4
+changed scip:spring_boot_microservices:noscip:calls: fp heuristic 0 → 13
+changed scip:spring_boot_microservices:noscip:calls: fn 0 → 12
+changed scip:spring_boot_microservices:noscip:calls: found_out_of_scope{not_covered} 191 → 7
+changed scip:spring_boot_microservices:noscip:calls: ambiguous_sites 0 → 8
+changed scip:spring_boot_microservices:noscip:calls: ambiguous_hits 0 → 8
+accepted scip:spring_boot_microservices:noscip:calls: fp ambiguous 0 → 4 (…)
+accepted scip:spring_boot_microservices:noscip:calls: fp heuristic 0 → 13 (…)
+accepted scip:spring_boot_microservices:noscip:calls: fn 0 → 12 (…)
+aggregates (micro-averaged, reading only):
+  scip calls noscip agreement: P 99.5% R 96.5% → P 99.8% R 96.0%
+  scip calls_file_scope noscip agreement: P 100.0% R 100.0% → P 99.5% R 99.2%
+warning: perf microservices_demo:scip: peak RSS 61816832 → 97615872 bytes (over 1.15×)
+warning: perf spring_boot_microservices:scip: peak RSS 31883264 → 37568512 bytes (over 1.15×)
+exit=0
+```
+
+Without `--accept` the same command prints those 12 lines as `REGRESSION` and exits 1 (`p9/compare-noaccept.txt`; the exit code is in `var/m9d/logs/p10/compare-noaccept-exit.txt`). The scip `calls` aggregate's recall falls 96.5 % → 96.0 % because cells scored for the first time enter it (fastapi alone adds 144 fn), and `calls_file_scope`'s falls to 99.2 % with microservices_demo's first file-scope gold (fp 2, fn 3). Every other aggregate is unchanged.
+
+**Accept lines (`bench/accept-m9d.tsv`: a header and 6 lines, one per cell; compare prints 12 `accepted` lines because a line covers each metric of its cell that rose).**
+
+| Cell | Accepted | Claim, bucket |
+|---|---|---|
+| `scip:fastapi_realworld:noscip:calls` | fp 0 → 47, fn 0 → 144 | C4, NEWIDX + FALLBACK |
+| `scip:mattermost:noscip:calls` | fn 1,590 → 1,654 | C5, C6, C7, WORK (and NEWIDX) |
+| `scip:microblog:noscip:calls` | fp 0 → 2, fn 0 → 23 | C3, NEWIDX |
+| `scip:microservices_demo:noscip:calls` | fp 0 → 1, fn 0 → 5 | C3, C12, NEWIDX |
+| `scip:microservices_demo:noscip:calls_file_scope` | fp 0 → 2, fn 0 → 3 | C3, NEWIDX |
+| `scip:spring_boot_microservices:noscip:calls` | fp ambiguous 0 → 4, fp heuristic 0 → 13, fn 0 → 12 | C11, NEWIDX |
+
+**Certainty table** (`rb-bench render --certainty`, `var/m9d/logs/p10/certainty.txt`).
+
+| Label | M9c (re-scored) | M9d | Predicted |
+|---|---|---|---|
+| `exact` | 100.0 % of 126 | 100.0 % of 126 | no `exact` fp rise |
+| `synthetic` | 83.0 % of 47 | 83.0 % of 47 | unchanged |
+| `heuristic` | 99.4 % of 167; agreement 99.5 % of 45,042 | 99.4 % of 167; agreement 99.8 % of 45,643 | Tier B rows `heuristic` |
+| `ambiguous` | agreement site hit 100.0 % of 47 sites, 100.0 % of 37 edges | site hit 100.0 % of 55 sites, 91.8 % of 49 edges (spring's 4 ambiguous fp) | not stated |
+| `dispatch` | not stored | not stored | |
+
+**Sample** (`p9/sample-missing.txt`, `append-verdicts.txt`, `citations-exact.txt`, `evidence-check.txt`, `judge-audit.txt`). `rb-bench sample` on the first run (the same draw on the cold run) listed 55 drawn `scip` edges without a verdict: mattermost 50, and fastapi, microblog, microservices_demo, nestjs and spring_boot 1 each. Three blind judges (19, 19, 17 edges) under M9c pass 1's prompt plus the template's "a version in a key does not matter" line judged **55 TRUE, 0 FALSE**. `append_verdicts.py` checked each row against its drawn edge and appended them under `# M9d` (`exact.tsv` 441 → 497 lines; no line edited). Citations: 194 OK, 7 MISMATCH, 6 UNRESOLVED of 207, each flagged one read by eye (`citations-by-eye.txt`); the +7 control gives 145 MISMATCH. Evidence: 54 of 54 listed rows OK; the shifted control flags 51 of 53. Audit: 38 tool calls, 1 flagged (judge 3 writing its verdict file in Python from the label directory). Every family is as at M9c:
+
+| Family | M9c | M9d | Wilson 95 % (M9d) | Without a verdict |
+|---|---|---|---|---|
+| manifest | 60 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| orm | 9 / 9 | 9 / 9 | 70.1–100.0 % | 0 |
+| routes | 60 / 60 | 60 / 60 | 94.0–100.0 % | 0 |
+| scip | 60 / 60 | 60 / 60 (55 redrawn) | 94.0–100.0 % | 0 |
+| sql | 59 / 60 | 59 / 60 | 91.1–99.7 % | 0 |
+
+**Perf (C16).**
+- **NFR, mattermost** (`p9/perf-table.txt`, the record run against M9c's pass-2 run; hardware equal):
+
+  | mattermost | M9c wall | M9d wall | ratio | M9c peak RSS | M9d peak RSS | ratio | load (record run) |
+  |---|---|---|---|---|---|---|---|
+  | `noscip-fresh` | 22.96 s | 22.77 s | 0.992 | 1,954.5 MB | 2,032.0 MB | 1.040 | 3.47–4.84 |
+  | `noscip-cached` | 17.74 s | 16.74 s | 0.944 | 1,725.6 MB | 1,761.2 MB | 1.021 | 4.84–4.28 |
+  | `scip` | 20.18 s | 20.74 s | 1.028 | 2,493.2 MB | 2,337.5 MB | 0.938 | 4.81–4.89 |
+
+  Warm full bench 2 min 57 s (≤ 20 min). Scoring 1.84 s and 1.64 s (≤ 30 s), `cmp`-identical, scoreboard and perf file both (`p9/score.txt`). `compare --perf` warns only on peak RSS for microservices_demo `scip` (61.8 → 97.6 MB) and spring_boot `scip` (31.9 → 37.6 MB).
+- **A/B rounds** (10 runs per side per mode, ABBA, all exit 0; each summary prints its rule first: noise iff median CPU ≤ 1.10, wall ≤ 1.25 and RSS ≤ 1.15, instructions retired breaking ties; ratios head / base).
+
+  | Round (log) | Mode | wall | CPU | RSS | instructions | printed verdict |
+  |---|---|---|---|---|---|---|
+  | M9c vs `rb.p9a` (`perf-ab9-summary-p9a.txt`) | microservices_demo `scip` | 1.364 | 1.789 | 1.572 | 2.753 | OVER-CPU+WALL+RSS |
+  | | spring_boot `scip` | 1.412 | 1.818 | 1.208 | 3.734 | OVER-CPU+WALL+RSS |
+  | M9c vs `rb.p9b` (`perf-ab9-summary-p9b.txt`) | microservices_demo `scip` | 1.147 | 1.263 | 1.547 | 1.379 | OVER-CPU+RSS |
+  | | spring_boot `scip` | 1.291 | 1.545 | 1.204 | 2.845 | OVER-CPU+WALL+RSS |
+  | **M9c vs `rb`** (`perf-ab9-summary.txt`, load 2.76–3.58) | microservices_demo `scip` | 1.129 | 1.211 | 1.515 | 1.251 | OVER-CPU+RSS |
+  | | spring_boot `scip` | 1.161 | 1.455 | 1.189 | 2.435 | OVER-CPU+RSS |
+  | | the four `noscip` siblings | 0.960–1.017 | 1.000–1.048 | 0.989–1.006 | 1.000–1.008 | noise |
+  | control, M9c vs `rb` (`perf-ab9c-summary.txt`, load 2.97–3.84) | bookcars, express_ts_boilerplate, go_gin_example `scip` | 1.021–1.212 | 1.016–1.056 | 0.983–1.007 | 0.999–1.004 | noise |
+  | | go_clean_arch `scip` | 1.197 | 1.125 (0.08 → 0.09 s) | 1.000 | 1.011 | OVER-CPU; read as noise by the tie-break (one 10 ms tick) |
+  | `rb.p9a` vs `rb.p9b` (`perf-ab9d-summary-p9b.txt`, P9b's effect) | microservices_demo `scip` | 0.839 | 0.706 | 0.994 | 0.501 | |
+  | | spring_boot `scip` | 0.972 | 0.850 | 0.989 | 0.763 | |
+  | `rb.p9b` vs `rb` (`perf-ab9e-summary.txt`, P9c's effect) | spring_boot `scip` | 0.922 | 0.941 | 0.992 | 0.858 | |
+
+- **Amendment 3's verdicts, on `rb`.** Both scip-mode cells are over the limits and both are **accepted as input-driven**:
+  - microservices_demo `scip`: (i) the extra decoded indexes are adservice (NEWIDX) and the four Python roots (NEWIDX 2, FALLBACK 2); the four Go jobs serve the same rows to both binaries. (ii) The control reads noise on three targets and, by the instructions tie-break, on go_clean_arch, whose CPU ratio is one 10 ms tick that is D12's fifth `docker image inspect` (10.0 ms child CPU, 23.6 ms wall per SCIP-mode run, `p9b/inspect-cost.txt`). (iii) In the P9b profiles `remove_lombok_generated` is 5.2 % of `index_commit`; no rb function outside decode and join at or above 10 % does avoidable per-occurrence or per-symbol work (`profile-shares3.txt`).
+  - spring_boot_microservices `scip`: (i) the extra index is the spring job (NEWIDX). (ii) As above. (iii) After P9c, the Lombok frames take 0 samples (10.2 % before P9c, which failed (iii) by 0.2 points, `perf-verdict-run3.txt`); the functions at or above 10 % outside decode (5.0 %) and join (43.4 %) are `bounded_output`, `age::project`, `scan_unparsed` (14.9 %), `run_projects` (11.1 %) and `raw_scan` (10.6 %); `package` (17.6 %) and `NameForms::of` (13.4 %) are inside the join, which (iii) exempts (`profile-shares4.txt`, 9 complete profiles of 10).
+  - rb-bench has no perf-accept mechanism (`compare_perf` warns only), so these verdicts live here and in the P9 note.
+- **Cost per decoded occurrence** (reported, not gated; `occ-counts.txt`, `perf-verdict-run3.txt`): mattermost's scip-go indexes 1.16 µs (`rb.p9b`); microservices_demo 0.69 µs (`rb.p9b`); spring_boot 6.6 µs with `rb.p9b` and 4.7 µs with `rb` (339 ms of decode and join over 9 runs, `profile-shares4.txt`). spring's index has about 6 occurrences per distinct reference symbol (mattermost server about 47), so per-symbol parses dominate (Out of scope: the shared parse).
+- **`rb check` A/B (C10)** on `rb`: above. The same A/B with `rb.p9a` read 464.2 → 24.7 ms (`check-ab-p9a.txt`); P1's on `rb.p1` read 464 → 53 ms at load 4.4–5.0 (`p1/check-ab-loaded.txt`).
+- **server under `go.work`.** P0's ABBA (`p0/a-gowork.txt`, `--network none`): 101 / 146 / 145 / 99 s wall (A / B / B / A), go.work 1.46× wall and 1.50× CPU, `memory.peak` 3.80–3.88 GB, 0 `max`/`oom`/`oom_kill`. P4's rb-run probe: `memory.peak` 3,921,051,648 B, 0 OOM events in every sample (`p4/mm-memwatch.txt`); job wall 196.9 s against M9c's server row 119.0 s at load 5.2–7.8 (not an A/B). Module cache +54,160 KiB with the `go list` fetch (+1.69 GiB with `go mod download`, P0 (a)).
+
+**Verification.**
+- **Tests.** P8, on `920e30e`'s code: usage guide §5.2's full run, real Docker, `--test-threads=1`, **1,183 passed, 0 failed, 0 ignored**, exit 0, `grep -c 'skipping:'` 0 (`p8/test.log`, `suite-totals.txt`; e2e 53, rb-store 85, rb-indexer 385, rb-scip 95, rb-cli `--bin rb` 49). After P9b and P9c, which changed `rb-scip/src/symbol.rs` and `rb-indexer/src/scip.rs`: `cargo test -p rb-scip` 96 then 97 passed, `-p rb-indexer --lib` 385, and the Java SCIP e2e set (15 `scip_*` tests, then `java_spring_jpa`, `kotlin_gradle_tier_b`, `doctor_reports_each_check`) passed both times, goldens unchanged (`p9b/units.txt`, `e2e-java.txt`; `p9c/units.txt`, `e2e-java.txt`). The full workspace run was not repeated after P9b (open item below).
+- **fmt and clippy** (`--workspace --all-targets -D warnings`) clean at every phase, last at P9c (`p9c/fmt.txt`, `clippy.txt`), and on P10's tree (records only).
+- **Mutants.** m360–m398: 39 specs, none retired; 39 of 39 KILLED at P9c, none STALE, INVALID or served from the cache (`p9c/battery-m9d.log`). All five batteries, 192 of 192, at P8 (`p8/battery-*.log`, load 2.37 → 3.82). m372 was INVALID once (P4) and re-specified; m336 and m359 (m9c) went STALE when M9d moved their lines and were re-anchored in P8 (deviation below). No spec mutates a DB write path; m387 and m9c's m338 ran on a `ScratchDb`.
+- **Database.** `SELECT * FROM rb.repo ORDER BY 1` is identical before and after every phase that touched the database (each note), and at P9's start and end (`p9/repo-before.txt`, `repo-after.txt`): the user's 4 rows (`fx_man`, `fx_date`, `fx_full`, `alvorabackend`). 0 `t_m9d_*`, `bench_m9d_*`, `bench_ab9*` or `bench_prof_*` repositories left. P10 did not connect to the database.
+
+**Notes: deviations and slips.** Each is in its phase note; this list points to them.
+- **Predictions that missed.**
+  - **The 19th fp** (P9): mattermost fp is 19, not 18. scip-go writes byte columns and leaves `position_encoding` unset; rb reads that as UTF-16, so an em-dash before the call on `plugin_access_control_test.go:299` shifts the occurrence by 2 and no scip edge joins it (`p9/fp19-encoding.txt`, `var/m9d/logs/p10/fp19-emdash.txt`; Out of scope; bench finding B15).
+  - **WORK's gold +248, not +253** (P9): tp +184, fn +64, against the emulation's +185 and +68; the emulation joined 5 pairs rb's join does not make (not decomposed).
+  - **RECIPE was not empty** (P9): 3 `stderr_tail` pairs (6 rows), scip-java's kotlin row among them because D12b re-ran every Maven job; the contract had assumed the tail is not in the dump.
+  - **D1's host rewrite** (P4 observed, P8 recorded): `replace-registry-host=always` also rewrote the `git+ssh` GitHub hosts of webapp and cypress, so their tails name `ssh://git@registry.npmjs.org/…`. They stay failed as predicted, but D1 closes the `RB_SCIP_REGISTRIES` opt-in path for npm git dependencies (Out of scope).
+  - **microblog's index** is 253,630 B with `--project-name root`, not 263 KB with `microblog` (P3): D2 names the repository root `root`.
+  - **D12b's "byte-identical"** holds for index content, not bytes (P6 deviation 5): scip-java's output order was already unstable between runs.
+- **Scope added by amendment.** D15 (e2e cache leak, amendment 1; its start-up clean-up removes every `t_*` cache, P1); D12b (targetroot) and D5's `go list` fetch (amendment 1); D5b (workspace fallback, amendment 2); NOSCIP-D2, the perf input-growth clause and phases P9b and P9c (amendment 3).
+- **Files outside a phase's list, each forced by a change in it:** `bench/mutants/run.py` (`"bin": "rb"`, P5), `rb-scip/src/hash.rs`, `rb-indexer/src/projects.rs` and `rb-cli/src/main.rs` (`tool_versions` records `scip_java25`, P6), `bench/mutants/m9c.json` (P8), `rb-indexer/src/scip.rs` test code (P9c), `e2e.rs` (P1).
+- **Design choices the contract left open**, each in its phase's deviation list: `GOWORK` set in both phases, vendored and ignored directories not workspace modules (found by `bench_go_plan.py`), absolute replace targets unsupported, replace targets counted as `link_targets`, the `go` line omitted when no module declares one (P4); the compiler plugin's `source`/`target` read and the parent check by `artifactId` (P6); the init script's location (P7); the fallback's `stderr_tail` kept and an index failure after a failed fetch keeping the fetch's failure (P3).
+- **The fifth `docker image inspect`** is left (P9b): `tool_versions` needs the JDK 25 image's ID on every SCIP-mode run, so resolving it lazily would change `main.rs` and the up-to-date semantics; m398 went to P9c's pre-check instead.
+- **Measurement and harness faults, each re-run:** P0's Docker Desktop mount fault (c, d), P4's empty `docker events` stream (its filter named the tag), P5's `measure.sql` kind (`'Package'` for `package`), P6's export mixing psql output into base64 and its `rb gc` without `RB_DATABASE_URL`, P9's first A/B names over rb's 40-character limit.
+- **The cold run was barely cold** (P9 deviation 1): P2–P7's probes had already written the new jobs' rows, so only the TS re-runs and kotlin's Maven re-run ran in Docker. The record is the warm run, as D14 says; no new job's cold cost is measured by the bench (each phase probe measured its own).
+- **The set-aside run** (P9): benched 4 min 53 s after the host woke from a 9 h 27 min sleep (`var/m9d/logs/p10/host-wake.txt`, from `pmset -g log`; the quiet check read 5-minute load 14.69, `quiet-before-run2.txt`). Six small-target `noscip-fresh` walls warned (0.3–0.6 s → 0.6–1.4 s); its dumps are identical; it is kept and not used. The P9 note's "load 40 on waking" is not in any log.
+- **Disk:** `cargo clean` twice when free space fell under 10 GiB (P6: 21.0 GiB; P9: 33.3 GiB, after the binaries were copied). `var/scip/cache/bench_m9d_mm` (2.1 GB) is kept from P4/P5.
+- **`rb.p5`'s sha256 differs from a rebuild of the same tree** (P5 deviation 9); not verified as relink nondeterminism. The binary of record is a release build from the commit.
+- **Process: the one-edit rule slipped in P3 (three messages), P4 (one message with three edits) and P8 (one message with two edits);** each edit was grepped and found landed before anything ran. P5, P6, P7, P9, P9b and P9c kept one edit or one asserting scripted edit per message.
+- **P10 trace findings.** `p9/job-status.txt` reads the first run, not the record run as the P9 note says; the record run's `.scip.status` lines are the same. `p9/score.txt`'s "base re-score vs P0's: 0 differing leaves" compares against the base as already rewritten by the first run's scoring; against P0's file the base differs in `keys["exact:verdicts"]` only (`var/m9d/logs/p10/base-rescore.txt`). The control's go_clean_arch line is printed `OVER-CPU`; the P9 note reads it as noise by the tie-break.
+
+**Open items** (carried in `tasks/todo.md`).
+- **The four older batteries and the full suite after P9b and P9c.** m8b, m9a, m9b and m9c were last run at P8 and the full real-Docker suite at P8; P9b and P9c changed `symbol.rs` and `scip.rs`, with the m9d battery, the unit suites and the Java SCIP e2e green after each and every anchor matching once. A re-run of all five batteries and the full suite on `559d41d` closes C17's gap.
+- **scip-go `position_encoding`** (B15): read an unset encoding from scip-go as bytes. It changes dumps (the 19th fp, 440 server occurrences).
+- **The shared per-symbol parse in the join** (`package`, `NameForms::of`, `last_descriptor_name`; 14.3 %, 11.9 % and 6.8 % of spring's samples on `rb.p9b`).
+- **npm `replace-registry-host` narrowed** to the lockfile's foreign host, so GitHub git dependencies are left alone.
+- **pip environments never reach scip-python's index** (amendment 1, risk 3): install to a mounted `--target` with `PYTHONPATH`; it changes every Python index.
+- **D12's fifth `docker image inspect`** (23.6 ms wall, 10.0 ms CPU per SCIP-mode run).
+- From Out of scope, each recorded with its reason: kotlin_spring_realworld (scip-java cannot index Kotlin on Maven or Kotlin 2 on Gradle); webapp and cypress `git+ssh` dependencies and webapp's size; a scip-typescript environment fallback; JavaScript-only packages, C# and PHP; a committed `go.work` at a job root; the 4,093 interface-method references (`unanchored`); cross-project `IMPLEMENTS` (352); analysing the AGE label tables; D12's in-repo-only release reader (amendment 1, risk 4); D13's protobuf-only locator (risk 5).
