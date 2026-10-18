@@ -233,14 +233,20 @@ Notes that bite newcomers:
   `super_call`, `star_import`, `reexport`, `module_variable`, `inherited_init`.
 - SCIP fetches and the `scip:` status lines (`rb index`, `rb status`):
   - **npm** fetches (`package-lock.json`, or no lockfile) run with
-    `npm_config_replace_registry_host=always` and `npm_config_engine_strict=false`.
-    A lockfile resolved from a mirror (`https://npm.styque.de/…`) installs
-    from `registry.npmjs.org`, with every tarball still checked against the
-    lockfile's integrity, and an `engines` range newer than the image's Node
-    no longer stops the install. Yarn and pnpm fetches are unchanged. npm also
-    rewrites a `git+ssh` GitHub dependency's host
-    (`ssh://git@registry.npmjs.org/…`). Such a fetch fails, as git hosts always
-    did behind the allow-list.
+    `npm_config_engine_strict=false`, so an `engines` range newer than the
+    image's Node no longer stops the install. When the `package-lock.json`'s
+    registry tarballs (`…/<name>/-/<file>.tgz`) come from exactly one host
+    that is neither on the allow-list nor opted in with `--scip-registries`
+    (`RB_SCIP_REGISTRIES`), the fetch also gets
+    `npm_config_replace_registry_host=<that host>`: a lockfile resolved from a
+    mirror (`https://npm.styque.de/…`) installs from `registry.npmjs.org`,
+    with every tarball still checked against the lockfile's integrity. Nothing
+    else is rewritten: a host you opt in, a URL dependency
+    (`https://cdn.sheetjs.com/…/xlsx-0.20.3.tgz`) and a `git+ssh` or
+    `git+https` dependency are fetched as written, so the allow-list and your
+    opt-in decide them. (M9d's first form rewrote every host, which made an
+    opted-in host unreachable.) A lockfile with two such mirrors gets no
+    rewrite. Yarn and pnpm fetches are unchanged.
   - **Python.** A directory with `requirements.txt` and neither
     `pyproject.toml` nor `setup.py` is a Python root, installed with pip. A
     root without `pyproject.toml` indexes as
@@ -273,8 +279,9 @@ Notes that bite newcomers:
   scip-go job). **Workspaces.** When a module's `go.mod` requires, with no
   `replace`, the module path of another `go.mod` below its directory
   (mattermost's `server` requires `server/public`), rb writes a `go.work`
-  (`use .` and each such directory) into the job's export, never into your
-  checkout, and runs both phases in workspace mode, so the compiler reads the
+  (`use .` and each such directory, and a `replace` of each such module at
+  the version your `go.mod` requires, so that version need not be
+  published) into the job's export, never into your checkout, and runs both phases in workspace mode, so the compiler reads the
   in-repo code rather than the required version from the module cache.
   Vendored, `testdata`, `.x` and `_x` directories are never workspace modules,
   and a module that commits its own `go.work` is left as it is. If the
