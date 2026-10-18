@@ -1,0 +1,398 @@
+{
+  "schema": 1,
+  "milestone": "m9d",
+  "hardware": "Mac16,12 10 cpus 17179869184 bytes",
+  "binary_sha256": "5d994f76699be1cc53f2594eeaa3dee4f91bd810368ce7defa0fb10ad78eb9f0",
+  "runs": {
+    "bookcars:noscip-cached": {
+      "wall_s": 0.93,
+      "peak_rss_bytes": 102531072,
+      "load_start": 3.83,
+      "load_end": 3.83
+    },
+    "bookcars:noscip-fresh": {
+      "wall_s": 1.18,
+      "peak_rss_bytes": 172507136,
+      "load_start": 3.99,
+      "load_end": 3.83
+    },
+    "bookcars:scip": {
+      "wall_s": 1.27,
+      "peak_rss_bytes": 167165952,
+      "load_start": 3.83,
+      "load_end": 3.83
+    },
+    "eshop_on_web:noscip-cached": {
+      "wall_s": 0.6,
+      "peak_rss_bytes": 33570816,
+      "load_start": 3.47,
+      "load_end": 3.47
+    },
+    "eshop_on_web:noscip-fresh": {
+      "wall_s": 0.59,
+      "peak_rss_bytes": 49692672,
+      "load_start": 3.47,
+      "load_end": 3.47
+    },
+    "express_ts_boilerplate:noscip-cached": {
+      "wall_s": 0.27,
+      "peak_rss_bytes": 20971520,
+      "load_start": 3.99,
+      "load_end": 3.99
+    },
+    "express_ts_boilerplate:noscip-fresh": {
+      "wall_s": 0.3,
+      "peak_rss_bytes": 30294016,
+      "load_start": 3.99,
+      "load_end": 3.99
+    },
+    "express_ts_boilerplate:scip": {
+      "wall_s": 0.42,
+      "peak_rss_bytes": 31817728,
+      "load_start": 3.99,
+      "load_end": 3.99
+    },
+    "fastapi_realworld:noscip-cached": {
+      "wall_s": 0.4,
+      "peak_rss_bytes": 26312704,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "fastapi_realworld:noscip-fresh": {
+      "wall_s": 0.42,
+      "peak_rss_bytes": 31080448,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "fastapi_realworld:scip": {
+      "wall_s": 0.59,
+      "peak_rss_bytes": 33374208,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "go_clean_arch:noscip-cached": {
+      "wall_s": 0.37,
+      "peak_rss_bytes": 19972096,
+      "load_start": 3.83,
+      "load_end": 3.68
+    },
+    "go_clean_arch:noscip-fresh": {
+      "wall_s": 0.37,
+      "peak_rss_bytes": 22609920,
+      "load_start": 3.83,
+      "load_end": 3.83
+    },
+    "go_clean_arch:scip": {
+      "wall_s": 0.5,
+      "peak_rss_bytes": 31784960,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "go_gin_example:noscip-cached": {
+      "wall_s": 0.49,
+      "peak_rss_bytes": 88293376,
+      "load_start": 3.83,
+      "load_end": 3.83
+    },
+    "go_gin_example:noscip-fresh": {
+      "wall_s": 0.55,
+      "peak_rss_bytes": 91308032,
+      "load_start": 3.83,
+      "load_end": 3.83
+    },
+    "go_gin_example:scip": {
+      "wall_s": 0.66,
+      "peak_rss_bytes": 91750400,
+      "load_start": 3.83,
+      "load_end": 3.83
+    },
+    "hk_polls:noscip-cached": {
+      "wall_s": 0.68,
+      "peak_rss_bytes": 32260096,
+      "load_start": 2.71,
+      "load_end": 2.71
+    },
+    "hk_polls:noscip-fresh": {
+      "wall_s": 0.69,
+      "peak_rss_bytes": 38125568,
+      "load_start": 2.71,
+      "load_end": 2.71
+    },
+    "hk_todo:noscip-cached": {
+      "wall_s": 0.65,
+      "peak_rss_bytes": 20971520,
+      "load_start": 2.71,
+      "load_end": 2.81
+    },
+    "hk_todo:noscip-fresh": {
+      "wall_s": 0.65,
+      "peak_rss_bytes": 24657920,
+      "load_start": 2.71,
+      "load_end": 2.71
+    },
+    "kotlin_spring_realworld:noscip-cached": {
+      "wall_s": 0.39,
+      "peak_rss_bytes": 18710528,
+      "load_start": 3.47,
+      "load_end": 3.47
+    },
+    "kotlin_spring_realworld:noscip-fresh": {
+      "wall_s": 0.4,
+      "peak_rss_bytes": 29982720,
+      "load_start": 3.47,
+      "load_end": 3.47
+    },
+    "kotlin_spring_realworld:scip": {
+      "wall_s": 0.54,
+      "peak_rss_bytes": 31817728,
+      "load_start": 3.47,
+      "load_end": 3.47
+    },
+    "laravel_realworld:noscip-cached": {
+      "wall_s": 0.38,
+      "peak_rss_bytes": 16760832,
+      "load_start": 3.47,
+      "load_end": 3.47
+    },
+    "laravel_realworld:noscip-fresh": {
+      "wall_s": 0.36,
+      "peak_rss_bytes": 16564224,
+      "load_start": 3.47,
+      "load_end": 3.47
+    },
+    "mattermost:noscip-cached": {
+      "wall_s": 16.74,
+      "peak_rss_bytes": 1761198080,
+      "load_start": 4.84,
+      "load_end": 4.28
+    },
+    "mattermost:noscip-fresh": {
+      "wall_s": 22.77,
+      "peak_rss_bytes": 2031960064,
+      "load_start": 3.47,
+      "load_end": 4.84
+    },
+    "mattermost:scip": {
+      "wall_s": 20.74,
+      "peak_rss_bytes": 2337456128,
+      "load_start": 4.81,
+      "load_end": 4.89
+    },
+    "microblog:noscip-cached": {
+      "wall_s": 0.38,
+      "peak_rss_bytes": 19841024,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "microblog:noscip-fresh": {
+      "wall_s": 0.41,
+      "peak_rss_bytes": 23658496,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "microblog:scip": {
+      "wall_s": 0.55,
+      "peak_rss_bytes": 31309824,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "microservices_demo:noscip-cached": {
+      "wall_s": 0.36,
+      "peak_rss_bytes": 45809664,
+      "load_start": 3.99,
+      "load_end": 3.99
+    },
+    "microservices_demo:noscip-fresh": {
+      "wall_s": 0.43,
+      "peak_rss_bytes": 61292544,
+      "load_start": 4.25,
+      "load_end": 3.99
+    },
+    "microservices_demo:scip": {
+      "wall_s": 0.61,
+      "peak_rss_bytes": 97615872,
+      "load_start": 3.99,
+      "load_end": 3.99
+    },
+    "mse_anilallewar:noscip-cached": {
+      "wall_s": 0.7,
+      "peak_rss_bytes": 40419328,
+      "load_start": 2.92,
+      "load_end": 2.92
+    },
+    "mse_anilallewar:noscip-fresh": {
+      "wall_s": 0.92,
+      "peak_rss_bytes": 63799296,
+      "load_start": 3.0,
+      "load_end": 2.92
+    },
+    "mse_callista:noscip-cached": {
+      "wall_s": 0.66,
+      "peak_rss_bytes": 21364736,
+      "load_start": 2.92,
+      "load_end": 2.92
+    },
+    "mse_callista:noscip-fresh": {
+      "wall_s": 0.66,
+      "peak_rss_bytes": 24051712,
+      "load_start": 2.92,
+      "load_end": 2.92
+    },
+    "mse_fernandoabcampos:noscip-cached": {
+      "wall_s": 0.64,
+      "peak_rss_bytes": 18317312,
+      "load_start": 2.92,
+      "load_end": 2.92
+    },
+    "mse_fernandoabcampos:noscip-fresh": {
+      "wall_s": 0.65,
+      "peak_rss_bytes": 20185088,
+      "load_start": 2.92,
+      "load_end": 2.92
+    },
+    "mse_jferrater:noscip-cached": {
+      "wall_s": 0.66,
+      "peak_rss_bytes": 18923520,
+      "load_start": 2.92,
+      "load_end": 2.93
+    },
+    "mse_jferrater:noscip-fresh": {
+      "wall_s": 0.7,
+      "peak_rss_bytes": 20840448,
+      "load_start": 2.92,
+      "load_end": 2.92
+    },
+    "mse_koushikkothagal:noscip-cached": {
+      "wall_s": 0.63,
+      "peak_rss_bytes": 17547264,
+      "load_start": 2.93,
+      "load_end": 2.93
+    },
+    "mse_koushikkothagal:noscip-fresh": {
+      "wall_s": 0.63,
+      "peak_rss_bytes": 19398656,
+      "load_start": 2.93,
+      "load_end": 2.93
+    },
+    "mse_mdeket:noscip-cached": {
+      "wall_s": 0.69,
+      "peak_rss_bytes": 22724608,
+      "load_start": 2.93,
+      "load_end": 2.93
+    },
+    "mse_mdeket:noscip-fresh": {
+      "wall_s": 0.65,
+      "peak_rss_bytes": 24854528,
+      "load_start": 2.93,
+      "load_end": 2.93
+    },
+    "mse_mudigal:noscip-cached": {
+      "wall_s": 0.68,
+      "peak_rss_bytes": 34390016,
+      "load_start": 2.93,
+      "load_end": 2.93
+    },
+    "mse_mudigal:noscip-fresh": {
+      "wall_s": 0.73,
+      "peak_rss_bytes": 42598400,
+      "load_start": 2.93,
+      "load_end": 2.93
+    },
+    "mse_piggymetrics:noscip-cached": {
+      "wall_s": 0.8,
+      "peak_rss_bytes": 40271872,
+      "load_start": 2.71,
+      "load_end": 2.71
+    },
+    "mse_piggymetrics:noscip-fresh": {
+      "wall_s": 0.94,
+      "peak_rss_bytes": 73809920,
+      "load_start": 2.77,
+      "load_end": 2.71
+    },
+    "mse_piomin:noscip-cached": {
+      "wall_s": 0.64,
+      "peak_rss_bytes": 20267008,
+      "load_start": 2.77,
+      "load_end": 2.77
+    },
+    "mse_piomin:noscip-fresh": {
+      "wall_s": 0.64,
+      "peak_rss_bytes": 21987328,
+      "load_start": 2.93,
+      "load_end": 2.77
+    },
+    "mse_rohitghatol:noscip-cached": {
+      "wall_s": 0.7,
+      "peak_rss_bytes": 36978688,
+      "load_start": 2.77,
+      "load_end": 2.77
+    },
+    "mse_rohitghatol:noscip-fresh": {
+      "wall_s": 0.83,
+      "peak_rss_bytes": 57311232,
+      "load_start": 2.77,
+      "load_end": 2.77
+    },
+    "mse_shabbirdwd53:noscip-cached": {
+      "wall_s": 0.66,
+      "peak_rss_bytes": 18333696,
+      "load_start": 2.77,
+      "load_end": 2.77
+    },
+    "mse_shabbirdwd53:noscip-fresh": {
+      "wall_s": 0.64,
+      "peak_rss_bytes": 19775488,
+      "load_start": 2.77,
+      "load_end": 2.77
+    },
+    "mse_yidongnan:noscip-cached": {
+      "wall_s": 0.63,
+      "peak_rss_bytes": 18104320,
+      "load_start": 2.71,
+      "load_end": 2.71
+    },
+    "mse_yidongnan:noscip-fresh": {
+      "wall_s": 0.61,
+      "peak_rss_bytes": 19791872,
+      "load_start": 2.71,
+      "load_end": 2.71
+    },
+    "nestjs_realworld:noscip-cached": {
+      "wall_s": 0.39,
+      "peak_rss_bytes": 20905984,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "nestjs_realworld:noscip-fresh": {
+      "wall_s": 0.42,
+      "peak_rss_bytes": 28966912,
+      "load_start": 3.68,
+      "load_end": 3.68
+    },
+    "nestjs_realworld:scip": {
+      "wall_s": 0.56,
+      "peak_rss_bytes": 31326208,
+      "load_start": 3.68,
+      "load_end": 3.47
+    },
+    "spring_boot_microservices:noscip-cached": {
+      "wall_s": 0.38,
+      "peak_rss_bytes": 30310400,
+      "load_start": 3.99,
+      "load_end": 3.99
+    },
+    "spring_boot_microservices:noscip-fresh": {
+      "wall_s": 0.33,
+      "peak_rss_bytes": 35045376,
+      "load_start": 3.99,
+      "load_end": 3.99
+    },
+    "spring_boot_microservices:scip": {
+      "wall_s": 0.55,
+      "peak_rss_bytes": 37568512,
+      "load_start": 3.99,
+      "load_end": 3.99
+    }
+  }
+}
