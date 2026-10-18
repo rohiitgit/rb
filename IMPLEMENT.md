@@ -922,3 +922,31 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - Binary of record `rb` `6cd5baaa…f5a8` from `15831b0`; the pass-2 run `var/bench/out/6cd5baaa8d1f/`: 0 failures, all 157 dumps byte-identical to the pass-1 run; scoreboard equal but for sha and commit; `compare` exit 0, same 45 changed and 6 accepted lines; the three mattermost RSS warnings A/B noise (CPU 1.010 / 1.059 / 0.986).
   - Verification: real-Docker 1,157/0/0 (0 `skipping:`); mutants m9c 56/56, m9b 39/39, m9a 31/31, m8b 29/29 KILLED; fmt and clippy clean.
 - **Status:** **closed 2026-10-17** (evaluator passes 1 and 2 answered, amendments 3 and 4).
+
+## M9d SCIP fetch and index failures (B4), Go workspaces, scip-go health, `rb check` JIT: built 2026-10-18
+
+- **Discussed and decided:** the contract (`tasks/contract-m9d.md`, C1–C18 and C5b, amendments 1–3, notes P1–P9c) traced every failed or absent SCIP job of the run of record to its cause before any code. None was a timeout, an OOM or the disk budget: a lockfile mirror outside the allow-list (nestjs), musl wheels under Poetry (fastapi), roots the planner never saw (`requirements.txt`-only Python), a relative `replace` the export dropped (sharedchannel-test), JDK 21 against `release 25` (spring_boot), a protoc binary without its executable bit (adservice), and an aggregator's `clean` deleting scip-java's targetroot (found in P0). The `go.work` question was answered by probe: under a generated `go.work` server types against the in-repo server/public, 0 locals are invalid, and its references are byte-equal to server/public's definitions. M9c's "4,092 skew" references are interface methods server/public defines no symbol for (plan correction 3). The `rb check` timeout is LLVM JIT on a plan cost inflated by unanalysed AGE label tables, not the `LIMIT`.
+- **Built:**
+  - P1 (D11, D15): `SET LOCAL jit = off` in `cypher()`'s transaction; e2e clean-ups remove read-only Go caches (`rb_scip::remove_cache_tree`).
+  - P2 (D1): npm fetches rewrite registry hosts and ignore engines; `RECIPE_TS` `m9d-ts-1`.
+  - P3 (D2–D4): `requirements.txt` Python roots with project flags; Poetry's error on stderr; the environment-less fallback (`RunStatus::OkWithoutEnvironment`, stored `ok`/`fetch`); `RECIPE_PY` `m9d-py-1`.
+  - P4 (D5–D7, D5b): the planner reads each Go root's `go.mod`; a generated `go.work`, `GOFLAGS` empty, `GOWORK` set, fetch `go list -deps -test`; replace targets exported or `unsupported`; the plain re-run after a failed workspace (`RunStatus::OkWithoutWorkspace`, stored `ok`/`index`); `RECIPE_GO_WORK` `m9d-go-1`.
+  - P5 (D8–D10): the D8′ join carries `exact` for byte-equal symbols; in-repo modules at an empty version make no `Package`; `locals`/`locals_invalid_type` counted for scip-go and printed when non-zero.
+  - P6 (D12, D12b): `rb-scip-java:0.13.1-jdk25` from `docker/scip-java/Dockerfile.jdk25`; the Maven release reader (properties, parent chain by `artifactId`, compiler plugin); `--targetroot /scip-targetroot`; `RECIPE_JAVA` `m9d-java-1`; `rb doctor` checks 6 images; `tool_versions` records `scip_java25`.
+  - P7 (D13): the Gradle init script (`whenReady`), mounted read-only in all three runs; `RECIPE_GRADLE` `m9d-gradle-1`.
+  - P8: `PIPELINE` `m9d-1`; design notes (§5.2, §5.3, §8.4) and usage guide.
+  - P9b, P9c: `LombokMarkers`, a per-index memo, and a byte pre-check on `LOMBOK_PACKAGE`; output unchanged on every bench and fixture index.
+- **Files:** `crates/rb-scip/src/{jobs,orchestrate,decode,symbol,hash}.rs`, `crates/rb-indexer/src/{lib,projects,scip}.rs`, `crates/rb-store/src/{lib,db_tests}.rs`, `crates/rb-cli/src/{main,doctor}.rs`, `crates/rb-cli/tests/{e2e.rs,common/mod.rs}`, `docker/scip-java/{Dockerfile.jdk25,README.md}`, `bench/probe/m9d_probe.py`, `bench/mutants/{m9d,m9c}.json`, `bench/mutants/run.py`, `bench/samples/exact.tsv`, `bench/scoreboard/m9d{,-perf}.json`, `bench/accept-m9d.tsv`, `README.md`, `docs/{usage-and-testing,repository-brain-design}.md`.
+- **Results** (binary `rb` `5d994f76…eb9f0` from `559d41d`, the record run `var/bench/out/5d994f76699b/`):
+  - Jobs failed or absent → ok: nestjs, fastapi (without environment), microblog, spring_boot_microservices (JDK 25), microservices_demo adservice and its 4 Python roots (2 without environment), mattermost sharedchannel-test. server ok under `go.work`, 0 of 202,391 locals invalid.
+  - fastapi, microblog, nestjs and spring_boot `calls` scored for the first time (gold 313, 72, 29, 179); microservices_demo gold 208 → 234; mattermost fp 203 → 19 (the reference gaining 184 go.work joins), fn 1,590 → 1,654.
+  - 23,180 `synthetic` scip edges → `exact`; mattermost `exact calls (scip)` 34,647 → 45,093.
+  - 12 of 314 cells changed; `compare` exits 0 with 12 accepted lines over 6 cells; invariant 0 unclassified over 157 dumps; no `exact` fp rise; the `scip` sample's 55 redrawn edges all TRUE.
+  - `rb check` `unowned_table_writes` 480.8 → 24.9 ms at load 4.4–4.7.
+- **Verification:**
+  - Mutants m9d 39/39 (m360–m398) KILLED on the final code; m9c 56/56, m9b 39/39, m9a 31/31, m8b 29/29 KILLED at P8.
+  - Real-Docker 1,183/0/0 (0 `skipping:`) at P8; rb-scip 97, rb-indexer 385 and the Java SCIP e2e set after P9c.
+  - fmt and clippy clean; `rb.repo` unchanged; two scorings `cmp`-identical.
+  - Perf: mattermost within the NFR (walls 0.944–1.028×); microservices_demo and spring_boot SCIP mode over the limits and accepted as input-driven under amendment 3 (newly decoded indexes, control noise, no avoidable per-occurrence work after P9b/P9c).
+- **Open:** the four older batteries and the full suite were last run at P8, before P9b/P9c's `symbol.rs` and `scip.rs` changes; scip-go's unset `position_encoding` read as UTF-16 (B15, the 19th fp); one shared per-symbol parse in the join; npm's `replace-registry-host` narrowed to the lockfile's mirror; pip environments never reach scip-python's index; D12's fifth `docker image inspect`. Recorded: kotlin_spring_realworld, webapp and cypress, the 4,093 interface-method references, cross-project `IMPLEMENTS`.
+- **Status:** built, evaluator pending.

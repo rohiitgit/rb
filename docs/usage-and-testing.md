@@ -440,14 +440,19 @@ part of the tree.)
   until proven otherwise. Usually the test lacks the input that only that
   rule explains, sometimes the code is dead (delete it), rarely the mutant is
   equivalent (record why). Re-check mutation text after any `cargo fmt`
-  (reflows break exact matches). Run the battery with
+  (reflows break exact matches), and after any change under `crates/` check
+  every battery's anchors, not only the current milestone's: earlier
+  batteries target the same files (M9d P8 found two m9c specs matching 0
+  times after M9d moved their lines). Run the battery with
   `python3 -I bench/mutants/run.py bench/mutants/m8b.json --jobs 4` (parallel
   worktrees; the main tree stays clean): a full all-KILLED run is cached in
   `var/bench/mutants-cache.json` and re-reports instantly while code and
   specs are unchanged. A spec names `file` under `crates/<crate>/src`;
   `crate` defaults to `rb-bench`, and any other crate runs
   `cargo test -q -p <crate> --lib <test>`, and its spec must name the `test`
-  filter (M9a's `bench/mutants/m9a.json` uses both crates). With a filter,
+  filter (M9a's `bench/mutants/m9a.json` uses both crates). A crate with no
+  library target names its binary instead: `"bin": "rb"` runs
+  `--bin rb` in place of `--lib` (rb-cli; M9d's m386). With a filter,
   KILLED needs a failing test whose name contains it (cargo's
   `---- <name> stdout ----`), so a wall-clock test that flakes under load
   cannot score a kill. An rb-bench spec without a filter is KILLED by any
