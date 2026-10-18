@@ -135,8 +135,9 @@ pub struct Job {
     pub unpinned: bool,
     /// scip-go (contract M9d D5): the directories under `root` (relative to it, sorted) of the
     /// other `go.mod` files whose module paths the root's `go.mod` requires without a
-    /// `replace`. Non-empty: rb writes a `go.work` that uses `.` and each of them, and both
-    /// phases run in workspace mode. Empty for every other job.
+    /// `replace`. Non-empty: rb writes a `go.work` that uses `.` and each of them, and
+    /// replaces each at the version the root requires (amendment 4), and both phases run in
+    /// workspace mode. Empty for every other job.
     pub workspace: Vec<String>,
     /// scip-go (contract M9d D6): the root's `go.mod` `replace` targets that are local
     /// directories outside `root`, as written (`../../server/public`), sorted and distinct.
@@ -709,8 +710,9 @@ pub(crate) struct GoMod {
     pub(crate) module: Option<String>,
     /// The `go` line's version.
     pub(crate) go: Option<String>,
-    /// Every `require`d module path, direct or `// indirect`.
-    pub(crate) requires: BTreeSet<String>,
+    /// Every `require`d module path, direct or `// indirect`, with its version as written
+    /// (empty if none is).
+    pub(crate) requires: BTreeMap<String, String>,
     /// Every `replace`: the replaced module path, and the target as written (a module path,
     /// or a local directory).
     pub(crate) replaces: Vec<(String, String)>,
@@ -743,11 +745,16 @@ pub(crate) fn go_mod(text: &str) -> GoMod {
             }
         };
         let unquote = |s: &str| s.trim_matches('"').to_owned();
-        let first = rest.split_whitespace().next().map(unquote);
+        let mut words = rest.split_whitespace().map(unquote);
+        let first = words.next();
         match directive {
             "module" => out.module = first,
             "go" => out.go = first,
-            "require" => out.requires.extend(first),
+            "require" => {
+                if let Some(path) = first {
+                    out.requires.insert(path, words.next().unwrap_or_default());
+                }
+            }
             "replace" => {
                 if let Some((from, to)) = rest.split_once("=>")
                     && let (Some(module), Some(target)) =
@@ -796,7 +803,7 @@ fn go_workspace(root: &str, module: &GoMod, modules: &BTreeMap<&str, GoMod>) -> 
         .filter(|(dir, _)| !ignored(&relative(dir, root)))
         .filter(|(_, other)| {
             other.module.as_ref().is_some_and(|path| {
-                let required = module.requires.contains(path);
+                let required = module.requires.contains_key(path);
                 let replaced = module.replaces.iter().any(|(m, _)| m == path);
                 required && !replaced
             })

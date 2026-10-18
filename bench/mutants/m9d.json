@@ -4,27 +4,27 @@
   "crate": "rb-scip",
   "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
   "file": "orchestrate.rs",
-  "old": "        (\"npm_config_replace_registry_host\", \"always\"),\n",
-  "new": "        // replace_registry_host dropped\n",
-  "what": "`replace_registry_host` setting dropped"
+  "old": "            fetch\n                .env\n                .push((\"npm_config_replace_registry_host\".into(), host));\n",
+  "new": "            drop(host);\n",
+  "what": "`replace_registry_host` setting dropped (re-anchored in E1)"
  },
  {
   "id": "m361",
   "crate": "rb-scip",
   "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
   "file": "orchestrate.rs",
-  "old": "        (\"npm_config_engine_strict\", \"false\"),\n",
-  "new": "        // engine_strict dropped\n",
-  "what": "`engine_strict` setting dropped"
+  "old": "        fetch\n            .env\n            .push((\"npm_config_engine_strict\".into(), \"false\".into()));\n",
+  "new": "",
+  "what": "`engine_strict` setting dropped (re-anchored in E1)"
  },
  {
   "id": "m362",
   "crate": "rb-scip",
   "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
   "file": "orchestrate.rs",
-  "old": "pub const RECIPE_TS: &str = \"m9d-ts-1\";\n",
-  "new": "pub const RECIPE_TS: &str = \"m6a-ts-1\";\n",
-  "what": "`RECIPE_TS` left at `m6a-ts-1`"
+  "old": "pub const RECIPE_TS: &str = \"m9d-ts-2\";\n",
+  "new": "pub const RECIPE_TS: &str = \"m9d-ts-1\";\n",
+  "what": "`RECIPE_TS` left at `m9d-ts-1` (amendment 4 moves it to `m9d-ts-2`; re-anchored in E1)"
  },
  {
   "id": "m387",
@@ -112,7 +112,7 @@
   "crate": "rb-scip",
   "test": "jobs::tests::go_jobs_requiring_in_repo_modules_get_a_workspace",
   "file": "jobs.rs",
-  "old": "                let required = module.requires.contains(path);\n",
+  "old": "                let required = module.requires.contains_key(path);\n",
   "new": "                let required = false;\n",
   "what": "no `workspace` for a required in-repo module"
  },
@@ -350,5 +350,32 @@
   "old": "        if !may_be_lombok_marker(symbol) {\n",
   "new": "        if false {\n",
   "what": "the byte pre-check bypassed: every symbol without the Lombok package's bytes is parsed (M9d P9c)"
+ },
+ {
+  "id": "m399",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_rewrite_names_the_lockfiles_one_foreign_registry_host",
+  "file": "orchestrate.rs",
+  "old": "        _ => None, // none left, or several: no setting, npm's default\n",
+  "new": "        _ => Some(\"always\".to_owned()), // none left, or several: no setting, npm's default\n",
+  "what": "the rewrite always set: `always` when no single foreign registry host is left (amendment 4, B1)"
+ },
+ {
+  "id": "m400",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_rewrite_names_the_lockfiles_one_foreign_registry_host",
+  "file": "orchestrate.rs",
+  "old": "        .filter(|host| !egress.hosts.contains(host))\n",
+  "new": "        .filter(|host| !crate::egress::REGISTRIES.contains(&host.as_str()))\n",
+  "what": "hosts opted in through `RB_SCIP_REGISTRIES` not dropped (only the built-in registries are) (amendment 4, B1)"
+ },
+ {
+  "id": "m401",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "    if !replaces.is_empty() {\n",
+  "new": "    if false && !replaces.is_empty() {\n",
+  "what": "the go.work's versioned replace lines not written (amendment 4, S1)"
  }
 ]

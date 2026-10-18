@@ -26,8 +26,9 @@ pub const RECIPE_JAVA: &str = "m9d-java-1";
 /// scip-typescript's recipe (contract M6a D8), bumped like [`RECIPE_JAVA`]. `m6a-ts-1`:
 /// workspace roots fetch and index their members (D5, D6) and exports are repository-shaped
 /// (D7). `m9d-ts-1`: npm fetches rewrite lockfile registry hosts and ignore `engine-strict`
-/// (contract M9d D1).
-pub const RECIPE_TS: &str = "m9d-ts-1";
+/// (contract M9d D1). `m9d-ts-2`: the rewrite names the lockfile's one foreign registry host
+/// instead of `always` (D1 narrowed by amendment 4).
+pub const RECIPE_TS: &str = "m9d-ts-2";
 
 /// scip-go's recipe (contract M6d S1/S3): `go mod download`, then `scip-go`
 /// offline. Bumped like [`RECIPE_JAVA`].
@@ -36,8 +37,10 @@ pub const RECIPE_GO: &str = "m6d-go-1";
 /// scip-go's recipe for a job with a workspace or a replace target outside its root
 /// (contract M9d D5, D6): a `go.work` written by rb with `GOFLAGS` empty and a `go list -deps
 /// -test` fetch, or a repository-shaped export starting in the root. Jobs with neither keep
-/// [`RECIPE_GO`], their layout and their cache rows.
-pub const RECIPE_GO_WORK: &str = "m9d-go-1";
+/// [`RECIPE_GO`], their layout and their cache rows. `m9d-go-2`: the `go.work` also replaces
+/// each workspace module at the version the root requires (amendment 4); its text is no input
+/// file, so the recipe carries the change.
+pub const RECIPE_GO_WORK: &str = "m9d-go-2";
 
 /// scip-python's recipe (contract M6d S2/S4): environment resolution, then
 /// `scip-python index` offline. Bumped like [`RECIPE_JAVA`]. `m6d-py-2`:
@@ -503,7 +506,9 @@ fn run_once(
     let name = format!("rb-scip-{instance}");
     let result = (|| -> anyhow::Result<ScipRun> {
         let (mut fetches, mut index) = match job.indexer {
-            Indexer::ScipTypescript => typescript_runs(job, image, work_dir, cache_dir, budget)?,
+            Indexer::ScipTypescript => {
+                typescript_runs(job, image, work_dir, cache_dir, budget, egress)?
+            }
             Indexer::ScipJava if job.fetch == Fetch::Gradle => gradle_runs(
                 image,
                 work_dir,
@@ -700,6 +705,69 @@ fn finished(
     }
 }
 
+/// Contract M9d D1, narrowed by amendment 4 (evaluator pass 1, B1): the host an npm fetch's
+/// `replace-registry-host` names, read from the job's `package-lock.json`. Every `resolved` URL
+/// counts, in the lockfile v1 shape (`dependencies`, nested), v2 (both sections) and v3
+/// (`packages`). Of the registry-shaped tarball URLs' hosts ([`registry_tarball_host`]), those
+/// `egress` allows (the built-in registries and the hosts opted in through
+/// `RB_SCIP_REGISTRIES`) are dropped. Exactly one host left is the answer; none, or several (a
+/// setting names one host), give `None`: no setting, npm's default. npm then rewrites only the
+/// URLs on that host, so a URL dependency or a git host is fetched as written, and the
+/// allow-list decides it.
+fn npm_registry_rewrite(lockfile: &[u8], egress: &Egress) -> Option<String> {
+    let lock: serde_json::Value = serde_json::from_slice(lockfile).ok()?;
+    let mut resolved: Vec<&str> = lock
+        .get("packages")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(|packages| packages.values())
+        .filter_map(|entry| entry.get("resolved")?.as_str())
+        .collect();
+    let mut nested: Vec<&serde_json::Value> = lock.get("dependencies").into_iter().collect();
+    while let Some(dependencies) = nested.pop() {
+        for entry in dependencies
+            .as_object()
+            .into_iter()
+            .flat_map(|d| d.values())
+        {
+            resolved.extend(entry.get("resolved").and_then(serde_json::Value::as_str));
+            nested.extend(entry.get("dependencies"));
+        }
+    }
+    let foreign: std::collections::BTreeSet<String> = resolved
+        .into_iter()
+        .filter_map(registry_tarball_host)
+        .filter(|host| !egress.hosts.contains(host))
+        .collect();
+    let mut hosts = foreign.into_iter();
+    match (hosts.next(), hosts.next()) {
+        (Some(host), None) => Some(host),
+        _ => None, // none left, or several: no setting, npm's default
+    }
+}
+
+/// The host of a registry-shaped tarball URL, `http(s)://<host>/…/<name>/-/<file>.tgz`, as npm
+/// compares it (`URL.host`: lower case, with a port if one is written, without user
+/// information). `<name>` is the last segment of the package name, so a scoped name
+/// (`…/@scope/name/-/name-1.0.0.tgz`) and a registry under a path prefix match. Anything else
+/// has none: a URL dependency's tarball (`https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz`),
+/// a git URL, a local path.
+fn registry_tarball_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let (authority, path) = rest.split_once('/')?;
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').collect();
+    match segments.as_slice() {
+        [.., name, "-", file] if !host.is_empty() && !name.is_empty() && file.ends_with(".tgz") => {
+            Some(host.to_ascii_lowercase())
+        }
+        _ => None,
+    }
+}
+
 /// The fetch and index invocations for a scip-typescript job (contract M3b facts: the image's
 /// `npm` is a wrapper that hides failures, so the real binary is called; `--network none` for
 /// the index; the image exists for linux/amd64 only).
@@ -709,6 +777,7 @@ fn typescript_runs(
     work_dir: &Path,
     cache_dir: &Path,
     budget: &Budget,
+    egress: &Egress,
 ) -> anyhow::Result<(Vec<ContainerRun>, ContainerRun)> {
     let workdir = crate::runner::absolute(work_dir)?;
     let npm_cache = crate::runner::absolute(cache_dir)?.join("npm");
@@ -796,28 +865,31 @@ fn typescript_runs(
         args,
         ..base.clone()
     };
-    // npm fetches only (contract M9d D1). A lockfile may resolve from a mirror outside the
-    // allow-list (nestjs_realworld: 194 entries from `npm.styque.de`, each with the same
-    // integrity on `registry.npmjs.org`): `replace-registry-host=always` fetches every tarball
-    // from the configured registry by the same path, and the lockfile's integrity still checks
-    // it. `engine-strict=false` stops a project `.npmrc` from refusing the image's node and npm
+    // npm fetches only (contract M9d D1, narrowed by amendment 4). A lockfile may resolve from
+    // a mirror outside the allow-list (nestjs_realworld: 194 entries from `npm.styque.de`, each
+    // with the same integrity on `registry.npmjs.org`): `replace-registry-host=<that host>`
+    // fetches its tarballs from the configured registry by the same path, and the lockfile's
+    // integrity still checks them. Only that one host is named ([`npm_registry_rewrite`]); URL
+    // dependencies, git hosts and opted-in hosts are fetched as written (`always` rewrote them
+    // all, so an opted-in host could not be reached; evaluator pass 1, B1).
+    // `engine-strict=false` stops a project `.npmrc` from refusing the image's node and npm
     // (mattermost webapp). Environment variables beat a project `.npmrc`. Yarn and pnpm runs,
     // and the index phase, are unchanged.
-    const NPM_FETCH_ENV: &[(&str, &str)] = &[
-        ("npm_config_replace_registry_host", "always"),
-        ("npm_config_engine_strict", "false"),
-    ];
-    if matches!(
-        job.fetch,
-        Fetch::Npm {
-            lockfile: NodeLock::PackageLock | NodeLock::None
+    if let Fetch::Npm {
+        lockfile: lockfile @ (NodeLock::PackageLock | NodeLock::None),
+    } = job.fetch
+    {
+        if lockfile == NodeLock::PackageLock
+            && let Ok(text) = std::fs::read(fetch.host_cwd().join("package-lock.json"))
+            && let Some(host) = npm_registry_rewrite(&text, egress)
+        {
+            fetch
+                .env
+                .push(("npm_config_replace_registry_host".into(), host));
         }
-    ) {
-        fetch.env.extend(
-            NPM_FETCH_ENV
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-        );
+        fetch
+            .env
+            .push(("npm_config_engine_strict".into(), "false".into()));
     }
     // Projects follow `--`, so a directory named like an option (`--help`) is a project.
     let mut index_args: Vec<String> =
@@ -1138,12 +1210,25 @@ fn go_runs(
 /// highest `go` line of the root's and each directory's `go.mod` in the export (Go's version
 /// order; none when no module declares one), then `use` with `.` and each directory, as `go
 /// work init` formats it. Written by rb, not by `go work init`, whose `go` line follows the
-/// toolchain.
+/// toolchain. Then (amendment 4) a `replace` block: for each directory whose module the root's
+/// `go.mod` requires at a version, `<module path> <that version> => ./<dir>`, in the
+/// directories' order. Without it, a root that also has a local `replace` makes Go ask the
+/// proxy for the required version, which an in-repo module need not have published (the
+/// evaluator's `wsrep` and `wsout`); a replace without the version is refused for a
+/// workspace module.
 fn go_work(root: &Path, workspace: &[String]) -> String {
-    let version = std::iter::once(".")
-        .chain(workspace.iter().map(String::as_str))
-        .filter_map(|dir| std::fs::read(root.join(dir).join("go.mod")).ok())
-        .filter_map(|text| crate::jobs::go_mod(&String::from_utf8_lossy(&text)).go)
+    let read = |dir: &str| {
+        std::fs::read(root.join(dir).join("go.mod"))
+            .ok()
+            .map(|text| crate::jobs::go_mod(&String::from_utf8_lossy(&text)))
+    };
+    let main = read(".");
+    let modules: Vec<(&String, Option<crate::jobs::GoMod>)> =
+        workspace.iter().map(|dir| (dir, read(dir))).collect();
+    let version = main
+        .iter()
+        .chain(modules.iter().filter_map(|(_, module)| module.as_ref()))
+        .filter_map(|module| module.go.as_ref())
         .max_by(|a, b| crate::jobs::go_version_key(a).cmp(&crate::jobs::go_version_key(b)));
     let mut text = version.map_or_else(String::new, |v| format!("go {v}\n\n"));
     text.push_str("use (\n\t.\n");
@@ -1151,6 +1236,19 @@ fn go_work(root: &Path, workspace: &[String]) -> String {
         text.push_str(&format!("\t./{dir}\n"));
     }
     text.push_str(")\n");
+    let replaces: Vec<String> = modules
+        .iter()
+        .filter_map(|(dir, module)| {
+            let path = module.as_ref()?.module.as_ref()?;
+            let version = main.as_ref()?.requires.get(path)?;
+            (!version.is_empty()).then(|| format!("\t{path} {version} => ./{dir}\n"))
+        })
+        .collect();
+    if !replaces.is_empty() {
+        text.push_str("\nreplace (\n");
+        text.extend(replaces);
+        text.push_str(")\n");
+    }
     text
 }
 
@@ -1645,8 +1743,10 @@ mod tests {
     }
 
     /// The `go.work` rb writes for [`workspace_job`] over [`go_files`]: the highest `go` line
-    /// of the modules (numerically, `1.26.10` above `1.26.9`), then `.` and each directory.
-    const GO_WORK: &str = "go 1.26.10\n\nuse (\n\t.\n\t./public\n)\n";
+    /// of the modules (numerically, `1.26.10` above `1.26.9`), then `.` and each directory,
+    /// then a versioned `replace` of each directory's module at the version the root requires
+    /// (amendment 4).
+    const GO_WORK: &str = "go 1.26.10\n\nuse (\n\t.\n\t./public\n)\n\nreplace (\n\texample.com/server/public v0.4.3 => ./public\n)\n";
 
     /// Contract M9d D5 (C5): a workspace job writes `<root>/go.work` (deterministic text: the
     /// highest `go` line, then `use` with `.` and each workspace directory, sorted) before the
@@ -1655,7 +1755,11 @@ mod tests {
     /// and each directory (amendment 1); the recipe is `RECIPE_GO_WORK`. A plain job keeps
     /// today's runs and `RECIPE_GO`. A D6 job (a replace target outside the root) starts in
     /// its root of a repository-shaped export and, without a workspace, keeps `-mod=mod` and
-    /// `go mod download`.
+    /// `go mod download`. Amendment 4 (evaluator pass 1, S1): the `go.work` also replaces each
+    /// workspace module the root's `go.mod` requires, at that version, with its directory, so
+    /// an unpublished version is never asked of the proxy when the root also has a local
+    /// `replace` (the evaluator's `wsrep` and `wsout`); a module the root does not require
+    /// gets no replace.
     #[test]
     fn workspace_jobs_write_go_work_and_clear_goflags() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1705,6 +1809,8 @@ mod tests {
         }
         assert_eq!(recipe(&workspace_job(), &Budget::default()), RECIPE_GO_WORK);
         assert_ne!(RECIPE_GO_WORK, RECIPE_GO);
+        // The go.work's text is no input file, so a change to it moves the recipe.
+        assert_eq!(RECIPE_GO_WORK, "m9d-go-2");
 
         // A plain job: today's runs, no go.work, `RECIPE_GO`.
         let fake = Fake::new(false, false);
@@ -1752,9 +1858,42 @@ mod tests {
             ]
         );
 
+        // The evaluator's `wsrep`: the root requires the workspace module at an unpublished
+        // version and replaces another module with a local directory (the planner leaves that
+        // one out of the workspace). The required version is replaced; quotes and the
+        // `// indirect` comment do not reach the go.work.
+        let files: Vec<(String, Vec<u8>)> = [
+            (
+                "go.mod",
+                "module example.com/wsrep\n\ngo 1.22\n\nrequire (\n\t\"example.com/wsrep/inner\" v0.0.0 // indirect\n\texample.com/wsrep/rep v0.0.0\n)\n\nreplace example.com/wsrep/rep => ./rep\n",
+            ),
+            ("inner/go.mod", "module example.com/wsrep/inner\n\ngo 1.23\n"),
+            ("rep/go.mod", "module example.com/wsrep/rep\n\ngo 1.22\n"),
+        ]
+        .map(|(p, t)| (p.to_owned(), t.as_bytes().to_vec()))
+        .to_vec();
+        let job = Job {
+            workspace: vec!["inner".into()],
+            ..go_job()
+        };
+        let fake = Fake::new(false, false);
+        run(&job, &files, &fake);
+        let wsrep = Some(
+            "go 1.23\n\nuse (\n\t.\n\t./inner\n)\n\nreplace (\n\texample.com/wsrep/inner v0.0.0 => ./inner\n)\n"
+                .to_owned(),
+        );
+        assert_eq!(
+            *fake.go_works.borrow(),
+            [wsrep.clone(), wsrep],
+            "both phases see the replace"
+        );
+
         // D6: repository-shaped, the container in the root; no workspace keeps `-mod=mod`.
         let files: Vec<(String, Vec<u8>)> = [
-            ("tools/sct/go.mod", "module example.com/sct\n\ngo 1.26.7\n"),
+            (
+                "tools/sct/go.mod",
+                "module example.com/sct\n\ngo 1.26.7\n\nrequire example.com/sct/sub v0.1.0\n",
+            ),
             (
                 "tools/sct/sub/go.mod",
                 "module example.com/sct/sub\n\ngo 1.26.7\n",
@@ -1791,7 +1930,9 @@ mod tests {
         let runs = fake.runs.borrow();
         assert_eq!(
             fake.go_works.borrow()[0].as_deref(),
-            Some("go 1.26.7\n\nuse (\n\t.\n\t./sub\n)\n")
+            Some(
+                "go 1.26.7\n\nuse (\n\t.\n\t./sub\n)\n\nreplace (\n\texample.com/sct/sub v0.1.0 => ./sub\n)\n"
+            )
         );
         assert_eq!(
             runs[0].args,
@@ -3045,23 +3186,28 @@ mod tests {
         }
     }
 
-    /// Contract M9d D1 (C2): an npm fetch rewrites a lockfile's registry host to the configured
-    /// registry (nestjs_realworld resolves 194 entries from a mirror outside the allow-list) and
-    /// ignores a project `.npmrc`'s `engine-strict` (mattermost webapp), through environment
-    /// variables, which beat the project's `.npmrc`. Yarn and pnpm runs, and every index
-    /// phase, keep today's environment. The recipe is bumped, so every cached TypeScript row
-    /// re-runs once.
+    /// Contract M9d D1 (C2), narrowed by amendment 4 (evaluator pass 1, B1): an npm fetch
+    /// names the lockfile's one foreign registry host in `replace-registry-host`
+    /// (nestjs_realworld resolves 194 entries from `npm.styque.de`, outside the allow-list), and
+    /// passes no such setting when that host is opted in or the job has no `package-lock.json`.
+    /// It ignores a project `.npmrc`'s `engine-strict` (mattermost webapp). Environment variables
+    /// beat the project's `.npmrc`. Yarn and pnpm runs, and every index phase, keep today's
+    /// environment. The recipe is bumped, so every cached TypeScript row re-runs once.
     #[test]
     fn npm_fetches_rewrite_registry_hosts_and_ignore_engines() {
-        assert_eq!(RECIPE_TS, "m9d-ts-1");
-        let settings: [(String, String); 2] = [
-            ("npm_config_replace_registry_host".into(), "always".into()),
-            ("npm_config_engine_strict".into(), "false".into()),
-        ];
+        assert_eq!(RECIPE_TS, "m9d-ts-2");
+        let engines: (String, String) = ("npm_config_engine_strict".into(), "false".into());
         let today: Vec<(String, String)> = vec![
             ("NODE_OPTIONS".into(), "--max-old-space-size=4096".into()),
             ("npm_config_update_notifier".into(), "false".into()),
         ];
+        // A v1 lockfile (nestjs_realworld's shape) with one entry from the mirror.
+        let lock = br#"{"lockfileVersion": 1, "dependencies": {"rxjs": {"version": "6.5.0",
+            "resolved": "https://npm.styque.de/rxjs/-/rxjs-6.5.0.tgz"}}}"#;
+        let plain = files();
+        let mut locked = files();
+        locked.push(("apps/web/package-lock.json".into(), lock.to_vec()));
+        let opted_in = Egress::with(&["npm.styque.de".to_owned()]).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         for (lockfile, npm) in [
             (NodeLock::PackageLock, true),
@@ -3071,34 +3217,151 @@ mod tests {
         ] {
             let job = ts_job(lockfile);
             assert_eq!(recipe(&job, &Budget::default()), RECIPE_TS, "{lockfile:?}");
-            let fake = Fake::new(false, false);
-            run_job(
-                &job,
-                SCIP_TYPESCRIPT_IMAGE,
-                &files(),
-                &tmp.path().join("w"),
-                &tmp.path().join("c"),
-                &Budget::default(),
-                &Egress::default(),
-                &fake,
-            )
-            .unwrap();
-            let runs = fake.runs.borrow();
-            assert_eq!(runs.len(), 2, "{lockfile:?}");
-            let (fetch, index) = (&runs[0], &runs[1]);
-            for s in &settings {
-                assert_eq!(fetch.env.contains(s), npm, "{lockfile:?}: {:?}", fetch.env);
+            for (files, egress, rewrite) in [
+                (
+                    &locked,
+                    &Egress::default(),
+                    lockfile == NodeLock::PackageLock,
+                ),
+                (&locked, &opted_in, false),
+                (&plain, &Egress::default(), false),
+            ] {
+                let what = format!("{lockfile:?}, {} files, {:?}", files.len(), egress.hosts);
+                let fake = Fake::new(false, false);
+                run_job(
+                    &job,
+                    SCIP_TYPESCRIPT_IMAGE,
+                    files,
+                    &tmp.path().join("w"),
+                    &tmp.path().join("c"),
+                    &Budget::default(),
+                    egress,
+                    &fake,
+                )
+                .unwrap();
+                let runs = fake.runs.borrow();
+                assert_eq!(runs.len(), 2, "{what}");
+                let (fetch, index) = (&runs[0], &runs[1]);
+                let expected: Vec<&str> = if rewrite {
+                    vec!["npm.styque.de"]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    env_of(fetch, "npm_config_replace_registry_host"),
+                    expected,
+                    "{what}"
+                );
+                assert_eq!(fetch.env.contains(&engines), npm, "{what}: {:?}", fetch.env);
+                // Apart from the two settings, every fetch starts with today's environment (the
+                // egress proxy's variables follow it).
+                let rest: Vec<(String, String)> = fetch
+                    .env
+                    .iter()
+                    .filter(|(k, _)| {
+                        k != "npm_config_replace_registry_host" && k != "npm_config_engine_strict"
+                    })
+                    .cloned()
+                    .collect();
+                assert_eq!(rest[..today.len()], today[..], "{what}");
+                assert_eq!(index.env, today, "{what}");
             }
-            // Apart from the two settings, every fetch starts with today's environment (the
-            // egress proxy's variables follow it).
-            let rest: Vec<(String, String)> = fetch
-                .env
+        }
+    }
+
+    /// Contract M9d D1, amendment 4 (evaluator pass 1, B1): the host `replace-registry-host`
+    /// names is the lockfile's one foreign registry host. Every `resolved` URL is read, in the
+    /// v1 shape (`dependencies`, nested), v2 (both) and v3 (`packages`); only registry-shaped
+    /// tarball URLs (`…/<name>/-/<file>.tgz`, scoped names included) count, so a URL dependency
+    /// (the evaluator's `cdn.sheetjs.com` tarball) and `git+ssh`/`git+https` hosts are never
+    /// rewritten; hosts on the allow-list or opted in (`RB_SCIP_REGISTRIES`) are dropped; none
+    /// or two left give no setting.
+    #[test]
+    fn npm_rewrite_names_the_lockfiles_one_foreign_registry_host() {
+        let npmjs = "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz";
+        let yarnpkg = "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz";
+        let mirror = "https://npm.styque.de/rxjs/-/rxjs-6.5.0.tgz";
+        let scoped = "https://npm.styque.de/@nestjs/core/-/core-7.0.0.tgz";
+        let other = "https://registry.example.com/npm/left-pad/-/left-pad-1.3.0.tgz";
+        let url_dep = "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz";
+        let git_ssh = "git+ssh://git@github.com/mattermost/react-bootstrap.git#c3fcb4d";
+        let git_https = "git+https://github.com/larkox/js-client-oauth2.git#a1b2c3d";
+        let v3 = |urls: &[&str]| -> Vec<u8> {
+            let packages: serde_json::Map<String, serde_json::Value> = urls
                 .iter()
-                .filter(|e| !settings.contains(e))
-                .cloned()
+                .enumerate()
+                .map(|(i, u)| {
+                    (
+                        format!("node_modules/p{i}"),
+                        serde_json::json!({"version": "1.0.0", "resolved": u}),
+                    )
+                })
+                .chain([("".to_owned(), serde_json::json!({"name": "app"}))])
                 .collect();
-            assert_eq!(rest[..today.len()], today[..], "{lockfile:?}");
-            assert_eq!(index.env, today, "{lockfile:?}");
+            serde_json::to_vec(&serde_json::json!({"lockfileVersion": 3, "packages": packages}))
+                .unwrap()
+        };
+        // v1: `dependencies`, the second URL only nested under the first entry.
+        let v1 = |top: &str, nested: &str| -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "lockfileVersion": 1,
+                "dependencies": {"a": {"version": "1.0.0", "resolved": top,
+                    "dependencies": {"b": {"version": "1.0.0", "resolved": nested}}}}
+            }))
+            .unwrap()
+        };
+        let default = Egress::default();
+        let opted_in = Egress::with(&["npm.styque.de".to_owned()]).unwrap();
+        let sheetjs = Egress::with(&["cdn.sheetjs.com".to_owned()]).unwrap();
+        let styque = Some("npm.styque.de".to_owned());
+        let rows: Vec<(&str, Vec<u8>, &Egress, Option<String>)> = vec![
+            (
+                "one foreign host",
+                v3(&[npmjs, mirror]),
+                &default,
+                styque.clone(),
+            ),
+            (
+                "scoped name",
+                v3(&[npmjs, scoped]),
+                &default,
+                styque.clone(),
+            ),
+            ("opted in", v3(&[npmjs, mirror, scoped]), &opted_in, None),
+            (
+                "opted in, another left",
+                v3(&[mirror, other]),
+                &opted_in,
+                Some("registry.example.com".to_owned()),
+            ),
+            ("allow-listed only", v3(&[npmjs, yarnpkg]), &default, None),
+            ("URL dependency", v3(&[npmjs, url_dep]), &default, None),
+            ("URL dependency opted in", v3(&[url_dep]), &sheetjs, None),
+            ("git", v3(&[npmjs, git_ssh, git_https]), &default, None),
+            (
+                "git beside a mirror",
+                v3(&[git_ssh, mirror]),
+                &default,
+                styque.clone(),
+            ),
+            ("two foreign hosts", v3(&[mirror, other]), &default, None),
+            ("v1 nested", v1(npmjs, scoped), &default, styque.clone()),
+            ("v1 nested, two hosts", v1(mirror, other), &default, None),
+            (
+                "v2 both sections",
+                serde_json::to_vec(&serde_json::json!({
+                    "lockfileVersion": 2,
+                    "packages": {"node_modules/rxjs": {"resolved": mirror}},
+                    "dependencies": {"rxjs": {"resolved": mirror}}
+                }))
+                .unwrap(),
+                &default,
+                styque.clone(),
+            ),
+            ("not JSON", b"{".to_vec(), &default, None),
+        ];
+        for (what, lockfile, egress, expected) in rows {
+            assert_eq!(npm_registry_rewrite(&lockfile, egress), expected, "{what}");
         }
     }
 
@@ -3108,7 +3371,7 @@ mod tests {
     /// `--`, in the job's (sorted) order; the recipes are per indexer.
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
-        assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m9d-java-1", "m9d-ts-1"));
+        assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m9d-java-1", "m9d-ts-2"));
         assert_eq!(RECIPE_PY, "m9d-py-1");
         assert_eq!(RECIPE_GRADLE, "m9d-gradle-1");
         assert_eq!(
@@ -3225,8 +3488,10 @@ mod tests {
     /// `cfa8ab9`'s code built (recorded from it: the Java runs and a TypeScript root job, whose
     /// construction differs since only in `cwd`, empty for both), so default runs and their
     /// cache keys are unchanged. Since M9d D1 the npm fetch also carries
-    /// `npm_config_replace_registry_host=always` and `npm_config_engine_strict=false` (and
-    /// `RECIPE_TS` moved, so cached TypeScript rows re-run once); every other line is as recorded.
+    /// `npm_config_engine_strict=false` (and `RECIPE_TS` moved, so cached TypeScript rows re-run
+    /// once); since amendment 4, `npm_config_replace_registry_host` only for a lockfile with one
+    /// foreign registry host, and this job's files hold no lockfile. Every other line is as
+    /// recorded.
     #[test]
     fn default_budget_argv_is_cfa8ab9s() {
         let proxy = [
@@ -3246,7 +3511,7 @@ mod tests {
             "run --rm --name <name> --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -v <work>-egress/client:/rb-egress:ro -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err {PROXY} sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 mvn -B -q -s /rb-egress/settings.xml org.apache.maven.plugins:maven-dependency-plugin:3.11.0:go-offline {OFF}",
             "run --rm --name <name> --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -v <work>-egress/client:/rb-egress:ro -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err {PROXY} sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 mvn -B -q -s /rb-egress/settings.xml clean verify -DskipTests {OFF}",
             "run --rm --name <name> --network none --cpus 2 --memory 4g -v <work>:/sources -w /sources -v <tmp>/c/m2:/root/.m2 -e MAVEN_OPTS=-Dorg.slf4j.simpleLogger.logFile=System.err sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2 scip-java index --build-tool Maven --targetroot /scip-targetroot -- --batch-mode --offline clean verify -DskipTests {OFF}",
-            "run --rm --name <name> --platform linux/amd64 --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -v <work>-egress/client:/rb-egress:ro -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false -e npm_config_replace_registry_host=always -e npm_config_engine_strict=false {PROXY} --entrypoint /usr/local/bin/actual-npm sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 ci --no-audit --no-fund --loglevel=error --ignore-scripts --logs-max=0",
+            "run --rm --name <name> --platform linux/amd64 --network rb-scip-fetch --dns 127.0.0.1 --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -v <work>-egress/client:/rb-egress:ro -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false -e npm_config_engine_strict=false {PROXY} --entrypoint /usr/local/bin/actual-npm sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 ci --no-audit --no-fund --loglevel=error --ignore-scripts --logs-max=0",
             "run --rm --name <name> --platform linux/amd64 --network none --cpus 2 --memory 4g -v <work>:/src -w /src -v <tmp>/c/npm:/root/.npm -e NODE_OPTIONS=--max-old-space-size=4096 -e npm_config_update_notifier=false sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845 index --output index.scip --no-progress-bar -- . sub",
         ]
         .iter()
