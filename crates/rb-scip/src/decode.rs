@@ -892,8 +892,9 @@ mod tests {
 
     /// Contract M9d D10 (C9): in a scip-go index the decoder counts the local symbols and those
     /// whose signature text contains `invalid type`, over every document. A global symbol with
-    /// that text is no local; a local without signature documentation is a local typed fine;
-    /// the same symbols in a scip-typescript index count nothing.
+    /// that text is no local; a local without signature documentation is a local typed fine,
+    /// and so is a local named or typed `invalid…` (evaluator pass 1, e08); the same symbols in
+    /// a scip-typescript index count nothing.
     #[test]
     fn scip_go_invalid_locals_are_counted() {
         let symbol = |symbol: &str, signature: Option<&str>| SymbolInformation {
@@ -924,6 +925,9 @@ mod tests {
                     symbols: vec![
                         symbol("local 0", Some("var u invalid type")),
                         symbol("local 1", Some("var n int")),
+                        // Named or typed `invalid…`, without `invalid type`: typed fine.
+                        symbol("local 2", Some("var invalidCount int")),
+                        symbol("local 3", Some("var e *invalidRequestError")),
                         // A global with the text: not a local, never counted.
                         symbol(
                             "scip-go gomod example.com/app . `example.com/app`/Bad().",
@@ -941,7 +945,7 @@ mod tests {
             ..Default::default()
         };
         let go = decode(&encode(&index_of("scip-go")), &|_| None).unwrap();
-        assert_eq!((go.locals_invalid_type, go.locals), (1, 3));
+        assert_eq!((go.locals_invalid_type, go.locals), (1, 5));
         let ts = decode(&encode(&index_of("scip-typescript")), &|_| None).unwrap();
         assert_eq!((ts.locals_invalid_type, ts.locals), (0, 0));
     }

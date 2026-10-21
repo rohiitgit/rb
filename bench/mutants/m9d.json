@@ -377,5 +377,59 @@
   "old": "    if !replaces.is_empty() {\n",
   "new": "    if false && !replaces.is_empty() {\n",
   "what": "the go.work's versioned replace lines not written (amendment 4, S1)"
+ },
+ {
+  "id": "m402",
+  "crate": "rb-indexer",
+  "test": "scip::tests::the_join_parses_each_distinct_symbol_once",
+  "file": "scip.rs",
+  "old": "        if let Some(parts) = self.0.borrow().get(symbol) {\n",
+  "new": "        if let Some(parts) = self.0.borrow().get(symbol).filter(|_| false) {\n",
+  "what": "the join's symbol memo never answers from what it kept: every question parses again (amendment 4, S2)"
+ },
+ {
+  "id": "m403",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::the_gradle_init_script_marks_only_protobuf_tools_under_the_gradle_home",
+  "file": "orchestrate.rs",
+  "old": "      if (path.startsWith(home)) {\n",
+  "new": "      if (!path.startsWith(home)) {\n",
+  "what": "D13's init script marks only tools outside the Gradle home (evaluator pass 1, e12; amendment 4, S3)"
+ },
+ {
+  "id": "m404",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_poetry_root_with_a_requirements_txt_keeps_poetry_and_todays_arguments",
+  "file": "jobs.rs",
+  "old": "        .filter(|r| !has(&join(r, \"pyproject.toml\")) && !has(&join(r, \"setup.py\")))\n",
+  "new": "        .filter(|r| !has(&join(r, \"setup.py\")))\n",
+  "what": "D2: a Poetry root that also commits a requirements.txt is planned requirements-only (evaluator pass 1, e09; amendment 4, S3)"
+ },
+ {
+  "id": "m405",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_invalid_locals_are_counted",
+  "file": "decode.rs",
+  "old": "        .is_some_and(|sig| sig.text.contains(\"invalid type\"))\n",
+  "new": "        .is_some_and(|sig| sig.text.contains(\"invalid\"))\n",
+  "what": "D10: a local named or typed `invalid…` counts as an invalid-type local (evaluator pass 1, e08; amendment 4, S3)"
+ },
+ {
+  "id": "m406",
+  "crate": "rb-scip",
+  "test": "jobs::tests::go_versions_order_pre_releases_between_the_language_version_and_its_release",
+  "file": "jobs.rs",
+  "old": "    (numbers, !pre.is_empty(), pre)\n",
+  "new": "    (numbers, false, \"\")\n",
+  "what": "D5: the go version key ignores pre-releases, so 1.21rc1 == 1.21 (evaluator pass 1, e03; amendment 4, S3)"
+ },
+ {
+  "id": "m407",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_workspace_fallbacks_elapsed_covers_both_runs",
+  "file": "orchestrate.rs",
+  "old": "            stderr_tail: attempt.stderr_tail,\n            elapsed,\n",
+  "new": "            stderr_tail: attempt.stderr_tail,\n            elapsed: rerun.elapsed,\n",
+  "what": "D5b: the elapsed time covers the re-run only (evaluator pass 1, e07; amendment 4, S3)"
  }
 ]

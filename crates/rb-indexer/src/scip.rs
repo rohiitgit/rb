@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 use rb_model::{Evidence, Span};
 use rb_scip::ScipIndex;
@@ -236,6 +237,9 @@ pub(crate) fn join_handing_back(
         }
     };
     let mut out = Joined::default();
+    // What the join reads from each global symbol, parsed once per distinct symbol for the
+    // whole join (contract M9c P7b, M9d E2; see `SymbolMemo`).
+    let memo = SymbolMemo::default();
     // Contract M6a D1, D2: in a scip-java index, each document's Lombok-generated occurrences
     // are removed first, and every check below judges what remains, unchanged. A document
     // without a marker is used as it is. Each distinct symbol is judged once for the whole index
@@ -276,7 +280,7 @@ pub(crate) fn join_handing_back(
         };
         indexed.insert(path.clone());
         let rejected = doc.rejected.or_else(|| {
-            definition_disagreement(facts, &doc.occurrences)
+            definition_disagreement(facts, &doc.occurrences, &memo)
                 .then_some(rb_scip::Rejection::DefinitionDisagreement)
         });
         if let Some(reason) = rejected {
@@ -298,7 +302,6 @@ pub(crate) fn join_handing_back(
     }
     // Per document, how its tokens may be named (contract M3b amendments 59 and 66), and its
     // definitions anchored to the index's definition occurrences.
-    let memo = NameMemo::default();
     let naming: Vec<Naming<'_>> = docs
         .iter()
         .map(|(_, doc, facts, by_span)| Naming::new(doc, facts, by_span, &memo))
@@ -380,11 +383,10 @@ pub(crate) fn join_handing_back(
     // one of them that the index does not define (a file of the project without a document;
     // scip-typescript's `node_modules/.prisma/…` under the project's own package name) is not
     // a dependency.
-    let own_packages: BTreeSet<Option<rb_scip::Package>> =
-        defined.iter().map(|s| rb_scip::package(s)).collect();
-    // The package of each symbol the index does not define, parsed once per distinct symbol
-    // (contract M9c P7b; see `NameMemo`): the loops below meet each one at every occurrence.
-    let mut packages: HashMap<&str, Option<rb_scip::Package>> = HashMap::new();
+    let own_packages: BTreeSet<Option<rb_scip::Package>> = defined
+        .iter()
+        .map(|s| memo.parts(s).package.clone())
+        .collect();
     out.documented = docs.iter().map(|(path, ..)| path.clone()).collect();
     out.coverage.files_without_document = files
         .iter()
@@ -457,13 +459,14 @@ pub(crate) fn join_handing_back(
         if symbol.starts_with("local ") {
             locals[di].contains_key(symbol)
         } else {
-            let Some(name) = rb_scip::last_descriptor_name(symbol) else {
+            let parts = memo.parts(symbol);
+            let Some(name) = parts.forms.as_ref().map(rb_scip::NameForms::last) else {
                 return false;
             };
             global_sites.get(symbol).is_some_and(|sites| {
                 sites
                     .iter()
-                    .any(|&(dj, l)| name_lines[dj].contains(&(l, name.as_str())))
+                    .any(|&(dj, l)| name_lines[dj].contains(&(l, name)))
             })
         }
     };
@@ -507,7 +510,7 @@ pub(crate) fn join_handing_back(
             if let Some(symbol) = global {
                 types_by_symbol.entry(symbol).or_default().push((di, i));
             }
-            let declared = declared_supertypes(d, by_span);
+            let declared = declared_supertypes(d, by_span, &memo);
             out.coverage.supertypes_unresolved += declared.iter().filter(|s| s.is_none()).count();
             let declared: Vec<String> = declared.into_iter().flatten().collect();
             // The supertypes the type's own symbol information relates it to, found by its
@@ -622,10 +625,7 @@ pub(crate) fn join_handing_back(
                 continue;
             }
             if !defined.contains(symbol) {
-                let package = packages
-                    .entry(symbol)
-                    .or_insert_with(|| rb_scip::package(symbol));
-                if own_packages.contains(package) {
+                if own_packages.contains(&memo.parts(symbol).package) {
                     out.coverage.references_undocumented += 1;
                 } else {
                     out.coverage.references_external += 1;
@@ -667,10 +667,8 @@ pub(crate) fn join_handing_back(
                 if o.symbol.starts_with("local ") || defined.contains(o.symbol.as_str()) {
                     continue;
                 }
-                let symbol = o.symbol.as_str();
-                let package = packages
-                    .entry(symbol)
-                    .or_insert_with(|| rb_scip::package(symbol));
+                let parts = memo.parts(&o.symbol);
+                let package = &parts.package;
                 if own_packages.contains(package) {
                     continue;
                 }
@@ -968,8 +966,7 @@ impl<'a> Anchors<'a> {
                     .and_then(|os| os.iter().copied().find(|o| accept(o)))
             };
             let global_named = |o: &rb_scip::Occurrence| {
-                is_global_definition(o)
-                    && rb_scip::last_descriptor_name(&o.symbol).as_deref() == Some(d.name.as_str())
+                is_global_definition(o) && naming.memo.last_name_is(&o.symbol, &d.name)
             };
             let local_named = |o: &rb_scip::Occurrence| {
                 is_local_definition(o)
@@ -1214,23 +1211,44 @@ fn definitions_unpaired(facts: &FileFacts, doc: &rb_scip::Document, anchors: &An
         })
 }
 
-/// [`rb_scip::may_name`] for one join, reading each distinct symbol string once (contract M9c
-/// P7b). The `scip` crate's parser formats its own state once per descriptor (scip 0.10.0,
+/// What one join reads from each global symbol ([`rb_scip::SymbolParts`]: its package, and the
+/// names it may stand at, its last descriptor's name among them), parsed once per distinct
+/// symbol string for the whole join (contract M9c P7b; M9d E2, amendment 4 S2). The `scip`
+/// crate's parser formats its own state once per descriptor (scip 0.10.0,
 /// `accept_one_descriptor`), so a parse costs far more than a lookup, and the join asks about
 /// the same symbols at reference after reference: mattermost's server index has 740,623
-/// occurrences of symbols it does not define, of 10,557 distinct symbols.
+/// occurrences of symbols it does not define, of 10,557 distinct symbols. Every answer is a
+/// function of the symbol string alone, so a kept answer is what a fresh parse would give.
 #[derive(Debug, Default)]
-struct NameMemo(RefCell<HashMap<String, Option<rb_scip::NameForms>>>);
+struct SymbolMemo(RefCell<HashMap<String, Rc<rb_scip::SymbolParts>>>);
 
-impl NameMemo {
-    fn may_name(&self, symbol: &str, text: &str) -> bool {
-        if let Some(forms) = self.0.borrow().get(symbol) {
-            return forms.as_ref().is_some_and(|f| f.names(text));
+impl SymbolMemo {
+    /// The symbol's parts, parsed at its first question only.
+    fn parts(&self, symbol: &str) -> Rc<rb_scip::SymbolParts> {
+        if let Some(parts) = self.0.borrow().get(symbol) {
+            return Rc::clone(parts);
         }
-        let forms = rb_scip::NameForms::of(symbol);
-        let named = forms.as_ref().is_some_and(|f| f.names(text));
-        self.0.borrow_mut().insert(symbol.to_owned(), forms);
-        named
+        let parts = Rc::new(rb_scip::SymbolParts::of(symbol));
+        self.0
+            .borrow_mut()
+            .insert(symbol.to_owned(), Rc::clone(&parts));
+        parts
+    }
+
+    /// [`rb_scip::may_name`].
+    fn may_name(&self, symbol: &str, text: &str) -> bool {
+        self.parts(symbol)
+            .forms
+            .as_ref()
+            .is_some_and(|f| f.names(text))
+    }
+
+    /// Whether [`rb_scip::last_descriptor_name`] of `symbol` is `name`.
+    fn last_name_is(&self, symbol: &str, name: &str) -> bool {
+        self.parts(symbol)
+            .forms
+            .as_ref()
+            .is_some_and(|f| f.last() == name)
     }
 
     /// The distinct symbols read so far.
@@ -1243,8 +1261,8 @@ impl NameMemo {
 /// How a document's tokens may be named, beyond [`rb_scip::may_name`] (contract M3b amendments
 /// 59 and 66): each local symbol's name, and each import alias with the symbol it stands for.
 struct Naming<'a> {
-    /// The join's memo of what each global symbol may name.
-    memo: &'a NameMemo,
+    /// The join's memo of what it reads from each global symbol.
+    memo: &'a SymbolMemo,
     /// A local symbol's `SymbolInformation.display_name` (scip-java), else the text at its
     /// definition occurrence as the decoder read it (`Document::local_names`; scip-typescript
     /// gives no display names).
@@ -1264,7 +1282,7 @@ impl<'a> Naming<'a> {
         doc: &'a rb_scip::Document,
         facts: &'a FileFacts,
         by_span: &BTreeMap<Span, Vec<&'a rb_scip::Occurrence>>,
-        memo: &'a NameMemo,
+        memo: &'a SymbolMemo,
     ) -> Self {
         let mut local_names: BTreeMap<&str, &str> = doc
             .local_names
@@ -1341,7 +1359,11 @@ impl<'a> Naming<'a> {
 /// not disagreements: Java annotation interfaces and their elements, scip-typescript's
 /// `<constructor>` at the `constructor` keyword (measured on the four public repositories:
 /// 52 such occurrences, 0 documents rejected).
-fn definition_disagreement(facts: &FileFacts, occurrences: &[rb_scip::Occurrence]) -> bool {
+fn definition_disagreement(
+    facts: &FileFacts,
+    occurrences: &[rb_scip::Occurrence],
+    memo: &SymbolMemo,
+) -> bool {
     let tokens: BTreeSet<Span> = facts
         .definitions
         .iter()
@@ -1355,10 +1377,11 @@ fn definition_disagreement(facts: &FileFacts, occurrences: &[rb_scip::Occurrence
         if !is_method_or_type_definition(o) {
             return false;
         }
-        let name = rb_scip::last_descriptor_name(&o.symbol);
+        let parts = memo.parts(&o.symbol);
+        let forms = parts.forms.as_ref();
         let accounted = facts.definitions.iter().any(|d| {
-            (d.name_span == o.span && rb_scip::may_name(&o.symbol, &d.name))
-                || (name.as_deref() == Some(d.name.as_str())
+            (d.name_span == o.span && forms.is_some_and(|f| f.names(&d.name)))
+                || (forms.map(rb_scip::NameForms::last) == Some(d.name.as_str())
                     && inside(
                         [d.span[0], d.span[1], d.name_span[0], d.name_span[1]],
                         o.span,
@@ -1491,6 +1514,7 @@ fn is_type(d: &rb_syntax::Definition) -> bool {
 fn declared_supertypes(
     d: &rb_syntax::Definition,
     by_span: &BTreeMap<Span, Vec<&rb_scip::Occurrence>>,
+    memo: &SymbolMemo,
 ) -> Vec<Option<String>> {
     d.supertypes
         .iter()
@@ -1505,9 +1529,7 @@ fn declared_supertypes(
                 .rfind(|o| {
                     !o.is_definition() && !o.symbol.starts_with("local ") && o.symbol.ends_with('#')
                 })
-                .filter(|o| {
-                    rb_scip::last_descriptor_name(&o.symbol).as_deref() == Some(simple_name)
-                })
+                .filter(|o| memo.last_name_is(&o.symbol, simple_name))
                 .map(|o| o.symbol.clone())
         })
         .collect()
@@ -4004,7 +4026,7 @@ mod tests {
                     m
                 });
         assert_eq!(
-            declared_supertypes(impl_def, &by_span),
+            declared_supertypes(impl_def, &by_span, &SymbolMemo::default()),
             [
                 Some(sym("a/Circle#")),
                 Some(sym("p/Repo#")),
@@ -4033,7 +4055,11 @@ mod tests {
                     m
                 });
         assert_eq!(
-            declared_supertypes(&ts_facts.definitions[0], &ts_by_span),
+            declared_supertypes(
+                &ts_facts.definitions[0],
+                &ts_by_span,
+                &SymbolMemo::default()
+            ),
             [Some(ts_sym("NS/Inner#"))]
         );
         let index = ScipIndex {
@@ -7259,10 +7285,11 @@ mod tests {
         assert_eq!(edge_lines(&joined), [format!("{p}a(). Calls {p}b().")]);
     }
 
-    /// M9c P7b: the join's name memo parses each distinct symbol string once and judges every
-    /// text against what it read, so it answers as `rb_scip::may_name` does whatever the order
-    /// of the questions: a symbol asked first at a text it names and then at one it does not
-    /// (and the reverse), a constructor, a local symbol and a string the grammar rejects.
+    /// M9c P7b, M9d E2: the join's symbol memo parses each distinct global symbol string once
+    /// and judges every text against what it read, so it answers as `rb_scip::may_name`,
+    /// `rb_scip::last_descriptor_name` and `rb_scip::package` do whatever the order of the
+    /// questions: a symbol asked first at a text it names and then at one it does not (and the
+    /// reverse), a constructor, a local symbol (never parsed) and a string the grammar rejects.
     #[test]
     fn the_name_memo_parses_each_symbol_once_and_judges_each_text() {
         let java = "scip-java maven maven/org.jsoup/jsoup 1.24.1 org/jsoup/";
@@ -7283,14 +7310,90 @@ mod tests {
             ("not a symbol", "not"),
             ("not a symbol", "not"),
         ];
-        let memo = NameMemo::default();
-        for (symbol, text) in questions {
+        let memo = SymbolMemo::default();
+        let before = rb_scip::symbol::parses();
+        let answers: Vec<(bool, bool, Option<rb_scip::Package>)> = questions
+            .iter()
+            .map(|(symbol, text)| {
+                (
+                    memo.may_name(symbol, text),
+                    memo.last_name_is(symbol, text),
+                    memo.parts(symbol).package.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rb_scip::symbol::parses() - before,
+            4,
+            "one parse per global symbol"
+        );
+        for ((symbol, text), answer) in questions.iter().zip(answers) {
             assert_eq!(
-                memo.may_name(symbol, text),
-                rb_scip::may_name(symbol, text),
+                answer,
+                (
+                    rb_scip::may_name(symbol, text),
+                    rb_scip::last_descriptor_name(symbol).as_deref() == Some(*text),
+                    rb_scip::package(symbol),
+                ),
                 "{symbol} at {text}"
             );
         }
         assert_eq!(memo.len(), 5, "one reading per distinct symbol");
+    }
+
+    /// Contract M9d E2 (amendment 4, S2): the join parses each distinct global symbol string
+    /// once, and that one parse answers every reader: the package (the index's own packages,
+    /// an external reference, the packages pass), the names a reference may stand at, and the
+    /// last descriptor's name (the definition check, a declared supertype, a dropped
+    /// relationship's ends). The index repeats its references (`helper` and `ext` twice each),
+    /// and no implementation link has a matched source, so `type_symbol_of`, which reads
+    /// another thing from a symbol, is never reached.
+    #[test]
+    fn the_join_parses_each_distinct_symbol_once() {
+        let src = "package p;\nclass Animal { void sound() {} }\nclass Dog extends Animal {\n  void sound() { helper(); helper(); ext(); ext(); local(); }\n  void helper() {}\n}\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let path = "svc/src/Dog.java";
+        let mut index = index(&facts);
+        // A field's implementation link: its source has no matched definition, so the link is
+        // dropped and its source is looked up by its last descriptor's name (`in_project`).
+        index.documents[0].symbols = vec![SymbolInfo {
+            symbol: "scip-java maven . . p/Dog#name.".into(),
+            relationships: vec![Relationship {
+                symbol: "scip-java maven . . p/Animal#name.".into(),
+                is_implementation: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let before = rb_scip::symbol::parses();
+        let joined = join(
+            &index,
+            "svc",
+            &files,
+            &keys,
+            &[Language::Java],
+            &rb_scip::TsScopes::build([]),
+        );
+        let parses = rb_scip::symbol::parses() - before;
+        // Every reader was asked.
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(joined.coverage.definitions_matched, 5);
+        assert_eq!(joined.coverage.references_external, 2);
+        assert_eq!(joined.packages.len(), 1);
+        assert_eq!(joined.coverage.relationships_dropped, 1);
+        assert_eq!(
+            edge_lines(&joined),
+            [
+                "scip-java maven . . p/Dog# References scip-java maven . . p/Animal#",
+                "scip-java maven . . p/Dog#sound(). Calls scip-java maven . . p/Dog#helper().",
+                "scip-java maven . . p/Dog#sound(). Calls scip-java maven . . p/Dog#helper().",
+            ]
+        );
+        // The five definitions, `ext` and the field; the link's target is never asked about
+        // (its source is not in the project), and `local 3` is never parsed.
+        assert_eq!(parses, 7, "one parse per distinct symbol the join reads");
     }
 }

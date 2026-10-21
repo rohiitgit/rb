@@ -2198,6 +2198,25 @@ mod tests {
         );
     }
 
+    /// Contract M9d D5 (evaluator pass 1, e03): a `go` line's key orders releases numerically
+    /// (`1.9` < `1.21`, `1.26.9` < `1.26.10`) and a language version below its pre-releases,
+    /// which sort below its first release: `1.21` < `1.21rc1` < `1.21rc2` < `1.21.0`, as Go
+    /// orders them.
+    #[test]
+    fn go_versions_order_pre_releases_between_the_language_version_and_its_release() {
+        let ordered = [
+            "1.9", "1.21", "1.21rc1", "1.21rc2", "1.21.0", "1.21.1", "1.26.9", "1.26.10",
+        ];
+        for pair in ordered.windows(2) {
+            assert!(
+                go_version_key(pair[0]) < go_version_key(pair[1]),
+                "{} < {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
     #[test]
     fn typescript_jobs_group_tsconfigs_under_their_nearest_package_root() {
         let files = [

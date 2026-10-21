@@ -337,9 +337,9 @@
   "crate": "rb-indexer",
   "test": "tests::the_name_memo_parses_each_symbol_once_and_judges_each_text",
   "file": "scip.rs",
-  "old": "        self.0.borrow_mut().insert(symbol.to_owned(), forms);\n",
-  "new": "        drop(forms);\n",
-  "what": "name memo never stores: every question parses its symbol again (P7b)"
+  "old": "        self.0\n            .borrow_mut()\n            .insert(symbol.to_owned(), Rc::clone(&parts));\n",
+  "new": "        drop(Rc::clone(&parts));\n",
+  "what": "symbol memo never stores: every question parses its symbol again (P7b; re-anchored on SymbolMemo, M9d E2)"
  },
  {
   "id": "m342",

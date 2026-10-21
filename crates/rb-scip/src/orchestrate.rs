@@ -2263,6 +2263,287 @@ mod tests {
         );
     }
 
+    /// Contract M9d D2 (C3; evaluator pass 1, e09): a root with a `pyproject.toml`, a
+    /// `poetry.lock` and a `requirements.txt` (Poetry's exported pins, a common pair) is a
+    /// Poetry root, not a requirements-only one: planned `Poetry` and pinned, fetched with
+    /// `poetry install`, and indexed with today's arguments (no project name).
+    #[test]
+    fn a_poetry_root_with_a_requirements_txt_keeps_poetry_and_todays_arguments() {
+        let paths = [
+            "svc/pyproject.toml",
+            "svc/poetry.lock",
+            "svc/requirements.txt",
+            "svc/app.py",
+        ];
+        let plan = crate::jobs::jobs(&paths, &|_| None);
+        let [job] = plan.jobs.as_slice() else {
+            panic!("{:?}", plan.jobs)
+        };
+        assert_eq!(
+            (job.root.as_str(), &job.fetch, job.unpinned),
+            (
+                "svc",
+                &Fetch::Python {
+                    lockfile: PythonLock::Poetry
+                },
+                false
+            )
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(false, false);
+        let files: Vec<(String, Vec<u8>)> = paths
+            .iter()
+            .map(|p| ((*p).to_owned(), Vec::new()))
+            .collect();
+        let run = run_job(
+            job,
+            "sha256:py",
+            &files,
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(run.status, RunStatus::Ok);
+        let runs = fake.runs.borrow();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs[0].args,
+            [
+                "sh",
+                "-c",
+                "exec poetry install --no-root --no-interaction 1>&2"
+            ]
+        );
+        assert_eq!(runs[1].args, ["scip-python", "index"]);
+    }
+
+    /// Contract M9d D5b (amendment 2: "The elapsed time covers both runs"; evaluator pass 1,
+    /// e07): a job run again without its workspace reports the time from the workspace run's
+    /// start to the re-run's end, whether the re-run indexes or fails. The workspace run is held
+    /// for 400 ms here, far longer than the plain re-run takes, so a time taken from the re-run
+    /// alone falls short of it.
+    #[test]
+    fn a_workspace_fallbacks_elapsed_covers_both_runs() {
+        const HOLD: Duration = Duration::from_millis(400);
+        /// [`Fake`], holding its first run for [`HOLD`].
+        struct Held<'a> {
+            fake: &'a Fake,
+            calls: std::cell::Cell<usize>,
+        }
+        impl Runner for Held<'_> {
+            fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
+                if self.calls.replace(self.calls.get() + 1) == 0 {
+                    std::thread::sleep(HOLD);
+                }
+                self.fake.run(run)
+            }
+            fn image_id(&self, image: &str) -> Option<String> {
+                self.fake.image_id(image)
+            }
+            fn start_proxy(&self, spec: &ProxySpec) -> anyhow::Result<String> {
+                self.fake.start_proxy(spec)
+            }
+            fn stop_proxy(&self, name: &str) -> String {
+                self.fake.stop_proxy(name)
+            }
+        }
+        let outcome = |exit_code: i32, tail: &str| Outcome {
+            exit_code: Some(exit_code),
+            timed_out: false,
+            stderr_tail: tail.into(),
+            elapsed: Duration::from_millis(1),
+        };
+        let failed = (outcome(1, "go: example.com/x@v1: not found"), false);
+        let ok = (outcome(0, ""), true);
+        for (script, status) in [
+            (
+                vec![failed.clone(), ok.clone(), ok.clone()],
+                RunStatus::OkWithoutWorkspace,
+            ),
+            (
+                vec![failed.clone(), failed.clone()],
+                RunStatus::Failed(Phase::Fetch),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = Fake::new(false, false);
+            *fake.script.borrow_mut() = script.into();
+            let held = Held {
+                fake: &fake,
+                calls: std::cell::Cell::new(0),
+            };
+            let ran = run_job(
+                &workspace_job(),
+                "sha256:go",
+                &go_files(),
+                &tmp.path().join("w"),
+                &tmp.path().join("c"),
+                &Budget::default(),
+                &Egress::default(),
+                &held,
+            )
+            .unwrap();
+            assert_eq!(ran.status, status);
+            assert!(
+                ran.elapsed >= HOLD,
+                "{status:?}: {:?} does not cover the workspace run",
+                ran.elapsed
+            );
+        }
+    }
+
+    /// Contract M9d D13 (evaluator pass 1, e12): what rb's Gradle init script marks
+    /// executable, read from the script's own predicates and evaluated on a model build, not
+    /// from the presence of substrings. The script is Groovy, so its four predicates (the
+    /// tasks that select a project, the locator configurations, the tool files, and the guard
+    /// on the resolved path) are parsed from its text and evaluated as Groovy would: `String`
+    /// `startsWith`/`endsWith`/`contains` on names, `Path.startsWith(Path)` on whole path
+    /// elements. Marked must be exactly the protobuf tools under the Gradle home of a project
+    /// that generates protos: not a jar, not a tool of another configuration, not one outside
+    /// the home (a sibling directory sharing its text prefix included), not one of a project
+    /// with no proto task. The mode set is `rwxr-xr-x`.
+    #[test]
+    fn the_gradle_init_script_marks_only_protobuf_tools_under_the_gradle_home() {
+        use std::path::PathBuf;
+        enum Val {
+            Str(String),
+            Path(PathBuf),
+        }
+        /// One predicate `[!]<subject>.<method>(<'literal'> | <name>)`.
+        fn eval(expr: &str, env: &dyn Fn(&str) -> Val) -> bool {
+            let expr = expr.trim();
+            let (negated, expr) = match expr.strip_prefix('!') {
+                Some(rest) => (true, rest.trim()),
+                None => (false, expr),
+            };
+            let open = expr.find('(').unwrap();
+            assert!(expr.ends_with(')'), "{expr}");
+            let (call, arg) = (&expr[..open], &expr[open + 1..expr.len() - 1]);
+            let dot = call.rfind('.').unwrap();
+            let (subject, method) = (env(&call[..dot]), &call[dot + 1..]);
+            let arg = match arg.strip_prefix('\'').and_then(|a| a.strip_suffix('\'')) {
+                Some(literal) => Val::Str(literal.to_owned()),
+                None => env(arg),
+            };
+            let holds = match (subject, method, arg) {
+                (Val::Path(p), "startsWith", Val::Path(q)) => p.starts_with(q),
+                (Val::Str(s), "startsWith", Val::Str(t)) => s.starts_with(&t),
+                (Val::Str(s), "endsWith", Val::Str(t)) => s.ends_with(&t),
+                (Val::Str(s), "contains", Val::Str(t)) => s.contains(&t),
+                _ => panic!("not modelled: {expr}"),
+            };
+            holds != negated
+        }
+        let script = GRADLE_INIT_SCRIPT;
+        // The body of the one `findAll { … }` after `receiver`.
+        let find_all = |receiver: &str| -> &str {
+            let at = format!("{receiver}.findAll {{ ");
+            assert_eq!(script.matches(at.as_str()).count(), 1, "{at}");
+            let rest = &script[script.find(at.as_str()).unwrap() + at.len()..];
+            &rest[..rest.find(" }").unwrap()]
+        };
+        let tasks = find_all("graph.allTasks");
+        let configurations = find_all("p.configurations");
+        let tools = find_all("c.resolve()");
+        assert_eq!(script.matches("findAll {").count(), 3);
+        assert_eq!(script.matches("if (").count(), 1);
+        let guard = {
+            let rest = &script[script.find("if (").unwrap() + "if (".len()..];
+            &rest[..rest.find(") {").unwrap()]
+        };
+        let mode = {
+            let at = "PosixFilePermissions.fromString('";
+            let rest = &script[script.find(at).unwrap() + at.len()..];
+            &rest[..rest.find('\'').unwrap()]
+        };
+        assert_eq!(mode, "rwxr-xr-x");
+        let home = PathBuf::from("/root/.gradle");
+        let cache = "/root/.gradle/caches/modules-2/files-2.1";
+        let protoc =
+            format!("{cache}/com.google.protobuf/protoc/3.25.1/a1/protoc-3.25.1-linux-x86_64.exe");
+        let grpc = format!(
+            "{cache}/io.grpc/protoc-gen-grpc-java/1.62.2/b2/protoc-gen-grpc-java-1.62.2-linux-x86_64.exe"
+        );
+        /// A project, its tasks' classes, and its configurations with their resolved files.
+        type Project<'a> = (&'a str, &'a [&'a str], Vec<(&'a str, Vec<String>)>);
+        let build: [Project; 2] = [
+            (
+                ":ads",
+                &[
+                    "org.gradle.api.tasks.compile.JavaCompile_Decorated",
+                    "com.google.protobuf.gradle.GenerateProtoTask_Decorated",
+                ],
+                vec![
+                    ("protobufToolsLocator_protoc", vec![protoc.clone()]),
+                    (
+                        "protobufToolsLocator_grpc",
+                        vec![
+                            grpc.clone(),
+                            format!("{cache}/io.grpc/grpc-api/1.62.2/c3/grpc-api-1.62.2.jar"),
+                        ],
+                    ),
+                    (
+                        "compileClasspath",
+                        vec![format!("{cache}/x/tool/1.0/d4/tool-1.0.exe")],
+                    ),
+                    (
+                        "protobufToolsLocator_local",
+                        vec![
+                            "/sources/tools/protoc.exe".to_owned(),
+                            "/root/.gradle-other/protoc.exe".to_owned(),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                ":web",
+                &["org.gradle.api.tasks.compile.JavaCompile_Decorated"],
+                vec![(
+                    "protobufToolsLocator_protoc",
+                    vec![format!(
+                        "{cache}/com.google.protobuf/protoc/3.25.1/e5/web-protoc.exe"
+                    )],
+                )],
+            ),
+        ];
+        /// The closure parameter `it` bound to something named `name`.
+        fn named(name: &str) -> impl Fn(&str) -> Val + '_ {
+            move |v: &str| match v {
+                "it.name" | "it.class.name" => Val::Str(name.to_owned()),
+                other => panic!("unbound {other}"),
+            }
+        }
+        let mut marked = Vec::new();
+        for (_, task_classes, configs) in &build {
+            if !task_classes.iter().any(|class| eval(tasks, &named(class))) {
+                continue;
+            }
+            for (config, files) in configs {
+                if !eval(configurations, &named(config)) {
+                    continue;
+                }
+                for file in files {
+                    let name = file.rsplit('/').next().unwrap();
+                    if !eval(tools, &named(name)) {
+                        continue;
+                    }
+                    let env = |v: &str| match v {
+                        "path" => Val::Path(PathBuf::from(file)),
+                        "home" => Val::Path(home.clone()),
+                        other => panic!("unbound {other}"),
+                    };
+                    if eval(guard, &env) {
+                        marked.push(file.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(marked, [protoc, grpc]);
+    }
+
     /// Contract M9d D3 (C4): Poetry 1.6.1 prints its errors on stdout, which the runner
     /// discards (fastapi_realworld's stored tail held only `Creating virtualenv …`), so the
     /// Poetry fetch runs under `sh -c` with stdout sent to stderr; `exec` keeps Poetry's exit

@@ -1,13 +1,32 @@
 //! Reading SCIP symbol strings (design §5.1) through the `scip` crate's parser.
 
+thread_local! {
+    /// Symbol strings this thread has handed to the `scip` crate's parser ([`parses`]).
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many symbol strings this thread has parsed so far, through every reader in this module
+/// (contract M9d E2): a test counts a join's parses as the difference around it. A local symbol
+/// is never parsed, so never counted.
+pub fn parses() -> usize {
+    PARSES.with(std::cell::Cell::get)
+}
+
+/// The `scip` crate's parse of a global symbol, counted ([`parses`]); `None` for a local symbol,
+/// which is not parsed, and for a string the grammar rejects.
+fn parse(symbol: &str) -> Option<scip::types::Symbol> {
+    if scip::symbol::is_local_symbol(symbol) {
+        return None;
+    }
+    PARSES.with(|n| n.set(n.get() + 1));
+    scip::symbol::parse_symbol(symbol).ok()
+}
+
 /// The name of a global symbol's last descriptor: `login` for
 /// `… com/acme/auth/AuthController#login().`, `users.ts` for a scip-typescript file namespace.
 /// `None` for local symbols and strings the grammar rejects.
 pub fn last_descriptor_name(symbol: &str) -> Option<String> {
-    if scip::symbol::is_local_symbol(symbol) {
-        return None;
-    }
-    let parsed = scip::symbol::parse_symbol(symbol).ok()?;
+    let parsed = parse(symbol)?;
     parsed.descriptors.last().map(|d| d.name.clone())
 }
 
@@ -44,10 +63,11 @@ impl NameForms {
     /// `None` for local symbols, strings the grammar rejects and symbols without descriptors,
     /// none of which may name a token.
     pub fn of(symbol: &str) -> Option<NameForms> {
-        if scip::symbol::is_local_symbol(symbol) {
-            return None;
-        }
-        let parsed = scip::symbol::parse_symbol(symbol).ok()?;
+        NameForms::from_parsed(&parse(symbol)?)
+    }
+
+    /// [`NameForms::of`] read from a parsed symbol.
+    fn from_parsed(parsed: &scip::types::Symbol) -> Option<NameForms> {
         let mut descriptors = parsed.descriptors.iter().rev();
         let last = descriptors.next()?;
         Some(NameForms {
@@ -55,6 +75,11 @@ impl NameForms {
             owner: descriptors.next().map(|d| d.name.clone()),
             meta: last.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Meta),
         })
+    }
+
+    /// The last descriptor's name, as [`last_descriptor_name`] reads it.
+    pub fn last(&self) -> &str {
+        &self.last
     }
 
     /// Whether the symbol may stand at a token whose text is `text`, in the forms [`may_name`]
@@ -86,10 +111,7 @@ impl NameForms {
 /// strings the grammar rejects, symbols without a type descriptor, and a symbol the `scip`
 /// crate would format differently from how the indexer wrote it (then no prefix is exact).
 pub fn type_symbol_of(symbol: &str) -> Option<String> {
-    if scip::symbol::is_local_symbol(symbol) {
-        return None;
-    }
-    let mut parsed = scip::symbol::parse_symbol(symbol).ok()?;
+    let mut parsed = parse(symbol)?;
     let last_type = parsed
         .descriptors
         .iter()
@@ -146,10 +168,7 @@ fn may_be_lombok_marker(symbol: &str) -> bool {
 /// [`is_lombok_generated_marker`] read from the parsed symbol, without the pre-check.
 fn parsed_lombok_marker(symbol: &str) -> bool {
     use scip::types::descriptor::Suffix;
-    if scip::symbol::is_local_symbol(symbol) {
-        return false;
-    }
-    let Ok(parsed) = scip::symbol::parse_symbol(symbol) else {
+    let Some(parsed) = parse(symbol) else {
         return false;
     };
     let in_lombok = parsed
@@ -203,10 +222,11 @@ impl<'a> LombokMarkers<'a> {
 /// manifest's `go` (contract M6d S5: one shared `go/<module>@<version>` key); every other
 /// manager passes through untouched.
 pub fn package(symbol: &str) -> Option<Package> {
-    if scip::symbol::is_local_symbol(symbol) {
-        return None;
-    }
-    let parsed = scip::symbol::parse_symbol(symbol).ok()?;
+    package_of(&parse(symbol)?)
+}
+
+/// [`package`] read from a parsed symbol.
+fn package_of(parsed: &scip::types::Symbol) -> Option<Package> {
     let p = parsed.package.as_ref()?;
     if p.manager.is_empty() || p.name.is_empty() {
         return None;
@@ -231,9 +251,68 @@ pub fn package(symbol: &str) -> Option<Package> {
     })
 }
 
+/// What the join reads from a global symbol, from one parse (contract M9d E2, amendment 4 S2):
+/// its [`package`] and its [`NameForms`], whose [`NameForms::last`] is its
+/// [`last_descriptor_name`] and whose [`NameForms::names`] is [`may_name`]. Each field is what
+/// its reader returns, computed by that reader's own code from the same parse.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SymbolParts {
+    pub package: Option<Package>,
+    pub forms: Option<NameForms>,
+}
+
+impl SymbolParts {
+    /// Both readers' answers for `symbol`: one parse of a global symbol, none of a local one or
+    /// of a string the grammar rejects (both answers `None`).
+    pub fn of(symbol: &str) -> SymbolParts {
+        parse(symbol).map_or_else(SymbolParts::default, |parsed| SymbolParts {
+            package: package_of(&parsed),
+            forms: NameForms::from_parsed(&parsed),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract M9d E2 (amendment 4, S2): [`SymbolParts::of`] answers as [`package`],
+    /// [`NameForms::of`] and [`last_descriptor_name`] do, with one parse of a global symbol
+    /// (a string the grammar rejects included) and none of a local one.
+    #[test]
+    fn symbol_parts_answer_as_each_reader_from_one_parse() {
+        let symbols = [
+            "scip-java maven maven/org.jsoup/jsoup 1.24.1 org/jsoup/Jsoup#`<init>`().",
+            "scip-java maven . . p/Dog#sound(+1).",
+            "scip-java maven . . org/springframework/",
+            "scip-typescript npm class-validator 0.15.1 src/decorator/`Is6.ts`/isISO63910:",
+            "scip-typescript npm auth-api 1.0.0 src/db/`users.ts`/",
+            "scip-go gomod github.com/mattermost/mattermost/server/public v0.4.3 `github.com/mattermost/mattermost/server/public/model`/NewId().",
+            "scip-go gomod example.com/mm/server/public . `example.com/mm/server/public/model`/",
+            "scip-go gomod gomod/example.com/x v1.0.0 `example.com/x`/F().",
+            "scip-python python my  project 1.0 `a.b`/f().",
+            "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Generated#",
+            "not a symbol",
+            "",
+            "local 3",
+        ];
+        for symbol in symbols {
+            let before = parses();
+            let parts = SymbolParts::of(symbol);
+            assert_eq!(
+                parses() - before,
+                usize::from(!symbol.starts_with("local ")),
+                "{symbol}"
+            );
+            assert_eq!(parts.package, package(symbol), "{symbol}");
+            assert_eq!(parts.forms, NameForms::of(symbol), "{symbol}");
+            assert_eq!(
+                parts.forms.as_ref().map(NameForms::last),
+                last_descriptor_name(symbol).as_deref(),
+                "{symbol}"
+            );
+        }
+    }
 
     #[test]
     fn the_last_descriptor_name_is_read_for_both_indexers_and_not_for_locals() {

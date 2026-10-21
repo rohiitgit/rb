@@ -739,3 +739,11 @@
 ## 2026-10-18: text rb generates into an export is outside the cache key, so changing it moves the recipe
 - **Context (M9d E1):** amendment 4's S1 changes the `go.work` rb writes into a workspace job's export. The cache key is the recipe, the exported files and the allow-list; the `go.work` is written after the key is taken, so with the recipe unchanged every cached D5 row (the evaluator's failed `wsrep` and `wsout`, mattermost `server`) would have replayed, and the fix would not have run. The amendment did not name a bump; E1 moved `RECIPE_GO_WORK` to `m9d-go-2`, pinned by the test.
 - **Rule:** When a change alters anything rb writes or passes to a container that is not an exported repository file (a generated `go.work`, an init script, an environment variable, an argument), bump that indexer's recipe in the same change and pin the new value in a test. A plan that changes such text names the bump and the jobs it re-runs.
+
+## 2026-10-21: a battery run without the test database scores its database specs SURVIVED
+- **Mistake (M9d E2):** the first m9d battery of E2 ran without `RB_TEST_DATABASE_URL`. m387's test (`db_tests::cypher_runs_without_jit`) printed `skipping:` and passed, so the runner scored the mutant SURVIVED (`var/m9d/logs/e2/battery-m9d-no-db-url.log`). The same run with the variable set, as E1's `batteries.zsh` sets it, read 48 of 48 KILLED.
+- **Rule:** Start every battery from a script that exports `RB_TEST_DATABASE_URL` (copy the last phase's), and read a SURVIVED whose filter selects a `db_tests::` test as "not run" until the log shows the test ran. The 2026-10-13 rule (database specs on a `ScratchDb` only) still holds.
+
+## 2026-10-21: an equivalence input kept under var/ can vanish between sessions
+- **Context (M9d E2):** P9's exported mattermost `server` index (177 MB) had been removed from `var/m9d/p9/idx/` after 2026-10-18 (the directory's mtime is 2026-10-19; who removed it is not recorded). The equivalence harness stopped on the missing file before comparing anything.
+- **Rule:** Before a run that reads kept inputs, check each against its manifest (size and sha256). A missing raw index is re-exported READ ONLY by the manifest's `input_hash` and `indexer_digest` and accepted only if its sha256 matches (`var/m9d/e2/scripts/reexport_server.py`).
