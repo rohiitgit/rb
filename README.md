@@ -316,7 +316,7 @@ troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 | `fixtures/` | 18 golden fixture repos (see the testing guide for the catalog) |
 | `tasks/`, `docs/`, `var/` | contracts, evaluations, lessons; design doc; per-milestone scripts/logs/evidence (gitignored scratch) |
 
-**Status: M0–M9d (M9a and M9b closed 2026-10-16; M9c closed 2026-10-17; M9d built 2026-10-18, evaluator pass 1 answered and re-closed 2026-10-21, pass 2 pending).** M0–M6l built the tool (foundations → structure → syntax →
+**Status: M0–M9d (M9a and M9b closed 2026-10-16; M9c closed 2026-10-17; M9d built 2026-10-18, evaluator pass 1 answered and re-closed 2026-10-21, pass 2 PASS; closing on the user's C16 sign-off).** M0–M6l built the tool (foundations → structure → syntax →
 SQL/ORM → resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules
 breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7j fixed
 what a stress campaign over 18 fixtures and 13 public repositories found

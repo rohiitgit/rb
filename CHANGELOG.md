@@ -9,7 +9,8 @@
 - **S4, S5:** accept explanations and the Result corrected (fastapi's 47 fp: 23 to an inherited `__init__`, 24 to the class's own; 61 of mattermost's 64 new fn call methods v0.4.3 lacks; the 19th fp explained by B15; the warm bench 3 min 12 s, not 2 min 57 s; the scip-go rate 1.23 µs, not 1.16 µs; four citations). N1, N2, N5, N6 recorded in Out of scope; N3 in `tasks/todo.md`.
 - **Scoreboard** (`bench/scoreboard/m9d.json`, binary `8445f0f4…0690` from `45bd5b5`; run `var/bench/out/8445f0f45fd1/`): differs from P9's only in the binary and commit, so every cell is as before; 155 dumps identical to P9's run, and mattermost's SCIP dump differs in webapp's and cypress's tails only. Invariant 0 unclassified (RECIPE 6 → 4); `compare` exits 0 with the same 46 changed and 12 accepted lines; two scorings `cmp`-identical. The mattermost dumps of M9c's and P9's records, removed from disk on 2026-10-19, were regenerated with the kept binaries and verified by byte count and by re-scoring both runs `cmp`-identical to their committed scoreboards.
 - **Verification:** real-Docker 1,192/0/0 (0 `skipping:`) on the final code; batteries m9d 48/48, m8b 29/29, m9a 31/31, m9b 39/39, m9c 56/56 KILLED on the final code; fmt and clippy clean; mattermost NFR within limits; `rb check` 801.9 → 40.3 ms at load 6.4–6.9; `rb.repo` unchanged.
-- **Status:** evaluator pass 1 answered; pass 2 pending.
+- **Evaluator pass 2** (`tasks/eval-m9d-pass2.md`): PASS, 0 blocking; its should-fix (P9's regenerated `noscip` dump is M9c's; the Mutants count) answered in the records.
+- **Status:** evaluator pass 2 PASS; closing waits for the user's sign-off on C16's waiver.
 
 ## [2026-10-18 16:30] (wall clock) M9d: SCIP fetch and index failures (B4), Go workspaces, scip-go health, `rb check` without JIT
 - **B4, every failed or absent SCIP job of M9c's record, by cause** (contract `tasks/contract-m9d.md`):
