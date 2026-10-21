@@ -506,6 +506,11 @@ cargo run -q -p rb-bench -- compare bench/scoreboard/m8a.json bench/scoreboard/m
   --accept bench/accept.tsv --perf bench/scoreboard/m8a-perf.json bench/scoreboard/m8b-perf.json
 ```
 
+- **Pins.** `score`, `sample` and `review` refuse a dump whose header commit
+  is not its target's manifest pin (letter case aside), naming the file, so a
+  run of another checkout is never scored as the pinned one. `compare` fails
+  (`REGRESSION … family vanished`) when an `exact` sample family the base
+  sampled is missing from the head.
 - **Keys (M8b adds three).** *microSecEnD*: 12 Java microservice
   applications' hand-made dataflow diagrams (`kind microsecend` in the
   manifest, pinned and checked by `bench/pin_microsecend.py`); scores

@@ -67,6 +67,17 @@ fn read_dump(path: &Path) -> Result<Option<Dump>, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Refuse to score output from a different revision than the target pinned by the manifest.
+pub fn check_pin(dump: &Dump, target: &Target, mode: &str) -> Result<(), String> {
+    if !dump.commit.eq_ignore_ascii_case(&target.sha) {
+        return Err(format!(
+            "{}.{mode}.jsonl: dump commit {} does not match manifest pin {}",
+            target.name, dump.commit, target.sha
+        ));
+    }
+    Ok(())
+}
+
 /// The timed runs of the manifest's targets in an output directory. Every run must be of one
 /// binary; a run that failed is reported, not timed.
 pub fn perf(
@@ -210,6 +221,8 @@ pub fn scoreboard(
             notes.push(format!("{}: no SCIP agreement (a dump is missing)", t.name));
             continue;
         };
+        check_pin(&scip, t, "scip")?;
+        check_pin(&noscip, t, "noscip")?;
         for class in scip_ref::CLASSES {
             let (cell, covered) = scip_ref::agreement(&scip, &noscip, class);
             if class == scip_ref::CLASSES[0] {
@@ -265,6 +278,7 @@ pub fn scoreboard(
             .insert(format!("handkey:{}", t.name), hex(&hash.finalize()));
         let dump = read_dump(&out.join(format!("{}.noscip.jsonl", t.name)))?
             .ok_or_else(|| format!("{}: no noscip dump for its hand key", t.name))?;
+        check_pin(&dump, t, "noscip")?;
         for (bench, key) in [(handkey::RAW_BENCH, &raw), ("handkey", &effective)] {
             for (class, cell) in handkey::score_key(key, &dump) {
                 let key = CellKey {
@@ -296,6 +310,7 @@ pub fn scoreboard(
     for t in targets.iter().filter(|t| t.kind == "stress") {
         for mode in ["noscip", "scip"] {
             if let Some(d) = read_dump(&out.join(format!("{}.{mode}.jsonl", t.name)))? {
+                check_pin(&d, t, mode)?;
                 stress_dumps.push((t.name.clone(), mode, d));
             }
         }
@@ -330,6 +345,7 @@ pub fn scoreboard(
         models.update(overrides.as_bytes());
         let dump = read_dump(&out.join(format!("{}.noscip.jsonl", t.name)))?
             .ok_or_else(|| format!("{}: no noscip dump", t.name))?;
+        check_pin(&dump, t, "noscip")?;
         let (cells, app_notes) = msecend::score_app(&model, &trace, &overrides, &dump)
             .map_err(|e| format!("{}: {e}", t.name))?;
         for (class, cell) in cells {
@@ -546,6 +562,55 @@ mod tests {
         );
     }
 
+    /// A dump is scored only against the revision the manifest pins: a dump whose header names
+    /// another commit is refused, and the pin matches whatever the letter case.
+    #[test]
+    fn a_dump_of_another_commit_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (out, repos, keys) = (
+            tmp.path().join("out"),
+            tmp.path().join("repos"),
+            tmp.path().join("keys"),
+        );
+        for d in [&out, &repos.join("t/a"), &keys.join("t")] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(repos.join("t/a/X.java"), "class X {}\n").unwrap();
+        fs::write(keys.join("t/key.txt"), "").unwrap();
+        let target = parse_manifest(
+            &ROW.replacen("go_clean_arch", "t", 1)
+                .replace("noscip,scip", "noscip")
+                .replacen("stress", "handkey", 1),
+        )
+        .unwrap();
+        let pin = target[0].sha.clone();
+        let score = || {
+            scoreboard(
+                &target,
+                &out,
+                &repos,
+                &keys,
+                &tmp.path().join("exact.tsv"),
+                "m9d",
+                Rb {
+                    commit: "c".into(),
+                    binary_sha256: "b".into(),
+                },
+            )
+        };
+        let dump = |commit: &str| format!("[\"rb-dump\",2,\"{commit}\"]\n");
+        fs::write(
+            out.join("t.noscip.jsonl"),
+            dump("0123456789abcdef0123456789abcdef01234567"),
+        )
+        .unwrap();
+        let err = score().unwrap_err();
+        assert!(err.contains("does not match manifest pin"), "{err}");
+        assert!(err.contains("t.noscip.jsonl"), "{err}");
+        fs::write(out.join("t.noscip.jsonl"), dump(&pin.to_uppercase())).unwrap();
+        assert!(score().is_ok(), "the pin in upper case is the pin");
+    }
+
     #[test]
     fn a_hand_key_is_scored_raw_and_adjudicated() {
         let tmp = tempfile::tempdir().unwrap();
@@ -569,7 +634,8 @@ mod tests {
         )
         .unwrap();
         let dump = [
-            r#"["rb-dump",2,"x"]"#,
+            // The dump of the pinned commit (`ROW`'s sha), as `check_pin` requires.
+            r#"["rb-dump",2,"e06c6d0cb37069b0ef56e3df67f80ca130a1ab82"]"#,
             r#"["N","symbol","rb-heuristic . . . `a/X.java`/X#q().","q",{}]"#,
             r#"["E","symbol","rb-heuristic . . . `a/X.java`/X#q().","DEFINED_IN","file","a/X.java","treesitter",5,{},[["a/X.java",[1,7,1,8]]]]"#,
             r#"["E","symbol","rb-heuristic . . . `a/X.java`/X#q().","QUERIES","table","public.users","sql_literal",5,{"ops":["read"],"schema_assumed":true},[["a/X.java",[1,10,1,11]]]]"#,

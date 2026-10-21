@@ -1,5 +1,15 @@
 # Changelog
 
+## [2026-10-21 08:03] (wall clock) rb-bench: dumps must match their manifest pin (on `m9`, after M9d)
+- **Pins:** `rb-bench score`, `sample` and `review` refuse a dump whose header commit is not its target's manifest pin (case-insensitive), naming the file (`run::check_pin`). Before, a dump of any checkout was scored as the pinned one.
+- **Sample gate:** `compare` fails with `REGRESSION exact sample <family>: family vanished` when a family the base sampled is missing from the head; it used to read only the head's families.
+- **Origin:** an uncommitted patch in the `main-1` worktree, brought to `m9` at the user's request. As found it did not compile (`check_pin` was `pub(crate)` but `main.rs` is its own crate) and it broke `a_hand_key_is_scored_raw_and_adjudicated`, whose dump named commit `x`; both fixed.
+- **Tests first:** `a_dump_of_another_commit_is_refused` and `a_vanished_sample_family_fails` failed on the unpatched code (`var/m9/checkpin/red.txt`), pass after; rb-bench 81 passed; fmt and clippy clean.
+- **On real data** (`var/m9/checkpin/verify.txt`): the new `rb-bench` scores E3's record, the reconstituted M9c record and the reconstituted P9 record `cmp`-identical to their committed scoreboards; `sample` output identical; the M9d gate still exits 0 (46 changed, 12 accepted). A copy of the record with one dump's header commit changed is refused by `score` and `sample`; the old `rb-bench` scored it.
+- **Mutants:** m408 (pin check bypassed), m409 (case-sensitive), m410 (head families only) added to `bench/mutants/m8b.json`; m8a 49/49 and m8b 32/32 KILLED.
+- **Note:** `rb-bench` rebuilt from here is a new binary (`0369a933…`); M9d's records name the binary they used (`var/m9d/bin/rb-bench`, `82839c81…`), which is unchanged.
+- **Files:** `crates/rb-bench/src/{run,compare,main}.rs`, `bench/mutants/m8b.json`, `docs/usage-and-testing.md`.
+
 ## [2026-10-21 06:58] (wall clock) M9d: evaluator pass 1 answered, pass 2 PASS, closed
 - `tasks/eval-m9d-pass1.md`: VERDICT FAIL, 1 blocking, 5 should-fix, 6 notes. Answered in contract amendment 4 by phases E1 (`94986f2`, `c209540`), E2 (`45bd5b5`) and E3 (records, re-close). `PIPELINE` `m9d-1`.
 - **B1 (npm):** the first D1 set `npm_config_replace_registry_host=always`, which also rewrote URL dependencies, git hosts and hosts opted in through `RB_SCIP_REGISTRIES` to `registry.npmjs.org`, so an opted-in fetch could no longer succeed. The rewrite now names the lockfile's one foreign registry host, and nothing when there are none or several (`RECIPE_TS` `m9d-ts-2`). nestjs's dump is unchanged; the evaluator's CDN-tarball fixture is `ok` once its host is opted in.

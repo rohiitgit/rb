@@ -751,3 +751,7 @@
 ## 2026-10-21: a scripted edit across several files checks every hunk before it writes any file
 - **Mistake (M9d, after evaluator pass 2):** one script edited the contract, `tasks/todo.md`, CHANGELOG, IMPLEMENT and README in turn, writing each file as it went. The todo hunk matched twice (an older milestone has the same line), the assertion stopped the script, and the contract was already written: a partial update, found by `git status` and finished by a second script. CHANGELOG's status line also occurred twice (M9c's re-close entry).
 - **Rule:** In a multi-file scripted edit, read every file and assert every hunk (exactly once, or at an asserted position for a line that legitimately repeats) before writing any file; then write them all. Lines shared across milestones (`- [ ] Evaluator pass 2 …`, `- **Status:** …`) are anchored by their milestone's heading, not by their text alone.
+
+## 2026-10-21: an uncommitted patch found in a tree is unverified until it builds and its crate's tests pass
+- **Context (rb-bench pins, after M9d):** the `check_pin` patch left in the `main-1` worktree read as finished, and the status report called it a small fix. Applied to `m9` it did not compile (`pub(crate)` called from the binary crate) and it broke an existing test whose fixture dump named a commit other than its pin.
+- **Rule:** Treat a stray patch as a proposal. Before describing it as ready, apply it to the target branch and run its crate's tests; write its tests red first against the unpatched code, as for any change.

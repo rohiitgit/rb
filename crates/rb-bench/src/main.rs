@@ -191,6 +191,7 @@ fn run(command: Command) -> Result<u8, String> {
                     let path = out.join(format!("{}.{mode}.jsonl", t.name));
                     if let Ok(text) = fs::read_to_string(&path) {
                         let d = rb_bench::dump::parse(&text).map_err(|e| e.to_string())?;
+                        run::check_pin(&d, t, mode)?;
                         dumps.push((t.name.clone(), t.sha.clone(), mode, d));
                     }
                 }
@@ -236,6 +237,7 @@ fn run(command: Command) -> Result<u8, String> {
             let trace = read(&dir.join(format!("{app}_traceability.json")))?;
             let dump = read(&out.join(format!("{target}.noscip.jsonl")))?;
             let dump = rb_bench::dump::parse(&dump).map_err(|e| e.to_string())?;
+            run::check_pin(&dump, t, "noscip")?;
             let review = msecend::endpoint_review(&model, &trace, &dump)?;
             let gold_text: String = review
                 .gold
