@@ -1217,6 +1217,8 @@ fn http_line(c: &rb_store::HttpCoverage) -> String {
         ("external", "external"),
         ("dynamic", "dynamic"),
         ("self", "self"),
+        ("in_process", "in process"),
+        ("empty_url", "empty url"),
     ];
     let mut line = format!(
         "http: {} routes in {} services; {} client calls",

@@ -45,10 +45,14 @@ pub(crate) enum Bucket {
     OwnService,
     External,
     Dynamic,
+    /// A Go request served in-process, never sent (contract M6b S4).
+    InProcess,
+    /// A Go request with an empty URL literal (contract M6b S4).
+    EmptyUrl,
 }
 
 impl Bucket {
-    pub(crate) const ALL: [Bucket; 8] = [
+    pub(crate) const ALL: [Bucket; 10] = [
         Bucket::Synthetic,
         Bucket::Heuristic,
         Bucket::Ambiguous,
@@ -57,6 +61,8 @@ impl Bucket {
         Bucket::OwnService,
         Bucket::External,
         Bucket::Dynamic,
+        Bucket::InProcess,
+        Bucket::EmptyUrl,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -69,6 +75,8 @@ impl Bucket {
             Bucket::OwnService => "self",
             Bucket::External => "external",
             Bucket::Dynamic => "dynamic",
+            Bucket::InProcess => "in_process",
+            Bucket::EmptyUrl => "empty_url",
         }
     }
 
@@ -80,6 +88,8 @@ impl Bucket {
             Bucket::OwnService => Some("http_self"),
             Bucket::External => Some("http_external"),
             Bucket::Dynamic => Some("http_url_dynamic"),
+            Bucket::InProcess => Some("http_in_process"),
+            Bucket::EmptyUrl => Some("http_empty_url"),
             Bucket::Synthetic | Bucket::Heuristic | Bucket::Ambiguous => None,
         }
     }
@@ -119,6 +129,9 @@ pub(crate) struct Site {
     /// one naming an external host makes the site external. Empty when the base is decided or
     /// unknown with no stated value, or does not apply (an absolute URL).
     pub base_candidates: Vec<Folded>,
+    /// The site is not network traffic (contract M6b S4): counted in its own bucket,
+    /// never matched.
+    pub dropped: Option<rb_frameworks::clients::DropKind>,
 }
 
 /// A service as the host rule (D6) sees it.
@@ -415,6 +428,7 @@ pub(crate) fn sites(inputs: &Inputs<'_, '_>) -> Vec<Site> {
                 base_verified,
                 discovery,
                 base_candidates,
+                dropped: call.dropped,
             });
         }
     }
@@ -650,6 +664,13 @@ impl<'e> Stitcher<'e> {
 
     /// The bucket and edges of one site (S13, S14).
     fn site(&self, site: &Site) -> Outcome {
+        // Dropped sites never match (contract M6b S4).
+        if let Some(dropped) = site.dropped {
+            return Outcome::bucket(match dropped {
+                rb_frameworks::clients::DropKind::InProcess => Bucket::InProcess,
+                rb_frameworks::clients::DropKind::EmptyUrl => Bucket::EmptyUrl,
+            });
+        }
         let Some(folded) = &site.url else {
             return Outcome::bucket(Bucket::Dynamic);
         };
@@ -1080,6 +1101,7 @@ mod tests {
             base_verified: None,
             discovery: false,
             base_candidates: Vec::new(),
+            dropped: None,
         }
     }
 
@@ -1417,6 +1439,35 @@ mod tests {
         assert_eq!(one(&many(16), &health).1.len(), 16);
         assert_eq!(one(&many(16), &health).0, Bucket::Ambiguous);
         assert_eq!(one(&many(17), &health), (Bucket::TooAmbiguous, vec![]));
+    }
+
+    /// S4: dropped sites never match, whatever their URL would stitch to.
+    #[test]
+    fn dropped_sites_never_match() {
+        use rb_frameworks::clients::DropKind;
+        let eps = endpoints();
+        // `/health` would stitch ambiguously (16 candidates); dropped wins.
+        let many: Vec<EndpointRef> = (0..16)
+            .map(|i| ep("GET", "/health", &format!("svc{i:02}")))
+            .collect();
+        for (drop, bucket) in [
+            (DropKind::InProcess, Bucket::InProcess),
+            (DropKind::EmptyUrl, Bucket::EmptyUrl),
+        ] {
+            let mut s = site(WEB, Some("GET"), Some(("/health", Literal)), 1);
+            s.dropped = Some(drop);
+            assert_eq!(one(&many, &s), (bucket, vec![]), "{drop:?}");
+        }
+        // Without the flag the same site stitches.
+        assert_eq!(
+            one(
+                &many,
+                &site(WEB, Some("GET"), Some(("/health", Literal)), 1)
+            )
+            .0,
+            Bucket::Ambiguous
+        );
+        let _ = eps;
     }
 
     /// Invariant 5 and D6: own-service candidates, a loopback host and a host naming the caller
@@ -2113,6 +2164,7 @@ mod tests {
             coverage.detail,
             json!({"sites": 8, "synthetic": 1, "heuristic": 2, "ambiguous": 1, "too_ambiguous": 0,
                    "unmatched": 1, "self": 1, "external": 1, "dynamic": 1,
+                   "in_process": 0, "empty_url": 0,
                    "bases": {"verified": 1, "unverified": 1}})
         );
         let total: u64 = Bucket::ALL

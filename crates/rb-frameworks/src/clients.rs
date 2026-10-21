@@ -94,6 +94,10 @@ pub struct ClientCall {
     /// Upper case; `None` when the method is not known statically.
     pub method: Option<String>,
     pub url: UrlValue,
+    /// The site is not network traffic (contract M6b S4): its request is served
+    /// in-process or its URL is empty. The stitcher counts it in its own bucket
+    /// instead of matching it.
+    pub dropped: Option<DropKind>,
     /// A base the URL is relative to (axios `baseURL`, `WebClient` `baseUrl`, Feign `url`).
     pub base: Option<UrlValue>,
     /// axios: the call is on this imported name, which the indexer must confirm is an axios
@@ -116,6 +120,15 @@ pub struct ClientCall {
     /// the indexer decides (it is exported, so never verified), and it caps every site of a
     /// client kind the repository may reconfigure ([`global_hooks`], [`feign_config_key`]).
     pub base_verified: Option<bool>,
+}
+
+/// Why a client call site is not network traffic (contract M6b S4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropKind {
+    /// The request is served in-process: passed to `ServeHTTP` or a test recorder.
+    InProcess,
+    /// A Go request with an empty URL literal (never path-matched as `/`).
+    EmptyUrl,
 }
 
 /// An axios instance bound to a name: `const api = axios.create({ baseURL })`.
@@ -806,6 +819,7 @@ fn fetch(facts: &FileScope<'_>, out: &mut FileClients) {
             kind: ClientKind::Fetch,
             method,
             url: UrlValue::of(link.args.first()),
+            dropped: None,
             base: None,
             instance: None,
             span: chain.span,
@@ -1186,6 +1200,7 @@ fn axios_call(
         kind: ClientKind::Axios,
         method,
         url: UrlValue::of(url),
+        dropped: None,
         base: config_base(facts, config).or(base),
         instance,
         span: chain.span,
@@ -1288,6 +1303,7 @@ fn rest_template(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBas
             kind: ClientKind::RestTemplate,
             method,
             url: java_url(facts, first.args.first()),
+            dropped: None,
             base_verified: verdict(plain, base.read),
             base: Some(base.value),
             instance: None,
@@ -1833,6 +1849,7 @@ fn web_client(facts: &FileScope<'_>, out: &mut FileClients, bases: &SpringBases)
             kind,
             method,
             url,
+            dropped: None,
             base_verified: verdict(plain, base.read && base.value != UrlValue::Unknown),
             base: Some(base.value),
             instance: None,
@@ -1964,6 +1981,7 @@ fn feign(facts: &FileScope<'_>, out: &mut FileClients) {
                     kind: ClientKind::Feign,
                     method,
                     url,
+                    dropped: None,
                     base: Some(base.clone()),
                     instance: None,
                     span: d.span,
@@ -1996,6 +2014,19 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
         return;
     };
     let fmt = import_name("fmt");
+    /// A `NewRequest` chain on the `net/http` package: a request value that a
+    /// `ServeHTTP` call below may serve in-process.
+    fn is_request(http: &str, chain: &CallChain) -> bool {
+        let Some(last) = chain.links.last() else {
+            return false;
+        };
+        matches!(last.name.as_str(), "NewRequest" | "NewRequestWithContext")
+            && chain.root.as_deref() == Some(http)
+    }
+    // Request chains by span, and each emitted call's chain span, so the sink pass
+    // below can mark them.
+    let mut requests: HashSet<Span> = HashSet::new();
+    let mut call_of: HashMap<Span, usize> = HashMap::new();
     for chain in &facts.chains {
         let (Some(root), [link]) = (chain.root.as_deref(), chain.links.as_slice()) else {
             continue;
@@ -2032,10 +2063,24 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
                 .map_or(UrlValue::Unknown, UrlValue::Template),
             other => UrlValue::of(other),
         };
+        let request = is_request(&http, chain);
+        // An empty URL literal never path-matches (contract M6b S4); an in-process
+        // request below overrides this with its mechanism.
+        let dropped = request
+            .then_some(match &url {
+                UrlValue::Template(t) if t.parts.is_empty() => Some(DropKind::EmptyUrl),
+                _ => None,
+            })
+            .flatten();
+        if request {
+            requests.insert(chain.span);
+        }
+        call_of.insert(chain.span, out.calls.len());
         out.calls.push(ClientCall {
             kind: ClientKind::GoHttp,
             method,
             url,
+            dropped,
             base: None,
             instance: None,
             span: chain.span,
@@ -2048,6 +2093,39 @@ fn go_http(facts: &FileScope<'_>, out: &mut FileClients) {
             base_verified: (!bare).then_some(false),
         });
     }
+    // A request served in-process: passed to `ServeHTTP`, directly as a call or by
+    // name through the declaration containing its creation (contract M6b S4).
+    // `ServeHTTP` serves whatever it is passed in-process by construction, so only
+    // positively identified flows are dropped; anything else stays stitched. (A
+    // request value both served and sent over the network is dropped: in-process
+    // wins, recorded residue.)
+    for chain in &facts.chains {
+        let (Some(_), [link]) = (chain.root.as_deref(), chain.links.as_slice()) else {
+            continue;
+        };
+        if link.name != "ServeHTTP" {
+            continue;
+        }
+        crate::work::tick(1);
+        for arg in &link.args {
+            crate::work::tick(1);
+            let hit: Option<Span> = match arg {
+                Arg::Other { span } if requests.contains(span) => Some(*span),
+                Arg::Name { text, span } => facts
+                    .binding_at(text, *span)
+                    .and_then(|b| requests.iter().find(|r| contains(b.span, **r)).copied()),
+                _ => None,
+            };
+            if let Some(idx) = hit.and_then(|s| call_of.get(&s)) {
+                out.calls[*idx].dropped = Some(DropKind::InProcess);
+            }
+        }
+    }
+}
+
+/// Whether span `inner` lies within `outer` (same-file spans compare row-major).
+fn contains(outer: Span, inner: Span) -> bool {
+    (outer[0], outer[1]) <= (inner[0], inner[1]) && (inner[2], inner[3]) <= (outer[2], outer[3])
 }
 
 /// `<root>.<name>(lit, args…)` at `span` — Go's `fmt.Sprintf`, Java's `String.format` — as a
@@ -2160,6 +2238,11 @@ mod tests {
                 }
                 if c.base_verified == Some(false) {
                     s.push_str(" unverified");
+                }
+                match c.dropped {
+                    Some(DropKind::InProcess) => s.push_str(" in-process"),
+                    Some(DropKind::EmptyUrl) => s.push_str(" empty-url"),
+                    None => {}
                 }
                 s
             })
@@ -3345,5 +3428,45 @@ mod tests {
         );
         let no_import = src.replace("\t\"net/http\"\n", "");
         assert!(calls(Language::Go, &no_import).is_empty());
+    }
+
+    /// S13: the serve-sink scan is linear in chains: 4× the requests and serves
+    /// makes at most 5× the counted steps.
+    #[test]
+    fn go_serve_sinks_grow_linearly() {
+        let work = |n: usize| {
+            let mut src = "package main\nimport \"net/http\"\nfunc f(h http.Handler, w http.ResponseWriter) {\n"
+                .to_owned();
+            for i in 0..n {
+                src.push_str(&format!(
+                    "\treq{i}, _ := http.NewRequest(\"GET\", \"/{i}\", nil)\n\th.ServeHTTP(w, req{i})\n"
+                ));
+            }
+            src.push_str("}\n");
+            let facts = extract(Language::Go, src.as_bytes()).unwrap();
+            crate::work::take();
+            let c = clients(Language::Go, &facts);
+            assert_eq!(c.calls.len(), n);
+            crate::work::take()
+        };
+        let (small, large) = (work(100), work(400));
+        assert!(small > 0 && large <= 5 * small, "{small} → {large}");
+    }
+
+    /// S4: a request served in-process (passed to `ServeHTTP`, directly or by name)
+    /// or with an empty URL is dropped with its mechanism, never stitched.
+    #[test]
+    fn go_in_process_and_empty_url_requests_drop() {
+        let src = "package main\nimport \"net/http\"\nfunc direct(h http.Handler, w http.ResponseWriter) {\n\th.ServeHTTP(w, http.NewRequest(\"GET\", \"/x\", nil))\n}\nfunc named(h http.Handler, w http.ResponseWriter) {\n\treq, _ := http.NewRequest(http.MethodPut, \"/y\", nil)\n\th.ServeHTTP(w, req)\n\t_ = req\n}\nfunc other(h http.Handler, w http.ResponseWriter, r *http.Request) {\n\th.ServeHTTP(w, r)\n}\nfunc empty() {\n\thttp.NewRequest(\"GET\", \"\", nil)\n}\nfunc both(h http.Handler, w http.ResponseWriter) {\n\treq, _ := http.NewRequest(\"GET\", \"\", nil)\n\th.ServeHTTP(w, req)\n\t_ = req\n}\nfunc network(c *http.Client) {\n\treq, _ := http.NewRequest(\"GET\", \"/z\", nil)\n\tc.Do(req)\n\t_ = req\n}\n";
+        assert_eq!(
+            calls(Language::Go, src),
+            [
+                "net/http GET '/x' unverified in-process",
+                "net/http PUT '/y' unverified in-process",
+                "net/http GET '' unverified empty-url",
+                "net/http GET '' unverified in-process",
+                "net/http GET '/z' unverified",
+            ]
+        );
     }
 }
