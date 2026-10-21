@@ -135,7 +135,34 @@ use serde_json::{Value, json};
 /// `m7i-1` Express routes match case-insensitively unless their router opts in
 /// (`CONSUMES` `case: folded`); JSON spec operations carry their path key's span.
 /// `m7j-1` `case: folded` decided per candidate (it was copied from the first).
-pub const PIPELINE: &str = "m7j-1";
+/// `m9a-1` `exact` precision: test-file routes are not endpoints (B7), spec-only
+/// endpoints are `synthetic` (B8), literal `"{id}"` paths (B12a), Go method sources take
+/// no interface bypass (B13), native config server context paths (B14).
+/// `m9a-2` an empty remote context path clears a lower one (M9a evaluator pass 1, E3).
+/// `m9b-1` Go methods declared outside their receiver type's file are its members and no
+/// package-level names (B9); `fmt.Sprintf` SQL folds package constants (B10); Spring Data REST
+/// repositories expose `synthetic` endpoints (B12b).
+/// `m9c-1` Tier B recall: JSONC tsconfig `paths` and TS default imports (B3); Go call
+/// results, call segments, aliases, embedded fields and package vars (B2); Python `super()`,
+/// star imports, re-exports, module variables, `raise` and inherited `__init__` (B5); the
+/// `tier_b_forms` diagnostic; scip-go references into another job's module join its
+/// definitions as `synthetic` (`scip_cross_project`; B1).
+/// `m9c-2` M9c evaluator pass 1: a Go result named by a type parameter types nothing, a
+/// `select` receive declares its names (E1); Python's MRO is C3 for inherited `__init__` and
+/// `super()`, and the later of a named and a star import wins (E2); a tsconfig BOM and
+/// `"baseUrl": "."` (E4); a scip-go call whose callee is a type is a `REFERENCES` (E5).
+/// `m9c-3` M9c evaluator pass 2: a Go parameter or local typed by a type parameter types
+/// nothing (N1); each Python class's MRO, C3's or the fallback, is computed once and no longer
+/// depends on which classes were looked up first (S2; it differs only past 64 levels).
+/// `m9d-1` SCIP jobs that failed or never ran (B4): npm fetches rewrite lockfile registry hosts
+/// and ignore `engines` (D1); `requirements.txt` directories are Python roots, and a failed
+/// Python fetch indexes without its environment (D2–D4); a Go module requiring an in-repo module
+/// indexes under a generated `go.work`, plain if that fails, and in-repo `replace` targets are
+/// exported (D5–D7, D5b); byte-equal cross-module symbols join `exact`, and in-repo Go modules
+/// are no `Package` (D8, D9); scip-go's `invalid type` locals are counted (D10); Maven releases
+/// above 21 run on the JDK 25 image, the targetroot outside the sources (D12); Gradle marks
+/// protoc tools executable (D13).
+pub const PIPELINE: &str = "m9d-1";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -513,6 +540,8 @@ struct SpringConfig {
     overrides: BTreeMap<String, stitch::Overrides>,
     /// Services with a `config_unread` diagnostic.
     unread: BTreeSet<String>,
+    /// Spring Cloud Config clients (the `config_client` reason).
+    clients: BTreeSet<String>,
 }
 
 /// Build dependencies that make a service a Spring Cloud Config client.
@@ -787,6 +816,7 @@ fn spring_config(
         reasons.extend(reason);
         if client {
             reasons.insert("config_client");
+            out.clients.insert(service.clone());
         }
         files.insert(path);
         let overrides = out.overrides.entry(service).or_default();
@@ -810,6 +840,151 @@ fn spring_config(
         out.properties.entry(service).or_default().extend(map);
     }
     (out, diagnostics)
+}
+
+const CONTEXT_PATH_KEY: &str = "server.servlet.context-path";
+
+/// Build dependencies that make a service serve Spring Data REST (contract M9b D7).
+const DATA_REST_DEPENDENCIES: &[&str] =
+    &["spring-boot-starter-data-rest", "spring-data-rest-webmvc"];
+/// The keys of Spring Data REST's base path, in Spring's relaxed binding forms.
+const DATA_REST_BASE_PATH_KEYS: &[&str] =
+    &["spring.data.rest.base-path", "spring.data.rest.basePath"];
+
+/// Services whose build file names Spring Data REST (contract M9b D7), each with the base path
+/// its read configuration sets (without slashes; `None` when unset or blank).
+fn data_rest_services(
+    config: &BTreeMap<&str, String>,
+    spring: &SpringConfig,
+    service_of: &dyn Fn(&str) -> String,
+) -> BTreeMap<String, Option<String>> {
+    config
+        .iter()
+        .filter(|(path, text)| {
+            config_file(path) == Some(ConfigFile::Build)
+                && DATA_REST_DEPENDENCIES.iter().any(|d| text.contains(d))
+        })
+        .map(|(path, _)| {
+            let service = service_of(path);
+            let base = spring.properties.get(&service).and_then(|p| {
+                DATA_REST_BASE_PATH_KEYS
+                    .iter()
+                    .find_map(|k| p.get(*k))
+                    .map(|v| v.trim().trim_matches('/').to_owned())
+                    .filter(|v| !v.is_empty())
+            });
+            (service, base)
+        })
+        .collect()
+}
+
+/// Context paths a native Spring Cloud Config server sets for its clients (contract M9a D4).
+/// The server is the one service whose effective configuration activates the `native` profile
+/// and lists `search-locations`; each `classpath:` location is the server's
+/// `src/main/resources/<dir>/` (`file:` and placeholder locations are not read). A config
+/// client takes `server.servlet.context-path` from the unconditional documents of
+/// `application.*` and then `<spring.application.name>.*` there, in location order
+/// (`.properties` above YAML in one location), all above its local files. The highest value
+/// found wins, and an empty one clears the context path (Spring's root context). Each
+/// application is counted; several such servers apply nothing.
+fn config_server_context_paths(
+    config: &BTreeMap<&str, String>,
+    spring: &SpringConfig,
+    context_paths: &mut BTreeMap<String, String>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let servers: Vec<(&String, &String)> = spring
+        .properties
+        .iter()
+        .filter_map(|(service, p)| {
+            let native = p
+                .get(ACTIVE_PROFILES_KEY)
+                .is_some_and(|v| split_profiles(v).iter().any(|profile| profile == "native"));
+            let locations = ["search-locations", "searchLocations"]
+                .iter()
+                .find_map(|k| p.get(&format!("spring.cloud.config.server.native.{k}")))?;
+            native.then_some((service, locations))
+        })
+        .collect();
+    if servers.len() > 1 {
+        diagnostics.push(Diagnostic {
+            kind: "config_server_ambiguous".into(),
+            path: None,
+            span: None,
+            detail: json!({ "servers": servers.iter().map(|(s, _)| s).collect::<Vec<_>>() }),
+        });
+        return diagnostics;
+    }
+    let Some(&(server, locations)) = servers.first() else {
+        return diagnostics;
+    };
+    let resources = if server == boundaries::ROOT_DIR {
+        "src/main/resources".to_owned()
+    } else {
+        format!("{server}/src/main/resources")
+    };
+    let dirs: Vec<String> = locations
+        .split(',')
+        .map(str::trim)
+        .filter(|l| !l.contains('{'))
+        .filter_map(|l| l.strip_prefix("classpath:"))
+        .map(|d| match d.trim_matches('/') {
+            "" => format!("{resources}/"),
+            d => format!("{resources}/{d}/"),
+        })
+        .collect();
+    for client in &spring.clients {
+        rb_frameworks::work::tick(1);
+        let name = spring
+            .properties
+            .get(client)
+            .and_then(|p| p.get("spring.application.name"));
+        let Some(name) = name.filter(|_| client != server) else {
+            continue;
+        };
+        // Lowest first, so the last value found wins.
+        let mut found: Option<(&str, String)> = None;
+        for stem in ["application", name.trim()] {
+            for dir in &dirs {
+                for ext in ["yml", "yaml", "properties"] {
+                    let Some((&file, text)) =
+                        config.get_key_value(format!("{dir}{stem}.{ext}").as_str())
+                    else {
+                        continue;
+                    };
+                    let entries: BTreeMap<String, String> = if ext == "properties" {
+                        rb_frameworks::fold::properties_documents(text)
+                            .into_iter()
+                            .filter(|d| !rb_frameworks::fold::conditional_document(d))
+                            .flatten()
+                            .collect()
+                    } else {
+                        select_yaml_documents(text, &BTreeSet::new()).0
+                    };
+                    if let Some(value) = entries.get(CONTEXT_PATH_KEY) {
+                        found = Some((file, value.trim().to_owned()));
+                    }
+                }
+            }
+        }
+        let Some((file, value)) = found else {
+            continue;
+        };
+        diagnostics.push(Diagnostic {
+            kind: "config_server_context_path".into(),
+            path: Some(file.to_owned()),
+            span: None,
+            detail: json!({ "service": client, "file": file, "context_path": value }),
+        });
+        // The highest value wins even when empty: Spring serves an empty context path at
+        // the root, so it clears a lower one, as for local files (evaluator pass 1, E3).
+        if value.is_empty() {
+            context_paths.remove(client);
+        } else {
+            context_paths.insert(client.clone(), value);
+        }
+    }
+    diagnostics
 }
 
 /// Builds the snapshot graph from the structural, syntax, SQL and ORM facts; returns the
@@ -918,6 +1093,18 @@ pub fn assemble(
     // `tsconfig*.json` scopes for partitioning `files_without_document` (contract M6e S10).
     let ts_scopes =
         rb_scip::TsScopes::build(content.manifests.iter().map(|(p, t)| (*p, t.as_str())));
+    // Contract M9c D8′: each ok scip-go job's root and `go.mod` module path, and the references
+    // each scip-go job hands back for the cross-project join after the loop.
+    let go_jobs: Vec<(&str, &str)> = content
+        .scip
+        .iter()
+        .filter(|p| p.indexer == "scip-go" && p.status.is_ok() && p.index.is_some())
+        .filter_map(|p| {
+            let module = content.go_modules.get(&p.root)?;
+            Some((p.root.as_str(), module.as_str()))
+        })
+        .collect();
+    let mut handed_back: Vec<(&str, Vec<scip::External>)> = Vec::new();
     for project in &content.scip {
         let files: BTreeMap<&str, (rb_syntax::Language, &rb_syntax::FileFacts)> = content
             .facts
@@ -925,16 +1112,32 @@ pub fn assemble(
             .filter(|(path, _)| owner_of(path) == Some(project.root.as_str()))
             .map(|(path, (language, facts))| (*path, (*language, *facts)))
             .collect();
-        let coverage = match (&project.status, &project.index) {
-            (rb_scip::RunStatus::Ok, Some(index)) => {
-                let joined = scip::join(
+        // Either `ok`: with its environment, or without it (contract M9d D4).
+        let coverage = match (project.status.is_ok(), &project.index) {
+            (true, Some(index)) => {
+                // The other ok scip-go jobs' module paths (a job sharing this one's module path
+                // included: its references to it are this index's own package, never external).
+                let modules: BTreeSet<&str> = if project.indexer == "scip-go" {
+                    go_jobs
+                        .iter()
+                        .filter(|&&(root, _)| root != project.root)
+                        .map(|&(_, module)| module)
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
+                let mut joined = scip::join_handing_back(
                     index,
                     &project.root,
                     &files,
                     &keys,
                     scip::indexed_languages(project.indexer),
                     &ts_scopes,
+                    &modules,
                 );
+                if !joined.external.is_empty() {
+                    handed_back.push((project.root.as_str(), std::mem::take(&mut joined.external)));
+                }
                 for (path, routes) in &file_routes {
                     for r in &routes.routes {
                         if let rb_frameworks::routes::Handler::Name { text, span } = &r.handler {
@@ -980,6 +1183,11 @@ pub fn assemble(
         };
         diagnostics.push(scip_status(project, coverage.as_ref()));
     }
+    let roots: Vec<&str> = content.scip.iter().map(|p| p.root.as_str()).collect();
+    let (cross_edges, cross_diagnostics) =
+        join_across_projects(&go_jobs, &handed_back, &keys, &roots);
+    drop(handed_back);
+    diagnostics.extend(cross_diagnostics);
     for ((service, key), (package, at)) in packages {
         let node = NodeKey::new(NodeKind::Package, key);
         b.add_node(
@@ -1013,11 +1221,25 @@ pub fn assemble(
     diagnostics.extend(manifest_diagnostics);
     diagnostics.extend(packages::unsupported_frameworks(&manifest_edges));
     // ORM mappings from every file first, so accesses can resolve entities across files.
+    // Go package constants for `fmt.Sprintf` SQL (contract M9b D6), before any file's queries.
+    let go_consts = sql::GoConsts::new(&content.facts);
     for (path, (_, facts)) in &content.facts {
         syntax::add_symbols(&mut b, path, facts, &keys[path])?;
-        diagnostics.extend(sql::add_queries(&mut b, path, facts, &keys[path])?);
+        diagnostics.extend(sql::add_queries(
+            &mut b,
+            path,
+            facts,
+            &keys[path],
+            &go_consts,
+        )?);
     }
-    for e in scip_edges {
+    // Each index's own edges are exact; a cross-project join carries its own certainty:
+    // `exact` for a byte-equal symbol, else `synthetic` (contracts M9c D8′, M9d D8).
+    let scip_edges = scip_edges
+        .into_iter()
+        .map(|e| (e, Certainty::Exact))
+        .chain(cross_edges);
+    for (e, certainty) in scip_edges {
         let src = match e.src {
             scip::Source::Symbol(key) => NodeKey::new(NodeKind::Symbol, key),
             scip::Source::File => NodeKey::new(NodeKind::File, e.at.path.clone()),
@@ -1033,7 +1255,7 @@ pub fn assemble(
                 kind,
                 NodeKey::new(NodeKind::Symbol, e.dst),
                 Provenance::Scip,
-                Certainty::Exact,
+                certainty,
             )
             .evidence(e.at),
         )?;
@@ -1055,7 +1277,7 @@ pub fn assemble(
     let index = index.with_aliases(aliases.clone());
     diagnostics.extend(resolve::add_edges(&mut b, &index, &exact_files)?);
     // Endpoints (contract M4a S4–S8): Spring's context path from each service's
-    // `application.properties`; a YAML file that sets one is counted as unread.
+    // configuration, then from a native config server's shared files (contract M9a D4).
     let service_of = |path: &str| {
         boundaries
             .project_for(path)
@@ -1063,14 +1285,19 @@ pub fn assemble(
     };
     let (spring, config_diagnostics) = spring_config(&content.config, &service_of);
     diagnostics.extend(config_diagnostics);
-    let context_paths: BTreeMap<String, String> = spring
+    let mut context_paths: BTreeMap<String, String> = spring
         .properties
         .iter()
         .filter_map(|(service, p)| {
-            let ctx = p.get("server.servlet.context-path")?.trim();
+            let ctx = p.get(CONTEXT_PATH_KEY)?.trim();
             (!ctx.is_empty()).then(|| (service.clone(), ctx.to_owned()))
         })
         .collect();
+    diagnostics.extend(config_server_context_paths(
+        &content.config,
+        &spring,
+        &mut context_paths,
+    ));
     let has_project = |path: &str| boundaries.project_for(path).is_some();
     // Spring DI (contract M4b S4–S8): `INJECTS` from injection points to beans.
     // (`deployable` computed above: manifest-detected plus `@SpringBootApplication` modules.)
@@ -1116,6 +1343,7 @@ pub fn assemble(
         &considered,
     );
     diagnostics.push(rta::apply(&mut b, &proof, &content.facts, &keys));
+    let data_rest = data_rest_services(&content.config, &spring, &service_of);
     let (route_diagnostics, endpoints) = routes::add_endpoints(
         &mut b,
         &routes::Inputs {
@@ -1127,6 +1355,7 @@ pub fn assemble(
             service_of: &service_of,
             context_paths: &context_paths,
             config_unread: &spring.unread,
+            data_rest: &data_rest,
             specs: &content.specs,
             has_project: &has_project,
         },
@@ -1295,6 +1524,116 @@ pub fn assemble(
     Ok((b.finish()?, diagnostics))
 }
 
+/// The cross-project join after the job loop (contract M9c D8′). Each reference a scip-go job
+/// handed back (`handed_back`: from root, references) names a package another ok scip-go job's
+/// `go.mod` declares (`go_jobs`: root, module path). When exactly one other job has that module
+/// path, the reference joins that job's anchored definition of the same symbol with the version
+/// dropped ([`scip::unversioned`]). When the reference's symbol string is byte-equal to that
+/// definition's, version included, the type checker read the in-repo tree (under a `go.work`,
+/// contract M9d D5), and the edge is `exact` (M9d D8). Otherwise it resolved the name against the
+/// version the module requires (`v0.4.3` from the module cache) while the target is the in-repo
+/// definition (version `.`), and the edge is `synthetic` (M9c). A symbol that job defines without
+/// anchoring it, or does not define, is `unanchored`. Two or more jobs with the module path make
+/// it `ambiguous`, counted against each of them, with no edge. One `scip_cross_project`
+/// diagnostic per (from root, to root) with a count; `keys` are the final symbol keys, `roots`
+/// every job's root (a file's owner is its deepest one).
+fn join_across_projects(
+    go_jobs: &[(&str, &str)],
+    handed_back: &[(&str, Vec<scip::External>)],
+    keys: &BTreeMap<&str, Vec<String>>,
+    roots: &[&str],
+) -> (Vec<(scip::ScipEdge, Certainty)>, Vec<Diagnostic>) {
+    #[derive(Default)]
+    struct Counts {
+        exact: usize,
+        synthetic: usize,
+        ambiguous: usize,
+        unanchored: usize,
+    }
+    let mut counts: BTreeMap<(&str, &str), Counts> = BTreeMap::new();
+    // Per target root, its anchored symbols by join key, built on first use from the keys of
+    // the files it owns (a heuristic key's manager `.` never matches `gomod`).
+    let mut anchored: BTreeMap<&str, BTreeMap<(&str, &str, &str), &str>> = BTreeMap::new();
+    let mut edges = Vec::new();
+    for &(from, ref refs) in handed_back {
+        for r in refs {
+            let Some(key) = scip::unversioned(&r.symbol) else {
+                continue;
+            };
+            let candidates: Vec<&str> = go_jobs
+                .iter()
+                .filter(|&&(root, module)| root != from && module == key.1)
+                .map(|&(root, _)| root)
+                .collect();
+            let to = match candidates[..] {
+                [to] => to,
+                _ => {
+                    for to in candidates {
+                        counts.entry((from, to)).or_default().ambiguous += 1;
+                    }
+                    continue;
+                }
+            };
+            let symbols = anchored.entry(to).or_insert_with(|| {
+                keys.iter()
+                    .filter(|(path, _)| {
+                        projects::owner_root(path, roots.iter().copied()) == Some(to)
+                    })
+                    .flat_map(|(_, file_keys)| file_keys)
+                    .filter_map(|k| scip::unversioned(k).map(|u| (u, k.as_str())))
+                    .collect()
+            });
+            let n = counts.entry((from, to)).or_default();
+            match symbols.get(&key) {
+                Some(dst) => {
+                    // Contract M9d D8: the same string, version included, is the same symbol.
+                    let exact = r.symbol == *dst;
+                    let certainty = if exact {
+                        n.exact += 1;
+                        Certainty::Exact
+                    } else {
+                        n.synthetic += 1;
+                        Certainty::Synthetic
+                    };
+                    edges.push((
+                        scip::ScipEdge {
+                            src: r.src.clone(),
+                            kind: r.kind,
+                            dst: (*dst).to_owned(),
+                            at: r.at.clone(),
+                        },
+                        certainty,
+                    ));
+                }
+                None => n.unanchored += 1,
+            }
+        }
+    }
+    let label = |root: &str| {
+        if root.is_empty() {
+            boundaries::ROOT_DIR.to_owned()
+        } else {
+            root.to_owned()
+        }
+    };
+    let diagnostics = counts
+        .into_iter()
+        .map(|((from, to), n)| Diagnostic {
+            kind: "scip_cross_project".into(),
+            path: Some(label(from)),
+            span: None,
+            detail: json!({
+                "to": label(to),
+                "exact": n.exact,
+                "synthetic": n.synthetic,
+                "ambiguous": n.ambiguous,
+                "unanchored": n.unanchored,
+            }),
+        })
+        .collect();
+    (edges, diagnostics)
+}
+
 /// One `scip_status` diagnostic per job (contract M3b S9). Its detail is a function of the
 /// commit and the cache, never of this run or this host: whether the index was served from the
 /// cache and how long the container ran are reported by `rb index`, not recorded here (design
@@ -1370,10 +1709,21 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
                 detail["coverage"][key] = n.into();
             }
         }
+        // Contract M9d D10: a scip-go index's locals, both counts, only when some local is
+        // typed `invalid type`, so a healthy index dumps as before M9d.
+        if c.locals_invalid_type > 0 {
+            detail["coverage"]["locals_invalid_type"] = c.locals_invalid_type.into();
+            detail["coverage"]["locals"] = c.locals.into();
+        }
     }
+    // An index without its environment keeps the failed fetch's tail: why the environment is
+    // missing (contract M9d D4); one without its workspace keeps the workspace run's (D5b).
     if matches!(
         p.status,
-        rb_scip::RunStatus::Failed(_) | rb_scip::RunStatus::Timeout { .. }
+        rb_scip::RunStatus::Failed(_)
+            | rb_scip::RunStatus::Timeout { .. }
+            | rb_scip::RunStatus::OkWithoutEnvironment
+            | rb_scip::RunStatus::OkWithoutWorkspace
     ) && !p.stderr_tail.is_empty()
     {
         detail["stderr_tail"] = p.stderr_tail.as_str().into();
@@ -2462,6 +2812,45 @@ mod tests {
         assert!(d.detail.get("budget_secs").is_none(), "{}", d.detail);
     }
 
+    /// Contract M9d D4 (C4): a scip-python index made without its environment records `ok`,
+    /// its image, the `fetch` phase and the fetch's tail (why the environment is missing); a
+    /// plain `ok` job records neither.
+    #[test]
+    fn scip_status_records_an_index_without_its_environment() {
+        let mut project = ok_project("", "scip-python", vec![]);
+        project.stderr_tail = "ChefBuildError: pyyaml (6.0)".into();
+        let plain = scip_status(&project, None);
+        assert!(plain.detail.get("phase").is_none(), "{}", plain.detail);
+        assert!(
+            plain.detail.get("stderr_tail").is_none(),
+            "{}",
+            plain.detail
+        );
+        project.status = rb_scip::RunStatus::from_cached("ok", Some("fetch")).unwrap();
+        let d = scip_status(&project, None);
+        assert_eq!(d.detail["status"], "ok");
+        assert_eq!(d.detail["phase"], "fetch");
+        assert_eq!(d.detail["image"], plain.detail["image"]);
+        assert!(d.detail.get("reason").is_none(), "{}", d.detail);
+        assert_eq!(d.detail["stderr_tail"], "ChefBuildError: pyyaml (6.0)");
+    }
+
+    /// Contract M9d D5b (amendment 2): a scip-go index made without its workspace, after the
+    /// workspace run failed, records `ok`, the `index` phase and the workspace run's tail (why
+    /// the workspace failed), and no reason.
+    #[test]
+    fn scip_status_records_an_index_without_its_workspace() {
+        let mut project = ok_project("server", "scip-go", vec![]);
+        project.stderr_tail = "Killed".into();
+        project.status =
+            rb_scip::RunStatus::from_cached("ok", Some("index")).expect("D5b's cached pair");
+        let d = scip_status(&project, None);
+        assert_eq!(d.detail["status"], "ok");
+        assert_eq!(d.detail["phase"], "index");
+        assert!(d.detail.get("reason").is_none(), "{}", d.detail);
+        assert_eq!(d.detail["stderr_tail"], "Killed");
+    }
+
     /// Contract M6a D3, D7: a job's exported link targets (top level, any status) and the
     /// documents it ignored outside its root (coverage) are written only when non-zero.
     #[test]
@@ -2527,6 +2916,51 @@ mod tests {
         without.remove("documents_lombok");
         assert_eq!(
             serde_json::Value::Object(without),
+            scip_status(&project, Some(&plain)).detail["coverage"]
+        );
+    }
+
+    /// Contract M9d D10 (C9): the join carries the decoder's counts of a scip-go index's locals
+    /// into the coverage, and `locals_invalid_type` and `locals` are written only when the
+    /// first is non-zero, so a healthy index dumps as before M9d.
+    #[test]
+    fn invalid_locals_are_written_only_when_non_zero() {
+        let index = rb_scip::ScipIndex {
+            locals: 2,
+            locals_invalid_type: 1,
+            ..Default::default()
+        };
+        let joined = scip::join(
+            &index,
+            "server",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[rb_syntax::Language::Go],
+            &rb_scip::TsScopes::build([]),
+        );
+        assert_eq!(
+            (joined.coverage.locals_invalid_type, joined.coverage.locals),
+            (1, 2)
+        );
+        let project = ok_project("server", "scip-go", vec![]);
+        let d = scip_status(&project, Some(&joined.coverage));
+        assert_eq!(d.detail["coverage"]["locals_invalid_type"], 1);
+        assert_eq!(d.detail["coverage"]["locals"], 2);
+        let plain = scip::Coverage::default();
+        let mut without = d.detail["coverage"].as_object().unwrap().clone();
+        without.remove("locals_invalid_type");
+        without.remove("locals");
+        assert_eq!(
+            serde_json::Value::Object(without),
+            scip_status(&project, Some(&plain)).detail["coverage"]
+        );
+        // Every local typed: neither key, however many locals.
+        let healthy = scip::Coverage {
+            locals: 202_391,
+            ..Default::default()
+        };
+        assert_eq!(
+            scip_status(&project, Some(&healthy)).detail["coverage"],
             scip_status(&project, Some(&plain)).detail["coverage"]
         );
     }
@@ -3032,5 +3466,821 @@ mod tests {
         let root = g.nodes().iter().find(|n| n.key == ".").unwrap();
         assert_eq!(root.attrs["role"], "unassigned");
         assert_eq!(root.name, "(unassigned)");
+    }
+
+    /// Contract M9b D7 (M9b pass 1, E1): a service serves Spring Data REST only when its Maven
+    /// or Gradle build names `spring-boot-starter-data-rest` or `spring-data-rest-webmvc`, and
+    /// its base path is read from `application.properties` or `application.yml` in either
+    /// relaxed form (`base-path`, `basePath`), without slashes; a blank one is none.
+    #[test]
+    fn data_rest_services_need_the_dependency_and_read_the_base_path() {
+        let starter = "<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-rest</artifactId></dependency>";
+        let config: BTreeMap<&str, String> = [
+            ("prop/pom.xml", format!("<project>{starter}</project>")),
+            (
+                "prop/src/main/resources/application.properties",
+                "spring.data.rest.basePath=/rest/\n".to_owned(),
+            ),
+            (
+                "yml/build.gradle",
+                "dependencies {\n    implementation 'org.springframework.boot:spring-boot-starter-data-rest'\n}\n".to_owned(),
+            ),
+            (
+                "yml/src/main/resources/application.yml",
+                "spring:\n  data:\n    rest:\n      base-path: /api/\n".to_owned(),
+            ),
+            (
+                "kts/build.gradle.kts",
+                "dependencies {\n    implementation(\"org.springframework.data:spring-data-rest-webmvc\")\n}\n".to_owned(),
+            ),
+            (
+                "blank/pom.xml",
+                format!("<project>{starter}</project>"),
+            ),
+            (
+                "blank/src/main/resources/application.properties",
+                "spring.data.rest.base-path=  /  \n".to_owned(),
+            ),
+            // A base path without the dependency serves nothing.
+            (
+                "web/pom.xml",
+                "<project><artifactId>spring-boot-starter-web</artifactId></project>".to_owned(),
+            ),
+            (
+                "web/src/main/resources/application.properties",
+                "spring.data.rest.base-path=/api\n".to_owned(),
+            ),
+        ]
+        .into();
+        let service_of = |p: &str| p.split('/').next().unwrap().to_owned();
+        let (spring, _) = spring_config(&config, &service_of);
+        assert_eq!(
+            data_rest_services(&config, &spring, &service_of),
+            BTreeMap::from([
+                ("blank".to_owned(), None),
+                ("kts".to_owned(), None),
+                ("prop".to_owned(), Some("rest".to_owned())),
+                ("yml".to_owned(), Some("api".to_owned())),
+            ])
+        );
+    }
+
+    /// Contract M9b N1 (M9a pass 2): a config server's context-path value is trimmed, so a
+    /// padded quoted value is its path and a whitespace-only one is empty and clears a local
+    /// context path, as for local files.
+    #[test]
+    fn config_server_context_path_values_are_trimmed() {
+        let shared = "config/src/main/resources/shared";
+        let config: BTreeMap<&str, String> = [
+            (
+                "config/src/main/resources/shared/acct-service.yml",
+                "server:\n  servlet:\n    context-path: \" /acct \"\n".to_owned(),
+            ),
+            (
+                "config/src/main/resources/shared/blank-service.yml",
+                "server:\n  servlet:\n    context-path: \"   \"\n".to_owned(),
+            ),
+        ]
+        .into();
+        let props = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let spring = SpringConfig {
+            properties: [
+                (
+                    "config".to_owned(),
+                    props(&[
+                        (ACTIVE_PROFILES_KEY, "native"),
+                        (
+                            "spring.cloud.config.server.native.search-locations",
+                            "classpath:/shared/",
+                        ),
+                    ]),
+                ),
+                (
+                    "acct".to_owned(),
+                    props(&[("spring.application.name", "acct-service")]),
+                ),
+                (
+                    "blank".to_owned(),
+                    props(&[("spring.application.name", "blank-service")]),
+                ),
+            ]
+            .into(),
+            clients: ["acct".to_owned(), "blank".to_owned()].into(),
+            ..SpringConfig::default()
+        };
+        assert!(config.keys().all(|k| k.starts_with(shared)));
+        let mut context_paths: BTreeMap<String, String> =
+            [("blank".to_owned(), "/local".to_owned())].into();
+        config_server_context_paths(&config, &spring, &mut context_paths);
+        assert_eq!(
+            context_paths,
+            BTreeMap::from([("acct".to_owned(), "/acct".to_owned())])
+        );
+    }
+
+    /// Contract M9a D4 (bench B14): a native config server's shared files set its clients'
+    /// context paths, matched by `spring.application.name`, above local files and with
+    /// `<name>.*` above `application.*`; the prefixed path is `synthetic` and counted.
+    #[test]
+    fn config_server_shared_files_set_client_context_paths() {
+        let controller = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass C { @GetMapping(\"/x\") String x() { return \"\"; } }\n";
+        let facts = rb_syntax::extract(rb_syntax::Language::Java, controller.as_bytes()).unwrap();
+        // Each top directory is a service with a `pom.xml` and the controller (files under
+        // `src/` belong to a project at the repository root); returns its `EXPOSES` targets
+        // with their certainty and the `config_server_*` diagnostics.
+        let run = |config: &[(&str, &str)]| -> (Vec<String>, Vec<String>) {
+            let dirs: BTreeSet<&str> = config
+                .iter()
+                .map(|(p, _)| match p.split('/').next().unwrap() {
+                    "src" => boundaries::ROOT_DIR,
+                    d => d,
+                })
+                .collect();
+            let under = |d: &str, rest: &str| {
+                if d == boundaries::ROOT_DIR {
+                    rest.to_owned()
+                } else {
+                    format!("{d}/{rest}")
+                }
+            };
+            let poms: Vec<String> = dirs.iter().map(|d| under(d, "pom.xml")).collect();
+            let java: Vec<String> = dirs
+                .iter()
+                .map(|d| under(d, "src/main/java/p/C.java"))
+                .collect();
+            let paths = config.iter().map(|(p, _)| *p);
+            let manifest = Manifest {
+                commit_sha: "c".repeat(40),
+                files: paths
+                    .clone()
+                    .chain(poms.iter().map(String::as_str))
+                    .chain(java.iter().map(String::as_str))
+                    .map(entry)
+                    .collect(),
+                skipped: vec![],
+            };
+            let projects = dirs
+                .iter()
+                .zip(&poms)
+                .map(|(d, pom)| project(d, pom))
+                .collect();
+            let boundaries = Boundaries::new(projects, vec![]);
+            let content = Content {
+                facts: java
+                    .iter()
+                    .map(|p| (p.as_str(), (rb_syntax::Language::Java, &facts)))
+                    .collect(),
+                config: config
+                    .iter()
+                    .map(|(p, t)| (*p, (*t).to_owned()))
+                    .chain(poms.iter().map(|p| (p.as_str(), "<project/>\n".to_owned())))
+                    .collect(),
+                ..Content::default()
+            };
+            let (g, diagnostics) = assemble(&manifest, None, &boundaries, &content).unwrap();
+            let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+            let exposes = g
+                .edges()
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Exposes)
+                .map(|e| format!("{} [{}]", key(e.dst), e.certainty.as_str()))
+                .collect();
+            let counted = diagnostics
+                .iter()
+                .filter(|d| d.kind.starts_with("config_server_"))
+                .map(|d| format!("{} {}", d.kind, d.detail))
+                .collect();
+            (exposes, counted)
+        };
+        let res = "src/main/resources";
+        let client = |name: &str| {
+            format!(
+                "spring:\n  application:\n    name: {name}\n  cloud:\n    config:\n      uri: http://config:8888\n"
+            )
+        };
+        // The server is itself a named config client (`fail-fast`), so only the "other than
+        // the server" rule keeps the shared `application.yml` off its route. Its locations
+        // carry a trailing `/`, padding, and a second `classpath:` location last.
+        let native = "spring:\n  application:\n    name: config-service\n  cloud:\n    config:\n      fail-fast: true\n      server:\n        native:\n          search-locations: classpath:/shared/ , file:/extra,  classpath:/{application}, classpath:common\n  profiles:\n     active: native\n";
+        let names = [
+            "acct", "alpha", "beta", "eps", "gamma", "iota", "notes", "stats", "theta", "zeta",
+        ];
+        let clients: Vec<String> = names
+            .iter()
+            .map(|n| client(&format!("{n}-service")))
+            .collect();
+        let path = |text: &str| format!("server:\n  servlet:\n    context-path: {text}\n");
+        let (app, accounts, beta_yml, eps, gamma_shared, gamma_common, zeta) = (
+            path("/app"),
+            path("/accounts"),
+            path("/beta-yml"),
+            path("\"\""),
+            path("/gamma-shared"),
+            path("/gamma-common"),
+            path(""),
+        );
+        let shared = [
+            (format!("config/{res}/shared/application.yml"), app.as_str()),
+            (
+                format!("config/{res}/shared/acct-service.yml"),
+                accounts.as_str(),
+            ),
+            // Not read: a `file:` location and a placeholder location.
+            (
+                format!("config/{res}/extra/notes-service.yml"),
+                "server:\n  servlet:\n    context-path: /from-file\n",
+            ),
+            (
+                format!("config/{res}/{{application}}/notes-service.yml"),
+                "server:\n  servlet:\n    context-path: /from-placeholder\n",
+            ),
+            // Only the unconditional documents are read, in YAML and in `.properties`.
+            (
+                format!("config/{res}/shared/alpha-service.yml"),
+                "server:\n  servlet:\n    context-path: /alpha\n---\nspring:\n  profiles: docker\nserver:\n  servlet:\n    context-path: /docker-alpha\n",
+            ),
+            (
+                format!("config/{res}/shared/iota-service.properties"),
+                "server.servlet.context-path=/iota\n#---\nspring.config.activate.on-profile=docker\nserver.servlet.context-path=/docker-iota\n",
+            ),
+            // In one location `.properties` beats YAML.
+            (
+                format!("config/{res}/shared/beta-service.yml"),
+                beta_yml.as_str(),
+            ),
+            (
+                format!("config/{res}/shared/beta-service.properties"),
+                "server.servlet.context-path=/beta-props\n",
+            ),
+            // A later location beats an earlier one.
+            (
+                format!("config/{res}/shared/gamma-service.yml"),
+                gamma_shared.as_str(),
+            ),
+            (
+                format!("config/{res}/common/gamma-service.yml"),
+                gamma_common.as_str(),
+            ),
+            // An empty remote value is the root context, over a local path (evaluator pass 1,
+            // E3) and over the shared `application.yml`; an absent key overrides nothing.
+            (format!("config/{res}/shared/eps-service.yml"), eps.as_str()),
+            (
+                format!("config/{res}/shared/zeta-service.yml"),
+                zeta.as_str(),
+            ),
+            (
+                format!("config/{res}/shared/theta-service.yml"),
+                "management:\n  port: 9000\n",
+            ),
+        ];
+        let mut files: Vec<(String, &str)> = vec![
+            (format!("config/{res}/application.yml"), native),
+            // The client's directory is not its name; its local context path ranks lowest.
+            (
+                format!("account/{res}/application.properties"),
+                "server.servlet.context-path=/local\n",
+            ),
+            (
+                format!("eps/{res}/application.properties"),
+                "server.servlet.context-path=/local-eps\n",
+            ),
+            // The same name without a config client.
+            (
+                format!("other/{res}/application.properties"),
+                "spring.application.name=acct-service\n",
+            ),
+        ];
+        for (n, text) in names.iter().zip(&clients) {
+            let dir = if *n == "acct" { "account" } else { n };
+            files.push((format!("{dir}/{res}/bootstrap.yml"), text));
+        }
+        files.extend(shared.iter().map(|(p, t)| (p.clone(), *t)));
+        let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        let applied = |service: &str, file: &str, context_path: &str| {
+            format!(
+                r#"config_server_context_path {{"context_path":"{context_path}","file":"config/src/main/resources/{file}","service":"{service}"}}"#
+            )
+        };
+        assert_eq!(
+            run(&borrowed),
+            (
+                vec![
+                    "HTTP GET /accounts/x @account [synthetic]".to_owned(),
+                    "HTTP GET /alpha/x @alpha [synthetic]".to_owned(),
+                    "HTTP GET /beta-props/x @beta [synthetic]".to_owned(),
+                    "HTTP GET /x @config [exact]".to_owned(),
+                    "HTTP GET /x @eps [exact]".to_owned(),
+                    "HTTP GET /gamma-common/x @gamma [synthetic]".to_owned(),
+                    "HTTP GET /iota/x @iota [synthetic]".to_owned(),
+                    "HTTP GET /app/x @notes [synthetic]".to_owned(),
+                    "HTTP GET /x @other [exact]".to_owned(),
+                    "HTTP GET /app/x @stats [synthetic]".to_owned(),
+                    "HTTP GET /app/x @theta [synthetic]".to_owned(),
+                    "HTTP GET /x @zeta [exact]".to_owned(),
+                ],
+                vec![
+                    applied("account", "shared/acct-service.yml", "/accounts"),
+                    applied("alpha", "shared/alpha-service.yml", "/alpha"),
+                    applied("beta", "shared/beta-service.properties", "/beta-props"),
+                    applied("eps", "shared/eps-service.yml", ""),
+                    applied("gamma", "common/gamma-service.yml", "/gamma-common"),
+                    applied("iota", "shared/iota-service.properties", "/iota"),
+                    applied("notes", "shared/application.yml", "/app"),
+                    applied("stats", "shared/application.yml", "/app"),
+                    applied("theta", "shared/application.yml", "/app"),
+                    applied("zeta", "shared/zeta-service.yml", ""),
+                ],
+            )
+        );
+        let acct = clients[0].as_str();
+        // `searchLocations` (camelCase) in `.properties`, and a server at the repository root.
+        let camel = [
+            (
+                format!("config/{res}/application.properties"),
+                "spring.profiles.active=native\nspring.cloud.config.server.native.searchLocations=classpath:/shared\n",
+            ),
+            (format!("account/{res}/bootstrap.yml"), acct),
+            (shared[1].0.clone(), shared[1].1),
+        ];
+        let root = [
+            (
+                format!("{res}/application.yml"),
+                "spring:\n  profiles:\n    active: native\n  cloud:\n    config:\n      server:\n        native:\n          search-locations: classpath:/shared\n",
+            ),
+            (format!("account/{res}/bootstrap.yml"), acct),
+            (format!("{res}/shared/acct-service.yml"), shared[1].1),
+        ];
+        for (files, server, file) in [
+            (&camel, "@config", "config/src/main/resources/shared"),
+            (&root, "@.", "src/main/resources/shared"),
+        ] {
+            let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+            let mut exposes = vec![
+                "HTTP GET /accounts/x @account [synthetic]".to_owned(),
+                format!("HTTP GET /x {server} [exact]"),
+            ];
+            exposes.sort();
+            let (mut got, counted) = run(&borrowed);
+            got.sort();
+            assert_eq!(
+                (got, counted),
+                (
+                    exposes,
+                    vec![format!(
+                        r#"config_server_context_path {{"context_path":"/accounts","file":"{file}/acct-service.yml","service":"account"}}"#
+                    )],
+                ),
+                "{server}"
+            );
+        }
+        // Local files follow the same rule: Spring reads YAML null and `key=` as the empty
+        // string, the root context, so a higher-ranked empty value clears a lower path.
+        let (boot, quoted, kept) = (path("/boot"), path("\"\""), path("/kept"));
+        let local = [
+            (format!("lbase/{res}/application.yml"), kept.as_str()),
+            (format!("lyml/{res}/bootstrap.yml"), boot.as_str()),
+            (format!("lyml/{res}/application.yml"), quoted.as_str()),
+            (
+                format!("lprof/{res}/application.properties"),
+                "spring.profiles.active=dev\nserver.servlet.context-path=/base\n",
+            ),
+            (
+                format!("lprof/{res}/application-dev.properties"),
+                "server.servlet.context-path=\n",
+            ),
+            (
+                format!("lnull/{res}/application.properties"),
+                "spring.profiles.active=dev\nserver.servlet.context-path=/base\n",
+            ),
+            (format!("lnull/{res}/application-dev.yml"), zeta.as_str()),
+        ];
+        let borrowed: Vec<(&str, &str)> = local.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        assert_eq!(
+            run(&borrowed),
+            (
+                vec![
+                    "HTTP GET /kept/x @lbase [synthetic]".to_owned(),
+                    "HTTP GET /x @lnull [exact]".to_owned(),
+                    "HTTP GET /x @lprof [exact]".to_owned(),
+                    "HTTP GET /x @lyml [exact]".to_owned(),
+                ],
+                vec![],
+            )
+        );
+        // A git backend serves nothing rb reads, even with native locations configured.
+        let git = "spring:\n  cloud:\n    config:\n      server:\n        git:\n          uri: https://example.com/cfg\n        native:\n          search-locations: classpath:/shared\n  profiles:\n     active: git\n";
+        let git_files = [
+            (format!("config/{res}/application.yml"), git),
+            (format!("account/{res}/bootstrap.yml"), acct),
+            (shared[1].0.clone(), shared[1].1),
+        ];
+        let borrowed: Vec<(&str, &str)> = git_files.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        assert_eq!(
+            run(&borrowed),
+            (
+                vec![
+                    "HTTP GET /x @account [exact]".to_owned(),
+                    "HTTP GET /x @config [exact]".to_owned(),
+                ],
+                vec![],
+            )
+        );
+        // Two native servers: nothing applies, and they are counted.
+        let two = [
+            (format!("config/{res}/application.yml"), native),
+            (format!("config2/{res}/application.yml"), native),
+            (format!("account/{res}/bootstrap.yml"), acct),
+            (shared[1].0.clone(), shared[1].1),
+            (
+                format!("config2/{res}/shared/acct-service.yml"),
+                shared[1].1,
+            ),
+        ];
+        let borrowed: Vec<(&str, &str)> = two.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        assert_eq!(
+            run(&borrowed),
+            (
+                vec![
+                    "HTTP GET /x @account [exact]".to_owned(),
+                    "HTTP GET /x @config [exact]".to_owned(),
+                    "HTTP GET /x @config2 [exact]".to_owned(),
+                ],
+                vec![r#"config_server_ambiguous {"servers":["config","config2"]}"#.to_owned()],
+            )
+        );
+    }
+
+    /// Contract M9c amendment 2, D8′ (C9′): a scip-go reference counted `references_external`
+    /// whose package is another ok scip-go job's `go.mod` module joins that job's definition of
+    /// the same symbol with the version dropped, as a `scip` edge of certainty `synthetic`.
+    /// A stdlib, a dependency and an unknown module's reference do not join; a symbol the other
+    /// job defines without anchoring it, or does not define, is `unanchored`; a namespace
+    /// occurrence is never handed back; two jobs with the module path are `ambiguous`, with no
+    /// edge. One `scip_cross_project` diagnostic per (from root, to root) counts each.
+    /// Amendment 3 (E3): a symbol under another manager is never handed back, and a failed job
+    /// is no candidate.
+    #[test]
+    fn external_references_join_another_projects_definitions() {
+        const SRV: &str = "example.com/mm/server/v8";
+        const PUB: &str = "example.com/mm/server/public";
+        const TOOLS: &str = "example.com/mm/tools";
+        let go = |src: &str| rb_syntax::extract(rb_syntax::Language::Go, src.as_bytes()).unwrap();
+        let server = go(concat!(
+            "package app\n\n",
+            "func Run() {\n",
+            "\tmodel.NewId()\n",
+            "\tvar u model.User\n",
+            "\tos.Getenv(\"HOME\")\n",
+            "\tdep.Do()\n",
+            "\tother.F()\n",
+            "\tmodel.Hidden()\n",
+            "\tmodel.Gone()\n",
+            "\tmodel.Npm()\n",
+            "\tmodel.Kind(\"x\")\n",
+            "\tmodel()\n",
+            "}\n",
+        ));
+        let public = go(
+            "package model\n\nfunc NewId() {}\n\ntype User struct{}\n\nfunc Hidden() {}\n\nfunc Npm() {}\n\ntype Kind string\n",
+        );
+        let tools = go("package tools\n\nfunc Tool() {}\n");
+        // The positive control: the references the rows below rely on are facts.
+        let refs: BTreeSet<(&str, rb_syntax::RefKind)> = server
+            .references
+            .iter()
+            .map(|r| (r.name.as_str(), r.kind))
+            .collect();
+        for (name, kind) in [
+            ("NewId", rb_syntax::RefKind::Call),
+            ("User", rb_syntax::RefKind::Type),
+            ("Getenv", rb_syntax::RefKind::Call),
+            ("Do", rb_syntax::RefKind::Call),
+            ("F", rb_syntax::RefKind::Call),
+            ("Hidden", rb_syntax::RefKind::Call),
+            ("Gone", rb_syntax::RefKind::Call),
+            ("Npm", rb_syntax::RefKind::Call),
+            ("Kind", rb_syntax::RefKind::Call),
+            ("model", rb_syntax::RefKind::Call),
+        ] {
+            assert!(refs.contains(&(name, kind)), "{name}: {refs:?}");
+        }
+        let external = |d: &str| format!("scip-go gomod {PUB} v0.4.3 `{PUB}/model`/{d}");
+        let own_public = |d: &str| format!("scip-go gomod {PUB} . `{PUB}/model`/{d}");
+        let run = format!("scip-go gomod {SRV} . `{SRV}/app`/Run().");
+        let server_sym = |name: &str| match name {
+            "Run" => run.clone(),
+            // `model.Kind("x")` converts to a type: a reference, never a call (amendment 3).
+            "User" | "Kind" => external(&format!("{name}#")),
+            "Getenv" => "scip-go gomod github.com/golang/go/src go1.23 os/Getenv().".into(),
+            "Do" => "scip-go gomod github.com/acme/dep v1.2.0 `github.com/acme/dep`/Do().".into(),
+            "F" => "scip-go gomod example.com/nobody v0.1.0 `example.com/nobody`/F().".into(),
+            // The module path of an ok job under another manager: not a Go module, never handed
+            // back (amendment 3, E3).
+            "Npm" => format!("scip-go npm {PUB} v0.4.3 `{PUB}/model`/Npm()."),
+            // A namespace symbol whose descriptor names the token.
+            "model" => format!("scip-go gomod {PUB} v0.4.3 model/"),
+            other => external(&format!("{other}().")),
+        };
+        let public_sym = |name: &str| match name {
+            "User" | "Kind" => own_public(&format!("{name}#")),
+            other => own_public(&format!("{other}().")),
+        };
+        // `Hidden().` is defined, but at the `package` keyword, where no Tree-sitter definition
+        // is: no node is anchored to it.
+        let public_doc = |root_relative: &str| {
+            let mut doc = document_for(root_relative, &public, &public_sym);
+            for o in &mut doc.occurrences {
+                if o.symbol == own_public("Hidden().") {
+                    o.span = [0, 0, 0, 7];
+                }
+            }
+            doc
+        };
+        let tools_sym = |name: &str| format!("scip-go gomod {TOOLS} . `{TOOLS}`/{name}().");
+        // A second job declaring `PUB`: none, ok, or failed (amendment 3, E3: only an ok job is
+        // a candidate).
+        #[derive(Clone, Copy, PartialEq)]
+        enum Dup {
+            None,
+            Ok,
+            Failed,
+        }
+        let assemble_with = |copy: Dup| {
+            let mut roots = vec![("server", SRV), ("public", PUB), ("tools", TOOLS)];
+            if copy != Dup::None {
+                roots.push(("copy", PUB));
+            }
+            let mut facts = BTreeMap::from([
+                ("server/app/a.go", (rb_syntax::Language::Go, &server)),
+                ("public/model/m.go", (rb_syntax::Language::Go, &public)),
+                ("tools/t.go", (rb_syntax::Language::Go, &tools)),
+            ]);
+            let mut scip = vec![
+                ok_project(
+                    "server",
+                    "scip-go",
+                    vec![document_for("app/a.go", &server, &server_sym)],
+                ),
+                ok_project("public", "scip-go", vec![public_doc("model/m.go")]),
+                ok_project(
+                    "tools",
+                    "scip-go",
+                    vec![document_for("t.go", &tools, &tools_sym)],
+                ),
+            ];
+            if copy != Dup::None {
+                facts.insert("copy/model/m.go", (rb_syntax::Language::Go, &public));
+                let mut project = ok_project("copy", "scip-go", vec![public_doc("model/m.go")]);
+                if copy == Dup::Failed {
+                    project.status = rb_scip::RunStatus::Failed(rb_scip::Phase::Index);
+                    project.index = None;
+                }
+                scip.push(project);
+            }
+            let manifest = Manifest {
+                commit_sha: "c".repeat(40),
+                files: roots
+                    .iter()
+                    .map(|(root, _)| format!("{root}/go.mod"))
+                    .chain(facts.keys().map(|p| (*p).to_owned()))
+                    .map(|p| entry(&p))
+                    .collect(),
+                skipped: vec![],
+            };
+            let boundaries = Boundaries::new(
+                roots
+                    .iter()
+                    .map(|(root, _)| project(root, &format!("{root}/go.mod")))
+                    .collect(),
+                vec![],
+            );
+            let content = Content {
+                facts,
+                go_modules: roots
+                    .iter()
+                    .map(|(root, module)| ((*root).to_owned(), (*module).to_owned()))
+                    .collect(),
+                scip,
+                ..Content::default()
+            };
+            assemble(&manifest, None, &boundaries, &content).unwrap()
+        };
+        let scip_edges = |g: &Graph| -> Vec<(String, EdgeKind, String, Certainty)> {
+            let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+            let mut out: Vec<(String, EdgeKind, String, Certainty)> = g
+                .edges()
+                .iter()
+                .filter(|e| {
+                    e.provenance == Provenance::Scip
+                        && matches!(e.kind, EdgeKind::Calls | EdgeKind::References)
+                })
+                .map(|e| (key(e.src), e.kind, key(e.dst), e.certainty))
+                .collect();
+            out.sort();
+            out
+        };
+        let cross = |diagnostics: &[Diagnostic]| -> Vec<(Option<String>, Value)> {
+            let mut out: Vec<(Option<String>, Value)> = diagnostics
+                .iter()
+                .filter(|d| d.kind == "scip_cross_project")
+                .map(|d| (d.path.clone(), d.detail.clone()))
+                .collect();
+            out.sort_by_key(|(path, detail)| (path.clone(), detail.to_string()));
+            out
+        };
+        let (g, diagnostics) = assemble_with(Dup::None);
+        let alone = (scip_edges(&g), cross(&diagnostics));
+        assert_eq!(
+            scip_edges(&g),
+            [
+                // public's own references at its types' names, exact as before.
+                (
+                    own_public("Kind#"),
+                    EdgeKind::References,
+                    own_public("Kind#"),
+                    Certainty::Exact,
+                ),
+                (
+                    own_public("User#"),
+                    EdgeKind::References,
+                    own_public("User#"),
+                    Certainty::Exact,
+                ),
+                (
+                    run.clone(),
+                    EdgeKind::Calls,
+                    own_public("NewId()."),
+                    Certainty::Synthetic,
+                ),
+                (
+                    run.clone(),
+                    EdgeKind::References,
+                    own_public("Kind#"),
+                    Certainty::Synthetic,
+                ),
+                (
+                    run.clone(),
+                    EdgeKind::References,
+                    own_public("User#"),
+                    Certainty::Synthetic,
+                ),
+            ]
+        );
+        assert_eq!(
+            cross(&diagnostics),
+            [(
+                Some("server".to_owned()),
+                json!({"to": "public", "exact": 0, "synthetic": 3, "ambiguous": 0, "unanchored": 2}),
+            )]
+        );
+        // `references_external` keeps its meaning: all ten are still counted there.
+        let external_count = diagnostics
+            .iter()
+            .find(|d| d.kind == "scip_status" && d.path.as_deref() == Some("server"))
+            .map(|d| d.detail["coverage"]["references_external"].clone());
+        assert_eq!(external_count, Some(json!(10)));
+        // A failed second job with the module path is no candidate: the joins stand as alone.
+        let (g, diagnostics) = assemble_with(Dup::Failed);
+        assert_eq!((scip_edges(&g), cross(&diagnostics)), alone);
+        // An ok second job with the module path: no edge, and each candidate pair counts it.
+        let (g, diagnostics) = assemble_with(Dup::Ok);
+        assert!(
+            scip_edges(&g)
+                .iter()
+                .all(|(.., certainty)| *certainty != Certainty::Synthetic),
+            "{:?}",
+            scip_edges(&g)
+        );
+        assert_eq!(
+            cross(&diagnostics),
+            [
+                (
+                    Some("server".to_owned()),
+                    json!({"to": "copy", "exact": 0, "synthetic": 0, "ambiguous": 5, "unanchored": 0}),
+                ),
+                (
+                    Some("server".to_owned()),
+                    json!({"to": "public", "exact": 0, "synthetic": 0, "ambiguous": 5, "unanchored": 0}),
+                ),
+            ]
+        );
+    }
+
+    /// Contract M9d D8 (C7): a handed-back reference whose symbol string is byte-equal to the
+    /// defining job's definition (version `.`: the type checker read the in-repo tree, under a
+    /// `go.work`) joins it `exact`; one at the module cache's version (`v0.4.3` against `.`)
+    /// joins it `synthetic`, as M9c built it. The `scip_cross_project` diagnostic counts each.
+    /// D9 at the graph: the in-repo module at `.` is no `Package`, the cached version still is.
+    #[test]
+    fn byte_equal_cross_project_symbols_join_exact() {
+        const SRV: &str = "example.com/mm/server/v8";
+        const PUB: &str = "example.com/mm/server/public";
+        let go = |src: &str| rb_syntax::extract(rb_syntax::Language::Go, src.as_bytes()).unwrap();
+        let server = go(concat!(
+            "package app\n\n",
+            "func Run() {\n",
+            "\tmodel.NewId()\n",
+            "\tmodel.Old()\n",
+            "\tvar u model.User\n",
+            "}\n",
+        ));
+        let public =
+            go("package model\n\nfunc NewId() {}\n\nfunc Old() {}\n\ntype User struct{}\n");
+        let own_public = |d: &str| format!("scip-go gomod {PUB} . `{PUB}/model`/{d}");
+        let run = format!("scip-go gomod {SRV} . `{SRV}/app`/Run().");
+        let server_sym = |name: &str| match name {
+            "Run" => run.clone(),
+            // Resolved against the module cache: the version differs from the definition's.
+            "Old" => format!("scip-go gomod {PUB} v0.4.3 `{PUB}/model`/Old()."),
+            "User" => own_public("User#"),
+            other => own_public(&format!("{other}().")),
+        };
+        let public_sym = |name: &str| match name {
+            "User" => own_public("User#"),
+            other => own_public(&format!("{other}().")),
+        };
+        let roots = [("server", SRV), ("public", PUB)];
+        let facts = BTreeMap::from([
+            ("server/app/a.go", (rb_syntax::Language::Go, &server)),
+            ("public/model/m.go", (rb_syntax::Language::Go, &public)),
+        ]);
+        let manifest = Manifest {
+            commit_sha: "c".repeat(40),
+            files: roots
+                .iter()
+                .map(|(root, _)| format!("{root}/go.mod"))
+                .chain(facts.keys().map(|p| (*p).to_owned()))
+                .map(|p| entry(&p))
+                .collect(),
+            skipped: vec![],
+        };
+        let boundaries = Boundaries::new(
+            roots
+                .iter()
+                .map(|(root, _)| project(root, &format!("{root}/go.mod")))
+                .collect(),
+            vec![],
+        );
+        let content = Content {
+            facts,
+            go_modules: roots
+                .iter()
+                .map(|(root, module)| ((*root).to_owned(), (*module).to_owned()))
+                .collect(),
+            scip: vec![
+                ok_project(
+                    "server",
+                    "scip-go",
+                    vec![document_for("app/a.go", &server, &server_sym)],
+                ),
+                ok_project(
+                    "public",
+                    "scip-go",
+                    vec![document_for("model/m.go", &public, &public_sym)],
+                ),
+            ],
+            ..Content::default()
+        };
+        let (g, diagnostics) = assemble(&manifest, None, &boundaries, &content).unwrap();
+        let key = |id: i64| g.nodes().iter().find(|n| n.id == id).unwrap().key.clone();
+        let mut from_run: Vec<(EdgeKind, String, Certainty)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.provenance == Provenance::Scip && key(e.src) == run)
+            .map(|e| (e.kind, key(e.dst), e.certainty))
+            .collect();
+        from_run.sort();
+        assert_eq!(
+            from_run,
+            [
+                (EdgeKind::Calls, own_public("NewId()."), Certainty::Exact),
+                (EdgeKind::Calls, own_public("Old()."), Certainty::Synthetic),
+                (EdgeKind::References, own_public("User#"), Certainty::Exact),
+            ]
+        );
+        let cross: Vec<(Option<String>, Value)> = diagnostics
+            .iter()
+            .filter(|d| d.kind == "scip_cross_project")
+            .map(|d| (d.path.clone(), d.detail.clone()))
+            .collect();
+        assert_eq!(
+            cross,
+            [(
+                Some("server".to_owned()),
+                json!({"to": "public", "exact": 2, "synthetic": 1, "ambiguous": 0, "unanchored": 0}),
+            )]
+        );
+        let packages: Vec<String> = g
+            .nodes()
+            .iter()
+            .filter(|n| n.kind == NodeKind::Package)
+            .map(|n| n.key.clone())
+            .collect();
+        assert_eq!(packages, [format!("go/{PUB}@v0.4.3")]);
     }
 }

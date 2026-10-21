@@ -109,14 +109,15 @@ mod tests {
     /// scip-typescript's recipe gives another key for the same files. Contract M6e phase 11:
     /// allow-listing `plugins-artifacts.gradle.org` moves the key (the allow-list is part of
     /// it by M5 S21, so the refused Gradle fetch retries); the new value was printed by the
-    /// failing test.
+    /// failing test. Contract M9d D12b: `RECIPE_JAVA` `m9d-java-1` moves it again (every
+    /// Maven job re-runs once); the new value was printed by the failing test.
     #[test]
     fn the_java_key_is_pinned_across_the_recipe_split() {
         let files = [("svc/pom.xml", "1"), ("svc/src/A.java", "2")];
-        assert_eq!(crate::RECIPE_JAVA, "m5-egress-1");
+        assert_eq!(crate::RECIPE_JAVA, "m9d-java-1");
         assert_eq!(
             key(files),
-            "c1fd98fd1f72a5121ed58244bcd16d4d1142c2be3090597dec9a907622977704"
+            "4e2b943d7f247252f487857ec5a7da1260a44b059fb2afb01b3cb242e64565d5"
         );
         assert_ne!(
             project_input_hash(crate::RECIPE_TS, files, &crate::Egress::default()),

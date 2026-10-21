@@ -19,6 +19,8 @@ use crate::work::Counted;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Framework {
     Spring,
+    /// Spring Data REST repository resources (contract M9b D7).
+    SpringDataRest,
     Express,
     Gin,
     Chi,
@@ -30,6 +32,7 @@ impl Framework {
     pub fn as_str(self) -> &'static str {
         match self {
             Framework::Spring => "spring",
+            Framework::SpringDataRest => "spring-data-rest",
             Framework::Express => "express",
             Framework::Gin => "gin",
             Framework::Chi => "chi",
@@ -525,11 +528,13 @@ fn mapping_paths(d: &Decoration) -> Result<Vec<String>, String> {
     let Some(arg) = arg else {
         return Ok(vec![String::new()]);
     };
-    let values: Vec<&DecorationArg> = if arg.items.is_empty() && !arg.value.starts_with('{') {
-        vec![arg]
-    } else {
-        arg.items.iter().collect()
-    };
+    // A string literal is a path even when it starts with `{` (`"{taskId}"`).
+    let values: Vec<&DecorationArg> =
+        if arg.items.is_empty() && (arg.literal || !arg.value.starts_with('{')) {
+            vec![arg]
+        } else {
+            arg.items.iter().collect()
+        };
     if values.is_empty() {
         return Ok(vec![String::new()]);
     }
@@ -572,6 +577,7 @@ fn spring(facts: &FileScope<'_>, out: &mut FileRoutes) {
             .collect();
         match def.kind {
             DefKind::Interface => {
+                spring_data_rest(facts, class, &methods, out);
                 // Feign clients are HTTP clients (S10); any other interface's mappings are
                 // counted, not resolved (D12).
                 if def
@@ -667,6 +673,155 @@ fn spring(facts: &FileScope<'_>, out: &mut FileRoutes) {
             }
             _ => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Spring Data REST (contract M9b D7)
+
+const SPRING_DATA_REST: &str = "org.springframework.data.rest.core.annotation";
+/// Packages a Spring Data repository base is imported from.
+const SPRING_DATA_REPOSITORY: &[&str] = &[
+    "org.springframework.data.repository",
+    "org.springframework.data.jpa.repository",
+];
+/// Bases whose collection resource also takes `POST`, with item resources.
+const CRUD_BASES: &[&str] = &["CrudRepository", "ListCrudRepository", "JpaRepository"];
+/// Subjects of a query method a search resource exports.
+const SEARCH_SUBJECTS: &[&str] = &["find", "read", "get", "query", "count", "exists"];
+/// `CrudRepository`'s own methods: their export depends on the Spring Data version.
+const CRUD_METHODS: &[&str] = &[
+    "findById",
+    "findAll",
+    "findOne",
+    "count",
+    "existsById",
+    "findAllById",
+];
+
+/// Whether `d`'s `exported` attribute leaves the resource exported: absent or `true`.
+fn exported(d: &Decoration) -> bool {
+    d.args
+        .iter()
+        .find(|a| a.key.as_deref() == Some("exported"))
+        .is_none_or(|a| a.value.trim() == "true")
+}
+
+/// The literal, non-blank `path` attribute of `d`, without surrounding slashes.
+fn literal_path(d: &Decoration) -> Option<String> {
+    let arg = d.args.iter().find(|a| a.key.as_deref() == Some("path"))?;
+    let path = arg.value.trim().trim_matches('/');
+    (arg.literal && arg.items.is_empty() && !path.is_empty()).then(|| path.to_owned())
+}
+
+/// Whether a written supertype is a Spring Data repository base: qualified, or imported by name
+/// or by a wildcard of its package.
+fn repository_base<'n>(facts: &FileFacts, written: &'n str) -> Option<&'n str> {
+    let base = simple(written);
+    if !crate::REPOSITORY_BASES.contains(&base) {
+        return None;
+    }
+    let qualified = SPRING_DATA_REPOSITORY
+        .iter()
+        .any(|p| written == format!("{p}.{base}"));
+    let imported = written == base
+        && facts.imports.iter().any(|i| {
+            !i.is_static
+                && SPRING_DATA_REPOSITORY.contains(&i.module.as_str())
+                && (i.wildcard || i.names.iter().any(|n| n.name == base && n.local == base))
+        });
+    (qualified || imported).then_some(base)
+}
+
+/// Whether `name` is a query method a search resource exports: a subject, an optional
+/// capitalised part, then `By` and a capitalised property; never a `CrudRepository` method.
+fn search_method(name: &str) -> bool {
+    if CRUD_METHODS.contains(&name) {
+        return false;
+    }
+    SEARCH_SUBJECTS.iter().any(|subject| {
+        let Some(rest) = name.strip_prefix(subject) else {
+            return false;
+        };
+        if !(rest.starts_with("By") || rest.starts_with(|c: char| c.is_ascii_uppercase())) {
+            return false;
+        }
+        rest.match_indices("By")
+            .any(|(i, _)| rest[i + 2..].starts_with(|c: char| c.is_ascii_uppercase()))
+    })
+}
+
+/// The resources Spring Data REST exports for the interface `class` (contract M9b D7): only an
+/// imported `@RepositoryRestResource` with a literal `path`, not `exported = false`, on an
+/// interface that directly extends a repository base. A bare `Repository` has no `findAll`, so
+/// no collection resource; a CRUD base adds `POST` and the item resource. Whether the service
+/// depends on Spring Data REST, and the certainty, are the indexer's.
+fn spring_data_rest(facts: &FileScope<'_>, class: usize, methods: &[usize], out: &mut FileRoutes) {
+    let defs = &facts.definitions;
+    let def = &defs[class];
+    let Some(d) = def
+        .decorations
+        .iter()
+        .find(|d| is_annotation(facts, d, SPRING_DATA_REST, "RepositoryRestResource"))
+    else {
+        return;
+    };
+    let Some(path) = literal_path(d).filter(|_| exported(d)) else {
+        return;
+    };
+    let bases: Vec<&str> = def
+        .supertypes
+        .iter()
+        .filter_map(|s| repository_base(facts, &s.name))
+        .collect();
+    if bases.is_empty() {
+        return;
+    }
+    let crud = bases.iter().any(|b| CRUD_BASES.contains(b));
+    let collection = bases.iter().any(|b| *b != "Repository");
+    let mut emit = |method: &str, path: String, handler: usize, span: Span| {
+        out.routes.push(RouteFact {
+            framework: Framework::SpringDataRest,
+            method: method.to_owned(),
+            path,
+            base: RouteBase::Root,
+            handler: Handler::Definition(handler),
+            span,
+            enclosing: Some(handler),
+            host: None,
+            path_name: None,
+        });
+    };
+    if collection {
+        emit("GET", format!("/{path}"), class, d.span);
+    }
+    if crud {
+        emit("POST", format!("/{path}"), class, d.span);
+        for verb in ["GET", "PUT", "PATCH", "DELETE"] {
+            emit(verb, format!("/{path}/{{id}}"), class, d.span);
+        }
+    }
+    for &m in methods {
+        let method = &defs[m];
+        if !search_method(&method.name) {
+            continue;
+        }
+        let rest = method
+            .decorations
+            .iter()
+            .find(|d| is_annotation(facts, d, SPRING_DATA_REST, "RestResource"));
+        let name = match rest {
+            None => method.name.clone(),
+            Some(r) if !exported(r) => continue,
+            Some(r) if r.args.iter().any(|a| a.key.as_deref() == Some("path")) => {
+                match literal_path(r) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            }
+            Some(_) => method.name.clone(),
+        };
+        emit("GET", format!("/{path}/search/{name}"), m, method.name_span);
     }
 }
 
@@ -1826,6 +1981,77 @@ public class AuthController {
         assert!(diagnostics(Language::Java, feign).is_empty());
     }
 
+    /// Contract M9b D7 (B12b): an imported `@RepositoryRestResource` with a literal `path` on a
+    /// Spring Data repository exposes Spring Data REST's resources; collection and item
+    /// resources bind to the interface, search resources to their method.
+    #[test]
+    fn spring_data_rest_repositories_expose_endpoints() {
+        const IMPORTS: &str = "package p;\nimport org.springframework.data.repository.CrudRepository;\nimport org.springframework.data.repository.Repository;\nimport org.springframework.data.rest.core.annotation.RepositoryRestResource;\nimport org.springframework.data.rest.core.annotation.RestResource;\n";
+        let src = |body: &str| format!("{IMPORTS}{body}");
+        // A CRUD base with two finders: 6 collection and item resources and 2 searches; the
+        // CRUD-named `findById` and `findAllById` are no searches.
+        let crud = src(
+            "@RepositoryRestResource(path = \"accounts\", collectionResourceRel = \"accounts\")\npublic interface AccountRepository extends CrudRepository<Account, Long> {\n    Account findByEmail(String email);\n    List<Account> readByLastNameOrderByEmail(String lastName);\n    Account findById(Long id);\n    List<Account> findAllById(Iterable<Long> ids);\n}\n",
+        );
+        assert_eq!(
+            summary(Language::Java, &crud),
+            [
+                "GET /accounts root def AccountRepository",
+                "POST /accounts root def AccountRepository",
+                "GET /accounts/{} root def AccountRepository",
+                "PUT /accounts/{} root def AccountRepository",
+                "PATCH /accounts/{} root def AccountRepository",
+                "DELETE /accounts/{} root def AccountRepository",
+                "GET /accounts/search/findByEmail root def findByEmail",
+                "GET /accounts/search/readByLastNameOrderByEmail root def readByLastNameOrderByEmail",
+            ]
+        );
+        let facts = extract(Language::Java, crud.as_bytes()).unwrap();
+        assert!(
+            routes(Language::Java, &facts)
+                .routes
+                .iter()
+                .all(|r| r.framework == Framework::SpringDataRest)
+        );
+        // `@RestResource` on a method: `exported = false` hides it, `path` renames it.
+        let methods = src(
+            "@RepositoryRestResource(path = \"items\")\ninterface ItemRepository extends CrudRepository<Item, Long> {\n    @RestResource(exported = false)\n    Item findByCode(String code);\n    @RestResource(path = \"byName\")\n    Item findByName(String name);\n}\n",
+        );
+        assert!(
+            summary(Language::Java, &methods)
+                .iter()
+                .filter(|r| r.contains("/search/"))
+                .eq(["GET /items/search/byName root def findByName"].iter())
+        );
+        // A bare `Repository` has no collection or item resources: searches only.
+        let bare = src(
+            "@RepositoryRestResource(path = \"codes\")\ninterface CodeRepository extends Repository<Code, Long> {\n    Code findByValue(String value);\n}\n",
+        );
+        assert_eq!(
+            summary(Language::Java, &bare),
+            ["GET /codes/search/findByValue root def findByValue"]
+        );
+        // Each of these exposes nothing.
+        for none in [
+            // Not exported.
+            "@RepositoryRestResource(path = \"hidden\", exported = false)\ninterface H extends CrudRepository<A, Long> { A findByX(String x); }\n",
+            // A path that is not a literal.
+            "@RepositoryRestResource(path = Paths.ACCOUNTS)\ninterface D extends CrudRepository<A, Long> { A findByX(String x); }\n",
+            // No path: the default strategy is out of scope.
+            "@RepositoryRestResource(collectionResourceRel = \"x\")\ninterface N extends CrudRepository<A, Long> { A findByX(String x); }\n",
+            // Not a repository.
+            "@RepositoryRestResource(path = \"plain\")\ninterface P { A findByX(String x); }\n",
+        ] {
+            assert!(summary(Language::Java, &src(none)).is_empty(), "{none}");
+        }
+        // A same-named annotation from another package.
+        let homonym = "package p;\nimport org.springframework.data.repository.CrudRepository;\nimport com.acme.RepositoryRestResource;\n@RepositoryRestResource(path = \"fake\")\ninterface F extends CrudRepository<A, Long> { A findByX(String x); }\n";
+        assert!(summary(Language::Java, homonym).is_empty());
+        // A same-named repository base from another package.
+        let base = "package p;\nimport com.acme.CrudRepository;\nimport org.springframework.data.rest.core.annotation.RepositoryRestResource;\n@RepositoryRestResource(path = \"other\")\ninterface O extends CrudRepository<A, Long> { A findByX(String x); }\n";
+        assert!(summary(Language::Java, base).is_empty());
+    }
+
     #[test]
     fn spring_dynamic_paths_are_counted() {
         let src = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass C { @GetMapping(Paths.BASE) void y() {} @GetMapping(\"/ok\") void z() {} }\n";
@@ -1834,6 +2060,25 @@ public class AuthController {
             diagnostics(Language::Java, src),
             [("route_path_dynamic".to_owned(), "Paths.BASE".to_owned())]
         );
+    }
+
+    /// Contract M9a C6 (bench B12a): a string literal is a path whatever its first character;
+    /// only a non-literal `{…}` is an array.
+    #[test]
+    fn spring_literal_paths_starting_with_a_brace_are_paths() {
+        let src = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\n@RequestMapping(\"/\")\nclass T {\n    @GetMapping(value = \"{taskId}\") void get() {}\n    @PutMapping({}) void put() {}\n    @PostMapping({\"/a\", \"{b}\"}) void post() {}\n}\n";
+        assert_eq!(
+            summary(Language::Java, src),
+            [
+                "GET /{} root def get",
+                "PUT / root def put",
+                "POST /a root def post",
+                "POST /{} root def post",
+            ]
+        );
+        let bare = "package p;\nimport org.springframework.web.bind.annotation.*;\n@RestController\nclass U { @GetMapping(\"{id}\") void get() {} }\n";
+        assert_eq!(summary(Language::Java, bare), ["GET /{} root def get"]);
+        assert!(diagnostics(Language::Java, src).is_empty());
     }
 
     const EXPRESS_APP: &str = "import express from \"express\";\nimport { authRouter } from \"./routes/auth\";\n\nexport const app = express();\napp.use(express.json());\napp.use(\"/api/v1\", authRouter);\napp.get(\"/health\", health);\n// app.post(\"/commented\", h);\n";

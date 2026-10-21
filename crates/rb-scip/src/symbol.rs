@@ -1,13 +1,32 @@
 //! Reading SCIP symbol strings (design §5.1) through the `scip` crate's parser.
 
+thread_local! {
+    /// Symbol strings this thread has handed to the `scip` crate's parser ([`parses`]).
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many symbol strings this thread has parsed so far, through every reader in this module
+/// (contract M9d E2): a test counts a join's parses as the difference around it. A local symbol
+/// is never parsed, so never counted.
+pub fn parses() -> usize {
+    PARSES.with(std::cell::Cell::get)
+}
+
+/// The `scip` crate's parse of a global symbol, counted ([`parses`]); `None` for a local symbol,
+/// which is not parsed, and for a string the grammar rejects.
+fn parse(symbol: &str) -> Option<scip::types::Symbol> {
+    if scip::symbol::is_local_symbol(symbol) {
+        return None;
+    }
+    PARSES.with(|n| n.set(n.get() + 1));
+    scip::symbol::parse_symbol(symbol).ok()
+}
+
 /// The name of a global symbol's last descriptor: `login` for
 /// `… com/acme/auth/AuthController#login().`, `users.ts` for a scip-typescript file namespace.
 /// `None` for local symbols and strings the grammar rejects.
 pub fn last_descriptor_name(symbol: &str) -> Option<String> {
-    if scip::symbol::is_local_symbol(symbol) {
-        return None;
-    }
-    let parsed = scip::symbol::parse_symbol(symbol).ok()?;
+    let parsed = parse(symbol)?;
     parsed.descriptors.last().map(|d| d.name.clone())
 }
 
@@ -24,33 +43,66 @@ pub fn last_descriptor_name(symbol: &str) -> Option<String> {
 /// `false` for local symbols and strings the grammar rejects. An import alias (a default
 /// import's local name) is the caller's to accept: it needs the file's imports.
 pub fn may_name(symbol: &str, text: &str) -> bool {
-    if scip::symbol::is_local_symbol(symbol) {
-        return false;
+    NameForms::of(symbol).is_some_and(|forms| forms.names(text))
+}
+
+/// What [`may_name`] reads from a global symbol, so that a caller asking about one symbol at
+/// many tokens parses it once (the `scip` crate's parser formats its own state once per
+/// descriptor, so a parse costs far more than the comparisons; contract M9c P7b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameForms {
+    /// The last descriptor's name.
+    last: String,
+    /// The name of the descriptor before it, if any.
+    owner: Option<String>,
+    /// Whether the last descriptor is a meta descriptor (`validate0:`).
+    meta: bool,
+}
+
+impl NameForms {
+    /// `None` for local symbols, strings the grammar rejects and symbols without descriptors,
+    /// none of which may name a token.
+    pub fn of(symbol: &str) -> Option<NameForms> {
+        NameForms::from_parsed(&parse(symbol)?)
     }
-    let Ok(parsed) = scip::symbol::parse_symbol(symbol) else {
-        return false;
-    };
-    let mut descriptors = parsed.descriptors.iter().rev();
-    let Some(last) = descriptors.next() else {
-        return false;
-    };
-    let name = last.name.as_str();
-    if name == text {
-        return true;
+
+    /// [`NameForms::of`] read from a parsed symbol.
+    fn from_parsed(parsed: &scip::types::Symbol) -> Option<NameForms> {
+        let mut descriptors = parsed.descriptors.iter().rev();
+        let last = descriptors.next()?;
+        Some(NameForms {
+            last: last.name.clone(),
+            owner: descriptors.next().map(|d| d.name.clone()),
+            meta: last.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Meta),
+        })
     }
-    if matches!(name, "<init>" | "<constructor>") {
-        return descriptors.next().is_some_and(|d| d.name == text);
+
+    /// The last descriptor's name, as [`last_descriptor_name`] reads it.
+    pub fn last(&self) -> &str {
+        &self.last
     }
-    if let Some(accessed) = name
-        .strip_prefix("<get>")
-        .or_else(|| name.strip_prefix("<set>"))
-    {
-        return accessed == text;
+
+    /// Whether the symbol may stand at a token whose text is `text`, in the forms [`may_name`]
+    /// lists.
+    pub fn names(&self, text: &str) -> bool {
+        let name = self.last.as_str();
+        if name == text {
+            return true;
+        }
+        if matches!(name, "<init>" | "<constructor>") {
+            return self.owner.as_deref() == Some(text);
+        }
+        if let Some(accessed) = name
+            .strip_prefix("<get>")
+            .or_else(|| name.strip_prefix("<set>"))
+        {
+            return accessed == text;
+        }
+        self.meta
+            && name
+                .strip_prefix(text)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     }
-    last.suffix.enum_value() == Ok(scip::types::descriptor::Suffix::Meta)
-        && name
-            .strip_prefix(text)
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The symbol of a global symbol's last type: the symbol cut after its last type descriptor
@@ -59,10 +111,7 @@ pub fn may_name(symbol: &str, text: &str) -> bool {
 /// strings the grammar rejects, symbols without a type descriptor, and a symbol the `scip`
 /// crate would format differently from how the indexer wrote it (then no prefix is exact).
 pub fn type_symbol_of(symbol: &str) -> Option<String> {
-    if scip::symbol::is_local_symbol(symbol) {
-        return None;
-    }
-    let mut parsed = scip::symbol::parse_symbol(symbol).ok()?;
+    let mut parsed = parse(symbol)?;
     let last_type = parsed
         .descriptors
         .iter()
@@ -99,19 +148,33 @@ impl Package {
 /// Whether `symbol` is Lombok's `@lombok.Generated` annotation type (contract M6a D1), the
 /// marker Lombok puts on every member it generates: package `maven/org.projectlombok/lombok` of
 /// any version, descriptors exactly the namespace `lombok/` and the type `Generated#`, read from
-/// the parsed symbol, never from its text.
+/// the parsed symbol, never from its text. A symbol whose text lacks [`LOMBOK_PACKAGE`] is
+/// answered without a parse ([`may_be_lombok_marker`]).
 pub fn is_lombok_generated_marker(symbol: &str) -> bool {
+    may_be_lombok_marker(symbol) && parsed_lombok_marker(symbol)
+}
+
+/// The package name of Lombok's marker, as scip-java writes it (contract M6a D1).
+pub const LOMBOK_PACKAGE: &str = "maven/org.projectlombok/lombok";
+
+/// The byte pre-check before the parse (contract M9d P9c): the marker's parsed package name is
+/// [`LOMBOK_PACKAGE`], and SCIP's grammar escapes only spaces in a package name (by doubling
+/// them), so a name without spaces stands verbatim in the symbol's text. A symbol whose text
+/// does not hold those bytes therefore cannot parse to the marker.
+fn may_be_lombok_marker(symbol: &str) -> bool {
+    symbol.contains(LOMBOK_PACKAGE)
+}
+
+/// [`is_lombok_generated_marker`] read from the parsed symbol, without the pre-check.
+fn parsed_lombok_marker(symbol: &str) -> bool {
     use scip::types::descriptor::Suffix;
-    if scip::symbol::is_local_symbol(symbol) {
-        return false;
-    }
-    let Ok(parsed) = scip::symbol::parse_symbol(symbol) else {
+    let Some(parsed) = parse(symbol) else {
         return false;
     };
     let in_lombok = parsed
         .package
         .as_ref()
-        .is_some_and(|p| p.manager == "maven" && p.name == "maven/org.projectlombok/lombok");
+        .is_some_and(|p| p.manager == "maven" && p.name == LOMBOK_PACKAGE);
     let descriptors: Vec<(&str, Result<Suffix, i32>)> = parsed
         .descriptors
         .iter()
@@ -125,16 +188,45 @@ pub fn is_lombok_generated_marker(symbol: &str) -> bool {
             ]
 }
 
+/// [`is_lombok_generated_marker`] for every occurrence of one index (contract M9d P9b): the
+/// answer depends on the symbol string alone, and one parse costs far more than a lookup, so
+/// each distinct symbol is parsed once and its answer kept for the index's other occurrences.
+#[derive(Debug, Default)]
+pub struct LombokMarkers<'a> {
+    seen: std::collections::HashMap<&'a str, bool>,
+    parses: usize,
+}
+
+impl<'a> LombokMarkers<'a> {
+    /// Whether `symbol` is the Lombok marker, as [`is_lombok_generated_marker`] answers.
+    pub fn is_marker(&mut self, symbol: &'a str) -> bool {
+        if !may_be_lombok_marker(symbol) {
+            return false;
+        }
+        let parses = &mut self.parses;
+        *self.seen.entry(symbol).or_insert_with(|| {
+            *parses += 1;
+            parsed_lombok_marker(symbol)
+        })
+    }
+
+    /// How many symbols were parsed so far (those that passed the byte pre-check, once each).
+    pub fn parses(&self) -> usize {
+        self.parses
+    }
+}
+
 /// The package of a global symbol; `None` for local symbols, strings the grammar rejects and
 /// symbols with no package (scip-java's namespace-only `scip-java maven . . org/springframework/`).
 /// scip-go reports module-resolved symbols under the manager `gomod`, which normalises to the
 /// manifest's `go` (contract M6d S5: one shared `go/<module>@<version>` key); every other
 /// manager passes through untouched.
 pub fn package(symbol: &str) -> Option<Package> {
-    if scip::symbol::is_local_symbol(symbol) {
-        return None;
-    }
-    let parsed = scip::symbol::parse_symbol(symbol).ok()?;
+    package_of(&parse(symbol)?)
+}
+
+/// [`package`] read from a parsed symbol.
+fn package_of(parsed: &scip::types::Symbol) -> Option<Package> {
     let p = parsed.package.as_ref()?;
     if p.manager.is_empty() || p.name.is_empty() {
         return None;
@@ -159,9 +251,68 @@ pub fn package(symbol: &str) -> Option<Package> {
     })
 }
 
+/// What the join reads from a global symbol, from one parse (contract M9d E2, amendment 4 S2):
+/// its [`package`] and its [`NameForms`], whose [`NameForms::last`] is its
+/// [`last_descriptor_name`] and whose [`NameForms::names`] is [`may_name`]. Each field is what
+/// its reader returns, computed by that reader's own code from the same parse.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SymbolParts {
+    pub package: Option<Package>,
+    pub forms: Option<NameForms>,
+}
+
+impl SymbolParts {
+    /// Both readers' answers for `symbol`: one parse of a global symbol, none of a local one or
+    /// of a string the grammar rejects (both answers `None`).
+    pub fn of(symbol: &str) -> SymbolParts {
+        parse(symbol).map_or_else(SymbolParts::default, |parsed| SymbolParts {
+            package: package_of(&parsed),
+            forms: NameForms::from_parsed(&parsed),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract M9d E2 (amendment 4, S2): [`SymbolParts::of`] answers as [`package`],
+    /// [`NameForms::of`] and [`last_descriptor_name`] do, with one parse of a global symbol
+    /// (a string the grammar rejects included) and none of a local one.
+    #[test]
+    fn symbol_parts_answer_as_each_reader_from_one_parse() {
+        let symbols = [
+            "scip-java maven maven/org.jsoup/jsoup 1.24.1 org/jsoup/Jsoup#`<init>`().",
+            "scip-java maven . . p/Dog#sound(+1).",
+            "scip-java maven . . org/springframework/",
+            "scip-typescript npm class-validator 0.15.1 src/decorator/`Is6.ts`/isISO63910:",
+            "scip-typescript npm auth-api 1.0.0 src/db/`users.ts`/",
+            "scip-go gomod github.com/mattermost/mattermost/server/public v0.4.3 `github.com/mattermost/mattermost/server/public/model`/NewId().",
+            "scip-go gomod example.com/mm/server/public . `example.com/mm/server/public/model`/",
+            "scip-go gomod gomod/example.com/x v1.0.0 `example.com/x`/F().",
+            "scip-python python my  project 1.0 `a.b`/f().",
+            "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Generated#",
+            "not a symbol",
+            "",
+            "local 3",
+        ];
+        for symbol in symbols {
+            let before = parses();
+            let parts = SymbolParts::of(symbol);
+            assert_eq!(
+                parses() - before,
+                usize::from(!symbol.starts_with("local ")),
+                "{symbol}"
+            );
+            assert_eq!(parts.package, package(symbol), "{symbol}");
+            assert_eq!(parts.forms, NameForms::of(symbol), "{symbol}");
+            assert_eq!(
+                parts.forms.as_ref().map(NameForms::last),
+                last_descriptor_name(symbol).as_deref(),
+                "{symbol}"
+            );
+        }
+    }
 
     #[test]
     fn the_last_descriptor_name_is_read_for_both_indexers_and_not_for_locals() {
@@ -418,5 +569,68 @@ mod tests {
         for symbol in no {
             assert!(!is_lombok_generated_marker(symbol), "{symbol}");
         }
+    }
+
+    /// Contract M9d P9b: the marker check parses each distinct symbol once, however often it
+    /// occurs, and answers every occurrence as `is_lombok_generated_marker` does.
+    #[test]
+    fn lombok_markers_parse_each_distinct_symbol_once() {
+        let marker = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Generated#";
+        let getter = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Getter#";
+        let own = "scip-java maven maven/com.acme/demo 1.0 p/Big#f().";
+        let occurrences = [
+            marker,
+            own,
+            getter,
+            marker,
+            own,
+            "local 4",
+            marker,
+            own,
+            "not a symbol",
+            "local 4",
+        ];
+        let mut memo = LombokMarkers::default();
+        for symbol in occurrences {
+            assert_eq!(
+                memo.is_marker(symbol),
+                is_lombok_generated_marker(symbol),
+                "{symbol}"
+            );
+        }
+        // Since P9c, only the distinct symbols that pass the byte pre-check are parsed (here the
+        // marker and the Getter).
+        let distinct: std::collections::BTreeSet<&str> = occurrences
+            .into_iter()
+            .filter(|s| s.contains(LOMBOK_PACKAGE))
+            .collect();
+        assert_eq!(memo.parses(), distinct.len());
+        // Asked again, nothing more is parsed.
+        assert!(memo.is_marker(marker) && !memo.is_marker(own));
+        assert_eq!(memo.parses(), distinct.len());
+    }
+
+    /// Contract M9d P9c: a symbol whose text does not hold the Lombok package's bytes is not the
+    /// marker, and is answered without a parse; one that holds them is parsed (once).
+    #[test]
+    fn lombok_markers_skip_symbols_without_the_package_bytes() {
+        let without = [
+            "scip-java maven maven/com.acme/demo 1.0 p/Big#f().",
+            "scip-java maven maven/com.example/fake 1.0 lombok/Generated#",
+            "scip-java maven jdk 21 javax/annotation/processing/Generated#",
+            "scip-java maven . . lombok/Generated#",
+            "local 4",
+            "not a symbol",
+        ];
+        let mut memo = LombokMarkers::default();
+        for symbol in without {
+            assert!(!memo.is_marker(symbol), "{symbol}");
+            assert!(!is_lombok_generated_marker(symbol), "{symbol}");
+        }
+        assert_eq!(memo.parses(), 0);
+        let marker = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Generated#";
+        let getter = "scip-java maven maven/org.projectlombok/lombok 1.18.34 lombok/Getter#";
+        assert!(memo.is_marker(marker) && !memo.is_marker(getter) && memo.is_marker(marker));
+        assert_eq!(memo.parses(), 2);
     }
 }

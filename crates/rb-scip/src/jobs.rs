@@ -10,11 +10,46 @@ use serde::{Deserialize, Serialize};
 /// the cache key uses its image ID, resolved at run time by [`crate::Runner::image_id`]; when the
 /// image is absent the job is `unsupported` and nothing builds it implicitly.
 pub const SCIP_JAVA_IMAGE: &str = "rb-scip-java:0.13.1";
+/// The scip-java image on JDK 25 (contract M9d D12): built locally from
+/// `docker/scip-java/Dockerfile.jdk25`, with the same Maven, Gradle and scip-java files as
+/// [`SCIP_JAVA_IMAGE`]. A Maven job whose poms declare a release above 21 runs on it.
+pub const SCIP_JAVA25_IMAGE: &str = "rb-scip-java:0.13.1-jdk25";
+
+/// The JDK of the scip-java image a job runs on (contract M9d D12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Jdk {
+    Jdk21,
+    Jdk25,
+}
+
+impl Jdk {
+    /// The image's reference.
+    pub fn image(self) -> &'static str {
+        match self {
+            Jdk::Jdk21 => SCIP_JAVA_IMAGE,
+            Jdk::Jdk25 => SCIP_JAVA25_IMAGE,
+        }
+    }
+}
+
+/// The JDK a scip-java job needs (contract M9d D12): JDK 25 for a Maven job whose release is
+/// above 21, JDK 21 otherwise (a Gradle job has no release). `Err` with the release when it is
+/// above 25, which neither image compiles.
+pub fn jdk(job: &Job) -> Result<Jdk, u32> {
+    match job.java_release {
+        Some(release) if release > 25 => Err(release),
+        Some(release) if release > 21 => Ok(Jdk::Jdk25),
+        _ => Ok(Jdk::Jdk21),
+    }
+}
 /// The scip-go image: built locally from `docker/scip-go` (no published image
 /// is suitable). Like scip-java, a local image has no registry digest, so the
 /// cache key uses its image ID, resolved at run time; when absent the job is
-/// `unsupported` and nothing builds it implicitly.
-pub const SCIP_GO_IMAGE: &str = "rb-scip-go:0.2.7";
+/// `unsupported` and nothing builds it implicitly. scip-go v0.2.7 with
+/// golang.org/x/tools raised to v0.50.0, the first that reads the export data
+/// Go 1.27.2 writes (version 5); `rb-scip-go:0.2.7` loaded no imported package
+/// (contract M9c amendment 2).
+pub const SCIP_GO_IMAGE: &str = "rb-scip-go:0.2.7-xtools0.50.0";
 /// scip-python v0.6.6 is published for linux/amd64 only; on arm64 hosts it
 /// runs emulated (like scip-typescript). Pinned by digest after measuring
 /// against the disk budget (contract M6d S2).
@@ -47,7 +82,9 @@ impl Indexer {
 pub enum Fetch {
     /// `mvn dependency:go-offline` and an online build with the image's Maven.
     Maven,
-    /// A Gradle dependency resolution (not verified yet: such jobs are `unsupported`).
+    /// `gradle dependencies` and an online build with the image's Gradle (contract M6e S2),
+    /// both phases with rb's init script marking the protobuf plugin's tool artifacts
+    /// executable (contract M9d D13).
     Gradle,
     /// `npm ci`, `yarn install --frozen-lockfile` or `pnpm install --frozen-lockfile`.
     Npm { lockfile: NodeLock },
@@ -96,6 +133,22 @@ pub struct Job {
     pub projects: Vec<String>,
     /// The fetch step cannot be pinned (no lockfile), so the index is not reproducible.
     pub unpinned: bool,
+    /// scip-go (contract M9d D5): the directories under `root` (relative to it, sorted) of the
+    /// other `go.mod` files whose module paths the root's `go.mod` requires without a
+    /// `replace`. Non-empty: rb writes a `go.work` that uses `.` and each of them, and
+    /// replaces each at the version the root requires (amendment 4), and both phases run in
+    /// workspace mode. Empty for every other job.
+    pub workspace: Vec<String>,
+    /// scip-go (contract M9d D6): the root's `go.mod` `replace` targets that are local
+    /// directories outside `root`, as written (`../../server/public`), sorted and distinct.
+    /// `projects::job_files` resolves them against the root: one inside the repository is
+    /// exported, one leaving it makes the job `unsupported`. Non-empty: the export is
+    /// repository-shaped and the container starts in the root. Empty for every other job.
+    pub replace_targets: Vec<String>,
+    /// scip-java Maven (contract M9d D12): the highest Java release the job's poms declare,
+    /// which picks its image. `None` for a Maven job that declares none, and for every other
+    /// job (a Gradle job always runs on the JDK 21 image).
+    pub java_release: Option<u32>,
 }
 
 /// A workspace root whose members are not grouped into its job (contract M6a D5), and why:
@@ -121,8 +174,9 @@ pub struct Plan {
 }
 
 /// The jobs for a commit, from its sorted file list; `read` gives a file's bytes (`None` when
-/// it cannot be read) and is asked only for `package.json` files and workspace roots'
-/// `yarn.lock`. Maven and Gradle roots are the outermost `pom.xml` / Gradle build files (a
+/// it cannot be read) and is asked only for `package.json` files, workspace roots'
+/// `yarn.lock`, Go roots' `go.mod` (contract M9d D7) and the `pom.xml` files under Maven roots
+/// (D12). Maven and Gradle roots are the outermost `pom.xml` / Gradle build files (a
 /// reactor or multi-project build runs once). TypeScript roots are package roots (a directory
 /// with `package.json`), each indexing every `tsconfig.json` directory whose nearest package
 /// root it is; a nested package root starts its own job, except a workspace member (contract
@@ -180,12 +234,21 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
         .cloned()
         .collect();
     for (root, fetch) in outermost {
+        // Contract M9d D12: a Maven job's release picks its image; a Gradle job has none.
+        let java_release = if fetch == Fetch::Maven {
+            maven_release(&root, &files, read)
+        } else {
+            None
+        };
         out.push(Job {
             root,
             indexer: Indexer::ScipJava,
             fetch,
             projects: Vec::new(),
             unpinned: false,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
+            java_release,
         });
     }
 
@@ -223,33 +286,69 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             fetch: Fetch::Npm { lockfile },
             projects,
             unpinned: lockfile == NodeLock::None,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
+            java_release: None,
         });
     }
-    // Go: every go.mod directory builds independently (workspaces are M6e).
+    // Go: every go.mod directory is a job. Contract M9d D7: each root's go.mod is read, so its
+    // workspace (D5) and its replace targets outside the root (D6) are decided here, and the
+    // input hash covers them through the exported go.mod files. A root holding its own
+    // go.work is left as it is (out of scope); an unreadable go.mod plans as before.
     let mut go_roots = dirs_with("go.mod");
     go_roots.sort();
     go_roots.dedup();
-    for root in go_roots {
+    let go_mods: BTreeMap<&str, GoMod> = go_roots
+        .iter()
+        .filter_map(|root| {
+            let text = read(&join(root, "go.mod"))?;
+            Some((root.as_str(), go_mod(&String::from_utf8_lossy(&text))))
+        })
+        .collect();
+    for root in &go_roots {
+        let (workspace, replace_targets) = match go_mods.get(root.as_str()) {
+            Some(module) if has(&join(root, "go.work")) => {
+                (Vec::new(), go_replace_targets(root, module))
+            }
+            Some(module) => (
+                go_workspace(root, module, &go_mods),
+                go_replace_targets(root, module),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         out.push(Job {
             root: root.clone(),
             indexer: Indexer::ScipGo,
             fetch: Fetch::Go,
             projects: Vec::new(),
-            unpinned: !has(&join(&root, "go.sum")),
+            unpinned: !has(&join(root, "go.sum")),
+            workspace,
+            replace_targets,
+            java_release: None,
         });
     }
     // Python: every pyproject.toml/setup.py directory is a job (contract M6d
-    // S2); the fetch installs from its lockfile (S4).
+    // S2); the fetch installs from its lockfile (S4). So is a directory with a
+    // requirements.txt and neither (contract M9d D2), which installs its pins.
+    let requirements_only: BTreeSet<String> = dirs_with("requirements.txt")
+        .into_iter()
+        .filter(|r| !has(&join(r, "pyproject.toml")) && !has(&join(r, "setup.py")))
+        .collect();
     let mut python_roots: Vec<String> = dirs_with("pyproject.toml")
         .into_iter()
         .chain(dirs_with("setup.py"))
+        .chain(requirements_only.iter().cloned())
         .collect();
     python_roots.sort();
     python_roots.dedup();
     for root in python_roots {
         // The strongest pin wins: a poetry.lock pins the whole tree, a
         // requirements.txt its pins only, anything else the project alone.
-        let lockfile = if has(&join(&root, "poetry.lock")) {
+        // Poetry needs a pyproject.toml, so a requirements-only root installs
+        // its pins whatever else it holds.
+        let lockfile = if requirements_only.contains(&root) {
+            PythonLock::Requirements
+        } else if has(&join(&root, "poetry.lock")) {
             PythonLock::Poetry
         } else if has(&join(&root, "requirements.txt")) {
             PythonLock::Requirements
@@ -262,6 +361,9 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
             fetch: Fetch::Python { lockfile },
             projects: Vec::new(),
             unpinned: lockfile != PythonLock::Poetry,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
+            java_release: None,
         });
     }
     out.sort_by(|a, b| (a.root.as_str(), a.indexer).cmp(&(b.root.as_str(), b.indexer)));
@@ -601,6 +703,364 @@ fn relative(dir: &str, root: &str) -> String {
     }
 }
 
+/// What the Go planner (contract M9d D5–D7) and the `go.work` writer read from a `go.mod`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct GoMod {
+    /// The `module` path.
+    pub(crate) module: Option<String>,
+    /// The `go` line's version.
+    pub(crate) go: Option<String>,
+    /// Every `require`d module path, direct or `// indirect`, with its version as written
+    /// (empty if none is).
+    pub(crate) requires: BTreeMap<String, String>,
+    /// Every `replace`: the replaced module path, and the target as written (a module path,
+    /// or a local directory).
+    pub(crate) replaces: Vec<(String, String)>,
+}
+
+/// Reads a `go.mod`'s `module`, `go`, `require` and `replace` directives, single-line and in
+/// blocks; comments and every other directive are ignored, quotes around paths dropped.
+pub(crate) fn go_mod(text: &str) -> GoMod {
+    let mut out = GoMod::default();
+    let mut block: Option<&str> = None;
+    for line in text.lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        let (directive, rest) = match block {
+            Some(_) if code == ")" => {
+                block = None;
+                continue;
+            }
+            Some(directive) => (directive, code),
+            None => {
+                let (directive, rest) = code.split_once(char::is_whitespace).unwrap_or((code, ""));
+                let rest = rest.trim();
+                if rest == "(" {
+                    block = Some(directive);
+                    continue;
+                }
+                (directive, rest)
+            }
+        };
+        let unquote = |s: &str| s.trim_matches('"').to_owned();
+        let mut words = rest.split_whitespace().map(unquote);
+        let first = words.next();
+        match directive {
+            "module" => out.module = first,
+            "go" => out.go = first,
+            "require" => {
+                if let Some(path) = first {
+                    out.requires.insert(path, words.next().unwrap_or_default());
+                }
+            }
+            "replace" => {
+                if let Some((from, to)) = rest.split_once("=>")
+                    && let (Some(module), Some(target)) =
+                        (from.split_whitespace().next(), to.split_whitespace().next())
+                {
+                    out.replaces.push((unquote(module), unquote(target)));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A `go` line's version as a key in Go's order: numerically by release (`1.26.10` above
+/// `1.26.9`, `1.21` above `1.9`), a language version (`1.21`) below its pre-releases
+/// (`1.21rc1`), which sort below its first release (`1.21.0`).
+pub(crate) fn go_version_key(version: &str) -> (Vec<u64>, bool, &str) {
+    let split = version
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(version.len());
+    let (release, pre) = version.split_at(split);
+    let numbers = release
+        .split('.')
+        .filter(|n| !n.is_empty())
+        .map(|n| n.parse().unwrap_or(0))
+        .collect();
+    (numbers, !pre.is_empty(), pre)
+}
+
+/// Contract M9d D5: the directories under `root` (relative to it, sorted) of the other
+/// `go.mod` files whose module path `module` requires with no `replace` of that path. A
+/// directory inside `vendor` holds a vendored copy, and one Go ignores (`testdata`, a name
+/// starting `.` or `_`) is no module of the build: neither is a workspace module.
+fn go_workspace(root: &str, module: &GoMod, modules: &BTreeMap<&str, GoMod>) -> Vec<String> {
+    let ignored = |rel: &str| {
+        rel.split('/').any(|segment| {
+            matches!(segment, "vendor" | "testdata")
+                || segment.starts_with('.')
+                || segment.starts_with('_')
+        })
+    };
+    modules
+        .iter()
+        .filter(|(dir, _)| is_under(dir, root))
+        .filter(|(dir, _)| !ignored(&relative(dir, root)))
+        .filter(|(_, other)| {
+            other.module.as_ref().is_some_and(|path| {
+                let required = module.requires.contains_key(path);
+                let replaced = module.replaces.iter().any(|(m, _)| m == path);
+                required && !replaced
+            })
+        })
+        .map(|(dir, _)| relative(dir, root))
+        .collect()
+}
+
+/// Contract M9d D6: `module`'s `replace` targets that are local directories (Go's rule: `.`,
+/// `..`, or a path starting `./`, `../` or `/`) and do not resolve, lexically, to `root` or
+/// below it; as written, sorted and distinct. A target leaving the repository is kept, for
+/// `projects::job_files` to refuse.
+fn go_replace_targets(root: &str, module: &GoMod) -> Vec<String> {
+    let local = |t: &str| {
+        t == "." || t == ".." || t.starts_with("./") || t.starts_with("../") || t.starts_with('/')
+    };
+    let targets: BTreeSet<&String> = module
+        .replaces
+        .iter()
+        .map(|(_, target)| target)
+        .filter(|target| local(target) && !resolves_under(root, target))
+        .collect();
+    targets.into_iter().cloned().collect()
+}
+
+/// Whether the relative directory `target`, read from `root`, resolves lexically (`.` and
+/// `..` folded, nothing on disk followed) to `root` or below it. An absolute path, or one
+/// that leaves the repository, does not.
+fn resolves_under(root: &str, target: &str) -> bool {
+    if target.starts_with('/') {
+        return false;
+    }
+    let mut at: Vec<&str> = if root.is_empty() {
+        Vec::new()
+    } else {
+        root.split('/').collect()
+    };
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if at.pop().is_none() {
+                    return false;
+                }
+            }
+            name => at.push(name),
+        }
+    }
+    let dir = at.join("/");
+    dir == root || is_under(&dir, root)
+}
+
+/// The highest Java release the `pom.xml` files under the Maven root `root` declare (contract
+/// M9d D12), each read by [`pom_release`]; `None` when none declares one. A parent pom outside
+/// the job (a `spring-boot-starter-parent`) is not visible: a release it derives from a
+/// module's `java.version` is not seen (amendment 1, risk 4).
+fn maven_release(
+    root: &str,
+    files: &[&str],
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Option<u32> {
+    let poms: BTreeMap<&str, Pom> = files
+        .iter()
+        .copied()
+        .filter(|f| f.rsplit('/').next() == Some("pom.xml"))
+        .filter(|f| dir(f) == root || is_under(dir(f), root))
+        .filter_map(|f| Some((f, Pom::read(&String::from_utf8_lossy(&read(f)?)))))
+        .collect();
+    poms.keys()
+        .filter_map(|path| pom_release(path, &poms))
+        .max()
+}
+
+/// What the release reader takes from one `pom.xml` (contract M9d D12).
+#[derive(Debug, Default)]
+struct Pom {
+    /// The project's own `artifactId`.
+    artifact_id: Option<String>,
+    /// The `<parent>` element's `artifactId`, and its `relativePath`: `../pom.xml` when absent,
+    /// `None` when empty (Maven then looks the parent up in the repositories only).
+    parent: Option<(Option<String>, Option<String>)>,
+    /// The project's `<properties>` (not a profile's), in document order.
+    properties: Vec<(String, String)>,
+    /// The `release`, `source` and `target` values of the compiler plugin's configurations
+    /// (the plugin's own and its executions').
+    compiler: Vec<String>,
+}
+
+impl Pom {
+    /// Reads the elements [`Pom`] holds from `xml`, outside comments; anything else is skipped.
+    fn read(xml: &str) -> Pom {
+        let mut pom = Pom::default();
+        let mut stack: Vec<&str> = Vec::new();
+        let (mut parent, mut parent_artifact, mut relative) = (false, None, None);
+        // Per open `<plugin>`: its artifactId and its configuration values.
+        let mut plugins: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        let mut rest = xml;
+        while let Some(open) = rest.find('<') {
+            let text = rest[..open].trim();
+            if !text.is_empty() {
+                let text = text.to_owned();
+                match stack.as_slice() {
+                    ["project", "artifactId"] => pom.artifact_id = Some(text),
+                    ["project", "parent", "artifactId"] => parent_artifact = Some(text),
+                    ["project", "parent", "relativePath"] => relative = Some(Some(text)),
+                    ["project", "properties", name] => {
+                        pom.properties.push(((*name).to_owned(), text))
+                    }
+                    [.., "plugin", "artifactId"] => {
+                        if let Some(plugin) = plugins.last_mut() {
+                            plugin.0 = Some(text);
+                        }
+                    }
+                    [.., "configuration", "release" | "source" | "target"] => {
+                        if let Some(plugin) = plugins.last_mut() {
+                            plugin.1.push(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &rest[open..];
+            if let Some(comment) = rest.strip_prefix("<!--") {
+                rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
+                continue;
+            }
+            let Some(close) = rest.find('>') else {
+                break;
+            };
+            let tag = &rest[1..close];
+            rest = &rest[close + 1..];
+            if tag.starts_with('?') || tag.starts_with('!') {
+                continue;
+            }
+            if let Some(name) = tag.strip_prefix('/') {
+                let name = name.trim();
+                if name == "plugin"
+                    && let Some((Some(artifact), values)) = plugins.pop()
+                    && artifact == "maven-compiler-plugin"
+                {
+                    pom.compiler.extend(values);
+                }
+                if let Some(at) = stack.iter().rposition(|open| *open == name) {
+                    stack.truncate(at);
+                }
+                continue;
+            }
+            let name = tag
+                .trim_end_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            let in_parent = stack.as_slice() == ["project", "parent"];
+            if in_parent && name == "relativePath" {
+                relative = Some(None);
+            }
+            if tag.ends_with('/') {
+                continue;
+            }
+            parent |= stack.as_slice() == ["project"] && name == "parent";
+            if name == "plugin" {
+                plugins.push((None, Vec::new()));
+            }
+            stack.push(name);
+        }
+        if parent {
+            let relative = relative.unwrap_or_else(|| Some("../pom.xml".to_owned()));
+            pom.parent = Some((parent_artifact, relative));
+        }
+        pom
+    }
+}
+
+/// The pom at `path` that the pom's `<parent>` names inside `poms`: its `relativePath` (a
+/// directory gets `pom.xml`) resolved from the pom's directory, if that pom's `artifactId` is
+/// the one `<parent>` names, as Maven checks before it looks in the repositories.
+fn parent_pom(path: &str, pom: &Pom, poms: &BTreeMap<&str, Pom>) -> Option<String> {
+    let (artifact, relative) = pom.parent.as_ref()?;
+    let mut at: Vec<&str> = dir(path).split('/').filter(|s| !s.is_empty()).collect();
+    for segment in relative.as_deref()?.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                at.pop()?;
+            }
+            name => at.push(name),
+        }
+    }
+    let mut target = at.join("/");
+    if !target.ends_with(".xml") {
+        target = join(&target, "pom.xml");
+    }
+    let candidate = poms.get(target.as_str())?;
+    (artifact.is_none() || *artifact == candidate.artifact_id).then_some(target)
+}
+
+/// One pom's release (contract M9d D12): the highest of `maven.compiler.release`, `source` and
+/// `target` and the compiler plugin's `release`, `source` and `target`, read over the pom and
+/// its parent chain inside the job as Maven inherits them (a child's property over its
+/// ancestors', every ancestor's plugin configuration), with a whole `${name}` value resolved
+/// through those properties. `java.version` counts only through them. `1.8` is release 8;
+/// an unresolved or non-numeric value counts as none.
+fn pom_release(path: &str, poms: &BTreeMap<&str, Pom>) -> Option<u32> {
+    // The pom and its ancestors, nearest first; a cycle ends the chain.
+    let mut chain: Vec<&Pom> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut at = Some(path.to_owned());
+    while let Some(p) = at.take() {
+        let Some(pom) = poms.get(p.as_str()) else {
+            break;
+        };
+        if !seen.insert(p.clone()) {
+            break;
+        }
+        chain.push(pom);
+        at = parent_pom(&p, pom, poms);
+    }
+    let mut properties: BTreeMap<&str, &str> = BTreeMap::new();
+    for pom in chain.iter().rev() {
+        for (name, value) in &pom.properties {
+            properties.insert(name, value);
+        }
+    }
+    let resolve = |value: &str| -> String {
+        let mut value = value.to_owned();
+        // A bounded chain of `${a}` → `${b}` → value.
+        for _ in 0..8 {
+            let Some(name) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+                break;
+            };
+            match properties.get(name) {
+                Some(v) => value = (*v).to_owned(),
+                None => break,
+            }
+        }
+        value
+    };
+    let number = |value: String| -> Option<u32> {
+        let value = value.trim();
+        value.strip_prefix("1.").unwrap_or(value).parse().ok()
+    };
+    [
+        "maven.compiler.release",
+        "maven.compiler.source",
+        "maven.compiler.target",
+    ]
+    .iter()
+    .filter_map(|name| properties.get(name).copied())
+    .chain(
+        chain
+            .iter()
+            .flat_map(|pom| pom.compiler.iter().map(String::as_str)),
+    )
+    .filter_map(|value| number(resolve(value)))
+    .max()
+}
+
 /// The source encoding a Maven build declares when it is not UTF-8 (contract M3b amendment
 /// 64), read from every `pom.xml` of the build: the first value of a
 /// `project.build.sourceEncoding`, `maven.compiler.encoding` or `encoding` element (the last
@@ -884,6 +1344,47 @@ pub fn strip_json_comments(text: &str) -> String {
     }
     out.push_str(&text[start..]);
     out
+}
+
+/// `text` read as JSONC, as `tsc` reads a `tsconfig.json` (contract M9c D1): a leading UTF-8
+/// byte order mark dropped (amendment 3, E4), [`strip_json_comments`], then each `,` outside
+/// strings followed only by whitespace before `}` or `]` is dropped, then strict JSON. `None`
+/// when that is not JSON.
+pub fn parse_jsonc(text: &str) -> Option<serde_json::Value> {
+    let text = strip_json_comments(text.strip_prefix('\u{feff}').unwrap_or(text));
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut start = 0;
+    let mut quote = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote {
+            match b {
+                b'\\' => escaped = true,
+                b'"' => quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => quote = true,
+            b',' if bytes[i + 1..]
+                .iter()
+                .find(|c| !c.is_ascii_whitespace())
+                .is_some_and(|&c| c == b'}' || c == b']') =>
+            {
+                out.push_str(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&text[start..]);
+    serde_json::from_str(&out).ok()
 }
 
 /// A `files` entry as a path relative to its tsconfig directory: one leading `./` ignored;
@@ -1202,6 +1703,41 @@ impl TsScopes {
 mod tests {
     use super::*;
 
+    /// Contract M9c amendment 2 (PI): the scip-go tag names what its Dockerfile pins, scip-go's
+    /// version and the raised x/tools (the first that reads Go 1.27.2's export data), so a
+    /// Dockerfile change that keeps the old tag fails here. The build-time self-test stays in
+    /// the Dockerfile, and both READMEs build the tag `rb index` runs.
+    #[test]
+    fn scip_go_image_tag_names_the_dockerfile_pins() {
+        let dockerfile = include_str!("../../../docker/scip-go/Dockerfile");
+        let arg = |name: &str| {
+            let prefix = format!("ARG {name}=");
+            dockerfile
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("no {prefix} in the Dockerfile"))
+        };
+        let xtools = arg("XTOOLS_VERSION");
+        assert_eq!(xtools, "v0.50.0");
+        let tag = format!(
+            "rb-scip-go:{}-xtools{}",
+            arg("SCIP_GO_VERSION"),
+            xtools.trim_start_matches('v')
+        );
+        assert_eq!(SCIP_GO_IMAGE, tag);
+        assert!(
+            dockerfile.contains("grep -aq ' os/Getenv()[.]' index.scip"),
+            "the build-time self-test is gone"
+        );
+        let build = format!("docker build -t {SCIP_GO_IMAGE} docker/scip-go");
+        for readme in [
+            include_str!("../../../docker/scip-go/README.md"),
+            include_str!("../../../README.md"),
+        ] {
+            assert!(readme.contains(&build), "{build}");
+        }
+    }
+
     fn summary(files: &[&str]) -> Vec<String> {
         workspace_summary(files, &[]).0
     }
@@ -1249,6 +1785,15 @@ mod tests {
                 if !members.is_empty() {
                     s.push_str(&format!(" {{{members}}}"));
                 }
+                if !j.workspace.is_empty() {
+                    s.push_str(&format!(" work[{}]", j.workspace.join(",")));
+                }
+                if !j.replace_targets.is_empty() {
+                    s.push_str(&format!(" replace[{}]", j.replace_targets.join(",")));
+                }
+                if let Some(release) = j.java_release {
+                    s.push_str(&format!(" release[{release}]"));
+                }
                 s
             })
             .collect();
@@ -1278,6 +1823,160 @@ mod tests {
         );
     }
 
+    /// Contract M9d D12 (C11): a Maven job's release is the highest its poms declare, read from
+    /// `maven.compiler.release`, `source` or `target` and the compiler plugin's configuration,
+    /// `${…}` resolved through the pom's properties and its parent chain inside the job;
+    /// `java.version` counts only through them. Above 21 the job takes the JDK 25 image; above
+    /// 25, or with that image absent, it is unsupported. A Gradle job stays on JDK 21.
+    #[test]
+    fn maven_release_above_21_takes_the_jdk25_image() {
+        let pom =
+            |body: &str| format!("<project><modelVersion>4.0.0</modelVersion>{body}</project>");
+        let app = |properties: &str| {
+            pom(&format!(
+                "<artifactId>app</artifactId><properties>{properties}</properties>"
+            ))
+        };
+        let plan = |contents: &[(&str, &str)]| -> Vec<String> {
+            let files: Vec<&str> = contents.iter().map(|(path, _)| *path).collect();
+            workspace_summary(&files, contents).0
+        };
+        let release = |n: &str| format!("<maven.compiler.release>{n}</maven.compiler.release>");
+        // A literal; `${java.version}` through the pom's own properties; `java.version` alone.
+        assert_eq!(
+            plan(&[("pom.xml", &app(&release("25")))]),
+            ["scip-java  maven release[25]"]
+        );
+        assert_eq!(
+            plan(&[(
+                "pom.xml",
+                &app(&format!(
+                    "<java.version>25</java.version>{}",
+                    release("${java.version}")
+                ))
+            )]),
+            ["scip-java  maven release[25]"]
+        );
+        assert_eq!(
+            plan(&[("pom.xml", &app("<java.version>25</java.version>"))]),
+            ["scip-java  maven"]
+        );
+        // `source` and `target`, `1.8` being release 8: the highest counts.
+        assert_eq!(
+            plan(&[(
+                "pom.xml",
+                &app("<maven.compiler.source>1.8</maven.compiler.source>\
+                     <maven.compiler.target>11</maven.compiler.target>")
+            )]),
+            ["scip-java  maven release[11]"]
+        );
+        // The compiler plugin's `<release>`, resolved; another plugin's is not the compiler's.
+        let plugins = pom(
+            "<artifactId>app</artifactId><properties><jdk>22</jdk></properties><build><plugins>\
+             <plugin><artifactId>maven-compiler-plugin</artifactId>\
+             <configuration><release>${jdk}</release></configuration></plugin>\
+             <plugin><artifactId>maven-enforcer-plugin</artifactId>\
+             <configuration><release>99</release></configuration></plugin>\
+             </plugins></build>",
+        );
+        assert_eq!(
+            plan(&[("pom.xml", &plugins)]),
+            ["scip-java  maven release[22]"]
+        );
+        // The parent chain inside the job: `api` inherits the root's `${java.version}` release
+        // with its own `java.version`. `web`'s parent is outside the job (`<relativePath/>`),
+        // and `svc`'s `../pom.xml` is not its parent (another artifactId): neither inherits.
+        let root = pom(&format!(
+            "<artifactId>parent</artifactId><properties><java.version>17</java.version>{}\
+             </properties>",
+            release("${java.version}")
+        ));
+        let module = |parent: &str, relative: &str| {
+            pom(&format!(
+                "<parent><artifactId>{parent}</artifactId>{relative}</parent>\
+                 <artifactId>m</artifactId><properties><java.version>24</java.version></properties>"
+            ))
+        };
+        assert_eq!(
+            plan(&[("api/pom.xml", &module("parent", "")), ("pom.xml", &root),]),
+            ["scip-java  maven release[24]"]
+        );
+        assert_eq!(
+            plan(&[
+                ("pom.xml", &root),
+                ("svc/pom.xml", &module("spring-boot-starter-parent", "")),
+                ("web/pom.xml", &module("parent", "<relativePath/>")),
+            ]),
+            ["scip-java  maven release[17]"]
+        );
+        // A Gradle build never takes a release, even over a Maven build inside it.
+        assert_eq!(
+            plan(&[
+                ("tools/settings.gradle", ""),
+                ("tools/sub/pom.xml", &app(&release("25"))),
+            ]),
+            [
+                "scip-java tools gradle",
+                "scip-java tools/sub maven release[25]"
+            ]
+        );
+
+        // The image follows the release.
+        use crate::orchestrate::{Images, image_for};
+        let maven = |java_release: Option<u32>| Job {
+            root: String::new(),
+            indexer: Indexer::ScipJava,
+            fetch: Fetch::Maven,
+            projects: Vec::new(),
+            unpinned: false,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
+            java_release,
+        };
+        let gradle = Job {
+            fetch: Fetch::Gradle,
+            ..maven(None)
+        };
+        for (job, image) in [
+            (maven(Some(25)), SCIP_JAVA25_IMAGE),
+            (maven(Some(22)), SCIP_JAVA25_IMAGE),
+            (maven(Some(21)), SCIP_JAVA_IMAGE),
+            (maven(None), SCIP_JAVA_IMAGE),
+            (gradle.clone(), SCIP_JAVA_IMAGE),
+        ] {
+            assert_eq!(image_for(&job), image, "{job:?}");
+        }
+        let images = Images {
+            java: Ok("sha256:jdk21".into()),
+            java25: Ok("sha256:jdk25".into()),
+            go: Err("absent".into()),
+            proxy: Ok("sha256:proxy".into()),
+        };
+        assert_eq!(
+            images.for_job(&maven(Some(25))).as_deref(),
+            Ok("sha256:jdk25")
+        );
+        assert_eq!(
+            images.for_job(&maven(Some(21))).as_deref(),
+            Ok("sha256:jdk21")
+        );
+        assert_eq!(images.for_job(&gradle).as_deref(), Ok("sha256:jdk21"));
+        let above = images.for_job(&maven(Some(26))).unwrap_err();
+        assert!(above.contains("release 26"), "{above}");
+        let absent = Images {
+            java25: Err(format!(
+                "scip-java: image {SCIP_JAVA25_IMAGE} is not available"
+            )),
+            ..images.clone()
+        };
+        let reason = absent.for_job(&maven(Some(25))).unwrap_err();
+        assert!(reason.contains(SCIP_JAVA25_IMAGE), "{reason}");
+        assert_eq!(
+            absent.for_job(&maven(Some(21))).as_deref(),
+            Ok("sha256:jdk21")
+        );
+    }
+
     #[test]
     fn go_modules_are_their_own_jobs() {
         // Each go.mod directory builds independently (workspaces are M6e);
@@ -1289,6 +1988,130 @@ mod tests {
                 "scip-go  go",
                 "scip-go lib go unpinned",
                 "scip-go tools go unpinned"
+            ]
+        );
+    }
+
+    /// Contract M9d D5, D6, D7 (C5): the planner reads each Go root's `go.mod`. A root whose
+    /// `go.mod` requires, with no `replace`, the module of another `go.mod` under it gets a
+    /// workspace of those directories, sorted (mattermost `server`: `public`). A required
+    /// in-repo module that is also replaced (by a directory or by another module), a module
+    /// outside the root, and a root with its own `go.work` get none. A `replace` onto a local
+    /// directory outside the root is a replace target, as written, whether or not it stays in
+    /// the repository (`projects::job_files` decides that); one inside the root, or onto
+    /// another module, is not. A `go.mod` that cannot be read plans as before. A vendored
+    /// module's `go.mod` (go_gin_example commits `vendor/` with six) and one in a directory Go
+    /// ignores (`testdata`, a name starting `.` or `_`) are not workspace modules.
+    #[test]
+    fn go_jobs_requiring_in_repo_modules_get_a_workspace() {
+        let files = [
+            "server/go.mod",
+            "server/go.sum",
+            "server/public/go.mod",
+            "server/public/go.sum",
+            "multi/go.mod",
+            "multi/z/go.mod",
+            "multi/a/go.mod",
+            "svc/go.mod",
+            "svc/lib/go.mod",
+            "fork/go.mod",
+            "fork/lib/go.mod",
+            "tools/x/go.mod",
+            "tools/sct/go.mod",
+            "tools/esc/go.mod",
+            "ws/go.mod",
+            "ws/go.work",
+            "ws/sub/go.mod",
+            "unread/go.mod",
+            "unread/sub/go.mod",
+            "vend/go.mod",
+            "vend/vendor/example.com/x/go.mod",
+            "vend/testdata/mod/go.mod",
+            "vend/_tools/go.mod",
+            "vend/.cache/go.mod",
+            "vend/ok/go.mod",
+        ];
+        let contents = [
+            (
+                "server/go.mod",
+                "module github.com/m/m/server/v8\n\ngo 1.26.7\n\nrequire (\n\tgithub.com/m/m/server/public v0.4.3\n\tgithub.com/other/x v1.0.0 // indirect\n)\n\nreplace github.com/vmihailenco/msgpack/v5 => github.com/m/msgpack/v5 v5.0.0\n",
+            ),
+            (
+                "server/public/go.mod",
+                "module github.com/m/m/server/public\n\ngo 1.26.7\n",
+            ),
+            (
+                "multi/go.mod",
+                "module example.com/multi\n\nrequire example.com/multi/z v0.1.0\nrequire \"example.com/multi/a\" v0.1.0\n",
+            ),
+            ("multi/z/go.mod", "module example.com/multi/z\n"),
+            ("multi/a/go.mod", "module \"example.com/multi/a\" // a\n"),
+            (
+                "svc/go.mod",
+                "module example.com/svc\n\nrequire example.com/svc/lib v0.1.0\n\nreplace example.com/svc/lib => ./lib\n",
+            ),
+            ("svc/lib/go.mod", "module example.com/svc/lib\n"),
+            (
+                "fork/go.mod",
+                "module example.com/fork\n\nrequire example.com/fork/lib v0.1.0\n\nreplace (\n\texample.com/fork/lib v0.1.0 => example.com/other/lib v0.2.0\n)\n",
+            ),
+            ("fork/lib/go.mod", "module example.com/fork/lib\n"),
+            (
+                "tools/x/go.mod",
+                "module example.com/x\n\nrequire github.com/m/m/server/public v0.4.0\n",
+            ),
+            (
+                "tools/sct/go.mod",
+                "module github.com/m/m/tools/sct\n\ngo 1.26.7\n\nrequire github.com/m/m/server/public v0.4.0\n\nreplace github.com/m/m/server/public => ../../server/public\n",
+            ),
+            (
+                "tools/esc/go.mod",
+                "module example.com/esc\n\nreplace (\n\texample.com/a => ../../../../a\n\texample.com/b v1.0.0 => /opt/b\n\texample.com/c => ./c\n\texample.com/a => ../../../../a\n)\n",
+            ),
+            (
+                "ws/go.mod",
+                "module example.com/ws\n\nrequire example.com/ws/sub v0.1.0\n",
+            ),
+            ("ws/sub/go.mod", "module example.com/ws/sub\n"),
+            ("unread/sub/go.mod", "module example.com/unread/sub\n"),
+            (
+                "vend/go.mod",
+                "module example.com/vend\n\nrequire (\n\texample.com/x v1.0.0\n\texample.com/vend/fixture v0.0.0\n\texample.com/vend/tools v0.0.0\n\texample.com/vend/cache v0.0.0\n\texample.com/vend/ok v0.0.0\n)\n",
+            ),
+            ("vend/vendor/example.com/x/go.mod", "module example.com/x\n"),
+            (
+                "vend/testdata/mod/go.mod",
+                "module example.com/vend/fixture\n",
+            ),
+            ("vend/_tools/go.mod", "module example.com/vend/tools\n"),
+            ("vend/.cache/go.mod", "module example.com/vend/cache\n"),
+            ("vend/ok/go.mod", "module example.com/vend/ok\n"),
+        ];
+        assert_eq!(
+            workspace_summary(&files, &contents).0,
+            [
+                "scip-go fork go unpinned",
+                "scip-go fork/lib go unpinned",
+                "scip-go multi go unpinned work[a,z]",
+                "scip-go multi/a go unpinned",
+                "scip-go multi/z go unpinned",
+                "scip-go server go work[public]",
+                "scip-go server/public go",
+                "scip-go svc go unpinned",
+                "scip-go svc/lib go unpinned",
+                "scip-go tools/esc go unpinned replace[../../../../a,/opt/b]",
+                "scip-go tools/sct go unpinned replace[../../server/public]",
+                "scip-go tools/x go unpinned",
+                "scip-go unread go unpinned",
+                "scip-go unread/sub go unpinned",
+                "scip-go vend go unpinned work[ok]",
+                "scip-go vend/.cache go unpinned",
+                "scip-go vend/_tools go unpinned",
+                "scip-go vend/ok go unpinned",
+                "scip-go vend/testdata/mod go unpinned",
+                "scip-go vend/vendor/example.com/x go unpinned",
+                "scip-go ws go unpinned",
+                "scip-go ws/sub go unpinned",
             ]
         );
     }
@@ -1340,6 +2163,58 @@ mod tests {
                 "scip-python tools python(None) unpinned",
             ]
         );
+    }
+
+    /// Contract M9d D2 (C3): a directory with a `requirements.txt` and neither a
+    /// `pyproject.toml` nor a `setup.py` is a Python root installing its pins (microblog's
+    /// root, microservices_demo's `src/*service`), at the repository root too. A
+    /// `requirements.txt` beside a `pyproject.toml` or a `setup.py` is that root's lockfile,
+    /// not a second job. A requirements-only root stays `Requirements` beside a `poetry.lock`
+    /// (Poetry needs a `pyproject.toml`).
+    #[test]
+    fn requirements_only_directories_are_python_roots() {
+        let files = [
+            "requirements.txt",
+            "app.py",
+            "src/emailservice/requirements.txt",
+            "src/emailservice/email_server.py",
+            "libs/pyproject.toml",
+            "libs/requirements.txt",
+            "tools/setup.py",
+            "tools/requirements.txt",
+            "legacy/requirements.txt",
+            "legacy/poetry.lock",
+            "docs/conf.py",
+        ];
+        assert_eq!(
+            summary(&files),
+            [
+                "scip-python  python(Requirements) unpinned",
+                "scip-python legacy python(Requirements) unpinned",
+                "scip-python libs python(Requirements) unpinned",
+                "scip-python src/emailservice python(Requirements) unpinned",
+                "scip-python tools python(Requirements) unpinned",
+            ]
+        );
+    }
+
+    /// Contract M9d D5 (evaluator pass 1, e03): a `go` line's key orders releases numerically
+    /// (`1.9` < `1.21`, `1.26.9` < `1.26.10`) and a language version below its pre-releases,
+    /// which sort below its first release: `1.21` < `1.21rc1` < `1.21rc2` < `1.21.0`, as Go
+    /// orders them.
+    #[test]
+    fn go_versions_order_pre_releases_between_the_language_version_and_its_release() {
+        let ordered = [
+            "1.9", "1.21", "1.21rc1", "1.21rc2", "1.21.0", "1.21.1", "1.26.9", "1.26.10",
+        ];
+        for pair in ordered.windows(2) {
+            assert!(
+                go_version_key(pair[0]) < go_version_key(pair[1]),
+                "{} < {}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]
@@ -2147,6 +3022,64 @@ mod tests {
         };
         let (small, large) = (work(100), work(400));
         assert!(large <= small * 5, "{small} -> {large}");
+    }
+
+    /// Contract M9c C2 (D1): JSONC as `tsc` reads it, bookcars `admin/tsconfig.json`'s shape.
+    /// Comments and trailing commas go; a `,}` or `,]` inside a string stays; strict JSON
+    /// parses as `serde_json` parses it; broken text is `None`.
+    #[test]
+    fn tsconfig_jsonc_resolves_aliases() {
+        let admin = r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2020", "DOM",],
+
+    /* Bundler mode */
+    "moduleResolution": "bundler", // trailing comment
+    "description": "keeps ,} and ,] and // and /* inside strings",
+    "paths": {
+      "@/*": ["./src/*"],
+      ":bookcars-types": ["../packages/bookcars-types"],
+    },
+  },
+  "include": ["src"],
+}
+"#;
+        let json = parse_jsonc(admin).expect("JSONC parses");
+        let options = &json["compilerOptions"];
+        assert_eq!(options["paths"]["@/*"], serde_json::json!(["./src/*"]));
+        assert_eq!(
+            options["paths"][":bookcars-types"],
+            serde_json::json!(["../packages/bookcars-types"])
+        );
+        assert_eq!(options["lib"], serde_json::json!(["ES2020", "DOM"]));
+        assert_eq!(
+            options["description"],
+            "keeps ,} and ,] and // and /* inside strings"
+        );
+        assert_eq!(json["include"], serde_json::json!(["src"]));
+        // An escaped quote does not end the string, so the comma before `}` inside it stays.
+        assert_eq!(
+            parse_jsonc(r#"{"a": "x\",}", "b": [1, 2 ,  ] ,}"#),
+            Some(serde_json::json!({"a": "x\",}", "b": [1, 2]}))
+        );
+        let strict = r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}, "n": [1, 2]}"#;
+        assert_eq!(
+            parse_jsonc(strict),
+            serde_json::from_str::<serde_json::Value>(strict).ok()
+        );
+        // A leading UTF-8 byte order mark is not text, as `tsc` reads it (amendment 3, E4).
+        assert_eq!(
+            parse_jsonc(&format!("\u{feff}{strict}")),
+            serde_json::from_str::<serde_json::Value>(strict).ok()
+        );
+        for broken in [
+            r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}"#,
+            r#"{"a": 1,, }"#,
+            "",
+        ] {
+            assert_eq!(parse_jsonc(broken), None, "{broken}");
+        }
     }
 
     /// Evaluator pass 1, M6e-12 (S10): a pattern escaping the tsconfig directory stays

@@ -1142,3 +1142,167 @@ Contract: `tasks/contract-m8b.md`. Branch `m8` (after the M8a commit `6c059ea`).
 - [x] T5: `sample.rs` (M3b draw, largest-remainder allocation, Wilson); `rb-bench sample`; four adversarial judges (audited) gave 249 verdicts in `bench/samples/exact.tsv`: manifest 60/60, orm 9/9, routes 58/60, scip 57/60, sql 59/60; the gate refuses missing verdicts and new wrong ones.
 - [x] T6, T7: the certainty table filled (raw keys and `table_ops` counted once); `m8b.json` scored twice identically; `compare` against m8a exits 2 (new keys), and all 260 M8a cells are unchanged. Mutants m201–m228 all killed (m213, m214, m219, m223 needed tests). Findings B7–B13.
 - [x] Amendment 2 (evaluator pass 1, 2026-10-15): 6 microSecEnD override files (`bench/keys/microsecend/*.md`, 23 removals: 6 context-path + 17 key errors, with 2 artifacts kept as fn, + 4 true prefixed additions); re-score `d7346ffb…` changes exactly the 6 microsecend endpoint cells (endpoints P 88.7 % R 75.8 %; `exact` 122/130); 3 hand-key second adjudications (31/37/72 statements, no entries); transcript audit clean; mutants m201–m229 all killed (m228 rewritten stale, m229 new); Result, B7/B9/B11/B12, new B14, CHANGELOG, IMPLEMENT and lessons corrected. Evaluator pass 2 (`tasks/eval-m8b-pass2.md`) VERDICT PASS with 1 prose should-fix (B12 piggymetrics) and 4 notes, all answered here; M8b closed 2026-10-16.
+
+---
+
+# M9a: `exact` precision from the M8 benchmark, started 2026-10-16
+
+Plan: `tasks/plan-m9.md` (from an opencode plan session; claims unverified until each contract checks them). Contract: `tasks/contract-m9a.md` (planner verified every root cause; 7 plan corrections). Branch `m9`, from `main` at `0453fda`; every M9 part commits there.
+
+- [x] Contract written (B7, B8, B12a, B13, B14, B11; C1–C12; mutants m230–m247).
+- [x] P0: mutant runner handles any crate, build errors INVALID; m8b battery re-run; M8 dumps re-scored byte-identical.
+- [x] P1: B12a (`"{taskId}"` literal).
+- [x] P2: B7 (test-file routes) and B8 (spec-only routes `synthetic`).
+- [x] P3: B13 (method → interface `IMPLEMENTS` dropped and counted).
+- [x] P4: B14 (config-server shared context paths).
+- [x] P5: `PIPELINE` `m9a-1`, docs, fmt/clippy, real-Docker suites, batteries; commit.
+- [x] P6: bench run, invariant, new sample verdicts, score ×2, re-scored base, compare. Binary `05a600c9…` from `7a82313`, 0 failures. M8 base's mattermost dumps restored from the M8 binary (re-score byte-identical); invariant 0 unclassified over 157 dumps; 80 redrawn edges judged, all TRUE; `compare` exit 0 with one accepted line; 14 small-target perf warnings re-measured (contract amendment 2).
+- [x] P7: records done; evaluator pass 1: PASS (4 should-fix, 4 notes, `tasks/eval-m9a-pass1.md`).
+- [x] Evaluator pass 2 (`tasks/eval-m9a-pass2.md`): PASS, 5 notes (amendment 4; N1, N2 carried to M9b P5). **M9a closed.**
+- [x] Pass 1 answered (contract amendment 3): E3 fix test first (`PIPELINE` `m9a-2`), E1 tests + mutants m248–m260, E2 runner filter rule, E4 `check_citations.py` (258/259 OK) and `disk.txt`, E5/E6 residue. Code `624da45`.
+- [x] Re-close: fmt/clippy, unit 357/204/79, e2e 52/0/0, batteries 31/31 + 29/29; binary `2e36cd60…`; bench 0 failures; dumps identical by row to r1; score ×2 `cmp`; sample 0 missing; `compare` exit 0; 27 perf warnings re-measured (`perf-ab3.txt`, `perf-ab4.txt`), none persists.
+- [ ] Evaluator pass 2 (verification only).
+
+## Review (M9a)
+- The 8 wrong `exact` edges the M8b keys found are gone: `exact` 100.0 % of 126 (M8b 93.8 % of 130), and the sample's `routes` and `scip` families are 60/60.
+- microSecEnD endpoints P 88.7 % → 100.0 %, R 75.8 % → 91.9 %; handkey endpoints P 95.1 % → 100.0 %. 8 of 314 cells moved; the one accepted line is a correct flow the model puts out of scope.
+- Two predictions missed: hk_todo's out-of-scope test handler binding also left (1 → 0), and the anilallewar and rohitghatol flows did not gain a tp. C4's "264 from 5 types" was two counts mixed: 277 from 5 types, 264 from the 4 in `_test.go` files (B13b, M9b).
+- Gitignored bench state can vanish: the M8 base dumps were deleted mid-milestone and had to be regenerated before the gate (lesson). `target/` had grown to 48 GiB (lesson).
+
+---
+
+# M9b: recall from the M8 benchmark, started 2026-10-16
+
+Contract: `tasks/contract-m9b.md` (10 plan corrections; amendments 0–8). Branch `m9`.
+
+- [x] Contract written (B1, B9, B10, B12b, B13b; C1–C12; amendment 0 moved the mutant ids to m261–m284).
+- [x] P0: SCIP probe from the raw indexes; base re-scored `cmp`-identical; D4 failed, so B1 moves to M9c (amendment 1). B13b recorded.
+- [x] P1: B9, Go methods in sibling files are members; two bare-name tables cleaned (amendment 2).
+- [x] P2: B10, `fmt.Sprintf` SQL folds package constants (amendment 3).
+- [x] P3: B12b, Spring Data REST endpoints `synthetic` (amendment 4).
+- [x] P4: not built (D4 failed; C5 and C6 withdrawn, m279–m284 dropped).
+- [x] P5: `PIPELINE` `m9b-1`, N1, N2, docs; fmt/clippy CLEAN; real-Docker 1,135/0/0; batteries 28/28, 31/31, 29/29; commit `3b83d68`.
+- [x] P6: binary `3fc09844…` from `3b83d68`, 0 failures; jferrater adjudicated (17 TRUE, 12 ADD); invariant 0 unclassified; sample 0 missing; score ×2 `cmp`; `compare` exit 0 with 2 accepted cells; 1 perf warning re-measured as noise (amendment 6).
+- [x] P7: records done; evaluator pass 1 pending.
+- [x] Evaluator pass 1 (`tasks/eval-m9b-pass1.md`): PASS, 6 should-fix, 4 notes; answered in amendment 7.
+  - [x] E3: named-type Go constants refused (row `N`, m296); `PIPELINE` `m9b-2`.
+  - [x] E2: `@Bean`/`withConfig`/Kotlin configurers cap (rows `adpt`, `bean`, `kcfg`, `kwith`, `neg`; m297–m299).
+  - [x] E1: rows `P`, `Q`, local type, `findAllById`, `data_rest_services` test; evaluator e1–e7 KILLED; m279–m284, m295; m267 re-anchored.
+  - [x] E4: runner matches the filter against full test paths; "6 crates".
+  - [x] E5: split 5 item / 2 collection / 5 search; `findById` gold omission recorded (key unedited).
+  - [x] E6: full `compare` command; `compare-r2.txt` exit 0; `GetClusterId` in M9c's open items.
+  - [x] Notes and the CRUD `exported = false` rule recorded as residue.
+  - [x] Re-close: e2e 52/0/0; batteries 39/31/29 KILLED; binary `36ed5ea4…` from `b651523`; bench 0 failures; r2 diff 0 rows; score ×2 `cmp`; sample 0 missing; `compare-r3.txt` exit 0; 24 perf warnings A/B noise.
+- [x] Evaluator pass 2 (`tasks/eval-m9b-pass2.md`): PASS, 0 blocking, 3 should-fix, 4 notes; answered in amendment 8. **M9b closed.**
+  - [x] S1: the six targets over 1.1× CPU re-measured, 20 ABBA runs per side (`perf_ab6.sh`): median CPU 0.932–1.097×, instructions 0.978–1.003×; noise under amendment 0 as written. Amendment 7's sentence corrected; `perf_ab5_summary.py` prints its rule.
+  - [x] S2: Result perf table has m9a, r1 and r2 columns.
+  - [x] S3: tries 1–2 failed under load; try 3 green (`var/m9b/logs/r3/s3-try3.log`). Full suite at `15baa12`: 1,134/2/0 under load (`test-r3.log`), then **1,136/0/0, 0 `skipping:`, exit 0** (`test-r3b.log`, `s3-green.txt`). Base binary fails `rb check` identically (`s3-check-ab.txt`).
+  - [x] N1: rows `fqb`, `fqs` (qualified configurer); x1 KILLED, no new id. Code `15baa12`.
+  - [x] N2, N3: "E4"; "17 of 18" in todo, IMPLEMENT, CHANGELOG and C4. N4: hazard noted, lesson added.
+- [x] **Open item (from M9b pass 2, S3; closed in M9d by D11, `tasks/contract-m9d.md`):** `rb check`'s `unowned_table_writes` rule takes 1.8–2.5 s on a 44-node graph on this host, at the 2,000 ms default statement timeout, so `check_gates` and `a_checkout_is_its_repository_whatever_its_name` fail under load. In `psql` the rule's Cypher runs in 52–67 ms without a `LIMIT` and in about 1.85 s with the `LIMIT` `rb-store` appends (`var/m9b/logs/r3/s3-limit-probe.txt`). The M9a binary fails identically (`s3-check-ab.txt`), so this is not an M9b regression. Find why the `Limit` node costs 1.8 s, and fix the query or the plan.
+  - **Closed (M9d D11):** the cost was LLVM JIT, not the `LIMIT`. None of the graph's AGE label tables is ever analysed, so the planner estimates the rule at 1,044,383 (above `jit_above_cost` 100,000 and the inline and optimise thresholds, 500,000), and the `Limit` node's start-up compiles the whole module: 0.27–0.37 s at load 2.4–3.2, 1.8 s at load 5. With jit off the query runs in 1.6 ms. `cypher()` now runs `SET LOCAL jit = off` beside its `statement_timeout`. `rb check --rule unowned_table_writes`, M9c's binary against M9d's on `topo-packs` at load 4.37–4.74: median **480.8 → 24.9 ms**, all three rules 495.6 → 36.5 ms, JIT absent from the plan, outputs identical (`var/m9d/logs/p9/check-ab.txt`; P1: 464 → 53 ms at load 4.4–5.0). `check_gates` and `a_checkout_is_its_repository_whatever_its_name` passed in P8's full run (1,183/0/0).
+
+## Review (M9b)
+- Recall moved where the M8 keys said it was missing: hk_todo handlers 0 → 12 of 13, tables 0 → 21 of 26, mse_jferrater endpoints 0 → 17 of 18 (17 of 17 against the key, which lacks the served `/customers/search/findById` that rb also misses). scip calls agreement R 49.7 % → 62.4 %, P 74.3 % → 78.4 %. No new edge is `exact`.
+- B1 was not built. The probe showed scip-go records only namespace occurrences for another module, so the planned symbol join had nothing to join. Reading the index before writing code saved a phase.
+- Three surprises: the bare-name defect the contract said made no edges made 41 ambiguous ones on mattermost; mattermost's 2 folded SQL sites add no `QUERIES`; the jferrater key gained 12 entries, not "up to 10".
+- Process: the adjudicator gave TRUE/FALSE, and ADD/REMOVE was derived with `adjudicate.py`'s rules. C6 had been P4's code and is withdrawn with it. 3 of the 14 accepted mattermost fp go to server's own `App#GetClusterId`, which the accept line's B1 reason does not explain.
+- Pass 1 found two wrong-or-missing rules on inputs the bench lacks (a named-type Go constant folded by its literal; a `@Bean` configurer not capping) and seven mutants that the tests did not bite. Its records findings stood: the ADD split was 5/2/5, and jferrater's 17 of 17 is 17 of 18 with the served `findById` search that neither rb nor the key has.
+- Pass 2 found no wrong rule. Its findings were about evidence: a perf verdict applied a looser rule than the one it cited (re-measured: noise, by CPU and by instructions retired), a table showed one run's numbers under another's name, and three tests failed only on a loaded host. The `rb check` timeout behind two of them is old `rb-store` code that the M9a binary hits too (open item above).
+
+---
+
+# M9c: Tier B call recall (Go, TS, Python), scip-go image, cross-module scip-go joins, started 2026-10-16
+
+Contract: `tasks/contract-m9c.md` (5 plan corrections; amendments 1–4; notes PI–P7b). Branch `m9`.
+
+- [x] Contract written (B1, B2, B3, B5, B13b; C1–C15; mutants from m300).
+- [x] P0: probe `bench/probe/m9c_forms.py`; base re-scored `cmp`-identical; 33 of 35 quoted numbers reproduced, B1's split corrected; D7 read per job (407 / 322); the `GetClusterId` fp traced to the scip-go image (amendment 1).
+- [x] P0b: image root cause verified (Go 1.27.2 export data V5, x/tools v0.45.0 reads V4); fix measured; D7 withdrawn, D8 → D8′, phase PI added (amendment 2).
+- [x] PI: `rb-scip-go:0.2.7-xtools0.50.0` with pinned modules and a build-time self-test; 2 golden rows re-blessed and classified; image control fails on the old tag.
+- [x] P1: B3, JSONC tsconfig `paths` and default imports; bookcars probe +801 `CALLS`; m300–m303 KILLED.
+- [x] P2: Go and Python facts (results, aliases, embedded fields, var literals, call pairs, `raise`); m304–m309 KILLED.
+- [x] P3: Go resolution through the five forms and `tier_b_forms`; go_clean_arch and gin probes +21 pairs; m310–m322 KILLED.
+- [x] P4: Python `super()`, star imports, re-exports, module variables, inherited `__init__`; PyCG probe exactly the 10 predicted cases; m323–m330 KILLED.
+- [x] P5: D8′ `synthetic` cross-project join, `exact calls (scip)` counts `exact` only; SCIP e2e green after a Maven 429 rescue; m334–m338, m340 KILLED.
+- [x] P6: `PIPELINE` `m9c-1`, design and usage docs; real-Docker 1,153/0/0; batteries m9c 37, m9b 39, m9a 31, m8b 29 KILLED.
+- [x] P7: binary `930271d4…` from `139dd21`, 0 failures; invariant 0 unclassified; 54 redrawn `scip` edges judged blind, 54 TRUE; score ×2 `cmp`; `compare` exit 0 with 6 accepted lines over 5 cells; `noscip-fresh` A/B noise; SCIP mode OVER-CPU (1.297×).
+- [x] P7b: cause (per-occurrence symbol parse in the join), memo fix `55592a1`, m341 KILLED (m9c 38/38); binary `f340b267…` re-benched (run 2 after an autovacuum re-run), 157 dumps identical, `compare` exit 0; SCIP-mode A/B 0.975× CPU, noise.
+- [x] P8: records done; real-Docker 1,154/0/0 after P7b (0 `skipping:`); batteries m9c 38, m9b 39, m9a 31, m8b 29 KILLED on the final code; evaluator pass 1 pending.
+- [x] Evaluator pass 1 (`tasks/eval-m9c-pass1.md`): PASS, 0 blocking, 6 should-fix, 6 notes; answered in amendment 3.
+  - [x] E1: Go type-parameter results refused (Go facts record type parameters); `select` receives declare their names; red first; m342–m346.
+  - [x] E2: Python member lookup by the C3 MRO (inherited `__init__`; `super()` too, N4); the later of a definition, named import and star import wins; red first; m347–m351; m302, m324–m328 re-anchored.
+  - [x] E3: rows for e1, e2, e4, e8 and e7 (`npm` manager); evaluator specs re-run: 9 KILLED, e5 equivalent (code simplified), e9b as before; e1, e2, e4, e8 adopted as m356–m359.
+  - [x] E4: BOM stripped in `parse_jsonc`; `join_dir` drops `.` segments; red first; m352, m353; 0 bench rows.
+  - [x] E5: 60 seeded D8′ `synthetic` `CALLS` judged blind: 59 TRUE (`bench/samples/synthetic-d8.tsv`); the FALSE (a Go conversion labelled `CALLS`) fixed as a class (77 rows → `REFERENCES`; m354, m355); precision decomposed: `exact`-only gold P 78.2 %.
+  - [x] E6: quiet-host check, re-bench, standalone timing: the pass-1 run's mattermost walls 26.10 / 16.63 / 20.34 s, within 1.15× of standalone; M9d's base noted.
+  - [x] N1–N6 answered (N1, N2 recorded; N3, N5, N6 fixed; N4 `super()` fixed, `raise` forms recorded).
+  - [x] `PIPELINE` `m9c-2`; fmt, clippy clean; real-Docker 1,156/0/0 (0 `skipping:`); batteries m9c 56, m9b 39, m9a 31, m8b 29 KILLED; commit `e58f6ee`.
+  - [x] Binary `3b94ded4…` (now `rb.r3`) from `e58f6ee`; bench 0 failures; the pass-1 run differs from the P7b run by 156 rows (E5c 154, E2 2), 0 unclassified; score ×2 `cmp`; 53 redrawn `exact` edges judged, 53 TRUE; `compare` exit 0 (45 changed, 6 accepted); RSS warnings A/B noise; amendment 3 and records; commit "M9c: re-close after evaluator pass 1".
+- [x] Evaluator pass 2 (`tasks/eval-m9c-pass2.md`): PASS, 0 blocking, 3 should-fix, 6 notes; answered in amendment 4.
+  - [x] S2: Python MRO memoised per class, fallback included; the depth cap ends the walk and is not memoised; structural test red first (4,096 → 24 computations at 12 layers); acyc28 164.49 s → 0.17 s, acyc40 > 625 s → 0.21 s; x10 KILLED on the pre-fix code, x10r and p2a–p2c KILLED; m348 re-anchored.
+  - [x] N1: Go parameters and locals typed by a type parameter type nothing; red first; p2d KILLED; struct fields and signature `REFERENCES` recorded as residue.
+  - [x] N3: scip-python row; x7 KILLED.
+  - [x] S1: S41–S60 evidence rebuilt from the judge's array; `bench/probe/sample_evidence_check.py` (60/60, control 58/59); amendment 3's audit sentence corrected.
+  - [x] S3, N4: stale P7b-run facts corrected in the Result, IMPLEMENT, todo and bench-findings; binaries and runs named once.
+  - [x] N2, N5 recorded as residue; N6 noted in `tasks/contract-m9d.md`'s NFRs.
+  - [x] `PIPELINE` `m9c-3`; commit `15831b0`; binary `6cd5baaa…` from it; bench 0 failures, 157 dumps identical to the pass-1 run; score ×2 `cmp`; `compare` exit 0 (45 changed, 6 accepted); RSS warnings A/B noise.
+  - [x] Real-Docker 1,157/0/0 (0 `skipping:`); batteries m9c 56, m9b 39, m9a 31, m8b 29 KILLED; fmt, clippy clean; amendment 4 and records; M9c closed.
+- **Open items carried to M9d (`tasks/contract-m9d.md`):** version skew (185 of the 203 mattermost fp, every D8′ join `synthetic`); `(T, *model.AppError)` results (1,050 headers on mattermost `server/`); the `scip` crate parser's remaining `Debug` cost on distinct strings; the 4,092 interface-method references (M9d plan correction 3). M9b's `unowned_table_writes` timeout is M9d's D11 (LLVM JIT, not the `LIMIT`).
+
+## Review (M9c)
+- Recall moved where B2, B3 and B5 said it was missing: mattermost scip `calls` fn 12,672 → 1,590 (1,659 in the P7b run) and fp 6,141 → 203; bookcars fn 694 → 8; go_clean_arch and gin 100 %; PyCG `calls` 12 → 14 of 48 and `calls_file_scope` 94 → 105 of 186. scip `calls` agreement P 78.4 % → 99.5 %, R 62.4 % → 96.5 % (96.3 % in the P7b run). The precision gain is the gold growing, not Tier B: D8′'s `synthetic` joins are scip gold, 5,944 of the 6,141 base fp became tp through them, and against `exact` gold alone P is 78.2 % (pass 1, E5). No new Tier B edge is `exact`, and `exact` stays 100.0 % of 126.
+- The biggest finding was not in the plan: rb's scip-go image had loaded no imported package since it was built, silently. Reading one missing occurrence (`GetClusterId`) down to the export-data version found it. It explained B13b and M9b's empty B1 probe, made 5,947 of mattermost's 6,141 agreement fp joinable, and made D7 unnecessary. The build now fails on the same kind of break.
+- Predictions held where they were syntactic (bookcars at the upper bound, the 21 Go pairs, the 10 PyCG cases exactly). Two outcomes were not predicted: D3's alias definitions let rb accept 10 scip-go documents (368 of the +399 `exact calls (scip)` that P5 had put on the image), and `calls_file_scope` on bookcars beat its prediction by 5 through default imports.
+- Perf: the scip-go image made server's index 35 % larger, and the join's per-occurrence symbol parse turned that into 1.297× CPU. The fix makes SCIP mode cheaper than M9b's.
+- Process: the one-edit rule slipped in P2–P5 and in P8 (always caught by grep before anything ran). A late-attaching profiler and an autovacuum after probe deletes each cost a re-measure. Records slips caught in P8: "27 identical target dumps" (26), the run-of-record window (17:41, not 17:38), and the accept line's "190 version-skew" fp (172 skew, 18 not).
+- Pass 1 found two wrong-edge rules each in Go and Python on inputs the bench lacks (type-parameter results, `select` receives; breadth-first `__init__`, star-import order), two tsconfig forms, four mutants no test bit, and a headline that hid where its precision came from. The judged sample it asked for found a fifth wrong rule in the very edges that had become gold: a Go conversion labelled `CALLS`, 77 rows. Only 156 bench rows moved; the cell numbers barely changed, and the records now say the precision gain is the reference growing (78.2 % against `exact` gold alone). The pass-1 run, on a quiet host, also fixed the perf base M9d inherits (mattermost walls a third of the P7b run's).
+- Pass 2 found no wrong edge on the bench but a cost one: pass 1's own MRO fix memoised only its success, so a lattice Python rejects (and a valid one deeper than the cap) was exponential, and past 64 levels the answer depended on lookup order. Memoising the fallback too, and keeping the cap out of the memo, fixed both; a structural test counts the computations. Its other findings were evidence: 20 sample rows carried their neighbour's evidence (a zsh array read from 0) behind an audit that could not see it, and records still stated P7b-run numbers as current. N1's type-parameter locals were the same defect class as E1 and cheap, so they were fixed too (`m9c-3`). No bench row moved: all 157 dumps are identical to the pass-1 run's.
+
+---
+
+# M9d: SCIP fetch and index failures (B4), Go workspaces, scip-go health, `rb check` JIT, started 2026-10-17
+
+Contract: `tasks/contract-m9d.md` (8 plan corrections; amendments 1–3; notes P1–P9c; Result). Branch `m9`.
+
+- [x] Contract written during M9c (B4's 10 jobs traced to causes; the `go.work` probe; `rb check` traced to LLVM JIT; C1–C17; mutants from m360).
+- [x] P0: M9c's record re-scored `cmp`-identical; the probe reproduces every planned number; gated probes: go.work A/B (+1.69 GiB with `go mod download`, +53 MiB with `go list`), spring on JDK 25 (targetroot cause found), adservice's init-script hook, the 4 Python roots (pip environment never reaches the index); amendment 1 (D5 amended, D12b, D15).
+- [x] P1: D11 `jit = off` in `cypher()`; D15 read-only cache clean-up; `rb check` 464 → 53 ms at load 4.4–5.0; m387, m392 KILLED.
+- [x] P2: D1 npm host rewrite and engine check; nestjs probe ok; m360–m362 KILLED.
+- [x] P3: D2–D4 `requirements.txt` roots, Poetry tail, environment-less fallback; fastapi and microblog probes ok; m363–m369 KILLED.
+- [x] Amendment 2: D5b, the plain re-run after a failed workspace.
+- [x] P4: D5–D7, D5b; server ok under `go.work` (0 invalid locals, peak 3.92 GB, 0 OOM), sharedchannel-test ok; m370–m378, m394–m396 KILLED (m372 re-specified).
+- [x] P5: D8 `exact` joins, D9 in-repo packages, D10 invalid-local counts; probe `exact` 45,478, `synthetic` 0; m379–m386 KILLED.
+- [x] P6: D12 JDK 25 image, D12b targetroot; spring probe ok (111 documents); m388–m390, m393 KILLED.
+- [x] P7: D13 Gradle init script; adservice probe ok; m391 KILLED; m9d 37/37.
+- [x] P8: `PIPELINE` `m9d-1`; design notes and usage guide; real-Docker 1,183/0/0 (0 `skipping:`); batteries 192/192 KILLED (m9c m336, m359 re-anchored).
+- [x] P9 first run: `rb.p9a`, 0 failures, invariant 0 unclassified (NOSCIP-D2 added by amendment 3), 55 drawn `scip` edges judged blind, 55 TRUE; `compare` exit 0; stopped on two perf blockers (amendment 3).
+- [x] P9b: Lombok marker memo; m397 KILLED; fifth `docker image inspect` measured and left.
+- [x] P9c: Lombok package byte pre-check; m398 KILLED; m9d 39/39.
+- [x] P9: binary of record `5d994f76…` from `559d41d`; record run `5d994f76699b`, 157 dumps identical to the first run; score ×2 `cmp`; `compare` exit 0 (46 changed, 12 accepted over 6 cells); both scip-mode perf cells accepted as input-driven under amendment 3; `rb check` 480.8 → 24.9 ms.
+- [x] P10: records (Result, CHANGELOG, IMPLEMENT, findings B1/B4/B15, lessons, README, usage guide, design row).
+- [x] Evaluator pass 1 (`tasks/eval-m9d-pass1.md`, FAIL: B1; S1–S5; N1–N6), answered in amendment 4 by E1–E3.
+- [x] **C16 waiver, the user's sign-off** (amendment 4; signed off by the user on 2026-10-21 ("1.", the option to accept the waiver, after the waiver was explained)): microservices_demo and spring_boot SCIP mode stay over the strict limits against M9c after E2 (CPU 1.200× and 1.333×, RSS 1.544× and 1.237×; `var/m9d/logs/e3/perf-ab-c16-summary.txt`); "waived under amendment 3, which was written after the first OVER verdict".
+- [x] Evaluator pass 2 (verification only): PASS, 0 blocking, 1 should-fix (answered in the records), 5 notes (`tasks/eval-m9d-pass2.md`).
+- **Open items and follow-ups (from the Result, Out of scope and the phase notes):**
+  - [x] Re-run all five mutant batteries and the full real-Docker suite on `559d41d`: m8b, m9a, m9b and m9c were last run at P8, and P9b/P9c changed `rb-scip/src/symbol.rs` and `rb-indexer/src/scip.rs` (m9a m236–m238 and m9c m334, m340, m341, m354, m355 mutate those files). Only the m9d battery, the unit suites and the Java SCIP e2e ran after them. Done 2026-10-18 (`var/m9d/logs/close/`): suite 1,185 passed, 0 failed, 0 ignored, 0 `skipping:`; batteries 194/194 KILLED (m8b 29, m9a 31, m9b 39, m9c 56, m9d 39), none re-anchored; `rb.repo` identical.
+  - [ ] **scip-go `position_encoding`** (bench finding B15): scip-go 0.2.7 writes byte columns and leaves the encoding unset; `decode.rs:200-211` reads that as UTF-16 for every tool but scip-java. 440 server occurrences (368 references) and 44 in server/public sit after a non-ASCII byte on their line; one of them is mattermost's 19th fp. Reading scip-go's unset encoding as bytes changes dumps (a `PIPELINE` bump and a re-score).
+  - [x] **One parse per distinct symbol, shared across the join's readers:** `rb_scip::symbol::package`, `NameForms::of` and `last_descriptor_name` each parse every distinct symbol (14.3 %, 11.9 % and 6.8 % of spring's `index_commit` samples on `rb.p9b`); spring's decode and join cost 4.7–6.6 µs per occurrence against 1.23 µs on mattermost's scip-go indexes (1.16 µs before E3's S5 correction). Resolved in E2 (`SymbolMemo`, m402).
+  - [x] **npm `replace-registry-host` narrowed:** `always` also rewrites `git+ssh` GitHub hosts (webapp, cypress), which closes the `RB_SCIP_REGISTRIES` opt-in for npm git dependencies. Set it to the lockfile's foreign registry host (`npm.styque.de` for nestjs), read by the planner from `resolved` URLs; check whether any bench lockfile mixes two mirrors. Resolved in E1 (amendment 4, evaluator pass 1 B1): the fetch reads the exported `package-lock.json` and names its one foreign registry host, none or several giving no setting; no bench lockfile has two (`var/m9d/logs/e1/bench-lock-hosts.txt`: nestjs `npm.styque.de` only). Probes: the evaluator's `npm_url` `ok` opted in and refused without; nestjs `ok`, dump identical to the record; webapp's and cypress's tails back to the refusal of `codeload.github.com`.
+  - [x] **Versioned workspace replaces** (amendment 4, evaluator pass 1 S1): rb's `go.work` replaces each workspace module at the version the root requires (`RECIPE_GO_WORK` `m9d-go-2`). The evaluator's `wsrep`, `wsout` and `go_ws/svc` failed → `ok`; mattermost's dump identical to the record except those two TS tails (E1 note).
+  - [x] **Evaluator pass 1, phase E2** (amendment 4): S2 (one shared per-symbol parse in the join, m402; C16 reported as measured) and S3 (rows for e12, e09, e08, e03, e07; m403–m407). Done 2026-10-21 (E2 note): equivalence on 14 indexes, 0 differing (spring parses 3,571 → 1,699); fmt, clippy clean; rb-scip 103, rb-indexer 386 passed; batteries 203/203 KILLED (m9d 48, m8b 29, m9a 31, m9b 39, m9c 56; m341 re-anchored). The A/B moves to E3, on the binary of record.
+  - [x] **Evaluator pass 1, phase E3** (amendment 4): S4, S5 records; N1, N2, N5, N6 to Out of scope, N3 here; the re-close (new binary of record, bench, invariant, gate, A/B, full suite and batteries), then evaluator pass 2. Done 2026-10-21 (E3 note): records corrected; binary of record `8445f0f4…` from `45bd5b5`, run `8445f0f45fd1` (scoreboard identical to P9's but for binary and commit; 155 dumps identical, mattermost's two TS tails moved); M9c's and P9's mattermost dumps regenerated and verified; invariant 0 unclassified (RECIPE 4); `compare` exit 0, 12 accepted; real-Docker 1,192/0/0; A/B: C16 still over on two cells (waiver to the user).
+  - [ ] **Judge prompt, next sample** (evaluator pass 1 N3, amendment 4): drop the template's line "The version in a key does not matter … whichever version go.mod requires" from any prompt that judges cross-module `exact` edges; it tells judges to accept a version-skewed resolution, which is the `exact`/`synthetic` question itself. No harm in M9d (the evaluator's decode found all 23,180 D8 edges byte-equal under `go.work`).
+  - [ ] **pip environments never reach scip-python's index** (amendment 1, risk 3): the fetch installs into its own container's site-packages, so a Requirements job's index equals D4's fallback (2 packages named against 12–14 in a one-container control). Install to a mounted `--target` with `PYTHONPATH`; it changes every Python index. Whether scip-python finds Poetry's virtualenv under `/root/.cache/pypoetry` is unmeasured.
+  - [ ] **D12's fifth `docker image inspect`**: 23.6 ms wall and 10.0 ms child CPU per SCIP-mode `rb index` (`var/m9d/logs/p9b/inspect-cost.txt`), the one control tick in P9's A/B. Resolving it lazily needs `tool_versions` (`main.rs`) to stop recording `scip_java25` on runs with no Maven job above release 21.
+  - [ ] Recorded in Out of scope, each a next step if wanted: kotlin_spring_realworld (a Kotlin SemanticDB path for Maven, or scip-java on Kotlin 2's FIR); mattermost `webapp`/`e2e-tests/cypress` `git+ssh` dependencies and webapp's size under 4 GiB; a scip-typescript environment fallback; JavaScript-only packages (`--infer-tsconfig`), C# and PHP; a committed `go.work` at a job root (meets `GOFLAGS=-mod=mod` today); the 4,093 interface-method references `unanchored` (why scip-go 0.2.7 omits them); cross-project `IMPLEMENTS` (352); D12's release reader sees in-repo properties only (risk 4); D13 knows the protobuf plugin's locator configurations only (risk 5).
+
+- [x] **rb-bench pins (on `m9`, after M9d close, 2026-10-21):** dumps must match their manifest pin; `compare` fails on a vanished sample family; tests red first; records re-score `cmp`-identical; m408–m410 KILLED (CHANGELOG).
+
+## Review (M9d)
+- Every failed or absent SCIP job of M9c's record now has a measured cause, and every one that could be fixed inside the allow-list and the disk budget is `ok`: 5 failed jobs (nestjs, fastapi, spring_boot, adservice, sharedchannel-test) and 5 absent Python roots became 10 `ok` jobs (3 of them without their environment). Four targets are scored for the first time (fastapi, microblog, nestjs, spring_boot), and microservices_demo's Python and Java parts join its Go part. Three stay failed with their reasons recorded (kotlin; webapp and cypress).
+- The `go.work` probe in planning paid for itself: it showed the 172 (then 185) version-skew fp would become joined tp and the joins byte-equal, so D8 could be `exact` rather than `synthetic`, and P0's A/B found the 1.69 GiB cache cost of `go mod download` before it was built. 184 skew fp became tp; the 19th fp is a separate defect (scip-go columns read as UTF-16), found by reading one span, not by the emulation.
+- `rb check`'s timeout was not where M9b looked (the `LIMIT`): one `EXPLAIN ANALYZE` showed JIT, and one session setting removed it (480.8 → 24.9 ms under load).
+- Predictions missed in four places, each explained: the 19th fp, WORK's gold +248 not +253, RECIPE not empty (scip-java rows re-ran with D12b; tails are in the dump), and D1's host rewrite reaching GitHub hosts.
+- Perf: two SCIP cells grew because they decode indexes the base never had. The first A/B also found a per-occurrence Lombok parse (M9c P7b's cost in another function); P9b and P9c removed it, and the perf rule gained the input-growth clause it should have had from the start (lesson).
+- Process: the one-edit rule slipped in P3, P4 and P8 (caught by grep each time); two m9c mutants went stale unseen because P1–P7 ran only the m9d battery; the "cold" bench run was warm because the probes had cached the new jobs; a run benched minutes after the host woke from a 9.5 h sleep was set aside.

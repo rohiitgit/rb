@@ -613,8 +613,12 @@ fn value_text(language: Language, node: Node<'_>, source: &[u8]) -> (String, boo
         .unwrap_or_else(|| (text(node, source), false))
 }
 
-/// Declared type parameter names of a Java or TypeScript class/interface.
+/// Declared type parameter names of a Java or TypeScript class/interface, or of a Go function,
+/// method (its receiver's) or type ([`go_type_params`]).
 pub(crate) fn type_params(language: Language, def: Node<'_>, source: &[u8]) -> Vec<String> {
+    if language == Language::Go {
+        return go_type_params(def, source);
+    }
     if !matches!(
         language,
         Language::Java | Language::TypeScript | Language::Tsx
@@ -633,6 +637,47 @@ pub(crate) fn type_params(language: Language, def: Node<'_>, source: &[u8]) -> V
                 .or_else(|| p.named_child(0))
                 .map(|n| text(n, source))
         })
+        .collect()
+}
+
+/// Go type parameters (contract M9c amendment 3, E1): a generic function's or type's own
+/// (`func Id[T any]`, `type Box[E any]`); for a method, the type arguments its receiver names
+/// (`func (b *Box[E]) Get() E` → `E`), which stand for the receiver type's parameters.
+fn go_type_params(def: Node<'_>, source: &[u8]) -> Vec<String> {
+    if let Some(params) = def.child_by_field_name("type_parameters") {
+        let mut c = params.walk();
+        return params
+            .named_children(&mut c)
+            .filter(|p| p.kind() == "type_parameter_declaration")
+            .flat_map(|p| {
+                let mut pc = p.walk();
+                p.children_by_field_name("name", &mut pc)
+                    .map(|n| text(n, source))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
+    if def.kind() != "method_declaration" {
+        return Vec::new();
+    }
+    let receiver_type = def.child_by_field_name("receiver").and_then(|r| {
+        let mut c = r.walk();
+        r.named_children(&mut c)
+            .find(|p| p.kind() == "parameter_declaration")
+            .and_then(|p| p.child_by_field_name("type"))
+    });
+    let generic = match receiver_type {
+        Some(t) if t.kind() == "pointer_type" => t.named_child(0),
+        other => other,
+    }
+    .filter(|t| t.kind() == "generic_type");
+    let Some(args) = generic.and_then(|g| g.child_by_field_name("type_arguments")) else {
+        return Vec::new();
+    };
+    let mut c = args.walk();
+    args.named_children(&mut c)
+        .map(|a| text(a, source))
+        .filter(|a| a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
         .collect()
 }
 
@@ -660,8 +705,22 @@ pub(crate) fn return_type(language: Language, def: Node<'_>, source: &[u8]) -> O
             };
             Some(text(ty, source))
         }
+        // A Go function's or method's `result` as written: `T`, `*T`, `(T, error)` (contract
+        // M9c D3).
+        Language::Go => matches!(def.kind(), "function_declaration" | "method_declaration")
+            .then(|| def.child_by_field_name("result"))
+            .flatten()
+            .map(|r| text(r, source)),
         _ => None,
     }
+}
+
+/// Go `type A = B`: the target type as written (contract M9c D3).
+pub(crate) fn alias_of(language: Language, def: Node<'_>, source: &[u8]) -> Option<String> {
+    (language == Language::Go && def.kind() == "type_alias")
+        .then(|| def.child_by_field_name("type"))
+        .flatten()
+        .map(|t| text(t, source))
 }
 
 /// Java modifiers that [`modifiers`] records.
@@ -1448,11 +1507,13 @@ mod signature_tests {
         );
     }
 
+    /// Neither has modifiers, and Python no return type. Go records its `result` as written
+    /// since contract M9c D3 (`go_results_aliases_and_embedded_fields_are_facts` has the forms).
     #[test]
     fn go_and_python_have_neither() {
         assert_eq!(
             signatures(Language::Go, "package p\nfunc F() int { return 1 }\n"),
-            ["F: - []"]
+            ["F: int []"]
         );
         assert_eq!(
             signatures(Language::Python, "def f() -> int:\n    return 1\n"),

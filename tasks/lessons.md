@@ -598,3 +598,160 @@
 ## 2026-10-15: an evaluator finding is closed by a re-score, not by a mechanism
 - **Mistake (caught):** the M8b tree already contained the microSecEnD override mechanism and the re-generated statements when pass 1 landed, so "fixed" looked done. But no override file existed (the 6 spurious tp were still in the scoreboard), the committed `statements.txt` still predated the normalisation in one target's record, and the Result still quoted pre-fix numbers.
 - **Rule:** For each finding name the artifact that proves it: the override file, the re-scored cell diff (here exactly the 6 microsecend endpoint cells), the `diff` of statements vs committed, the pasted tool output. A mechanism without its output is not a fix.
+
+## 2026-10-16: check that a benchmark's base dumps still exist before the gate
+- **Context:** M9a's invariant and gate compare against the M8 base dumps in `var/bench/out/a038653b8478/`, which are gitignored. At 03:19 the base's mattermost dumps were deleted by a process outside the session, with the mattermost `.jsonl` in `var/m7e/inv/`. Nothing in git noticed.
+- **Rule:** Before an invariant or a gate, check that every base dump the manifest names exists and is non-empty, and re-score the base to confirm it reproduces the committed scoreboard byte for byte. If a dump is missing, regenerate it only from the base's own binary (sha256 checked), touch only the missing files, and compare `rb status` counts with the original run's `.out` before using it.
+
+## 2026-10-16: check the disk at every milestone start
+- **Context:** `target/` grew to 48 GiB over a series of milestones and took free space down to 2.4 GiB during M9a, under `bench/run.sh`'s 6 GiB floor. `cargo clean` freed 48.0 GiB.
+- **Rule:** At each milestone start, run `du -sh target` and `df -h .`. Run `cargo clean` when free space is under twice the bench floor plus one release build.
+
+## 2026-10-16: a mutant is killed by its named test, not by any panic
+- **Mistake (caught by M9a evaluator pass 1, E2):** the runner counted any `panicked at` as KILLED. Under `--jobs 4` the machine was loaded, a wall-clock test (`…_stay_fast`) panicked, and unfiltered `rb-indexer` specs that changed no test result read KILLED.
+- **Rule:** Every spec outside rb-bench names its `test` filter, and KILLED needs a failing test whose name contains it (`---- <name> stdout ----`). A run whose failures all lie outside the filter is INVALID, never a kill. The mutant caches in `/tmp/rbmut-target-*` grow to about 5 GiB each; delete them when the disk is short.
+
+## 2026-10-16: "as for X" in a contract is a claim to test with X's edge cases
+- **Mistake (caught by M9a evaluator pass 1, E3):** amendment 1 said an empty remote context path "counts as none, as for local files". The local rule takes the highest value first and then drops an empty one. The remote loop skipped empty values while searching, so a lower path survived. No test held an empty remote value over a lower one, and the mutant that removed the rule survived.
+- **Rule:** When a rule is stated as equivalent to an existing one, write one test row per edge of the existing rule (empty, absent, overridden) on both sides, and see each row fail on a mutant before calling the two equivalent.
+
+## 2026-10-16: a spot check is a file, or it did not happen
+- **Mistake (caught by M9a evaluator pass 1, E4):** the Result said "18 citations were spot-checked", and the disk figures came from tool output, but no list, command or output was kept.
+- **Rule:** Every audit is a script with a logged output (`var/m9a/scripts/check_citations.py` → `logs/citations.txt`, with a shifted-line control that shows the check can fail). A number seen only in a session's tool output is written to a log, with its source, before it goes into a record.
+
+## 2026-10-16: an "ended" session can still be running
+- **Mistake:** during M9b a second orchestrator resumed agents of a session reported as ended, while that session was still running. Two orchestrators then drove the same work.
+- **Rule:** Before resuming agents of an earlier session, run `ps` and look for another `claude` process on the same session id. Resume only when none is running.
+
+## 2026-10-16: "the defect produces no edges" is a claim about every target
+- **Mistake:** M9b's contract said B9's bare-name defect made no edge "in the four Go dumps we have". mattermost's dumps were missing at planning time, and on mattermost the fix removed 41 ambiguous `CALLS` and took a candidate from 40 more (contract-m9b amendment 6).
+- **Rule:** A claim that a defect produces no edges is checked on every target's dump, not on the ones at hand. If a dump is missing, the claim says so and P0 checks it before the build.
+
+## 2026-10-16: a framework registration is detected in every form its pinned reference shows
+- **Mistake (caught by M9b evaluator pass 1, E2):** D7 capped data-rest endpoints for a class extending `RepositoryRestConfigurer`, but the Spring Data REST 2.5.5 reference registers one as a `@Bean` returning an anonymous `…Adapter`, and 3.1+ adds `withConfig(…)`. The reference's own example was not detected.
+- **Rule:** Before coding a detector for a framework hook, list every registration form the pinned version's reference shows (subclass, `@Bean` factory, anonymous class, static factory, other JVM languages), and give each a test row and a mutant.
+
+## 2026-10-16: a folded value is what the formatter prints, not what the source writes
+- **Mistake (caught by M9b evaluator pass 1, E3):** the Go `Sprintf` fold put a typed constant's literal into `%s`, but Go prints a named type through its `String()` method.
+- **Rule:** When folding a value into a formatted string, check that the formatter prints the value as written. A value of a type that can carry formatting methods (`String()`, `Error()`, `Format`, `__str__`, `toString()`) is refused unless the type is a built-in string.
+
+## 2026-10-16: read a test's full path from cargo, and time an NFR with the build the record used
+- **Mistake (caught by running it):** a scan of `mod … {` blocks lost `tests::` from `resolve.rs`'s tests, because a raw string held `}` at column 0. Separately, scoring timed with the debug `rb-bench` took 36 s, against the record's 1.5 s, which had used the release build. (Pass 2, N4: the build profile is only part of that gap. Release scoring also took 7.5–11 s on the loaded host that day; host load explains the rest.)
+- **Rule:** Take a Rust test's path from `cargo test -- --list`, not from parsing source. Time an NFR with the same binary and build profile as the record it is compared to, and name the binary in the log.
+
+## 2026-10-16: a verdict column prints the rule it applies, and that rule is the contract's
+- **Mistake (caught by M9b evaluator pass 2, S1):** `perf_ab5_summary.py` wrote `noise` on all 24 rows, and amendment 7 called them noise "under amendment 0's rule". The script let any target whose base CPU was under 1 s pass on wall alone, an exemption the rule does not have; six targets had a median CPU ratio of 1.105–1.303.
+- **Rule:** A script that classifies prints its rule as its first line, in the contract's words, and any exemption is either in the contract or not in the script. On sub-second runs, user+sys CPU from `/usr/bin/time` is too coarse for a 1.1× ratio: re-measure with more runs, alternate the order (ABBA), and record `instructions retired` (`/usr/bin/time -l`), which barely moves with load.
+
+## 2026-10-16: probe repositories outside `t_*` while a suite may run
+- **Context (M9b evaluator pass 2, N4):** the e2e harness's start-up clean-up deletes every `t_*` repository (`crates/rb-cli/tests/common/mod.rs`). An evaluator's `t_eval2_*` fixtures vanished when the suite started.
+- **Rule:** Name probes that must outlive a test run `bench_*` (removed by `bench/cleanup.sh`) or finish them before the suite starts. Never give a user repository a `t_` name.
+
+## 2026-10-17: an invariant that no edge observes needs an assertion on the structure itself
+- **Context (M9c P3, m318):** "embedding never enters `supertypes()`" could not be killed through edges. Go types declare no supertypes, so `implements()` skips them, and `members` reached the same embedded types either way. A mutant adding embeds to `supertypes()` changed no edge and would have survived an edge-only test.
+- **Rule:** When a mutant targets an invariant on an internal structure that other stages read (DI's `direct_supertypes`, RTA), assert the structure directly in the unit test. Pair it with a positive row that shows the input is seen (`embedded_types(Top) = [Base]`), so the empty answer is not vacuous.
+
+## 2026-10-17: a fact field means what the extractor makes it mean, per language
+- **Mistake (caught by the red test, M9c P4):** I wrote "a top-level binding" as `scope: None`. In Python a module-level `x = …` is also a top-level `constant` definition (tree-sitter-python's `tags.scm`), and the binding's scope is that definition. So `__all__` and `smth = Smth()` were invisible, and the test failed on the code, not the design.
+- **Rule:** Before keying resolution on a fact field (`scope`, `parent`, `kind`), print that field for one sample per language involved (a throwaway test, deleted at once), and write the per-language reading into the helper's doc comment.
+
+## 2026-10-17: a fetch failure across many fixtures at once is the registry before it is the code
+- **Context (M9c P5):** 8 of 15 SCIP e2e tests failed in one run, every one at a Maven or Gradle fetch, while the change under test touched only scip-go. `rb.scip_index.stderr_tail` (read `READ ONLY`) showed `status code: 429, reason phrase: Too Many Requests` from `repo.maven.apache.org`, and the egress probe test read `allowed 429`. The failures were cached, so a plain re-run replayed `failed (cached)`.
+- **Rule:** When several container tests fail in the fetch phase together, read one `stderr_tail` and the egress probe line before touching code. A 429 is external: wait until the registry answers 200 through the proxy (the egress probe test alone is the check). Then overwrite each cached row with a `--no-cache --force` run of the fixture materialised as the harness does (tracked files at the repository root, one commit; `var/m9c/p5/refresh_fixture_cache.sh`). Delete those repositories and their `var/scip/cache/<repo>` (Go caches need `chmod -R u+w`), and re-run the failed tests. Report the suite as green over the logs it took.
+
+## 2026-10-17: a profile that attaches late misreads the early phases
+- **Mistake (M9c P7):** `scip_profile.sh` slept 0.3 s before attaching `sample`. The m9b profile missed the run's first phase (no `Repo::manifest` samples, against 582 in m9c's), so `scan_unparsed` and `raw_scan` seemed to grow by 1.4 s and 0.9 s in code that had not changed. P7b's profiles, attached at launch, read 2,458 / 2,463 / 2,463.
+- **Rule:** Attach the profiler at launch, and check each profile for completeness by the samples of the run's first phase before comparing any phase. Do not start a process stopped and continue it after `exec`: on macOS `exec` invalidates the task port that `sample` holds.
+
+## 2026-10-17: deleting probe snapshots puts autovacuum into the next timed run
+- **Mistake (M9c P7b):** the A/B, profile and identity probes deleted about 36 mattermost snapshots, which left 7.6M dead `rb.edge` tuples and 2.6M dead `rb.edge_evidence` tuples. Autovacuum ran through the bench that followed, and every mattermost wall was 2.7× P7's. The dumps were unaffected.
+- **Rule:** After deleting large probe repositories, wait until `pg_stat_activity` shows no `autovacuum:` on the graph tables, and log `n_dead_tup` before a timed run. When walls inflate in modes a change cannot reach, time the old binary interleaved with the new on one small target, and compare CPU and instructions retired, before reading anything into the walls.
+
+## 2026-10-17: a diff that reports zero needs a control that must differ
+- **Mistake (caught, M9c P7b):** the scoreboard diff printed "0 differing leaves" because the script never called its own `walk`; `diff` showed two.
+- **Rule:** Every equality check gets a control in the same log that must fail: a known-different input that shows a non-zero count. Without it, a zero proves nothing.
+
+## 2026-10-17: an indexer that exits 0 can still have typed nothing
+- **Mistake (found in M9c P0/P0b):** rb's scip-go image paired Go 1.27.2, which writes export data version 5, with scip-go's x/tools v0.45.0, which reads up to version 4. No import loaded, scip-go swallowed the errors and exited 0, and for five days every Go index rb made came from that degraded type check (119,977 of server's 202,385 locals `invalid type`). M9b read the symptom (no member occurrence of another module) as scip-go's behaviour and moved B1 on.
+- **Rule:** An indexer image's build runs a self-test that asserts on output content (scip-go must write `os/Getenv().` for `os.Getenv(…)`), with a control logged against the previous image that must fail. When a toolchain is pinned, pin the libraries that read its output to versions that read it, and check one standard-library symbol in a fresh index before reading any zero as the tool's behaviour.
+
+## 2026-10-17: a residue is labelled by a split of its rows, not by its largest part
+- **Mistake (found in M9c P8 and by M9d's contract):** amendment 2 called 4,092 server → server/public member references "skew"; they are references to 133 interface-method symbols that server/public's index defines none for. M9c's accept line called the 190 remaining mattermost fp "version-skew calls"; 18 of them are `docs/site` and e2e-tests calls (`var/m9c/logs/p8/fp-split.txt`).
+- **Rule:** Before a record names what a residue is, split its rows by a recorded rule (area, language, symbol kind) and log the split. A label covers only the rows it was checked on; the rest are named as unclassified or by their own split.
+
+## 2026-10-17: a precision headline says how much of it is the reference changing
+- **Mistake (caught by M9c evaluator pass 1, E5):** M9c's records quoted scip `calls` agreement P 78.4 % → 99.5 % without saying that D8′'s own `synthetic` joins had entered the gold. 5,944 of the 6,141 base fp became tp that way; against `exact` gold alone P was 78.2 %. No judged sample covered the new gold either; when one was drawn, it found a wrong-edge class (a Go type conversion labelled `CALLS`) in the very edges that defined it.
+- **Rule:** When a change adds edges that the benchmark's reference also takes in, score the cell with and without them and quote both, and judge a seeded sample of the new reference edges before reporting the gain.
+
+## 2026-10-17: "as the language does" is tested on the case where the shortcut differs
+- **Mistake (caught by M9c evaluator pass 1, E2):** the inherited `__init__` walked supertypes breadth-first and the note called it "Python's MRO at one level". `class R(P, Q)` with `P(A)` takes `A.__init__` in Python and `Q.__init__` breadth-first, and the PyCG cases had no inherited left base to show it. Likewise a star import "after named imports" ignored that Python rebinds in source order.
+- **Rule:** When an implementation approximates a language rule, write the smallest input where the approximation and the rule disagree (a left base that inherits, a later statement that rebinds), and see it fail before calling the approximation the rule.
+
+## 2026-10-17: a refactor moves the mutants' anchors; re-run the battery before trusting it
+- **Context (M9c pass 1):** moving Python star imports into `python_module_level` left 5 of M9c's specs STALE and 2 SURVIVED (the `super().m()` path no longer passed through the arm they mutated). The battery caught it only because it was re-run on the changed tree.
+- **Rule:** After any refactor of code that existing mutants target, re-run that battery before the commit, and re-anchor each STALE or newly surviving spec on the line its behaviour moved to, with the same mutation, recording which ones moved.
+
+## 2026-10-17: a bench's walls become a base only after a standalone timing agrees
+- **Mistake (caught by M9c evaluator pass 1, E6):** M9c's run of record had mattermost walls about 3× the same binary's standalone timing (autovacuum after probe deletes), and M9d's wall limit was set against them, so a wall regression up to about 3.6× could not have warned.
+- **Rule:** Before a run's perf file becomes a later milestone's base, check the host (load, memory, `pg_stat_activity`, `pg_stat_progress_vacuum`, `n_dead_tup`) and time the same binary standalone on the largest target; if any wall disagrees by more than 1.3×, re-run the bench.
+
+## 2026-10-17: zsh arrays start at 1; write paired data files in Python
+- **Mistake (caught by M9c evaluator pass 2, S1):** a judge wrote its verdict file with `"${ev[$i]}"` in a loop from `i=0`. zsh arrays are 1-based, so row k got the evidence of row k-1: S41 had none, S42–S60 carried their predecessor's, and S60's was lost. The citation check passed, because it tests that a `file:line` exists, not that it belongs to the edge, and amendment 3 said "No verdict rests on a wrong line".
+- **Rule:** Write any file that pairs rows with values (verdicts, evidence, labels) in Python, with an assertion that each value belongs to its row, never with a shell loop over an array. An evidence audit checks that each row's evidence names its own edge (`bench/probe/sample_evidence_check.py`), with a control that shifts the evidence by one row and must fail.
+
+## 2026-10-17: memoise every outcome that depends on the node alone, and keep the walk's state out of the memo
+- **Mistake (caught by M9c evaluator pass 2, S2):** the Python MRO memoised only a whole C3 result. A class whose bases could not be merged (an inconsistent order or a cycle) was recomputed by every class above it, so a 28-layer lattice of diamonds took 165 s and a 40-layer one did not finish; a valid lattice deeper than the 64-level cap was exponential too. And because the cap was applied per lookup while the memo was per class, a class's MRO past 64 levels depended on which classes had been looked up first.
+- **Rule:** In a recursion over a graph whose nodes can be shared, memoise every outcome that is a function of the node alone, failures included. Anything that depends on the walk (depth, the path) stays out of the memo and ends the walk. Test it by counting computations on a wide lattice, not by timing it. Before claiming "output unchanged", list what the old result depended on besides the input (here: lookup order), and say where the new code differs.
+
+## 2026-10-17: name each binary and each run once
+- **Mistake (M9c evaluator pass 2, N4):** "r1" meant P7's binary (`rb.r1`) in one place and P7b's run in another, and "r2" meant P7b's binary file and pass 1's run.
+- **Rule:** Name binaries by their file (`rb.r1`, `rb.r2`, …) and runs by the phase that made them ("the P7b run"), define both once in the Result, and never reuse a label for another thing. A log directory named before the rule keeps its name, and the Result says what it holds.
+
+## 2026-10-17: an alarm on `/usr/bin/time` does not stop the process it times
+- **Mistake (M9c pass 2):** `perl -e 'alarm 300; exec …' /usr/bin/time rb index …` killed `time` at 300 s, but `rb` kept running orphaned, at 98 % CPU, for 10 minutes into the quiet check before the bench.
+- **Rule:** Cap a probe by killing its process group (or `rb` itself), and check `ps` for the timed command before any quiet-host check.
+
+## 2026-10-17: the one-edit rule slips when two edits look like one change (recurred in M9d)
+- **Mistake (M9c pass 2):** two Edit calls went out in one message twice: a struct field with its initialiser, and two sentences of one design note. Both were grepped and found landed before anything ran.
+- **Recurred (M9d):** P3 sent two `Edit` calls to one file in one message three times (orchestrate.rs twice, lib.rs once), P4 sent three to `orchestrate.rs` in one message (a test `Fake`'s fields, constructor and `run`), and P8 two to the design doc (two hunks of one note). P10 sent two in one message too, to two files (this file and `README.md`), while writing this very recurrence. Each was grepped and found landed before anything ran. The phases that did not slip (P5–P7, P9–P9c) put every multi-hunk change to one file into one scripted edit that asserted each hunk matched exactly once.
+- **Rule:** Before sending a message with an Edit, count its tool calls: one. A field and its initialiser, or two sentences of one note, are two edits and two messages. When one change needs several hunks in one file, make it one scripted edit (Python, reading the file, asserting each old text occurs once, writing once), not several Edit calls; then grep each new text.
+
+## 2026-10-18: a phase that moves code re-checks the anchors of every battery, not only its own
+- **Mistake (found in M9d P8):** P1–P7 ran only the m9d battery. P3 rewrote the `go_jobs` filter line and P5 removed the `.chain(… Certainty::Synthetic)` line, so m9c's m359 and m336 matched their files 0 times, and no run saw it until P8's dry anchor check before the batteries (`var/m9d/logs/p8/anchors-dry.txt`). The lesson of 2026-10-17 said to re-run "that battery" after a refactor; the batteries of earlier milestones target the same files.
+- **Rule:** After every phase that changes `crates/`, run the dry anchor check over all batteries (each spec's text counted once in its file), and re-run every battery that has a spec in a changed file, not only the current milestone's. Record in the phase note which batteries ran on which tree.
+
+## 2026-10-18: a run is cold only if the cache rows it would write do not exist yet
+- **Mistake (M9d P9):** the bench's "cold" run was meant to measure the new jobs' cold cost, but P2–P7's probes had already written their `rb.scip_index` rows (same inputs, same recipes), so only the TS re-runs and kotlin's Maven re-run ran in Docker. The run was warm for every job the milestone added.
+- **Rule:** Before calling a run cold, list the jobs it is meant to time and check, read-only, whether a row with their input hash already exists. If probes have written them, take each job's cold cost from the probe that wrote its row, and say so; do not quote the bench run's wall as a cold cost.
+
+## 2026-10-18: a timed run right after the host wakes is not a measurement
+- **Mistake (M9d P9):** the first P9b run started 4 min 53 s after the host woke from a 9 h 27 min sleep (`pmset -g log`). The quiet check read a 1-minute load of 3.34 and passed, but the 5-minute load was 14.69; `compare` warned on six small-target walls, and walls ran up to 3.0× the base's (`var/m9d/logs/p10/set-aside-walls.txt`) while every dump was identical. The run was set aside and re-run (`var/m9d/logs/p10/host-wake.txt`).
+- **Rule:** The quiet check before a timed run reads the 5- and 15-minute loads, not only the 1-minute one, `pmset -g log` for a wake in the last 30 minutes, and autovacuum. After a wake, wait until the 5-minute load is back near the host's usual before timing anything.
+
+## 2026-10-18: a setting that rewrites inputs is predicted for every class of input it touches
+- **Mistake (M9d P2, seen in P4):** D1 predicted that `npm_config_replace_registry_host=always` would rewrite registry tarball hosts, and that webapp and cypress would fail on their `git+ssh` GitHub dependencies as before. `always` rewrites every host in a resolved URL, the GitHub ones included, so their tails name `ssh://git@registry.npmjs.org/…`, and a host that opts GitHub in through `RB_SCIP_REGISTRIES` would still be refused. P2's probe used nestjs, whose lockfile has no git dependency.
+- **Rule:** Before adopting a setting that rewrites hosts, paths or versions, list the classes of input it reaches (registry tarballs, git URLs, file paths, aliases) and probe one lockfile or tree holding each class. Prefer the narrowest form the tool offers (here, the one foreign host) over a catch-all.
+
+## 2026-10-18: a perf rule that can block on input growth says how growth is judged before the run
+- **Mistake (M9d P9):** the NFRs bounded every bench cell's wall and RSS against M9c's, but M9d's purpose was to index jobs the base never had. The first run's two scip-mode cells went over the limits because they decoded new indexes, and the gate stopped with no rule to tell growth from regression; amendment 3's input-growth clause was written after the data. It also turned up a real per-occurrence cost (P9b, P9c), which a clause written first would have looked for anyway.
+- **Rule:** When a milestone adds work the base never did (new jobs, new indexes, new targets), its contract states, before the bench, how an over-limit cell is judged: which buckets the extra work must be in, a same-input control A/B that must read noise, and a profile condition (no avoidable per-occurrence or per-symbol work outside the exempt phases). Report cost per unit of input beside the ratio.
+
+## 2026-10-18: text rb generates into an export is outside the cache key, so changing it moves the recipe
+- **Context (M9d E1):** amendment 4's S1 changes the `go.work` rb writes into a workspace job's export. The cache key is the recipe, the exported files and the allow-list; the `go.work` is written after the key is taken, so with the recipe unchanged every cached D5 row (the evaluator's failed `wsrep` and `wsout`, mattermost `server`) would have replayed, and the fix would not have run. The amendment did not name a bump; E1 moved `RECIPE_GO_WORK` to `m9d-go-2`, pinned by the test.
+- **Rule:** When a change alters anything rb writes or passes to a container that is not an exported repository file (a generated `go.work`, an init script, an environment variable, an argument), bump that indexer's recipe in the same change and pin the new value in a test. A plan that changes such text names the bump and the jobs it re-runs.
+
+## 2026-10-21: a battery run without the test database scores its database specs SURVIVED
+- **Mistake (M9d E2):** the first m9d battery of E2 ran without `RB_TEST_DATABASE_URL`. m387's test (`db_tests::cypher_runs_without_jit`) printed `skipping:` and passed, so the runner scored the mutant SURVIVED (`var/m9d/logs/e2/battery-m9d-no-db-url.log`). The same run with the variable set, as E1's `batteries.zsh` sets it, read 48 of 48 KILLED.
+- **Rule:** Start every battery from a script that exports `RB_TEST_DATABASE_URL` (copy the last phase's), and read a SURVIVED whose filter selects a `db_tests::` test as "not run" until the log shows the test ran. The 2026-10-13 rule (database specs on a `ScratchDb` only) still holds.
+
+## 2026-10-21: an equivalence input kept under var/ can vanish between sessions
+- **Context (M9d E2):** P9's exported mattermost `server` index (177 MB) had been removed from `var/m9d/p9/idx/` after 2026-10-18 (the directory's mtime is 2026-10-19; who removed it is not recorded). The equivalence harness stopped on the missing file before comparing anything. E3 then found M9c's exported server index and the mattermost dumps of every run under `var/bench/out/` gone too (same timestamp), M9c's and P9's runs of record among them; they were regenerated with the kept binaries and accepted only after byte counts matched the invariant log and both runs re-scored `cmp`-identical to their committed scoreboards (contract-m9d E3 note).
+- **Rule:** Before a run that reads kept inputs, check each against its manifest (size and sha256). A missing raw index is re-exported READ ONLY by the manifest's `input_hash` and `indexer_digest` and accepted only if its sha256 matches (`var/m9d/e2/scripts/reexport_server.py`).
+
+## 2026-10-21: a scripted edit across several files checks every hunk before it writes any file
+- **Mistake (M9d, after evaluator pass 2):** one script edited the contract, `tasks/todo.md`, CHANGELOG, IMPLEMENT and README in turn, writing each file as it went. The todo hunk matched twice (an older milestone has the same line), the assertion stopped the script, and the contract was already written: a partial update, found by `git status` and finished by a second script. CHANGELOG's status line also occurred twice (M9c's re-close entry).
+- **Rule:** In a multi-file scripted edit, read every file and assert every hunk (exactly once, or at an asserted position for a line that legitimately repeats) before writing any file; then write them all. Lines shared across milestones (`- [ ] Evaluator pass 2 …`, `- **Status:** …`) are anchored by their milestone's heading, not by their text alone.
+
+## 2026-10-21: an uncommitted patch found in a tree is unverified until it builds and its crate's tests pass
+- **Context (rb-bench pins, after M9d):** the `check_pin` patch left in the `main-1` worktree read as finished, and the status report called it a small fix. Applied to `m9` it did not compile (`pub(crate)` called from the binary crate) and it broke an existing test whose fixture dump named a commit other than its pin.
+- **Rule:** Treat a stray patch as a proposal. Before describing it as ready, apply it to the target branch and run its crate's tests; write its tests red first against the unpatched code, as for any change.

@@ -65,8 +65,12 @@ via `check`:
   components required).
 - Docker, with context `desktop-linux` (Docker Desktop is the runtime of
   record: `DOCKER_CONTEXT=desktop-linux` or `docker context use
-  desktop-linux`). SCIP jobs need the four images (see README "SCIP
-  indexers"); `--no-scip` runs need no images.
+  desktop-linux`). SCIP jobs need the six images in README "Setup
+  reference" (four indexers, the second scip-java image on JDK 25, and the
+  egress proxy); `rb doctor` checks all six (`6 pinned images present`) and
+  names any that is absent. The JDK 25 image is built second, from the first:
+  `docker build -t rb-scip-java:0.13.1-jdk25 -f docker/scip-java/Dockerfile.jdk25 docker/scip-java`.
+  `--no-scip` runs need no images.
 - Disk: SCIP fetches are heavy (tens of GB for large repos); keep several GB
   free (`df -h /`).
 - Ports: Postgres 55432 by default (`RB_DB_PORT=55433` moves it; the machine
@@ -165,6 +169,162 @@ Notes that bite newcomers:
   `18 routes (3 from specs only)`. Express routes match client paths
   case-insensitively (as Express does by default); such a link carries
   `case: folded` (JSON, dumps) and `rb path` notes `case folded`.
+- An endpoint is `exact` only when code registers it. An OpenAPI operation
+  with no code route is `synthetic`; a code route the spec also states stays
+  `exact`. Routes registered in test files (`rb_model::is_test_path`: `_test.go`,
+  `src/test/`, `*.spec.ts`, …) are not endpoints and set no prefix; each such
+  file gets one `routes_in_test_code` diagnostic with its route count.
+- A context path set in a `native` Spring Cloud Config server's shared files
+  (`search-locations: classpath:/shared`) applies to the client whose
+  `spring.application.name` names the file (`account-service.yml`), or to
+  every client through the shared `application.yml`. It is `synthetic`, and each
+  client gets a `config_server_context_path` diagnostic. The remote value
+  overrides local files, and an empty one (`context-path: ""`) puts the routes
+  back at the root, as Spring serves them. Two such servers in
+  one repository apply nothing (`config_server_ambiguous`).
+- A Spring Data repository annotated `@RepositoryRestResource(path = "accounts")`
+  in a service whose build file names `spring-boot-starter-data-rest` exposes
+  Spring Data REST's resources as `synthetic` endpoints: `GET`/`POST /accounts`,
+  `GET|PUT|PATCH|DELETE /accounts/{id}` (CRUD bases), and
+  `GET /accounts/search/findByEmail` per query method. The context path and
+  `spring.data.rest.base-path` prefix them. A `RepositoryRestConfigurer` in the
+  service, which can move the base path in code, caps them at `heuristic`
+  and adds one `data_rest_base_unread` diagnostic `{service}`: a Java or
+  Kotlin class extending it (or `RepositoryRestConfigurerAdapter`), a Java
+  `@Bean` method returning one, or a `RepositoryRestConfigurer.withConfig(…)`
+  call. Unannotated repositories, Kotlin repositories and default paths are
+  not read.
+- Go SQL built with `fmt.Sprintf("SELECT … FROM %s", usersTable)` is parsed with
+  the package constant folded in, when `usersTable` is an untyped or `string`
+  `const` declared once in the package (any file but tests) and nothing
+  shadows it. A constant of a named type is not folded: `%s` prints it
+  through its `String()` method.
+  Only `%s`, `%v` and `%%` fold; anything else leaves the string as written.
+  The edges stay `heuristic`, and each file with a folded call gets one
+  `sql_folded` diagnostic `{sites, constants}`.
+- A Go method declared in another file than its type (`func (h *Handler)
+  signUp` in `auth.go`, `type Handler` in `handler.go`) is a member of the
+  type: `h.signUp()` and a gin handler `r.POST("/x", h.signUp)` resolve to it.
+  It is never a package-level name, so a bare `signUp()` does not.
+- Without SCIP, Go receivers are also typed by a constructor's result
+  (`u := article.NewService(…)` then `u.Fetch()`; results `T` or `(T, error)`),
+  by calls inside a qualifier (`th.App.Srv().Store()`), through type aliases
+  (`type Context = web.Context`), through embedded structs
+  (`ArticlePosterBg{ *ArticlePoster }` promotes `ArticlePoster`'s methods) and
+  through a package-level var declared in a sibling file (a test file's var is
+  seen by test files only). Embedding never makes `IMPLEMENTS`.
+- TypeScript `paths` are read from `tsconfig.json` files with comments and
+  trailing commas, and `import f from './m'` resolves to what `m` exports as
+  default (a leading byte order mark and `"baseUrl": "."` are read as `tsc`
+  reads them). Python resolves `super().m()` (the next class with an `m` in
+  the class's method resolution order, C3 as Python computes it), names from
+  `from m import *` (not `_` names, and not from a module that defines
+  `__all__`; of a star import, a named import and a definition of one name,
+  the later statement wins), names a package's `__init__.py` only re-imports,
+  an imported module-level instance (`smth = Smth()` then `smth.f()`), `raise
+  A` as a construction of `A`, and a subclass constructor call that reaches an
+  inherited `__init__` (the first in the MRO). A Go call result named by one
+  of the function's type parameters (`func Id[T any](x T) T`) types nothing,
+  nor does a parameter or local declared with one (`x T`, `var e E`), and
+  `case v := <-ch:` declares `v` for its case.
+  All these edges are `heuristic`. Each file that used one of these forms gets one
+  `tier_b_forms` diagnostic counting the references per form: `return_type`,
+  `call_segment`, `type_alias`, `embedded`, `package_var`, `default_import`,
+  `super_call`, `star_import`, `reexport`, `module_variable`, `inherited_init`.
+- SCIP fetches and the `scip:` status lines (`rb index`, `rb status`):
+  - **npm** fetches (`package-lock.json`, or no lockfile) run with
+    `npm_config_engine_strict=false`, so an `engines` range newer than the
+    image's Node no longer stops the install. When the `package-lock.json`'s
+    registry tarballs (`…/<name>/-/<file>.tgz`) come from exactly one host
+    that is neither on the allow-list nor opted in with `--scip-registries`
+    (`RB_SCIP_REGISTRIES`), the fetch also gets
+    `npm_config_replace_registry_host=<that host>`: a lockfile resolved from a
+    mirror (`https://npm.styque.de/…`) installs from `registry.npmjs.org`,
+    with every tarball still checked against the lockfile's integrity. Nothing
+    else is rewritten: a host you opt in, a URL dependency
+    (`https://cdn.sheetjs.com/…/xlsx-0.20.3.tgz`) and a `git+ssh` or
+    `git+https` dependency are fetched as written, so the allow-list and your
+    opt-in decide them. (M9d's first form rewrote every host, which made an
+    opted-in host unreachable.) A lockfile with two such mirrors gets no
+    rewrite. Yarn and pnpm fetches are unchanged.
+  - **Python.** A directory with `requirements.txt` and neither
+    `pyproject.toml` nor `setup.py` is a Python root, installed with pip. A
+    root without `pyproject.toml` indexes as
+    `--project-name <directory> --project-version .` (`root` at the repository
+    root). When a Python fetch fails (a pin that must build from source on the
+    image's musl, say), the index still runs, without the environment:
+    `scip-python ok (environment not installed: fetch failed)` (`rb index`
+    prints the time before the parenthesis). The row is cached as `ok` with
+    phase `fetch`, and the `scip_status` diagnostic keeps the fetch's
+    `stderr_tail`, Poetry's errors included. Third-party names are unresolved
+    either way: the index phase never sees a pip environment (contract M9d,
+    amendment 1, risk 3).
+  - **scip-go health.** scip-go exits 0 when packages fail to load. An index
+    with locals typed `invalid type` ends its line with
+    `, N of M locals typed invalid` (coverage keys `locals_invalid_type` and
+    `locals`, written only when N > 0). A healthy index prints nothing.
+  - **Java.** A Maven job whose poms declare a Java release above 21
+    (`maven.compiler.release`/`source`/`target` or the compiler plugin's,
+    `${…}` resolved through the poms in the build root) runs on
+    `rb-scip-java:0.13.1-jdk25`. Above 25 it is `unsupported`
+    (`scip-java: the poms declare Java release N; the newest scip-java image runs JDK 25`),
+    and so is it when that image is absent. Maven indexes write SemanticDB to
+    `--targetroot /scip-targetroot`, outside the sources, so an aggregator
+    root's `clean` cannot delete it. Gradle jobs stay on the JDK 21 image, and
+    a read-only init script sets the executable bit on the protobuf plugin's
+    `protoc` tool artifacts before any task runs: on Docker Desktop's bind
+    mount, Gradle believed a `0644` file executable, and `:generateProto`
+    failed with `error: 13`.
+- Go with SCIP across modules of one repository (each `go.mod` is its own
+  scip-go job). **Workspaces.** When a module's `go.mod` requires, with no
+  `replace`, the module path of another `go.mod` below its directory
+  (mattermost's `server` requires `server/public`), rb writes a `go.work`
+  (`use .` and each such directory, and a `replace` of each such module at
+  the version your `go.mod` requires, so that version need not be
+  published) into the job's export, never into your checkout, and runs both phases in workspace mode, so the compiler reads the
+  in-repo code rather than the required version from the module cache.
+  Vendored, `testdata`, `.x` and `_x` directories are never workspace modules,
+  and a module that commits its own `go.work` is left as it is. If the
+  workspace run fails (a non-zero exit such as an OOM kill, or no index), the
+  job is run again without `go.work` and its line reads
+  `scip-go ok (workspace failed: indexed without go.work)`; the stored tail says
+  why the workspace failed. A timeout or a Docker failure is not re-run.
+  **Replace targets.** A relative `replace` target inside the repository but
+  outside the module (`../../server/public`) is exported with the job (its line
+  counts it in `N link targets`); one leaving the repository, or an absolute
+  path, makes the job `unsupported` (`replace target outside the repository`).
+- Go with SCIP, the join across modules: a call from one module into another
+  module of the repository (`model.NewId()` from `server` into
+  `server/public`) links to that module's own definition with provenance
+  `scip`. It is `exact` when the reference's symbol equals the definition's
+  byte for byte, version included: under a workspace or a local `replace` the
+  compiler saw the in-repo code. It is `synthetic` otherwise: the compiler
+  resolved the name against a required version (`v0.4.3`) from the module
+  cache, which can differ from the in-repo code. Each (from module, to module)
+  pair gets one `scip_cross_project` diagnostic
+  `{to, exact, synthetic, ambiguous, unanchored}`. `ambiguous` means two
+  modules declare the same module path (no edge). `unanchored` means the
+  target module has no definition node for the name, for example a name the
+  required version has and the in-repo code does not, or an interface method
+  (scip-go defines no symbol for one). `rb status`'s `exact calls (scip)`
+  counts the `exact` joins and not the `synthetic` ones. A reference into
+  another module of the repository at no version is not an external package:
+  it adds no `Package` node and no `scip` `DEPENDS_ON`; one at a real version
+  (`…/server/public@v0.4.3`) still does. These joined edges enter the bench's
+  SCIP agreement reference like every `scip` call; M9c judged a seeded 60-edge
+  sample of them blind once, when they were all `synthetic`
+  (`bench/samples/synthetic-d8.tsv`, not read by `rb-bench`).
+- Go with SCIP: a call whose callee is a type (`model.ChannelType(s)`, a
+  conversion: Go has no constructors) is a `REFERENCES` edge to the type,
+  within one module or across modules, never `CALLS`.
+- Go with SCIP: a type that satisfies an interface gets `IMPLEMENTS` to it from
+  the type (`Card# → Payer#`). scip-go also links each method to the interface
+  method; that link gives no edge, since the interface method has no node, and
+  is counted in `relationships dropped` on the `scip:` line.
+- `rb table-deps` shows a Spring Data repository type with its own `QUERIES`
+  row: all four ops, `synthetic`. That row stands for the CRUD it inherits
+  (`save`, `findById`, `delete`, …), not for a query it states. Its declared
+  methods have their own rows.
 - Two `rb index` runs of one repository take turns: the second prints
   `waiting: another rb index of <repo> is running`, then usually finds the
   first's snapshot up to date.
@@ -213,9 +373,9 @@ is not a pass**. Always set it:
 
 ```sh
 export RB_TEST_DATABASE_URL=postgresql://rb:rb@127.0.0.1:55433/rb
-cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (83 tests)
+cargo test -p rb-store --lib        # migrations, publish/retention/gc, check rules (85 tests)
 cargo test -p rb-server -- --nocapture  # serve binding, limits, parity (12 tests)
-cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (52 tests)
+cargo test -p rb-cli --test e2e     # fixtures: determinism, guards, goldens, AGE parity (53 tests)
 cargo test -p rb-cli --test api     # CLI↔HTTP identity over 150 parameter sets (1 test)
 ```
 
@@ -287,11 +447,37 @@ part of the tree.)
   until proven otherwise. Usually the test lacks the input that only that
   rule explains, sometimes the code is dead (delete it), rarely the mutant is
   equivalent (record why). Re-check mutation text after any `cargo fmt`
-  (reflows break exact matches). Run the battery with
+  (reflows break exact matches), and after any change under `crates/` check
+  every battery's anchors, not only the current milestone's: earlier
+  batteries target the same files (M9d P8 found two m9c specs matching 0
+  times after M9d moved their lines). Run the battery with
   `python3 -I bench/mutants/run.py bench/mutants/m8b.json --jobs 4` (parallel
   worktrees; the main tree stays clean): a full all-KILLED run is cached in
   `var/bench/mutants-cache.json` and re-reports instantly while code and
-  specs are unchanged.
+  specs are unchanged. A spec names `file` under `crates/<crate>/src`;
+  `crate` defaults to `rb-bench`, and any other crate runs
+  `cargo test -q -p <crate> --lib <test>`, and its spec must name the `test`
+  filter (M9a's `bench/mutants/m9a.json` uses both crates). A crate with no
+  library target names its binary instead: `"bin": "rb"` runs
+  `--bin rb` in place of `--lib` (rb-cli; M9d's m386). With a filter,
+  KILLED needs a failing test whose name contains it (cargo's
+  `---- <name> stdout ----`), so a wall-clock test that flakes under load
+  cannot score a kill. An rb-bench spec without a filter is KILLED by any
+  failing test (`test result: FAILED` or `panicked at`). A build error, a
+  spec with no filter outside rb-bench, failures only outside the filter, or
+  a mutation that leaves the file unchanged, is INVALID: it gives no
+  verdict, so rewrite the spec. So is a spec whose filter selects a
+  wall-clock test, before anything runs: such a test can fail under the
+  battery's own load (M9b N2). The list lives in one place,
+  `bench/mutants/timing_tests.txt`, written by
+  `python3 -I bench/mutants/timing_tests.py`: every test whose assertion reads
+  the clock (`.elapsed()`, `Instant`) or bounds a duration, or whose name
+  contains `stay_fast` (17 in 6 crates at M9b), each with its full path as
+  `cargo test -- --list` prints it (`resolve::tests::name`). Re-run it after
+  adding a timing test; it compiles the test targets it reads. A filter
+  selects a listed test when the test's full path contains it, as cargo
+  matches, so a module filter such as `resolve` or `tests` is INVALID in a
+  crate with a timing test there; name the test.
 - **Stress repros:** `tasks/stress-findings.md` lists each finding with its
   repro and what fixed it. Re-run the repros of the findings a change touches.
 
@@ -320,6 +506,11 @@ cargo run -q -p rb-bench -- compare bench/scoreboard/m8a.json bench/scoreboard/m
   --accept bench/accept.tsv --perf bench/scoreboard/m8a-perf.json bench/scoreboard/m8b-perf.json
 ```
 
+- **Pins.** `score`, `sample` and `review` refuse a dump whose header commit
+  is not its target's manifest pin (letter case aside), naming the file, so a
+  run of another checkout is never scored as the pinned one. `compare` fails
+  (`REGRESSION … family vanished`) when an `exact` sample family the base
+  sampled is missing from the head.
 - **Keys (M8b adds three).** *microSecEnD*: 12 Java microservice
   applications' hand-made dataflow diagrams (`kind microsecend` in the
   manifest, pinned and checked by `bench/pin_microsecend.py`); scores
@@ -333,6 +524,17 @@ cargo run -q -p rb-bench -- compare bench/scoreboard/m8a.json bench/scoreboard/m
   `sql`, `orm`, `routes`, `manifest`) by the M3b rule, and judges' verdicts
   live in `bench/samples/exact.tsv` (keyed by rb's edge identity and pin, so
   they carry over); the gate fails while a drawn edge lacks a verdict.
+  Judges are told to assume each edge false and see only the edge list and the
+  pinned checkout. For a Go `IMPLEMENTS`, the prompt states scip-go's
+  convention: `T` implements `I` when the method set of `T` or of `*T`
+  satisfies `I` (M9c amendment 3; the template is in
+  `bench/probe/m9c_synthetic_sample.py`).
+  Verdicts are appended, never edited. Adding any changes the
+  `exact:verdicts` key hash, so `compare` against the previous close exits 2.
+  Re-score the base first: run `rb-bench score` with HEAD's `rb-bench` over
+  the base's dumps against the new verdicts, check that the result equals the
+  committed base except for `keys["exact:verdicts"]`, then `compare` against
+  it (M9a: `var/m9a/m8b-rescored.json`).
 - **Keys (M8a).** *SCIP agreement*: on each stress repo with SCIP mode, the
   `scip`-provenance `CALLS` of the SCIP run against the `--no-scip` run, in
   files SCIP covered. It is labelled `agreement`, never accuracy: it goes

@@ -1592,3 +1592,172 @@ fn cached_facts_stream_the_rows_load_returns() {
         .unwrap_err();
     assert_eq!(err.to_string(), "stop");
 }
+
+/// Contract M9c C10: `rb status`'s `exact calls (scip)` counts `scip` `CALLS` rows of certainty
+/// `exact` only. A `synthetic` `scip` call (a D8′ cross-project join), a heuristic call and an
+/// exact `scip` `REFERENCES` row are not exact calls. On a scratch database: the query is
+/// read-side, but the snapshot it reads is published here.
+#[test]
+fn scip_status_counts_exact_certainty_only() {
+    let Some(db) = db() else { return };
+    let scratch = ScratchDb::create(&db.url, "scipcalls");
+    let mut store = Store::connect(&scratch.url).unwrap();
+    let file = NodeKey::new(NodeKind::File, "src/a.go".to_owned());
+    let sym = |name: &str| NodeKey::new(NodeKind::Symbol, format!("sym {name}"));
+    let mut b = GraphBuilder::new();
+    b.add_node(file.clone(), "a.go", Default::default())
+        .unwrap();
+    for name in ["a", "b", "c", "d"] {
+        b.add_node(sym(name), name, Default::default()).unwrap();
+    }
+    let at = |line: i32| Evidence {
+        path: "src/a.go".into(),
+        span: [line, 0, line, 1],
+    };
+    for (dst, kind, provenance, certainty, line) in [
+        ("b", EdgeKind::Calls, Provenance::Scip, Certainty::Exact, 1),
+        (
+            "c",
+            EdgeKind::Calls,
+            Provenance::Scip,
+            Certainty::Synthetic,
+            2,
+        ),
+        (
+            "d",
+            EdgeKind::Calls,
+            Provenance::Heuristic,
+            Certainty::Heuristic,
+            3,
+        ),
+        (
+            "b",
+            EdgeKind::References,
+            Provenance::Scip,
+            Certainty::Exact,
+            4,
+        ),
+    ] {
+        b.add_edge(
+            NewEdge::new(sym("a"), kind, sym(dst), provenance, certainty).evidence(at(line)),
+        )
+        .unwrap();
+    }
+    let graph = b.finish().unwrap();
+    let published = store
+        .publish_snapshot(
+            &repo_name("scipcalls"),
+            &"c".repeat(40),
+            &json!({}),
+            &graph,
+            &[],
+            &load_dir(),
+        )
+        .unwrap();
+    let coverage = store.resolution_coverage(published.snapshot.id).unwrap();
+    assert_eq!(coverage.exact_calls, 1);
+}
+
+/// Contract M9d C10 (D11): `cypher()`'s session runs without JIT. `unowned_table_writes` on a
+/// graph shaped like `topo-packs` (the rule's labels, a few rows each) plans at a cost above
+/// `jit_above_cost`, because no AGE label table is ever analysed; with JIT on, LLVM compiled
+/// that plan for 0.3–2 s of a 2 s statement timeout on a 44-node graph. The plan is read under
+/// the very settings `cypher()` applies, and a control without them must show a `JIT` key, so
+/// the absence is not vacuous.
+#[test]
+fn cypher_runs_without_jit() {
+    let Some(db) = db() else { return };
+    let scratch = ScratchDb::create(&db.url, "nojit");
+    let mut store = Store::connect(&scratch.url).unwrap();
+    let svc = |k: &str| NodeKey::new(NodeKind::Service, k.to_owned());
+    let file = |k: &str| NodeKey::new(NodeKind::File, k.to_owned());
+    let table = NodeKey::new(NodeKind::Table, "public.t".to_owned());
+    let sym = NodeKey::new(NodeKind::Symbol, "s".to_owned());
+    let mut b = GraphBuilder::new();
+    for (key, name) in [
+        (svc("a"), "a"),
+        (svc("b"), "b"),
+        (file("a/f"), "f"),
+        (file("b/g"), "g"),
+        (sym.clone(), "s"),
+        (table.clone(), "t"),
+    ] {
+        b.add_node(key, name, Default::default()).unwrap();
+    }
+    for (src, kind, dst) in [
+        (file("a/f"), EdgeKind::InService, svc("a")),
+        (file("b/g"), EdgeKind::InService, svc("b")),
+        (sym.clone(), EdgeKind::DefinedIn, file("b/g")),
+        (file("a/f"), EdgeKind::Migrates, table.clone()),
+    ] {
+        b.add_edge(NewEdge::new(
+            src,
+            kind,
+            dst,
+            Provenance::Treesitter,
+            Certainty::Exact,
+        ))
+        .unwrap();
+    }
+    // b's symbol writes a table a migrates: one violation.
+    let mut q = NewEdge::new(
+        sym,
+        EdgeKind::Queries,
+        table,
+        Provenance::SqlLiteral,
+        Certainty::Heuristic,
+    );
+    q.attrs = [("ops".to_owned(), json!(["insert"]))]
+        .into_iter()
+        .collect();
+    b.add_edge(q).unwrap();
+    let repo = repo_name("nojit");
+    let live = store
+        .publish_snapshot(
+            &repo,
+            &"c".repeat(40),
+            &json!({}),
+            &b.finish().unwrap(),
+            &[],
+            &load_dir(),
+        )
+        .unwrap()
+        .snapshot;
+    let rule = crate::check::RULES
+        .iter()
+        .find(|r| r.name == crate::check::RULE_UNOWNED_TABLE_WRITES)
+        .unwrap();
+    let columns = ["src".to_owned(), "dst".to_owned()];
+    let limits = crate::CypherLimits::default();
+    let rows = store
+        .cypher(live.id, rule.cypher, &columns, limits)
+        .unwrap();
+    assert_eq!(rows.rows, vec![vec!["b".to_owned(), "public.t".to_owned()]]);
+
+    // The statement `cypher()` sends, explained in a transaction like its own.
+    let sql = format!(
+        "EXPLAIN (ANALYZE, FORMAT JSON) {} LIMIT {}",
+        crate::age::cypher_sql(&crate::graph_name(&repo, live.id), rule.cypher, &columns).unwrap(),
+        limits.rows + 1
+    );
+    let mut plan = |session: &str| -> serde_json::Value {
+        let mut tx = store
+            .client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .unwrap();
+        tx.batch_execute(session).unwrap();
+        let plan: serde_json::Value = tx.query_one(sql.as_str(), &[]).unwrap().get(0);
+        tx.commit().unwrap();
+        plan
+    };
+    let control = plan("SET LOCAL ROLE rb_reader");
+    assert!(
+        control[0].get("JIT").is_some(),
+        "the control must be JIT-compiled (server jit on, cost above jit_above_cost): {control}"
+    );
+    let ours = plan(&crate::cypher_session(limits.timeout_ms));
+    assert!(ours[0].get("JIT").is_none(), "{}", ours[0]["JIT"]);
+}

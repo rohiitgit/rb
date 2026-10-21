@@ -1,0 +1,435 @@
+[
+ {
+  "id": "m360",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
+  "file": "orchestrate.rs",
+  "old": "            fetch\n                .env\n                .push((\"npm_config_replace_registry_host\".into(), host));\n",
+  "new": "            drop(host);\n",
+  "what": "`replace_registry_host` setting dropped (re-anchored in E1)"
+ },
+ {
+  "id": "m361",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
+  "file": "orchestrate.rs",
+  "old": "        fetch\n            .env\n            .push((\"npm_config_engine_strict\".into(), \"false\".into()));\n",
+  "new": "",
+  "what": "`engine_strict` setting dropped (re-anchored in E1)"
+ },
+ {
+  "id": "m362",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_fetches_rewrite_registry_hosts_and_ignore_engines",
+  "file": "orchestrate.rs",
+  "old": "pub const RECIPE_TS: &str = \"m9d-ts-2\";\n",
+  "new": "pub const RECIPE_TS: &str = \"m9d-ts-1\";\n",
+  "what": "`RECIPE_TS` left at `m9d-ts-1` (amendment 4 moves it to `m9d-ts-2`; re-anchored in E1)"
+ },
+ {
+  "id": "m387",
+  "crate": "rb-store",
+  "test": "db_tests::cypher_runs_without_jit",
+  "file": "lib.rs",
+  "old": "        \"SET LOCAL statement_timeout = {timeout_ms}; SET LOCAL jit = off; SET LOCAL ROLE rb_reader\"\n",
+  "new": "        \"SET LOCAL statement_timeout = {timeout_ms}; SET LOCAL ROLE rb_reader\"\n",
+  "what": "`jit = off` removed from the session (read-side; ScratchDb)"
+ },
+ {
+  "id": "m392",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::cache_trees_with_read_only_modules_are_removed",
+  "file": "orchestrate.rs",
+  "old": "        Ok(m) if m.is_dir() => writable(path)?,\n",
+  "new": "        Ok(m) if m.is_dir() => {}\n",
+  "what": "the permission pass dropped (plain remove_dir_all)"
+ },
+ {
+  "id": "m363",
+  "crate": "rb-scip",
+  "test": "jobs::tests::requirements_only_directories_are_python_roots",
+  "file": "jobs.rs",
+  "old": "        .chain(requirements_only.iter().cloned())\n",
+  "new": "        .chain(std::iter::empty::<String>())\n",
+  "what": "`requirements.txt` directories not roots"
+ },
+ {
+  "id": "m364",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::python_roots_without_pyproject_name_their_project",
+  "file": "orchestrate.rs",
+  "old": "    if !pyproject.is_file() {\n",
+  "new": "    if true {\n",
+  "what": "project flags passed with a `pyproject.toml` too"
+ },
+ {
+  "id": "m365",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::python_roots_without_pyproject_name_their_project",
+  "file": "orchestrate.rs",
+  "old": "    if !pyproject.is_file() {\n",
+  "new": "    if false {\n",
+  "what": "project flags never passed"
+ },
+ {
+  "id": "m366",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::poetry_errors_reach_the_tail",
+  "file": "orchestrate.rs",
+  "old": "            \"exec poetry install --no-root --no-interaction 1>&2\",\n",
+  "new": "            \"exec poetry install --no-root --no-interaction\",\n",
+  "what": "Poetry run without `1>&2`"
+ },
+ {
+  "id": "m367",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_python_fetch_indexes_without_the_environment",
+  "file": "orchestrate.rs",
+  "old": "            let python = job.indexer == Indexer::ScipPython;\n",
+  "new": "            let python = false;\n",
+  "what": "a failed Python fetch returns `failed` (no fallback)"
+ },
+ {
+  "id": "m368",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_python_fetch_indexes_without_the_environment",
+  "file": "orchestrate.rs",
+  "old": "            if !(python && failed.status == RunStatus::Failed(Phase::Fetch)) {\n",
+  "new": "            if !(python && failed.status.phase() == Some(Phase::Fetch)) {\n",
+  "what": "fallback also after a fetch timeout"
+ },
+ {
+  "id": "m369",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_python_fetch_indexes_without_the_environment",
+  "file": "orchestrate.rs",
+  "old": "            let python = job.indexer == Indexer::ScipPython;\n",
+  "new": "            let python = true;\n",
+  "what": "fallback for a non-Python job"
+ },
+ {
+  "id": "m370",
+  "crate": "rb-scip",
+  "test": "jobs::tests::go_jobs_requiring_in_repo_modules_get_a_workspace",
+  "file": "jobs.rs",
+  "old": "                let required = module.requires.contains_key(path);\n",
+  "new": "                let required = false;\n",
+  "what": "no `workspace` for a required in-repo module"
+ },
+ {
+  "id": "m371",
+  "crate": "rb-scip",
+  "test": "jobs::tests::go_jobs_requiring_in_repo_modules_get_a_workspace",
+  "file": "jobs.rs",
+  "old": "                let replaced = module.replaces.iter().any(|(m, _)| m == path);\n",
+  "new": "                let replaced = false;\n",
+  "what": "a replaced in-repo module also put in `workspace`"
+ },
+ {
+  "id": "m372",
+  "crate": "rb-scip",
+  "test": "jobs::tests::go_jobs_requiring_in_repo_modules_get_a_workspace",
+  "file": "jobs.rs",
+  "old": "        .filter(|(dir, _)| is_under(dir, root))\n",
+  "new": "        .filter(|(dir, _)| is_under(dir, \"\"))\n",
+  "what": "a module outside the root put in `workspace`"
+ },
+ {
+  "id": "m373",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "        env.push((\"GOFLAGS\".into(), String::new()));\n",
+  "new": "        env.push((\"GOFLAGS\".into(), \"-mod=mod\".into()));\n",
+  "what": "`GOFLAGS=-mod=mod` kept in a workspace job"
+ },
+ {
+  "id": "m374",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "        args: fetch_args,\n",
+  "new": "        args: fetch_args, env: [base.env.clone(), vec![(\"GOWORK\".into(), \"off\".into())]].concat(),\n",
+  "what": "the fetch runs outside the workspace (`GOWORK=off`): `go.work` serves the index phase only"
+ },
+ {
+  "id": "m375",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "            RECIPE_GO_WORK.to_owned()\n",
+  "new": "            RECIPE_GO.to_owned()\n",
+  "what": "a workspace job keeps `RECIPE_GO`"
+ },
+ {
+  "id": "m394",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "        fetch_args = workspace_fetch(&job.workspace);\n",
+  "new": "        fetch_args = [\"go\", \"mod\", \"download\"].map(String::from).to_vec();\n",
+  "what": "a workspace job's fetch is `go mod download`"
+ },
+ {
+  "id": "m376",
+  "crate": "rb-indexer",
+  "test": "projects::tests::go_replace_targets_inside_the_repository_are_exported",
+  "file": "projects.rs",
+  "old": "                dirs.extend(dir);\n",
+  "new": "                let _ = dir;\n",
+  "what": "replace targets not exported"
+ },
+ {
+  "id": "m377",
+  "crate": "rb-indexer",
+  "test": "projects::tests::go_replace_targets_inside_the_repository_are_exported",
+  "file": "projects.rs",
+  "old": "                        let repository_shaped = !job.replace_targets.is_empty();\n",
+  "new": "                        let repository_shaped = true;\n",
+  "what": "a plain Go job exported repository-shaped"
+ },
+ {
+  "id": "m378",
+  "crate": "rb-indexer",
+  "test": "projects::tests::go_replace_targets_outside_are_unsupported",
+  "file": "projects.rs",
+  "old": "                    resolve_link(&job.root, target).map_err(|_| REPLACE_OUTSIDE.to_owned())?;\n",
+  "new": "                    resolve_link(&job.root, target).unwrap_or(None);\n",
+  "what": "a target outside the repository accepted"
+ },
+ {
+  "id": "m379",
+  "crate": "rb-indexer",
+  "test": "tests::byte_equal_cross_project_symbols_join_exact",
+  "file": "lib.rs",
+  "old": "                    let exact = r.symbol == *dst;\n",
+  "new": "                    let exact = false;\n",
+  "what": "equal symbols joined `synthetic` (D8)"
+ },
+ {
+  "id": "m380",
+  "crate": "rb-indexer",
+  "test": "tests::byte_equal_cross_project_symbols_join_exact",
+  "file": "lib.rs",
+  "old": "                    let exact = r.symbol == *dst;\n",
+  "new": "                    let exact = scip::unversioned(&r.symbol) == scip::unversioned(dst);\n",
+  "what": "unequal versions joined `exact` (D8: compared without the version)"
+ },
+ {
+  "id": "m381",
+  "crate": "rb-indexer",
+  "test": "scip::tests::in_repo_modules_are_not_packages",
+  "file": "scip.rs",
+  "old": "                if package.as_ref().is_some_and(|p| in_repo_module(p, modules)) {\n",
+  "new": "                if false {\n",
+  "what": "`.`-version in-repo reference creates a `Package` (D9)"
+ },
+ {
+  "id": "m382",
+  "crate": "rb-indexer",
+  "test": "scip::tests::in_repo_modules_are_not_packages",
+  "file": "scip.rs",
+  "old": "    let declared = modules.contains(package.name.as_str());\n",
+  "new": "    let declared = true;\n",
+  "what": "every `.`-version package dropped, third-party too (D9)"
+ },
+ {
+  "id": "m383",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_invalid_locals_are_counted",
+  "file": "decode.rs",
+  "old": "                locals_invalid_type += usize::from(invalid_type(s));\n",
+  "new": "                locals_invalid_type += 0;\n",
+  "what": "invalid locals not counted (D10)"
+ },
+ {
+  "id": "m384",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_invalid_locals_are_counted",
+  "file": "decode.rs",
+  "old": "    let scip_go = tool == \"scip-go\";\n",
+  "new": "    let scip_go = true;\n",
+  "what": "counted for any indexer (D10)"
+ },
+ {
+  "id": "m385",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_invalid_locals_are_counted",
+  "file": "decode.rs",
+  "old": "                .filter(|s| s.symbol.starts_with(\"local \"))\n",
+  "new": "                .filter(|_| true)\n",
+  "what": "non-local symbols counted (D10)"
+ },
+ {
+  "id": "m386",
+  "crate": "rb-cli",
+  "bin": "rb",
+  "test": "tests::scip_status_line_prints_invalid_locals",
+  "file": "main.rs",
+  "old": "        if n(\"locals_invalid_type\") > 0 {\n",
+  "new": "        if false {\n",
+  "what": "status line omits the count (D10)"
+ },
+ {
+  "id": "m395",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_workspace_run_reindexes_without_go_work",
+  "file": "orchestrate.rs",
+  "old": "    if !(workspace && matches!(attempt.status, RunStatus::Failed(_))) {\n",
+  "new": "    if true {\n",
+  "what": "no re-run after a workspace failure (D5b)"
+ },
+ {
+  "id": "m396",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_failed_workspace_run_reindexes_without_go_work",
+  "file": "orchestrate.rs",
+  "old": "    if !(workspace && matches!(attempt.status, RunStatus::Failed(_))) {\n",
+  "new": "    if !(workspace && matches!(attempt.status, RunStatus::Failed(_) | RunStatus::Timeout { .. })) {\n",
+  "what": "a re-run after a workspace timeout too (D5b)"
+ },
+ {
+  "id": "m388",
+  "crate": "rb-scip",
+  "test": "jobs::tests::maven_release_above_21_takes_the_jdk25_image",
+  "file": "jobs.rs",
+  "old": "        Some(release) if release > 21 => Ok(Jdk::Jdk25),\n",
+  "new": "        Some(release) if release > 21 => Ok(Jdk::Jdk21),\n",
+  "what": "release above 21 keeps the JDK 21 image (D12)"
+ },
+ {
+  "id": "m389",
+  "crate": "rb-scip",
+  "test": "jobs::tests::maven_release_above_21_takes_the_jdk25_image",
+  "file": "jobs.rs",
+  "old": "            match properties.get(name) {\n",
+  "new": "            match None::<&&str> {\n",
+  "what": "`${java.version}` not resolved: no `${…}` resolves through the properties (D12)"
+ },
+ {
+  "id": "m390",
+  "crate": "rb-scip",
+  "test": "jobs::tests::maven_release_above_21_takes_the_jdk25_image",
+  "file": "jobs.rs",
+  "old": "        let java_release = if fetch == Fetch::Maven {\n",
+  "new": "        let java_release = if true {\n",
+  "what": "a Gradle job takes the JDK 25 image: its root's poms are read too (D12)"
+ },
+ {
+  "id": "m391",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::gradle_runs_mark_tool_artifacts_executable",
+  "file": "orchestrate.rs",
+  "old": "            .chain(flags.iter())\n            .chain(init.iter())\n",
+  "new": "            .chain(flags.iter())\n",
+  "what": "init script missing from the fetch phase: the fetches run without `--init-script` (D13)"
+ },
+ {
+  "id": "m393",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::maven_index_phase_writes_the_targetroot_outside_the_sources",
+  "file": "orchestrate.rs",
+  "old": "            \"--targetroot\",\n            MAVEN_TARGETROOT,\n",
+  "new": "",
+  "what": "`--targetroot` dropped from the Maven index arguments (D12b)"
+ },
+ {
+  "id": "m397",
+  "crate": "rb-scip",
+  "test": "symbol::tests::lombok_markers_parse_each_distinct_symbol_once",
+  "file": "symbol.rs",
+  "old": "        let parses = &mut self.parses;\n",
+  "new": "        self.seen.clear();\n        let parses = &mut self.parses;\n",
+  "what": "the Lombok marker memo bypassed: every occurrence's symbol is parsed again (M9d P9b)"
+ },
+ {
+  "id": "m398",
+  "crate": "rb-scip",
+  "test": "symbol::tests::lombok_markers_skip_symbols_without_the_package_bytes",
+  "file": "symbol.rs",
+  "old": "        if !may_be_lombok_marker(symbol) {\n",
+  "new": "        if false {\n",
+  "what": "the byte pre-check bypassed: every symbol without the Lombok package's bytes is parsed (M9d P9c)"
+ },
+ {
+  "id": "m399",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_rewrite_names_the_lockfiles_one_foreign_registry_host",
+  "file": "orchestrate.rs",
+  "old": "        _ => None, // none left, or several: no setting, npm's default\n",
+  "new": "        _ => Some(\"always\".to_owned()), // none left, or several: no setting, npm's default\n",
+  "what": "the rewrite always set: `always` when no single foreign registry host is left (amendment 4, B1)"
+ },
+ {
+  "id": "m400",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::npm_rewrite_names_the_lockfiles_one_foreign_registry_host",
+  "file": "orchestrate.rs",
+  "old": "        .filter(|host| !egress.hosts.contains(host))\n",
+  "new": "        .filter(|host| !crate::egress::REGISTRIES.contains(&host.as_str()))\n",
+  "what": "hosts opted in through `RB_SCIP_REGISTRIES` not dropped (only the built-in registries are) (amendment 4, B1)"
+ },
+ {
+  "id": "m401",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::workspace_jobs_write_go_work_and_clear_goflags",
+  "file": "orchestrate.rs",
+  "old": "    if !replaces.is_empty() {\n",
+  "new": "    if false && !replaces.is_empty() {\n",
+  "what": "the go.work's versioned replace lines not written (amendment 4, S1)"
+ },
+ {
+  "id": "m402",
+  "crate": "rb-indexer",
+  "test": "scip::tests::the_join_parses_each_distinct_symbol_once",
+  "file": "scip.rs",
+  "old": "        if let Some(parts) = self.0.borrow().get(symbol) {\n",
+  "new": "        if let Some(parts) = self.0.borrow().get(symbol).filter(|_| false) {\n",
+  "what": "the join's symbol memo never answers from what it kept: every question parses again (amendment 4, S2)"
+ },
+ {
+  "id": "m403",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::the_gradle_init_script_marks_only_protobuf_tools_under_the_gradle_home",
+  "file": "orchestrate.rs",
+  "old": "      if (path.startsWith(home)) {\n",
+  "new": "      if (!path.startsWith(home)) {\n",
+  "what": "D13's init script marks only tools outside the Gradle home (evaluator pass 1, e12; amendment 4, S3)"
+ },
+ {
+  "id": "m404",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_poetry_root_with_a_requirements_txt_keeps_poetry_and_todays_arguments",
+  "file": "jobs.rs",
+  "old": "        .filter(|r| !has(&join(r, \"pyproject.toml\")) && !has(&join(r, \"setup.py\")))\n",
+  "new": "        .filter(|r| !has(&join(r, \"setup.py\")))\n",
+  "what": "D2: a Poetry root that also commits a requirements.txt is planned requirements-only (evaluator pass 1, e09; amendment 4, S3)"
+ },
+ {
+  "id": "m405",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_invalid_locals_are_counted",
+  "file": "decode.rs",
+  "old": "        .is_some_and(|sig| sig.text.contains(\"invalid type\"))\n",
+  "new": "        .is_some_and(|sig| sig.text.contains(\"invalid\"))\n",
+  "what": "D10: a local named or typed `invalid…` counts as an invalid-type local (evaluator pass 1, e08; amendment 4, S3)"
+ },
+ {
+  "id": "m406",
+  "crate": "rb-scip",
+  "test": "jobs::tests::go_versions_order_pre_releases_between_the_language_version_and_its_release",
+  "file": "jobs.rs",
+  "old": "    (numbers, !pre.is_empty(), pre)\n",
+  "new": "    (numbers, false, \"\")\n",
+  "what": "D5: the go version key ignores pre-releases, so 1.21rc1 == 1.21 (evaluator pass 1, e03; amendment 4, S3)"
+ },
+ {
+  "id": "m407",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_workspace_fallbacks_elapsed_covers_both_runs",
+  "file": "orchestrate.rs",
+  "old": "            stderr_tail: attempt.stderr_tail,\n            elapsed,\n",
+  "new": "            stderr_tail: attempt.stderr_tail,\n            elapsed: rerun.elapsed,\n",
+  "what": "D5b: the elapsed time covers the re-run only (evaluator pass 1, e07; amendment 4, S3)"
+ }
+]

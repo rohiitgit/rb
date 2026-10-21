@@ -117,7 +117,10 @@ a trace of one request.
 
 **Follow data.** `rb table-deps users` rolls every accessor of a table up to
 entry points per service, and lists services that reach the table only through
-another service's API.
+another service's API. A Spring Data repository type has its own `QUERIES` row
+with all four ops (`read+insert+update+delete`, `synthetic`). That row stands
+for the CRUD methods it inherits from the framework, not for a query it states.
+Its declared methods (`findByEmail`, `@Query`) get rows of their own.
 
 **Compare and gate.** `rb diff` diffs two snapshots (endpoints, table access,
 dependencies, nodes, edges — never re-indexes). `rb check` runs the
@@ -207,20 +210,25 @@ adds compiler-grade `exact` edges where a build can run in a container.
 
 | Language | Parsed | `exact` via SCIP | HTTP routes | HTTP / RPC clients | Dependency injection | Data access |
 |---|---|---|---|---|---|---|
-| **Java** | yes | scip-java (Maven, Gradle) | Spring MVC (class × method prefixes, context path; OpenAPI interfaces handled by implementors) | RestTemplate, WebClient, RestClient, Feign, gRPC stubs, OpenAPI-generated clients | Spring (stereotypes, `@Bean`, qualifiers, Lombok), Guice, Dagger, Spring XML | JPA + Spring Data (mappings, derived and `@Query` methods, JPQL), MyBatis XML mappers, SQL in strings |
+| **Java** | yes | scip-java (Maven, Gradle) | Spring MVC (class × method prefixes, context path; OpenAPI interfaces handled by implementors), Spring Data REST (`@RepositoryRestResource` with a literal `path`, `synthetic`) | RestTemplate, WebClient, RestClient, Feign, gRPC stubs, OpenAPI-generated clients | Spring (stereotypes, `@Bean`, qualifiers, Lombok), Guice, Dagger, Spring XML | JPA + Spring Data (mappings, derived and `@Query` methods, JPQL), MyBatis XML mappers, SQL in strings |
 | **TypeScript / JavaScript** | yes (TS, TSX, JS) | scip-typescript (npm, pnpm, Yarn) | Express (routers, mounts, constant paths, `require('express')()`; paths matched case-insensitively, as Express does, unless the router mentions `caseSensitive` or the app sets `case sensitive routing`: any value counts, since the value is not read) | fetch, axios (incl. shared default-exported instances), HTTP client wrappers, gRPC stubs, OpenAPI-generated clients | NestJS (providers, constructor points, tokens) | Prisma (models and queries), TypeORM (models only), SQL in strings |
 | **Python** | yes | scip-python | FastAPI (decorators, `APIRouter` prefixes, `include_router` across modules) | requests, httpx | none | SQLAlchemy and Django models (mappings, not queries), SQL in strings |
-| **Go** | yes | scip-go | gin (incl. groups passed as parameters), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings |
+| **Go** | yes | scip-go (a module requiring another module of the repository is indexed under a generated `go.work`, which also replaces that module at the required version, so the version need not be published and the module may have other local `replace`s; calls between them are then `exact`; they are `synthetic` only where the compiler saw a required version, not the in-repo code) | gin (incl. groups passed as parameters, method-value handlers declared in other files), chi, net/http `ServeMux` | net/http, gRPC stubs (`pb.NewXClient`) | none | SQL in strings, incl. `fmt.Sprintf` with package-constant table names |
 | **Kotlin** | yes | scip-java (Gradle) | none | none | `beans { }` DSL (function and top-level `val` forms) | SQL in strings |
 | **C#** | yes (`heuristic` only) | none | none | none | .NET DI (`Add*`/`TryAdd*`/keyed, minimal hosting, implicit and global usings, implementation owners, constructor and `[Inject]` points) | SQL in strings |
 
 Across languages:
 - **Endpoints.** `.proto` gRPC services (attributed to the services that
-  register a server) and OpenAPI/Swagger specs.
+  register a server) and OpenAPI/Swagger specs. An endpoint is `exact` only
+  when code registers it; one that only a spec states is `synthetic`. Routes
+  registered in test files are not endpoints; one `routes_in_test_code`
+  diagnostic counts them per file.
 - **Data.** SQL migration files, aiosql/HugSQL query files and Prisma schemas.
-- **Config and wiring.** Spring `application.*` config and profiles, Kafka and
-  RabbitMQ topics (Java), nginx and Spring Cloud Gateway routes, Compose and
-  Kubernetes service names, and CODEOWNERS for file ownership.
+- **Config and wiring.** Spring `application.*` config and profiles, a
+  `native` Spring Cloud Config server's shared files (context paths only,
+  matched to clients by `spring.application.name`), Kafka and RabbitMQ topics
+  (Java), nginx and Spring Cloud Gateway routes, Compose and Kubernetes
+  service names, and CODEOWNERS for file ownership.
 - **Calls between services** are stitched from clients to endpoints and are
   never `exact`.
 
@@ -262,9 +270,11 @@ SCIP images (only needed without `--no-scip`):
 
 ```sh
 docker build -t rb-scip-java:0.13.1 docker/scip-java
+# JDK 25, for Maven builds whose release is above 21; copies its tools from the image above
+docker build -t rb-scip-java:0.13.1-jdk25 -f docker/scip-java/Dockerfile.jdk25 docker/scip-java
 docker build -t rb-egress-proxy:1.11.3 docker/egress-proxy
 docker pull --platform linux/amd64 sourcegraph/scip-typescript@sha256:028c00429913fde8ed684ae9e9f175f0e66484398c7c9f6de51bf06d32223845
-docker build -t rb-scip-go:0.2.7 docker/scip-go
+docker build -t rb-scip-go:0.2.7-xtools0.50.0 docker/scip-go
 docker pull --platform linux/amd64 sourcegraph/scip-python@sha256:1847528ce710f58d13200e8c0237f8028342eee3f8a073a9f6109107f930be23
 ```
 
@@ -306,7 +316,7 @@ troubleshooting) is [docs/usage-and-testing.md](docs/usage-and-testing.md).
 | `fixtures/` | 18 golden fixture repos (see the testing guide for the catalog) |
 | `tasks/`, `docs/`, `var/` | contracts, evaluations, lessons; design doc; per-milestone scripts/logs/evidence (gitignored scratch) |
 
-**Status: M0–M7j (M7 closed).** M0–M6l built the tool (foundations → structure → syntax →
+**Status: M0–M9d (M9a and M9b closed 2026-10-16; M9c closed 2026-10-17; M9d closed 2026-10-21).** M0–M6l built the tool (foundations → structure → syntax →
 SQL/ORM → resolution → SCIP → endpoints → DI → scale/API → SCIP/topology/rules
 breadth → Kotlin/C# → DI breadth → DI recall → XML siting). M7a–M7j fixed
 what a stress campaign over 18 fixtures and 13 public repositories found
@@ -315,5 +325,16 @@ silent recall losses, vendored and built code, the error contract,
 honesty about what was not analysed, the CLI's rough edges (checkouts
 known by path, `rb doctor`), and the last precision and cost items (Express
 case, spec-only routes, bounded hub answers, one index per repository,
-streamed caches). Detail per milestone: `CHANGELOG.md`,
+streamed caches). M8a–M8b added an accuracy benchmark with answer keys
+(`bench/`, `tasks/bench-findings.md`). M9a fixes the wrong `exact` edges
+it found (test-file routes, spec-only routes, literal-brace Spring paths,
+Go method `IMPLEMENTS`, config-server context paths). M9b adds recall it
+found missing: Go methods declared outside their type's file, `fmt.Sprintf`
+SQL with package constants, Spring Data REST endpoints; cross-module SCIP
+calls moved to M9c. M9c fixes the scip-go image (it had loaded no imported
+package since it was built), adds Tier B recall for Go receivers, TypeScript
+tsconfig `paths` and default imports, and Python `super()`, star imports and
+the MRO, and joins calls between a repository's Go modules as `synthetic`
+`scip` edges (their gain in SCIP agreement precision is the reference
+gaining those joins; recall rose from 62 % to 96 %). Detail per milestone: `CHANGELOG.md`,
 `IMPLEMENT.md`, contracts in `tasks/`.

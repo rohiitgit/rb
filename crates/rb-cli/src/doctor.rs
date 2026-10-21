@@ -175,8 +175,9 @@ fn silent_database(url: &str) -> Vec<Row> {
 }
 
 /// The pinned images SCIP runs (README, "SCIP images").
-const IMAGES: [&str; 5] = [
+const IMAGES: [&str; 6] = [
     rb_scip::jobs::SCIP_JAVA_IMAGE,
+    rb_scip::jobs::SCIP_JAVA25_IMAGE,
     rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE,
     rb_scip::jobs::SCIP_GO_IMAGE,
     rb_scip::jobs::SCIP_PYTHON_IMAGE,
@@ -446,10 +447,18 @@ mod tests {
         );
 
         assert_eq!(images_row(&[]).status, Status::Ok);
-        let absent = images_row(&["rb-scip-go:0.2.7"]);
+        // Contract M9d D12: both scip-java images are checked.
+        assert!(
+            IMAGES.contains(&rb_scip::jobs::SCIP_JAVA_IMAGE)
+                && IMAGES.contains(&rb_scip::jobs::SCIP_JAVA25_IMAGE),
+            "{IMAGES:?}"
+        );
+        assert_eq!(images_row(&[]).detail, "6 pinned images present");
+        let go = rb_scip::jobs::SCIP_GO_IMAGE;
+        let absent = images_row(&[go]);
         assert_eq!(
-            (absent.status, absent.detail.as_str()),
-            (Status::Warn, "absent: rb-scip-go:0.2.7")
+            (absent.status, absent.detail),
+            (Status::Warn, format!("absent: {go}"))
         );
 
         let home = Path::new("/Users/me");

@@ -1387,16 +1387,19 @@ fn phase_detail(phase: &str, budget_secs: Option<u64>) -> String {
 }
 
 /// What `rb index` prints after a job's status: the phase of a timeout or failure, else the
-/// reason a job did not run, else nothing.
+/// reason a job did not run, else nothing; an index without its environment (contract M9d
+/// D4) or without its workspace (D5b) says so.
 fn status_detail(status: &rb_scip::RunStatus) -> String {
     match status {
         rb_scip::RunStatus::Timeout { phase, budget_secs } => {
             phase_detail(phase.as_str(), Some(*budget_secs))
         }
         rb_scip::RunStatus::Failed(phase) => phase_detail(phase.as_str(), None),
-        other => other
-            .reason()
-            .map_or_else(String::new, |reason| format!(": {reason}")),
+        other => match (other.note(), other.reason()) {
+            (Some(note), _) => format!(" ({note})"),
+            (None, Some(reason)) => format!(": {reason}"),
+            (None, None) => String::new(),
+        },
     }
 }
 
@@ -1515,8 +1518,17 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
     }
     // A timeout's stored `reason` is rendered from its phase and budget, so the detail is
     // printed once, as `rb index` prints it (contract M3b amendment 50); a failure prints its
-    // phase (amendment 56).
+    // phase (amendment 56). An `ok` job with a phase made a degraded index: without the
+    // environment after a failed fetch (contract M9d D4), or without the workspace after a
+    // failed workspace run (D5b); the stored pair names the variant, which names the text.
     match d.detail["phase"].as_str() {
+        Some(phase) if d.detail["status"] == "ok" => {
+            if let Some(note) =
+                rb_scip::RunStatus::from_cached("ok", Some(phase)).and_then(|s| s.note())
+            {
+                let _ = write!(line, " ({note})");
+            }
+        }
         Some(phase) => line.push_str(&phase_detail(phase, d.detail["budget_secs"].as_u64())),
         None => {
             if let Some(reason) = d.detail["reason"].as_str() {
@@ -1636,6 +1648,16 @@ fn scip_status_line(d: &rb_model::Diagnostic) -> String {
         // (contract M3b amendment 54).
         if n("definitions_local") > 0 {
             let _ = write!(line, ", {} local definitions", n("definitions_local"));
+        }
+        // A scip-go index whose packages did not all load (contract M9d D10): scip-go exits 0,
+        // and its locals typed `invalid type` are the only sign. Only when there are any.
+        if n("locals_invalid_type") > 0 {
+            let _ = write!(
+                line,
+                ", {} of {} locals typed invalid",
+                n("locals_invalid_type"),
+                n("locals")
+            );
         }
     }
     line
@@ -1816,6 +1838,8 @@ fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value
     });
     if *scip == rb_indexer::ScipMode::On {
         tools["scip_java"] = images.identity(rb_scip::jobs::Indexer::ScipJava).into();
+        // Contract M9d D12: the JDK 25 scip-java image, for Maven releases above 21.
+        tools["scip_java25"] = images.java25_identity().into();
         tools["scip_typescript"] = images
             .identity(rb_scip::jobs::Indexer::ScipTypescript)
             .into();
@@ -3554,17 +3578,20 @@ mod tests {
     fn tool_versions_record_image_identities_when_scip_is_on() {
         let images = rb_scip::Images {
             java: Err("absent".into()),
+            java25: Err("absent".into()),
             go: Err("absent".into()),
             proxy: Ok("sha256:proxy".into()),
         };
         let on = tool_versions(&rb_indexer::ScipMode::On, &images);
         assert_eq!(on["scip"], "on");
         assert_eq!(on["scip_java"], "absent");
+        assert_eq!(on["scip_java25"], "absent");
         assert_eq!(on["scip_typescript"], rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE);
         assert_eq!(on["scip_go"], "absent");
         assert_eq!(on["scip_python"], rb_scip::jobs::SCIP_PYTHON_IMAGE);
         let present = rb_scip::Images {
             java: Ok("sha256:abc".into()),
+            java25: Ok("sha256:abc".into()),
             go: Ok("sha256:abc".into()),
             proxy: Ok("sha256:proxy".into()),
         };
@@ -3575,6 +3602,14 @@ mod tests {
         assert_eq!(
             tool_versions(&rb_indexer::ScipMode::On, &present)["scip_go"],
             "sha256:abc"
+        );
+        let jdk25 = rb_scip::Images {
+            java25: Ok("sha256:jdk25".into()),
+            ..present.clone()
+        };
+        assert_eq!(
+            tool_versions(&rb_indexer::ScipMode::On, &jdk25)["scip_java25"],
+            "sha256:jdk25"
         );
         assert_eq!(on["pipeline"], rb_indexer::PIPELINE);
         let off = tool_versions(&rb_indexer::ScipMode::Off, &rb_scip::Images::unresolved());
@@ -3987,6 +4022,99 @@ mod tests {
             ": docker is not available"
         );
         assert_eq!(status_detail(&rb_scip::RunStatus::Ok), "");
+    }
+
+    /// Contract M9d D4 (C4): a scip-python index made without its environment after a failed
+    /// fetch is `ok` and says so on both lines, never as a failed phase; a plain `ok` prints
+    /// nothing.
+    #[test]
+    fn scip_status_line_prints_an_index_without_its_environment() {
+        let line = |unpinned: bool| {
+            scip_status_line(&rb_model::Diagnostic {
+                kind: "scip_status".into(),
+                path: Some(".".into()),
+                span: None,
+                detail: json!({
+                    "indexer": "scip-python", "status": "ok", "unpinned": unpinned,
+                    "image": "sha256:1", "phase": "fetch",
+                    "stderr_tail": "ChefBuildError: pyyaml (6.0)",
+                }),
+            })
+        };
+        assert_eq!(
+            line(false),
+            "scip: . scip-python ok (environment not installed: fetch failed)"
+        );
+        assert_eq!(
+            line(true),
+            "scip: . scip-python ok unpinned (environment not installed: fetch failed)"
+        );
+        let fallback = rb_scip::RunStatus::from_cached("ok", Some("fetch")).unwrap();
+        assert_eq!(
+            status_detail(&fallback),
+            " (environment not installed: fetch failed)"
+        );
+        assert_eq!(status_detail(&rb_scip::RunStatus::Ok), "");
+    }
+
+    /// Contract M9d D5b (amendment 2): a scip-go index made without its workspace after a
+    /// failed workspace run is `ok` with phase `index`, and both lines say so, never as a
+    /// failed phase and never as D4's text.
+    #[test]
+    fn scip_status_line_prints_an_index_without_its_workspace() {
+        let line = scip_status_line(&rb_model::Diagnostic {
+            kind: "scip_status".into(),
+            path: Some("server".into()),
+            span: None,
+            detail: json!({
+                "indexer": "scip-go", "status": "ok", "unpinned": false,
+                "image": "sha256:1", "phase": "index", "stderr_tail": "Killed",
+            }),
+        });
+        assert_eq!(
+            line,
+            "scip: server scip-go ok (workspace failed: indexed without go.work)"
+        );
+        let fallback =
+            rb_scip::RunStatus::from_cached("ok", Some("index")).expect("D5b's cached pair");
+        assert_eq!(
+            status_detail(&fallback),
+            " (workspace failed: indexed without go.work)"
+        );
+    }
+
+    /// Contract M9d D10 (C9): a scip-go index with locals typed `invalid type` says how many,
+    /// of how many, at the end of its line; one without the keys (every healthy index) says
+    /// nothing.
+    #[test]
+    fn scip_status_line_prints_invalid_locals() {
+        let line = |coverage: serde_json::Value| {
+            scip_status_line(&rb_model::Diagnostic {
+                kind: "scip_status".into(),
+                path: Some("server".into()),
+                span: None,
+                detail: json!({
+                    "indexer": "scip-go", "status": "ok", "unpinned": false,
+                    "image": "sha256:1", "coverage": coverage,
+                }),
+            })
+        };
+        let degraded = line(json!({
+            "definitions_matched": 2, "definitions_total": 2, "relationships_dropped": 0,
+            "locals_invalid_type": 1, "locals": 2,
+        }));
+        assert!(
+            degraded.ends_with(
+                ", relationships dropped 0 (0 in project, 0 anonymous), 1 of 2 locals typed invalid"
+            ),
+            "{degraded}"
+        );
+        let healthy = line(json!({"definitions_matched": 2, "definitions_total": 2}));
+        assert!(!healthy.contains("locals typed invalid"), "{healthy}");
+        assert!(
+            healthy.ends_with(", relationships dropped 0 (0 in project, 0 anonymous)"),
+            "{healthy}"
+        );
     }
 
     /// Contract M5 S22: each repository's package caches live in a directory of its own, so

@@ -64,11 +64,13 @@ pub fn remove_leftover_test_repositories(url: &str) {
     }
     let plan = store.gc_plan("t_").unwrap();
     let removed = store.gc_apply(&plan).unwrap();
+    let caches = remove_test_caches(&scip_cache_dir());
     eprintln!(
-        "e2e start-up: removed {} leftover test repositories, {} graphs and {} building rows",
+        "e2e start-up: removed {} leftover test repositories, {} graphs, {} building rows and {} package caches",
         leftover.len(),
         removed.graphs.len(),
-        removed.building.len()
+        removed.building.len(),
+        caches
     );
 }
 
@@ -190,14 +192,58 @@ impl Drop for Cleanup<'_> {
                 let _ = store.delete_repo(r);
             }
         }
-        let mut ran = false;
-        for r in &self.repos {
-            let cache = workspace_root().join("var/scip/cache").join(r);
-            ran |= cache.exists();
-            let _ = std::fs::remove_dir_all(cache);
-        }
-        if ran {
+        if remove_repo_caches(&scip_cache_dir(), &self.repos) {
             let _ = rb_scip::DockerRunner::default().egress_leftovers(true);
+        }
+    }
+}
+
+/// Where `rb` keeps the e2e repositories' package caches (`RB_SCIP_WORK_DIR`'s `cache`).
+pub fn scip_cache_dir() -> PathBuf {
+    workspace_root().join("var/scip/cache")
+}
+
+/// Removes `<caches>/<repo>` for each of `repos`, read-only Go module trees included (contract
+/// M9d D15), and prints any failure with its path; true when any of them existed.
+pub fn remove_repo_caches(caches: &Path, repos: &[String]) -> bool {
+    let mut ran = false;
+    for r in repos {
+        let cache = caches.join(r);
+        ran |= cache.exists();
+        remove_cache(&cache);
+    }
+    ran
+}
+
+/// Removes every `t_*` directory under `caches` (contract M9d D15): the caches of leftover
+/// test repositories, and those an earlier clean-up failed to remove. Test repositories own
+/// the `t_` prefix, as the start-up clean-up of rows assumes. Returns how many it removed.
+pub fn remove_test_caches(caches: &Path) -> usize {
+    let entries = match std::fs::read_dir(caches) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            eprintln!("e2e clean-up: could not list {}: {e}", caches.display());
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir && entry.file_name().to_string_lossy().starts_with("t_") {
+            removed += usize::from(remove_cache(&entry.path()));
+        }
+    }
+    removed
+}
+
+/// Removes one cache tree; prints the error with the path instead of discarding it.
+fn remove_cache(cache: &Path) -> bool {
+    match rb_scip::orchestrate::remove_cache_tree(cache) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("e2e clean-up: could not remove {}: {e}", cache.display());
+            false
         }
     }
 }

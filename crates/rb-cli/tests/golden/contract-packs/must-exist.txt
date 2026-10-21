@@ -1,9 +1,10 @@
 # Precision guards for the contract-packs fixture (contract M6f S7),
 # checked against the SCIP dump.
 # One edge per line: <KIND> <src key> -> <dst key> [<certainty>] {<attributes that must match>}
-# S3: spec and proto endpoints are exact.
+# S3: proto endpoints and spec operations joined to code are exact; a spec-only operation is
+# synthetic (contract M9a D2).
 EXPOSES . -> HTTP GET /users @. [exact]
-EXPOSES . -> HTTP POST /users @. [exact]
+EXPOSES . -> HTTP POST /users @. [synthetic]
 EXPOSES . -> GRPC acme.Greeter/SayHello @. [exact]
 EXPOSES . -> GRPC acme.Users/Get @. [exact]
 EXPOSES . -> GRPC acme.Users/Watch @. [exact]

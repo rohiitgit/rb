@@ -1,0 +1,353 @@
+[
+ {
+  "id": "m261",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "                    own.extend(self.go_methods_of(c, name, want));\n",
+  "new": "                    own.extend(Vec::<Sym<'a>>::new());\n",
+  "what": "receiver table not consulted in members"
+ },
+ {
+  "id": "m262",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "            .get(&(key, def.name.as_str()))\n",
+  "new": "            .iter().find(|((_, r), _)| *r == def.name.as_str()).map(|(_, m)| m)\n",
+  "what": "receiver table looked up without package_key"
+ },
+ {
+  "id": "m263",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "                    if d.receiver.is_none() {\n",
+  "new": "                    if true {\n",
+  "what": "receiver-carrying defs kept in the bare-name package table"
+ },
+ {
+  "id": "m264",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "            .get(&(key, def.name.as_str()))\n",
+  "new": "            .iter().find(|((k, r), _)| k.0 == key.0 && *r == def.name.as_str()).map(|(_, m)| m)\n",
+  "what": "receiver table looked up by directory only (replaces 'by the caller's file', amendment 2)"
+ },
+ {
+  "id": "m265",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "            .and_then(|scope| consts.fold(path, facts, scope, candidate));\n",
+  "new": "            .and_then(|_| None::<(String, Vec<String>)>);\n",
+  "what": "fold disabled"
+ },
+ {
+  "id": "m266",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "                .is_some_and(|i| (path, i) != (c.file, c.binding));\n",
+  "new": "                .is_some_and(|_| false);\n",
+  "what": "shadow check removed"
+ },
+ {
+  "id": "m267",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "                let constant = b.constant && b.type_name.is_empty();\n",
+  "new": "                let constant = b.type_name.is_empty();\n",
+  "what": "var bindings enter the table (re-anchored after pass 1 E3 rewrote the line)"
+ },
+ {
+  "id": "m268",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "        table.retain(|k, _| declared.get(k) == Some(&1));\n",
+  "new": "        table.retain(|_, _| true);\n",
+  "what": "duplicate declarations keep a value"
+ },
+ {
+  "id": "m269",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "            _ => return None,\n",
+  "new": "            _ => {}\n",
+  "what": "unknown verbs skipped instead of refusing"
+ },
+ {
+  "id": "m270",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "            Some('%') => out.push('%'),\n",
+  "new": "            Some('%') => out.push_str(\"%%\"),\n",
+  "what": "%% kept as %%"
+ },
+ {
+  "id": "m271",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "        if link.name != \"Sprintf\" || chain.root.as_deref() != Some(\"fmt\") {\n",
+  "new": "        if link.name != \"Sprintf\" {\n",
+  "what": "fmt qualifier check removed"
+ },
+ {
+  "id": "m272",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "        .find(|d| is_annotation(facts, d, SPRING_DATA_REST, \"RepositoryRestResource\"))\n",
+  "new": "        .find(|d| simple(&d.name) == \"RepositoryRestResource\")\n",
+  "what": "import check on the annotation removed"
+ },
+ {
+  "id": "m273",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    let Some(path) = literal_path(d).filter(|_| exported(d)) else {\n",
+  "new": "    let Some(path) = literal_path(d) else {\n",
+  "what": "exported = false ignored"
+ },
+ {
+  "id": "m274",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    (arg.literal && arg.items.is_empty() && !path.is_empty()).then(|| path.to_owned())\n",
+  "new": "    (arg.items.is_empty() && !path.is_empty()).then(|| path.to_owned())\n",
+  "what": "non-literal path accepted"
+ },
+ {
+  "id": "m275",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    let crud = bases.iter().any(|b| CRUD_BASES.contains(b));\n",
+  "new": "    let crud = true;\n",
+  "what": "item resources for a bare Repository base"
+ },
+ {
+  "id": "m276",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    if CRUD_METHODS.contains(&name) {\n",
+  "new": "    if false {\n",
+  "what": "CRUD-named finders emitted"
+ },
+ {
+  "id": "m277",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                            Certainty::Synthetic\n                        };\n",
+  "new": "                            Certainty::Exact\n                        };\n",
+  "what": "data-rest certainty Synthetic -> Exact"
+ },
+ {
+  "id": "m278",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                        let Some(base) = inputs.data_rest.get(&service) else {\n                            continue;\n                        };\n",
+  "new": "                        let base = inputs.data_rest.get(&service).unwrap_or(&None);\n",
+  "what": "data-rest dependency gate removed"
+ },
+ {
+  "id": "m279",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "        && scope.binding_index_at(\"fmt\", at).is_none()\n",
+  "new": "        && true\n",
+  "what": "a local binding of fmt no longer refuses the fold (pass 1 e1; row Q)"
+ },
+ {
+  "id": "m280",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "            Some('s' | 'v') => out.push_str(next.next()?),\n",
+  "new": "            Some('s' | 'v' | 'd') => out.push_str(next.next()?),\n",
+  "what": "%d accepted as a string hole (pass 1 e2; row P)"
+ },
+ {
+  "id": "m281",
+  "crate": "rb-indexer",
+  "test": "tests::data_rest_services_need_the_dependency_and_read_the_base_path",
+  "file": "lib.rs",
+  "old": "                && DATA_REST_DEPENDENCIES.iter().any(|d| text.contains(d))\n",
+  "new": "                && true\n",
+  "what": "every build file names Spring Data REST (pass 1 e3)"
+ },
+ {
+  "id": "m282",
+  "crate": "rb-indexer",
+  "test": "tests::data_rest_services_need_the_dependency_and_read_the_base_path",
+  "file": "lib.rs",
+  "old": "    &[\"spring.data.rest.base-path\", \"spring.data.rest.basePath\"];\n",
+  "new": "    &[\"spring.data.rest.base-path\"];\n",
+  "what": "basePath (camelCase) key not read (pass 1 e4)"
+ },
+ {
+  "id": "m283",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "            Some(\"RepositoryRestConfigurer\" | \"RepositoryRestConfigurerAdapter\")\n",
+  "new": "            Some(\"RepositoryRestConfigurer\")\n",
+  "what": "RepositoryRestConfigurerAdapter no longer caps (pass 1 e5)"
+ },
+ {
+  "id": "m284",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "        if language != Language::Go || def.parent.is_some() {\n",
+  "new": "        if language != Language::Go {\n",
+  "what": "a function-local type gets the package type's cross-file methods (pass 1 e6)"
+ },
+ {
+  "id": "m285",
+  "crate": "rb-indexer",
+  "test": "resolve::tests::go_methods_in_sibling_files_are_members",
+  "file": "resolve.rs",
+  "old": "                    (None, Some(_)) => continue,\n",
+  "new": "                    (None, Some(_)) => &mut sc.top,\n",
+  "what": "receiver-carrying defs kept in the file's top scope (amendment 2)"
+ },
+ {
+  "id": "m286",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "        if !fmt_is_the_fmt_package(facts, scope, chain.span) {\n",
+  "new": "        if false {\n",
+  "what": "fmt import check removed (amendment 3)"
+ },
+ {
+  "id": "m287",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "                let test_file = rb_model::is_test_path(path);\n",
+  "new": "                let test_file = false;\n",
+  "what": "test-file constants enter the table (amendment 3)"
+ },
+ {
+  "id": "m288",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "            Some(r) if !exported(r) => continue,\n",
+  "new": "            Some(r) if false => continue,\n",
+  "what": "method @RestResource(exported = false) ignored (amendment 4)"
+ },
+ {
+  "id": "m289",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "                    Some(p) => p,\n",
+  "new": "                    Some(_) => method.name.clone(),\n",
+  "what": "method @RestResource(path) ignored (amendment 4)"
+ },
+ {
+  "id": "m290",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    let collection = bases.iter().any(|b| *b != \"Repository\");\n",
+  "new": "    let collection = true;\n",
+  "what": "collection resource for a bare Repository base (amendment 4)"
+ },
+ {
+  "id": "m291",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                        let certainty = if configured.contains(&service) {\n",
+  "new": "                        let certainty = if false {\n",
+  "what": "RepositoryRestConfigurer cap removed (amendment 4)"
+ },
+ {
+  "id": "m292",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    (qualified || imported).then_some(base)\n",
+  "new": "    Some(base)\n",
+  "what": "repository base import check removed (amendment 4)"
+ },
+ {
+  "id": "m293",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                            Some(base) => format!(\"/{base}{route_path}\"),\n",
+  "new": "                            Some(_) => route_path.to_owned(),\n",
+  "what": "base path ignored (amendment 4)"
+ },
+ {
+  "id": "m294",
+  "crate": "rb-indexer",
+  "test": "tests::config_server_context_path_values_are_trimmed",
+  "file": "lib.rs",
+  "old": "                        found = Some((file, value.trim().to_owned()));\n",
+  "new": "                        found = Some((file, value.to_owned()));\n",
+  "what": "remote context-path value not trimmed (N1; M9a pass 2's v03)"
+ },
+ {
+  "id": "m295",
+  "crate": "rb-frameworks",
+  "test": "routes::tests::spring_data_rest_repositories_expose_endpoints",
+  "file": "routes.rs",
+  "old": "    \"findAllById\",\n",
+  "new": "    \"findAllByIdX\",\n",
+  "what": "findAllById exported as a search resource (pass 1 e7)"
+ },
+ {
+  "id": "m296",
+  "crate": "rb-indexer",
+  "test": "sql::tests::sprintf_sql_folds_package_constants",
+  "file": "sql.rs",
+  "old": "                let constant = b.constant && b.type_name.is_empty();\n",
+  "new": "                let constant = b.constant;\n",
+  "what": "a named-type constant folds its literal, not its String() (pass 1 E3; row N)"
+ },
+ {
+  "id": "m297",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                        || d.return_type.as_deref().is_some_and(configurer)\n",
+  "new": "                        || false\n",
+  "what": "a method returning a configurer (the @Bean form) no longer caps (pass 1 E2)"
+ },
+ {
+  "id": "m298",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "                        && c.links.first().is_some_and(|l| l.name == \"withConfig\")\n",
+  "new": "                        && c.links.first().is_some_and(|l| l.name == \"withConfigX\")\n",
+  "what": "RepositoryRestConfigurer.withConfig no longer caps (pass 1 E2; Kotlin row)"
+ },
+ {
+  "id": "m299",
+  "crate": "rb-indexer",
+  "test": "routes::tests::data_rest_endpoints_are_synthetic",
+  "file": "routes.rs",
+  "old": "            matches!(language, Language::Java | Language::Kotlin)\n",
+  "new": "            *language == Language::Java\n",
+  "what": "Kotlin configurers no longer cap (pass 1 E2)"
+ }
+]

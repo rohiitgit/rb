@@ -3,7 +3,9 @@
 //! `IMPLEMENTS` edges. Tree-sitter supplies the syntactic role (a call, a type use, an
 //! implementation) and the enclosing definition; SCIP supplies which symbol a name refers to.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 use rb_model::{Evidence, Span};
 use rb_scip::ScipIndex;
@@ -34,6 +36,20 @@ pub(crate) struct Joined {
     /// of that package; sorted by file, then site.
     pub packages: Vec<PackageUse>,
     pub coverage: Coverage,
+    /// References counted `references_external` that are handed back for the cross-project
+    /// join (contract M9c D8′, [`join_handing_back`]); in the order the join met them.
+    pub external: Vec<External>,
+}
+
+/// A reference handed back for the cross-project join (contract M9c D8′): an external
+/// `gomod` symbol of a module another scip-go job's `go.mod` declares. Its source and kind are
+/// those the edge would have had if this index had defined the symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct External {
+    pub src: Source,
+    pub kind: EdgeKind,
+    pub symbol: String,
+    pub at: Evidence,
 }
 
 /// A file's first use of a symbol from a package the index does not define.
@@ -129,8 +145,10 @@ pub(crate) struct Coverage {
     pub occurrences_unconverted: usize,
     /// `is_implementation` relationships that gave no edge because their source or target
     /// symbol has no matched project definition (a local class expression, a field, an
-    /// external type; contract M3b amendment 52). Relationships the direction rule rejects
-    /// (the reverse side of an override) are not dropped: their forward twin is the edge.
+    /// external type; contract M3b amendment 52), or because a method links to an interface
+    /// method its holder satisfies implicitly (contract M9a D3). Relationships the direction
+    /// rule rejects (the reverse side of an override) are not dropped: their forward twin is
+    /// the edge.
     pub relationships_dropped: usize,
     /// The subset of `relationships_dropped` whose source and target are both defined in this
     /// project: each has a definition occurrence in the index's documents (a local one in the
@@ -160,6 +178,11 @@ pub(crate) struct Coverage {
     /// (scip-typescript indexing a link target's sources through the link; contract M6a D7):
     /// ignored, the link target's own job owning its files.
     pub documents_outside_root: usize,
+    /// scip-go only (contract M9d D10): the index's locals typed `invalid type` and all its
+    /// locals, as the decoder counted them ([`rb_scip::ScipIndex::locals`]); a load failure
+    /// scip-go otherwise hides behind exit code 0.
+    pub locals_invalid_type: usize,
+    pub locals: usize,
 }
 
 /// A document with facts: repo path, the document, its facts and its occurrences by span.
@@ -173,7 +196,8 @@ type Doc<'a> = (
 /// Joins `index` (paths relative to `root`) with the facts of the files the project owns, keyed
 /// by repo path, whose heuristic keys are `keys[path]`; `languages` are the ones the indexer
 /// covers ([`indexed_languages`]); `ts_scopes` partitions `files_without_document` by tsconfig
-/// membership without moving any edge (contract M6e S10).
+/// membership without moving any edge (contract M6e S10). Hands nothing back.
+#[cfg(test)]
 pub(crate) fn join(
     index: &ScipIndex,
     root: &str,
@@ -181,6 +205,29 @@ pub(crate) fn join(
     keys: &BTreeMap<&str, Vec<String>>,
     languages: &[Language],
     ts_scopes: &rb_scip::TsScopes,
+) -> Joined {
+    join_handing_back(
+        index,
+        root,
+        files,
+        keys,
+        languages,
+        ts_scopes,
+        &BTreeSet::new(),
+    )
+}
+
+/// [`join`], also handing back each reference counted `references_external` whose symbol
+/// [`hands_back`] to one of `modules`: the `go.mod` module paths of the other ok scip-go jobs
+/// (contract M9c D8′; empty for any other indexer). `references_external` keeps its meaning.
+pub(crate) fn join_handing_back(
+    index: &ScipIndex,
+    root: &str,
+    files: &BTreeMap<&str, (Language, &FileFacts)>,
+    keys: &BTreeMap<&str, Vec<String>>,
+    languages: &[Language],
+    ts_scopes: &rb_scip::TsScopes,
+    modules: &BTreeSet<&str>,
 ) -> Joined {
     let repo_path = |doc: &str| {
         if root.is_empty() {
@@ -190,16 +237,21 @@ pub(crate) fn join(
         }
     };
     let mut out = Joined::default();
+    // What the join reads from each global symbol, parsed once per distinct symbol for the
+    // whole join (contract M9c P7b, M9d E2; see `SymbolMemo`).
+    let memo = SymbolMemo::default();
     // Contract M6a D1, D2: in a scip-java index, each document's Lombok-generated occurrences
     // are removed first, and every check below judges what remains, unchanged. A document
-    // without a marker is used as it is.
+    // without a marker is used as it is. Each distinct symbol is judged once for the whole index
+    // (contract M9d P9b).
+    let mut lombok = rb_scip::symbol::LombokMarkers::default();
     let without_lombok: Vec<Option<(rb_scip::Document, usize)>> = index
         .documents
         .iter()
         .map(|doc| {
             languages
                 .contains(&Language::Java)
-                .then(|| remove_lombok_generated(doc))
+                .then(|| remove_lombok_generated(doc, &mut lombok))
                 .flatten()
         })
         .collect();
@@ -228,7 +280,7 @@ pub(crate) fn join(
         };
         indexed.insert(path.clone());
         let rejected = doc.rejected.or_else(|| {
-            definition_disagreement(facts, &doc.occurrences)
+            definition_disagreement(facts, &doc.occurrences, &memo)
                 .then_some(rb_scip::Rejection::DefinitionDisagreement)
         });
         if let Some(reason) = rejected {
@@ -252,7 +304,7 @@ pub(crate) fn join(
     // definitions anchored to the index's definition occurrences.
     let naming: Vec<Naming<'_>> = docs
         .iter()
-        .map(|(_, doc, facts, by_span)| Naming::new(doc, facts, by_span))
+        .map(|(_, doc, facts, by_span)| Naming::new(doc, facts, by_span, &memo))
         .collect();
     let anchors: Vec<Anchors<'_>> = docs
         .iter()
@@ -331,8 +383,10 @@ pub(crate) fn join(
     // one of them that the index does not define (a file of the project without a document;
     // scip-typescript's `node_modules/.prisma/…` under the project's own package name) is not
     // a dependency.
-    let own_packages: BTreeSet<Option<rb_scip::Package>> =
-        defined.iter().map(|s| rb_scip::package(s)).collect();
+    let own_packages: BTreeSet<Option<rb_scip::Package>> = defined
+        .iter()
+        .map(|s| memo.parts(s).package.clone())
+        .collect();
     out.documented = docs.iter().map(|(path, ..)| path.clone()).collect();
     out.coverage.files_without_document = files
         .iter()
@@ -352,6 +406,9 @@ pub(crate) fn join(
         })
         .count();
     out.coverage.tsconfig_unread = ts_scopes.unread_under(root);
+    // Contract M9d D10: the decoder's counts of the index's locals, for the job's status.
+    out.coverage.locals_invalid_type = index.locals_invalid_type;
+    out.coverage.locals = index.locals;
     let mut locals: Vec<BTreeMap<&str, usize>> = Vec::with_capacity(docs.len());
     for ((path, ..), anchors) in docs.iter().zip(anchors_kept) {
         out.coverage.definitions_total += anchors.total;
@@ -402,13 +459,14 @@ pub(crate) fn join(
         if symbol.starts_with("local ") {
             locals[di].contains_key(symbol)
         } else {
-            let Some(name) = rb_scip::last_descriptor_name(symbol) else {
+            let parts = memo.parts(symbol);
+            let Some(name) = parts.forms.as_ref().map(rb_scip::NameForms::last) else {
                 return false;
             };
             global_sites.get(symbol).is_some_and(|sites| {
                 sites
                     .iter()
-                    .any(|&(dj, l)| name_lines[dj].contains(&(l, name.as_str())))
+                    .any(|&(dj, l)| name_lines[dj].contains(&(l, name)))
             })
         }
     };
@@ -452,7 +510,7 @@ pub(crate) fn join(
             if let Some(symbol) = global {
                 types_by_symbol.entry(symbol).or_default().push((di, i));
             }
-            let declared = declared_supertypes(d, by_span);
+            let declared = declared_supertypes(d, by_span, &memo);
             out.coverage.supertypes_unresolved += declared.iter().filter(|s| s.is_none()).count();
             let declared: Vec<String> = declared.into_iter().flatten().collect();
             // The supertypes the type's own symbol information relates it to, found by its
@@ -524,6 +582,28 @@ pub(crate) fn join(
                 continue;
             };
             let symbol = o.symbol.as_str();
+            // Go has no constructors: a call whose callee is a type (a global type symbol, or a
+            // local one bound to a type definition) converts to it, a reference to the type
+            // (contract M9c amendment 3).
+            let converts = || {
+                symbol.ends_with('#')
+                    || locals[di].get(symbol).is_some_and(|&i| {
+                        matches!(
+                            facts.definitions[i].kind,
+                            rb_syntax::DefKind::Class
+                                | rb_syntax::DefKind::Interface
+                                | rb_syntax::DefKind::Type
+                        )
+                    })
+            };
+            let kind = if kind == EdgeKind::Calls
+                && files[path.as_str()].0 == Language::Go
+                && converts()
+            {
+                EdgeKind::References
+            } else {
+                kind
+            };
             if symbol.starts_with("local ") {
                 // A local symbol bound to a definition of this document (amendment 54) is an
                 // exact target with that definition's heuristic key.
@@ -545,10 +625,21 @@ pub(crate) fn join(
                 continue;
             }
             if !defined.contains(symbol) {
-                if own_packages.contains(&rb_scip::package(symbol)) {
+                if own_packages.contains(&memo.parts(symbol).package) {
                     out.coverage.references_undocumented += 1;
                 } else {
                     out.coverage.references_external += 1;
+                    if hands_back(symbol, modules) {
+                        out.external.push(External {
+                            src: source(r.enclosing),
+                            kind,
+                            symbol: symbol.to_owned(),
+                            at: Evidence {
+                                path: path.clone(),
+                                span: r.span,
+                            },
+                        });
+                    }
                 }
                 continue;
             }
@@ -576,12 +667,20 @@ pub(crate) fn join(
                 if o.symbol.starts_with("local ") || defined.contains(o.symbol.as_str()) {
                     continue;
                 }
-                let package = rb_scip::package(&o.symbol);
-                if own_packages.contains(&package) {
+                let parts = memo.parts(&o.symbol);
+                let package = &parts.package;
+                if own_packages.contains(package) {
                     continue;
                 }
-                if let Some(package) = package {
-                    first.entry(package).or_insert(*span);
+                // Contract M9d D9: another ok scip-go job's module read from the in-repo tree
+                // is joined across projects (D8), not a dependency.
+                if package.as_ref().is_some_and(|p| in_repo_module(p, modules)) {
+                    continue;
+                }
+                if let Some(package) = package
+                    && !first.contains_key(package)
+                {
+                    first.insert(package.clone(), *span);
                 }
             }
         }
@@ -642,14 +741,20 @@ pub(crate) fn join(
                 // supertypes (Go's implicit idiom — nothing to walk), the
                 // target type is an interface by the indexer's own kinds, and
                 // it is anchored. The spec method itself has no node, so the
-                // edge lands on the interface. Anything else takes the walk
-                // below (a spec-to-impl twin lands on a class there and is
-                // rejected as today).
+                // edge lands on the interface, and only a type may start it
+                // (contract M9a D3): a method's link is dropped and counted,
+                // its type's own link gives the type-level edge. Anything else
+                // takes the walk below (a spec-to-impl twin lands on a class
+                // there and is rejected as today).
                 let type_symbol = rb_scip::type_symbol_of(&rel.symbol);
                 let bypass = type_symbol.as_deref().is_some_and(|ts| {
                     symbol_kinds.get(ts).is_some_and(|k| *k == "Interface")
                         && supertypes.get(&holder).is_some_and(Vec::is_empty)
                 });
+                if bypass && !is_type(&facts.definitions[i]) {
+                    dropped(rel);
+                    continue;
+                }
                 let target = if bypass {
                     type_symbol.filter(|ts| nodes.contains(ts.as_str()))
                 } else if target_local {
@@ -726,6 +831,58 @@ pub(crate) fn join(
     out.edges.dedup();
     out.packages.sort();
     out
+}
+
+/// Whether `package` is the module of another ok scip-go job (`modules`, as for [`hands_back`])
+/// at an empty version (contract M9d D9): the type checker read that job's in-repo tree (under
+/// a `go.work`), so the module is no dependency of this one. A real version (`v0.4.3`, from the
+/// module cache) and a module no job declares (a third-party module replaced by a directory
+/// outside every job) stay packages.
+fn in_repo_module(package: &rb_scip::Package, modules: &BTreeSet<&str>) -> bool {
+    let declared = modules.contains(package.name.as_str());
+    package.manager == "go" && package.version.is_empty() && declared
+}
+
+/// Whether an external reference's `symbol` is handed back for the cross-project join
+/// (contract M9c D8′): its manager is `gomod`, its package name is one of `modules`, and it is
+/// not a namespace (`` …`pkg/path`/ ``, an import path or a package qualifier), which names a
+/// package, not a definition.
+fn hands_back(symbol: &str, modules: &BTreeSet<&str>) -> bool {
+    !symbol.ends_with('/')
+        && unversioned(symbol)
+            .is_some_and(|(manager, name, _)| manager == "gomod" && modules.contains(name))
+}
+
+/// The cross-project join's key for a global symbol (contract M9c D8′): `(manager, package
+/// name, descriptors)` as written, the scheme and the version dropped. Within the four fields
+/// before the descriptors a space is escaped as two (SCIP's symbol grammar). `None` for a local
+/// symbol and for a string with fewer fields.
+pub(crate) fn unversioned(symbol: &str) -> Option<(&str, &str, &str)> {
+    if symbol.starts_with("local ") {
+        return None;
+    }
+    let bytes = symbol.as_bytes();
+    let mut at = [0; 4];
+    let (mut found, mut i) = (0, 0);
+    while found < at.len() && i < bytes.len() {
+        if bytes[i] == b' ' {
+            if bytes.get(i + 1) == Some(&b' ') {
+                i += 2;
+                continue;
+            }
+            at[found] = i;
+            found += 1;
+        }
+        i += 1;
+    }
+    if found < at.len() {
+        return None;
+    }
+    Some((
+        &symbol[at[0] + 1..at[1]],
+        &symbol[at[1] + 1..at[2]],
+        &symbol[at[3] + 1..],
+    ))
 }
 
 /// The project definition an accepted document's reference occurrence at `span` names, when the
@@ -809,8 +966,7 @@ impl<'a> Anchors<'a> {
                     .and_then(|os| os.iter().copied().find(|o| accept(o)))
             };
             let global_named = |o: &rb_scip::Occurrence| {
-                is_global_definition(o)
-                    && rb_scip::last_descriptor_name(&o.symbol).as_deref() == Some(d.name.as_str())
+                is_global_definition(o) && naming.memo.last_name_is(&o.symbol, &d.name)
             };
             let local_named = |o: &rb_scip::Occurrence| {
                 is_local_definition(o)
@@ -1055,9 +1211,58 @@ fn definitions_unpaired(facts: &FileFacts, doc: &rb_scip::Document, anchors: &An
         })
 }
 
+/// What one join reads from each global symbol ([`rb_scip::SymbolParts`]: its package, and the
+/// names it may stand at, its last descriptor's name among them), parsed once per distinct
+/// symbol string for the whole join (contract M9c P7b; M9d E2, amendment 4 S2). The `scip`
+/// crate's parser formats its own state once per descriptor (scip 0.10.0,
+/// `accept_one_descriptor`), so a parse costs far more than a lookup, and the join asks about
+/// the same symbols at reference after reference: mattermost's server index has 740,623
+/// occurrences of symbols it does not define, of 10,557 distinct symbols. Every answer is a
+/// function of the symbol string alone, so a kept answer is what a fresh parse would give.
+#[derive(Debug, Default)]
+struct SymbolMemo(RefCell<HashMap<String, Rc<rb_scip::SymbolParts>>>);
+
+impl SymbolMemo {
+    /// The symbol's parts, parsed at its first question only.
+    fn parts(&self, symbol: &str) -> Rc<rb_scip::SymbolParts> {
+        if let Some(parts) = self.0.borrow().get(symbol) {
+            return Rc::clone(parts);
+        }
+        let parts = Rc::new(rb_scip::SymbolParts::of(symbol));
+        self.0
+            .borrow_mut()
+            .insert(symbol.to_owned(), Rc::clone(&parts));
+        parts
+    }
+
+    /// [`rb_scip::may_name`].
+    fn may_name(&self, symbol: &str, text: &str) -> bool {
+        self.parts(symbol)
+            .forms
+            .as_ref()
+            .is_some_and(|f| f.names(text))
+    }
+
+    /// Whether [`rb_scip::last_descriptor_name`] of `symbol` is `name`.
+    fn last_name_is(&self, symbol: &str, name: &str) -> bool {
+        self.parts(symbol)
+            .forms
+            .as_ref()
+            .is_some_and(|f| f.last() == name)
+    }
+
+    /// The distinct symbols read so far.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+}
+
 /// How a document's tokens may be named, beyond [`rb_scip::may_name`] (contract M3b amendments
 /// 59 and 66): each local symbol's name, and each import alias with the symbol it stands for.
 struct Naming<'a> {
+    /// The join's memo of what it reads from each global symbol.
+    memo: &'a SymbolMemo,
     /// A local symbol's `SymbolInformation.display_name` (scip-java), else the text at its
     /// definition occurrence as the decoder read it (`Document::local_names`; scip-typescript
     /// gives no display names).
@@ -1077,6 +1282,7 @@ impl<'a> Naming<'a> {
         doc: &'a rb_scip::Document,
         facts: &'a FileFacts,
         by_span: &BTreeMap<Span, Vec<&'a rb_scip::Occurrence>>,
+        memo: &'a SymbolMemo,
     ) -> Self {
         let mut local_names: BTreeMap<&str, &str> = doc
             .local_names
@@ -1109,6 +1315,7 @@ impl<'a> Naming<'a> {
             }
         }
         Naming {
+            memo,
             local_names,
             default_imports,
             named_imports,
@@ -1132,12 +1339,12 @@ impl<'a> Naming<'a> {
                 None => bound.is_none_or(|name| name == text),
             };
         }
-        rb_scip::may_name(&o.symbol, text)
+        self.memo.may_name(&o.symbol, text)
             || self.default_imports.get(text) == Some(&o.symbol.as_str())
             || self
                 .named_imports
                 .get(text)
-                .is_some_and(|name| rb_scip::may_name(&o.symbol, name))
+                .is_some_and(|name| self.memo.may_name(&o.symbol, name))
     }
 }
 
@@ -1152,7 +1359,11 @@ impl<'a> Naming<'a> {
 /// not disagreements: Java annotation interfaces and their elements, scip-typescript's
 /// `<constructor>` at the `constructor` keyword (measured on the four public repositories:
 /// 52 such occurrences, 0 documents rejected).
-fn definition_disagreement(facts: &FileFacts, occurrences: &[rb_scip::Occurrence]) -> bool {
+fn definition_disagreement(
+    facts: &FileFacts,
+    occurrences: &[rb_scip::Occurrence],
+    memo: &SymbolMemo,
+) -> bool {
     let tokens: BTreeSet<Span> = facts
         .definitions
         .iter()
@@ -1166,10 +1377,11 @@ fn definition_disagreement(facts: &FileFacts, occurrences: &[rb_scip::Occurrence
         if !is_method_or_type_definition(o) {
             return false;
         }
-        let name = rb_scip::last_descriptor_name(&o.symbol);
+        let parts = memo.parts(&o.symbol);
+        let forms = parts.forms.as_ref();
         let accounted = facts.definitions.iter().any(|d| {
-            (d.name_span == o.span && rb_scip::may_name(&o.symbol, &d.name))
-                || (name.as_deref() == Some(d.name.as_str())
+            (d.name_span == o.span && forms.is_some_and(|f| f.names(&d.name)))
+                || (forms.map(rb_scip::NameForms::last) == Some(d.name.as_str())
                     && inside(
                         [d.span[0], d.span[1], d.name_span[0], d.name_span[1]],
                         o.span,
@@ -1214,12 +1426,16 @@ fn leaves_root(path: &str) -> bool {
 /// token, so neither equals a marker span (an annotation, a declarator with its terminator, or
 /// `class … }`); a reference merely inside a marker span (an anonymous class in a field
 /// initializer) is kept. One pass collects the markers into a sorted set and one filters.
-fn remove_lombok_generated(doc: &rb_scip::Document) -> Option<(rb_scip::Document, usize)> {
+/// `lombok` keeps each distinct symbol's answer across the index's documents (contract M9d P9b).
+fn remove_lombok_generated<'a>(
+    doc: &'a rb_scip::Document,
+    lombok: &mut rb_scip::symbol::LombokMarkers<'a>,
+) -> Option<(rb_scip::Document, usize)> {
     rb_frameworks::work::tick(doc.occurrences.len());
     let markers: BTreeSet<Span> = doc
         .occurrences
         .iter()
-        .filter(|o| !o.is_definition() && rb_scip::symbol::is_lombok_generated_marker(&o.symbol))
+        .filter(|o| !o.is_definition() && lombok.is_marker(&o.symbol))
         .map(|o| o.span)
         .collect();
     if markers.is_empty() {
@@ -1298,6 +1514,7 @@ fn is_type(d: &rb_syntax::Definition) -> bool {
 fn declared_supertypes(
     d: &rb_syntax::Definition,
     by_span: &BTreeMap<Span, Vec<&rb_scip::Occurrence>>,
+    memo: &SymbolMemo,
 ) -> Vec<Option<String>> {
     d.supertypes
         .iter()
@@ -1312,9 +1529,7 @@ fn declared_supertypes(
                 .rfind(|o| {
                     !o.is_definition() && !o.symbol.starts_with("local ") && o.symbol.ends_with('#')
                 })
-                .filter(|o| {
-                    rb_scip::last_descriptor_name(&o.symbol).as_deref() == Some(simple_name)
-                })
+                .filter(|o| memo.last_name_is(&o.symbol, simple_name))
                 .map(|o| o.symbol.clone())
         })
         .collect()
@@ -1594,6 +1809,8 @@ mod tests {
                 lombok_removed: 0,
                 documents_lombok: 0,
                 documents_outside_root: 0,
+                locals_invalid_type: 0,
+                locals: 0,
             }
         );
         // The external call names a package (design §5.5), at its site.
@@ -1684,6 +1901,109 @@ mod tests {
                     version: "2.0.0".into(),
                 },
             }]
+        );
+    }
+
+    /// Contract M9d D9 (C8): a scip-go reference into another ok scip-go job's module at an
+    /// empty version (`.`: the type checker read the in-repo tree, under a `go.work`) is no
+    /// package, its namespace occurrence neither: it is joined (D8). The same module at a real
+    /// version (`v0.4.3`, from the module cache) keeps its package, and so does a third-party
+    /// module at `.` (replaced by a directory outside every job). With no module handed back,
+    /// the in-repo reference is a package as before.
+    #[test]
+    fn in_repo_modules_are_not_packages() {
+        const PUB: &str = "example.com/mm/server/public";
+        let src = "package app\n\nfunc Run() {\n\tmodel.NewId()\n\tmodel.Old()\n\tdep.Do()\n}\n";
+        let facts = rb_syntax::extract(Language::Go, src.as_bytes()).unwrap();
+        let path = "server/app/a.go";
+        let at = |token: &str| -> Span {
+            let line = src.lines().position(|l| l.contains(token)).unwrap();
+            let col = src.lines().nth(line).unwrap().find(token).unwrap();
+            let (line, col) = (line as i32, col as i32);
+            [line, col, line, col + token.len() as i32]
+        };
+        let occ = |span: Span, symbol: &str, roles: i32| Occurrence {
+            span,
+            symbol: symbol.into(),
+            roles,
+            enclosing: None,
+        };
+        let qualifier = {
+            let s = at("model.NewId");
+            [s[0], s[1], s[2], s[1] + "model".len() as i32]
+        };
+        let in_repo = |d: &str| format!("scip-go gomod {PUB} . `{PUB}/model`/{d}");
+        let cached = format!("scip-go gomod {PUB} v0.4.3 `{PUB}/model`/Old().");
+        let third_party = "scip-go gomod github.com/acme/dep . `github.com/acme/dep`/Do().";
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "app/a.go".into(),
+                occurrences: vec![
+                    occ(
+                        at("Run"),
+                        "scip-go gomod example.com/mm/server/v8 . `example.com/mm/server/v8/app`/Run().",
+                        1,
+                    ),
+                    // The package qualifier `model`: a namespace of the in-repo module.
+                    occ(qualifier, &in_repo(""), 0),
+                    occ(at("NewId"), &in_repo("NewId()."), 0),
+                    occ(at("Old"), &cached, 0),
+                    occ(at("Do"), third_party, 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files = BTreeMap::from([(path, (Language::Go, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let joined_with = |modules: &BTreeSet<&str>| {
+            join_handing_back(
+                &index,
+                "server",
+                &files,
+                &keys,
+                &[Language::Go],
+                &rb_scip::TsScopes::build([]),
+                modules,
+            )
+        };
+        let package_use = |span: Span, name: &str, version: &str| PackageUse {
+            at: Evidence {
+                path: path.into(),
+                span,
+            },
+            package: rb_scip::Package {
+                manager: "go".into(),
+                name: name.into(),
+                version: version.into(),
+            },
+        };
+        let joined = joined_with(&BTreeSet::from([PUB]));
+        // The positive control: the in-repo reference is seen, and handed back to the join.
+        assert_eq!(
+            joined
+                .external
+                .iter()
+                .map(|e| e.symbol.as_str())
+                .collect::<Vec<_>>(),
+            [in_repo("NewId()."), cached.clone()]
+        );
+        assert_eq!(
+            joined.packages,
+            [
+                package_use(at("Old"), PUB, "v0.4.3"),
+                package_use(at("Do"), "github.com/acme/dep", ""),
+            ]
+        );
+        // No other ok job declares the module: its references are a package, as before D9.
+        assert_eq!(
+            joined_with(&BTreeSet::new()).packages,
+            [
+                package_use(qualifier, PUB, ""),
+                package_use(at("Old"), PUB, "v0.4.3"),
+                package_use(at("Do"), "github.com/acme/dep", ""),
+            ]
         );
     }
 
@@ -3092,11 +3412,12 @@ mod tests {
 
     /// Contract M6d S9: Go's implicit satisfaction needs no declared
     /// heritage — an origin-attested implementation of an interface lands on
-    /// the interface type (the spec method has no node), measured on scip-go
-    /// (is_implementation on the method only, kinds as it reports them). An
-    /// attested link at a struct needs the walk.
+    /// the interface type (the spec method has no node), kinds as scip-go
+    /// reports them. Contract M9a D3 (bench B13): only a type's link makes the
+    /// edge; a method's link to the interface method is dropped and counted.
+    /// An attested link at a struct needs the walk.
     #[test]
-    fn go_implicit_satisfaction_needs_no_declared_heritage() {
+    fn go_implicit_satisfaction_lands_on_the_type_not_the_method() {
         let src = "package main\ntype Payer interface {\n\tPay(amount int) string\n}\ntype Card struct{}\nfunc (c Card) Pay(amount int) string {\n\treturn \"\"\n}\ntype Base struct{}\n";
         let facts = rb_syntax::extract(Language::Go, src.as_bytes()).unwrap();
         let at = |token: &str, n: usize| {
@@ -3123,6 +3444,7 @@ mod tests {
                     path: "main.go".into(),
                     occurrences: vec![
                         def(at("Payer", 0), sym("`example.com/shop`/Payer#")),
+                        def(at("Card", 0), sym("`example.com/shop`/Card#")),
                         def(at("Base", 0), sym("`example.com/shop`/Base#")),
                         def(at("Pay", 2), sym("`example.com/shop`/Card#Pay().")),
                     ],
@@ -3142,14 +3464,22 @@ mod tests {
                 &[Language::Go],
                 &rb_scip::TsScopes::build([]),
             );
-            edge_lines(&joined)
+            let lines = edge_lines(&joined)
                 .into_iter()
                 .filter(|l| l.contains(" Implements "))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (lines, joined.coverage.relationships_dropped)
         };
         let pay = sym("`example.com/shop`/Card#Pay().");
+        let card = sym("`example.com/shop`/Card#");
         let spec = sym("`example.com/shop`/Payer#Pay.");
         let iface = sym("`example.com/shop`/Payer#");
+        let interface = SymbolInfo {
+            symbol: iface.clone(),
+            kind: "Interface".into(),
+            ..Default::default()
+        };
+        // The method's link: no method-to-type edge, one dropped relationship.
         assert_eq!(
             go(vec![
                 SymbolInfo {
@@ -3162,13 +3492,26 @@ mod tests {
                     }],
                     ..Default::default()
                 },
+                interface.clone(),
+            ]),
+            (Vec::new(), 1),
+        );
+        // The struct's own link lands on the interface.
+        assert_eq!(
+            go(vec![
                 SymbolInfo {
-                    symbol: iface.clone(),
-                    kind: "Interface".into(),
+                    symbol: card.clone(),
+                    kind: "Struct".into(),
+                    relationships: vec![Relationship {
+                        symbol: iface.clone(),
+                        is_implementation: true,
+                        ..Default::default()
+                    }],
                     ..Default::default()
                 },
+                interface,
             ]),
-            [format!("{pay} Implements {iface}")],
+            (vec![format!("{card} Implements {iface}")], 0),
         );
         // The same attestation at a struct needs the walk: no edge (the
         // holder declares no supertypes, so the walk fails too — this pins
@@ -3191,8 +3534,114 @@ mod tests {
                     ..Default::default()
                 },
             ])
+            .0
             .is_empty()
         );
+    }
+
+    /// Contract M9c amendment 3 (E5's FALSE verdict): Go has no constructors, so a call whose
+    /// callee is a type (`Kind("a")`, a global type symbol, or a local one bound to a type
+    /// definition) is a conversion: a `REFERENCES` edge to the type, never `CALLS`. A method
+    /// called on the converted value is still a call.
+    #[test]
+    fn go_conversions_to_types_are_references_not_calls() {
+        let src = "package main\ntype Kind string\nfunc (k Kind) Ok() bool {\n\treturn true\n}\nfunc Make() Kind {\n\treturn Kind(\"a\")\n}\nfunc use() {\n\t_ = Kind(\"x\").Ok()\n\t_ = Make()\n}\nfunc loc() {\n\ttype L int\n\t_ = L(1)\n}\n";
+        let facts = rb_syntax::extract(Language::Go, src.as_bytes()).unwrap();
+        let at = |token: &str, n: usize| {
+            let start = src.match_indices(token).nth(n).unwrap().0;
+            let pos = |byte: usize| {
+                let before = &src[..byte];
+                let row = before.matches('\n').count() as i32;
+                let col = (byte - before.rfind('\n').map_or(0, |i| i + 1)) as i32;
+                (row, col)
+            };
+            let (a, b) = (pos(start), pos(start + token.len()));
+            [a.0, a.1, b.0, b.1]
+        };
+        let sym = |s: &str| format!("scip-go gomod example.com/shop . `example.com/shop`/{s}");
+        let occ = |span: Span, symbol: String, roles: i32| Occurrence {
+            span,
+            symbol,
+            roles,
+            enclosing: None,
+        };
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "main.go".into(),
+                occurrences: vec![
+                    occ(at("Kind", 0), sym("Kind#"), 1),
+                    occ(at("Ok", 0), sym("Kind#Ok()."), 1),
+                    occ(at("Make", 0), sym("Make()."), 1),
+                    occ(at("Kind", 3), sym("Kind#"), 0),
+                    occ(at("use", 0), sym("use()."), 1),
+                    occ(at("Kind", 4), sym("Kind#"), 0),
+                    occ(at("Ok", 1), sym("Kind#Ok()."), 0),
+                    occ(at("Make", 1), sym("Make()."), 0),
+                    occ(at("loc", 0), sym("loc()."), 1),
+                    occ(at("L", 0), "local 0".into(), 1),
+                    occ(at("L", 1), "local 0".into(), 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let files = BTreeMap::from([("main.go", (Language::Go, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([("main.go", rb_syntax::symbol_keys("main.go", &facts))]);
+        let joined = join(
+            &index,
+            "",
+            &files,
+            &keys,
+            &[Language::Go],
+            &rb_scip::TsScopes::build([]),
+        );
+        let mut lines: Vec<String> = edge_lines(&joined)
+            .into_iter()
+            .filter(|l| l.contains(" Calls ") || l.contains(" References "))
+            .map(|l| l.replace("scip-go gomod example.com/shop . `example.com/shop`/", ""))
+            .collect();
+        lines.sort();
+        let local = keys["main.go"][facts
+            .definitions
+            .iter()
+            .position(|d| d.name == "L")
+            .unwrap()]
+        .clone();
+        assert_eq!(
+            lines,
+            [
+                "Make(). References Kind#".to_owned(),
+                format!("loc(). References {local}"),
+                "use(). Calls Kind#Ok().".to_owned(),
+                "use(). Calls Make().".to_owned(),
+                "use(). References Kind#".to_owned(),
+            ]
+        );
+        // Only Go (pass 2, N3): a Python call whose callee is a class constructs it, and
+        // stays a call.
+        let src = "class Kind:\n    pass\ndef make():\n    return Kind(\"a\")\n";
+        let facts = rb_syntax::extract(Language::Python, src.as_bytes()).unwrap();
+        let sym = |s: &str| format!("scip-python python shop 0.1 `shop.main`/{s}");
+        let index = ScipIndex {
+            documents: vec![Document {
+                path: "main.py".into(),
+                occurrences: vec![
+                    occ([0, 6, 0, 10], sym("Kind#"), 1),
+                    occ([2, 4, 2, 8], sym("make()."), 1),
+                    occ([3, 11, 3, 15], sym("Kind#"), 0),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let joined = join_facts(Language::Python, &[("main.py".into(), facts)], &index);
+        let lines: Vec<String> = edge_lines(&joined)
+            .into_iter()
+            .filter(|l| l.contains(" Calls ") || l.contains(" References "))
+            .map(|l| l.replace("scip-python python shop 0.1 `shop.main`/", ""))
+            .collect();
+        assert_eq!(lines, ["make(). Calls Kind#"]);
     }
 
     /// The heritage check is hostile-input defense: a holder that declares an
@@ -3477,6 +3926,8 @@ mod tests {
                 lombok_removed: 0,
                 documents_lombok: 0,
                 documents_outside_root: 0,
+                locals_invalid_type: 0,
+                locals: 0,
             }
         );
         let packages: Vec<String> = joined.packages.iter().map(|p| p.package.key()).collect();
@@ -3575,7 +4026,7 @@ mod tests {
                     m
                 });
         assert_eq!(
-            declared_supertypes(impl_def, &by_span),
+            declared_supertypes(impl_def, &by_span, &SymbolMemo::default()),
             [
                 Some(sym("a/Circle#")),
                 Some(sym("p/Repo#")),
@@ -3604,7 +4055,11 @@ mod tests {
                     m
                 });
         assert_eq!(
-            declared_supertypes(&ts_facts.definitions[0], &ts_by_span),
+            declared_supertypes(
+                &ts_facts.definitions[0],
+                &ts_by_span,
+                &SymbolMemo::default()
+            ),
             [Some(ts_sym("NS/Inner#"))]
         );
         let index = ScipIndex {
@@ -6567,8 +7022,19 @@ mod tests {
             ..Default::default()
         };
         rb_frameworks::work::take();
-        let (_, removed) = remove_lombok_generated(&doc).unwrap();
+        let mut lombok = rb_scip::symbol::LombokMarkers::default();
+        let (_, removed) = remove_lombok_generated(&doc, &mut lombok).unwrap();
         assert_eq!(removed, 3 * n);
+        // Contract M9d P9b: one parse per distinct reference symbol, not per occurrence (the
+        // marker occurs n times); since P9c only those holding the Lombok package's bytes.
+        let distinct: BTreeSet<&str> = doc
+            .occurrences
+            .iter()
+            .filter(|o| !o.is_definition() && o.symbol.contains(rb_scip::symbol::LOMBOK_PACKAGE))
+            .map(|o| o.symbol.as_str())
+            .collect();
+        assert_eq!(distinct.len(), 1);
+        assert_eq!(lombok.parses(), distinct.len());
         rb_frameworks::work::take()
     }
 
@@ -6817,5 +7283,117 @@ mod tests {
             BTreeSet::from(["app/src/a.ts".to_owned()])
         );
         assert_eq!(edge_lines(&joined), [format!("{p}a(). Calls {p}b().")]);
+    }
+
+    /// M9c P7b, M9d E2: the join's symbol memo parses each distinct global symbol string once
+    /// and judges every text against what it read, so it answers as `rb_scip::may_name`,
+    /// `rb_scip::last_descriptor_name` and `rb_scip::package` do whatever the order of the
+    /// questions: a symbol asked first at a text it names and then at one it does not (and the
+    /// reverse), a constructor, a local symbol (never parsed) and a string the grammar rejects.
+    #[test]
+    fn the_name_memo_parses_each_symbol_once_and_judges_each_text() {
+        let java = "scip-java maven maven/org.jsoup/jsoup 1.24.1 org/jsoup/";
+        let go = "scip-go gomod github.com/mattermost/mattermost/server/public v0.4.3 ";
+        let init = format!("{java}Jsoup#`<init>`().");
+        let parse = format!("{java}Jsoup#parse().");
+        let new_id = format!("{go}`github.com/mattermost/mattermost/server/public/model`/NewId().");
+        let questions: [(&str, &str); 11] = [
+            (&init, "Jsoup"),
+            (&init, "Other"),
+            (&init, "Jsoup"),
+            (&parse, "other"),
+            (&parse, "parse"),
+            (&new_id, "NewId"),
+            (&new_id, "model"),
+            (&new_id, "NewId"),
+            ("local 3", "m"),
+            ("not a symbol", "not"),
+            ("not a symbol", "not"),
+        ];
+        let memo = SymbolMemo::default();
+        let before = rb_scip::symbol::parses();
+        let answers: Vec<(bool, bool, Option<rb_scip::Package>)> = questions
+            .iter()
+            .map(|(symbol, text)| {
+                (
+                    memo.may_name(symbol, text),
+                    memo.last_name_is(symbol, text),
+                    memo.parts(symbol).package.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rb_scip::symbol::parses() - before,
+            4,
+            "one parse per global symbol"
+        );
+        for ((symbol, text), answer) in questions.iter().zip(answers) {
+            assert_eq!(
+                answer,
+                (
+                    rb_scip::may_name(symbol, text),
+                    rb_scip::last_descriptor_name(symbol).as_deref() == Some(*text),
+                    rb_scip::package(symbol),
+                ),
+                "{symbol} at {text}"
+            );
+        }
+        assert_eq!(memo.len(), 5, "one reading per distinct symbol");
+    }
+
+    /// Contract M9d E2 (amendment 4, S2): the join parses each distinct global symbol string
+    /// once, and that one parse answers every reader: the package (the index's own packages,
+    /// an external reference, the packages pass), the names a reference may stand at, and the
+    /// last descriptor's name (the definition check, a declared supertype, a dropped
+    /// relationship's ends). The index repeats its references (`helper` and `ext` twice each),
+    /// and no implementation link has a matched source, so `type_symbol_of`, which reads
+    /// another thing from a symbol, is never reached.
+    #[test]
+    fn the_join_parses_each_distinct_symbol_once() {
+        let src = "package p;\nclass Animal { void sound() {} }\nclass Dog extends Animal {\n  void sound() { helper(); helper(); ext(); ext(); local(); }\n  void helper() {}\n}\n";
+        let facts = rb_syntax::extract(Language::Java, src.as_bytes()).unwrap();
+        let path = "svc/src/Dog.java";
+        let mut index = index(&facts);
+        // A field's implementation link: its source has no matched definition, so the link is
+        // dropped and its source is looked up by its last descriptor's name (`in_project`).
+        index.documents[0].symbols = vec![SymbolInfo {
+            symbol: "scip-java maven . . p/Dog#name.".into(),
+            relationships: vec![Relationship {
+                symbol: "scip-java maven . . p/Animal#name.".into(),
+                is_implementation: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let files = BTreeMap::from([(path, (Language::Java, &facts))]);
+        let keys: BTreeMap<&str, Vec<String>> =
+            BTreeMap::from([(path, rb_syntax::symbol_keys(path, &facts))]);
+        let before = rb_scip::symbol::parses();
+        let joined = join(
+            &index,
+            "svc",
+            &files,
+            &keys,
+            &[Language::Java],
+            &rb_scip::TsScopes::build([]),
+        );
+        let parses = rb_scip::symbol::parses() - before;
+        // Every reader was asked.
+        assert_eq!(joined.coverage.documents_rejected, 0);
+        assert_eq!(joined.coverage.definitions_matched, 5);
+        assert_eq!(joined.coverage.references_external, 2);
+        assert_eq!(joined.packages.len(), 1);
+        assert_eq!(joined.coverage.relationships_dropped, 1);
+        assert_eq!(
+            edge_lines(&joined),
+            [
+                "scip-java maven . . p/Dog# References scip-java maven . . p/Animal#",
+                "scip-java maven . . p/Dog#sound(). Calls scip-java maven . . p/Dog#helper().",
+                "scip-java maven . . p/Dog#sound(). Calls scip-java maven . . p/Dog#helper().",
+            ]
+        );
+        // The five definitions, `ext` and the field; the link's target is never asked about
+        // (its source is not in the project), and `local 3` is never parsed.
+        assert_eq!(parses, 7, "one parse per distinct symbol the join reads");
     }
 }

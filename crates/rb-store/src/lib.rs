@@ -516,6 +516,17 @@ impl std::fmt::Display for CypherError {
 
 impl std::error::Error for CypherError {}
 
+/// The settings [`Store::cypher`] applies at the start of its transaction: the statement
+/// timeout, no JIT, and the role `rb_reader` (contracts M5 D9, M9d D11). AGE's label tables
+/// are never analysed, so the planner's default row estimates put a few `OPTIONAL MATCH`
+/// joins above `jit_above_cost` on any graph; LLVM then spent 0.3–2 s compiling a query
+/// that runs in 2 ms, inside the statement timeout.
+pub(crate) fn cypher_session(timeout_ms: u64) -> String {
+    format!(
+        "SET LOCAL statement_timeout = {timeout_ms}; SET LOCAL jit = off; SET LOCAL ROLE rb_reader"
+    )
+}
+
 /// Classifies a database error from a Cypher query of `columns` columns; anything that is not
 /// the server's answer (a broken connection) stays as it is.
 fn cypher_error(e: postgres::Error, limits: CypherLimits, columns: usize) -> anyhow::Error {
@@ -1628,10 +1639,7 @@ impl Store {
             age::cypher_sql(&graph, query, columns)?,
             limits.rows + 1
         );
-        tx.batch_execute(&format!(
-            "SET LOCAL statement_timeout = {}; SET LOCAL ROLE rb_reader",
-            limits.timeout_ms
-        ))?;
+        tx.batch_execute(&cypher_session(limits.timeout_ms))?;
         let mut rows = tx
             .query(sql.as_str(), &[])
             .map_err(|e| cypher_error(e, limits, columns.len()))?;

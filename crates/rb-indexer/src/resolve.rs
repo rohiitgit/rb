@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rb_model::{
     Attrs, Certainty, Diagnostic, EdgeKind, Evidence, GraphBuilder, NewEdge, NodeKey, NodeKind,
-    Provenance,
+    Provenance, Span,
 };
-use rb_syntax::{Binding, DefKind, Definition, FileFacts, Language, RefKind};
+use rb_syntax::{Binding, DefKind, Definition, FileFacts, Init, Language, RefKind};
 use serde_json::json;
 
 use crate::modules::{Modules, dir};
@@ -40,7 +40,9 @@ pub(crate) fn add_edges(
             None => NodeKey::new(NodeKind::File, path),
         };
         let (mut calls, mut types, mut external) = (0u64, 0u64, 0u64);
+        let mut forms: BTreeMap<&str, u64> = BTreeMap::new();
         for r in &facts.references {
+            index.forms.borrow_mut().clear();
             let at = Evidence {
                 path: path.to_owned(),
                 span: r.span,
@@ -95,6 +97,10 @@ pub(crate) fn add_edges(
                 }
                 continue;
             }
+            // Each new form the resolved reference used counts once (contract M9c D6).
+            for &form in index.forms.borrow().iter() {
+                *forms.entry(form).or_default() += 1;
+            }
             edges.record_all(source(r.enclosing), &found, index, &at);
         }
         if calls + types + external > 0 {
@@ -108,6 +114,18 @@ pub(crate) fn add_edges(
                     "external": external,
                     "language": language.as_str(),
                 }),
+            });
+        }
+        if !forms.is_empty() {
+            let detail: serde_json::Map<String, serde_json::Value> = TIER_B_FORMS
+                .iter()
+                .map(|&k| ((*k).to_owned(), json!(forms.get(k).copied().unwrap_or(0))))
+                .collect();
+            diagnostics.push(Diagnostic {
+                kind: "tier_b_forms".into(),
+                path: Some(path.to_owned()),
+                span: None,
+                detail: detail.into(),
             });
         }
         index.implements(path, facts, &mut edges);
@@ -246,6 +264,9 @@ pub(crate) struct Index<'a> {
     imports: BTreeMap<&'a str, Vec<Vec<&'a str>>>,
     /// Resolved direct supertypes of a type (memoised; resolving them never needs members).
     supers: RefCell<BTreeMap<Sym<'a>, Vec<Sym<'a>>>>,
+    /// Python: each class's method resolution order once computed, C3's or the fallback
+    /// (contract M9c amendment 3; pass 2, S2: the fallback too, so it is computed once).
+    mros: RefCell<BTreeMap<Sym<'a>, Mro<'a>>>,
     /// Type resolutions in progress. Bindings can make them cyclic (`session =
     /// session.Session()`): a resolution already in progress finds nothing.
     resolving: RefCell<BTreeSet<(&'a str, Option<usize>, String)>>,
@@ -258,7 +279,66 @@ pub(crate) struct Index<'a> {
     /// Top-level definitions by name per Java package and per Go (directory, package), so the
     /// same-package level costs a lookup rather than a scan of the package.
     packages: BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<Sym<'a>>>>,
+    /// Go methods declared in another file than their receiver type (`parent: None`, `receiver:
+    /// Some`), by (the method's package key, receiver type name), then by method name (contract
+    /// M9b D5). They are members of that type and never package-level names.
+    go_methods: GoMethods<'a>,
+    /// Go: call references by the span of their name, per file, so a binding initialised by a
+    /// call finds the reference at its chain's last link (contract M9c D4).
+    call_refs: BTreeMap<&'a str, BTreeMap<Span, usize>>,
+    /// Go: top-level non-member bindings by package key, then by name, with their files
+    /// (contract M9c D4, package vars).
+    package_vars: PackageVars<'a>,
+    /// Go: the embedded member bindings of each struct (contract M9c D4). Never supertypes.
+    embeds: BTreeMap<Sym<'a>, Vec<&'a Binding>>,
+    /// The result types of a Go callable, with the forms resolving them used (memoised).
+    results: RefCell<Memo<'a, Sym<'a>>>,
+    /// The result types of a Go call chain's last link, by (file, chain index) (memoised).
+    chain_results: RefCell<Memo<'a, (&'a str, usize)>>,
+    /// Call chains being resolved, so a chain that needs itself finds nothing.
+    calling: RefCell<BTreeSet<(&'a str, usize)>>,
+    /// The new Tier B forms (contract M9c D6) the reference being resolved has used.
+    forms: RefCell<BTreeSet<&'static str>>,
+    /// Tests: how many times a class's MRO was computed rather than read (pass 2, S2).
+    #[cfg(test)]
+    mro_frames: std::cell::Cell<usize>,
 }
+
+/// [`Index::go_methods`]: (package key, receiver type name) → method name → definitions.
+type GoMethods<'a> = BTreeMap<((&'a str, &'a str), &'a str), BTreeMap<&'a str, Vec<Sym<'a>>>>;
+
+/// [`Index::package_vars`]: package key → name → (file, binding).
+type PackageVars<'a> = BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<(&'a str, &'a Binding)>>>;
+
+/// A Python class's MRO as [`Index::mro_at`] finds it (contract M9c pass 2, S2).
+#[derive(Clone)]
+enum Mro<'a> {
+    /// C3's linearisation, and the height of the hierarchy (its longest chain of bases).
+    C3(Vec<Sym<'a>>, usize),
+    /// C3 gives none: an inconsistent order, a cycle, or more than [`MAX_INHERITANCE_DEPTH`]
+    /// levels. The fallback order once a lookup of the class itself has needed it.
+    Fallback(Option<Vec<Sym<'a>>>),
+    /// The walk reached the depth cap below: true of the lookup, not of the class.
+    Cut,
+}
+
+/// Memoised types, with the [`TIER_B_FORMS`] their resolution used, replayed on a hit.
+type Memo<'a, K> = BTreeMap<K, (Vec<Sym<'a>>, BTreeSet<&'static str>)>;
+
+/// The keys of the `tier_b_forms` diagnostic (contract M9c D6).
+const TIER_B_FORMS: [&str; 11] = [
+    "return_type",
+    "call_segment",
+    "type_alias",
+    "embedded",
+    "package_var",
+    "default_import",
+    "super_call",
+    "star_import",
+    "reexport",
+    "module_variable",
+    "inherited_init",
+];
 
 /// The declarations of one name in one file, sorted by the start of their extent. Extents are
 /// nested or disjoint (scopes are), so `parent` links each declaration to the nearest enclosing
@@ -325,7 +405,7 @@ pub(crate) enum TypeLevel {
 
 /// The package a file's same-package level searches: `("", package)` for Java, `(dir, package)`
 /// for Go (a directory may also hold an external `_test` package).
-fn package_key<'a>(
+pub(crate) fn package_key<'a>(
     path: &'a str,
     language: Language,
     facts: &'a FileFacts,
@@ -376,6 +456,141 @@ fn is_callable(kind: DefKind) -> bool {
     matches!(kind, DefKind::Function | DefKind::Method | DefKind::Class)
 }
 
+/// `s` split at each `sep` outside brackets and string or rune literals, each part trimmed
+/// (contract M9c D4): `a.Keep(cfg.Size(x.y)).Run` at `.` is `a`, `Keep(cfg.Size(x.y))`, `Run`.
+fn split_top(s: &str, sep: u8) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let (mut out, mut depth, mut start, mut i) = (Vec::new(), 0usize, 0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'"' | b'\'' | b'`' => i = literal_end(bytes, i),
+            c if c == sep && depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(s[start.min(s.len())..].trim());
+    out
+}
+
+/// A Go qualifier's segments (contract M9c D4): split at `.` at bracket depth 0.
+fn split_qualifier(q: &str) -> Vec<&str> {
+    split_top(q, b'.')
+}
+
+/// The index of the quote closing the literal opened at `open` (`"…"` and `'…'` with escapes,
+/// a raw `` `…` `` without), or the length when it never closes.
+fn literal_end(bytes: &[u8], open: usize) -> usize {
+    let quote = bytes[open];
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if quote != b'`' => i += 1,
+            c if c == quote => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// The callee of a Go call segment `name(…)`: an identifier and one argument list that closes
+/// the segment; `None` for any other segment (`m[k]`, `f(a)(b)`, `(T)`, `F[T](x)`).
+fn call_segment(seg: &str) -> Option<&str> {
+    let open = seg.find('(')?;
+    let name = &seg[..open];
+    if !is_identifier(name) {
+        return None;
+    }
+    let bytes = seg.as_bytes();
+    let (mut depth, mut i) = (0usize, open);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return (i == bytes.len() - 1).then_some(name);
+                }
+            }
+            b'"' | b'\'' | b'`' => i = literal_end(bytes, i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// An ASCII identifier (Go names outside ASCII are left unresolved).
+fn is_identifier(s: &str) -> bool {
+    s.bytes().next().is_some_and(|c| !c.is_ascii_digit())
+        && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+/// The type a Go result names when it is usable (contract M9c D4): one named type, or the first
+/// of a list of two whose second is `error`, `*` stripped; `None` for anything else (`(T, U)`,
+/// three results, named results, `[]T`).
+fn go_result_type(result: &str) -> Option<&str> {
+    let result = result.trim();
+    let one = match result.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        Some(list) => match split_top(list, b',').as_slice() {
+            [one] => *one,
+            [first, "error"] => *first,
+            _ => return None,
+        },
+        None => result,
+    };
+    go_named_type(one)
+}
+
+/// A named Go type as written, `*` and type arguments stripped (`*store.Store[T]` is
+/// `store.Store`); `None` for any other type (`[]T`, `map[K]V`, `func()`, `struct{}`).
+fn go_named_type(t: &str) -> Option<&str> {
+    let t = t.trim().trim_start_matches('*').trim_start();
+    let t = match t.find('[') {
+        Some(i) if i > 0 && t.ends_with(']') => &t[..i],
+        Some(_) => return None,
+        None => t,
+    };
+    let named = match t.split_once('.') {
+        Some((package, name)) => is_identifier(package) && is_identifier(name),
+        None => is_identifier(t),
+    };
+    named.then_some(t)
+}
+
+/// Where a Python top-level name comes from: (module, the name there, reached through a star
+/// import).
+type Owner<'a> = (&'a str, String, bool);
+
+/// C3's merge (contract M9c amendment 3, E2): `head`, then repeatedly the first head of `seqs`
+/// that is in no sequence's tail, taken off every sequence it heads; `None` when no head
+/// qualifies (an inconsistent hierarchy).
+fn c3_merge<T: Copy + PartialEq>(head: T, mut seqs: Vec<Vec<T>>) -> Option<Vec<T>> {
+    let mut out = vec![head];
+    loop {
+        seqs.retain(|s| !s.is_empty());
+        if seqs.is_empty() {
+            return Some(out);
+        }
+        let next = seqs
+            .iter()
+            .map(|s| s[0])
+            .find(|h| !seqs.iter().any(|s| s[1..].contains(h)))?;
+        out.push(next);
+        for s in &mut seqs {
+            if s[0] == next {
+                s.remove(0);
+            }
+        }
+    }
+}
+
 impl<'a> Index<'a> {
     /// Exact manifest resolution for bare specifiers (contract M6c S4).
     /// Default (no manifests) resolves nothing, as before.
@@ -414,7 +629,35 @@ impl<'a> Index<'a> {
         let mut defs_by_name: BTreeMap<&str, BTreeMap<&str, Vec<usize>>> = BTreeMap::new();
         let mut fields: BTreeMap<&str, BTreeMap<(usize, &str), Vec<&Binding>>> = BTreeMap::new();
         let mut packages: BTreeMap<(&str, &str), BTreeMap<&str, Vec<Sym>>> = BTreeMap::new();
+        let mut go_methods: GoMethods = BTreeMap::new();
+        let mut call_refs: BTreeMap<&str, BTreeMap<Span, usize>> = BTreeMap::new();
+        let mut package_vars: PackageVars = BTreeMap::new();
+        let mut embeds: BTreeMap<Sym, Vec<&Binding>> = BTreeMap::new();
         for (&path, (language, facts)) in files {
+            if *language == Language::Go {
+                let refs = call_refs.entry(path).or_default();
+                for (i, r) in facts.references.iter().enumerate() {
+                    if r.kind == RefKind::Call {
+                        refs.insert(r.span, i);
+                    }
+                }
+                for b in facts.bindings.iter().filter(|b| b.member && b.embedded) {
+                    if let Some(t) = b.scope {
+                        embeds.entry((path, t)).or_default().push(b);
+                    }
+                }
+                if let Some(key) = package_key(path, *language, facts) {
+                    let vars = package_vars.entry(key).or_default();
+                    // A top-level function type's parameters (`var cb func(c *Ctx)`) are no vars.
+                    for b in facts
+                        .bindings
+                        .iter()
+                        .filter(|b| !b.member && b.scope.is_none() && b.parameter.is_none())
+                    {
+                        vars.entry(b.name.as_str()).or_default().push((path, b));
+                    }
+                }
+            }
             let (l, f) = (
                 raw_locals.entry(path).or_default(),
                 fields.entry(path).or_default(),
@@ -446,14 +689,27 @@ impl<'a> Index<'a> {
                     .enumerate()
                     .filter(|(_, d)| d.parent.is_none())
                 {
-                    table.entry(d.name.as_str()).or_default().push((path, i));
+                    if let Some(receiver) = d.receiver.as_deref() {
+                        go_methods
+                            .entry((key, receiver))
+                            .or_default()
+                            .entry(d.name.as_str())
+                            .or_default()
+                            .push((path, i));
+                    }
+                    // A method of a type declared in another file is no package-level name.
+                    if d.receiver.is_none() {
+                        table.entry(d.name.as_str()).or_default().push((path, i));
+                    }
                 }
             }
             let mut sc = Scopes::default();
             for (i, d) in facts.definitions.iter().enumerate() {
-                let table = match d.parent {
-                    Some(p) => sc.of.entry(p).or_default(),
-                    None => &mut sc.top,
+                let table = match (d.parent, &d.receiver) {
+                    (Some(p), _) => sc.of.entry(p).or_default(),
+                    // A method of a type declared in another file is no top-level name.
+                    (None, Some(_)) => continue,
+                    (None, None) => &mut sc.top,
                 };
                 table.entry(d.name.as_str()).or_default().push(i);
             }
@@ -467,6 +723,7 @@ impl<'a> Index<'a> {
             scopes,
             imports,
             supers: RefCell::new(BTreeMap::new()),
+            mros: RefCell::new(BTreeMap::new()),
             resolving: RefCell::new(BTreeSet::new()),
             defs_by_name,
             locals: raw_locals
@@ -481,6 +738,16 @@ impl<'a> Index<'a> {
                 .collect(),
             fields,
             packages,
+            go_methods,
+            call_refs,
+            package_vars,
+            embeds,
+            results: RefCell::new(BTreeMap::new()),
+            chain_results: RefCell::new(BTreeMap::new()),
+            calling: RefCell::new(BTreeSet::new()),
+            forms: RefCell::new(BTreeSet::new()),
+            #[cfg(test)]
+            mro_frames: std::cell::Cell::new(0),
         }
     }
 
@@ -702,7 +969,27 @@ impl<'a> Index<'a> {
                 return Vec::new();
             }
         }
-        let found = dedup(self.resolve_type_unguarded(path, scope, name));
+        let found = self.resolve_type_unguarded(path, scope, name);
+        // Go `type A = B` stands for what `B` names in the alias's file (contract M9c D4),
+        // resolved while this name is still in progress, so `A = B; B = A` finds nothing.
+        let found = dedup(
+            found
+                .into_iter()
+                .flat_map(|t| {
+                    let def = self.def(t);
+                    let Some(target) = def.alias_of.as_deref() else {
+                        return vec![t];
+                    };
+                    let types = go_named_type(target)
+                        .map(|n| self.resolve_type(t.0, def.parent, n))
+                        .unwrap_or_default();
+                    if !types.is_empty() {
+                        self.note("type_alias");
+                    }
+                    types
+                })
+                .collect(),
+        );
         self.resolving.borrow_mut().remove(&key);
         found
     }
@@ -775,17 +1062,25 @@ impl<'a> Index<'a> {
                 return (found, TypeLevel::Local);
             }
         }
-        let found = self.named(path, None, name, want);
-        if !found.is_empty() {
-            return (found, TypeLevel::Local);
+        // Python: the module-level statement that binds the name last (contract M9c D5,
+        // amendment 3).
+        if language == Language::Python {
+            if let Some(hit) = self.python_module_level(path, name, want) {
+                return hit;
+            }
+        } else {
+            let found = self.named(path, None, name, want);
+            if !found.is_empty() {
+                return (found, TypeLevel::Local);
+            }
+            // Java (JLS §6.4.1): single-type imports shadow the package, which shadows
+            // on-demand (wildcard) imports. Elsewhere imports come before the package.
+            let found = self.imported(path, name, want, false);
+            if !found.is_empty() {
+                return (found, TypeLevel::Import);
+            }
         }
-        // Java (JLS §6.4.1): single-type imports shadow the package, which shadows on-demand
-        // (wildcard) imports. Elsewhere imports come before the package.
-        let found = self.imported(path, name, want, false);
-        if !found.is_empty() {
-            return (found, TypeLevel::Import);
-        }
-        if self.language(path) == Language::Java {
+        if language == Language::Java {
             let found = self.same_package(path, name, want);
             if !found.is_empty() {
                 return (found, TypeLevel::SamePackage);
@@ -905,17 +1200,103 @@ impl<'a> Index<'a> {
                     }));
                 }
                 _ => {
-                    for n in import
-                        .names
-                        .iter()
-                        .filter(|n| n.local == name && n.name != "default")
-                    {
-                        out.extend(top(&n.name));
+                    for n in import.names.iter().filter(|n| n.local == name) {
+                        if n.name != "default" {
+                            out.extend(top(&n.name));
+                        } else if matches!(
+                            language,
+                            Language::TypeScript | Language::Tsx | Language::JavaScript
+                        ) {
+                            // `import x from './m'` names what `m`'s `export default` names
+                            // (contract M9c D2); a target without one gives nothing.
+                            for &f in targets {
+                                if let Some(exported) = self.facts(f).default_export.as_deref() {
+                                    let found = self.named(f, None, exported, want);
+                                    if !found.is_empty() {
+                                        self.note("default_import");
+                                    }
+                                    out.extend(found);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         out
+    }
+
+    /// Python `name` at module level in `path` (contract M9c D5, amendment 3, E2): of the
+    /// file's own top-level definitions of the name, each named import of it and each star
+    /// import that brings it, the statement that starts last wins, as Python rebinds the name
+    /// in source order. Only candidates that resolve compete; the winner's forms are counted.
+    fn python_module_level(
+        &self,
+        path: &'a str,
+        name: &str,
+        want: fn(DefKind) -> bool,
+    ) -> Option<(Vec<Sym<'a>>, TypeLevel)> {
+        type Candidate<'a> = ((i32, i32), Vec<Sym<'a>>, TypeLevel, BTreeSet<&'static str>);
+        let mut best: Option<Candidate<'a>> = None;
+        let mut offer = |start: (i32, i32), found: Vec<Sym<'a>>, level, forms| {
+            if !found.is_empty() && best.as_ref().is_none_or(|(s, ..)| start > *s) {
+                best = Some((start, found, level, forms));
+            }
+        };
+        let own = self.named(path, None, name, want);
+        if let Some(start) = own
+            .iter()
+            .map(|&s| (self.def(s).span[0], self.def(s).span[1]))
+            .max()
+        {
+            offer(start, own, TypeLevel::Local, BTreeSet::new());
+        }
+        for (import, targets) in self.facts(path).imports.iter().zip(&self.imports[path]) {
+            let outer = self.forms.take();
+            let found = self.python_import_brings(import, targets, name, want);
+            let forms = self.forms.replace(outer);
+            let level = if import.wildcard {
+                TypeLevel::ImportOnDemand
+            } else {
+                TypeLevel::Import
+            };
+            offer((import.span[0], import.span[1]), found, level, forms);
+        }
+        let (_, found, level, forms) = best?;
+        self.forms.borrow_mut().extend(forms);
+        Some((found, level))
+    }
+
+    /// What one Python import statement binds `name` to (contract M9c D5): a named import of
+    /// it, followed through the target's re-exports; `from m import *` brings `m`'s top-level
+    /// names not starting with `_`, unless `m` lists its own in `__all__`.
+    fn python_import_brings(
+        &self,
+        import: &rb_syntax::Import,
+        targets: &[&'a str],
+        name: &str,
+        want: fn(DefKind) -> bool,
+    ) -> Vec<Sym<'a>> {
+        if import.wildcard {
+            if name.starts_with('_') {
+                return Vec::new();
+            }
+            return targets
+                .iter()
+                .filter(|&&f| !self.defines_all(f))
+                .flat_map(|&f| self.python_exported(f, name, want, true))
+                .collect();
+        }
+        import
+            .names
+            .iter()
+            .filter(|n| n.local == name)
+            .flat_map(|n| {
+                targets
+                    .iter()
+                    .flat_map(|&f| self.python_exported(f, &n.name, want, false))
+            })
+            .collect()
     }
 
     fn same_package(&self, path: &'a str, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
@@ -960,20 +1341,42 @@ impl<'a> Index<'a> {
 
     /// Members named `name` of `t`, else of its nearest supertypes that have one (breadth-first,
     /// each type once, at most [`MAX_INHERITANCE_DEPTH`] levels).
+    /// Go has no supertypes: the next levels are the embedded types (contract M9c D4), and a
+    /// tie at one depth gives every candidate. Python walks the class's MRO instead, the first
+    /// class that has one winning (contract M9c amendment 3, E2).
     fn members(&self, t: Sym<'a>, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
+        if self.language(t.0) == Language::Python {
+            return self
+                .python_mro(t)
+                .into_iter()
+                .map(|c| self.named(c.0, Some(c.1), name, want))
+                .find(|own| !own.is_empty())
+                .unwrap_or_default();
+        }
         let mut seen = BTreeSet::from([t]);
         let mut level = vec![t];
-        for _ in 0..MAX_INHERITANCE_DEPTH {
+        for depth in 0..MAX_INHERITANCE_DEPTH {
             let found: Vec<Sym<'a>> = level
                 .iter()
-                .flat_map(|&c| self.named(c.0, Some(c.1), name, want))
+                .flat_map(|&c| {
+                    let mut own = self.named(c.0, Some(c.1), name, want);
+                    own.extend(self.go_methods_of(c, name, want));
+                    own
+                })
                 .collect();
             if !found.is_empty() {
+                if depth > 0 && self.language(t.0) == Language::Go {
+                    self.note("embedded");
+                }
                 return found;
             }
             level = level
                 .iter()
-                .flat_map(|&c| self.supertypes(c))
+                .flat_map(|&c| {
+                    let mut next = self.supertypes(c);
+                    next.extend(self.embedded_types(c));
+                    next
+                })
                 .filter(|s| seen.insert(*s))
                 .collect();
             if level.is_empty() {
@@ -981,6 +1384,28 @@ impl<'a> Index<'a> {
             }
         }
         Vec::new()
+    }
+
+    /// The methods named `name` that Go files declare for the top-level type `t` outside its own
+    /// file (contract M9b D5): looked up by the package of `t`'s file, so a same-named type of
+    /// another directory, or of the external `_test` package beside it, gets none of them.
+    fn go_methods_of(&self, t: Sym<'a>, name: &str, want: fn(DefKind) -> bool) -> Vec<Sym<'a>> {
+        let (language, facts) = self.files[t.0];
+        let def = self.def(t);
+        if language != Language::Go || def.parent.is_some() {
+            return Vec::new();
+        }
+        let Some(key) = package_key(t.0, language, facts) else {
+            return Vec::new();
+        };
+        self.go_methods
+            .get(&(key, def.name.as_str()))
+            .and_then(|methods| methods.get(name))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&s| want(self.def(s).kind))
+            .collect()
     }
 
     /// The resolved direct supertypes of `t` (all candidates of each name).
@@ -997,6 +1422,407 @@ impl<'a> Index<'a> {
             .collect();
         self.supers.borrow_mut().insert(t, found.clone());
         found
+    }
+
+    /// Python's method resolution order of `class`, `class` first (contract M9c amendment 3,
+    /// E2): the C3 linearisation over its resolved bases, in the order written (a base that
+    /// resolves to several classes contributes each). A hierarchy C3 cannot merge (Python
+    /// refuses to create the class), a cycle, or one deeper than [`MAX_INHERITANCE_DEPTH`]
+    /// falls back to left-first depth-first order, each class once. Either is a function of
+    /// the class alone, computed once per class (pass 2, S2).
+    fn python_mro(&self, class: Sym<'a>) -> Vec<Sym<'a>> {
+        if let Some(Mro::Fallback(Some(order))) = self.mros.borrow().get(&class) {
+            return order.clone();
+        }
+        if let Mro::C3(order, _) = self.mro_at(class, 0, &mut BTreeSet::new()) {
+            return order;
+        }
+        let mut order = Vec::new();
+        self.depth_first(class, 0, &mut BTreeSet::new(), &mut order);
+        let known = Mro::Fallback(Some(order.clone()));
+        self.mros.borrow_mut().insert(class, known);
+        order
+    }
+
+    /// The MRO of `c`, `depth` levels below the class looked up. C3 and the fallback are
+    /// memoised, since they depend on `c` alone: C3 needs every base's C3, a merge, and a
+    /// height within [`MAX_INHERITANCE_DEPTH`]. A fallback base does not stop the walk, so it
+    /// reaches the same classes in the same order as before (pass 2, S2). Reaching the cap
+    /// (`Cut`) says only that the class looked up is too deep: it is not memoised and ends the
+    /// walk, so one lookup computes at most one chain of classes it cut.
+    fn mro_at(&self, c: Sym<'a>, depth: usize, visiting: &mut BTreeSet<Sym<'a>>) -> Mro<'a> {
+        if let Some(known) = self.mros.borrow().get(&c) {
+            return known.clone();
+        }
+        let bases = self.supertypes(c);
+        if bases.is_empty() {
+            return Mro::C3(vec![c], 0);
+        }
+        if depth >= MAX_INHERITANCE_DEPTH {
+            return Mro::Cut;
+        }
+        if !visiting.insert(c) {
+            // On the walk's own path: a cycle, which has no C3 for any class on it.
+            return Mro::Fallback(None);
+        }
+        #[cfg(test)]
+        self.mro_frames.set(self.mro_frames.get() + 1);
+        let (mut seqs, mut height, mut c3) = (Vec::new(), 0, true);
+        for &b in &bases {
+            match self.mro_at(b, depth + 1, visiting) {
+                Mro::C3(order, h) => {
+                    height = height.max(h + 1);
+                    seqs.push(order);
+                }
+                Mro::Fallback(_) => c3 = false,
+                Mro::Cut if depth > 0 => {
+                    visiting.remove(&c);
+                    return Mro::Cut;
+                }
+                // At the top, a cut below means more levels than the cap.
+                Mro::Cut => {
+                    c3 = false;
+                    break;
+                }
+            }
+        }
+        visiting.remove(&c);
+        seqs.push(bases);
+        let mro = match c3_merge(c, seqs) {
+            Some(order) if c3 && height <= MAX_INHERITANCE_DEPTH => Mro::C3(order, height),
+            _ => Mro::Fallback(None),
+        };
+        self.mros.borrow_mut().insert(c, mro.clone());
+        mro
+    }
+
+    /// `c` and its supertypes, left-first depth-first, each once (the MRO's fallback).
+    fn depth_first(
+        &self,
+        c: Sym<'a>,
+        depth: usize,
+        seen: &mut BTreeSet<Sym<'a>>,
+        out: &mut Vec<Sym<'a>>,
+    ) {
+        if depth > MAX_INHERITANCE_DEPTH || !seen.insert(c) {
+            return;
+        }
+        out.push(c);
+        for b in self.supertypes(c) {
+            self.depth_first(b, depth + 1, seen, out);
+        }
+    }
+
+    /// Records that the reference being resolved used `form` (contract M9c D6).
+    fn note(&self, form: &'static str) {
+        debug_assert!(TIER_B_FORMS.contains(&form), "{form}");
+        self.forms.borrow_mut().insert(form);
+    }
+
+    /// `compute`'s types, memoised in `memo` under `key` with the forms it used, which a hit
+    /// records again, so a memoised resolution counts its forms like a fresh one.
+    fn memoised<K: Ord + Copy>(
+        &self,
+        memo: &RefCell<Memo<'a, K>>,
+        key: K,
+        compute: impl FnOnce() -> Vec<Sym<'a>>,
+    ) -> Vec<Sym<'a>> {
+        let hit = memo.borrow().get(&key).cloned();
+        if let Some((types, forms)) = hit {
+            self.forms.borrow_mut().extend(forms);
+            return types;
+        }
+        let outer = self.forms.take();
+        let types = compute();
+        let used = self.forms.replace(outer);
+        self.forms.borrow_mut().extend(used.iter().copied());
+        memo.borrow_mut().insert(key, (types.clone(), used));
+        types
+    }
+
+    /// The types Go struct `t` embeds (contract M9c D4): never supertypes, never `IMPLEMENTS`.
+    fn embedded_types(&self, t: Sym<'a>) -> Vec<Sym<'a>> {
+        self.embeds
+            .get(&t)
+            .into_iter()
+            .flatten()
+            .filter(|b| !b.type_name.is_empty())
+            .flat_map(|b| self.resolve_type(t.0, b.scope, &b.type_name))
+            .collect()
+    }
+
+    /// The types a binding of `path` stands for: its declared type, else (Go) the result type of
+    /// the call that initialises it (contract M9c D4). A Go parameter or local declared with one
+    /// of its function's type parameters (a method's: those its receiver names) has none, even
+    /// beside a package type of that name (pass 2, N1).
+    fn binding_types(&self, path: &'a str, b: &'a Binding) -> Vec<Sym<'a>> {
+        if !b.type_name.is_empty() {
+            let type_param = b.scope.is_some_and(|s| {
+                self.facts(path).definitions[s]
+                    .type_params
+                    .contains(&b.type_name)
+            });
+            if type_param && self.language(path) == Language::Go {
+                return Vec::new();
+            }
+            return self.resolve_type(path, b.scope, &b.type_name);
+        }
+        let Some(Init::Call { chain }) = b.init else {
+            return Vec::new();
+        };
+        if self.language(path) != Language::Go {
+            return Vec::new();
+        }
+        let types = self.memoised(&self.chain_results, (path, chain), || {
+            self.chain_result(path, chain)
+        });
+        if !types.is_empty() {
+            self.note("return_type");
+        }
+        types
+    }
+
+    /// The result types of the callables the reference at chain `chain`'s last link resolves to.
+    fn chain_result(&self, path: &'a str, chain: usize) -> Vec<Sym<'a>> {
+        let facts = self.facts(path);
+        let Some(link) = facts.chains.get(chain).and_then(|c| c.links.last()) else {
+            return Vec::new();
+        };
+        let Some(&i) = self
+            .call_refs
+            .get(path)
+            .and_then(|refs| refs.get(&link.span))
+        else {
+            return Vec::new();
+        };
+        {
+            let mut calling = self.calling.borrow_mut();
+            if calling.len() >= MAX_TYPE_DEPTH || !calling.insert((path, chain)) {
+                return Vec::new();
+            }
+        }
+        let r = &facts.references[i];
+        let callees = self.call(
+            path,
+            r.enclosing,
+            &r.name,
+            r.qualifier.as_deref(),
+            Some(r.span),
+        );
+        self.calling.borrow_mut().remove(&(path, chain));
+        self.results_of(callees)
+    }
+
+    /// The result types of the functions and methods among `callees`.
+    fn results_of(&self, callees: impl IntoIterator<Item = (EdgeKind, Sym<'a>)>) -> Vec<Sym<'a>> {
+        dedup(
+            callees
+                .into_iter()
+                .filter(|&(kind, s)| {
+                    kind == EdgeKind::Calls
+                        && matches!(self.def(s).kind, DefKind::Function | DefKind::Method)
+                })
+                .flat_map(|(_, s)| self.result_types(s))
+                .collect(),
+        )
+    }
+
+    /// The type a Go callable returns (contract M9c D4): one named type, or the first of two
+    /// results whose second is `error`, resolved in the callable's file. A result named by one
+    /// of the callable's type parameters is none (amendment 3, E1). Memoised.
+    fn result_types(&self, s: Sym<'a>) -> Vec<Sym<'a>> {
+        self.memoised(&self.results, s, || {
+            let def = self.def(s);
+            def.return_type
+                .as_deref()
+                .and_then(go_result_type)
+                .filter(|t| !def.type_params.iter().any(|p| p == t))
+                .map(|t| self.resolve_type(s.0, def.parent, t))
+                .unwrap_or_default()
+        })
+    }
+
+    /// The package-level var `name` of `path`'s Go package (contract M9c D4): the package must
+    /// declare the name exactly once, of any kind, as a var with a type, and a non-test file
+    /// never sees a test file's var.
+    fn package_var(&self, path: &'a str, name: &str) -> Option<(&'a str, &'a Binding)> {
+        let (language, facts) = self.files[path];
+        if language != Language::Go {
+            return None;
+        }
+        let key = package_key(path, language, facts)?;
+        let vars = self.package_vars.get(&key)?.get(name)?;
+        let defs = self
+            .packages
+            .get(&key)
+            .and_then(|table| table.get(name))
+            .map_or(0, Vec::len);
+        let [(file, b)] = vars.as_slice() else {
+            return None;
+        };
+        let hidden = file.ends_with("_test.go") && !path.ends_with("_test.go");
+        (defs == 0 && !b.type_name.is_empty() && !hidden).then_some((*file, *b))
+    }
+
+    /// Python imports followed from a module to where a name is defined (contract M9c D5).
+    const MAX_REEXPORT_DEPTH: usize = 8;
+
+    /// The top-level, non-member bindings of `name` in `f`. A Python module-level `x = …` is
+    /// also a top-level `constant` definition, which is the binding's scope.
+    fn top_bindings(&self, f: &str, name: &str) -> Vec<&'a Binding> {
+        let defs = &self.facts(f).definitions;
+        self.locals
+            .get(f)
+            .and_then(|l| l.get(name))
+            .into_iter()
+            .flat_map(|l| l.bindings.iter().copied())
+            .filter(|b| {
+                b.scope.is_none_or(|d| {
+                    let d = &defs[d];
+                    d.parent.is_none() && d.kind == DefKind::Constant && d.name == name
+                })
+            })
+            .collect()
+    }
+
+    /// Whether Python module `f` lists its public names in a top-level `__all__`, which a star
+    /// import then skips (contract M9c D5: the list itself is not read). A module-level
+    /// `__all__ = …` is both a constant definition and a binding, so the binding decides; a
+    /// `def` or `class __all__` would make the star import itself fail (amendment 3, E3: e5).
+    fn defines_all(&self, f: &str) -> bool {
+        !self.top_bindings(f, "__all__").is_empty()
+    }
+
+    /// Where the top-level name `name` of Python module `f` comes from (contract M9c D5): of
+    /// `f`'s own top-level definition or binding of the name, its named imports of it and its
+    /// star imports, the last statement that leads somewhere (amendment 3), followed at most
+    /// [`Self::MAX_REEXPORT_DEPTH`] imports deep, each (module, name) once along a path. As
+    /// (module, the name there, reached through a star import).
+    fn owners(&self, f: &'a str, name: &str) -> Vec<(&'a str, String, bool)> {
+        let mut out = Vec::new();
+        self.owners_from(f, name, 0, false, &mut BTreeSet::new(), &mut out);
+        out
+    }
+
+    fn owners_from(
+        &self,
+        f: &'a str,
+        name: &str,
+        depth: usize,
+        star: bool,
+        seen: &mut BTreeSet<(&'a str, String)>,
+        out: &mut Vec<(&'a str, String, bool)>,
+    ) {
+        if !seen.insert((f, name.to_owned())) {
+            return;
+        }
+        // Of `f`'s own top-level definitions and bindings of the name, its named imports of it
+        // and its star imports that lead somewhere, the statement that starts last wins
+        // (amendment 3, E2).
+        let defs = &self.facts(f).definitions;
+        let own = self.scopes[f]
+            .top
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|&d| defs[d].span)
+            .chain(self.top_bindings(f, name).into_iter().map(|b| b.span))
+            .map(|s| (s[0], s[1]))
+            .max();
+        let mut best: Option<((i32, i32), Vec<Owner<'a>>)> =
+            own.map(|start| (start, vec![(f, name.to_owned(), star)]));
+        if depth < Self::MAX_REEXPORT_DEPTH {
+            for (import, targets) in self.facts(f).imports.iter().zip(&self.imports[f]) {
+                let start = (import.span[0], import.span[1]);
+                if best.as_ref().is_some_and(|(s, _)| start <= *s) {
+                    continue;
+                }
+                let mut found = Vec::new();
+                if import.wildcard {
+                    if !name.starts_with('_') {
+                        for &t in targets.iter().filter(|&&t| !self.defines_all(t)) {
+                            let mut seen = seen.clone();
+                            self.owners_from(t, name, depth + 1, true, &mut seen, &mut found);
+                        }
+                    }
+                } else {
+                    for n in import.names.iter().filter(|n| n.local == name) {
+                        for &t in targets {
+                            let mut seen = seen.clone();
+                            self.owners_from(t, &n.name, depth + 1, star, &mut seen, &mut found);
+                        }
+                    }
+                }
+                if !found.is_empty() {
+                    best = Some((start, found));
+                }
+            }
+        }
+        if let Some((_, found)) = best {
+            out.extend(found);
+        }
+    }
+
+    /// The definitions `want` accepts that the top-level name `name` of Python module `f`
+    /// stands for, through its re-exports (contract M9c D5); `star`: `f` is a star import's
+    /// target.
+    fn python_exported(
+        &self,
+        f: &'a str,
+        name: &str,
+        want: fn(DefKind) -> bool,
+        star: bool,
+    ) -> Vec<Sym<'a>> {
+        let mut out = Vec::new();
+        for (g, m, via_star) in self.owners(f, name) {
+            let found = self.named(g, None, &m, want);
+            if found.is_empty() {
+                continue;
+            }
+            if star || via_star {
+                self.note("star_import");
+            }
+            if g != f {
+                self.note("reexport");
+            }
+            out.extend(found);
+        }
+        out
+    }
+
+    /// The types an imported Python name stands for when it is a module-level variable where
+    /// the import leads (`smth = Smth()`; contract M9c D5): its only top-level binding there,
+    /// with a type.
+    fn module_variable(&self, targets: &[&'a str], name: &str) -> Option<Vec<Sym<'a>>> {
+        let (mut found, mut reexport, mut star) = (Vec::new(), false, false);
+        for &f in targets {
+            for (g, m, via_star) in self.owners(f, name) {
+                let bindings = self.top_bindings(g, &m);
+                if !bindings.is_empty() {
+                    reexport |= g != f;
+                    star |= via_star;
+                }
+                found.extend(bindings.into_iter().map(|b| (g, b)));
+            }
+        }
+        let [(g, b)] = found.as_slice() else {
+            return None;
+        };
+        if b.type_name.is_empty() {
+            return None;
+        }
+        let types = self.resolve_type(g, None, &b.type_name);
+        if types.is_empty() {
+            return None;
+        }
+        self.note("module_variable");
+        if reexport {
+            self.note("reexport");
+        }
+        if star {
+            self.note("star_import");
+        }
+        Some(types)
     }
 
     /// The declaration `name` refers to at position `at` in `path`: the innermost local whose
@@ -1077,12 +1903,45 @@ impl<'a> Index<'a> {
         q: &str,
         at: Option<rb_model::Span>,
     ) -> Option<Container<'a>> {
-        let segments: Vec<&str> = q.split('.').collect();
+        // Go splits at bracket depth 0, so `a.B(x.y).C` is three segments (contract M9c D4).
+        let go = self.language(path) == Language::Go;
+        let segments: Vec<&str> = if go {
+            split_qualifier(q)
+        } else {
+            q.split('.').collect()
+        };
         let (mut target, consumed) = self.first_segment(path, scope, &segments, at)?;
         for seg in &segments[consumed..] {
-            target = self.step(target, seg)?;
+            target = if go && seg.contains(['(', '[', '{']) {
+                // A call steps to its result; any other bracketed segment stops the walk.
+                self.call_step(target, call_segment(seg)?)?
+            } else {
+                self.step(target, seg)?
+            };
         }
         Some(target)
+    }
+
+    /// The container a Go call segment `name(…)` stands for: the result types of the members
+    /// named `name` of the current types, or of a module's top-level functions (contract M9c
+    /// D4).
+    fn call_step(&self, target: Container<'a>, name: &str) -> Option<Container<'a>> {
+        let callees: Vec<Sym<'a>> = match target {
+            Container::Types(ts) => ts
+                .into_iter()
+                .flat_map(|t| self.members(t, name, is_callable))
+                .collect(),
+            Container::Module(files) => files
+                .into_iter()
+                .flat_map(|f| self.named(f, None, name, is_callable))
+                .collect(),
+        };
+        let types = self.results_of(callees.into_iter().map(|s| (EdgeKind::Calls, s)));
+        if types.is_empty() {
+            return None;
+        }
+        self.note("call_segment");
+        Some(Container::Types(types))
     }
 
     fn first_segment(
@@ -1102,14 +1961,32 @@ impl<'a> Index<'a> {
                 let class = self.enclosing_type(path, scope)?;
                 return Some((Container::Types(self.supertypes(class)), 1));
             }
+            // Python: exactly `super()` is `super`, the enclosing class's supertypes (contract
+            // M9c D5); `super(C, self)` is not.
+            "super()" if language == Language::Python => {
+                let class = self.enclosing_type(path, scope)?;
+                let types = self.supertypes(class);
+                if !types.is_empty() {
+                    self.note("super_call");
+                }
+                return Some((Container::Types(types), 1));
+            }
             _ => {}
         }
-        // A variable: its declared type, or nothing. Never a same-named type or module.
-        if let Some(b) = self.binding(path, scope, s0, at) {
-            if b.type_name.is_empty() {
+        // Go: a call at the head (`Setup(t).App`) stands for its callees' result types (contract
+        // M9c D4); any other bracketed head stops the walk.
+        if language == Language::Go && s0.contains(['(', '[', '{']) {
+            let types = self.results_of(self.call(path, scope, call_segment(s0)?, None, at));
+            if types.is_empty() {
                 return None;
             }
-            let types = self.resolve_type(path, b.scope, &b.type_name);
+            self.note("call_segment");
+            return Some((Container::Types(types), 1));
+        }
+        // A variable: its declared type (Go: else its initialising call's result), or nothing.
+        // Never a same-named type or module.
+        if let Some(b) = self.binding(path, scope, s0, at) {
+            let types = self.binding_types(path, b);
             return (!types.is_empty()).then_some((Container::Types(types), 1));
         }
         let imports = self.facts(path).imports.iter().zip(&self.imports[path]);
@@ -1139,10 +2016,18 @@ impl<'a> Index<'a> {
                 return Some((Container::Module(targets.clone()), 1));
             }
             for n in import.names.iter().filter(|n| n.local == s0) {
-                let mut types: Vec<Sym<'a>> = targets
-                    .iter()
-                    .flat_map(|&f| self.named(f, None, &n.name, is_type))
-                    .collect();
+                let mut types: Vec<Sym<'a>> = if language == Language::Python {
+                    // A class the target only imports is followed (contract M9c D5).
+                    targets
+                        .iter()
+                        .flat_map(|&f| self.python_exported(f, &n.name, is_type, false))
+                        .collect()
+                } else {
+                    targets
+                        .iter()
+                        .flat_map(|&f| self.named(f, None, &n.name, is_type))
+                        .collect()
+                };
                 if types.is_empty() && language == Language::Java {
                     let module: Vec<&str> = import.module.split('.').collect();
                     types = targets
@@ -1166,7 +2051,25 @@ impl<'a> Index<'a> {
                 if !submodule.is_empty() {
                     return Some((Container::Module(submodule), 1));
                 }
+                // Python: the target's module-level variable (`smth = Smth()`; contract M9c D5).
+                if language == Language::Python
+                    && let Some(types) = self.module_variable(targets, &n.name)
+                {
+                    return Some((Container::Types(types), 1));
+                }
             }
+        }
+        // Go: a var any file of the package declares (contract M9c D4), after the file's
+        // imports; a variable too, so its type or nothing.
+        if at.is_some()
+            && let Some((file, b)) = self.package_var(path, s0)
+        {
+            let types = self.resolve_type(file, b.scope, &b.type_name);
+            if types.is_empty() {
+                return None;
+            }
+            self.note("package_var");
+            return Some((Container::Types(types), 1));
         }
         let types = self.resolve_type(path, scope, s0);
         if !types.is_empty() {
@@ -1185,15 +2088,18 @@ impl<'a> Index<'a> {
             Container::Types(ts) => ts
                 .into_iter()
                 .flat_map(|t| {
-                    let fields = self.fields[t.0]
-                        .get(&(t.1, seg))
+                    let declared = self.fields[t.0].get(&(t.1, seg));
+                    let mut own: Vec<Sym<'a>> = declared
                         .into_iter()
                         .flatten()
                         .filter(|b| !b.type_name.is_empty())
-                        .flat_map(|b| self.resolve_type(t.0, Some(t.1), &b.type_name));
-                    fields
-                        .chain(self.named(t.0, Some(t.1), seg, is_type))
-                        .collect::<Vec<_>>()
+                        .flat_map(|b| self.resolve_type(t.0, Some(t.1), &b.type_name))
+                        .collect();
+                    own.extend(self.named(t.0, Some(t.1), seg, is_type));
+                    if declared.is_none() && own.is_empty() {
+                        own = self.promoted_field(t, seg);
+                    }
+                    own
                 })
                 .collect(),
             Container::Module(files) => files
@@ -1204,6 +2110,52 @@ impl<'a> Index<'a> {
         // Deduplicated, so repeated bindings or declarations never multiply along a chain.
         let found = dedup(found);
         (!found.is_empty()).then_some(Container::Types(found))
+    }
+
+    /// The types of the field `seg` that Go struct `t` promotes from the structs it embeds
+    /// (contract M9c D4): breadth-first, the shallowest depth declaring the field wins, and a
+    /// tie at that depth gives every candidate. Empty for any other language.
+    fn promoted_field(&self, t: Sym<'a>, seg: &str) -> Vec<Sym<'a>> {
+        let mut seen = BTreeSet::from([t]);
+        let mut level: Vec<Sym<'a>> = self
+            .embedded_types(t)
+            .into_iter()
+            .filter(|s| seen.insert(*s))
+            .collect();
+        for _ in 0..MAX_INHERITANCE_DEPTH {
+            if level.is_empty() {
+                break;
+            }
+            let declared: Vec<(Sym<'a>, &'a Binding)> = level
+                .iter()
+                .flat_map(|&c| {
+                    self.fields[c.0]
+                        .get(&(c.1, seg))
+                        .into_iter()
+                        .flatten()
+                        .map(move |b| (c, *b))
+                })
+                .collect();
+            if !declared.is_empty() {
+                let types = dedup(
+                    declared
+                        .into_iter()
+                        .filter(|(_, b)| !b.type_name.is_empty())
+                        .flat_map(|(c, b)| self.resolve_type(c.0, Some(c.1), &b.type_name))
+                        .collect(),
+                );
+                if !types.is_empty() {
+                    self.note("embedded");
+                }
+                return types;
+            }
+            level = level
+                .iter()
+                .flat_map(|&c| self.embedded_types(c))
+                .filter(|s| seen.insert(*s))
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Candidates of a call reference, each with the edge it gives. Shared
@@ -1227,6 +2179,9 @@ impl<'a> Index<'a> {
         let found = match (qualifier, variable) {
             (None, Some(b)) => self.defines(path, name, b).into_iter().collect(),
             (None, None) => self.levels(path, scope, name, is_callable, true).0,
+            (Some("super()"), _) if self.language(path) == Language::Python => {
+                self.python_super(path, scope, name)
+            }
             (Some(q), _) => match self.container(path, scope, q, at) {
                 Some(Container::Types(ts)) => ts
                     .into_iter()
@@ -1254,10 +2209,40 @@ impl<'a> Index<'a> {
             .collect()
     }
 
+    /// Python `super().name(…)`: the first class after the enclosing one in its MRO that has
+    /// `name` (contract M9c amendment 3, N4); counted as `super_call` when that class has a
+    /// base, as D5's `super()` arm counts it.
+    fn python_super(&self, path: &'a str, scope: Option<usize>, name: &str) -> Vec<Sym<'a>> {
+        let Some(class) = self.enclosing_type(path, scope) else {
+            return Vec::new();
+        };
+        let tail: Vec<Sym<'a>> = self.python_mro(class).into_iter().skip(1).collect();
+        if !tail.is_empty() {
+            self.note("super_call");
+        }
+        tail.into_iter()
+            .map(|c| self.named(c.0, Some(c.1), name, is_callable))
+            .find(|own| !own.is_empty())
+            .unwrap_or_default()
+    }
+
     fn constructor(&self, class: Sym<'a>) -> Option<Sym<'a>> {
         let name = match self.language(class.0) {
             Language::Java => self.def(class).name.as_str(),
-            Language::Python => "__init__",
+            // Python inherits `__init__`: the first in the class's MRO (contract M9c D5,
+            // amendment 3).
+            Language::Python => {
+                let init = self
+                    .members(class, "__init__", |k| {
+                        matches!(k, DefKind::Method | DefKind::Function)
+                    })
+                    .into_iter()
+                    .next()?;
+                if (init.0, self.def(init).parent) != (class.0, Some(class.1)) {
+                    self.note("inherited_init");
+                }
+                return Some(init);
+            }
             Language::TypeScript | Language::Tsx | Language::JavaScript => "constructor",
             // Contract M6i S2: constructor dispatch lands with Tier B (Go precedent: none).
             Language::Go | Language::Kotlin | Language::CSharp => return None,
@@ -1385,6 +2370,16 @@ mod tests {
     }
 
     fn build(files: &[(&str, Language, &str)], go_modules: &[(&str, &str)]) -> Built {
+        build_with_manifests(files, go_modules, &[])
+    }
+
+    /// [`build`] with manifest texts by path (`tsconfig.json`, `package.json`) for the
+    /// index's alias maps, as `lib.rs` builds them.
+    fn build_with_manifests(
+        files: &[(&str, Language, &str)],
+        go_modules: &[(&str, &str)],
+        manifests: &[(&str, &str)],
+    ) -> Built {
         let facts: Vec<(String, Language, FileFacts)> = files
             .iter()
             .map(|(p, l, src)| {
@@ -1414,11 +2409,46 @@ mod tests {
             crate::syntax::add_symbols(&mut b, path, f, &keys[path]).unwrap();
         }
         let index = Index::new(&by_path, &go, &keys);
+        let index = if manifests.is_empty() {
+            index
+        } else {
+            index.with_aliases(crate::rta::AliasMaps::build(
+                &manifests
+                    .iter()
+                    .map(|(p, t)| (*p, (*t).to_owned()))
+                    .collect(),
+            ))
+        };
         let diagnostics = add_edges(&mut b, &index, &BTreeSet::new()).unwrap();
         Built {
             graph: b.finish().unwrap(),
             diagnostics,
         }
+    }
+
+    /// Runs `f` on the index of `files` (no Go modules, no manifests), for assertions on the
+    /// index itself rather than on its edges.
+    fn with_index(files: &[(&str, Language, &str)], f: impl FnOnce(&Index<'_>)) {
+        let facts: Vec<(String, Language, FileFacts)> = files
+            .iter()
+            .map(|(p, l, src)| {
+                (
+                    (*p).to_owned(),
+                    *l,
+                    rb_syntax::extract(*l, src.as_bytes()).unwrap(),
+                )
+            })
+            .collect();
+        let by_path: BTreeMap<&str, (Language, &FileFacts)> = facts
+            .iter()
+            .map(|(p, l, f)| (p.as_str(), (*l, f)))
+            .collect();
+        let keys: BTreeMap<&str, Vec<String>> = by_path
+            .iter()
+            .map(|(p, (_, f))| (*p, rb_syntax::symbol_keys(p, f)))
+            .collect();
+        let go = BTreeMap::new();
+        f(&Index::new(&by_path, &go, &keys));
     }
 
     /// `src -> dst [certainty]` (plus `(n)` candidates) for edges of `kind`, keys shortened to
@@ -1702,6 +2732,135 @@ function local() {}
         assert_eq!(unresolved(&built), [("src/app.ts".into(), 0, 0, 1)]);
     }
 
+    /// Contract M9c C2 (D1): bookcars' `admin/src/pages/ChangePassword.tsx` calls
+    /// `helper.info` through `import * as helper from '@/utils/helper'`, an alias of
+    /// `admin/tsconfig.json`, whose comments and trailing commas strict JSON refused. A named
+    /// import through the alias resolves too. `frontend/`'s broken tsconfig resolves nothing.
+    #[test]
+    fn namespace_calls_behind_jsonc_paths_resolve() {
+        let page = r#"import * as helper from '@/utils/helper'
+import { error } from '@/utils/helper'
+export function ChangePassword() {
+  helper.info('updated')
+  error()
+}
+"#;
+        let helper = "export const info = (message: string) => {\n  toast(message)\n}\n\
+                      export function error() {}\n";
+        let built = build_with_manifests(
+            &[
+                ("admin/src/pages/ChangePassword.tsx", Language::Tsx, page),
+                ("admin/src/utils/helper.ts", TS, helper),
+                ("frontend/src/pages/ChangePassword.tsx", Language::Tsx, page),
+                ("frontend/src/utils/helper.ts", TS, helper),
+            ],
+            &[],
+            &[
+                (
+                    "admin/tsconfig.json",
+                    r#"{
+  "compilerOptions": {
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "paths": {
+      "@/*": ["./src/*"],
+    },
+  },
+  "include": ["src"],
+}
+"#,
+                ),
+                (
+                    "frontend/tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}"#,
+                ),
+            ],
+        );
+        let calls = edges(&built, EdgeKind::Calls);
+        let admin: Vec<&String> = calls.iter().filter(|e| e.contains("-> helper:")).collect();
+        assert_eq!(
+            admin,
+            [
+                "ChangePassword:ChangePassword(). -> helper:error(). [heuristic]",
+                "ChangePassword:ChangePassword(). -> helper:info(). [heuristic]",
+            ],
+            "{calls:?}"
+        );
+        // Both callers are `ChangePassword:…`; only admin's resolve, so each edge is admin's.
+        let admin_calls = built
+            .graph
+            .edges()
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| {
+                let key = |id| {
+                    built
+                        .graph
+                        .nodes()
+                        .iter()
+                        .find(|n| n.id == id)
+                        .unwrap()
+                        .key
+                        .clone()
+                };
+                (key(e.src), key(e.dst))
+            })
+            .filter(|(s, d)| s.contains("admin/src/pages") && d.contains("admin/src/utils"))
+            .count();
+        assert_eq!(admin_calls, 2);
+    }
+
+    /// Contract M9c C3 (D2): an `import x from './m'` names the definition `m`'s
+    /// `export default` names, whatever the local name; a target without a default export
+    /// gives nothing, as before.
+    #[test]
+    fn default_imports_resolve_to_the_default_export() {
+        let built = build(
+            &[
+                (
+                    "src/app.ts",
+                    TS,
+                    r#"import f from './m'
+import local from './n'
+import h from './o'
+export function run() {
+  f()
+  local()
+  h()
+}
+"#,
+                ),
+                ("src/m.ts", TS, "function f() {}\nexport default f\n"),
+                (
+                    "src/n.ts",
+                    TS,
+                    "export default function named() {}\nexport function local() {}\n",
+                ),
+                ("src/o.ts", TS, "export function h() {}\n"),
+                // JavaScript too (D2 names TS/JS; amendment 3, E3).
+                (
+                    "web/main.js",
+                    Language::JavaScript,
+                    "import g from './p'\nexport function go() {\n  g()\n}\n",
+                ),
+                (
+                    "web/p.js",
+                    Language::JavaScript,
+                    "export default function shown() {}\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "app:run(). -> m:f(). [heuristic]",
+                "app:run(). -> n:named(). [heuristic]",
+                "main:go(). -> p:shown(). [heuristic]",
+            ]
+        );
+    }
+
     #[test]
     fn python_modules_self_members_and_relative_imports() {
         let built = build(
@@ -1795,6 +2954,1117 @@ func (s *Server) helper() {}
             ]
         );
         assert_eq!(unresolved(&built), [("svc/server.go".into(), 1, 0, 0)]);
+    }
+
+    /// Contract M9b D5: a Go method declared in another file than its receiver type is a member
+    /// of that type, found through the type's own package (directory and package name), and is
+    /// never a bare package-level name.
+    #[test]
+    fn go_methods_in_sibling_files_are_members() {
+        let built = build(
+            &[
+                ("svc/h.go", GO, "package svc\ntype H struct{}\n"),
+                (
+                    "svc/m.go",
+                    GO,
+                    "package svc\nfunc (h *H) M() {}\nfunc bare() { M() }\n",
+                ),
+                (
+                    "svc/use.go",
+                    GO,
+                    "package svc\nfunc run(h *H) {\n\th.M()\n\th.T()\n\th.N()\n}\nfunc other() { M() }\n",
+                ),
+                // An internal test file attaches like any other.
+                ("svc/z_test.go", GO, "package svc\nfunc (h *H) T() {}\n"),
+                // The external test package in the same directory has its own `H`.
+                ("svc/x_test.go", GO, "package svc_test\ntype H struct{}\n"),
+                (
+                    "svc/y_test.go",
+                    GO,
+                    "package svc_test\nfunc (h *H) N() {}\nfunc use3(h *H) { h.M() }\n",
+                ),
+                // A function-local `H` is another type: the package `H`'s methods are not its
+                // own (M9b pass 1, E1).
+                (
+                    "svc/loc.go",
+                    GO,
+                    "package svc\nfunc loc() {\n\ttype H struct{}\n\tvar h H\n\th.M()\n}\n",
+                ),
+                // Another package with its own `H`, which has no `M`.
+                ("b/h.go", GO, "package b\ntype H struct{}\n"),
+                ("b/use.go", GO, "package b\nfunc run2(h *H) { h.M() }\n"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "use:run(). -> m:H#M(). [heuristic]",
+                "use:run(). -> z_test:H#T(). [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M9c C5 (D4, call results and call segments, Go only): a local initialised by a
+    /// call takes the callee's result type, `T` or `(T, error)` with `*` stripped; `(T, U)` and
+    /// three results give none; several callees give several candidates. A qualifier is split
+    /// at bracket depth 0, so `a.Keep(cfg.Size(x.y))` is two segments, and a call segment steps
+    /// to the result of a member, a module's function, or (at the head) a callable of the
+    /// levels. A bracketed segment that is not a call (`repo[0]`) stops the walk.
+    #[test]
+    fn go_call_results_and_segments_type_receivers() {
+        let built = build(
+            &[
+                (
+                    "svc/svc.go",
+                    GO,
+                    "package svc
+type Service struct {
+\trepo *Repo
+}
+type Repo struct{}
+type Box struct{}
+func New() *Service { return nil }
+func NewE() (*Service, error) { return nil, nil }
+func NewPair() (*Service, *Repo) { return nil, nil }
+func NewThree() (*Service, *Repo, error) { return nil, nil, nil }
+func (s *Service) Srv() *Service { return s }
+func (s *Service) Keep(n int) Box { return Box{} }
+func (s *Service) Run() {}
+func (s *Service) Named(n string) *Service { return s }
+func (r *Repo) Get() {}
+func (b Box) Save() {}
+type List []*Repo
+func (l List) Get() {}
+func GetList() List { return nil }
+func head() {
+\tNew().Srv().Run()
+}
+",
+                ),
+                // Contract M9c amendment 3 (E1): a result named by a type parameter (the
+                // function's own, or one the receiver names) is no named type, even beside a
+                // package type of that name; a named result still is.
+                (
+                    "gen/gen.go",
+                    GO,
+                    "package gen
+type T struct{}
+func (t T) Foo() {}
+type V struct{}
+func (v V) Foo() {}
+type A struct{}
+func (a A) Foo() {}
+type E struct{}
+func (e E) Foo() {}
+type Box[E any] struct{ v E }
+func (b *Box[E]) Get() E { return b.v }
+func Id[T any](x T) T { return x }
+func Ptr[V any](v V) *V { return &v }
+func Named() T { return T{} }
+func g1() {
+\tt := Id(A{})
+\tt.Foo()
+}
+func g2() {
+\tp := Ptr(A{})
+\tp.Foo()
+}
+func g3(b *Box[A]) {
+\te := b.Get()
+\te.Foo()
+}
+func g4() {
+\tn := Named()
+\tn.Foo()
+}
+func Use[T any](x T) {
+\tx.Foo()
+}
+func (b *Box[E]) Each() {
+\tvar e E
+\te.Foo()
+}
+func Keep[T any](x T, a A) {
+\ta.Foo()
+}
+",
+                ),
+                (
+                    "use/use.go",
+                    GO,
+                    "package use
+import \"example.com/app/svc\"
+func f1() {
+\ta := svc.New()
+\ta.Run()
+}
+func f2() {
+\tb, err := svc.NewE()
+\tb.Run()
+}
+func f3() {
+\tc, d := svc.NewPair()
+\tc.Run()
+}
+func f4() {
+\te := svc.NewThree()
+\te.Run()
+}
+func f5(cfg Config) {
+\ta := svc.New()
+\ta.Keep(cfg.Size(x.y)).Save()
+}
+func f6() {
+\tsvc.New().Srv().Run()
+}
+func f7() {
+\ta := svc.New()
+\ta.repo[0].Get()
+}
+func f8() {
+\ta := svc.New()
+\ta.Named(\"(\").Srv().Run()
+}
+func f9() {
+\ta := svc.New()
+\ta.Named(\").\").Run()
+}
+func f10() {
+\tsvc.GetList()[0].Get()
+}
+",
+                ),
+                (
+                    "multi/a.go",
+                    GO,
+                    "package multi\ntype A struct{}\nfunc (a *A) Hi() {}\nfunc Make() *A { return nil }\n",
+                ),
+                (
+                    "multi/b.go",
+                    GO,
+                    "package multi\ntype B struct{}\nfunc (b *B) Hi() {}\nfunc Make() *B { return nil }\n",
+                ),
+                (
+                    "multi/m.go",
+                    GO,
+                    "package multi\nfunc g() {\n\tm := Make()\n\tm.Hi()\n}\n",
+                ),
+            ],
+            &[("", "example.com/app")],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                // A parameter or local typed by a type parameter types nothing (pass 2, N1);
+                // `Use` and `Box#Each` reach no `T#Foo`/`E#Foo`. A concrete parameter beside
+                // one still types.
+                "gen:Keep(). -> gen:A#Foo(). [heuristic]",
+                "gen:g1(). -> gen:Id(). [heuristic]",
+                "gen:g2(). -> gen:Ptr(). [heuristic]",
+                "gen:g3(). -> gen:Box#Get(). [heuristic]",
+                "gen:g4(). -> gen:Named(). [heuristic]",
+                "gen:g4(). -> gen:T#Foo(). [heuristic]",
+                "m:g(). -> a:A#Hi(). [ambiguous] (2)",
+                "m:g(). -> a:Make(). [ambiguous] (2)",
+                "m:g(). -> b:B#Hi(). [ambiguous] (2)",
+                "m:g(). -> b:Make(). [ambiguous] (2)",
+                "svc:head(). -> svc:New(). [heuristic]",
+                "svc:head(). -> svc:Service#Run(). [heuristic]",
+                "svc:head(). -> svc:Service#Srv(). [heuristic]",
+                "use:f1(). -> svc:New(). [heuristic]",
+                "use:f1(). -> svc:Service#Run(). [heuristic]",
+                // `GetList()[0]` indexes a result: no call segment, so no `List#Get` (E3).
+                "use:f10(). -> svc:GetList(). [heuristic]",
+                "use:f2(). -> svc:NewE(). [heuristic]",
+                "use:f2(). -> svc:Service#Run(). [heuristic]",
+                "use:f3(). -> svc:NewPair(). [heuristic]",
+                "use:f4(). -> svc:NewThree(). [heuristic]",
+                "use:f5(). -> svc:Box#Save(). [heuristic]",
+                "use:f5(). -> svc:New(). [heuristic]",
+                "use:f5(). -> svc:Service#Keep(). [heuristic]",
+                "use:f6(). -> svc:New(). [heuristic]",
+                "use:f6(). -> svc:Service#Run(). [heuristic]",
+                "use:f6(). -> svc:Service#Srv(). [heuristic]",
+                "use:f7(). -> svc:New(). [heuristic]",
+                // A bracket inside a string argument is text, at either split (E3).
+                "use:f8(). -> svc:New(). [heuristic]",
+                "use:f8(). -> svc:Service#Named(). [heuristic]",
+                "use:f8(). -> svc:Service#Run(). [heuristic]",
+                "use:f8(). -> svc:Service#Srv(). [heuristic]",
+                "use:f9(). -> svc:New(). [heuristic]",
+                "use:f9(). -> svc:Service#Named(). [heuristic]",
+                "use:f9(). -> svc:Service#Run(). [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M9c C5 (D4, aliases): `type A = B` resolves to what `B` resolves to in the
+    /// alias's file, through a chain of aliases, a pointer target and a sibling file; a cycle
+    /// (`A = B; B = A`) resolves to nothing. Type references land on the target as calls do.
+    #[test]
+    fn go_type_aliases_resolve_to_their_target() {
+        let built = build(
+            &[
+                (
+                    "web/ctx.go",
+                    GO,
+                    "package web\ntype Context struct{}\nfunc (c *Context) JSON() {}\n",
+                ),
+                (
+                    "api/handlers.go",
+                    GO,
+                    "package api
+import \"example.com/app/web\"
+type Context = web.Context
+type Ctx2 = Context
+type P = *web.Context
+type A = B
+type B = A
+func h1(c *Context) { c.JSON() }
+func h2(c *Ctx2) { c.JSON() }
+func h3(c P) { c.JSON() }
+func h4(c *A) { c.JSON() }
+",
+                ),
+                (
+                    "api/other.go",
+                    GO,
+                    "package api\nfunc h5(c Context) { c.JSON() }\n",
+                ),
+            ],
+            &[("", "example.com/app")],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "handlers:h1(). -> ctx:Context#JSON(). [heuristic]",
+                "handlers:h2(). -> ctx:Context#JSON(). [heuristic]",
+                "handlers:h3(). -> ctx:Context#JSON(). [heuristic]",
+                "other:h5(). -> ctx:Context#JSON(). [heuristic]",
+            ]
+        );
+        let functions: Vec<String> = edges(&built, EdgeKind::References)
+            .into_iter()
+            .filter(|e| e.contains(":h"))
+            .collect();
+        assert_eq!(
+            functions,
+            [
+                "handlers:h1(). -> ctx:Context# [heuristic]",
+                "handlers:h2(). -> ctx:Context# [heuristic]",
+                "handlers:h3(). -> ctx:Context# [heuristic]",
+                "other:h5(). -> ctx:Context# [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M9c C5 (D4, embedding): a member the type and its sibling-file methods lack is
+    /// searched in the embedded types breadth-first; the shallower depth wins, a tie at one
+    /// depth is ambiguous, promoted fields walk the same way, and embedding never makes an
+    /// `IMPLEMENTS` edge.
+    #[test]
+    fn go_embedded_types_promote_members() {
+        let built = build(
+            &[
+                (
+                    "p/types.go",
+                    GO,
+                    "package p
+type Logger struct{}
+func (l *Logger) Write() {}
+type Base struct {
+\tLog *Logger
+}
+func (b *Base) Hello() {}
+func (b *Base) Both() {}
+type Mid struct {
+\t*Base
+}
+func (m *Mid) Name() {}
+type Other struct{}
+func (o *Other) Both() {}
+func (o *Other) Name() {}
+type Top struct {
+\t*Mid
+\tOther
+}
+func (t *Top) Own() {}
+",
+                ),
+                ("p/more.go", GO, "package p\nfunc (b *Base) Later() {}\n"),
+                (
+                    "p/use.go",
+                    GO,
+                    "package p
+func own(t *Top) { t.Own() }
+func deep(t *Top) { t.Hello() }
+func tie(t *Top) { t.Name() }
+func near(t *Top) { t.Both() }
+func field(m *Mid) { m.Log.Write() }
+func explicit(t *Top) { t.Mid.Name() }
+func later(t *Top) { t.Later() }
+",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "use:deep(). -> types:Base#Hello(). [heuristic]",
+                "use:explicit(). -> types:Mid#Name(). [heuristic]",
+                "use:field(). -> types:Logger#Write(). [heuristic]",
+                "use:later(). -> more:Base#Later(). [heuristic]",
+                "use:near(). -> types:Other#Both(). [heuristic]",
+                "use:own(). -> types:Top#Own(). [heuristic]",
+                "use:tie(). -> types:Mid#Name(). [ambiguous] (2)",
+                "use:tie(). -> types:Other#Name(). [ambiguous] (2)",
+            ]
+        );
+        assert_eq!(edges(&built, EdgeKind::Implements), Vec::<String>::new());
+        // Embedding never enters `supertypes()`, which DI reads through `direct_supertypes`;
+        // the embedded type is seen, as an embed.
+        let src = "package p\ntype Base struct{}\ntype Top struct {\n\t*Base\n}\n";
+        with_index(&[("p/t.go", GO, src)], |index| {
+            let top = ("p/t.go", 1);
+            assert_eq!(index.def(top).name, "Top");
+            assert_eq!(index.embedded_types(top), [("p/t.go", 0)]);
+            assert_eq!(index.direct_supertypes(top), Vec::<Sym>::new());
+        });
+    }
+
+    /// Contract M9c C5 (D4, package vars): a qualifier head with no local binding is a
+    /// package-level var of a sibling file when the package declares that name exactly once
+    /// (any kind), the var has a type, and a non-test file is not reading a test file's var. A
+    /// local of the same name shadows it; another directory never sees it.
+    #[test]
+    fn go_package_vars_of_sibling_files_type_names() {
+        let built = build(
+            &[
+                (
+                    "svc/helper.go",
+                    GO,
+                    "package svc
+type Helper struct{}
+func (h *Helper) Setup() {}
+type Other struct{}
+var shared *Helper
+var twice *Helper
+var mixed *Helper
+",
+                ),
+                (
+                    "svc/d.go",
+                    GO,
+                    "package svc\nvar twice *Helper\nfunc mixed() {}\n",
+                ),
+                (
+                    "svc/main_test.go",
+                    GO,
+                    "package svc\nvar mainHelper *Helper\n",
+                ),
+                (
+                    "svc/a_test.go",
+                    GO,
+                    "package svc
+func TestA() { mainHelper.Setup() }
+func TestB() {
+\tmainHelper := Other{}
+\tmainHelper.Setup()
+}
+func TestC() { shared.Setup() }
+",
+                ),
+                (
+                    "svc/b.go",
+                    GO,
+                    "package svc
+func run() { mainHelper.Setup() }
+func run2() { shared.Setup() }
+func run3() { twice.Setup() }
+func run4() { mixed.Setup() }
+",
+                ),
+                (
+                    "other/x.go",
+                    GO,
+                    "package other\nfunc o() { shared.Setup() }\n",
+                ),
+                // A `select` receive declares its names (contract M9c amendment 3, E1): they
+                // shadow the package var, as `:=` does anywhere else.
+                (
+                    "svc/sel.go",
+                    GO,
+                    "package svc
+type Cfg struct{}
+func (c *Cfg) Load() {}
+var cfg *Cfg
+func sel(ch chan *Helper) {
+\tselect {
+\tcase cfg := <-ch:
+\t\tcfg.Load()
+\t}
+}
+func sel2(ch chan *Helper) {
+\tselect {
+\tcase cfg, ok := <-ch:
+\t\t_ = ok
+\t\tcfg.Load()
+\t}
+}
+func usesVar() { cfg.Load() }
+",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "a_test:TestA(). -> helper:Helper#Setup(). [heuristic]",
+                "a_test:TestC(). -> helper:Helper#Setup(). [heuristic]",
+                "b:run2(). -> helper:Helper#Setup(). [heuristic]",
+                "sel:usesVar(). -> sel:Cfg#Load(). [heuristic]",
+            ]
+        );
+    }
+
+    /// Contract M9c C7 (D6): one `tier_b_forms` diagnostic per file that resolved a reference
+    /// through a new form, every key present; a reference counts each form it used once (two
+    /// call segments in one qualifier count once), an unresolved reference counts nothing, and a
+    /// file that used no form has no diagnostic.
+    #[test]
+    fn tier_b_forms_count_each_form() {
+        let built = build(
+            &[
+                (
+                    "svc/svc.go",
+                    GO,
+                    "package svc\ntype Service struct{}\nfunc New() *Service { return nil }\nfunc (s *Service) Srv() *Service { return s }\nfunc (s *Service) Run() {}\n",
+                ),
+                (
+                    "use/use.go",
+                    GO,
+                    "package use
+import \"example.com/app/svc\"
+type Alias = svc.Service
+type Wrap struct {
+\t*svc.Service
+}
+func f(s *svc.Service, al *Alias, w *Wrap) {
+\ta := svc.New()
+\ta.Run()
+\ts.Srv().Srv().Run()
+\tal.Run()
+\tw.Run()
+\tglobal.Run()
+\ta.Missing()
+}
+",
+                ),
+                (
+                    "use/vars.go",
+                    GO,
+                    "package use\nimport \"example.com/app/svc\"\nvar global *svc.Service\n",
+                ),
+                (
+                    "use/plain.go",
+                    GO,
+                    "package use\nimport \"example.com/app/svc\"\nfunc p(s *svc.Service) { s.Run() }\n",
+                ),
+                ("web/m.ts", TS, "export default function g() {}\n"),
+                (
+                    "web/u.ts",
+                    TS,
+                    "import f from './m';\nfunction run() { f(); f(); }\n",
+                ),
+            ],
+            &[("", "example.com/app")],
+        );
+        let forms: Vec<(String, serde_json::Value)> = built
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "tier_b_forms")
+            .map(|d| (d.path.clone().unwrap_or_default(), d.detail.clone()))
+            .collect();
+        let zero = json!({
+            "return_type": 0, "call_segment": 0, "type_alias": 0, "embedded": 0,
+            "package_var": 0, "default_import": 0, "super_call": 0, "star_import": 0,
+            "reexport": 0, "module_variable": 0, "inherited_init": 0,
+        });
+        let with = |pairs: &[(&str, u64)]| {
+            let mut v = zero.clone();
+            for (k, n) in pairs {
+                v[*k] = json!(n);
+            }
+            v
+        };
+        assert_eq!(
+            forms,
+            [
+                (
+                    "use/use.go".to_owned(),
+                    with(&[
+                        ("return_type", 1),
+                        ("call_segment", 2),
+                        ("type_alias", 2),
+                        ("embedded", 1),
+                        ("package_var", 1),
+                    ])
+                ),
+                ("web/u.ts".to_owned(), with(&[("default_import", 2)])),
+            ]
+        );
+    }
+
+    /// `(path, detail)` of every `tier_b_forms` diagnostic, with only its non-zero keys.
+    fn forms_used(built: &Built) -> Vec<(String, Vec<(String, u64)>)> {
+        built
+            .diagnostics
+            .iter()
+            .filter(|d| d.kind == "tier_b_forms")
+            .map(|d| {
+                let used = d.detail.as_object().unwrap().iter();
+                let used = used
+                    .filter_map(|(k, v)| v.as_u64().filter(|&n| n > 0).map(|n| (k.clone(), n)))
+                    .collect();
+                (d.path.clone().unwrap_or_default(), used)
+            })
+            .collect()
+    }
+
+    /// Contract M9c C6 (D5, Python only), the PyCG shapes and their refusals: exactly `super()`
+    /// stands for the enclosing class's supertypes (`super(C, self)` does not); `from m import *`
+    /// comes after own definitions and named imports, never brings `_` names, and skips a target
+    /// that defines `__all__`; a name an `__init__.py` only imports is followed to where it is
+    /// defined, renamed or through a star import, and a re-export cycle ends; an imported
+    /// module-level binding (`smth = Smth()`) types a qualifier when it is the only one.
+    #[test]
+    fn python_super_star_reexport_and_module_vars_resolve() {
+        let built = build(
+            &[
+                (
+                    "m/sup.py",
+                    PY,
+                    "class A:
+    def __init__(self):
+        pass
+    def run(self):
+        pass
+
+class B(A):
+    def __init__(self):
+        super().__init__()
+        super().run()
+
+class C(B):
+    def __init__(self):
+        super().__init__()
+    def other(self):
+        super(C, self).run()
+
+class SB:
+    def m(self):
+        pass
+
+class SC:
+    def m(self):
+        pass
+
+class SD(SB, SC):
+    def m(self):
+        super().m()
+
+class SE(SB):
+    pass
+
+class SF(SE, SC):
+    def m(self):
+        super().m()
+
+class SG(SB):
+    helper = SC()
+
+class SH(SG):
+    def m(self):
+        super().helper.m()
+",
+                ),
+                // Contract M9c amendment 3 (E2): the later of a named and a star import of one
+                // name wins, as Python binds it, also in a module that re-exports it.
+                ("pkg/mod_n.py", PY, "def f():\n    pass\n"),
+                (
+                    "pkg/mod_m.py",
+                    PY,
+                    "def f():\n    pass\n\ndef g():\n    pass\n",
+                ),
+                (
+                    "pkg/star_after_named.py",
+                    PY,
+                    "from pkg.mod_n import f\nfrom pkg.mod_m import *\n\ndef use():\n    f()\n",
+                ),
+                (
+                    "pkg/star_after_def.py",
+                    PY,
+                    "def g():\n    pass\n\nfrom pkg.mod_m import *\n\ndef use():\n    g()\n",
+                ),
+                (
+                    "pkg/named_after_star.py",
+                    PY,
+                    "from pkg.mod_m import *\nfrom pkg.mod_n import f\n\ndef use():\n    f()\n",
+                ),
+                (
+                    "reorder/__init__.py",
+                    PY,
+                    "from .ra import h\nfrom .rb import *\n",
+                ),
+                ("reorder/ra.py", PY, "def h():\n    pass\n"),
+                ("reorder/rb.py", PY, "def h():\n    pass\n"),
+                (
+                    "app/main2.py",
+                    PY,
+                    "from reorder import h\n\ndef run2():\n    h()\n",
+                ),
+                ("pkg/__init__.py", PY, ""),
+                (
+                    "pkg/stars.py",
+                    PY,
+                    "def func1():\n    pass\n\ndef func2():\n    pass\n\ndef func3():\n    pass\n\ndef _hidden():\n    pass\n\nclass Klass:\n    def m(self):\n        pass\n",
+                ),
+                (
+                    "pkg/limited.py",
+                    PY,
+                    "__all__ = [\"shown\"]\n\ndef shown():\n    pass\n",
+                ),
+                ("pkg/other.py", PY, "def func3():\n    pass\n"),
+                (
+                    "pkg/star_user.py",
+                    PY,
+                    "from pkg.stars import *
+from pkg.limited import *
+from pkg.other import func3
+
+def func2():
+    pass
+
+def use():
+    func1()
+    func2()
+    func3()
+    _hidden()
+    shown()
+    Klass.m(None)
+",
+                ),
+                (
+                    "nested/__init__.py",
+                    PY,
+                    "from .mod import func2 as f2\nfrom .deep import *\n\ndef func():\n    pass\n",
+                ),
+                ("nested/mod.py", PY, "def func2():\n    pass\n"),
+                ("nested/deep.py", PY, "from .deeper import g\n"),
+                ("nested/deeper.py", PY, "def g():\n    pass\n"),
+                ("cyc/__init__.py", PY, ""),
+                ("cyc/a.py", PY, "from cyc.b import loop\n"),
+                ("cyc/b.py", PY, "from cyc.a import loop\n"),
+                (
+                    "app/main.py",
+                    PY,
+                    "from nested import func, f2, g
+from cyc.a import loop
+
+def run():
+    func()
+    f2()
+    g()
+    loop()
+",
+                ),
+                (
+                    "svc/__init__.py",
+                    PY,
+                    "from .impl import smth\nfrom .impl import twice\n",
+                ),
+                (
+                    "svc/impl.py",
+                    PY,
+                    "class Smth:
+    def func(self):
+        pass
+
+class Other:
+    def func(self):
+        pass
+
+smth = Smth()
+twice = Smth()
+twice = Other()
+",
+                ),
+                (
+                    "app/client.py",
+                    PY,
+                    "from svc import smth, twice
+
+def call():
+    smth.func()
+
+def call2():
+    twice.func()
+",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "client:call(). -> impl:Smth#func(). [heuristic]",
+                "main2:run2(). -> rb:h(). [heuristic]",
+                "main:run(). -> __init__:func(). [heuristic]",
+                "main:run(). -> deeper:g(). [heuristic]",
+                "main:run(). -> mod:func2(). [heuristic]",
+                "named_after_star:use(). -> mod_n:f(). [heuristic]",
+                "star_after_def:use(). -> mod_m:g(). [heuristic]",
+                "star_after_named:use(). -> mod_m:f(). [heuristic]",
+                "star_user:use(). -> other:func3(). [heuristic]",
+                "star_user:use(). -> star_user:func2(). [heuristic]",
+                "star_user:use(). -> stars:Klass#m(). [heuristic]",
+                "star_user:use(). -> stars:func1(). [heuristic]",
+                "sup:B#__init__(). -> sup:A#__init__(). [heuristic]",
+                "sup:B#__init__(). -> sup:A#run(). [heuristic]",
+                "sup:C#__init__(). -> sup:B#__init__(). [heuristic]",
+                // `super()` is the next class of the MRO with the member (amendment 3, N4).
+                "sup:SD#m(). -> sup:SB#m(). [heuristic]",
+                "sup:SF#m(). -> sup:SB#m(). [heuristic]",
+                // A longer chain walks from the supertypes' class attributes, as before.
+                "sup:SH#m(). -> sup:SC#m(). [heuristic]",
+            ]
+        );
+        assert_eq!(
+            forms_used(&built),
+            [
+                (
+                    "app/client.py".to_owned(),
+                    vec![("module_variable".into(), 1), ("reexport".into(), 1)]
+                ),
+                (
+                    "app/main.py".to_owned(),
+                    vec![("reexport".into(), 2), ("star_import".into(), 1)]
+                ),
+                (
+                    "app/main2.py".to_owned(),
+                    vec![("reexport".into(), 1), ("star_import".into(), 1)]
+                ),
+                ("m/sup.py".to_owned(), vec![("super_call".into(), 6)]),
+                (
+                    "pkg/star_after_def.py".to_owned(),
+                    vec![("star_import".into(), 1)]
+                ),
+                (
+                    "pkg/star_after_named.py".to_owned(),
+                    vec![("star_import".into(), 1)]
+                ),
+                (
+                    "pkg/star_user.py".to_owned(),
+                    vec![("star_import".into(), 2)]
+                ),
+            ]
+        );
+    }
+
+    /// Contract M9c C6 (D5): Python instantiates a bare class it raises (`raise A`, `raise
+    /// Outer.B`), never the `from` cause; a class without its own `__init__` is constructed by
+    /// the nearest supertype's (breadth-first, the leftmost of a tie, as Python's MRO is at one
+    /// level). Java, whose own constructor is all `constructor` reads, is unchanged.
+    #[test]
+    fn python_raise_and_inherited_init_construct() {
+        let built = build(
+            &[
+                (
+                    "e/main.py",
+                    PY,
+                    "class A(Exception):
+    def __init__(self):
+        pass
+
+class Cause(Exception):
+    def __init__(self):
+        pass
+
+class Outer:
+    class B(Exception):
+        def __init__(self):
+            pass
+
+class Plain(Exception):
+    pass
+
+def f():
+    raise A
+
+def g():
+    raise Outer.B
+
+def h():
+    raise A from Cause
+
+def k():
+    raise Plain
+",
+                ),
+                (
+                    "mro/m.py",
+                    PY,
+                    "class A:
+    def __init__(self):
+        pass
+
+class B(A):
+    def func(self):
+        pass
+
+class C(A):
+    def func(self):
+        pass
+
+class D(B, C):
+    pass
+
+class E:
+    def __init__(self):
+        pass
+
+class N:
+    pass
+
+class G(N, E):
+    pass
+
+class F(E, A):
+    pass
+
+class P(A):
+    pass
+
+class Q:
+    def __init__(self):
+        pass
+
+class R(P, Q):
+    pass
+
+class X:
+    def __init__(self):
+        pass
+
+class Y(X):
+    pass
+
+class Z(X):
+    def __init__(self):
+        pass
+
+class W(Y, Z):
+    pass
+
+def basic():
+    B()
+
+def same():
+    D()
+
+def two():
+    G()
+
+def tie():
+    F()
+
+def left():
+    R()
+
+def diamond():
+    W()
+",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            edges(&built, EdgeKind::Calls),
+            [
+                "m:basic(). -> m:A#__init__(). [heuristic]",
+                // C3 (amendment 3, E2): R's MRO is R, P, A, Q; W's is W, Y, Z, X.
+                "m:diamond(). -> m:Z#__init__(). [heuristic]",
+                "m:left(). -> m:A#__init__(). [heuristic]",
+                "m:same(). -> m:A#__init__(). [heuristic]",
+                "m:tie(). -> m:E#__init__(). [heuristic]",
+                "m:two(). -> m:E#__init__(). [heuristic]",
+                "main:f(). -> main:A#__init__(). [heuristic]",
+                "main:g(). -> main:Outer#B#__init__(). [heuristic]",
+                "main:h(). -> main:A#__init__(). [heuristic]",
+            ]
+        );
+        assert_eq!(
+            forms_used(&built),
+            [("mro/m.py".to_owned(), vec![("inherited_init".into(), 6)])]
+        );
+        // Java: `constructor` reads the class's own constructor only; a subclass without one
+        // has none (Tree-sitter tags `new Sub()` as a class reference, so no edge reaches it).
+        let java = [
+            (
+                "j/Base.java",
+                J,
+                "package j;\npublic class Base {\n  public Base() {}\n}\n",
+            ),
+            (
+                "j/Sub.java",
+                J,
+                "package j;\npublic class Sub extends Base {\n}\n",
+            ),
+            (
+                "p/k.py",
+                PY,
+                "class A:\n    def __init__(self):\n        pass\nclass B(A):\n    pass\n",
+            ),
+        ];
+        with_index(&java, |index| {
+            let ctor = |path: &'static str, class: usize| {
+                let found = index.constructor((path, class));
+                found.map(|s| index.key(s).rsplit('/').next().unwrap().to_owned())
+            };
+            assert_eq!(ctor("j/Base.java", 0), Some("Base#Base().".into()));
+            assert_eq!(ctor("j/Sub.java", 0), None);
+            assert_eq!(ctor("p/k.py", 2), Some("A#__init__().".into()));
+        });
+    }
+
+    /// Contract M9c pass 2, S2: a hierarchy C3 cannot linearise (an inconsistent order, a
+    /// cycle, more than [`MAX_INHERITANCE_DEPTH`] levels) takes its fallback order as before,
+    /// but each class's MRO is computed once, as a C3 one is, so a lattice costs its size and
+    /// not two to the power of its depth. A class's MRO never depends on which classes were
+    /// looked up before it.
+    #[test]
+    fn python_mro_is_computed_once_per_class_and_unmergeable_hierarchies_fall_back() {
+        // `layers` diamonds over `base`: `Lka` and `Lkb` both extend `L(k-1)a, L(k-1)b`, and
+        // layer 1 extends `first`.
+        let lattice = |base: &str, first: &str, layers: usize| {
+            let mut src = base.to_owned();
+            for k in 1..=layers {
+                let below = if k == 1 {
+                    first.to_owned()
+                } else {
+                    format!("L{}a, L{}b", k - 1, k - 1)
+                };
+                for side in ["a", "b"] {
+                    src.push_str(&format!("class L{k}{side}({below}):\n    pass\n"));
+                }
+            }
+            src.push_str(&format!("def make():\n    return L{layers}a()\n"));
+            src
+        };
+        let init = "    def __init__(self):\n        pass\n";
+        // `L1a(T0, T1)` with `T1(T0)`: Python raises TypeError. A cycle `T0(T1)`, `T1(T0)`.
+        let inconsistent = format!("class T0:\n{init}class T1(T0):\n    pass\n");
+        let cycle = format!("class T0(T1):\n{init}class T1(T0):\n    pass\n");
+        for (base, own) in [(&inconsistent, 0), (&cycle, 1)] {
+            for layers in [12, 40] {
+                let src = lattice(base, "T0, T1", layers);
+                with_index(&[("lat.py", PY, &src)], |index| {
+                    let class = |name: &str| {
+                        let defs = &index.facts("lat.py").definitions;
+                        ("lat.py", defs.iter().position(|d| d.name == name).unwrap())
+                    };
+                    let top = class(&format!("L{layers}a"));
+                    let mro = || -> Vec<String> {
+                        let order = index.python_mro(top);
+                        order
+                            .into_iter()
+                            .map(|s| index.def(s).name.clone())
+                            .collect()
+                    };
+                    // The fallback: left-first depth-first, each class once.
+                    let mut want: Vec<String> =
+                        (1..=layers).rev().map(|k| format!("L{k}a")).collect();
+                    want.extend(["T0".to_owned(), "T1".to_owned()]);
+                    want.extend((1..layers).map(|k| format!("L{k}b")));
+                    assert_eq!(mro(), want, "{layers} layers");
+                    // One computation per class with bases below the top: `L1a`-`Lna`,
+                    // `L1b`-`L(n-1)b`, `T1`, and `T0` when it is on the cycle.
+                    let once = 2 * layers + own;
+                    assert_eq!(index.mro_frames.get(), once, "{layers} layers");
+                    assert_eq!(mro(), want);
+                    assert_eq!(index.mro_frames.get(), once, "a second lookup reads it");
+                });
+            }
+            let built = build(&[("p/lat.py", PY, &lattice(base, "T0, T1", 40))], &[]);
+            assert_eq!(
+                edges(&built, EdgeKind::Calls),
+                ["lat:make(). -> lat:T0#__init__(). [heuristic]"]
+            );
+        }
+        // The evaluator's rows: an inconsistent order and a cycle keep their fallback.
+        let rows = "class X:\n{init}class Y(X):\n    pass\nclass Bad(X, Y):\n    pass\ndef bad():\n    return Bad()\nclass Cy1(Cy2):\n    pass\nclass Cy2(Cy1):\n{init}def cyc():\n    return Cy1()\n"
+            .replace("{init}", init);
+        assert_eq!(
+            edges(&build(&[("p/c3.py", PY, &rows)], &[]), EdgeKind::Calls),
+            [
+                "c3:bad(). -> c3:X#__init__(). [heuristic]",
+                "c3:cyc(). -> c3:Cy2#__init__(). [heuristic]",
+            ]
+        );
+        // A chain of 69 classes over a diamond (`W(Y, Z)`, `Y(X)`, `Z(X)`; C3 takes `Z`'s
+        // `__init__`, depth-first `X`'s). `Deep69` is deeper than the cap, so it falls back and
+        // finds none within it; `Deep6` is C3 whether or not `Deep69`'s lookup passed it first.
+        let mut chain = format!(
+            "class X:\n{init}class Y(X):\n    pass\nclass Z(X):\n{init}class W(Y, Z):\n    pass\nclass Deep1(W):\n    pass\n"
+        );
+        for k in 2..=69 {
+            chain.push_str(&format!("class Deep{k}(Deep{}):\n    pass\n", k - 1));
+        }
+        let far = "def far():\n    return Deep69()\n";
+        let near = "def near():\n    return Deep6()\n";
+        for order in [[far, near], [near, far]] {
+            let src = format!("{chain}{}{}", order[0], order[1]);
+            assert_eq!(
+                edges(&build(&[("p/deep.py", PY, &src)], &[]), EdgeKind::Calls),
+                ["deep:near(). -> deep:Z#__init__(). [heuristic]"],
+                "{}",
+                order[0].lines().next().unwrap()
+            );
+        }
+        // A valid lattice deeper than the cap: computed along one path to the cap, not
+        // exhaustively; it falls back, and `T0`'s `__init__` lies beyond the cap.
+        let valid = format!("class T0:\n{init}class T1(T0):\n    pass\n");
+        let src = lattice(&valid, "T1, T0", 70);
+        with_index(&[("lat.py", PY, &src)], |index| {
+            let defs = &index.facts("lat.py").definitions;
+            let top = (
+                "lat.py",
+                defs.iter().position(|d| d.name == "L70a").unwrap(),
+            );
+            assert!(
+                !index
+                    .python_mro(top)
+                    .iter()
+                    .any(|&s| index.def(s).name == "T0")
+            );
+            assert!(
+                index.mro_frames.get() <= defs.len(),
+                "{}",
+                index.mro_frames.get()
+            );
+        });
+        assert_eq!(
+            edges(&build(&[("p/lat.py", PY, &src)], &[]), EdgeKind::Calls),
+            Vec::<String>::new()
+        );
+        let src = lattice(&valid, "T1, T0", 40);
+        assert_eq!(
+            edges(&build(&[("p/lat.py", PY, &src)], &[]), EdgeKind::Calls),
+            ["lat:make(). -> lat:T0#__init__(). [heuristic]"]
+        );
     }
 
     #[test]

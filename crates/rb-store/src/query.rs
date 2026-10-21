@@ -158,7 +158,8 @@ pub struct ResolutionCoverage {
     pub unresolved: i64,
     /// References into packages outside the snapshot.
     pub external: i64,
-    /// `CALLS` edges with provenance `scip` (exact, from an indexer; contract M3b S9).
+    /// `CALLS` edges with provenance `scip` and certainty `exact` (contract M3b S9; M9c C10: a
+    /// `synthetic` cross-project join is not an exact call).
     pub exact_calls: i64,
 }
 
@@ -556,8 +557,9 @@ impl Store {
                     (SELECT coalesce(sum((detail->>'external')::bigint), 0)::bigint
                      FROM rb.diagnostic WHERE snapshot_id = $1 AND kind = 'unresolved_references'),
                     (SELECT count(*) FROM rb.edge
-                     WHERE snapshot_id = $1 AND kind = 'CALLS' AND provenance = 'scip')",
-            &[&snapshot_id],
+                     WHERE snapshot_id = $1 AND kind = 'CALLS' AND provenance = 'scip'
+                       AND certainty = $2)",
+            &[&snapshot_id, &rb_model::Certainty::Exact.rank()],
         )?;
         Ok(ResolutionCoverage {
             resolved: r.get(0),

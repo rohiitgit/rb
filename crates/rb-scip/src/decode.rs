@@ -23,6 +23,15 @@ pub struct ScipIndex {
     pub tool: String,
     /// One entry per distinct relative path, sorted.
     pub documents: Vec<Document>,
+    /// scip-go only (contract M9d D10): the documents' local symbols (`SymbolInformation`
+    /// entries whose symbol is `local …`, counted as written, duplicates included), and those
+    /// whose signature text contains `invalid type`, go/types' spelling for a type it could not
+    /// load. scip-go exits 0 when packages fail to load, so this is the only sign. 0 for every
+    /// other indexer.
+    #[serde(default)]
+    pub locals: usize,
+    #[serde(default)]
+    pub locals_invalid_type: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -172,7 +181,21 @@ pub fn decode(
         symbols: BTreeSet<SymbolInfo>,
     }
     let mut documents: BTreeMap<String, Merged> = BTreeMap::new();
+    // Contract M9d D10: scip-go exits 0 when packages fail to load; its locals' signatures
+    // are where the failure shows. Counted as written, before documents merge.
+    let scip_go = tool == "scip-go";
+    let (mut locals, mut locals_invalid_type) = (0, 0);
     for doc in &index.documents {
+        if scip_go {
+            for s in doc
+                .symbols
+                .iter()
+                .filter(|s| s.symbol.starts_with("local "))
+            {
+                locals += 1;
+                locals_invalid_type += usize::from(invalid_type(s));
+            }
+        }
         let path = normalise(&doc.relative_path);
         let encoding = doc.position_encoding.enum_value_or_default();
         let units_per = match encoding {
@@ -296,7 +319,17 @@ pub fn decode(
             .map(|t| format!("{} {}", t.name, t.version))
             .unwrap_or_default(),
         documents,
+        locals,
+        locals_invalid_type,
     })
+}
+
+/// Whether go/types printed a symbol's type as `invalid type`, its spelling for a type it could
+/// not load (contract M9d D10).
+fn invalid_type(s: &scip::types::SymbolInformation) -> bool {
+    s.signature_documentation
+        .as_ref()
+        .is_some_and(|sig| sig.text.contains("invalid type"))
 }
 
 /// The first sign in `blob` (and the index's `text`, when it has one) that the indexer and
@@ -855,6 +888,66 @@ mod tests {
         assert_eq!(s.display_name, "Dog");
         assert_eq!(s.relationships[0].symbol, "scip-java maven . . p/Animal#");
         assert!(s.relationships[0].is_implementation && !s.relationships[0].is_reference);
+    }
+
+    /// Contract M9d D10 (C9): in a scip-go index the decoder counts the local symbols and those
+    /// whose signature text contains `invalid type`, over every document. A global symbol with
+    /// that text is no local; a local without signature documentation is a local typed fine,
+    /// and so is a local named or typed `invalid…` (evaluator pass 1, e08); the same symbols in
+    /// a scip-typescript index count nothing.
+    #[test]
+    fn scip_go_invalid_locals_are_counted() {
+        let symbol = |symbol: &str, signature: Option<&str>| SymbolInformation {
+            symbol: symbol.into(),
+            signature_documentation: signature
+                .map(|text| scip::types::Signature {
+                    language: "go".into(),
+                    text: text.into(),
+                    ..Default::default()
+                })
+                .into(),
+            ..Default::default()
+        };
+        let index_of = |tool: &str| Index {
+            metadata: Some(Metadata {
+                tool_info: Some(ToolInfo {
+                    name: tool.into(),
+                    version: "0.2.7".into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            documents: vec![
+                ScipDocument {
+                    relative_path: "app/a.go".into(),
+                    symbols: vec![
+                        symbol("local 0", Some("var u invalid type")),
+                        symbol("local 1", Some("var n int")),
+                        // Named or typed `invalid…`, without `invalid type`: typed fine.
+                        symbol("local 2", Some("var invalidCount int")),
+                        symbol("local 3", Some("var e *invalidRequestError")),
+                        // A global with the text: not a local, never counted.
+                        symbol(
+                            "scip-go gomod example.com/app . `example.com/app`/Bad().",
+                            Some("func Bad() invalid type"),
+                        ),
+                    ],
+                    ..Default::default()
+                },
+                ScipDocument {
+                    relative_path: "app/b.go".into(),
+                    symbols: vec![symbol("local 0", None)],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let go = decode(&encode(&index_of("scip-go")), &|_| None).unwrap();
+        assert_eq!((go.locals_invalid_type, go.locals), (1, 5));
+        let ts = decode(&encode(&index_of("scip-typescript")), &|_| None).unwrap();
+        assert_eq!((ts.locals_invalid_type, ts.locals), (0, 0));
     }
 
     /// Merging duplicate documents must not compare every occurrence with every other one:

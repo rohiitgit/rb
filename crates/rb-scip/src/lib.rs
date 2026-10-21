@@ -27,4 +27,6 @@ pub use orchestrate::{
 };
 pub mod symbol;
 
-pub use symbol::{Package, last_descriptor_name, may_name, package, type_symbol_of};
+pub use symbol::{
+    NameForms, Package, SymbolParts, last_descriptor_name, may_name, package, type_symbol_of,
+};

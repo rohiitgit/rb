@@ -201,5 +201,29 @@
   "old": " && k.class != \"table_ops\"",
   "new": "",
   "what": "table_ops rows counted as edges"
+ },
+ {
+  "id": "m408",
+  "test": "run::tests::a_dump_of_another_commit_is_refused",
+  "file": "run.rs",
+  "old": "    if !dump.commit.eq_ignore_ascii_case(&target.sha) {\n",
+  "new": "    if false {\n",
+  "what": "check_pin bypassed: a dump of another commit is scored against the manifest's pin (m9, after M9d)"
+ },
+ {
+  "id": "m409",
+  "test": "run::tests::a_dump_of_another_commit_is_refused",
+  "file": "run.rs",
+  "old": "    if !dump.commit.eq_ignore_ascii_case(&target.sha) {\n",
+  "new": "    if dump.commit != target.sha {\n",
+  "what": "check_pin case-sensitive: the pinned commit in another letter case is refused (m9, after M9d)"
+ },
+ {
+  "id": "m410",
+  "test": "compare::tests::a_vanished_sample_family_fails",
+  "file": "compare.rs",
+  "old": "    let sample_families: BTreeSet<_> = base.samples.keys().chain(head.samples.keys()).collect();\n",
+  "new": "    let sample_families: BTreeSet<_> = head.samples.keys().collect();\n",
+  "what": "the exact-sample gate reads the head's families only: a family the base sampled can vanish unseen (m9, after M9d)"
  }
 ]

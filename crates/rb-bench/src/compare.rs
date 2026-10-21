@@ -120,8 +120,14 @@ pub fn compare(base: &Scoreboard, head: &Scoreboard, accept: &Accept) -> Report 
     }
     // The `exact` sample (T5): a drawn edge without a verdict, or one more wrong `exact` edge,
     // fails whatever the accept file says.
-    for (family, h) in &head.samples {
+    let sample_families: BTreeSet<_> = base.samples.keys().chain(head.samples.keys()).collect();
+    for family in sample_families {
         let b = base.samples.get(family).copied().unwrap_or_default();
+        let Some(h) = head.samples.get(family) else {
+            exit = REGRESSION;
+            let _ = writeln!(out, "REGRESSION exact sample {family}: family vanished");
+            continue;
+        };
         if h.missing > 0 {
             exit = REGRESSION;
             let _ = writeln!(
@@ -428,6 +434,31 @@ mod tests {
         assert_eq!(rep.exit, REGRESSION);
         assert!(
             rep.text.contains("wrong 1 → 2 (never acceptable)"),
+            "{}",
+            rep.text
+        );
+    }
+
+    /// A family the base sampled but the head does not is a regression: its verdicts would
+    /// otherwise leave the gate unread.
+    #[test]
+    fn a_vanished_sample_family_fails() {
+        use crate::sample::Tally;
+        let mut b = one(record(1, 0, 0));
+        b.samples.insert(
+            "sql".to_owned(),
+            Tally {
+                right: 59,
+                wrong: 1,
+                missing: 0,
+            },
+        );
+        let h = one(record(1, 0, 0));
+        let rep = run(&b, &h, "");
+        assert_eq!(rep.exit, REGRESSION, "{}", rep.text);
+        assert!(
+            rep.text
+                .contains("REGRESSION exact sample sql: family vanished"),
             "{}",
             rep.text
         );

@@ -15,7 +15,9 @@ pub struct ScipCacheEntry {
     /// by an older binary, is a miss.
     pub status: String,
     /// The phase a `failed` run stopped in (`fetch` or `index`; contract M3b amendment 56); a
-    /// `failed` row without one, written by an older binary, is a miss.
+    /// `failed` row without one, written by an older binary, is a miss. `fetch` on an `ok`
+    /// row: a scip-python index made without its environment (contract M9d D4); `index` on an
+    /// `ok` row: a scip-go index made without its workspace (D5b).
     pub phase: Option<String>,
     /// `index.scip` bytes when `ok`.
     pub index: Option<Vec<u8>>,
@@ -171,7 +173,8 @@ pub(crate) fn run_projects(
         .iter()
         .map(|f| (f.path.as_str(), f.blob_sha.as_str()))
         .collect();
-    // The manifest reader of D5: `package.json` files and workspace roots' `yarn.lock`.
+    // The manifest reader of D5: `package.json` files and workspace roots' `yarn.lock`, Go
+    // roots' `go.mod` (contract M9d D7) and the `pom.xml` files under Maven roots (D12).
     let read_path = |path: &str| blobs.get(path).and_then(|blob| read_blob(blob).ok());
     let plan = rb_scip::jobs(&paths, &read_path);
     let mut out = Vec::new();
@@ -251,7 +254,11 @@ pub(crate) fn run_projects(
                         // Contract M6d S1/S2: scip-go exports like scip-java
                         // (root-relative); scip-python is repository-shaped
                         // like scip-typescript; both revisited with evidence in S5.
+                        // Contract M9d D6: a scip-go job with a replace target outside
+                        // its root is repository-shaped, so the replace resolves.
+                        let repository_shaped = !job.replace_targets.is_empty();
                         let path = match job.indexer {
+                            rb_scip::Indexer::ScipGo if repository_shaped => (*path).to_owned(),
                             rb_scip::Indexer::ScipJava | rb_scip::Indexer::ScipGo => {
                                 relative(path, &job.root)
                             }
@@ -290,7 +297,8 @@ pub(crate) fn run_projects(
         project.status = status;
         project.elapsed_ms = entry.elapsed_ms;
         project.stderr_tail = entry.stderr_tail;
-        if let (RunStatus::Ok, Some(bytes)) = (&project.status, &entry.index) {
+        // Either `ok`: with its environment, or without it (contract M9d D4).
+        if let (true, Some(bytes)) = (project.status.is_ok(), &entry.index) {
             let source_of = |doc: &str| {
                 let path = join_root(&job.root, doc);
                 blobs.get(path.as_str()).and_then(|b| read_blob(b).ok())
@@ -329,6 +337,10 @@ pub(crate) struct JobFiles<'b> {
 /// The reason a job whose lockfile links outside the repository is `unsupported`; it names no
 /// path of the host or the repository (contract M6a D7).
 const LINK_OUTSIDE: &str = "link target outside the repository";
+
+/// The reason a scip-go job whose `go.mod` replaces a module with a directory outside the
+/// repository is `unsupported` (contract M9d D6); it names no path.
+const REPLACE_OUTSIDE: &str = "replace target outside the repository";
 
 /// The files of `job`'s root, and for a scip-typescript job whose root holds a
 /// `package-lock.json` the tracked files (outside any `node_modules`) of each directory the
@@ -373,6 +385,17 @@ pub(crate) fn job_files<'b>(
             Some(manifest) => yarn_file_targets(&job.root, &manifest)?,
             None => Vec::new(),
         },
+        // Contract M9d D6: a scip-go job's local replace targets outside its root, resolved
+        // like links; one leaving the repository makes the job `unsupported`.
+        rb_scip::jobs::Fetch::Go => {
+            let mut dirs = BTreeSet::new();
+            for target in &job.replace_targets {
+                let dir =
+                    resolve_link(&job.root, target).map_err(|_| REPLACE_OUTSIDE.to_owned())?;
+                dirs.extend(dir);
+            }
+            dirs.into_iter().collect()
+        }
         _ => Vec::new(),
     };
     let mut exported_targets = 0;
@@ -873,6 +896,102 @@ mod tests {
         assert_eq!(*retry.runs.borrow(), 2);
     }
 
+    /// Contract M9d D4 (C4): a scip-python job whose fetch failed and whose index ran without
+    /// the environment is cached as `ok` in the `fetch` phase with the fetch's tail, its index
+    /// is decoded, and the row is served as the same status next time without a run.
+    #[test]
+    fn python_fallback_rows_round_trip() {
+        /// The fetch fails (Poetry's sdist build, as on fastapi_realworld); the index writes
+        /// a one-document index of `src/a.py`.
+        struct FetchFails {
+            runs: RefCell<usize>,
+            index: Vec<u8>,
+        }
+        impl Runner for FetchFails {
+            fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
+                *self.runs.borrow_mut() += 1;
+                let index = run.network == rb_scip::Network::None;
+                if index {
+                    std::fs::write(run.host_cwd().join("index.scip"), &self.index)?;
+                }
+                Ok(Outcome {
+                    exit_code: Some(i32::from(!index)),
+                    timed_out: false,
+                    stderr_tail: if index {
+                        String::new()
+                    } else {
+                        "ChefBuildError: pyyaml (6.0)".into()
+                    },
+                    elapsed: std::time::Duration::from_millis(7),
+                })
+            }
+            fn image_id(&self, image: &str) -> Option<String> {
+                (image == rb_scip::egress::PROXY_IMAGE).then(|| "sha256:proxy".to_owned())
+            }
+            fn start_proxy(&self, _: &rb_scip::ProxySpec) -> anyhow::Result<String> {
+                Ok("10.9.8.7".to_owned())
+            }
+            fn stop_proxy(&self, _: &str) -> String {
+                String::new()
+            }
+        }
+        let mut occurrence = field(1, &[0, 4, 5]);
+        occurrence.extend(field(2, b"scip-python python app 0.1.0 `src.a`/f()."));
+        occurrence.extend([3 << 3, 1]);
+        let mut document = field(1, b"src/a.py");
+        document.extend(field(2, &occurrence));
+        let fake = FetchFails {
+            runs: RefCell::new(0),
+            index: field(2, &document),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            entry("svc/pyproject.toml", "1"),
+            entry("svc/poetry.lock", "2"),
+            entry("svc/src/a.py", "3"),
+        ];
+        let read = |_: &str| Ok(b"def f(): pass\n".to_vec());
+        let mut cache = MemCache::default();
+        let opts = options(tmp.path(), &fake);
+        let cold = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
+        assert_eq!(cold.len(), 1);
+        let p = &cold[0];
+        assert_eq!((p.root.as_str(), p.indexer), ("svc", "scip-python"));
+        assert_eq!(
+            (p.status.as_str(), p.status.phase()),
+            ("ok", Some(rb_scip::Phase::Fetch))
+        );
+        assert_eq!(p.stderr_tail, "ChefBuildError: pyyaml (6.0)");
+        assert!(!p.cached);
+        assert_eq!(
+            p.index.as_ref().map(|i| i.documents[0].path.as_str()),
+            Some("src/a.py"),
+            "the index is decoded"
+        );
+        assert_eq!(*fake.runs.borrow(), 2, "fetch and index");
+        assert_eq!(cache.puts, 1, "the fallback is cached");
+        let row = cache.rows.values().next().unwrap();
+        assert_eq!(
+            (
+                row.status.as_str(),
+                row.phase.as_deref(),
+                row.stderr_tail.as_str(),
+                row.index.is_some()
+            ),
+            ("ok", Some("fetch"), "ChefBuildError: pyyaml (6.0)", true)
+        );
+        let warm = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
+        assert_eq!(*fake.runs.borrow(), 2, "no container ran");
+        assert!(warm[0].cached);
+        assert_eq!(warm[0].status, cold[0].status);
+        assert_eq!(warm[0].stderr_tail, cold[0].stderr_tail);
+        assert_eq!(warm[0].index, cold[0].index);
+    }
+
     /// A Maven job with the local image present runs (two fetch runs and the index) and is
     /// cached under the image ID, which is what the project reports as its image.
     #[test]
@@ -1231,6 +1350,9 @@ mod tests {
             fetch: rb_scip::jobs::Fetch::Npm { lockfile },
             projects: vec![".".into()],
             unpinned: false,
+            workspace: Vec::new(),
+            replace_targets: Vec::new(),
+            java_release: None,
         }
     }
 
@@ -1384,6 +1506,206 @@ mod tests {
             !tmp.path().join("work").exists()
                 || !tmp.path().join("work").read_dir().unwrap().any(|_| true)
         );
+    }
+
+    fn go_job(root: &str, replace_targets: &[&str]) -> rb_scip::Job {
+        rb_scip::Job {
+            root: root.into(),
+            indexer: rb_scip::Indexer::ScipGo,
+            fetch: rb_scip::jobs::Fetch::Go,
+            projects: Vec::new(),
+            unpinned: false,
+            workspace: Vec::new(),
+            replace_targets: replace_targets.iter().map(|t| (*t).to_owned()).collect(),
+            java_release: None,
+        }
+    }
+
+    /// Every file under `dir`, relative to `root`.
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.push(path.strip_prefix(root).unwrap().display().to_string());
+            }
+        }
+    }
+
+    /// Records each run's working directory and its export's files, read while it runs; knows
+    /// the scip-go image.
+    #[derive(Default)]
+    struct GoRecorder {
+        runs: RefCell<Vec<(String, Vec<String>)>>,
+    }
+
+    impl Runner for GoRecorder {
+        fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
+            let mut files = Vec::new();
+            walk(&run.workdir, &run.workdir, &mut files);
+            files.sort();
+            self.runs.borrow_mut().push((run.cwd.clone(), files));
+            if run.network == rb_scip::Network::None {
+                std::fs::write(run.host_cwd().join("index.scip"), index_bytes())?;
+            }
+            Ok(Outcome {
+                exit_code: Some(0),
+                timed_out: false,
+                stderr_tail: String::new(),
+                elapsed: std::time::Duration::from_millis(7),
+            })
+        }
+
+        fn image_id(&self, image: &str) -> Option<String> {
+            match image {
+                rb_scip::egress::PROXY_IMAGE => Some("sha256:proxy".to_owned()),
+                rb_scip::jobs::SCIP_GO_IMAGE => Some("sha256:go".to_owned()),
+                _ => None,
+            }
+        }
+
+        fn start_proxy(&self, _: &rb_scip::ProxySpec) -> anyhow::Result<String> {
+            Ok("10.9.8.7".to_owned())
+        }
+
+        fn stop_proxy(&self, _: &str) -> String {
+            String::new()
+        }
+    }
+
+    /// Contract M9d D6 (C6): a scip-go job's replace target inside the repository and outside
+    /// its root (mattermost `tools/sharedchannel-test` → `../../server/public`) is exported
+    /// with its tracked files and counted; a sibling directory is not. Through
+    /// `run_projects`, where the planner reads the `go.mod`: that job's export is
+    /// repository-shaped and its container starts in the root, while a plain Go job's export
+    /// stays root-relative and starts at its top.
+    #[test]
+    fn go_replace_targets_inside_the_repository_are_exported() {
+        let paths = [
+            "tools/sct/go.mod",
+            "tools/sct/main.go",
+            "server/public/go.mod",
+            "server/public/model/a.go",
+            "server/app.go",
+            "README.md",
+        ];
+        let blobs: BTreeMap<&str, &str> = paths.iter().map(|p| (*p, "b")).collect();
+        let none = |_: &str| None;
+        let selected = job_files(
+            &go_job("tools/sct", &["../../server/public"]),
+            &blobs,
+            &none,
+        )
+        .unwrap();
+        assert_eq!(selected.link_targets, 1, "server/public");
+        let files: Vec<&str> = selected.files.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            files,
+            [
+                "server/public/go.mod",
+                "server/public/model/a.go",
+                "tools/sct/go.mod",
+                "tools/sct/main.go",
+            ]
+        );
+        let plain = job_files(&go_job("tools/sct", &[]), &blobs, &none).unwrap();
+        assert_eq!(plain.link_targets, 0);
+        assert_eq!(plain.files.len(), 2);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            entry("tools/sct/go.mod", "1"),
+            entry("tools/sct/main.go", "2"),
+            entry("server/public/go.mod", "3"),
+            entry("server/public/model/a.go", "4"),
+            entry("api/go.mod", "5"),
+            entry("api/main.go", "6"),
+        ];
+        let read = |blob: &str| {
+            Ok(match &blob[..1] {
+                "1" => b"module example.com/sct\n\nrequire example.com/public v0.4.0\n\nreplace example.com/public => ../../server/public\n".to_vec(),
+                "3" => b"module example.com/public\n".to_vec(),
+                "5" => b"module example.com/api\n".to_vec(),
+                _ => b"package x\n".to_vec(),
+            })
+        };
+        let recorder = GoRecorder::default();
+        let mut cache = MemCache::default();
+        let opts = options(tmp.path(), &recorder);
+        let (ran, _) =
+            run_projects(&files, &read, &Mode::Run(&recorder), &opts, &mut cache).unwrap();
+        let roots: Vec<&str> = ran.iter().map(|p| p.root.as_str()).collect();
+        assert_eq!(roots, ["api", "server/public", "tools/sct"]);
+        assert_eq!(ran[2].link_targets, 1);
+        let runs = recorder.runs.borrow();
+        assert_eq!(runs.len(), 6, "fetch and index per job");
+        // Each job's fetch, as its export stood.
+        assert_eq!(
+            runs[0],
+            (
+                "".to_owned(),
+                vec!["go.mod".to_owned(), "main.go".to_owned()]
+            ),
+            "a plain Go job stays root-relative"
+        );
+        assert_eq!(
+            runs[4],
+            (
+                "tools/sct".to_owned(),
+                [
+                    "server/public/go.mod",
+                    "server/public/model/a.go",
+                    "tools/sct/go.mod",
+                    "tools/sct/main.go",
+                ]
+                .map(String::from)
+                .to_vec()
+            ),
+            "repository-shaped, the container in the root"
+        );
+    }
+
+    /// Contract M9d D6 (C6): a replace target that leaves the repository (or an absolute
+    /// path) makes the job `unsupported` with a reason that names no path; nothing is
+    /// exported, run or cached.
+    #[test]
+    fn go_replace_targets_outside_are_unsupported() {
+        let blobs: BTreeMap<&str, &str> = ["tools/sct/go.mod", "tools/sct/main.go"]
+            .iter()
+            .map(|p| (*p, "b"))
+            .collect();
+        let none = |_: &str| None;
+        for target in ["../../../x", "/opt/x"] {
+            assert_eq!(
+                job_files(&go_job("tools/sct", &[target]), &blobs, &none).err(),
+                Some("replace target outside the repository".to_owned()),
+                "{target}"
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            entry("tools/sct/go.mod", "1"),
+            entry("tools/sct/main.go", "2"),
+        ];
+        let read = |blob: &str| {
+            Ok(if blob.starts_with('1') {
+                b"module example.com/sct\n\nreplace example.com/public => ../../../public\n"
+                    .to_vec()
+            } else {
+                b"package main\n".to_vec()
+            })
+        };
+        let recorder = GoRecorder::default();
+        let mut cache = MemCache::default();
+        let opts = options(tmp.path(), &recorder);
+        let (ran, _) =
+            run_projects(&files, &read, &Mode::Run(&recorder), &opts, &mut cache).unwrap();
+        assert_eq!(
+            ran[0].status,
+            RunStatus::Unsupported("replace target outside the repository".into())
+        );
+        assert_eq!((recorder.runs.borrow().len(), cache.puts), (0, 0));
     }
 
     /// The cache key covers every exported file: one byte of a link target's file changes it

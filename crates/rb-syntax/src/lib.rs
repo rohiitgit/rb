@@ -170,7 +170,9 @@ pub struct Definition {
     /// Python class bodies: `NAME = 'string'` assignments (e.g. `__tablename__`), in order.
     #[serde(default)]
     pub class_constants: Vec<ClassConstant>,
-    /// Declared type parameters (`BaseRepo<T, ID>` → `T`, `ID`), for Java and TypeScript.
+    /// Declared type parameters (`BaseRepo<T, ID>` → `T`, `ID`), for Java and TypeScript; for
+    /// Go a function's or type's own, and the type arguments a method's receiver names
+    /// (contract M9c amendment 3).
     #[serde(default)]
     pub type_params: Vec<String>,
     /// The declared return type as written, type arguments included: a Java method's (`void`
@@ -178,6 +180,10 @@ pub struct Definition {
     /// S1).
     #[serde(default)]
     pub return_type: Option<String>,
+    /// Go `type A = B`: the target type as written (contract M9c D3); `None` for every other
+    /// definition.
+    #[serde(default)]
+    pub alias_of: Option<String>,
     /// Modifiers as written, sorted: Java `public`, `protected`, `private`, `static`,
     /// `abstract`, `final`, `default`; TS/JS `export`, `export_default`, `abstract`, `static`.
     #[serde(default)]
@@ -656,6 +662,10 @@ pub struct Binding {
     /// Java: a field or local declarator has an initialiser (`= …`), whatever its kind.
     #[serde(default)]
     pub initialised: bool,
+    /// Go: an embedded struct field (`*SqlStore`, `store.Base`), a member named by its type's
+    /// last segment (contract M9c D3). Never a supertype.
+    #[serde(default)]
+    pub embedded: bool,
 }
 
 /// Parses `source` and extracts its definitions and references.
@@ -723,6 +733,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
             class_constants: decorations::class_constants(language, d.node, source),
             type_params: decorations::type_params(language, d.node, source),
             return_type: decorations::return_type(language, d.node, source),
+            alias_of: decorations::alias_of(language, d.node, source),
             modifiers: decorations::modifiers(language, d.node, source),
         })
         .collect();
@@ -828,6 +839,7 @@ pub fn extract(language: Language, source: &[u8]) -> anyhow::Result<FileFacts> {
                 nested_type_args: b.nested_type_args,
                 modifiers: b.modifiers,
                 initialised: b.initialised,
+                embedded: b.embedded,
             }
         })
         .collect();
@@ -1539,6 +1551,171 @@ export function hash(s: string): string {
         assert_eq!(
             outline(Language::Go, other_fn),
             ["function f@1:5", "type f.T@2:6", "method T.M@4:11"]
+        );
+    }
+
+    /// Contract M9c C4 (D3), one row per bullet: a Go function's or method's result as written;
+    /// `type A = B` as a type definition carrying its target as written; an embedded field
+    /// (`*SqlStore`, `store.Base`) as a member binding named by its type's last segment, `*`
+    /// stripped, typed by it and marked embedded. Named fields stay as they were.
+    #[test]
+    fn go_results_aliases_and_embedded_fields_are_facts() {
+        let src = "package p
+func F() int { return 1 }
+func New() (*Service, error) { return nil, nil }
+func (s *Service) Store() store.Store { return nil }
+func Run() {}
+type Context = web.Context
+type Local = Service
+type Service struct {
+\t*SqlStore
+\tstore.Base
+\t*sync.Mutex
+\tName string
+\trepo Repo
+\tw, h int
+}
+";
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        let defs: Vec<String> = facts
+            .definitions
+            .iter()
+            .map(|d| {
+                format!(
+                    "{} {} -> {} = {}",
+                    d.kind.as_str(),
+                    d.name,
+                    d.return_type.as_deref().unwrap_or("-"),
+                    d.alias_of.as_deref().unwrap_or("-")
+                )
+            })
+            .collect();
+        assert_eq!(
+            defs,
+            [
+                "function F -> int = -",
+                "function New -> (*Service, error) = -",
+                "method Store -> store.Store = -",
+                "function Run -> - = -",
+                "type Context -> - = web.Context",
+                "type Local -> - = Service",
+                "type Service -> - = -",
+            ]
+        );
+        let members: Vec<String> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.member)
+            .map(|b| {
+                let ty = if b.type_name.is_empty() {
+                    "?"
+                } else {
+                    &b.type_name
+                };
+                let embedded = if b.embedded { " embedded" } else { "" };
+                format!("{}: {ty}{embedded}", b.name)
+            })
+            .collect();
+        assert_eq!(
+            members,
+            [
+                "SqlStore: SqlStore embedded",
+                "Base: store.Base embedded",
+                "Mutex: sync.Mutex embedded",
+                "Name: ?",
+                "repo: Repo",
+                "w: ?",
+                "h: ?",
+            ]
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .filter(|b| !b.member)
+                .all(|b| !b.embedded)
+        );
+    }
+
+    /// Contract M9c amendment 3 (E1): Go type parameters are facts, as for Java and TypeScript:
+    /// a generic function's own, the type arguments a method's receiver names, a generic type's
+    /// own. A result named by one is not a named type, so the resolver refuses it.
+    #[test]
+    fn go_type_parameters_are_facts() {
+        let src = "package p
+func Id[T any](x T) T { return x }
+func Pair[K comparable, V any, W any](k K) V { var v V; return v }
+func (b *Box[E]) Get() E { var e E; return e }
+func (m Map[K, V]) Keys() []K { return nil }
+func (b Box2) Plain() T { return T{} }
+func Plain() T { return T{} }
+type Box[E any] struct{ v E }
+type T struct{}
+";
+        let facts = extract(Language::Go, src.as_bytes()).unwrap();
+        let params: Vec<String> = facts
+            .definitions
+            .iter()
+            .map(|d| format!("{} [{}]", d.name, d.type_params.join(", ")))
+            .collect();
+        assert_eq!(
+            params,
+            [
+                "Id [T]",
+                "Pair [K, V, W]",
+                "Get [E]",
+                "Keys [K, V]",
+                "Plain []",
+                "Plain []",
+                "Box [E]",
+                "T []",
+            ]
+        );
+    }
+
+    /// Contract M9c C6 (D5): Python instantiates a bare class it raises, so `raise A` and
+    /// `raise m.A` are call references (`A`, qualifier `m`). The `from` cause is not one
+    /// (`raise C from e`, `raise E.F from e.cause`), and `raise D()` stays the one call it was.
+    #[test]
+    fn python_raise_is_a_call_reference() {
+        let src = "def f():
+    raise A
+
+def g():
+    raise errors.B
+
+def h(e):
+    raise C from e
+
+def i():
+    raise D()
+
+def j():
+    raise
+
+def k(e):
+    raise E.F from e.cause
+";
+        let facts = extract(Language::Python, src.as_bytes()).unwrap();
+        let calls: Vec<String> = facts
+            .references
+            .iter()
+            .filter(|r| r.kind == RefKind::Call)
+            .map(|r| {
+                let enclosing = r
+                    .enclosing
+                    .map_or("-".to_owned(), |i| facts.definitions[i].name.clone());
+                let qualifier = r
+                    .qualifier
+                    .as_deref()
+                    .map(|q| format!("{q}."))
+                    .unwrap_or_default();
+                format!("{qualifier}{} in {enclosing}", r.name)
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            ["A in f", "errors.B in g", "C in h", "D in i", "E.F in k"]
         );
     }
 
