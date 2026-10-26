@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026-10-27 01:00] (wall clock) B15: scip-go unset encoding reads as bytes; N3 prompt note (bench re-score pending)
+- **B15 (code done, bench pending):** `decode.rs` split the `UnspecifiedPositionEncoding` arm. Unset from `scip-go` now reads as bytes (go/token writes byte columns); unset from `scip-java` still reads as javac columns, from everything else as UTF-16. Explicit encodings are untouched. `PIPELINE` `m9d-1` → `m9d-2`, since dumps move by design. `tasks/todo.md` keeps the item open until the re-score.
+- **Tests first:** `scip_go_unset_encoding_reads_byte_columns` failed before the fix (same raw columns decoded identically for both tools) and passes after; `scip-go` gives `[0,7,0,10]`, `scip-typescript` gives `[0,8,0,10]` on the UTF-16 reading.
+- **Verification on this host:** rb-scip 104, rb-bench 81, rb-indexer 386 passed; fmt and stub scan clean; clippy clean. Targeted e2e with a live DB: `scip_go_chi_sqlx` ok; both noscip `polyglot_monorepo` tests ok; `scip_polyglot_monorepo` ok on the second run. Its first run failed only on cold-image Docker pull chatter in `apps/web`'s tail (image pulled mid-test, absent in the fresh run); unrelated to this diff, fixtures here are ASCII-only so goldens cannot move.
+- **N3:** comment above `PROMPT` in `bench/probe/m9c_synthetic_sample.py` marks the version-waiver sentence synthetic-only. Prompt text unchanged.
+- **Pending (needs the bench corpus, absent here):** cold + warm bench from a clean tree, `cmp` of the two scorings, `compare --perf` vs the M9d record, invariant 0 unclassified. Expectation: mattermost fp 19 → 18, about 440 server and 44 server/public spans shift, all else identical.
+- **Files:** `crates/rb-scip/src/decode.rs`, `crates/rb-indexer/src/lib.rs`, `bench/probe/m9c_synthetic_sample.py`.
+
 ## [2026-10-21 08:03] (wall clock) rb-bench: dumps must match their manifest pin (on `m9`, after M9d)
 - **Pins:** `rb-bench score`, `sample` and `review` refuse a dump whose header commit is not its target's manifest pin (case-insensitive), naming the file (`run::check_pin`). Before, a dump of any checkout was scored as the pinned one.
 - **Sample gate:** `compare` fails with `REGRESSION exact sample <family>: family vanished` when a family the base sampled is missing from the head; it used to read only the head's families.

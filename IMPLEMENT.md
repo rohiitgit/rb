@@ -955,3 +955,14 @@ This file traces decisions from conversation to code. The design lives in `docs/
   - **C16 as measured:** microservices_demo and spring_boot SCIP mode over the strict limits against M9c (CPU 1.200× and 1.333×, RSS 1.544× and 1.237×; spring's instructions 0.702× of P9's binary after E2); **waived under amendment 3, which was written after the first OVER verdict**; signed off by the user on 2026-10-21 ("1.", the option to accept the waiver, after the waiver was explained).
 - **Open:** scip-go's unset `position_encoding` read as UTF-16 (B15, the 19th fp); pip environments never reach scip-python's index; D12's fifth `docker image inspect`. Recorded: kotlin_spring_realworld, webapp and cypress, the 4,093 interface-method references, cross-project `IMPLEMENTS`.
 - **Status:** built; evaluator pass 1 answered (E1–E3), re-closed 2026-10-21; evaluator pass 2 PASS; C16's waiver signed off by the user; closed 2026-10-21.
+
+## B15 scip-go columns, N3 prompt note: implemented 2026-10-27 (bench re-score pending)
+
+- **Discussed and decided:** bench finding B15 (`tasks/bench-findings.md`): scip-go 0.2.7 writes byte columns and leaves `position_encoding` unset, and the decoder read that as UTF-16 for every tool but scip-java. On a line with a non-ASCII byte before an occurrence the span shifts and misses its Tree-sitter site (mattermost's 19th fp). The fix reads unset-as-bytes for `scip-go` only, so no other indexer changes behavior. It moves dumps by design, hence `PIPELINE` `m9d-2`. N3 (evaluator pass 1, amendment 4) only needed a scoping note, since the waiver sentence lives in the synthetic-sample probe script: marked synthetic-only, exact-edge prompts must omit it.
+- **Built:**
+  - `crates/rb-scip/src/decode.rs`: `UnspecifiedPositionEncoding` arm split out; `scip-go` plus unset gives `Units::Bytes`. Module and `unconverted` docs updated. New test `scip_go_unset_encoding_reads_byte_columns`, red first.
+  - `crates/rb-indexer/src/lib.rs`: `PIPELINE` `m9d-1` → `m9d-2` with a doc line.
+  - `bench/probe/m9c_synthetic_sample.py`: N3 comment above `PROMPT`; prompt text unchanged.
+- **Verification (this host, no bench corpus):** rb-scip 104, rb-bench 81, rb-indexer 386 passed; fmt, clippy and stub scan clean. Targeted e2e with live DB: `scip_go_chi_sqlx` ok; noscip polyglot pair ok; `scip_polyglot_monorepo` ok after warming the TS image (first attempt failed solely on cold-pull chatter in a stored tail). Fixtures are ASCII-only, so no golden churn here.
+- **Files:** `crates/rb-scip/src/decode.rs`, `crates/rb-indexer/src/lib.rs`, `bench/probe/m9c_synthetic_sample.py`, `CHANGELOG.md`, `IMPLEMENT.md`.
+- **Status:** code complete and verified as far as this host allows. Open: bench re-score plus `compare` on a corpus host, then close the `tasks/todo.md` B15 checkbox and re-anchor affected goldens. Untouched: pip `--target` envs, lazy `java25` inspect, and the recorded Out of scope items.

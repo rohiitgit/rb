@@ -162,7 +162,8 @@ use serde_json::{Value, json};
 /// are no `Package` (D8, D9); scip-go's `invalid type` locals are counted (D10); Maven releases
 /// above 21 run on the JDK 25 image, the targetroot outside the sources (D12); Gradle marks
 /// protoc tools executable (D13).
-pub const PIPELINE: &str = "m9d-1";
+/// `m9d-2` B15: scip-go's unset `position_encoding` reads as bytes (go/token).
+pub const PIPELINE: &str = "m9d-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path

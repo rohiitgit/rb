@@ -1,6 +1,7 @@
 //! Decoding an `index.scip` (design §5.1). Ranges become 0-based `[line, byte col, line, byte
 //! col]` spans like Tree-sitter's; SCIP's columns are code units in the document's position
-//! encoding, which scip-java and scip-typescript leave unset while meaning UTF-16, and SCIP's
+//! encoding, which scip-java and scip-typescript leave unset while meaning UTF-16, scip-go
+//! leaves unset while meaning bytes (go/token; bench finding B15), and SCIP's
 //! lines are the indexer's, which also end at terminators Tree-sitter does not count as rows
 //! (contract M3b amendment 59).
 
@@ -42,7 +43,8 @@ pub struct Document {
     pub occurrences: Vec<Occurrence>,
     pub symbols: Vec<SymbolInfo>,
     /// Occurrences whose columns could not be converted (no source text): kept as code units.
-    /// Both supported indexers leave the encoding unset and mean UTF-16, which is assumed then.
+    /// scip-java and scip-typescript leave the encoding unset and mean UTF-16, scip-go leaves
+    /// it unset and means bytes; that is assumed then.
     pub unconverted: usize,
     /// Set when the text shows that the indexer and Tree-sitter may read the file differently
     /// (contract M3b amendment 64); the join then leaves the whole file to Tier B.
@@ -201,10 +203,21 @@ pub fn decode(
         let units_per = match encoding {
             PositionEncoding::UTF8CodeUnitOffsetFromLineStart => Units::Bytes,
             PositionEncoding::UTF32CodeUnitOffsetFromLineStart => Units::Chars,
-            PositionEncoding::UTF16CodeUnitOffsetFromLineStart
-            | PositionEncoding::UnspecifiedPositionEncoding => {
+            PositionEncoding::UTF16CodeUnitOffsetFromLineStart => {
                 if scip_java {
                     Units::Javac
+                } else {
+                    Units::Utf16
+                }
+            }
+            // scip-go leaves the encoding unset while writing byte columns
+            // (go/token; bench finding B15). Every other indexer that leaves
+            // it unset means UTF-16 (scip-java: javac columns).
+            PositionEncoding::UnspecifiedPositionEncoding => {
+                if scip_java {
+                    Units::Javac
+                } else if scip_go {
+                    Units::Bytes
                 } else {
                     Units::Utf16
                 }
@@ -854,6 +867,51 @@ mod tests {
         let got = decode(&encode(&index), &|_| None).unwrap();
         assert_eq!(got.documents[0].occurrences[0].span, [0, 2, 0, 3]);
         assert_eq!(got.documents[0].unconverted, 4);
+    }
+
+    /// Bench finding B15: scip-go leaves `position_encoding` unset while writing byte
+    /// columns (go/token). An unset encoding from scip-go reads as bytes; from any other
+    /// indexer it still reads as UTF-16 (scip-java: javac columns).
+    #[test]
+    fn scip_go_unset_encoding_reads_byte_columns() {
+        // `é` is 2 bytes, 1 UTF-16 unit: `foo` starts at byte 7, UTF-16 unit 6.
+        let text = "v \"é\" foo\n";
+        let index_of = |tool: &str| Index {
+            metadata: Some(Metadata {
+                tool_info: Some(ToolInfo {
+                    name: tool.into(),
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            })
+            .into(),
+            documents: vec![ScipDocument {
+                relative_path: "a.go".into(),
+                occurrences: vec![{
+                    let mut o = occ("scip-go gomod . . p/foo().", 0);
+                    o.range = vec![0, 7, 10];
+                    o
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let spans = |tool: &str| {
+            decode(&encode(&index_of(tool)), &|_| {
+                Some(text.as_bytes().to_vec())
+            })
+            .unwrap()
+            .documents[0]
+                .occurrences[0]
+                .span
+        };
+        assert_eq!(spans("scip-go"), [0, 7, 0, 10]);
+        assert_eq!(
+            spans("scip-typescript"),
+            [0, 8, 0, 10],
+            "same raw columns read as UTF-16 units (end clamps to the line)"
+        );
     }
 
     #[test]
