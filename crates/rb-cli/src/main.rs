@@ -641,7 +641,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                 rb_scip::docker_available().map_err(|e| {
                     anyhow::anyhow!("{e}; the current scip-java image is unknown, nothing pruned")
                 })?;
-                let images = rb_scip::Images::resolve(&rb_scip::DockerRunner::default());
+                let images = rb_scip::Images::resolve(&rb_scip::DockerRunner::default(), false);
                 let java = images
                     .java
                     .map_err(|e| anyhow::anyhow!("{e}; nothing pruned"))?;
@@ -1187,7 +1187,8 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         eprintln!("waiting: another rb index of {repo} is running");
         store.lock_index(&repo)?;
     }
-    let commit_sha = rb_git::Repo::open(&path)?.resolve_commit(&rev)?;
+    let git_repo = rb_git::Repo::open(&path)?;
+    let commit_sha = git_repo.resolve_commit(&rev)?;
     // Decided here, before the "up to date" check: a snapshot indexed without Docker, or
     // without an indexer image, is heuristic and must be rebuilt once they answer (contract M3b
     // amendments 17 and 29). The images are looked up once; the jobs run in and cache under
@@ -1200,8 +1201,36 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
             Err(reason) => rb_indexer::ScipMode::Unavailable(reason),
         }
     };
+    // Contract D12-lazy: plan the jobs once to learn whether any needs JDK 25, so the
+    // java25 image is resolved (and recorded) only then. Planned from the full tree, a
+    // superset of what `index_commit` plans from, so the flag can only over-approximate:
+    // a missed job is impossible, an extra lookup harmless. Contract Part B: any Maven
+    // job also resolves it, as the fallback for an externally-dictated release needs it.
+    let (need_jdk25, has_maven) = if scip_mode == rb_indexer::ScipMode::On {
+        let manifest = git_repo.manifest(&commit_sha)?;
+        let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+        let read = |wanted: &str| {
+            manifest
+                .files
+                .iter()
+                .find(|f| f.path == wanted)
+                .and_then(|f| git_repo.blob(&f.blob_sha).ok())
+        };
+        let plan = rb_scip::jobs(&paths, &read);
+        (
+            plan.needs_jdk25(),
+            plan.jobs
+                .iter()
+                .any(|j| matches!(j.fetch, rb_scip::jobs::Fetch::Maven)),
+        )
+    } else {
+        (false, false)
+    };
+    let java25 = need_jdk25 || has_maven;
     let images = match &scip_mode {
-        rb_indexer::ScipMode::On => rb_scip::Images::resolve(&rb_scip::DockerRunner::default()),
+        rb_indexer::ScipMode::On => {
+            rb_scip::Images::resolve(&rb_scip::DockerRunner::default(), java25)
+        }
         rb_indexer::ScipMode::Unavailable(detail) => {
             // The detail names the host (its socket path); the stored reason does not
             // (contract M3b amendment 49).
@@ -1210,7 +1239,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         }
         rb_indexer::ScipMode::Off => rb_scip::Images::unresolved(),
     };
-    let tools = tool_versions(&scip_mode, &images);
+    let tools = tool_versions(&scip_mode, &images, java25);
 
     if !force && let Some(live) = store.live_snapshot(&repo)? {
         let scip_on = scip_mode == rb_indexer::ScipMode::On;
@@ -1829,7 +1858,7 @@ fn gc_lines(done: &rb_store::GcPlan, dry_run: bool) -> String {
 /// `on` the identity of each indexer image (the pinned one's digest reference; the local one's
 /// ID, or `absent`; contract M3b amendments 29 and 48), since a graph indexed without an image
 /// is heuristic and a rebuilt image may index differently.
-fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value {
+fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images, jdk25: bool) -> Value {
     let mut tools = json!({
         "rb": env!("CARGO_PKG_VERSION"),
         "pipeline": rb_indexer::PIPELINE,
@@ -1838,8 +1867,11 @@ fn tool_versions(scip: &rb_indexer::ScipMode, images: &rb_scip::Images) -> Value
     });
     if *scip == rb_indexer::ScipMode::On {
         tools["scip_java"] = images.identity(rb_scip::jobs::Indexer::ScipJava).into();
-        // Contract M9d D12: the JDK 25 scip-java image, for Maven releases above 21.
-        tools["scip_java25"] = images.java25_identity().into();
+        // Contract D12-lazy: the JDK 25 scip-java image, for Maven releases above 21.
+        // Recorded only when a planned job needs it, so other runs skip the lookup.
+        if jdk25 {
+            tools["scip_java25"] = images.java25_identity().into();
+        }
         tools["scip_typescript"] = images
             .identity(rb_scip::jobs::Indexer::ScipTypescript)
             .into();
@@ -3574,6 +3606,7 @@ mod tests {
     /// Contract M6d S1 (evaluator pass 1, E1-1): the locally built scip-go
     /// image and the pinned scip-python image are recorded too, so a rebuilt
     /// image is never served as "up to date".
+    /// Contract D12-lazy: `scip_java25` is recorded only when a job needs JDK 25.
     #[test]
     fn tool_versions_record_image_identities_when_scip_is_on() {
         let images = rb_scip::Images {
@@ -3582,13 +3615,17 @@ mod tests {
             go: Err("absent".into()),
             proxy: Ok("sha256:proxy".into()),
         };
-        let on = tool_versions(&rb_indexer::ScipMode::On, &images);
+        let on = tool_versions(&rb_indexer::ScipMode::On, &images, true);
         assert_eq!(on["scip"], "on");
         assert_eq!(on["scip_java"], "absent");
         assert_eq!(on["scip_java25"], "absent");
         assert_eq!(on["scip_typescript"], rb_scip::jobs::SCIP_TYPESCRIPT_IMAGE);
         assert_eq!(on["scip_go"], "absent");
         assert_eq!(on["scip_python"], rb_scip::jobs::SCIP_PYTHON_IMAGE);
+        // Without a JDK 25 job the key is not recorded at all.
+        let unneeded = tool_versions(&rb_indexer::ScipMode::On, &images, false);
+        assert!(unneeded.get("scip_java25").is_none());
+        assert_eq!(unneeded["scip_java"], "absent");
         let present = rb_scip::Images {
             java: Ok("sha256:abc".into()),
             java25: Ok("sha256:abc".into()),
@@ -3596,11 +3633,11 @@ mod tests {
             proxy: Ok("sha256:proxy".into()),
         };
         assert_eq!(
-            tool_versions(&rb_indexer::ScipMode::On, &present)["scip_java"],
+            tool_versions(&rb_indexer::ScipMode::On, &present, true)["scip_java"],
             "sha256:abc"
         );
         assert_eq!(
-            tool_versions(&rb_indexer::ScipMode::On, &present)["scip_go"],
+            tool_versions(&rb_indexer::ScipMode::On, &present, true)["scip_go"],
             "sha256:abc"
         );
         let jdk25 = rb_scip::Images {
@@ -3608,16 +3645,21 @@ mod tests {
             ..present.clone()
         };
         assert_eq!(
-            tool_versions(&rb_indexer::ScipMode::On, &jdk25)["scip_java25"],
+            tool_versions(&rb_indexer::ScipMode::On, &jdk25, true)["scip_java25"],
             "sha256:jdk25"
         );
         assert_eq!(on["pipeline"], rb_indexer::PIPELINE);
-        let off = tool_versions(&rb_indexer::ScipMode::Off, &rb_scip::Images::unresolved());
+        let off = tool_versions(
+            &rb_indexer::ScipMode::Off,
+            &rb_scip::Images::unresolved(),
+            false,
+        );
         assert_eq!(off["scip"], "off");
         assert!(off.get("scip_java").is_none() && off.get("scip_typescript").is_none());
         let unavailable = tool_versions(
             &rb_indexer::ScipMode::Unavailable("no docker".into()),
             &rb_scip::Images::unresolved(),
+            false,
         );
         assert!(unavailable.get("scip_java").is_none());
         assert_eq!(

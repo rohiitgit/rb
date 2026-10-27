@@ -1,0 +1,21 @@
+[
+ {
+  "id": "m413",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::resolve_skips_the_jdk25_lookup_when_no_job_needs_it",
+  "file": "orchestrate.rs",
+  "old": "            java25: if jdk25 {\n",
+  "new": "            java25: if true {\n",
+  "what": "D12-lazy flag ignored: the java25 image is always inspected"
+ },
+ {
+  "id": "m414",
+  "crate": "rb-cli",
+  "bin": "rb",
+  "test": "tool_versions_record_image_identities_when_scip_is_on",
+  "file": "main.rs",
+  "old": "        if jdk25 {\n",
+  "new": "        if true {\n",
+  "what": "D12-lazy flag ignored: scip_java25 is always recorded"
+ }
+]

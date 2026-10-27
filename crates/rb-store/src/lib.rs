@@ -349,6 +349,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0007_repo_checkout",
         include_str!("../../../migrations/0007_repo_checkout.sql"),
     ),
+    (
+        "0008_scip_jdk_phase",
+        include_str!("../../../migrations/0008_scip_jdk_phase.sql"),
+    ),
 ];
 
 /// Name of the newest embedded migration; recorded in each snapshot's `tool_versions`.

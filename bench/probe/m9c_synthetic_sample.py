@@ -25,6 +25,10 @@ import sys
 
 SYNTHETIC = 3  # rb_model::Certainty::Synthetic
 
+# N3 (evaluator pass 1, contract-m9d amendment 4): the "The version in a key does not
+# matter ..." sentence below is SYNTHETIC-ONLY. It tells judges to accept a version-skewed
+# resolution, which is correct when judging `synthetic` joins but pre-empts the very question
+# a cross-module `exact` edge asks. Do not copy it into any prompt that judges `exact` edges.
 PROMPT = """You are an adversarial JUDGE. A tool labelled each edge below `synthetic`: it claims each is right, joined by symbol from one Go module's SCIP index to a definition in another module of the same repository. ASSUME EACH EDGE IS FALSE; mark it TRUE only if you can prove it from the source with file:line.
 
 READ only: the edge list {drawn}, and the checkout {checkout} (pinned at the commit named in the edge). Read-only commands (grep, sed, cat, git ls-files, git show) inside that checkout are fine. Do NOT read anything else under {repo}; no rb, rb-bench, cargo, go, node, network.

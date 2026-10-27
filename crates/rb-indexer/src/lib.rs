@@ -162,7 +162,8 @@ use serde_json::{Value, json};
 /// are no `Package` (D8, D9); scip-go's `invalid type` locals are counted (D10); Maven releases
 /// above 21 run on the JDK 25 image, the targetroot outside the sources (D12); Gradle marks
 /// protoc tools executable (D13).
-pub const PIPELINE: &str = "m9d-1";
+/// `m9d-2` B15: scip-go's unset `position_encoding` reads as bytes (go/token).
+pub const PIPELINE: &str = "m9d-2";
 
 /// Name of the repo-root service when no project lives at the root. Files outside every project
 /// belong to it (design §4.3). Its key is the root directory `.`, which Git forbids as a path
@@ -1651,8 +1652,10 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
         Some(reason) => detail["reason"] = reason.into(),
         None => detail["image"] = p.image.as_str().into(),
     }
-    if let Some(phase) = p.status.phase() {
-        detail["phase"] = phase.as_str().into();
+    // The stored phase, not the run phase: a JDK 25 fallback records "jdk" (Part B),
+    // which is no fetch or index phase of its own.
+    if let Some(phase) = p.status.stored_phase() {
+        detail["phase"] = phase.into();
     }
     // Contract M6a D3, D5, D7: only for a grouped workspace root or a job with link targets,
     // so other jobs dump as before.

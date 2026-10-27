@@ -51,8 +51,10 @@ pub const RECIPE_GO_WORK: &str = "m9d-go-2";
 /// default trips on slow wheel reads through the emulated stack). `m9d-py-1`:
 /// a root without a `pyproject.toml` names its project, Poetry's stdout reaches
 /// the tail, and a failed fetch is followed by an index without the
-/// environment (contract M9d D2–D4).
-pub const RECIPE_PY: &str = "m9d-py-1";
+/// environment (contract M9d D2–D4). `m9e-py-1`: the fetch installs into a
+/// mounted `--target` (pip) or an in-project venv (Poetry), and the index sees
+/// it through `PYTHONPATH` (contract pip).
+pub const RECIPE_PY: &str = "m9e-py-1";
 
 /// scip-java's Gradle recipe (contract M6e S2): dependency resolution plus one
 /// online build in the fetch phase, then `scip-java index --build-tool Gradle`
@@ -107,6 +109,11 @@ pub enum RunStatus {
     /// Stored as `ok` with phase `index` (the workspace's index is the part missing);
     /// `stderr_tail` is the workspace run's.
     OkWithoutWorkspace,
+    /// A Maven job whose run failed with `release version {N} not supported` (its effective
+    /// release comes from outside the job, contract Part B) and whose re-run on the JDK 25
+    /// image wrote an index: the index is the JDK 25 one. Stored as `ok` with phase `jdk`;
+    /// `stderr_tail` is the JDK 21 run's.
+    OkWithoutJdk21,
     /// The fetch or index phase failed (contract M3b amendment 56: which one is recorded, as
     /// for a timeout; an index that was not produced or could not be decoded is the index
     /// phase's); `stderr_tail` says why.
@@ -158,7 +165,10 @@ impl RunStatus {
     /// The value stored in `rb.scip_index.status` and reported per project.
     pub fn as_str(&self) -> &'static str {
         match self {
-            RunStatus::Ok | RunStatus::OkWithoutEnvironment | RunStatus::OkWithoutWorkspace => "ok",
+            RunStatus::Ok
+            | RunStatus::OkWithoutEnvironment
+            | RunStatus::OkWithoutWorkspace
+            | RunStatus::OkWithoutJdk21 => "ok",
             RunStatus::Failed(_) => "failed",
             RunStatus::Timeout { .. } => "timeout",
             RunStatus::Unsupported(_) => "unsupported",
@@ -167,12 +177,15 @@ impl RunStatus {
         }
     }
 
-    /// Whether the job wrote an index: `ok`, with its environment or without it (D4), or
-    /// without its workspace (D5b).
+    /// Whether the job wrote an index: `ok`, with its environment or without it (D4),
+    /// without its workspace (D5b), or on JDK 25 after a JDK 21 failure (Part B).
     pub fn is_ok(&self) -> bool {
         matches!(
             self,
-            RunStatus::Ok | RunStatus::OkWithoutEnvironment | RunStatus::OkWithoutWorkspace
+            RunStatus::Ok
+                | RunStatus::OkWithoutEnvironment
+                | RunStatus::OkWithoutWorkspace
+                | RunStatus::OkWithoutJdk21
         )
     }
 
@@ -195,6 +208,19 @@ impl RunStatus {
         }
     }
 
+    /// The `phase` value a finished run is stored under: like [`RunStatus::phase`], plus
+    /// `"jdk"` for an index made on JDK 25 after a JDK 21 failure (Part B), which is no
+    /// fetch or index phase of its own. Anything else is decided again next time.
+    pub fn stored_phase(&self) -> Option<&'static str> {
+        match self {
+            RunStatus::Failed(phase) | RunStatus::Timeout { phase, .. } => Some(phase.as_str()),
+            RunStatus::OkWithoutEnvironment => Some("fetch"),
+            RunStatus::OkWithoutWorkspace => Some("index"),
+            RunStatus::OkWithoutJdk21 => Some("jdk"),
+            _ => None,
+        }
+    }
+
     /// The status a cache row recorded: `ok` (in the `fetch` phase: an index without the
     /// environment, D4; in the `index` phase: an index without the workspace, D5b), or
     /// `failed` with its phase. `None` for any other value (a `timeout`, a `failed` without a
@@ -204,6 +230,7 @@ impl RunStatus {
             ("ok", None) => Some(RunStatus::Ok),
             ("ok", Some("fetch")) => Some(RunStatus::OkWithoutEnvironment),
             ("ok", Some("index")) => Some(RunStatus::OkWithoutWorkspace),
+            ("ok", Some("jdk")) => Some(RunStatus::OkWithoutJdk21),
             ("failed", phase) => phase.and_then(Phase::parse).map(RunStatus::Failed),
             _ => None,
         }
@@ -222,17 +249,19 @@ impl RunStatus {
             RunStatus::Ok
             | RunStatus::OkWithoutEnvironment
             | RunStatus::OkWithoutWorkspace
+            | RunStatus::OkWithoutJdk21
             | RunStatus::Failed(_) => None,
         }
     }
 
     /// What an `ok` job's status line appends when its index is degraded: made without the
-    /// environment after a failed fetch (contract M9d D4), or without the workspace after a
-    /// failed workspace run (D5b).
+    /// environment after a failed fetch (contract M9d D4), without the workspace after a
+    /// failed workspace run (D5b), or on JDK 25 after a JDK 21 failure (contract Part B).
     pub fn note(&self) -> Option<&'static str> {
         match self {
             RunStatus::OkWithoutEnvironment => Some("environment not installed: fetch failed"),
             RunStatus::OkWithoutWorkspace => Some("workspace failed: indexed without go.work"),
+            RunStatus::OkWithoutJdk21 => Some("jdk 21 failed: indexed with JDK 25"),
             _ => None,
         }
     }
@@ -305,7 +334,11 @@ pub struct Images {
 }
 
 impl Images {
-    pub fn resolve(runner: &dyn Runner) -> Images {
+    /// The indexer images on this host, looked up once per `rb index` (contract M3b
+    /// amendment 29). `jdk25` tells whether any planned job needs JDK 25 (contract
+    /// D12-lazy, from the plan): without one the java25 image is not inspected and
+    /// records as not looked up, saving the fifth `docker image inspect` per run.
+    pub fn resolve(runner: &dyn Runner, jdk25: bool) -> Images {
         Images {
             java: runner.image_id(SCIP_JAVA_IMAGE).ok_or_else(|| {
                 format!(
@@ -313,12 +346,18 @@ impl Images {
                      docker/scip-java/README.md describes"
                 )
             }),
-            java25: runner.image_id(SCIP_JAVA25_IMAGE).ok_or_else(|| {
-                format!(
-                    "scip-java: image {SCIP_JAVA25_IMAGE} is not available locally; build it as \
-                     docker/scip-java/README.md describes"
-                )
-            }),
+            java25: if jdk25 {
+                runner.image_id(SCIP_JAVA25_IMAGE).ok_or_else(|| {
+                    format!(
+                        "scip-java: image {SCIP_JAVA25_IMAGE} is not available locally; build it as \
+                         docker/scip-java/README.md describes"
+                    )
+                })
+            } else {
+                Err(format!(
+                    "scip-java: image {SCIP_JAVA25_IMAGE} was not looked up"
+                ))
+            },
             go: runner.image_id(SCIP_GO_IMAGE).ok_or_else(|| {
                 format!(
                     "scip-go: image {SCIP_GO_IMAGE} is not available locally; build it as \
@@ -402,6 +441,25 @@ impl Images {
 /// phase runs behind its own egress proxy, `rb-egress-<that name>`, allowing `egress`'s hosts
 /// (contract M5 S21); its configuration lives in `<that directory>-egress` while it runs.
 ///
+/// Contract Part B: the JDK release a failed Maven run needed, when its tail says the
+/// running JDK does not support it (`error: release version N not supported`). Only
+/// releases the JDK 25 image can build (22–25): anything older is a different problem,
+/// anything newer no image can build, and neither triggers a re-run.
+pub fn jdk_release_needed(tail: &str) -> Option<u32> {
+    let mut rest = tail;
+    while let Some(at) = rest.find("release version ") {
+        rest = &rest[at + "release version ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u32>()
+            && (22..=25).contains(&n)
+            && rest[digits.len()..].starts_with(" not supported")
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
 /// A scip-go workspace job (contract M9d D5) whose workspace run failed, a phase exiting
 /// non-zero (137: an OOM kill) or no index written, runs again exactly as a plain job: a fresh
 /// export without `go.work`, `GOFLAGS=-mod=mod`, `go mod download` (D5b, amendment 2). An
@@ -1166,7 +1224,11 @@ fn go_runs(
     } else {
         let root = workdir.join(&cwd);
         std::fs::create_dir_all(&root)?;
-        std::fs::write(root.join("go.work"), go_work(&root, &job.workspace))?;
+        // Contract Part A: a committed go.work is used as written, never overwritten;
+        // rb writes its generated file only when the export has none.
+        if !root.join("go.work").is_file() {
+            std::fs::write(root.join("go.work"), go_work(&root, &job.workspace))?;
+        }
         env.push(("GOFLAGS".into(), String::new()));
         let at = if cwd.is_empty() {
             "/sources/go.work".to_owned()
@@ -1255,10 +1317,16 @@ fn go_work(root: &Path, workspace: &[String]) -> String {
 /// A workspace job's fetch (contract M9d D5, amendment 1): `go list -deps -test` over `.` and
 /// each workspace directory, without `-e`, so a module that cannot be fetched fails the fetch.
 fn workspace_fetch(workspace: &[String]) -> Vec<String> {
+    // `"."` needs no extra pattern: `./...` already covers the root.
     ["go", "list", "-deps", "-test", "./..."]
         .map(String::from)
         .into_iter()
-        .chain(workspace.iter().map(|dir| format!("./{dir}/...")))
+        .chain(
+            workspace
+                .iter()
+                .filter(|dir| dir.as_str() != ".")
+                .map(|dir| format!("./{dir}/...")),
+        )
         .collect()
 }
 
@@ -1285,7 +1353,22 @@ fn python_runs(
     let workdir = crate::runner::absolute(work_dir)?;
     let pip_cache = crate::runner::absolute(cache_dir)?.join("pip");
     std::fs::create_dir_all(&pip_cache)?;
+    // The installed environment outlives the fetch container: `pip install --target`
+    // lands in `<cache>/pytarget/<root>` (per root, so pins never clobber each other),
+    // mounted at /python-env in both phases like the pip cache; the index phase only
+    // reads it. Poetry installs into an in-project venv instead (see below).
+    let envdir = if job.root.is_empty() {
+        "root".to_owned()
+    } else {
+        job.root.replace('/', "__")
+    };
+    let pytarget = crate::runner::absolute(cache_dir)?
+        .join("pytarget")
+        .join(&envdir);
+    // Created up front: Docker would otherwise create the bind-mount source as root.
+    std::fs::create_dir_all(&pytarget)?;
     let mut caches = vec![(pip_cache, "/root/.cache/pip".into())];
+    caches.push((pytarget, "/python-env".into()));
     if lockfile == PythonLock::Poetry {
         let poetry_cache = crate::runner::absolute(cache_dir)?.join("pypoetry");
         std::fs::create_dir_all(&poetry_cache)?;
@@ -1311,6 +1394,9 @@ fn python_runs(
         env: vec![
             ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
             ("PIP_TIMEOUT".into(), "60".into()),
+            // Contract pip C1: Poetry installs into an in-project venv (see the
+            // index below), which only exists when told to.
+            ("POETRY_VIRTUALENVS_IN_PROJECT".into(), "true".into()),
         ],
         network: Network::Fetch,
         cpus: budget.cpus,
@@ -1328,6 +1414,8 @@ fn python_runs(
             "exec poetry install --no-root --no-interaction 1>&2",
         ]
         .to_vec(),
+        // Contract pip C1: `--target /python-env` installs into the mounted per-root
+        // dir above, which survives into the index container.
         // `--ignore-requires-python`: the image's interpreter (3.10) predates
         // some lockfiles' floors (S11: a `>=3.14` floor fails the fetch
         // otherwise); versions stay pinned, and what the older runtime cannot
@@ -1338,6 +1426,8 @@ fn python_runs(
             "install",
             "--no-deps",
             "--ignore-requires-python",
+            "--target",
+            "/python-env",
             "-r",
             "requirements.txt",
         ]
@@ -1347,6 +1437,8 @@ fn python_runs(
             "install",
             "--no-deps",
             "--ignore-requires-python",
+            "--target",
+            "/python-env",
             "-e",
             ".",
         ]
@@ -1370,10 +1462,24 @@ fn python_runs(
         let name = name.unwrap_or("root");
         index_args.extend(["--project-name", name, "--project-version", "."].map(String::from));
     }
+    // Contract pip C2: the index sees the installed environment through PYTHONPATH:
+    // the mounted target dir, or the in-project venv's site-packages for Poetry
+    // (`<mount>/<root>/.venv`, a pure function of the job root; the image's
+    // interpreter is 3.10, so that suffix is fixed — contract M9d S11).
+    let site_packages = match lockfile {
+        PythonLock::Poetry if job.root.is_empty() => {
+            "/src/.venv/lib/python3.10/site-packages".to_owned()
+        }
+        PythonLock::Poetry => format!("/src/{}/.venv/lib/python3.10/site-packages", job.root),
+        _ => "/python-env".to_owned(),
+    };
+    let mut index_env = base.env.clone();
+    index_env.push(("PYTHONPATH".into(), site_packages));
     let index = ContainerRun {
         network: Network::None,
         timeout: budget.index_timeout,
         args: index_args,
+        env: index_env,
         ..base
     };
     Ok((vec![fetch], index))
@@ -1945,6 +2051,102 @@ mod tests {
         }
     }
 
+    /// Contract Part A (C2): a committed `go.work` is used as written and never
+    /// overwritten: no write happens, but the run is still a workspace run (empty
+    /// `GOFLAGS`, `GOWORK` set, the `go list` fetch). `use .` alone fetches `./...`.
+    #[test]
+    fn a_committed_go_work_file_is_used_as_is() {
+        let committed = "go 1.27\n\nuse .\n";
+        let files: Vec<(String, Vec<u8>)> = [
+            ("go.mod", "module example.com/m\n\ngo 1.21\n"),
+            ("go.work", committed),
+        ]
+        .map(|(p, t)| (p.to_owned(), t.as_bytes().to_vec()))
+        .to_vec();
+        // As the planner now plans it: workspace mode from the committed file.
+        let job = Job {
+            workspace: vec![".".into()],
+            ..go_job()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(false, false);
+        run_job(
+            &job,
+            "sha256:go",
+            &files,
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(
+            fake.go_works.borrow()[0].as_deref(),
+            Some(committed),
+            "the committed file survives the run"
+        );
+        let runs = fake.runs.borrow();
+        for r in runs.iter() {
+            assert_eq!(env_of(r, "GOFLAGS"), [""], "{r:?}");
+        }
+        assert_eq!(env_of(&runs[0], "GOWORK"), ["/sources/go.work"]);
+        assert_eq!(runs[0].args, ["go", "list", "-deps", "-test", "./..."]);
+    }
+
+    /// Contract Part B: only a Maven failure whose tail names an unsupported release
+    /// above 21 triggers the JDK 25 retry (`error: release version N not supported`).
+    /// Anything else, and anything at or below the running JDK, does not.
+    #[test]
+    fn only_an_unsupported_release_tail_requests_a_newer_jdk() {
+        assert_eq!(
+            jdk_release_needed("error: release version 25 not supported"),
+            Some(25)
+        );
+        assert_eq!(
+            jdk_release_needed(
+                "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile (default-compile) on project app: Fatal error compiling: error: release version 25 not supported"
+            ),
+            Some(25)
+        );
+        assert_eq!(
+            jdk_release_needed("error: release version 21 not supported"),
+            None
+        );
+        assert_eq!(
+            jdk_release_needed("error: release version 26 not supported"),
+            None
+        );
+        assert_eq!(jdk_release_needed("BUILD FAILURE"), None);
+        assert_eq!(jdk_release_needed(""), None);
+        assert_eq!(
+            jdk_release_needed("error: release version abc not supported"),
+            None
+        );
+    }
+
+    /// Contract Part B: the retry stores `ok` with phase `jdk`, round-trips through
+    /// [`RunStatus::from_cached`], and carries the suffix; like every other variant.
+    #[test]
+    fn jdk_fallback_status_round_trips() {
+        let ok = RunStatus::OkWithoutJdk21;
+        assert_eq!(ok.as_str(), "ok");
+        assert!(ok.is_ok());
+        assert_eq!(ok.stored_phase(), Some("jdk"));
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("jdk")),
+            Some(RunStatus::OkWithoutJdk21)
+        );
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("jdk")).and_then(|s| s.note()),
+            Some("jdk 21 failed: indexed with JDK 25")
+        );
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("index")),
+            Some(RunStatus::OkWithoutWorkspace)
+        );
+    }
+
     /// Contract M9d D5b (amendment 2, C5b): a workspace run whose fetch or index exits non-zero
     /// (137: an OOM kill), or that writes no index, is run again exactly as a plain job (a
     /// fresh export without go.work, `GOFLAGS=-mod=mod`, `go mod download`). An index from the
@@ -2140,12 +2342,12 @@ mod tests {
             ),
             (
                 PythonLock::Requirements,
-                "pip install --no-deps --ignore-requires-python -r requirements.txt",
+                "pip install --no-deps --ignore-requires-python --target /python-env -r requirements.txt",
                 "/root/.cache/pip",
             ),
             (
                 PythonLock::None,
-                "pip install --no-deps --ignore-requires-python -e .",
+                "pip install --no-deps --ignore-requires-python --target /python-env -e .",
                 "/root/.cache/pip",
             ),
         ] {
@@ -2174,6 +2376,85 @@ mod tests {
                 lines[1]
             );
         }
+    }
+
+    /// Contract pip C1, C2: the fetch installs into a mounted `--target` that survives
+    /// into the index phase, and the index sees it through `PYTHONPATH`. Per-root
+    /// subdirectories keep roots' pins from clobbering each other; Poetry's in-project
+    /// venv is addressed through the job's mount, a pure function of its root.
+    #[test]
+    fn python_index_sees_the_installed_environment() {
+        let lines = argv_lines(
+            &python_job(PythonLock::Requirements),
+            "sha256:py",
+            &Budget::default(),
+        );
+        // Root `svc`: its own target subdirectory, mounted at /python-env in both phases;
+        // the index names it in PYTHONPATH.
+        assert!(
+            lines[0].contains("/pytarget/svc:/python-env"),
+            "fetch mounts the target: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("-e PYTHONPATH=/python-env"),
+            "index sees the target: {}",
+            lines[1]
+        );
+        // A nested root gets its own subdirectory, at the same container path.
+        let nested = Job {
+            root: "src/emailservice".into(),
+            ..python_job(PythonLock::Requirements)
+        };
+        let lines = argv_lines(&nested, "sha256:py", &Budget::default());
+        assert!(
+            lines[0].contains("/pytarget/src__emailservice:/python-env"),
+            "nested root's own target: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("-e PYTHONPATH=/python-env"),
+            "same container path: {}",
+            lines[1]
+        );
+        // Poetry installs into an in-project venv; the fetch opts into it and the index
+        // names its site-packages (`<mount>/<root>/.venv`, `/src/.venv` at the root).
+        let lines = argv_lines(
+            &python_job(PythonLock::Poetry),
+            "sha256:py",
+            &Budget::default(),
+        );
+        assert!(
+            lines[0].contains("-e POETRY_VIRTUALENVS_IN_PROJECT=true"),
+            "fetch uses in-project venvs: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("-e PYTHONPATH=/src/svc/.venv/lib/python3.10/site-packages"),
+            "index sees the venv: {}",
+            lines[1]
+        );
+        let at_root = Job {
+            root: String::new(),
+            ..python_job(PythonLock::Poetry)
+        };
+        let lines = argv_lines(&at_root, "sha256:py", &Budget::default());
+        assert!(
+            lines[1].contains("-e PYTHONPATH=/src/.venv/lib/python3.10/site-packages"),
+            "root job's venv: {}",
+            lines[1]
+        );
+        let nested = Job {
+            root: "src/emailservice".into(),
+            ..python_job(PythonLock::Poetry)
+        };
+        let lines = argv_lines(&nested, "sha256:py", &Budget::default());
+        assert!(
+            lines[1]
+                .contains("-e PYTHONPATH=/src/src/emailservice/.venv/lib/python3.10/site-packages"),
+            "nested root's venv: {}",
+            lines[1]
+        );
     }
 
     /// Contract M9d D2 (C3): scip-python reads its project's name and version from a
@@ -2700,6 +2981,55 @@ mod tests {
         ]
     }
 
+    /// Contract D12-lazy C1: resolving without a job that needs JDK 25 never asks the
+    /// runtime for the java25 image; resolving with one records its identity like before.
+    #[test]
+    fn resolve_skips_the_jdk25_lookup_when_no_job_needs_it() {
+        struct Counting {
+            lookups: RefCell<Vec<String>>,
+        }
+        impl Runner for Counting {
+            fn run(&self, _run: &ContainerRun) -> anyhow::Result<Outcome> {
+                panic!("no containers run during resolve")
+            }
+            fn image_id(&self, image: &str) -> Option<String> {
+                self.lookups.borrow_mut().push(image.to_owned());
+                Some("sha256:test".to_owned())
+            }
+            fn start_proxy(&self, _spec: &ProxySpec) -> anyhow::Result<String> {
+                panic!("no proxy during resolve")
+            }
+            fn stop_proxy(&self, _name: &str) -> String {
+                panic!("no proxy during resolve")
+            }
+        }
+        let counting = Counting {
+            lookups: RefCell::new(Vec::new()),
+        };
+        let without = Images::resolve(&counting, false);
+        assert!(
+            !counting
+                .lookups
+                .borrow()
+                .iter()
+                .any(|i| i == SCIP_JAVA25_IMAGE),
+            "no java25 lookup: {:?}",
+            counting.lookups.borrow()
+        );
+        assert!(without.java25.is_err());
+        let with = Images::resolve(&counting, true);
+        assert!(
+            counting
+                .lookups
+                .borrow()
+                .iter()
+                .any(|i| i == SCIP_JAVA25_IMAGE),
+            "looked up when needed: {:?}",
+            counting.lookups.borrow()
+        );
+        assert_eq!(with.java25.as_deref(), Ok("sha256:test"));
+    }
+
     #[test]
     fn fetch_then_offline_index_and_the_work_directory_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2707,7 +3037,7 @@ mod tests {
         let cache = tmp.path().join("cache");
         let fake = Fake::new(false, false);
         let job = ts_job(NodeLock::PackageLock);
-        let images = Images::resolve(&fake);
+        let images = Images::resolve(&fake, true);
         let image = images.for_job(&job).unwrap();
         assert_eq!(
             image, SCIP_TYPESCRIPT_IMAGE,
@@ -2854,7 +3184,7 @@ mod tests {
         let cache = tmp.path().join("cache");
         let fake = Fake::new(false, false);
         let job = java_job(Fetch::Maven);
-        let image = Images::resolve(&fake).for_job(&job).unwrap();
+        let image = Images::resolve(&fake, true).for_job(&job).unwrap();
         assert_eq!(image, JAVA_ID);
         let budget = Budget {
             cpus: 3.0,
@@ -3084,7 +3414,7 @@ mod tests {
 
         let mut fake = Fake::new(false, false);
         fake.proxy_image = false;
-        let images = Images::resolve(&fake);
+        let images = Images::resolve(&fake, true);
         for job in [java_job(Fetch::Maven), ts_job(NodeLock::PackageLock)] {
             let reason = images.for_job(&job).unwrap_err();
             assert!(reason.contains("rb-egress-proxy:1.11.3"), "{reason}");
@@ -3347,7 +3677,7 @@ mod tests {
             java_image: false,
             ..Fake::new(false, false)
         };
-        let images = Images::resolve(&no_image);
+        let images = Images::resolve(&no_image, true);
         let reason = images.for_job(&java_job(Fetch::Maven)).unwrap_err();
         assert!(
             reason.contains("rb-scip-java:0.13.1") && reason.contains("docker/scip-java/README.md"),
@@ -3653,7 +3983,7 @@ mod tests {
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m9d-java-1", "m9d-ts-2"));
-        assert_eq!(RECIPE_PY, "m9d-py-1");
+        assert_eq!(RECIPE_PY, "m9e-py-1");
         assert_eq!(RECIPE_GRADLE, "m9d-gradle-1");
         assert_eq!(
             recipe(&java_job(Fetch::Maven), &Budget::default()),

@@ -1,0 +1,74 @@
+[
+ {
+  "id": "m419",
+  "crate": "rb-scip",
+  "test": "jobs::tests::a_committed_go_work_supplies_the_workspace",
+  "file": "jobs.rs",
+  "old": "                let workspace = match read(&join(root, \"go.work\")) {\n                    Some(text) => go_work_use_dirs(root, &String::from_utf8_lossy(&text)),\n                    None => vec![\".\".to_owned()],\n                };\n",
+  "new": "                let workspace = Vec::new();\n",
+  "what": "Part A planner ignores the committed go.work (old behavior: plain job)"
+ },
+ {
+  "id": "m420",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_committed_go_work_file_is_used_as_is",
+  "file": "orchestrate.rs",
+  "old": "        if !root.join(\"go.work\").is_file() {\n            std::fs::write(root.join(\"go.work\"), go_work(&root, &job.workspace))?;\n        }\n",
+  "new": "        std::fs::write(root.join(\"go.work\"), go_work(&root, &job.workspace))?;\n",
+  "what": "Part A run always overwrites go.work (committed file lost)"
+ },
+ {
+  "id": "m421",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_committed_go_work_file_is_used_as_is",
+  "file": "orchestrate.rs",
+  "old": "                .filter(|dir| dir.as_str() != \".\")\n",
+  "new": "",
+  "what": "Part A fetch lists a redundant ./... for the root (verbose, untested shape)"
+ },
+ {
+  "id": "m422",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::only_an_unsupported_release_tail_requests_a_newer_jdk",
+  "file": "orchestrate.rs",
+  "old": "        if let Ok(n) = digits.parse::<u32>()\n            && (22..=25).contains(&n)\n            && rest[digits.len()..].starts_with(\" not supported\")\n",
+  "new": "        if let Ok(n) = digits.parse::<u32>()\n            && (22..=25).contains(&n)\n            && rest[digits.len()..].starts_with(\" not supported\")\n            && false\n",
+  "what": "Part B matcher never fires (release failures never retried)"
+ },
+ {
+  "id": "m423",
+  "crate": "rb-indexer",
+  "test": "projects::tests::a_maven_job_needing_a_newer_jdk_reruns_on_jdk25",
+  "file": "projects.rs",
+  "old": "                    && rb_scip::jdk_release_needed(&run.stderr_tail).is_some()\n",
+  "new": "                    && false\n",
+  "what": "Part B retry disabled (release failures stay failed)"
+ },
+ {
+  "id": "m424",
+  "crate": "rb-indexer",
+  "test": "projects::tests::a_maven_job_needing_a_newer_jdk_reruns_on_jdk25",
+  "file": "projects.rs",
+  "old": "                    && let Ok(image) = options.images.java25.clone()\n",
+  "new": "                    && let Ok(image) = Err::<String, String>(\"absent\".into())\n",
+  "what": "Part B java25 image never resolves (retry impossible)"
+ },
+ {
+  "id": "m425",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::jdk_fallback_status_round_trips",
+  "file": "orchestrate.rs",
+  "old": "        RunStatus::OkWithoutJdk21 => Some(\"jdk\"),\n",
+  "new": "        RunStatus::OkWithoutJdk21 => Some(\"idx\"),\n",
+  "what": "Part B stored phase misspelled (rows unreadable, cache never hits)"
+ },
+ {
+  "id": "m426",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::jdk_fallback_status_round_trips",
+  "file": "orchestrate.rs",
+  "old": "            (\"ok\", Some(\"jdk\")) => Some(RunStatus::OkWithoutJdk21),\n",
+  "new": "            (\"ok\", Some(\"jdk\")) => Some(RunStatus::OkWithoutWorkspace),\n",
+  "what": "Part B cached jdk rows read back as the wrong variant (wrong suffix)"
+ }
+]
