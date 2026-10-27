@@ -1,0 +1,20 @@
+[
+ {
+  "id": "m411",
+  "crate": "rb-scip",
+  "test": "decode::tests::scip_go_unset_encoding_reads_byte_columns",
+  "file": "decode.rs",
+  "old": "                } else if scip_go {\n                    Units::Bytes\n",
+  "new": "",
+  "what": "B15 scip-go unset encoding reads as UTF-16 (the pre-fix behavior)"
+ },
+ {
+  "id": "m412",
+  "crate": "rb-scip",
+  "test": "decode::tests::javac_columns_expand_tabs_to_multiples_of_eight",
+  "file": "decode.rs",
+  "old": "            PositionEncoding::UnspecifiedPositionEncoding => {\n                if scip_java {\n                    Units::Javac\n",
+  "new": "            PositionEncoding::UnspecifiedPositionEncoding => {\n                if scip_java {\n                    Units::Utf16\n",
+  "what": "scip-java unset encoding reads as plain UTF-16 (no javac tab expansion)"
+ }
+]

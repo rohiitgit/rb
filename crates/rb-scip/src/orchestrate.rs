@@ -305,7 +305,11 @@ pub struct Images {
 }
 
 impl Images {
-    pub fn resolve(runner: &dyn Runner) -> Images {
+    /// The indexer images on this host, looked up once per `rb index` (contract M3b
+    /// amendment 29). `jdk25` tells whether any planned job needs JDK 25 (contract
+    /// D12-lazy, from the plan): without one the java25 image is not inspected and
+    /// records as not looked up, saving the fifth `docker image inspect` per run.
+    pub fn resolve(runner: &dyn Runner, jdk25: bool) -> Images {
         Images {
             java: runner.image_id(SCIP_JAVA_IMAGE).ok_or_else(|| {
                 format!(
@@ -313,12 +317,18 @@ impl Images {
                      docker/scip-java/README.md describes"
                 )
             }),
-            java25: runner.image_id(SCIP_JAVA25_IMAGE).ok_or_else(|| {
-                format!(
-                    "scip-java: image {SCIP_JAVA25_IMAGE} is not available locally; build it as \
-                     docker/scip-java/README.md describes"
-                )
-            }),
+            java25: if jdk25 {
+                runner.image_id(SCIP_JAVA25_IMAGE).ok_or_else(|| {
+                    format!(
+                        "scip-java: image {SCIP_JAVA25_IMAGE} is not available locally; build it as \
+                         docker/scip-java/README.md describes"
+                    )
+                })
+            } else {
+                Err(format!(
+                    "scip-java: image {SCIP_JAVA25_IMAGE} was not looked up"
+                ))
+            },
             go: runner.image_id(SCIP_GO_IMAGE).ok_or_else(|| {
                 format!(
                     "scip-go: image {SCIP_GO_IMAGE} is not available locally; build it as \
@@ -2700,6 +2710,55 @@ mod tests {
         ]
     }
 
+    /// Contract D12-lazy C1: resolving without a job that needs JDK 25 never asks the
+    /// runtime for the java25 image; resolving with one records its identity like before.
+    #[test]
+    fn resolve_skips_the_jdk25_lookup_when_no_job_needs_it() {
+        struct Counting {
+            lookups: RefCell<Vec<String>>,
+        }
+        impl Runner for Counting {
+            fn run(&self, _run: &ContainerRun) -> anyhow::Result<Outcome> {
+                panic!("no containers run during resolve")
+            }
+            fn image_id(&self, image: &str) -> Option<String> {
+                self.lookups.borrow_mut().push(image.to_owned());
+                Some("sha256:test".to_owned())
+            }
+            fn start_proxy(&self, _spec: &ProxySpec) -> anyhow::Result<String> {
+                panic!("no proxy during resolve")
+            }
+            fn stop_proxy(&self, _name: &str) -> String {
+                panic!("no proxy during resolve")
+            }
+        }
+        let counting = Counting {
+            lookups: RefCell::new(Vec::new()),
+        };
+        let without = Images::resolve(&counting, false);
+        assert!(
+            !counting
+                .lookups
+                .borrow()
+                .iter()
+                .any(|i| i == SCIP_JAVA25_IMAGE),
+            "no java25 lookup: {:?}",
+            counting.lookups.borrow()
+        );
+        assert!(without.java25.is_err());
+        let with = Images::resolve(&counting, true);
+        assert!(
+            counting
+                .lookups
+                .borrow()
+                .iter()
+                .any(|i| i == SCIP_JAVA25_IMAGE),
+            "looked up when needed: {:?}",
+            counting.lookups.borrow()
+        );
+        assert_eq!(with.java25.as_deref(), Ok("sha256:test"));
+    }
+
     #[test]
     fn fetch_then_offline_index_and_the_work_directory_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2707,7 +2766,7 @@ mod tests {
         let cache = tmp.path().join("cache");
         let fake = Fake::new(false, false);
         let job = ts_job(NodeLock::PackageLock);
-        let images = Images::resolve(&fake);
+        let images = Images::resolve(&fake, true);
         let image = images.for_job(&job).unwrap();
         assert_eq!(
             image, SCIP_TYPESCRIPT_IMAGE,
@@ -2854,7 +2913,7 @@ mod tests {
         let cache = tmp.path().join("cache");
         let fake = Fake::new(false, false);
         let job = java_job(Fetch::Maven);
-        let image = Images::resolve(&fake).for_job(&job).unwrap();
+        let image = Images::resolve(&fake, true).for_job(&job).unwrap();
         assert_eq!(image, JAVA_ID);
         let budget = Budget {
             cpus: 3.0,
@@ -3084,7 +3143,7 @@ mod tests {
 
         let mut fake = Fake::new(false, false);
         fake.proxy_image = false;
-        let images = Images::resolve(&fake);
+        let images = Images::resolve(&fake, true);
         for job in [java_job(Fetch::Maven), ts_job(NodeLock::PackageLock)] {
             let reason = images.for_job(&job).unwrap_err();
             assert!(reason.contains("rb-egress-proxy:1.11.3"), "{reason}");
@@ -3347,7 +3406,7 @@ mod tests {
             java_image: false,
             ..Fake::new(false, false)
         };
-        let images = Images::resolve(&no_image);
+        let images = Images::resolve(&no_image, true);
         let reason = images.for_job(&java_job(Fetch::Maven)).unwrap_err();
         assert!(
             reason.contains("rb-scip-java:0.13.1") && reason.contains("docker/scip-java/README.md"),

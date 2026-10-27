@@ -173,6 +173,17 @@ pub struct Plan {
     pub ungrouped: Vec<Ungrouped>,
 }
 
+impl Plan {
+    /// Whether any job needs the JDK 25 image (contract D12-lazy): the caller resolves it
+    /// and records `scip_java25` only then. A release above 25 makes its job `unsupported`
+    /// rather than jdk25, so it never counts here.
+    pub fn needs_jdk25(&self) -> bool {
+        self.jobs
+            .iter()
+            .any(|job| matches!(jdk(job), Ok(Jdk::Jdk25)))
+    }
+}
+
 /// The jobs for a commit, from its sorted file list; `read` gives a file's bytes (`None` when
 /// it cannot be read) and is asked only for `package.json` files, workspace roots'
 /// `yarn.lock`, Go roots' `go.mod` (contract M9d D7) and the `pom.xml` files under Maven roots
@@ -1975,6 +1986,34 @@ mod tests {
             absent.for_job(&maven(Some(21))).as_deref(),
             Ok("sha256:jdk21")
         );
+    }
+
+    /// Contract D12-lazy C3: the plan exposes whether any job needs JDK 25, from the
+    /// highest declared Maven release. Plain jobs and older releases never do.
+    #[test]
+    fn jdk25_jobs_are_visible_to_the_planner() {
+        let plan_of = |contents: &[(&str, &str)]| {
+            let files: Vec<&str> = contents.iter().map(|(p, _)| *p).collect();
+            let read = |path: &str| {
+                contents
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, text)| text.as_bytes().to_vec())
+            };
+            jobs(&files, &read)
+        };
+        let pom = |release: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><artifactId>app</artifactId>\
+                 <properties><maven.compiler.release>{release}</maven.compiler.release>\
+                 </properties></project>"
+            )
+        };
+        assert!(plan_of(&[("pom.xml", &pom("25"))]).needs_jdk25());
+        assert!(!plan_of(&[("pom.xml", &pom("21"))]).needs_jdk25());
+        assert!(!plan_of(&[("pom.xml", &pom(""))]).needs_jdk25());
+        assert!(!plan_of(&[("go.mod", "module example.com/m\n\ngo 1.21\n")]).needs_jdk25());
+        assert!(!plan_of(&[("README.md", "hi")]).needs_jdk25());
     }
 
     #[test]

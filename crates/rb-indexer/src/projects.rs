@@ -732,7 +732,7 @@ mod tests {
     fn options(tmp: &std::path::Path, runner: &dyn Runner) -> ScipOptions {
         ScipOptions {
             mode: ScipMode::On,
-            images: Images::resolve(runner),
+            images: Images::resolve(runner, true),
             work_dir: tmp.join("work"),
             cache_dir: tmp.join("cache"),
             budget: Budget::default(),
