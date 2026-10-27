@@ -1,0 +1,38 @@
+[
+ {
+  "id": "m415",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::python_jobs_fetch_lockfile_driven_environments_then_index_offline",
+  "file": "orchestrate.rs",
+  "old": "            \"--target\",\n            \"/python-env\",\n            \"-r\",\n",
+  "new": "            \"-r\",\n",
+  "what": "pip fetch without --target (the pre-pip env that vanishes with the container)"
+ },
+ {
+  "id": "m416",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::python_index_sees_the_installed_environment",
+  "file": "orchestrate.rs",
+  "old": "    index_env.push((\"PYTHONPATH\".into(), site_packages));\n",
+  "new": "    index_env.push((\"PYTHONPATH\".into(), \"/nowhere\".into()));\n",
+  "what": "index PYTHONPATH points nowhere (env installed but invisible again)"
+ },
+ {
+  "id": "m417",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::a_workspace_job_fetches_at_its_root_and_indexes_every_member",
+  "file": "orchestrate.rs",
+  "old": "pub const RECIPE_PY: &str = \"m9e-py-1\";\n",
+  "new": "pub const RECIPE_PY: &str = \"m9d-py-1\";\n",
+  "what": "recipe not bumped (old cache rows would serve env-less indexes)"
+ },
+ {
+  "id": "m418",
+  "crate": "rb-scip",
+  "test": "orchestrate::tests::python_index_sees_the_installed_environment",
+  "file": "orchestrate.rs",
+  "old": "            (\"POETRY_VIRTUALENVS_IN_PROJECT\".into(), \"true\".into()),\n",
+  "new": "            (\"POETRY_VIRTUALENVS_IN_PROJECT\".into(), \"false\".into()),\n",
+  "what": "Poetry fetch without in-project venvs (venv lands where the index never looks)"
+ }
+]

@@ -51,8 +51,10 @@ pub const RECIPE_GO_WORK: &str = "m9d-go-2";
 /// default trips on slow wheel reads through the emulated stack). `m9d-py-1`:
 /// a root without a `pyproject.toml` names its project, Poetry's stdout reaches
 /// the tail, and a failed fetch is followed by an index without the
-/// environment (contract M9d D2–D4).
-pub const RECIPE_PY: &str = "m9d-py-1";
+/// environment (contract M9d D2–D4). `m9e-py-1`: the fetch installs into a
+/// mounted `--target` (pip) or an in-project venv (Poetry), and the index sees
+/// it through `PYTHONPATH` (contract pip).
+pub const RECIPE_PY: &str = "m9e-py-1";
 
 /// scip-java's Gradle recipe (contract M6e S2): dependency resolution plus one
 /// online build in the fetch phase, then `scip-java index --build-tool Gradle`
@@ -1295,7 +1297,22 @@ fn python_runs(
     let workdir = crate::runner::absolute(work_dir)?;
     let pip_cache = crate::runner::absolute(cache_dir)?.join("pip");
     std::fs::create_dir_all(&pip_cache)?;
+    // The installed environment outlives the fetch container: `pip install --target`
+    // lands in `<cache>/pytarget/<root>` (per root, so pins never clobber each other),
+    // mounted at /python-env in both phases like the pip cache; the index phase only
+    // reads it. Poetry installs into an in-project venv instead (see below).
+    let envdir = if job.root.is_empty() {
+        "root".to_owned()
+    } else {
+        job.root.replace('/', "__")
+    };
+    let pytarget = crate::runner::absolute(cache_dir)?
+        .join("pytarget")
+        .join(&envdir);
+    // Created up front: Docker would otherwise create the bind-mount source as root.
+    std::fs::create_dir_all(&pytarget)?;
     let mut caches = vec![(pip_cache, "/root/.cache/pip".into())];
+    caches.push((pytarget, "/python-env".into()));
     if lockfile == PythonLock::Poetry {
         let poetry_cache = crate::runner::absolute(cache_dir)?.join("pypoetry");
         std::fs::create_dir_all(&poetry_cache)?;
@@ -1321,6 +1338,9 @@ fn python_runs(
         env: vec![
             ("PIP_DISABLE_PIP_VERSION_CHECK".into(), "1".into()),
             ("PIP_TIMEOUT".into(), "60".into()),
+            // Contract pip C1: Poetry installs into an in-project venv (see the
+            // index below), which only exists when told to.
+            ("POETRY_VIRTUALENVS_IN_PROJECT".into(), "true".into()),
         ],
         network: Network::Fetch,
         cpus: budget.cpus,
@@ -1338,6 +1358,8 @@ fn python_runs(
             "exec poetry install --no-root --no-interaction 1>&2",
         ]
         .to_vec(),
+        // Contract pip C1: `--target /python-env` installs into the mounted per-root
+        // dir above, which survives into the index container.
         // `--ignore-requires-python`: the image's interpreter (3.10) predates
         // some lockfiles' floors (S11: a `>=3.14` floor fails the fetch
         // otherwise); versions stay pinned, and what the older runtime cannot
@@ -1348,6 +1370,8 @@ fn python_runs(
             "install",
             "--no-deps",
             "--ignore-requires-python",
+            "--target",
+            "/python-env",
             "-r",
             "requirements.txt",
         ]
@@ -1357,6 +1381,8 @@ fn python_runs(
             "install",
             "--no-deps",
             "--ignore-requires-python",
+            "--target",
+            "/python-env",
             "-e",
             ".",
         ]
@@ -1380,10 +1406,24 @@ fn python_runs(
         let name = name.unwrap_or("root");
         index_args.extend(["--project-name", name, "--project-version", "."].map(String::from));
     }
+    // Contract pip C2: the index sees the installed environment through PYTHONPATH:
+    // the mounted target dir, or the in-project venv's site-packages for Poetry
+    // (`<mount>/<root>/.venv`, a pure function of the job root; the image's
+    // interpreter is 3.10, so that suffix is fixed — contract M9d S11).
+    let site_packages = match lockfile {
+        PythonLock::Poetry if job.root.is_empty() => {
+            "/src/.venv/lib/python3.10/site-packages".to_owned()
+        }
+        PythonLock::Poetry => format!("/src/{}/.venv/lib/python3.10/site-packages", job.root),
+        _ => "/python-env".to_owned(),
+    };
+    let mut index_env = base.env.clone();
+    index_env.push(("PYTHONPATH".into(), site_packages));
     let index = ContainerRun {
         network: Network::None,
         timeout: budget.index_timeout,
         args: index_args,
+        env: index_env,
         ..base
     };
     Ok((vec![fetch], index))
@@ -2150,12 +2190,12 @@ mod tests {
             ),
             (
                 PythonLock::Requirements,
-                "pip install --no-deps --ignore-requires-python -r requirements.txt",
+                "pip install --no-deps --ignore-requires-python --target /python-env -r requirements.txt",
                 "/root/.cache/pip",
             ),
             (
                 PythonLock::None,
-                "pip install --no-deps --ignore-requires-python -e .",
+                "pip install --no-deps --ignore-requires-python --target /python-env -e .",
                 "/root/.cache/pip",
             ),
         ] {
@@ -2184,6 +2224,85 @@ mod tests {
                 lines[1]
             );
         }
+    }
+
+    /// Contract pip C1, C2: the fetch installs into a mounted `--target` that survives
+    /// into the index phase, and the index sees it through `PYTHONPATH`. Per-root
+    /// subdirectories keep roots' pins from clobbering each other; Poetry's in-project
+    /// venv is addressed through the job's mount, a pure function of its root.
+    #[test]
+    fn python_index_sees_the_installed_environment() {
+        let lines = argv_lines(
+            &python_job(PythonLock::Requirements),
+            "sha256:py",
+            &Budget::default(),
+        );
+        // Root `svc`: its own target subdirectory, mounted at /python-env in both phases;
+        // the index names it in PYTHONPATH.
+        assert!(
+            lines[0].contains("/pytarget/svc:/python-env"),
+            "fetch mounts the target: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("-e PYTHONPATH=/python-env"),
+            "index sees the target: {}",
+            lines[1]
+        );
+        // A nested root gets its own subdirectory, at the same container path.
+        let nested = Job {
+            root: "src/emailservice".into(),
+            ..python_job(PythonLock::Requirements)
+        };
+        let lines = argv_lines(&nested, "sha256:py", &Budget::default());
+        assert!(
+            lines[0].contains("/pytarget/src__emailservice:/python-env"),
+            "nested root's own target: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("-e PYTHONPATH=/python-env"),
+            "same container path: {}",
+            lines[1]
+        );
+        // Poetry installs into an in-project venv; the fetch opts into it and the index
+        // names its site-packages (`<mount>/<root>/.venv`, `/src/.venv` at the root).
+        let lines = argv_lines(
+            &python_job(PythonLock::Poetry),
+            "sha256:py",
+            &Budget::default(),
+        );
+        assert!(
+            lines[0].contains("-e POETRY_VIRTUALENVS_IN_PROJECT=true"),
+            "fetch uses in-project venvs: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("-e PYTHONPATH=/src/svc/.venv/lib/python3.10/site-packages"),
+            "index sees the venv: {}",
+            lines[1]
+        );
+        let at_root = Job {
+            root: String::new(),
+            ..python_job(PythonLock::Poetry)
+        };
+        let lines = argv_lines(&at_root, "sha256:py", &Budget::default());
+        assert!(
+            lines[1].contains("-e PYTHONPATH=/src/.venv/lib/python3.10/site-packages"),
+            "root job's venv: {}",
+            lines[1]
+        );
+        let nested = Job {
+            root: "src/emailservice".into(),
+            ..python_job(PythonLock::Poetry)
+        };
+        let lines = argv_lines(&nested, "sha256:py", &Budget::default());
+        assert!(
+            lines[1]
+                .contains("-e PYTHONPATH=/src/src/emailservice/.venv/lib/python3.10/site-packages"),
+            "nested root's venv: {}",
+            lines[1]
+        );
     }
 
     /// Contract M9d D2 (C3): scip-python reads its project's name and version from a
@@ -3712,7 +3831,7 @@ mod tests {
     #[test]
     fn a_workspace_job_fetches_at_its_root_and_indexes_every_member() {
         assert_eq!((RECIPE_JAVA, RECIPE_TS), ("m9d-java-1", "m9d-ts-2"));
-        assert_eq!(RECIPE_PY, "m9d-py-1");
+        assert_eq!(RECIPE_PY, "m9e-py-1");
         assert_eq!(RECIPE_GRADLE, "m9d-gradle-1");
         assert_eq!(
             recipe(&java_job(Fetch::Maven), &Budget::default()),
