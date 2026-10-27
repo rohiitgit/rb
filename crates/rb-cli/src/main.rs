@@ -1204,8 +1204,9 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
     // Contract D12-lazy: plan the jobs once to learn whether any needs JDK 25, so the
     // java25 image is resolved (and recorded) only then. Planned from the full tree, a
     // superset of what `index_commit` plans from, so the flag can only over-approximate:
-    // a missed job is impossible, an extra lookup harmless.
-    let need_jdk25 = if scip_mode == rb_indexer::ScipMode::On {
+    // a missed job is impossible, an extra lookup harmless. Contract Part B: any Maven
+    // job also resolves it, as the fallback for an externally-dictated release needs it.
+    let (need_jdk25, has_maven) = if scip_mode == rb_indexer::ScipMode::On {
         let manifest = git_repo.manifest(&commit_sha)?;
         let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
         let read = |wanted: &str| {
@@ -1215,13 +1216,20 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
                 .find(|f| f.path == wanted)
                 .and_then(|f| git_repo.blob(&f.blob_sha).ok())
         };
-        rb_scip::jobs(&paths, &read).needs_jdk25()
+        let plan = rb_scip::jobs(&paths, &read);
+        (
+            plan.needs_jdk25(),
+            plan.jobs
+                .iter()
+                .any(|j| matches!(j.fetch, rb_scip::jobs::Fetch::Maven)),
+        )
     } else {
-        false
+        (false, false)
     };
+    let java25 = need_jdk25 || has_maven;
     let images = match &scip_mode {
         rb_indexer::ScipMode::On => {
-            rb_scip::Images::resolve(&rb_scip::DockerRunner::default(), need_jdk25)
+            rb_scip::Images::resolve(&rb_scip::DockerRunner::default(), java25)
         }
         rb_indexer::ScipMode::Unavailable(detail) => {
             // The detail names the host (its socket path); the stored reason does not
@@ -1231,7 +1239,7 @@ fn index(store: &mut Store, load_dir: &Path, args: IndexArgs) -> anyhow::Result<
         }
         rb_indexer::ScipMode::Off => rb_scip::Images::unresolved(),
     };
-    let tools = tool_versions(&scip_mode, &images, need_jdk25);
+    let tools = tool_versions(&scip_mode, &images, java25);
 
     if !force && let Some(live) = store.live_snapshot(&repo)? {
         let scip_on = scip_mode == rb_indexer::ScipMode::On;

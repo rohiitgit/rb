@@ -1,0 +1,2 @@
+  code: no heuristic references to own code (0 external); 1 exact calls (scip)
+  scip: . scip-go ok unpinned, definitions matched 2/2 (0 by name), definitions without occurrence 0, references matched 1, external 1, undocumented 0, local 0, unanchored 0, unmatched 1, unconverted 0, documents rejected 0, relationships dropped 0 (0 in project, 0 anonymous)

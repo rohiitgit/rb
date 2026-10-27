@@ -109,6 +109,11 @@ pub enum RunStatus {
     /// Stored as `ok` with phase `index` (the workspace's index is the part missing);
     /// `stderr_tail` is the workspace run's.
     OkWithoutWorkspace,
+    /// A Maven job whose run failed with `release version {N} not supported` (its effective
+    /// release comes from outside the job, contract Part B) and whose re-run on the JDK 25
+    /// image wrote an index: the index is the JDK 25 one. Stored as `ok` with phase `jdk`;
+    /// `stderr_tail` is the JDK 21 run's.
+    OkWithoutJdk21,
     /// The fetch or index phase failed (contract M3b amendment 56: which one is recorded, as
     /// for a timeout; an index that was not produced or could not be decoded is the index
     /// phase's); `stderr_tail` says why.
@@ -160,7 +165,10 @@ impl RunStatus {
     /// The value stored in `rb.scip_index.status` and reported per project.
     pub fn as_str(&self) -> &'static str {
         match self {
-            RunStatus::Ok | RunStatus::OkWithoutEnvironment | RunStatus::OkWithoutWorkspace => "ok",
+            RunStatus::Ok
+            | RunStatus::OkWithoutEnvironment
+            | RunStatus::OkWithoutWorkspace
+            | RunStatus::OkWithoutJdk21 => "ok",
             RunStatus::Failed(_) => "failed",
             RunStatus::Timeout { .. } => "timeout",
             RunStatus::Unsupported(_) => "unsupported",
@@ -169,12 +177,15 @@ impl RunStatus {
         }
     }
 
-    /// Whether the job wrote an index: `ok`, with its environment or without it (D4), or
-    /// without its workspace (D5b).
+    /// Whether the job wrote an index: `ok`, with its environment or without it (D4),
+    /// without its workspace (D5b), or on JDK 25 after a JDK 21 failure (Part B).
     pub fn is_ok(&self) -> bool {
         matches!(
             self,
-            RunStatus::Ok | RunStatus::OkWithoutEnvironment | RunStatus::OkWithoutWorkspace
+            RunStatus::Ok
+                | RunStatus::OkWithoutEnvironment
+                | RunStatus::OkWithoutWorkspace
+                | RunStatus::OkWithoutJdk21
         )
     }
 
@@ -197,6 +208,19 @@ impl RunStatus {
         }
     }
 
+    /// The `phase` value a finished run is stored under: like [`RunStatus::phase`], plus
+    /// `"jdk"` for an index made on JDK 25 after a JDK 21 failure (Part B), which is no
+    /// fetch or index phase of its own. Anything else is decided again next time.
+    pub fn stored_phase(&self) -> Option<&'static str> {
+        match self {
+            RunStatus::Failed(phase) | RunStatus::Timeout { phase, .. } => Some(phase.as_str()),
+            RunStatus::OkWithoutEnvironment => Some("fetch"),
+            RunStatus::OkWithoutWorkspace => Some("index"),
+            RunStatus::OkWithoutJdk21 => Some("jdk"),
+            _ => None,
+        }
+    }
+
     /// The status a cache row recorded: `ok` (in the `fetch` phase: an index without the
     /// environment, D4; in the `index` phase: an index without the workspace, D5b), or
     /// `failed` with its phase. `None` for any other value (a `timeout`, a `failed` without a
@@ -206,6 +230,7 @@ impl RunStatus {
             ("ok", None) => Some(RunStatus::Ok),
             ("ok", Some("fetch")) => Some(RunStatus::OkWithoutEnvironment),
             ("ok", Some("index")) => Some(RunStatus::OkWithoutWorkspace),
+            ("ok", Some("jdk")) => Some(RunStatus::OkWithoutJdk21),
             ("failed", phase) => phase.and_then(Phase::parse).map(RunStatus::Failed),
             _ => None,
         }
@@ -224,17 +249,19 @@ impl RunStatus {
             RunStatus::Ok
             | RunStatus::OkWithoutEnvironment
             | RunStatus::OkWithoutWorkspace
+            | RunStatus::OkWithoutJdk21
             | RunStatus::Failed(_) => None,
         }
     }
 
     /// What an `ok` job's status line appends when its index is degraded: made without the
-    /// environment after a failed fetch (contract M9d D4), or without the workspace after a
-    /// failed workspace run (D5b).
+    /// environment after a failed fetch (contract M9d D4), without the workspace after a
+    /// failed workspace run (D5b), or on JDK 25 after a JDK 21 failure (contract Part B).
     pub fn note(&self) -> Option<&'static str> {
         match self {
             RunStatus::OkWithoutEnvironment => Some("environment not installed: fetch failed"),
             RunStatus::OkWithoutWorkspace => Some("workspace failed: indexed without go.work"),
+            RunStatus::OkWithoutJdk21 => Some("jdk 21 failed: indexed with JDK 25"),
             _ => None,
         }
     }
@@ -414,6 +441,25 @@ impl Images {
 /// phase runs behind its own egress proxy, `rb-egress-<that name>`, allowing `egress`'s hosts
 /// (contract M5 S21); its configuration lives in `<that directory>-egress` while it runs.
 ///
+/// Contract Part B: the JDK release a failed Maven run needed, when its tail says the
+/// running JDK does not support it (`error: release version N not supported`). Only
+/// releases the JDK 25 image can build (22–25): anything older is a different problem,
+/// anything newer no image can build, and neither triggers a re-run.
+pub fn jdk_release_needed(tail: &str) -> Option<u32> {
+    let mut rest = tail;
+    while let Some(at) = rest.find("release version ") {
+        rest = &rest[at + "release version ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<u32>()
+            && (22..=25).contains(&n)
+            && rest[digits.len()..].starts_with(" not supported")
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
 /// A scip-go workspace job (contract M9d D5) whose workspace run failed, a phase exiting
 /// non-zero (137: an OOM kill) or no index written, runs again exactly as a plain job: a fresh
 /// export without `go.work`, `GOFLAGS=-mod=mod`, `go mod download` (D5b, amendment 2). An
@@ -1178,7 +1224,11 @@ fn go_runs(
     } else {
         let root = workdir.join(&cwd);
         std::fs::create_dir_all(&root)?;
-        std::fs::write(root.join("go.work"), go_work(&root, &job.workspace))?;
+        // Contract Part A: a committed go.work is used as written, never overwritten;
+        // rb writes its generated file only when the export has none.
+        if !root.join("go.work").is_file() {
+            std::fs::write(root.join("go.work"), go_work(&root, &job.workspace))?;
+        }
         env.push(("GOFLAGS".into(), String::new()));
         let at = if cwd.is_empty() {
             "/sources/go.work".to_owned()
@@ -1267,10 +1317,16 @@ fn go_work(root: &Path, workspace: &[String]) -> String {
 /// A workspace job's fetch (contract M9d D5, amendment 1): `go list -deps -test` over `.` and
 /// each workspace directory, without `-e`, so a module that cannot be fetched fails the fetch.
 fn workspace_fetch(workspace: &[String]) -> Vec<String> {
+    // `"."` needs no extra pattern: `./...` already covers the root.
     ["go", "list", "-deps", "-test", "./..."]
         .map(String::from)
         .into_iter()
-        .chain(workspace.iter().map(|dir| format!("./{dir}/...")))
+        .chain(
+            workspace
+                .iter()
+                .filter(|dir| dir.as_str() != ".")
+                .map(|dir| format!("./{dir}/...")),
+        )
         .collect()
 }
 
@@ -1993,6 +2049,102 @@ mod tests {
             assert_eq!(env_of(r, "GOFLAGS"), [""]);
             assert_eq!(env_of(r, "GOWORK"), ["/sources/tools/sct/go.work"]);
         }
+    }
+
+    /// Contract Part A (C2): a committed `go.work` is used as written and never
+    /// overwritten: no write happens, but the run is still a workspace run (empty
+    /// `GOFLAGS`, `GOWORK` set, the `go list` fetch). `use .` alone fetches `./...`.
+    #[test]
+    fn a_committed_go_work_file_is_used_as_is() {
+        let committed = "go 1.27\n\nuse .\n";
+        let files: Vec<(String, Vec<u8>)> = [
+            ("go.mod", "module example.com/m\n\ngo 1.21\n"),
+            ("go.work", committed),
+        ]
+        .map(|(p, t)| (p.to_owned(), t.as_bytes().to_vec()))
+        .to_vec();
+        // As the planner now plans it: workspace mode from the committed file.
+        let job = Job {
+            workspace: vec![".".into()],
+            ..go_job()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new(false, false);
+        run_job(
+            &job,
+            "sha256:go",
+            &files,
+            &tmp.path().join("w"),
+            &tmp.path().join("c"),
+            &Budget::default(),
+            &Egress::default(),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(
+            fake.go_works.borrow()[0].as_deref(),
+            Some(committed),
+            "the committed file survives the run"
+        );
+        let runs = fake.runs.borrow();
+        for r in runs.iter() {
+            assert_eq!(env_of(r, "GOFLAGS"), [""], "{r:?}");
+        }
+        assert_eq!(env_of(&runs[0], "GOWORK"), ["/sources/go.work"]);
+        assert_eq!(runs[0].args, ["go", "list", "-deps", "-test", "./..."]);
+    }
+
+    /// Contract Part B: only a Maven failure whose tail names an unsupported release
+    /// above 21 triggers the JDK 25 retry (`error: release version N not supported`).
+    /// Anything else, and anything at or below the running JDK, does not.
+    #[test]
+    fn only_an_unsupported_release_tail_requests_a_newer_jdk() {
+        assert_eq!(
+            jdk_release_needed("error: release version 25 not supported"),
+            Some(25)
+        );
+        assert_eq!(
+            jdk_release_needed(
+                "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.13.0:compile (default-compile) on project app: Fatal error compiling: error: release version 25 not supported"
+            ),
+            Some(25)
+        );
+        assert_eq!(
+            jdk_release_needed("error: release version 21 not supported"),
+            None
+        );
+        assert_eq!(
+            jdk_release_needed("error: release version 26 not supported"),
+            None
+        );
+        assert_eq!(jdk_release_needed("BUILD FAILURE"), None);
+        assert_eq!(jdk_release_needed(""), None);
+        assert_eq!(
+            jdk_release_needed("error: release version abc not supported"),
+            None
+        );
+    }
+
+    /// Contract Part B: the retry stores `ok` with phase `jdk`, round-trips through
+    /// [`RunStatus::from_cached`], and carries the suffix; like every other variant.
+    #[test]
+    fn jdk_fallback_status_round_trips() {
+        let ok = RunStatus::OkWithoutJdk21;
+        assert_eq!(ok.as_str(), "ok");
+        assert!(ok.is_ok());
+        assert_eq!(ok.stored_phase(), Some("jdk"));
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("jdk")),
+            Some(RunStatus::OkWithoutJdk21)
+        );
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("jdk")).and_then(|s| s.note()),
+            Some("jdk 21 failed: indexed with JDK 25")
+        );
+        assert_eq!(
+            RunStatus::from_cached("ok", Some("index")),
+            Some(RunStatus::OkWithoutWorkspace)
+        );
     }
 
     /// Contract M9d D5b (amendment 2, C5b): a workspace run whose fetch or index exits non-zero

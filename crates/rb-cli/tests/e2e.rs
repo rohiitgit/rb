@@ -3831,6 +3831,52 @@ fn scip_go_chi_sqlx() {
     assert_eq!(rb(&url, &["dump", "--repo", &other]), dump);
 }
 
+/// Contract Part A: a committed `go.work` is used as written, never overwritten.
+/// The fixture root commits `go.work` (`use .`); the fetch runs in workspace mode
+/// (no `-mod=mod` refusal) and the index is byte-identical across fresh, cached and
+/// no-cache runs.
+#[test]
+fn scip_go_workspace_committed() {
+    let Some(url) = db_url() else { return };
+    if let Err(reason) = scip_go_available() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let fixture = "go-workspace-committed";
+    let repo = fixture_repo(fixture);
+    let path = repo.path().to_str().unwrap();
+    let name = format!("t_scipgow_{}", std::process::id());
+    let _cleanup = Cleanup {
+        url: &url,
+        repos: vec![name.clone()],
+    };
+    let started = std::time::Instant::now();
+    let first = rb(&url, &["index", path, "--repo", &name]);
+    eprintln!(
+        "scip_go_workspace_committed: first index {:.1?}",
+        started.elapsed()
+    );
+    assert!(
+        first.contains("scip: . scip-go ok") && !first.contains("failed"),
+        "workspace mode, no GOFLAGS refusal: {first}"
+    );
+    let dump = rb(&url, &["dump", "--repo", &name]);
+    golden(fixture, "dump.jsonl", &dump);
+    golden(fixture, "scip-status.txt", &scip_status_lines(&url, &name));
+    let second = rb(&url, &["index", path, "--repo", &name, "--force"]);
+    assert!(second.contains("scip: . scip-go ok (cached"), "{second}");
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+    let fresh = rb(
+        &url,
+        &["index", path, "--repo", &name, "--force", "--no-cache"],
+    );
+    assert!(
+        fresh.contains("scip: . scip-go ok ") && !fresh.contains("(cached"),
+        "{fresh}"
+    );
+    assert_eq!(rb(&url, &["dump", "--repo", &name]), dump);
+}
+
 /// Contract M6d S9: the FastAPI/SQLAlchemy fixture. Decorators, prefixes
 /// and includes become endpoints; `__tablename__` models and f-string/literal
 /// SQL become `QUERIES`; intra-repo imports resolve exact both ways;

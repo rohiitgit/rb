@@ -57,3 +57,12 @@ flowchart LR
 
 - SCIP-mode `rb index` on a repo with no jdk25 job: 4 Docker CLI calls, not 5 (one fewer `docker image inspect`, ~24 ms wall saved).
 - No `exact` fp rise possible (no dump moves); the gate is `compare` exit 0 with zero changed lines.
+
+## Amendments
+
+### Amendment 1 (2026-10-27, Part B): the flag covers any Maven job
+
+D12 as built resolves and records `java25` only when a job plans for JDK 25.
+Part B's fallback needs the image whenever a Maven job might fail onto it, so
+the flag is `needs_jdk25() || any Maven job`. Go/Python/TS-only runs still skip
+the lookup. NFR restated: the inspect is skipped on runs with no Maven jobs.

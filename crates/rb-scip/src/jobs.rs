@@ -182,12 +182,23 @@ impl Plan {
             .iter()
             .any(|job| matches!(jdk(job), Ok(Jdk::Jdk25)))
     }
+
+    /// Whether the java25 image must be resolved at all: a job plans for it, or any
+    /// Maven job might fail onto it through the Part B retry. Go/Python/TS-only
+    /// repositories still skip the lookup.
+    pub fn needs_java25_image(&self) -> bool {
+        self.needs_jdk25()
+            || self
+                .jobs
+                .iter()
+                .any(|job| matches!(job.fetch, Fetch::Maven))
+    }
 }
 
 /// The jobs for a commit, from its sorted file list; `read` gives a file's bytes (`None` when
 /// it cannot be read) and is asked only for `package.json` files, workspace roots'
-/// `yarn.lock`, Go roots' `go.mod` (contract M9d D7) and the `pom.xml` files under Maven roots
-/// (D12). Maven and Gradle roots are the outermost `pom.xml` / Gradle build files (a
+/// `yarn.lock`, Go roots' `go.mod` and committed `go.work` files (contracts M9d D7 and Part A)
+/// and the `pom.xml` files under Maven roots (D12). Maven and Gradle roots are the outermost `pom.xml` / Gradle build files (a
 /// reactor or multi-project build runs once). TypeScript roots are package roots (a directory
 /// with `package.json`), each indexing every `tsconfig.json` directory whose nearest package
 /// root it is; a nested package root starts its own job, except a workspace member (contract
@@ -305,7 +316,8 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
     // Go: every go.mod directory is a job. Contract M9d D7: each root's go.mod is read, so its
     // workspace (D5) and its replace targets outside the root (D6) are decided here, and the
     // input hash covers them through the exported go.mod files. A root holding its own
-    // go.work is left as it is (out of scope); an unreadable go.mod plans as before.
+    // go.work is a workspace job over the file's `use` entries (contract Part A), read
+    // here as well; an unreadable go.mod plans as before.
     let mut go_roots = dirs_with("go.mod");
     go_roots.sort();
     go_roots.dedup();
@@ -319,7 +331,14 @@ pub fn jobs(files: &[&str], read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Plan {
     for root in &go_roots {
         let (workspace, replace_targets) = match go_mods.get(root.as_str()) {
             Some(module) if has(&join(root, "go.work")) => {
-                (Vec::new(), go_replace_targets(root, module))
+                // Contract Part A: a committed go.work supplies the workspace from its
+                // own `use` entries, which the run uses as written (never overwritten).
+                // An unreadable file still runs in workspace mode.
+                let workspace = match read(&join(root, "go.work")) {
+                    Some(text) => go_work_use_dirs(root, &String::from_utf8_lossy(&text)),
+                    None => vec![".".to_owned()],
+                };
+                (workspace, go_replace_targets(root, module))
             }
             Some(module) => (
                 go_workspace(root, module, &go_mods),
@@ -821,6 +840,91 @@ fn go_workspace(root: &str, module: &GoMod, modules: &BTreeMap<&str, GoMod>) -> 
         })
         .map(|(dir, _)| relative(dir, root))
         .collect()
+}
+
+/// A committed `go.work`'s `use` directories (contract Part A): single-line and block
+/// form, comments and quotes ignored like [`go_mod`]. Entries resolve against the job
+/// root; ones leaving it and ignored-shaped ones (vendor, testdata, dot- and
+/// underscore-dirs, as in [`go_workspace`]) are dropped. `"."` is always kept.
+/// No usable entry reads as `["."]`: the file's presence alone puts Go in workspace
+/// mode, where `-mod=mod` is refused.
+fn go_work_use_dirs(root: &str, text: &str) -> Vec<String> {
+    let ignored = |rel: &str| {
+        rel.split('/').any(|segment| {
+            matches!(segment, "vendor" | "testdata")
+                || segment.starts_with('.')
+                || segment.starts_with('_')
+        })
+    };
+    let mut block = false;
+    let mut dirs = BTreeSet::new();
+    for line in text.lines() {
+        let code = line.split("//").next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        if code == "use (" {
+            block = true;
+            continue;
+        }
+        if block && code == ")" {
+            block = false;
+            continue;
+        }
+        let rest = if block {
+            code
+        } else {
+            let (directive, rest) = code.split_once(char::is_whitespace).unwrap_or((code, ""));
+            if directive != "use" {
+                continue;
+            }
+            rest.trim()
+        };
+        for raw in rest.split_whitespace().map(|s| s.trim_matches('"')) {
+            if raw.is_empty() || raw.starts_with('/') {
+                continue;
+            }
+            // Fold lexically against the root; anything not at-or-under it is out.
+            let mut at: Vec<&str> = if root.is_empty() {
+                Vec::new()
+            } else {
+                root.split('/').collect()
+            };
+            let mut ok = true;
+            for segment in raw.split('/') {
+                match segment {
+                    "" | "." => {}
+                    ".." => {
+                        if at.pop().is_none() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    name => at.push(name),
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let dir = at.join("/");
+            let under = dir == root
+                || (!root.is_empty() && dir.starts_with(&format!("{root}/")))
+                || (root.is_empty() && !dir.is_empty());
+            if !under {
+                continue;
+            }
+            let rel = relative(&dir, root);
+            if rel != "." && ignored(&rel) {
+                continue;
+            }
+            dirs.insert(rel);
+        }
+    }
+    if dirs.is_empty() {
+        vec![".".to_owned()]
+    } else {
+        dirs.into_iter().collect()
+    }
 }
 
 /// Contract M9d D6: `module`'s `replace` targets that are local directories (Go's rule: `.`,
@@ -2016,6 +2120,40 @@ mod tests {
         assert!(!plan_of(&[("README.md", "hi")]).needs_jdk25());
     }
 
+    /// Contract Part B: the java25 image is resolved when a job plans for JDK 25 or when
+    /// any Maven job might fail onto it; Go/Python/TS-only repositories skip the lookup.
+    #[test]
+    fn java25_image_lookup_covers_planned_and_fallback_jobs() {
+        let image_needed = |files: &[&str], contents: &[(&str, &str)]| {
+            let read = |path: &str| {
+                contents
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, text)| text.as_bytes().to_vec())
+            };
+            jobs(files, &read).needs_java25_image()
+        };
+        let pom = |release: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><artifactId>app</artifactId>\
+                 <properties><maven.compiler.release>{release}</maven.compiler.release>\
+                 </properties></project>"
+            )
+        };
+        assert!(image_needed(&["pom.xml"], &[("pom.xml", &pom("25"))]));
+        // No planned jdk25 job, but a Maven job that could fail onto the retry.
+        assert!(image_needed(&["pom.xml"], &[("pom.xml", &pom("21"))]));
+        assert!(!image_needed(
+            &["go.mod"],
+            &[("go.mod", "module example.com/m\n")]
+        ));
+        assert!(!image_needed(
+            &["pyproject.toml"],
+            &[("pyproject.toml", "[project]\nname = \"p\"\n")]
+        ));
+        assert!(!image_needed(&["README.md"], &[]));
+    }
+
     #[test]
     fn go_modules_are_their_own_jobs() {
         // Each go.mod directory builds independently (workspaces are M6e);
@@ -2035,12 +2173,15 @@ mod tests {
     /// `go.mod` requires, with no `replace`, the module of another `go.mod` under it gets a
     /// workspace of those directories, sorted (mattermost `server`: `public`). A required
     /// in-repo module that is also replaced (by a directory or by another module), a module
-    /// outside the root, and a root with its own `go.work` get none. A `replace` onto a local
+    /// outside the root, and an unreadable `go.mod` plan as before. A `replace` onto a local
     /// directory outside the root is a replace target, as written, whether or not it stays in
     /// the repository (`projects::job_files` decides that); one inside the root, or onto
     /// another module, is not. A `go.mod` that cannot be read plans as before. A vendored
     /// module's `go.mod` (go_gin_example commits `vendor/` with six) and one in a directory Go
     /// ignores (`testdata`, a name starting `.` or `_`) are not workspace modules.
+    /// Contract Part A: a root holding its own `go.work` gets its workspace from the
+    /// file's `use` entries instead (tested separately in
+    /// `a_committed_go_work_supplies_the_workspace`).
     #[test]
     fn go_jobs_requiring_in_repo_modules_get_a_workspace() {
         let files = [
@@ -2111,6 +2252,7 @@ mod tests {
                 "ws/go.mod",
                 "module example.com/ws\n\nrequire example.com/ws/sub v0.1.0\n",
             ),
+            ("ws/go.work", "go 1.21\n\nuse (\n\t./sub\n)\n"),
             ("ws/sub/go.mod", "module example.com/ws/sub\n"),
             ("unread/sub/go.mod", "module example.com/unread/sub\n"),
             (
@@ -2149,10 +2291,89 @@ mod tests {
                 "scip-go vend/ok go unpinned",
                 "scip-go vend/testdata/mod go unpinned",
                 "scip-go vend/vendor/example.com/x go unpinned",
-                "scip-go ws go unpinned",
+                "scip-go ws go unpinned work[sub]",
                 "scip-go ws/sub go unpinned",
             ]
         );
+    }
+
+    /// Contract Part A (C1): a root holding its own `go.work` is a workspace job over
+    /// the file's `use` entries, not D5's requires-analysis. A file with no usable
+    /// entry, an unreadable one, and one whose entries all leave the root still run
+    /// in workspace mode (`["."]`): the file's presence alone forbids `-mod=mod`.
+    #[test]
+    fn a_committed_go_work_supplies_the_workspace() {
+        let workspace_of = |files: &[&str], contents: &[(&str, &str)]| {
+            let read = |path: &str| {
+                contents
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, text)| text.as_bytes().to_vec())
+            };
+            let mut out = BTreeMap::new();
+            for job in jobs(files, &read).jobs {
+                if job.indexer == Indexer::ScipGo {
+                    out.insert(job.root, job.workspace);
+                }
+            }
+            out
+        };
+        let go_mod =
+            |module: &str, requires: &str| format!("module {module}\n\ngo 1.21\n{requires}");
+        // D5 alone would say [keep, solo] (both required, unreplaced): the committed
+        // `use ./keep` wins.
+        let ws = workspace_of(
+            &["go.mod", "go.work", "solo/go.mod", "keep/go.mod"],
+            &[
+                (
+                    "go.mod",
+                    &go_mod(
+                        "example.com/m",
+                        "require (\n\texample.com/m/solo v1.0.0\n\texample.com/m/keep v1.0.0\n)\n",
+                    ),
+                ),
+                ("solo/go.mod", &go_mod("example.com/m/solo", "")),
+                ("keep/go.mod", &go_mod("example.com/m/keep", "")),
+                ("go.work", "go 1.21\n\nuse (\n\t./keep\n)\n"),
+            ],
+        );
+        assert_eq!(
+            ws.get(""),
+            Some(&vec!["keep".to_owned()]),
+            "committed use dirs win over D5's requires: {ws:?}"
+        );
+        // `use .`, single-line form, comments and quotes are read; entries outside the
+        // root and ignored-shaped ones (vendor, dot-dirs) are dropped.
+        let ws = workspace_of(
+            &["svc/go.mod", "svc/go.work", "svc/a/go.mod"],
+            &[
+                ("svc/go.mod", &go_mod("example.com/svc", "")),
+                ("svc/a/go.mod", &go_mod("example.com/svc/a", "")),
+                (
+                    "svc/go.work",
+                    "go 1.21\n\n// use the api\nuse ./a // and more\nuse \"../svc/a\"\nuse /abs\nuse ../outside\nuse ./vendor/x\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            ws.get("svc"),
+            Some(&vec!["a".to_owned()]),
+            "single lines, quotes, comments; outside and ignored dropped: {ws:?}"
+        );
+        // No usable entry, an unreadable file, and a missing file's absence each still
+        // run in workspace mode when the file exists — except a root with no go.work
+        // at all, which stays plain.
+        let ws = workspace_of(
+            &["e/go.mod", "e/go.work", "u/go.mod", "u/go.work", "p/go.mod"],
+            &[
+                ("e/go.mod", &go_mod("example.com/e", "")),
+                ("e/go.work", "go 1.21\n"),
+                ("u/go.mod", &go_mod("example.com/u", "")),
+            ],
+        );
+        assert_eq!(ws.get("e"), Some(&vec![".".to_owned()]), "{ws:?}");
+        assert_eq!(ws.get("u"), Some(&vec![".".to_owned()]), "{ws:?}");
+        assert_eq!(ws.get("p"), Some(&Vec::new()), "{ws:?}");
     }
 
     #[test]

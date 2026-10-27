@@ -269,7 +269,7 @@ pub(crate) fn run_projects(
                         Ok((path, read_blob(blob)?))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                let run = rb_scip::run_job(
+                let mut run = rb_scip::run_job(
                     &job,
                     &project.image,
                     &exported,
@@ -279,9 +279,40 @@ pub(crate) fn run_projects(
                     &options.egress,
                     runner,
                 )?;
+                // Contract Part B: a Maven job that fails because its effective release
+                // needs a newer JDK runs again on the JDK 25 image. Timeouts, docker
+                // failures, non-Maven jobs, other tails, and a missing java25 image keep
+                // the first outcome: only a release the JDK 25 image can build retries.
+                if matches!(run.status, RunStatus::Failed(_))
+                    && matches!(job.fetch, rb_scip::jobs::Fetch::Maven)
+                    && rb_scip::jdk_release_needed(&run.stderr_tail).is_some()
+                    && let Ok(image) = options.images.java25.clone()
+                {
+                    let retry = rb_scip::run_job(
+                        &job,
+                        &image,
+                        &exported,
+                        &options.work_dir.join(&input_hash[..16]),
+                        &options.cache_dir,
+                        &options.budget,
+                        &options.egress,
+                        runner,
+                    )?;
+                    project.image = image;
+                    let elapsed = run.elapsed + retry.elapsed;
+                    run = match retry.status {
+                        RunStatus::Ok => rb_scip::ScipRun {
+                            status: RunStatus::OkWithoutJdk21,
+                            stderr_tail: run.stderr_tail,
+                            elapsed,
+                            ..retry
+                        },
+                        _ => rb_scip::ScipRun { elapsed, ..retry },
+                    };
+                }
                 let entry = ScipCacheEntry {
                     status: run.status.as_str().to_owned(),
-                    phase: run.status.phase().map(|p| p.as_str().to_owned()),
+                    phase: run.status.stored_phase().map(str::to_owned),
                     index: run.index,
                     stderr_tail: run.stderr_tail,
                     elapsed_ms: u64::try_from(run.elapsed.as_millis()).unwrap_or(u64::MAX),
@@ -611,13 +642,14 @@ fn join_root(root: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     use rb_scip::{ContainerRun, Outcome};
 
     use super::*;
 
     const JAVA_ID: &str = "sha256:66a0b395166fc65c49cc099b0b3e4d2cb61e16c177dbc3c022160bb0b4cd1cf2";
+    const JDK25_ID: &str = "sha256:jdk25";
 
     struct Fake {
         runs: RefCell<usize>,
@@ -625,8 +657,12 @@ mod tests {
         fail: bool,
         /// The scip-java image is present locally.
         java_image: bool,
+        /// The JDK 25 scip-java image is present locally.
+        java25_image: bool,
         /// Replaces every run's outcome when set (a runtime failure, a timeout).
         outcome: Option<Outcome>,
+        /// Scripted outcomes, popped per run; the bool writes `index` on index runs.
+        script: RefCell<VecDeque<(Outcome, bool)>>,
     }
 
     impl Fake {
@@ -636,7 +672,9 @@ mod tests {
                 index,
                 fail,
                 java_image,
+                java25_image: true,
                 outcome: None,
+                script: RefCell::new(VecDeque::new()),
             }
         }
     }
@@ -644,6 +682,13 @@ mod tests {
     impl Runner for Fake {
         fn run(&self, run: &ContainerRun) -> anyhow::Result<Outcome> {
             *self.runs.borrow_mut() += 1;
+            let is_index = run.network == rb_scip::Network::None;
+            if let Some((outcome, writes)) = self.script.borrow_mut().pop_front() {
+                if is_index && writes {
+                    std::fs::write(run.host_cwd().join("index.scip"), &self.index)?;
+                }
+                return Ok(outcome);
+            }
             if let Some(outcome) = &self.outcome {
                 return Ok(outcome.clone());
             }
@@ -666,7 +711,13 @@ mod tests {
             if image == rb_scip::egress::PROXY_IMAGE {
                 return Some("sha256:proxy".to_owned());
             }
-            (self.java_image && image == rb_scip::jobs::SCIP_JAVA_IMAGE).then(|| JAVA_ID.to_owned())
+            if image == rb_scip::jobs::SCIP_JAVA_IMAGE {
+                return self.java_image.then(|| JAVA_ID.to_owned());
+            }
+            if image == rb_scip::jobs::SCIP_JAVA25_IMAGE {
+                return self.java25_image.then(|| JDK25_ID.to_owned());
+            }
+            None
         }
 
         fn start_proxy(&self, _: &rb_scip::ProxySpec) -> anyhow::Result<String> {
@@ -798,6 +849,189 @@ mod tests {
         outside[3].blob_sha = "8".repeat(40);
         run_projects(&outside, &read, &Mode::Run(&fake), &opts, &mut cache).unwrap();
         assert_eq!(*fake.runs.borrow(), 4);
+    }
+
+    /// Contract Part B: a Maven job whose fetch or index fails with
+    /// `release version {N>21} not supported` runs again on the JDK 25 image. The retry
+    /// stores `ok`/phase `jdk` with the first run's tail; the image key switches to the
+    /// JDK 25 image, so both rows are cached.
+    #[test]
+    fn a_maven_job_needing_a_newer_jdk_reruns_on_jdk25() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![entry("svc/pom.xml", "1"), entry("svc/src/A.java", "2")];
+        let sources = HashMap::from([
+            ("1".repeat(40), b"<project><modelVersion>4.0.0</modelVersion><artifactId>svc</artifactId><properties><maven.compiler.release>21</maven.compiler.release></properties></project>".to_vec()),
+            ("2".repeat(40), b"class A {}".to_vec()),
+        ]);
+        let read = |blob: &str| Ok(sources[blob].clone());
+        let ok = || Outcome {
+            exit_code: Some(0),
+            timed_out: false,
+            stderr_tail: String::new(),
+            elapsed: std::time::Duration::from_millis(1),
+        };
+        let failed_release = || Outcome {
+            exit_code: Some(1),
+            timed_out: false,
+            stderr_tail: "error: release version 25 not supported".into(),
+            elapsed: std::time::Duration::from_millis(1),
+        };
+        let mut fake = Fake::new(index_bytes(), false, true);
+        // Each Maven run fetches twice (go-offline, then an online build) and indexes
+        // once: the release failure lands on the second fetch.
+        fake.script = RefCell::new(
+            vec![
+                (ok(), false),
+                (ok(), false),
+                (failed_release(), false),
+                (ok(), false),
+                (ok(), false),
+                (ok(), true),
+            ]
+            .into(),
+        );
+        let mut cache = MemCache::default();
+        let opts = options(tmp.path(), &fake);
+        let projects = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
+        assert_eq!(projects.len(), 1);
+        let p = &projects[0];
+        assert_eq!(p.status, RunStatus::OkWithoutJdk21);
+        assert_eq!(p.image, JDK25_ID, "the retry runs in the JDK 25 image");
+        assert!(
+            p.stderr_tail.contains("release version 25 not supported"),
+            "the first run's tail says why: {}",
+            p.stderr_tail
+        );
+        assert_eq!(
+            *fake.runs.borrow(),
+            6,
+            "fetch, fetch, fail, fetch, fetch, index"
+        );
+        // Only the final outcome is cached, under the retry's image: the intermediate
+        // JDK 21 failure is an implementation detail of this run, and caching it would
+        // need retry-on-hit logic to avoid serving a stale failure. A re-index simply
+        // rediscovers the fallback.
+        assert_eq!(cache.puts, 1, "only the retry's outcome is cached");
+        assert!(p.index.is_some(), "the retry's index is decoded");
+    }
+
+    /// Contract Part B: no retry on a timeout or a docker client failure, on a
+    /// non-Maven job, without the JDK 25 image, or when the release is supported.
+    #[test]
+    fn jdk_retry_only_fires_when_warranted() {
+        let files = vec![entry("svc/pom.xml", "1"), entry("svc/src/A.java", "2")];
+        let sources = HashMap::from([
+            ("1".repeat(40), b"<project><modelVersion>4.0.0</modelVersion><artifactId>svc</artifactId><properties><maven.compiler.release>21</maven.compiler.release></properties></project>".to_vec()),
+            ("2".repeat(40), b"class A {}".to_vec()),
+        ]);
+        let read = |blob: &str| Ok(sources[blob].clone());
+        let outcome = |exit_code: Option<i32>, timed_out: bool, tail: &str| Outcome {
+            exit_code,
+            timed_out,
+            stderr_tail: tail.into(),
+            elapsed: std::time::Duration::from_millis(1),
+        };
+        // A timeout is returned as-is, never retried.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(index_bytes(), false, true);
+        fake.script = RefCell::new(
+            vec![
+                (outcome(Some(0), false, ""), false),
+                (outcome(None, true, ""), false),
+            ]
+            .into(),
+        );
+        let mut cache = MemCache::default();
+        let projects = run_projects(
+            &files,
+            &read,
+            &Mode::Run(&fake),
+            &options(tmp.path(), &fake),
+            &mut cache,
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(projects[0].status, RunStatus::Timeout { .. }));
+        assert_eq!(*fake.runs.borrow(), 2, "no retry after a timeout");
+        // A non-Maven job with the same tail is not retried.
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = vec![
+            entry("web/package.json", "3"),
+            entry("web/tsconfig.json", "4"),
+        ];
+        let ts_sources = HashMap::from([
+            ("3".repeat(40), b"{}".to_vec()),
+            ("4".repeat(40), b"{}".to_vec()),
+        ]);
+        let ts_read = |blob: &str| Ok(ts_sources[blob].clone());
+        let mut fake = Fake::new(index_bytes(), false, true);
+        fake.script = RefCell::new(
+            vec![
+                (outcome(Some(0), false, ""), false),
+                (
+                    outcome(Some(1), false, "error: release version 25 not supported"),
+                    false,
+                ),
+            ]
+            .into(),
+        );
+        let mut cache = MemCache::default();
+        let projects = run_projects(
+            &ts,
+            &ts_read,
+            &Mode::Run(&fake),
+            &options(tmp.path(), &fake),
+            &mut cache,
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(projects[0].status, RunStatus::Failed(_)));
+        assert_eq!(*fake.runs.borrow(), 2, "no retry for a non-Maven job");
+        // Without the JDK 25 image the failure stands.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(index_bytes(), false, true);
+        fake.script = RefCell::new(
+            vec![
+                (outcome(Some(0), false, ""), false),
+                (
+                    outcome(Some(1), false, "error: release version 25 not supported"),
+                    false,
+                ),
+            ]
+            .into(),
+        );
+        let mut cache = MemCache::default();
+        let mut opts = options(tmp.path(), &fake);
+        opts.images.java25 = Err("absent".into());
+        let projects = run_projects(&files, &read, &Mode::Run(&fake), &opts, &mut cache)
+            .unwrap()
+            .0;
+        assert!(matches!(projects[0].status, RunStatus::Failed(_)));
+        assert_eq!(*fake.runs.borrow(), 2, "no retry without the JDK 25 image");
+        // An unrelated Maven failure is not retried.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fake = Fake::new(index_bytes(), false, true);
+        fake.script = RefCell::new(
+            vec![
+                (outcome(Some(0), false, ""), false),
+                (outcome(Some(1), false, "BUILD FAILURE"), false),
+            ]
+            .into(),
+        );
+        let mut cache = MemCache::default();
+        let projects = run_projects(
+            &files,
+            &read,
+            &Mode::Run(&fake),
+            &options(tmp.path(), &fake),
+            &mut cache,
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(projects[0].status, RunStatus::Failed(_)));
+        assert_eq!(*fake.runs.borrow(), 2, "no retry without the release tail");
     }
 
     #[test]

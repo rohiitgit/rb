@@ -23,7 +23,8 @@ pub use hash::project_input_hash;
 pub mod orchestrate;
 
 pub use orchestrate::{
-    Budget, Images, Phase, RECIPE_JAVA, RECIPE_TS, RunStatus, ScipRun, image_for, recipe, run_job,
+    Budget, Images, Phase, RECIPE_JAVA, RECIPE_TS, RunStatus, ScipRun, image_for,
+    jdk_release_needed, recipe, run_job,
 };
 pub mod symbol;
 

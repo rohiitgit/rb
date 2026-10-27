@@ -1652,8 +1652,10 @@ fn scip_status(p: &ScipProject, coverage: Option<&scip::Coverage>) -> Diagnostic
         Some(reason) => detail["reason"] = reason.into(),
         None => detail["image"] = p.image.as_str().into(),
     }
-    if let Some(phase) = p.status.phase() {
-        detail["phase"] = phase.as_str().into();
+    // The stored phase, not the run phase: a JDK 25 fallback records "jdk" (Part B),
+    // which is no fetch or index phase of its own.
+    if let Some(phase) = p.status.stored_phase() {
+        detail["phase"] = phase.into();
     }
     // Contract M6a D3, D5, D7: only for a grouped workspace root or a job with link targets,
     // so other jobs dump as before.
