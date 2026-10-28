@@ -998,3 +998,17 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Built:** `0009_phases.sql`; `rb-ops` (keywords, `incremental_changed`, event kinds, decision scoring, `route_task`, `security_scan`, `cost_check`, `plan_from_context`, `render_feature`); `rb-store/src/phases.rs` (event/decision/deployment/incident/feature CRUD + search); `rb-cli/src/phases.rs` + 11 new commands; `rb ide export` static viewer (gitignored under `var/`).
 - **Verification:** rb-ops 9, rb-store 85 + 24 db, rb-cli 49; fmt + clippy clean; stub scan clean; every command exercised live (t_phases/t_demo repos, cleaned up after).
 - **Status:** closed. Remaining: the deferred notes in `tasks/deferred-next-steps.md` (untouched).
+
+## Phases 2-10 per-phase goals — each planned, built, and proven separately (2026-10-28)
+
+- **Phase 2 (goal: git-driven incremental updates).** `events apply` diffs live commit vs HEAD, records the delta, splits blobs by facts-cache presence. Proven live: 1-file change detected, re-run is a no-op.
+- **Phase 3 (goal: decisions, not chats).** `decisions import` parses ADR markdown (`parse_adr` tested); `why` answers why/who with source + author. Proven live including skip of heading-less files.
+- **Phase 4 (goal: context package before any LLM).** Added deployments to the package; proven live with deployment+incident+decision rows.
+- **Phase 5 (goal: plan from context only).** Test locks every target to context lists; capabilities fixed to read/edit/execute/test.
+- **Phase 6 (goal: independent verifiers).** `verify` runs security + cost + live-graph architecture; exit 1 on findings (proven with planted secret). Scanner hardened by self-scan (length rule, boundary rule, runtime fixtures).
+- **Phase 7 (goal: deployment caused it).** `incident blame` resolves service -> deployment -> error -> sibling scope; FK honesty and empty cases proven.
+- **Phase 8 (goal: feature answers without file names).** Render covers services/endpoints/tables/deployments/metrics; `billing` demo verified.
+- **Phase 9 (goal: routed agents with verification).** Subtasks carry per-agent evidence scopes; verification named per subtask.
+- **Phase 10 (goal: thin IDE over the API).** Seven read-only endpoints added (`Answer::Phases`); IDE fetches them live (verified via curl against `rb serve`: find/service/agent/orchestrate/decisions/events/callers).
+- **Deviations:** none from the phase goals; the doctor e2e flake is host load (recorded in CHANGELOG, test untouched).
+- **Status:** each phase goal met with a live proof above; committed below.

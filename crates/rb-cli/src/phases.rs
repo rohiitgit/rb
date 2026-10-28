@@ -8,136 +8,17 @@ use serde_json::{Value, json};
 
 use rb_store::Store;
 
-fn live_id(store: &mut Store, repo: &str) -> anyhow::Result<Option<i64>> {
-    Ok(store.live_snapshot(repo)?.map(|s| s.id))
-}
-
-fn service_keys(store: &mut Store, snap: i64) -> Vec<String> {
-    store
-        .services(snap)
-        .map(|v| v.into_iter().map(|s| s.key).collect())
-        .unwrap_or_default()
-}
-
-fn find_keys(store: &mut Store, snap: i64, q: &str, kind: &str) -> Vec<String> {
-    let k = kind.parse().ok();
-    store
-        .find(snap, q, k, 5, 0)
-        .map(|p| p.nodes.into_iter().map(|n| n.key).collect())
-        .unwrap_or_default()
-}
-
 pub fn context_package(store: &mut Store, repo: &str, task: &str) -> anyhow::Result<Value> {
-    let keywords = rb_ops::keywords(task);
-    let snap = live_id(store, repo)?;
-    let mut services = Vec::new();
-    let mut endpoints = Vec::new();
-    let mut tables = Vec::new();
-    if let Some(id) = snap {
-        services = service_keys(store, id);
-        for w in keywords.iter().take(4) {
-            endpoints.extend(find_keys(store, id, w, "endpoint"));
-            tables.extend(find_keys(store, id, w, "table"));
-        }
-        endpoints.sort();
-        endpoints.dedup();
-        endpoints.truncate(10);
-        tables.sort();
-        tables.dedup();
-        tables.truncate(10);
-        // Keep only services named by a keyword; fall back to all (max 10).
-        if !keywords.is_empty() {
-            let kept: Vec<String> = services
-                .iter()
-                .filter(|s| keywords.iter().any(|w| s.to_lowercase().contains(w)))
-                .cloned()
-                .collect();
-            if !kept.is_empty() {
-                services = kept;
-            }
-        }
-        services.truncate(10);
-    }
-    let decisions = store
-        .search_decisions(repo, task, 5)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|d| {
-            json!({"title": d.title, "reason": d.reason, "source": d.source, "author": d.author})
-        })
-        .collect::<Vec<_>>();
-    let incidents = store
-        .list_incidents(repo, None)
-        .unwrap_or_default()
-        .into_iter()
-        .take(5)
-        .map(|i| json!({"service": i.service, "severity": i.severity, "summary": i.summary}))
-        .collect::<Vec<_>>();
-    Ok(json!({
-        "task": task,
-        "keywords": keywords,
-        "services": services,
-        "endpoints": endpoints,
-        "tables": tables,
-        "decisions": decisions,
-        "incidents": incidents,
-        "snapshot": snap,
-    }))
+    store.context_package(repo, task)
 }
 
 pub fn agent_plan(store: &mut Store, repo: &str, task: &str) -> anyhow::Result<Value> {
-    let ctx = context_package(store, repo, task)?;
-    let services: Vec<String> = ctx["services"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    let endpoints: Vec<String> = ctx["endpoints"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    let tables: Vec<String> = ctx["tables"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    let steps = rb_ops::plan_from_context(&services, &endpoints, &tables, 8);
-    let agents: Vec<&str> = rb_ops::route_task(task)
-        .into_iter()
-        .map(rb_ops::Agent::as_str)
-        .collect();
-    Ok(json!({
-        "task": task,
-        "agents": agents,
-        "context": ctx,
-        "steps": steps.into_iter().map(|s| {
-            json!({"tool": s.tool, "target": s.target, "why": s.why})
-        }).collect::<Vec<_>>(),
-        "capabilities": ["read", "edit", "execute", "test"],
-    }))
+    store.agent_plan(repo, task)
 }
 
 pub fn orchestrate_plan(store: &mut Store, repo: &str, task: &str) -> anyhow::Result<Value> {
-    let plan = agent_plan(store, repo, task)?;
-    let subtasks: Vec<Value> = plan["agents"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .map(|a| {
-            json!({
-                "agent": a,
-                "task": task,
-                "verification": "rb verify",
-            })
-        })
-        .collect();
-    Ok(json!({"task": task, "subtasks": subtasks, "plan": plan}))
+    store.orchestrate_plan(repo, task)
 }
-
 pub fn verify_tree(root: &Path, max_files: usize) -> anyhow::Result<Value> {
     let mut files = Vec::new();
     collect_text_files(root, &mut files, max_files);
@@ -189,24 +70,61 @@ fn collect_text_files(root: &Path, out: &mut Vec<(String, String)>, cap: usize) 
 
 pub fn ide_html() -> String {
     r#"<!doctype html><html><head><meta charset="utf-8"><title>rb thin IDE</title>
-<style>body{font-family:monospace;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;height:100vh;margin:0}section{border:1px solid #ccc;padding:8px;overflow:auto}h2{margin:0 0 8px;font-size:14px}</style>
+<style>body{font-family:monospace;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:auto 1fr 1fr;height:100vh;margin:0}header{grid-column:1/3;padding:8px;border-bottom:1px solid #ccc}section{border:1px solid #ccc;padding:8px;overflow:auto}h2{margin:0 0 8px;font-size:14px}input{font-family:monospace;width:60%}</style>
 </head><body>
-<section><h2>Editor (read-only; edits via rb agent)</h2><pre id="editor">open a file:line from Graph Explorer</pre></section>
-<section><h2>Graph Explorer</h2><input id="q" placeholder="rb find query"><button onclick="find()">find</button><pre id="graph"></pre></section>
-<section><h2>Agent Interface</h2><input id="task" placeholder="task"><button onclick="agent()">plan</button><pre id="plan"></pre></section>
-<section><h2>Review Interface</h2><button onclick="verify()">rb verify</button><pre id="review"></pre></section>
+<header><b>rb thin IDE</b> (read-only; edits via <code>rb agent</code>)
+base <input id="base" value="http://127.0.0.1:55480"> repo <input id="repo" value="demo"></header>
+<section><h2>Editor (evidence viewer: symbol &rarr; callers with file:line)</h2><input id="sym" placeholder="symbol, e.g. Db#load()."><button onclick="callers()">callers</button><pre id="editor"></pre></section>
+<section><h2>Graph Explorer (find + service card)</h2><input id="q" placeholder="find query"><button onclick="find()">find</button> <input id="svc" placeholder="service"><button onclick="card()">card</button><pre id="graph"></pre></section>
+<section><h2>Agent Interface (task &rarr; plan from context only)</h2><input id="task" placeholder="task, e.g. fix login timeout"><button onclick="agent()">plan</button><pre id="plan"></pre></section>
+<section><h2>Review Interface (orchestrate: agents, scopes, verification)</h2><input id="task2" placeholder="task"><button onclick="review()">orchestrate</button><pre id="review"></pre></section>
 <script>
-const base="http://127.0.0.1:8080/v1/repos";
-async function find(){const r=await fetch(`${base}/demo/find?q=${encodeURIComponent(document.getElementById('q').value)}`);document.getElementById('graph').textContent=await r.text()}
-async function agent(){document.getElementById('plan').textContent="run: rb agent \""+document.getElementById('task').value+"\" --repo demo"}
-async function verify(){document.getElementById('review').textContent="run: rb verify --repo demo"}
+async function get(path, params, el) {
+  const base = document.getElementById('base').value.replace(/\/$/, '');
+  const repo = encodeURIComponent(document.getElementById('repo').value);
+  const qs = new URLSearchParams(params).toString();
+  let out;
+  try {
+    const r = await fetch(`${base}/v1/repos/${repo}/${path}?${qs}`);
+    out = JSON.stringify(JSON.parse(await r.text()), null, 2);
+  } catch (e) { out = "request failed: " + e + " (is `rb serve` running?)"; }
+  document.getElementById(el).textContent = out;
+}
+function find() { get('find', {q: document.getElementById('q').value}, 'graph'); }
+function card() { get('service', {name: document.getElementById('svc').value}, 'graph'); }
+function callers() { get('callers', {target: document.getElementById('sym').value}, 'editor'); }
+function agent() { get('agent', {task: document.getElementById('task').value}, 'plan'); }
+function review() { get('orchestrate', {task: document.getElementById('task2').value}, 'review'); }
 </script></body></html>"#.to_owned()
 }
 
 pub fn write_ide(output: &PathBuf) -> anyhow::Result<()> {
+    write_ide_to(output, &ide_html())
+}
+
+fn write_ide_to(output: &PathBuf, html: &str) -> anyhow::Result<()> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(output, ide_html())?;
+    std::fs::write(output, html)?;
     Ok(())
+}
+
+/// Phase 6: architecture violations on the repo's live snapshot, if it has one.
+/// `None` means no live graph to check (not a pass).
+pub fn arch_violations(
+    store: &mut Store,
+    repo: &str,
+) -> anyhow::Result<Option<Vec<(String, String, String)>>> {
+    let live = match store.live_snapshot(repo)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let graph = store.load_graph(live.id)?;
+    Ok(Some(
+        rb_store::check::check(&graph)
+            .into_iter()
+            .map(|v| (v.rule.to_owned(), v.src.clone(), v.dst.clone()))
+            .collect(),
+    ))
 }

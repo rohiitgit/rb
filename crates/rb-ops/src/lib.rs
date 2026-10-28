@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Stopwords removed from task keywords (Phase 4 context).
 const STOPWORDS: &[&str] = &[
     "the", "a", "an", "and", "or", "for", "fix", "show", "what", "which", "how", "why", "does",
-    "is", "are", "of", "in", "on", "to", "with", "please",
+    "is", "are", "of", "in", "on", "to", "with", "please", "who", "made", "this", "that", "was",
+    "were", "when",
 ];
 
 /// Phase 4: task text to sorted keyword list.
@@ -271,17 +272,81 @@ pub fn plan_from_context(
 }
 
 /// Phase 8: render a feature without file names (user-facing answer).
+/// Phase 2: split changed `(path, blob)` rows into cached (skip extraction) and
+/// new (must extract). Pure; the caller reads cache presence from the store.
+pub fn partition_cached(
+    changed: &[(String, String)],
+    cached_blobs: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut skip = Vec::new();
+    let mut extract = Vec::new();
+    for (path, blob) in changed {
+        if cached_blobs.contains(blob) {
+            skip.push(path.clone());
+        } else {
+            extract.push(path.clone());
+        }
+    }
+    (skip, extract)
+}
+
+/// Phase 3: parse one ADR markdown document into (title, reason, date, source,
+/// author). The title is the first `# ` heading; `Reason:`/`Date:`/`Source:`/
+/// `Author:` field lines fill the record; remaining body text extends the reason.
+/// Files without a `# ` heading return `None` (skipped, never guessed).
+pub fn parse_adr(text: &str) -> Option<(String, String, String, String, String)> {
+    let mut title = String::new();
+    let mut reason = String::new();
+    let mut date = String::new();
+    let mut source = String::new();
+    let mut author = String::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if title.is_empty() {
+            if let Some(h) = t.strip_prefix("# ") {
+                title = h.trim().to_owned();
+            }
+            continue;
+        }
+        let (k, v) = match t.split_once(':') {
+            Some((k, v)) => (k.trim().to_lowercase(), v.trim()),
+            None => ("".into(), ""),
+        };
+        match k.as_str() {
+            "reason" => reason = v.to_owned(),
+            "date" => date = v.to_owned(),
+            "source" => source = v.to_owned(),
+            "author" => author = v.to_owned(),
+            _ if !t.is_empty() => {
+                if !reason.is_empty() {
+                    reason.push('\n');
+                }
+                reason.push_str(t);
+            }
+            _ => {}
+        }
+    }
+    if title.is_empty() {
+        return None;
+    }
+    Some((title, reason, date, source, author))
+}
+
 pub fn render_feature(
     name: &str,
     description: &str,
     services: &[String],
     endpoints: &[String],
     tables: &[String],
+    deployments: &[String],
+    metrics: &[String],
 ) -> String {
     let mut out = format!("feature {name}\n{description}\n");
     out.push_str(&format!("services: {}\n", services.join(", ")));
     out.push_str(&format!("endpoints: {}\n", endpoints.join(", ")));
     out.push_str(&format!("tables: {}\n", tables.join(", ")));
+    out.push_str(&format!("deployments: {}\n", deployments.join(", ")));
+    out.push_str(&format!("metrics: {}\n", metrics.join(", ")));
     out
 }
 
@@ -389,6 +454,67 @@ mod tests {
     }
 
     #[test]
+    fn plan_targets_come_from_context_never_blind_search() {
+        let services = vec!["shop".into()];
+        let endpoints = vec!["GET /x".into()];
+        let tables = vec!["t".into()];
+        let allowed: std::collections::BTreeSet<String> = services
+            .iter()
+            .map(|s: &String| format!("service:{s}"))
+            .chain(endpoints.iter().map(|e| format!("endpoint:{e}")))
+            .chain(tables.iter().map(|t| format!("table:{t}")))
+            .chain(["cargo test".into()])
+            .collect();
+        for step in plan_from_context(&services, &endpoints, &tables, 10) {
+            assert!(
+                allowed.contains(&step.target),
+                "blind target: {}",
+                step.target
+            );
+            assert!(["read", "edit", "execute", "test"].contains(&step.tool));
+        }
+    }
+
+    #[test]
+    fn adr_documents_parse_or_skip() {
+        let doc = "# Use Redis Streams\nReason: Ordering guarantees\nDate: 2026-09-01\nSource: PR #231\nAuthor: rohit\n";
+        assert_eq!(
+            parse_adr(doc),
+            Some((
+                "Use Redis Streams".into(),
+                "Ordering guarantees".into(),
+                "2026-09-01".into(),
+                "PR #231".into(),
+                "rohit".into()
+            ))
+        );
+        let thin = "# Drop RabbitMQ\nIt cost too much to run.\n";
+        assert_eq!(
+            parse_adr(thin),
+            Some((
+                "Drop RabbitMQ".into(),
+                "It cost too much to run.".into(),
+                "".into(),
+                "".into(),
+                "".into()
+            ))
+        );
+        assert_eq!(parse_adr("no heading here\n"), None);
+        assert_eq!(parse_adr(""), None);
+    }
+
+    #[test]
+    fn cached_blobs_skip_extraction() {
+        use std::collections::BTreeSet;
+        let changed = vec![("a.ts".into(), "h1".into()), ("b.ts".into(), "h2".into())];
+        let cached: BTreeSet<String> = ["h1".into()].into_iter().collect();
+        let (skip, extract) = partition_cached(&changed, &cached);
+        assert_eq!(skip, vec!["a.ts".to_owned()]);
+        assert_eq!(extract, vec!["b.ts".to_owned()]);
+        assert!(partition_cached(&[], &cached).0.is_empty());
+    }
+
+    #[test]
     fn feature_render_has_no_file_paths() {
         let s = render_feature(
             "billing",
@@ -396,8 +522,11 @@ mod tests {
             &["billing".into()],
             &["POST /pay".into()],
             &["invoices".into()],
+            &["v5".into()],
+            &["pay_latency_p99".into()],
         );
         assert!(s.contains("billing") && s.contains("POST /pay"));
+        assert!(s.contains("v5") && s.contains("pay_latency_p99"));
         assert!(!s.contains(".ts") && !s.contains("src/"));
     }
 }

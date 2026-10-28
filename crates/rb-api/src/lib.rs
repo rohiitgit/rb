@@ -113,10 +113,24 @@ pub enum Endpoint {
     Path,
     Cypher,
     Diff,
+    /// Phase 3: search engineering decisions.
+    Decisions,
+    /// Phase 4: assemble a context package for a task.
+    Context,
+    /// Phase 5: a deterministic agent plan for a task.
+    Agent,
+    /// Phase 9: multi-agent orchestration plan.
+    Orchestrate,
+    /// Phase 8: show a feature's graph slice.
+    Feature,
+    /// Phase 7: blame an incident on its deployment.
+    Blame,
+    /// Phase 2: list incremental-update events.
+    Events,
 }
 
 impl Endpoint {
-    pub const ALL: [Endpoint; 11] = [
+    pub const ALL: [Endpoint; 18] = [
         Endpoint::Status,
         Endpoint::Snapshots,
         Endpoint::Find,
@@ -128,6 +142,13 @@ impl Endpoint {
         Endpoint::Path,
         Endpoint::Cypher,
         Endpoint::Diff,
+        Endpoint::Decisions,
+        Endpoint::Context,
+        Endpoint::Agent,
+        Endpoint::Orchestrate,
+        Endpoint::Feature,
+        Endpoint::Blame,
+        Endpoint::Events,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -143,6 +164,13 @@ impl Endpoint {
             Endpoint::Path => "path",
             Endpoint::Cypher => "cypher",
             Endpoint::Diff => "diff",
+            Endpoint::Decisions => "decisions",
+            Endpoint::Context => "context",
+            Endpoint::Agent => "agent",
+            Endpoint::Orchestrate => "orchestrate",
+            Endpoint::Feature => "feature",
+            Endpoint::Blame => "blame",
+            Endpoint::Events => "events",
         }
     }
 
@@ -191,6 +219,13 @@ impl Endpoint {
             Endpoint::Cypher => &["query", "columns", "timeout_ms", "snapshot"],
             // `from` and `to` select the snapshots (D11).
             Endpoint::Diff => &["from", "to", "limit", "offset", "diagnostics"],
+            Endpoint::Decisions => &["q", "limit"],
+            Endpoint::Context => &["task"],
+            Endpoint::Agent => &["task"],
+            Endpoint::Orchestrate => &["task"],
+            Endpoint::Feature => &["name"],
+            Endpoint::Blame => &["service", "incident"],
+            Endpoint::Events => &["limit"],
         }
     }
 }
@@ -316,6 +351,29 @@ pub enum Query {
         /// List the diagnostics' multiset difference, not only the counts per kind.
         diagnostics: bool,
     },
+    Decisions {
+        q: String,
+        limit: u64,
+    },
+    Context {
+        task: String,
+    },
+    Agent {
+        task: String,
+    },
+    Orchestrate {
+        task: String,
+    },
+    Feature {
+        name: String,
+    },
+    Blame {
+        service: String,
+        incident: Option<i64>,
+    },
+    Events {
+        limit: u64,
+    },
 }
 
 /// The largest `pick` accepted. A pick beyond several candidates lists them again; beyond the
@@ -419,6 +477,29 @@ pub fn parse(
             page: Page::read(p, diff::LIMIT_MAX, diff::LIMIT_MAX)?,
             diagnostics: p.boolean("diagnostics")?,
         },
+        Endpoint::Decisions => Query::Decisions {
+            q: p.text("q")?,
+            limit: p.int("limit", 20, 1, 100)?,
+        },
+        Endpoint::Context => Query::Context {
+            task: p.text("task")?,
+        },
+        Endpoint::Agent => Query::Agent {
+            task: p.text("task")?,
+        },
+        Endpoint::Orchestrate => Query::Orchestrate {
+            task: p.text("task")?,
+        },
+        Endpoint::Feature => Query::Feature {
+            name: p.text("name")?,
+        },
+        Endpoint::Blame => Query::Blame {
+            service: p.text("service")?,
+            incident: p.int_opt("incident", 1, i64::MAX as u64)?.map(|n| n as i64),
+        },
+        Endpoint::Events => Query::Events {
+            limit: p.int("limit", 20, 1, 100)?,
+        },
         Endpoint::Cypher => Query::Cypher {
             query: p.text("query")?,
             columns: columns(p)?,
@@ -476,6 +557,13 @@ impl Query {
             Query::Path { .. } => Endpoint::Path,
             Query::Cypher { .. } => Endpoint::Cypher,
             Query::Diff { .. } => Endpoint::Diff,
+            Query::Decisions { .. } => Endpoint::Decisions,
+            Query::Context { .. } => Endpoint::Context,
+            Query::Agent { .. } => Endpoint::Agent,
+            Query::Orchestrate { .. } => Endpoint::Orchestrate,
+            Query::Feature { .. } => Endpoint::Feature,
+            Query::Blame { .. } => Endpoint::Blame,
+            Query::Events { .. } => Endpoint::Events,
         }
     }
 
@@ -563,6 +651,15 @@ impl Query {
                 "offset": page.offset,
                 "diagnostics": diagnostics,
             }),
+            Query::Decisions { q, limit } => json!({"q": q, "limit": limit}),
+            Query::Context { task } => json!({"task": task}),
+            Query::Agent { task } => json!({"task": task}),
+            Query::Orchestrate { task } => json!({"task": task}),
+            Query::Feature { name } => json!({"name": name}),
+            Query::Blame { service, incident } => {
+                json!({"service": service, "incident": incident})
+            }
+            Query::Events { limit } => json!({"limit": limit}),
         }
     }
 }
@@ -601,6 +698,8 @@ pub enum Answer {
     },
     Cypher(CypherRows),
     Diff(Box<diff::DiffAnswer>),
+    /// Phases 2-9 repo-level answers: the store-built JSON value itself.
+    Phases(Value),
 }
 
 impl Serialize for Answer {
@@ -634,6 +733,7 @@ impl Serialize for Answer {
             Answer::TableDeps(deps) => deps.serialize(s),
             Answer::Path { ix, path } => render::path_json(ix, path).serialize(s),
             Answer::Diff(d) => d.to_json().serialize(s),
+            Answer::Phases(v) => v.serialize(s),
             Answer::Cypher(rows) => {
                 json!({"columns": rows.columns, "rows": rows.rows}).serialize(s)
             }
@@ -794,6 +894,79 @@ pub fn run(
                 }),
             })
         }
+        Query::Decisions { q, limit } => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            if !s.repo_names()?.contains(&repo) {
+                return Err(not_indexed(&repo).into());
+            }
+            let found = s.search_decisions(&repo, q, *limit as i64)?;
+            Ok(phases_output(
+                s,
+                &repo,
+                &req.query,
+                Answer::Phases(json!(found)),
+            )?)
+        }
+        Query::Context { task } => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            let pkg = s.context_package(&repo, task)?;
+            Ok(phases_output(s, &repo, &req.query, Answer::Phases(pkg))?)
+        }
+        Query::Agent { task } => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            let plan = s.agent_plan(&repo, task)?;
+            Ok(phases_output(s, &repo, &req.query, Answer::Phases(plan))?)
+        }
+        Query::Orchestrate { task } => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            let plan = s.orchestrate_plan(&repo, task)?;
+            Ok(phases_output(s, &repo, &req.query, Answer::Phases(plan))?)
+        }
+        Query::Feature { name } => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            let f = s.show_feature(&repo, name)?;
+            Ok(phases_output(
+                s,
+                &repo,
+                &req.query,
+                Answer::Phases(json!({
+                    "name": f.name,
+                    "description": f.description,
+                    "links": f.links,
+                })),
+            )?)
+        }
+        Query::Blame { service, incident } => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            let blamed = s.incident_blame(&repo, service, *incident)?;
+            let v = match blamed {
+                Some((i, d, siblings)) => json!({
+                    "service": i.service,
+                    "severity": i.severity,
+                    "summary": i.summary,
+                    "deployment": d.map(|x| json!({
+                        "id": x.id, "service": x.service, "commit": x.commit_sha,
+                        "version": x.version, "status": x.status,
+                    })),
+                    "impact_scope": siblings,
+                }),
+                None => json!(null),
+            };
+            Ok(phases_output(s, &repo, &req.query, Answer::Phases(v))?)
+        }
+        Query::Events { limit } => {
+            let repo = resolve_repo(s, req.repo.as_deref())?;
+            if !s.repo_names()?.contains(&repo) {
+                return Err(not_indexed(&repo).into());
+            }
+            let events = s.list_events(&repo, *limit as i64)?;
+            Ok(phases_output(
+                s,
+                &repo,
+                &req.query,
+                Answer::Phases(json!(events)),
+            )?)
+        }
         _ => {
             let repo = resolve_repo(s, req.repo.as_deref())?;
             let (snap, live) = resolve_snapshot(s, &repo, req.snapshot)?;
@@ -877,6 +1050,26 @@ fn scip_jobs<S: Serializer>(jobs: &[rb_model::Diagnostic], s: S) -> Result<S::Ok
         .map(|d| json!({"path": d.path, "detail": d.detail}))
         .collect::<Vec<_>>()
         .serialize(s)
+}
+
+/// A repo-level phases answer (Phase 10): the envelope names the repo and its
+/// live snapshot when it has one; the result is the store-built value itself.
+fn phases_output(
+    store: &mut Store,
+    repo: &str,
+    query: &Query,
+    answer: Answer,
+) -> Result<Output, ApiError> {
+    let live = store.live_snapshot(repo).ok().flatten();
+    Ok(Output {
+        repo: Some(repo.to_owned()),
+        snapshot: live.as_ref().map(snapshot_ref),
+        query: query.normalised(),
+        limits: BTreeMap::new(),
+        truncated: Vec::new(),
+        certainty: None,
+        answer,
+    })
 }
 
 /// The status of `repo`, or of every repository (inside the read transaction); a repository
@@ -1275,6 +1468,16 @@ fn answer(
             }
         }
         Query::Status | Query::Snapshots(_) | Query::Cypher { .. } | Query::Diff { .. } => {
+            unreachable!("answered by `run` itself")
+        }
+        // Repo-level phases reads: answered by `run` itself, never through a snapshot.
+        Query::Decisions { .. }
+        | Query::Context { .. }
+        | Query::Agent { .. }
+        | Query::Orchestrate { .. }
+        | Query::Feature { .. }
+        | Query::Blame { .. }
+        | Query::Events { .. } => {
             unreachable!("answered by `run` itself")
         }
     };

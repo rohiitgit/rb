@@ -554,6 +554,16 @@ enum EventsAction {
         #[arg(long, default_value_t = 20)]
         limit: i64,
     },
+    /// Diff the live snapshot commit against a checkout's HEAD, record
+    /// `commit.created` + `file.changed` events for the delta, and report which
+    /// changed blobs the facts cache already holds (skip) vs must extract.
+    Apply {
+        #[arg(long)]
+        repo: String,
+        /// Path to the git checkout (its HEAD is the new commit).
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -576,6 +586,13 @@ enum DecisionsAction {
         #[arg(long)]
         repo: String,
     },
+    /// Import ADR markdown files (a file or a directory of `*.md`) as decisions.
+    Import {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -597,6 +614,16 @@ enum IncidentAction {
         repo: String,
         #[arg(long)]
         service: Option<String>,
+    },
+    /// Blame the latest incident of a service (or one id) on its deployment:
+    /// service -> deployment -> error -> impact scope.
+    Blame {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        incident: Option<i64>,
     },
 }
 
@@ -880,6 +907,72 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                     );
                 }
             }
+            EventsAction::Apply { repo, path } => {
+                let git_repo = rb_git::Repo::open(&path)?;
+                let head = git_repo.resolve_commit("HEAD")?;
+                let live = match store.live_snapshot(&repo)? {
+                    Some(s) => s.commit_sha,
+                    None => {
+                        println!("no live snapshot for {repo:?}; index first");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                };
+                if live == head {
+                    println!("up to date: {repo} already covers {head}");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                let before = git_repo.manifest(&live)?;
+                let after = git_repo.manifest(&head)?;
+                let map = |m: &rb_model::Manifest| {
+                    m.files
+                        .iter()
+                        .map(|f| (f.path.clone(), f.blob_sha.clone()))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                };
+                let before_map = map(&before);
+                let after_map = map(&after);
+                let changed = rb_ops::incremental_changed(&before_map, &after_map);
+                let rows: Vec<(String, String)> = changed
+                    .into_iter()
+                    .map(|p| {
+                        let blob = after_map.get(&p).cloned().unwrap_or_default();
+                        (p, blob)
+                    })
+                    .collect();
+                let blobs: Vec<String> = rows.iter().map(|(_, b)| b.clone()).collect();
+                let cached = store.cached_blobs(&blobs)?;
+                let present: std::collections::BTreeSet<String> = rows
+                    .iter()
+                    .zip(cached)
+                    .filter(|(_, hit)| *hit)
+                    .map(|((_, blob), _)| blob.clone())
+                    .collect();
+                let (skip, extract) = rb_ops::partition_cached(&rows, &present);
+                store.record_event(
+                    &repo,
+                    "commit.created",
+                    &head,
+                    None,
+                    &serde_json::json!({"from": live, "extract": extract.len(), "skip": skip.len()}),
+                )?;
+                for p in skip.iter().chain(extract.iter()) {
+                    store.record_event(
+                        &repo,
+                        "file.changed",
+                        &head,
+                        Some(p),
+                        &serde_json::json!({}),
+                    )?;
+                }
+                println!(
+                    "commit.created {head}: {} to extract, {} cached (run `rb index` to publish)",
+                    extract.len(),
+                    skip.len()
+                );
+                for p in &extract {
+                    println!("  extract {p}");
+                }
+            }
         },
         Command::Decisions { action } => match action {
             DecisionsAction::Add {
@@ -901,6 +994,43 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                         d.id, d.title, d.decided_on, d.source, d.author
                     );
                 }
+            }
+            DecisionsAction::Import { repo, path } => {
+                let mut files = vec![path.clone()];
+                if path.is_dir() {
+                    files.clear();
+                    let mut stack = vec![path.clone()];
+                    while let Some(dir) = stack.pop() {
+                        for e in std::fs::read_dir(&dir)?.flatten() {
+                            let p = e.path();
+                            if p.is_dir() {
+                                stack.push(p);
+                            } else if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                                files.push(p);
+                            }
+                        }
+                    }
+                    files.sort();
+                }
+                let mut imported = 0;
+                let mut skipped = 0;
+                for f in &files {
+                    let text = std::fs::read_to_string(f)?;
+                    match rb_ops::parse_adr(&text) {
+                        Some((title, reason, date, source, author)) => {
+                            let source = if source.is_empty() {
+                                f.display().to_string()
+                            } else {
+                                source
+                            };
+                            store
+                                .record_decision(&repo, &title, &reason, &date, &source, &author)?;
+                            imported += 1;
+                        }
+                        None => skipped += 1,
+                    }
+                }
+                println!("imported {imported}, skipped {skipped}");
             }
         },
         Command::Why { query, repo, json } => {
@@ -949,13 +1079,28 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                 println!("{plan:#}");
             }
         }
-        Command::Verify {
-            repo: _,
-            path,
-            json,
-        } => {
+        Command::Verify { repo, path, json } => {
             let root = path.unwrap_or_else(|| PathBuf::from("."));
-            let report = phases::verify_tree(&root, 200)?;
+            let mut report = phases::verify_tree(&root, 200)?;
+            // Architecture is the fourth independent checker: the live graph's
+            // rules, or an explicit skip when the repo has no live snapshot.
+            let arch = match repo {
+                Some(r) => phases::arch_violations(&mut store, &r)?,
+                None => None,
+            };
+            let arch_json: serde_json::Value = match &arch {
+                Some(v) => serde_json::json!(
+                    v.iter()
+                        .map(|(rule, src, dst)| serde_json::json!({
+                            "rule": rule, "src": src, "dst": dst
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+                None => serde_json::json!(null),
+            };
+            if let Some(obj) = report.as_object_mut() {
+                obj.insert("architecture".into(), arch_json);
+            }
             if json {
                 println!(
                     "{}",
@@ -964,8 +1109,9 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
             } else {
                 println!("{report:#}");
             }
-            let bad = report["security"].as_array().is_some_and(|a| !a.is_empty());
-            if bad {
+            let sec_bad = report["security"].as_array().is_some_and(|a| !a.is_empty());
+            let arch_bad = arch.is_some_and(|v| !v.is_empty());
+            if sec_bad || arch_bad {
                 return Ok(ExitCode::from(1));
             }
         }
@@ -1007,6 +1153,25 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                     );
                 }
             }
+            IncidentAction::Blame {
+                repo,
+                service,
+                incident,
+            } => match store.incident_blame(&repo, &service, incident)? {
+                Some((i, deploy, siblings)) => {
+                    println!("service {service}");
+                    match deploy {
+                        Some(d) => println!(
+                            "caused by deployment {} ({} {}, {})",
+                            d.id, d.commit_sha, d.version, d.status
+                        ),
+                        None => println!("caused by deployment: unlinked"),
+                    }
+                    println!("error [{}] {}", i.severity, i.summary);
+                    println!("impact scope: {siblings} incident(s) on this deployment");
+                }
+                None => println!("no incidents for {service} in {repo}"),
+            },
         },
         Command::Feature { action } => match action {
             FeatureAction::Add {
@@ -1031,17 +1196,29 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                 let mut svcs = Vec::new();
                 let mut eps = Vec::new();
                 let mut tabs = Vec::new();
+                let mut deploys = Vec::new();
+                let mut metrics = Vec::new();
                 for (k, t) in &f.links {
                     match k.as_str() {
                         "service" => svcs.push(t.clone()),
                         "endpoint" => eps.push(t.clone()),
                         "table" => tabs.push(t.clone()),
+                        "deployment" => deploys.push(t.clone()),
+                        "metric" => metrics.push(t.clone()),
                         _ => {}
                     }
                 }
                 print!(
                     "{}",
-                    rb_ops::render_feature(&f.name, &f.description, &svcs, &eps, &tabs)
+                    rb_ops::render_feature(
+                        &f.name,
+                        &f.description,
+                        &svcs,
+                        &eps,
+                        &tabs,
+                        &deploys,
+                        &metrics
+                    )
                 );
             }
         },
@@ -1535,6 +1712,9 @@ fn render_text(output: &rb_api::Output, evidence: bool) -> String {
             }
             out
         }
+        // Served over HTTP and `--json`; the CLI's phase commands print their own
+        // text, so this arm only fires if a future command routes through it.
+        Answer::Phases(v) => format!("{v:#}\n"),
     }
 }
 
