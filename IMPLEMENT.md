@@ -991,3 +991,10 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Verification:** rb-scip 112, rb-cli 49, rb-indexer 388; fmt, clippy clean; mutants m419–m426 KILLED. E2e: new `go-workspace-committed` fixture green (`scip: . scip-go ok`, goldens hand-reviewed row by row); scratch probes confirm the tools-JSON key follows the widened flag. Full bench `d89b2e124d86`, 0 failures; `compare` vs pip exits 0 with zero changed lines, no accept file; scoring `cmp`-identical. Full workspace suite on the final tree: all green (1198 passed, 0 failed) except one `deadline_exceeded` in `api_bodies_equal_cli_json` under suite load, which passes alone in 42 s — a host-load flake on an untouched query path, not the diff.
 - **Files:** as listed in the CHANGELOG entry above.
 - **Status:** closed; the two todo items checked. Remaining: the recorded Out of scope items (kotlin, webapp/cypress, ts env fallback, JS-only, C#, PHP, 4093 interface-method refs, cross-project IMPLEMENTS, D13 protobuf locators).
+
+## Phases 2-10: deterministic graph operations — closed 2026-10-28
+
+- **Decided:** Phase 1 needed no rebuild (four stop-questions already deterministic). Phases 2-10 built as planned: one migration, one pure-logic crate, store SQL, CLI handlers. No LLM, no embeddings, no new server surface.
+- **Built:** `0009_phases.sql`; `rb-ops` (keywords, `incremental_changed`, event kinds, decision scoring, `route_task`, `security_scan`, `cost_check`, `plan_from_context`, `render_feature`); `rb-store/src/phases.rs` (event/decision/deployment/incident/feature CRUD + search); `rb-cli/src/phases.rs` + 11 new commands; `rb ide export` static viewer (gitignored under `var/`).
+- **Verification:** rb-ops 9, rb-store 85 + 24 db, rb-cli 49; fmt + clippy clean; stub scan clean; every command exercised live (t_phases/t_demo repos, cleaned up after).
+- **Status:** closed. Remaining: the deferred notes in `tasks/deferred-next-steps.md` (untouched).

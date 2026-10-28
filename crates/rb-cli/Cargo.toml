@@ -18,6 +18,7 @@ rb-frameworks.workspace = true
 rb-git.workspace = true
 rb-indexer.workspace = true
 rb-model.workspace = true
+rb-ops.workspace = true
 rb-scip.workspace = true
 rb-server.workspace = true
 rb-syntax.workspace = true

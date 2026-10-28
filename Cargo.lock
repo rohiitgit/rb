@@ -2120,6 +2120,7 @@ dependencies = [
  "rb-git",
  "rb-indexer",
  "rb-model",
+ "rb-ops",
  "rb-scip",
  "rb-server",
  "rb-store",
@@ -2181,6 +2182,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-ops"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rb-scip"
 version = "0.1.0"
 dependencies = [
@@ -2223,6 +2233,7 @@ dependencies = [
  "csv",
  "postgres",
  "rb-model",
+ "rb-ops",
  "serde",
  "serde_json",
 ]

@@ -12,6 +12,7 @@ pub mod code;
 mod db_tests;
 pub mod diff;
 pub mod path;
+pub mod phases;
 mod query;
 pub mod rollup;
 
@@ -352,6 +353,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0008_scip_jdk_phase",
         include_str!("../../../migrations/0008_scip_jdk_phase.sql"),
+    ),
+    (
+        "0009_phases",
+        include_str!("../../../migrations/0009_phases.sql"),
     ),
 ];
 

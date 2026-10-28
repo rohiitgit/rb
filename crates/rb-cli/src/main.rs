@@ -13,6 +13,7 @@ use anyhow::{Context, ensure};
 mod code;
 mod doctor;
 mod path;
+mod phases;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rb_api::{Answer, ApiError, Endpoint, Params};
 use rb_model::{ServiceRole, canonical_dump};
@@ -435,6 +436,86 @@ enum Command {
         #[arg(long)]
         timeout_ms: Option<String>,
     },
+    /// Phase 2: record and list incremental-update events (commit/file/pr/branch).
+    Events {
+        #[command(subcommand)]
+        action: EventsAction,
+    },
+    /// Phase 3: record and list engineering decisions.
+    Decisions {
+        #[command(subcommand)]
+        action: DecisionsAction,
+    },
+    /// Phase 3: why was this decided (searches decisions, no LLM).
+    Why {
+        query: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Phase 4: assemble a context package for a task (no LLM).
+    Context {
+        task: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Phase 5: deterministic agent plan for a task (reads context only).
+    Agent {
+        task: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Phase 6: independent verification (security + cost + architecture).
+    Verify {
+        #[arg(long)]
+        repo: Option<String>,
+        /// Directory to scan for security patterns (default: current dir).
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Phase 7: record a production deployment.
+    Deploy {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        commit: String,
+        #[arg(long, default_value = "")]
+        version: String,
+        #[arg(long, default_value = "ok")]
+        status: String,
+    },
+    /// Phase 7: record and list production incidents.
+    Incident {
+        #[command(subcommand)]
+        action: IncidentAction,
+    },
+    /// Phase 8: feature graph (feature -> services/endpoints/tables).
+    Feature {
+        #[command(subcommand)]
+        action: FeatureAction,
+    },
+    /// Phase 9: multi-agent orchestration (deterministic routing + verification).
+    Orchestrate {
+        task: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Phase 10: thin IDE (static 4-pane viewer over the API).
+    Ide {
+        #[command(subcommand)]
+        action: IdeAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -450,6 +531,109 @@ enum CacheAction {
         /// Report what would be removed, and remove nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventsAction {
+    Record {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, default_value = "{}")]
+        detail: String,
+    },
+    List {
+        #[arg(long)]
+        repo: String,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum DecisionsAction {
+    Add {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+        #[arg(long, default_value = "")]
+        decided_on: String,
+        #[arg(long, default_value = "")]
+        source: String,
+        #[arg(long, default_value = "")]
+        author: String,
+    },
+    List {
+        #[arg(long)]
+        repo: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum IncidentAction {
+    Record {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        service: String,
+        #[arg(long, default_value = "warn")]
+        severity: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long)]
+        deployment: Option<i64>,
+    },
+    List {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        service: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FeatureAction {
+    Add {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    Link {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        target: String,
+    },
+    Show {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdeAction {
+    /// Write a static 4-pane viewer (editor/graph/agent/review) wired to `rb serve`.
+    Export {
+        #[arg(long, default_value = "var/ide/index.html")]
+        output: PathBuf,
     },
 }
 
@@ -483,6 +667,11 @@ fn wants_json(command: &Command) -> bool {
         | Command::Cypher { json, .. }
         | Command::Check { json, .. } => *json,
         Command::Path { json, format, .. } => *json || *format == Format::Json,
+        Command::Why { json, .. }
+        | Command::Context { json, .. }
+        | Command::Agent { json, .. }
+        | Command::Verify { json, .. }
+        | Command::Orchestrate { json, .. } => *json,
         _ => false,
     }
 }
@@ -667,6 +856,215 @@ fn run_cli(cli: Cli) -> anyhow::Result<ExitCode> {
                 baseline.as_deref(),
             );
         }
+        Command::Events { action } => match action {
+            EventsAction::Record {
+                repo,
+                kind,
+                commit,
+                path,
+                detail,
+            } => {
+                let detail: serde_json::Value = detail.parse()?;
+                let id = store.record_event(&repo, &kind, &commit, path.as_deref(), &detail)?;
+                println!("event {id}");
+            }
+            EventsAction::List { repo, limit } => {
+                for e in store.list_events(&repo, limit)? {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        e.id,
+                        e.kind,
+                        e.commit_sha,
+                        e.path.as_deref().unwrap_or("-"),
+                        e.detail
+                    );
+                }
+            }
+        },
+        Command::Decisions { action } => match action {
+            DecisionsAction::Add {
+                repo,
+                title,
+                reason,
+                decided_on,
+                source,
+                author,
+            } => {
+                let id =
+                    store.record_decision(&repo, &title, &reason, &decided_on, &source, &author)?;
+                println!("decision {id}");
+            }
+            DecisionsAction::List { repo } => {
+                for d in store.search_decisions(&repo, "", 100)? {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        d.id, d.title, d.decided_on, d.source, d.author
+                    );
+                }
+            }
+        },
+        Command::Why { query, repo, json } => {
+            let repo = repo
+                .or(cwd_repo(&mut store).ok())
+                .ok_or_else(|| anyhow::anyhow!("pass --repo (no indexed checkout found)"))?;
+            let found = store.search_decisions(&repo, &query, 5)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&found).unwrap_or_default()
+                );
+            } else if found.is_empty() {
+                println!("no decisions match {query:?}");
+            } else {
+                for d in found {
+                    println!(
+                        "- {} ({}; {})\n  reason: {}\n  by {}",
+                        d.title, d.decided_on, d.source, d.reason, d.author
+                    );
+                }
+            }
+        }
+        Command::Context { task, repo, json } => {
+            let repo = repo
+                .or(cwd_repo(&mut store).ok())
+                .ok_or_else(|| anyhow::anyhow!("pass --repo (no indexed checkout found)"))?;
+            let pkg = phases::context_package(&mut store, &repo, &task)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pkg).unwrap_or_default());
+            } else {
+                println!("{pkg:#}");
+            }
+        }
+        Command::Agent { task, repo, json } => {
+            let repo = repo
+                .or(cwd_repo(&mut store).ok())
+                .ok_or_else(|| anyhow::anyhow!("pass --repo (no indexed checkout found)"))?;
+            let plan = phases::agent_plan(&mut store, &repo, &task)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&plan).unwrap_or_default()
+                );
+            } else {
+                println!("{plan:#}");
+            }
+        }
+        Command::Verify {
+            repo: _,
+            path,
+            json,
+        } => {
+            let root = path.unwrap_or_else(|| PathBuf::from("."));
+            let report = phases::verify_tree(&root, 200)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
+            } else {
+                println!("{report:#}");
+            }
+            let bad = report["security"].as_array().is_some_and(|a| !a.is_empty());
+            if bad {
+                return Ok(ExitCode::from(1));
+            }
+        }
+        Command::Deploy {
+            repo,
+            service,
+            commit,
+            version,
+            status,
+        } => {
+            let repo = repo
+                .or(cwd_repo(&mut store).ok())
+                .ok_or_else(|| anyhow::anyhow!("pass --repo (no indexed checkout found)"))?;
+            let id = store.record_deployment(&repo, &service, &commit, &version, &status)?;
+            println!("deployment {id}");
+        }
+        Command::Incident { action } => match action {
+            IncidentAction::Record {
+                repo,
+                service,
+                severity,
+                summary,
+                deployment,
+            } => {
+                let id = store.record_incident(&repo, &service, deployment, &severity, &summary)?;
+                println!("incident {id}");
+            }
+            IncidentAction::List { repo, service } => {
+                for i in store.list_incidents(&repo, service.as_deref())? {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        i.id,
+                        i.service,
+                        i.severity,
+                        i.deployment_id
+                            .map(|d| d.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        i.summary
+                    );
+                }
+            }
+        },
+        Command::Feature { action } => match action {
+            FeatureAction::Add {
+                repo,
+                name,
+                description,
+            } => {
+                let id = store.record_feature(&repo, &name, &description)?;
+                println!("feature {id}");
+            }
+            FeatureAction::Link {
+                repo,
+                name,
+                kind,
+                target,
+            } => {
+                store.link_feature(&repo, &name, &kind, &target)?;
+                println!("linked {kind}:{target} to {name}");
+            }
+            FeatureAction::Show { repo, name } => {
+                let f = store.show_feature(&repo, &name)?;
+                let mut svcs = Vec::new();
+                let mut eps = Vec::new();
+                let mut tabs = Vec::new();
+                for (k, t) in &f.links {
+                    match k.as_str() {
+                        "service" => svcs.push(t.clone()),
+                        "endpoint" => eps.push(t.clone()),
+                        "table" => tabs.push(t.clone()),
+                        _ => {}
+                    }
+                }
+                print!(
+                    "{}",
+                    rb_ops::render_feature(&f.name, &f.description, &svcs, &eps, &tabs)
+                );
+            }
+        },
+        Command::Orchestrate { task, repo, json } => {
+            let repo = repo
+                .or(cwd_repo(&mut store).ok())
+                .ok_or_else(|| anyhow::anyhow!("pass --repo (no indexed checkout found)"))?;
+            let plan = phases::orchestrate_plan(&mut store, &repo, &task)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&plan).unwrap_or_default()
+                );
+            } else {
+                println!("{plan:#}");
+            }
+        }
+        Command::Ide { action } => match action {
+            IdeAction::Export { output } => {
+                phases::write_ide(&output)?;
+                println!("wrote {}", output.display());
+            }
+        },
         question => {
             let asked = asked(question).expect("every other command is a question");
             return answer(&mut store, asked);
@@ -873,7 +1271,18 @@ fn asked(command: Command) -> Option<Asked> {
         | Command::Dump { .. }
         | Command::Gc { .. }
         | Command::Doctor { .. }
-        | Command::Cache { .. } => return None,
+        | Command::Cache { .. }
+        | Command::Events { .. }
+        | Command::Decisions { .. }
+        | Command::Why { .. }
+        | Command::Context { .. }
+        | Command::Agent { .. }
+        | Command::Verify { .. }
+        | Command::Deploy { .. }
+        | Command::Incident { .. }
+        | Command::Feature { .. }
+        | Command::Orchestrate { .. }
+        | Command::Ide { .. } => return None,
     })
 }
 
