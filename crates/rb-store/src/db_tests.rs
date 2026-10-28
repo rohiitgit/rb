@@ -1761,3 +1761,100 @@ fn cypher_runs_without_jit() {
     let ours = plan(&crate::cypher_session(limits.timeout_ms));
     assert!(ours[0].get("JIT").is_none(), "{}", ours[0]["JIT"]);
 }
+
+/// Phases 2-8 storage: events, decisions, deployments, incidents and features
+/// round-trip; decision search ranks by keyword; blame resolves the chain.
+#[test]
+fn phases_tables_round_trip_and_blame_resolves() {
+    let Some(db) = db() else { return };
+    let repo = repo_name("phases");
+    let _cleanup = Cleanup {
+        url: &db.url,
+        repos: vec![repo.clone()],
+    };
+    let mut store = Store::connect(&db.url).unwrap();
+    let eid = store
+        .record_event(
+            &repo,
+            "file.changed",
+            &"a".repeat(40),
+            Some("src/a.ts"),
+            &json!({}),
+        )
+        .unwrap();
+    assert!(eid > 0);
+    let events = store.list_events(&repo, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "file.changed");
+    assert!(
+        store
+            .record_event(&repo, "bogus", &"b".repeat(40), None, &json!({}))
+            .is_err()
+    );
+
+    store
+        .record_decision(
+            &repo,
+            "Use Kafka",
+            "Ordering guarantees",
+            "2026-09-01",
+            "PR #231",
+            "rohit",
+        )
+        .unwrap();
+    let found = store.search_decisions(&repo, "why kafka", 5).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].author, "rohit");
+    assert!(
+        store
+            .search_decisions(&repo, "unrelated xyz", 5)
+            .unwrap()
+            .is_empty()
+    );
+    // Re-recording the title updates the row instead of duplicating it.
+    store
+        .record_decision(
+            &repo,
+            "Use Kafka",
+            "New reason",
+            "2026-09-02",
+            "PR #232",
+            "ana",
+        )
+        .unwrap();
+    let found = store.search_decisions(&repo, "kafka", 5).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].reason, "New reason");
+
+    let did = store
+        .record_deployment(&repo, "auth", &"c".repeat(40), "v4", "failed")
+        .unwrap();
+    store
+        .record_incident(&repo, "auth", Some(did), "critical", "login 500s")
+        .unwrap();
+    store
+        .record_incident(&repo, "auth", Some(did), "warn", "login slow")
+        .unwrap();
+    let (incident, deploy, siblings) = store
+        .incident_blame(&repo, "auth", None)
+        .unwrap()
+        .expect("an incident exists");
+    assert_eq!(incident.summary, "login slow");
+    assert_eq!(deploy.map(|d| d.version), Some("v4".to_owned()));
+    assert_eq!(siblings, 2);
+    assert!(store.incident_blame(&repo, "nope", None).unwrap().is_none());
+
+    store
+        .record_feature(&repo, "billing", "charges customers")
+        .unwrap();
+    store
+        .link_feature(&repo, "billing", "service", "billing")
+        .unwrap();
+    store
+        .link_feature(&repo, "billing", "table", "invoices")
+        .unwrap();
+    assert!(store.link_feature(&repo, "billing", "bogus", "x").is_err());
+    let f = store.show_feature(&repo, "billing").unwrap();
+    assert_eq!(f.links.len(), 2);
+    assert!(store.show_feature(&repo, "missing").is_err());
+}

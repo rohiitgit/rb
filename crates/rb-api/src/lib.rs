@@ -1655,6 +1655,37 @@ mod tests {
         assert_eq!(e.param.as_deref(), Some("columns"));
     }
 
+    /// Phases 2-9 endpoints: required parameters are enforced, defaults filled,
+    /// unknown parameters refused, and every segment round-trips.
+    #[test]
+    fn phases_endpoints_take_their_parameters() {
+        let q = parse_pairs(Endpoint::Decisions, &[("q", "kafka")]).unwrap();
+        assert_eq!(q.query.normalised(), json!({"q": "kafka", "limit": 20}));
+        assert!(parse_pairs(Endpoint::Decisions, &[]).is_err());
+        let q = parse_pairs(Endpoint::Context, &[("task", "fix login")]).unwrap();
+        assert_eq!(q.query.normalised(), json!({"task": "fix login"}));
+        let q = parse_pairs(Endpoint::Agent, &[("task", "x")]).unwrap();
+        assert_eq!(q.query.endpoint(), Endpoint::Agent);
+        let q = parse_pairs(Endpoint::Orchestrate, &[("task", "x")]).unwrap();
+        assert_eq!(q.query.endpoint(), Endpoint::Orchestrate);
+        let q = parse_pairs(Endpoint::Feature, &[("name", "billing")]).unwrap();
+        assert_eq!(q.query.normalised(), json!({"name": "billing"}));
+        let q = parse_pairs(Endpoint::Blame, &[("service", "auth"), ("incident", "4")]).unwrap();
+        assert_eq!(
+            q.query.normalised(),
+            json!({"service": "auth", "incident": 4})
+        );
+        let q = parse_pairs(Endpoint::Blame, &[("service", "auth")]).unwrap();
+        assert_eq!(
+            q.query.normalised(),
+            json!({"service": "auth", "incident": null})
+        );
+        let q = parse_pairs(Endpoint::Events, &[]).unwrap();
+        assert_eq!(q.query.normalised(), json!({"limit": 20}));
+        assert!(parse_pairs(Endpoint::Events, &[("limit", "0")]).is_err());
+        assert!(parse_pairs(Endpoint::Events, &[("limit", "101")]).is_err());
+    }
+
     /// Contract M5 S15: for limits 1, 7 and the maximum, the pages concatenate to the whole list;
     /// `total` is its length; `next_offset` is null exactly on the last page; an offset past the
     /// end is an empty page with a null `next_offset`.
