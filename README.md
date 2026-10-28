@@ -162,6 +162,33 @@ HTTP, and an exit code (HTTP status) per kind:
 | 5 | `cypher`, `cypher_timeout` | 422 |
 | 6 | `unavailable`: the database cannot be reached | 503 |
 
+## Beyond the graph: events, memory, context, agents, verification
+
+The graph is the base. On top of it, `rb` keeps the surrounding facts, all
+deterministic and all without an LLM:
+
+```sh
+rb events record --repo demo --kind file.changed --commit <sha> --path src/a.ts
+rb events apply --repo demo --path .   # diff live commit vs HEAD, record the delta
+rb decisions add --repo demo --title "Use Kafka" --reason "Ordering guarantees" --source "PR #231"
+rb decisions import --repo demo --path docs/adrs
+rb why "why kafka" --repo demo         # searches decisions, shows reason + author
+rb context "fix login timeout" --repo demo    # task -> services, endpoints, tables, decisions, incidents, deployments
+rb agent "fix login timeout" --repo demo      # plan drawn from the context only
+rb verify --repo demo --path ./services/auth # security + cost + architecture, exit 1 on findings
+rb deploy --repo demo --service auth --commit <sha> --version v5
+rb incident record --repo demo --service auth --severity critical --summary "login 500s"
+rb incident blame --repo demo --service auth  # service -> deployment -> error -> scope
+rb feature add --repo demo --name billing --description "charges customers"
+rb feature show --repo demo --name billing    # no file names, just the slice
+rb orchestrate "fix slow sql query" --repo demo
+rb ide export --output var/ide/index.html     # 4-pane viewer over `rb serve`
+```
+
+The same reads are served over HTTP (`/v1/repos/{repo}/decisions`,
+`/context`, `/agent`, `/orchestrate`, `/feature`, `/blame`, `/events`),
+so the IDE panes fetch them instead of shelling out.
+
 ## What rb leaves out, and says so
 
 `rb` would rather tell you it did not look than answer zero.
