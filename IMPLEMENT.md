@@ -1012,3 +1012,10 @@ This file traces decisions from conversation to code. The design lives in `docs/
 - **Phase 10 (goal: thin IDE over the API).** Seven read-only endpoints added (`Answer::Phases`); IDE fetches them live (verified via curl against `rb serve`: find/service/agent/orchestrate/decisions/events/callers).
 - **Deviations:** none from the phase goals; the doctor e2e flake is host load (recorded in CHANGELOG, test untouched).
 - **Status:** each phase goal met with a live proof above; committed below.
+
+## Release gate on the phases tree (2026-10-28)
+
+- **Bench:** binary `f98995b7d639`, full run, 0 failures, no leftover `bench_%` repos.
+- **Compare vs `gw.json`:** exit 0, zero changed lines, no accept file (phases work touches no graph output). 19 warnings, all host-noise class (fresh-wall + RSS). Scoring `cmp`-identical across two runs.
+- **Suite:** 150 passed, 0 failed on unit counts; `api_bodies_equal_cli_json` failed once under DB crash fallout ("connection closed" mid-retention) and once more on the settling DB, then passed standalone (53.74 s). The crash came from running the full suite and the full bench concurrently (host OOM, 166 s WAL replay); re-ran sequentially after that. Lesson: never overlap the two long poles.
+- **Scoreboards:** `bench/scoreboard/phases{,-perf}.json` committed as the gate record.
